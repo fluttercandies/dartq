@@ -1626,6 +1626,13 @@ pub struct LibraryView<'a> {
     /// per-library fold (#775). Entries are the facts' own `Arc`s, so the
     /// share costs refcount bumps, never clones.
     pub index: &'a dartq_semantic::ElementIndex,
+    /// The per-library resolved-type snapshot (#2204 phase A): one
+    /// `dartq_types` table + hierarchy + name registry over the whole
+    /// residency's element index, built once per analyze beside
+    /// `index` and shared by every per-unit fold through the flow layer's
+    /// `TypeOps` seam. `None` when the analyze resolved no element index
+    /// (the incremental-diagnosis path keeps the name-level default).
+    pub types: Option<&'a dartq_semantic::LibraryTypes>,
     /// The language-strictness modes governing the library (the defining
     /// file's analysis options, `unwrap_or(false)` per flag — the official
     /// off posture): the `analyzer.language.strict-*` config → gate face

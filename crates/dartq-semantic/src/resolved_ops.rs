@@ -1,0 +1,1349 @@
+//! The resolved-type back-end for the flow layer's [`dartq_flow::TypeOps`]
+//! seam (#2204, phase A): a per-library `dartq_types` snapshot plus the
+//! adapter that maps the flow layer's `Ty`/`ArgTy` spellings onto it.
+//!
+//! # The snapshot
+//!
+//! [`LibraryTypes`] is built once per analyze beside the `ElementIndex`
+//! (the engine's `semdiag::build_index` sibling) and shared by every
+//! per-unit fold through `LibraryView`. It declares every named container
+//! the diagnosing library can see — the library's own units plus every
+//! container its namespace resolves through imports and re-exports —
+//! over a curated `dart:core` face identical to [`crate::bounds`]'s
+//! builtin table.
+//!
+//! The element model's supertype edges are name-level ([`Container`]'s
+//! `superclass`/`with_clause`/`implements_clause` carry no written
+//! arguments), so each edge instantiates its target to bounds (the
+//! official raw-type posture, `instantiateToBounds`,
+//! type_system.dart:719-731) — exact for the sealed-subtype closure
+//! (`sealed class Resource` / `class File extends Resource`), one arity
+//! step short for generic-penetrating questions Phase C's `TypedModel`
+//! migration answers. A clause name that resolves to no registered
+//! declaration contributes no edge — the open direction (a missing edge
+//! under-reports subtype answers, never a false positive).
+//!
+//! # The adapter
+//!
+//! [`ResolvedTypeOps`] implements [`dartq_flow::TypeOps`]: a
+//! `flow::Ty`'s interned name id resolves through the recorder's own
+//! lexeme table to the shared `StringTable`, then through the
+//! `StringId → TypeDeclId` registry to an interned `TypeId`. A name
+//! absent from the registry maps to [`UninternedType::Invalid`] —
+//! `subtype.dart`'s 0c arm suppresses both directions, matching the
+//! name-level `unknown-is-top` posture.
+//!
+//! ## The `names` asymmetry
+//!
+//! The seam's `is_always_exhaustive` carries the recorder's `names`
+//! table and `ArgTy` arena (a switch probe needs both to decode the
+//! scrutinee's spelling); the other six ops take bare `Ty`s. So the
+//! adapter resolves a `Base::Name` id two ways: inside
+//! `is_always_exhaustive` it reads `names[id]` directly and caches the
+//! `id → (decl, args)` binding; inside `is_subtype`/`factor`/`classify`/…
+//! it reads the cache only. A name id the cache has not yet seen answers
+//! through [`dartq_flow::ty::NameTypeOps`]'s name-level logic — the
+//! pre-mount behavior — so the resolved face never answers *worse* than
+//! today's, only better (cross-file decl identity) once a switch probe
+//! has populated the cache.
+//!
+//! Single-threaded like [`TypeTable`] (its interior `RefCell` memo):
+//! the flow replays on the fold's thread.
+
+use std::cell::RefCell;
+
+use dartq_flow::ty::{ArgTy, Base, Classification, NameTypeOps, TypeOps, Ty as FlowTy};
+use dartq_resolution::{LibraryGraph, LibraryId, Lookup, NamespaceEntry, Namespaces};
+use dartq_source::{FileId, StringId, StringTable};
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use dartq_types::{
+    CoreDecls, ParamFacts, ParamFactsTable, TypeDeclId, TypeHierarchy, TypeId, TypeKind,
+    TypeParamId, TypeSystem, TypeTable, UninternedType, Variance,
+    instantiate_type_formals_to_bounds,
+};
+
+use crate::library::ElementIndex;
+use crate::model::{ContainerKind, MicroKind};
+
+/// Core-declaration raw ids (the hierarchy requires `Object`, `Future`,
+/// and bare `Function`). Each snapshot owns its id space.
+const OBJECT_RAW: u32 = 1;
+const FUTURE_RAW: u32 = 2;
+const FUNCTION_RAW: u32 = 3;
+const FIRST_BUILTIN_RAW: u32 = 4;
+const FIRST_CONTAINER_RAW: u32 = 100;
+
+/// The curated `dart:core` face — the same fixed public-declaration table
+/// [`crate::bounds`]'s snapshot carries (`int`/`double` subtype `num`,
+/// `num` implements `Comparable<num>`, `String` implements
+/// `Comparable<String>, Pattern`, the collection roots reach
+/// `Iterable`), plus `bool` registered as a two-constant enum: its
+/// `true`/`false` constants close the exhaustiveness arm
+/// (`static_type.dart:67`'s closed-by-construction face). `FutureOr`
+/// stays unregistered — it has a first-class [`TypeKind`] variant, not a
+/// declaration. A name absent here is invisible to the resolved walk; the
+/// adapter's `Invalid` fallback keeps the question open.
+const BUILTINS: &[(&str, &[&str], &[&str])] = &[
+    ("num", &[], &["Comparable<num>"]),
+    ("int", &[], &["num"]),
+    ("double", &[], &["num"]),
+    ("String", &[], &["Comparable<String>", "Pattern"]),
+    ("bool", &[], &[]),
+    ("Pattern", &[], &[]),
+    ("Comparable", &["T"], &[]),
+    ("Iterable", &["E"], &[]),
+    ("List", &["E"], &["Iterable<E>"]),
+    ("Set", &["E"], &["Iterable<E>"]),
+    ("Map", &["K", "V"], &[]),
+];
+
+/// The per-library resolved-type world: one interned [`TypeTable`] plus
+/// the [`TypeHierarchy`] over it, a `StringId → TypeDeclId` name registry
+/// covering every reachable declaration (in-library and imported
+/// containers, the `dart:core` builtins), and the [`ParamFactsTable`] the
+/// instantiate-to-bounds defaults read. Built once per analyze over the
+/// whole residency's element index (the same face `build_index`
+/// indexes), shared by every per-unit fold.
+pub struct LibraryTypes {
+    table: TypeTable,
+    hierarchy: TypeHierarchy,
+    /// Written name → declaration. In-library and import-reachable
+    /// containers register under their declared spelling; the builtins
+    /// ride under their `dart:core` names and lose to a same-named
+    /// registered declaration (the scope chain resolves the local first).
+    registry: FxHashMap<StringId, TypeDeclId>,
+    /// The parameter bounds face (`instantiateToBounds` reads it). The
+    /// element model carries parameter *counts* only — the bound trees
+    /// are the parse-time capture's (`crate::bounds`), which this
+    /// library-scoped build does not see — so every parameter's bound
+    /// registers `dynamic` (the always-satisfied default). Phase C's
+    /// `TypedModel` wiring tightens the same field.
+    facts: ParamFactsTable,
+    /// Declaration → its type-parameter ids, in declaration order — the
+    /// instantiate-to-bounds input (a raw `List` reads `List<dynamic>`).
+    decl_params: FxHashMap<TypeDeclId, Vec<TypeParamId>>,
+    /// Resolved names that are not containers (a typedef, a top-level
+    /// function or variable): a spelling that resolves to one maps
+    /// `Invalid` rather than borrowing a same-named builtin.
+    non_containers: FxHashSet<StringId>,
+}
+
+impl LibraryTypes {
+    /// Builds the snapshot for one library. `index` is the analyze-wide
+    /// element index (`build_index`'s product); `graph`/`namespaces` the
+    /// resolution pair the unit's own resolves run on. The registered
+    /// names are the library's own containers plus every container its
+    /// namespace can resolve a name to (import edges' targets' export
+    /// scopes, transitively through re-exports), keyed on the shared
+    /// `StringTable` so the adapter's lookups cost one hash probe.
+    pub fn build(
+        graph: &LibraryGraph,
+        namespaces: &Namespaces,
+        index: &ElementIndex,
+        strings: &StringTable,
+        lib: LibraryId,
+    ) -> Self {
+        let table = TypeTable::new();
+        let object = TypeDeclId::from_raw(OBJECT_RAW);
+        let future = TypeDeclId::from_raw(FUTURE_RAW);
+        let function = TypeDeclId::from_raw(FUNCTION_RAW);
+        let mut builder = TypeHierarchy::builder(CoreDecls {
+            object,
+            future,
+            function,
+            record: None,
+        })
+        .decl(object, Vec::new())
+        .decl(future, vec![TypeParamId::from_raw(1)])
+        .decl(function, Vec::new());
+        let mut facts = ParamFactsTable::new();
+        facts.set(
+            TypeParamId::from_raw(1),
+            ParamFacts {
+                variance: Variance::Covariant,
+                bound: None,
+            },
+        );
+
+        let mut registry: FxHashMap<StringId, TypeDeclId> = FxHashMap::default();
+        let mut decl_params: FxHashMap<TypeDeclId, Vec<TypeParamId>> = FxHashMap::default();
+        let decl_owner: FxHashMap<TypeDeclId, (FileId, LibraryId)> = FxHashMap::default();
+        let non_containers: FxHashSet<StringId> = FxHashSet::default();
+        let mut next_decl = FIRST_BUILTIN_RAW;
+        let mut next_param = 2_u32;
+
+        // —— the builtin face ————————————————————————————————————————
+        // Fresh parameter ids per builtin; `Object`'s edge arrives
+        // implicitly at `build`, and `bool` is the only enum-shaped one
+        // (its constants close `true`/`false` — the exhaustiveness arm
+        // reads `enum_constant_count`). The `Comparable<num>`/`Iterable<E>`
+        // edges intern below once every decl exists (a forward reference
+        // like `Comparable` must already be registered).
+        let mut builtin_edges: Vec<(TypeDeclId, &str)> = Vec::new();
+        for &(name, params, supers) in BUILTINS {
+            let decl = TypeDeclId::from_raw(next_decl);
+            next_decl += 1;
+            let mut param_ids = Vec::with_capacity(params.len());
+            for _ in params {
+                let id = TypeParamId::from_raw(next_param);
+                next_param += 1;
+                param_ids.push(id);
+                facts.set(
+                    id,
+                    ParamFacts {
+                        variance: Variance::Covariant,
+                        bound: None,
+                    },
+                );
+            }
+            registry.insert(strings.intern(name), decl);
+            builder = builder.decl(decl, param_ids.clone());
+            decl_params.insert(decl, param_ids);
+            for &super_text in supers {
+                builtin_edges.push((decl, super_text));
+            }
+        }
+        let bool_decl = registry[&strings.intern("bool")];
+        builder = builder.enumeration(bool_decl, 2);
+
+        // —— the reachable containers ————————————————————————————————
+        // `Registry` carries the mutable build state; `register_file`
+        // collects the decl actions (plain/sealed/enum) into `actions`
+        // rather than touching the move-only builder, then a single pass
+        // applies them all — the same information, in build order.
+        let mut registry = Registry {
+            registry,
+            decl_params,
+            decl_owner,
+            non_containers,
+            facts,
+            next_decl: FIRST_CONTAINER_RAW,
+            next_param,
+        };
+        let mut actions: Vec<DeclAction> = Vec::new();
+        for &file in graph.unit_files(lib) {
+            registry.register_file(index, file, lib, &mut actions);
+            for action in actions.drain(..) {
+                builder = action.apply(builder);
+            }
+        }
+
+        // The import reachability sweep: BFS over import edges from
+        // `lib`, each target's export scope contributing the names the
+        // unit's resolves see (re-exports ride the same edges — the
+        // scope the names resolve through is exactly `export_scope`'s).
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        seen.insert(lib.index());
+        let mut queue: Vec<LibraryId> = vec![lib];
+        while let Some(current) = queue.pop() {
+            for edge in graph.import_edges(current) {
+                let Some(target) = edge.target else {
+                    continue;
+                };
+                if !seen.insert(target.index()) {
+                    continue;
+                }
+                queue.push(target);
+                for (name, entry) in graph.export_scope(target) {
+                    if registry.registry.contains_key(&name)
+                        || registry.non_containers.contains(&name)
+                    {
+                        continue;
+                    }
+                    match index.get(entry.file).map(|els| els.container(name)) {
+                        Some(Some(_)) => {
+                            registry.register_file(index, entry.file, target, &mut actions);
+                            for action in actions.drain(..) {
+                                builder = action.apply(builder);
+                            }
+                        }
+                        Some(None) | None => {
+                            // The name resolves but its declaring file
+                            // carries no model, or the model holds no
+                            // container under it — suppress, never
+                            // borrow a same-named decl.
+                            registry.non_containers.insert(name);
+                        }
+                    }
+                }
+            }
+        }
+        let Registry {
+            registry,
+            decl_params,
+            decl_owner,
+            non_containers,
+            facts,
+            ..
+        } = registry;
+
+        // —— supertype edges —————————————————————————————————————————
+        // The builtins' written edges (`Comparable<num>`, `Iterable<E>`)
+        // intern by hand: the argument `E` is the owner's own parameter
+        // (a `List<E> implements Iterable<E>` edge reads `E` as `List`'s
+        // parameter); ground names resolve through the registry.
+        for (decl, super_text) in &builtin_edges {
+            if let Some(ty) =
+                builtin_super(&table, &registry, &decl_params, strings, *decl, super_text)
+            {
+                builder = builder.supertype(*decl, ty);
+            }
+        }
+        // The model's name-level clauses: `superclass`/`with`/
+        // `implements` instantiate to bounds (no written arguments exist
+        // to map); a mixin's `on` constraints join the walk — a
+        // constraint bounds the application's supertype face. A clause
+        // name resolving to no registered container contributes
+        // nothing — the declaration keeps its remaining edges plus the
+        // implicit `Object` the builder adds (the open direction).
+        //
+        // `decl_owner` pairs each decl back to its declaring file and
+        // library: an imported container's `extends` resolves in its
+        // own scope, not `lib`'s (the same discipline `resolve_container`
+        // climbs with).
+        for (&decl, &(file, owner)) in &decl_owner {
+            let Some(elements) = index.get(file) else {
+                continue;
+            };
+            // Recover the decl's name from the registry (the only
+            // name→decl pairing the snapshot carries; a build-time scan
+            // pays once per decl).
+            let Some(name) = registry
+                .iter()
+                .find_map(|(&n, &d)| (d == decl).then_some(n))
+            else {
+                continue;
+            };
+            let Some(container) = elements.container(name) else {
+                continue;
+            };
+            let clause_names = container
+                .superclass
+                .iter()
+                .chain(container.with_clause.iter())
+                .chain(container.implements_clause.iter())
+                .chain(
+                    (container.kind == ContainerKind::Mixin)
+                        .then(|| container.on_clause.iter())
+                        .into_iter()
+                        .flatten(),
+                )
+                .copied();
+            for target_name in clause_names {
+                let target_decl = registry.get(&target_name).copied().or_else(|| {
+                    match namespaces.lookup(graph, owner, target_name) {
+                        Lookup::Found(NamespaceEntry::Decl(owner_file)) => index
+                            .get(owner_file)
+                            .and_then(|els| els.container(target_name))
+                            .and_then(|_| registry.get(&target_name).copied()),
+                        _ => None,
+                    }
+                });
+                let Some(target_decl) = target_decl else {
+                    continue;
+                };
+                if let Some(ty) =
+                    instantiate_to_bounds(&table, &facts, &decl_params, target_decl)
+                {
+                    builder = builder.supertype(decl, ty);
+                }
+            }
+        }
+
+        // Freeze: an invalid captured graph (a cycle, an arity-mismatched
+        // edge) falls back to the bare core — declarations stay
+        // registered but carry no hierarchy face, the same under-report
+        // posture `crate::bounds` takes.
+        let hierarchy = match builder.build(&table) {
+            Ok(hierarchy) => hierarchy,
+            Err(_) => TypeHierarchy::builder(CoreDecls {
+                object,
+                future,
+                function,
+                record: None,
+            })
+            .decl(object, Vec::new())
+            .decl(future, vec![TypeParamId::from_raw(1)])
+            .decl(function, Vec::new())
+            .build(&table)
+            .expect("the bare core hierarchy is always valid"),
+        };
+
+        Self {
+            table,
+            hierarchy,
+            registry,
+            facts,
+            decl_params,
+            non_containers,
+        }
+    }
+}
+
+/// One hierarchy declaration step `register_file` emits — the move-only
+/// `TypeHierarchyBuilder` applies them in order after each file's names
+/// are registered (the builder's `decl`/`sealed`/`enumeration` calls
+/// consume `self`, so they ride out through `apply`).
+enum DeclAction {
+    /// `builder.decl(decl, params)`.
+    Decl(TypeDeclId, Vec<TypeParamId>),
+    /// `builder.sealed(decl)`.
+    Sealed(TypeDeclId),
+    /// `builder.enumeration(decl, constants)`.
+    Enum(TypeDeclId, u16),
+}
+
+impl DeclAction {
+    fn apply(self, builder: dartq_types::TypeHierarchyBuilder) -> dartq_types::TypeHierarchyBuilder {
+        match self {
+            Self::Decl(decl, params) => builder.decl(decl, params),
+            Self::Sealed(decl) => builder.sealed(decl),
+            Self::Enum(decl, constants) => builder.enumeration(decl, constants),
+        }
+    }
+}
+
+/// The mutable state `LibraryTypes::build`'s container-registration pass
+/// carries: the name→decl registry, the decl→params/owner side tables,
+/// the parameter facts, and the fresh-id cursors. Struct-scoped so
+/// `register_file` can take `&mut self` without fighting the borrow
+/// checker.
+struct Registry {
+    registry: FxHashMap<StringId, TypeDeclId>,
+    decl_params: FxHashMap<TypeDeclId, Vec<TypeParamId>>,
+    decl_owner: FxHashMap<TypeDeclId, (FileId, LibraryId)>,
+    non_containers: FxHashSet<StringId>,
+    facts: ParamFactsTable,
+    next_decl: u32,
+    next_param: u32,
+}
+
+impl Registry {
+    /// Declares every named container of one unit file into the snapshot
+    /// (declaration order; first-wins on a shared name — a local shadows
+    /// an import exactly like the scope chain), plus the unit's
+    /// non-container top-level declarations (marked so a spelling that
+    /// resolves to a typedef/function/variable never borrows a same-named
+    /// registered decl or builtin). The hierarchy steps append to
+    /// `actions` in file order — the caller applies them to the builder.
+    fn register_file(
+        &mut self,
+        index: &ElementIndex,
+        file: FileId,
+        owner: LibraryId,
+        actions: &mut Vec<DeclAction>,
+    ) {
+        let Some(elements) = index.get(file) else {
+            return;
+        };
+        for &name in elements.container_order() {
+            let Some(container) = elements.container(name) else {
+                continue;
+            };
+            if self.registry.contains_key(&name) {
+                continue;
+            }
+            let decl = TypeDeclId::from_raw(self.next_decl);
+            self.next_decl += 1;
+            let mut param_ids = Vec::with_capacity(usize::from(container.type_params));
+            for _ in 0..container.type_params {
+                let id = TypeParamId::from_raw(self.next_param);
+                self.next_param += 1;
+                param_ids.push(id);
+                self.facts.set(
+                    id,
+                    ParamFacts {
+                        variance: Variance::Covariant,
+                        bound: None,
+                    },
+                );
+            }
+            self.registry.insert(name, decl);
+            self.decl_params.insert(decl, param_ids.clone());
+            self.decl_owner.insert(decl, (file, owner));
+            actions.push(DeclAction::Decl(decl, param_ids));
+            if container.sealed {
+                actions.push(DeclAction::Sealed(decl));
+            }
+            if container.kind == ContainerKind::Enum {
+                let constants =
+                    u16::try_from(container.enum_constants.len()).unwrap_or(u16::MAX);
+                actions.push(DeclAction::Enum(decl, constants));
+            }
+        }
+        // A non-container top-level declaration of a name stays out of
+        // the registry — mark it so the adapter never borrows a
+        // same-named builtin or co-declared container.
+        for (name, decl) in elements.declarations() {
+            if self.registry.contains_key(&name) {
+                continue;
+            }
+            let container_like = matches!(
+                decl.kind,
+                MicroKind::Class | MicroKind::Enum | MicroKind::Mixin | MicroKind::Extension
+            );
+            if !container_like {
+                self.non_containers.insert(name);
+            }
+        }
+    }
+}
+
+/// One builtin supertype text (`Comparable<num>`, `Iterable<E>`, or a
+/// bare `num`) interned: the head resolves through the registry; a
+/// written argument resolves as the OWNER's own type parameter when the
+/// head declares one and the text is not a registered name (the fixed
+/// table's generic edges are all `Name<Param>` — `List<E>`'s `E` is
+/// `List`'s sole parameter) or as a ground type through the registry
+/// (`Comparable<num>`'s `num`). `None` on an unresolvable head or
+/// argument.
+fn builtin_super(
+    table: &TypeTable,
+    registry: &FxHashMap<StringId, TypeDeclId>,
+    decl_params: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
+    strings: &StringTable,
+    owner: TypeDeclId,
+    text: &str,
+) -> Option<TypeId> {
+    let (head, args_text) = match text.split_once('<') {
+        Some((head, rest)) => (head.trim(), rest.strip_suffix('>').map(str::trim)),
+        None => (text.trim(), None),
+    };
+    let &decl = registry.get(&strings.intern(head))?;
+    let args = match args_text {
+        None => Vec::new(),
+        Some(inner) if inner.is_empty() => Vec::new(),
+        Some(inner) => {
+            let owner_params = decl_params.get(&owner)?;
+            let &param = owner_params.first()?;
+            let mut args = Vec::new();
+            for arg_text in inner.split(',') {
+                let arg_text = arg_text.trim();
+                // A registered name (`num` in `Comparable<num>`) is a
+                // ground argument; anything else in the fixed table is
+                // the owner's own parameter spelling.
+                if let Some(&arg_decl) = registry.get(&strings.intern(arg_text)) {
+                    args.push(instantiate_to_bounds(
+                        table,
+                        &ParamFactsTable::new(),
+                        decl_params,
+                        arg_decl,
+                    )?);
+                    continue;
+                }
+                args.push(table.intern(
+                    UninternedType::TypeParameter { parameter: param },
+                    false,
+                ));
+            }
+            args
+        }
+    };
+    Some(table.intern(UninternedType::Interface { decl, args }, false))
+}
+
+/// Instantiates a registered declaration to its parameter bounds —
+/// `List` reads `List<dynamic>` while the snapshot carries no bounds, a
+/// bounded head would read its bound. `None` for an undeclared decl (the
+/// registry and `decl_params` are built together, so a miss is the bail).
+fn instantiate_to_bounds(
+    table: &TypeTable,
+    facts: &ParamFactsTable,
+    decl_params: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
+    decl: TypeDeclId,
+) -> Option<TypeId> {
+    let params = decl_params.get(&decl)?;
+    if params.is_empty() {
+        return Some(
+            table.intern(
+                UninternedType::Interface {
+                    decl,
+                    args: Vec::new(),
+                },
+                false,
+            ),
+        );
+    }
+    let instantiation = instantiate_type_formals_to_bounds(table, facts, params);
+    Some(table.intern(
+        UninternedType::Interface {
+            decl,
+            args: instantiation.defaults,
+        },
+        false,
+    ))
+}
+
+/// The adapter: `dartq_flow`'s `Ty`/`ArgTy` spellings mapped onto the
+/// snapshot's interned `TypeId`s, [`TypeOps`] answered through
+/// [`TypeSystem`]. One instance per `fold_unit` call — the `name_ty`
+/// cache keys on the unit recorder's interned ids, which are only
+/// meaningful inside that unit's spelling universe.
+pub struct ResolvedTypeOps<'a> {
+    snapshot: &'a LibraryTypes,
+    strings: &'a StringTable,
+    system: TypeSystem<'a>,
+    /// `name_id → (non-null TypeId, nullable TypeId)`, lazily extended:
+    /// `is_always_exhaustive` is the only op carrying the recorder's
+    /// `names` table, so each probe's `names` slice grows the cache in
+    /// one pass (the recorder's table never shrinks — a cached binding
+    /// stays valid). A name the registry misses caches the `invalid`
+    /// pair — the base ops read `None` only for an *unobserved* id and
+    /// fall back to `NameTypeOps`; an observed-but-unresolved name
+    /// answers `Invalid` (the suppress face), matching today's
+    /// unknown-is-top posture.
+    name_ty: RefCell<Vec<(TypeId, TypeId)>>,
+    /// `TypeDeclId` → memoized "sealed or enum" answer — the
+    /// `is_always_exhaustive` per-decl verdict, stable across the
+    /// corpus's switch-end probes.
+    closed: RefCell<FxHashMap<TypeDeclId, bool>>,
+    dynamic: TypeId,
+    null: TypeId,
+    void: TypeId,
+    invalid: TypeId,
+}
+
+impl<'a> ResolvedTypeOps<'a> {
+    /// Mounts the adapter over `snapshot`: `strings` is the shared name
+    /// table the recorder's lexemes intern into (the same one the
+    /// snapshot's registry keyed its `StringId`s on).
+    pub fn new(snapshot: &'a LibraryTypes, strings: &'a StringTable) -> Self {
+        let table = &snapshot.table;
+        Self {
+            snapshot,
+            strings,
+            system: TypeSystem::new(&snapshot.table, &snapshot.hierarchy),
+            name_ty: RefCell::new(Vec::new()),
+            closed: RefCell::new(FxHashMap::default()),
+            dynamic: table.intern(UninternedType::Dynamic, false),
+            null: table.intern(UninternedType::Null, false),
+            void: table.intern(UninternedType::Void, false),
+            invalid: table.intern(UninternedType::Invalid, false),
+        }
+    }
+
+    /// Extends the `name_id → (non-null, nullable)` binding through
+    /// `names` — one forward scan covering the ids seen since the last
+    /// call. A `Base::Name` spelling whose decl is registered maps to its
+    /// to-bounds interface (interned once per nullability face);
+    /// everything else (a type parameter, a local function, a synthetic
+    /// `#<handle>` token, an unindexed import) caches the `Invalid`
+    /// pair.
+    fn observe_names(&self, names: &[Box<str>]) {
+        let mut cache = self.name_ty.borrow_mut();
+        let start = cache.len();
+        if names.len() <= start {
+            return;
+        }
+        cache.reserve(names.len() - start);
+        for lexeme in &names[start..] {
+            let name = self.strings.intern(lexeme);
+            let pair = self
+                .snapshot
+                .registry
+                .get(&name)
+                .filter(|_| !self.snapshot.non_containers.contains(&name))
+                .and_then(|&decl| {
+                    let params = self
+                        .snapshot
+                        .decl_params
+                        .get(&decl)
+                        .map_or(&[][..], Vec::as_slice);
+                    let args = if params.is_empty() {
+                        Vec::new()
+                    } else {
+                        instantiate_type_formals_to_bounds(
+                            &self.snapshot.table,
+                            &self.snapshot.facts,
+                            params,
+                        )
+                        .defaults
+                    };
+                    Some((decl, args))
+                })
+                .map_or((self.invalid, self.invalid), |(decl, args)| {
+                    let non_null = self.snapshot.table.intern(
+                        UninternedType::Interface { decl, args: args.clone() },
+                        false,
+                    );
+                    let nullable = self.snapshot.table.intern(
+                        UninternedType::Interface { decl, args },
+                        true,
+                    );
+                    (non_null, nullable)
+                });
+            cache.push(pair);
+        }
+    }
+
+    /// The `name_id → (non-null, nullable)` map the base ops read:
+    /// `Some` when the id was observed (a `names` table reached it),
+    /// `None` while still unobserved — a `var`-inferred or
+    /// never-switched spelling answers through the `NameTypeOps`
+    /// fallback, preserving the pre-mount behavior exactly.
+    fn mapped_name(&self, id: u32) -> Option<(TypeId, TypeId)> {
+        self.name_ty.borrow().get(id as usize).copied()
+    }
+
+    /// Maps a `Ty` to a `TypeId` for the base ops — the `names`-free
+    /// arm. `Base::Name` resolves through the observed cache;
+    /// `None` where the name is unobserved means the caller falls back
+    /// to `NameTypeOps`.
+    fn map_base(&self, ty: FlowTy) -> Option<TypeId> {
+        match ty.base {
+            Base::Dynamic => Some(self.dynamic),
+            Base::Void => Some(self.void),
+            Base::Never => Some(
+                self.snapshot
+                    .table
+                    .intern(UninternedType::Never, ty.nullable),
+            ),
+            Base::Null => Some(self.null),
+            Base::Unknown => Some(self.invalid),
+            Base::Function => Some(
+                self.snapshot
+                    .table
+                    .intern(UninternedType::Interface {
+                        decl: self.snapshot.hierarchy.core().function,
+                        args: Vec::new(),
+                    }, ty.nullable),
+            ),
+            Base::Name(id) => {
+                let (non_null, nullable) = self.mapped_name(id)?;
+                Some(if ty.nullable { nullable } else { non_null })
+            }
+        }
+    }
+
+    /// Maps one `ArgTy` node (recursion for `FutureOr`); `names` and
+    /// `arena` are the live faces `is_always_exhaustive` carries. A node
+    /// whose name resolves to nothing maps `invalid` — the enclosing
+    /// `Interface` arm suppresses through it.
+    fn map_node(&self, node: &ArgTy, arena: &[Vec<ArgTy>], names: &[Box<str>]) -> TypeId {
+        match node.base {
+            Base::Dynamic => self.dynamic,
+            Base::Void => self.void,
+            Base::Never => self
+                .snapshot
+                .table
+                .intern(UninternedType::Never, node.nullable),
+            Base::Null => self.null,
+            Base::Unknown => self.invalid,
+            Base::Function => self
+                .snapshot
+                .table
+                .intern(UninternedType::Interface {
+                    decl: self.snapshot.hierarchy.core().function,
+                    args: Vec::new(),
+                }, node.nullable),
+            Base::Name(id) => {
+                let Some(lexeme) = names.get(id as usize) else {
+                    return self.invalid;
+                };
+                let name = self.strings.intern(lexeme);
+                if lexeme.as_ref() == "FutureOr" {
+                    return self.map_future_or(node.args, arena, names, node.nullable);
+                }
+                let Some(&decl) = self
+                    .snapshot
+                    .registry
+                    .get(&name)
+                    .filter(|_| !self.snapshot.non_containers.contains(&name))
+                else {
+                    return self.invalid;
+                };
+                let Some(args) = self.map_args(node.args, arena, names, decl) else {
+                    return self.invalid;
+                };
+                self.snapshot
+                    .table
+                    .intern(UninternedType::Interface { decl, args }, node.nullable)
+            }
+        }
+    }
+
+    /// `FutureOr<T>`: the tree arm `is_always_exhaustive` recurses into.
+    /// A bare `FutureOr` (no args) reads `FutureOr<dynamic>` — the
+    /// raw-type face every unparameterized generic takes.
+    fn map_future_or(
+        &self,
+        args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+        nullable: bool,
+    ) -> TypeId {
+        let base = match arena.get(args as usize).map(Vec::as_slice) {
+            Some([arg]) => self.map_node(arg, arena, names),
+            _ => self.dynamic,
+        };
+        self.snapshot
+            .table
+            .intern(UninternedType::FutureOr { base }, nullable)
+    }
+
+    /// The `Interface` arm's written argument list; an argument-less
+    /// head instantiates to bounds (a bare `List` reads `List<dynamic>`
+    /// — the official `instantiateToBounds` on a resolved element).
+    /// `None` on arity mismatch (the written count disagrees with the
+    /// declaration's) — the whole `Interface` suppresses through
+    /// `Invalid`.
+    fn map_args(
+        &self,
+        args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+        decl: TypeDeclId,
+    ) -> Option<Vec<TypeId>> {
+        let params = self
+            .snapshot
+            .decl_params
+            .get(&decl)
+            .map_or(&[][..], Vec::as_slice);
+        let row = arena.get(args as usize).map_or(&[][..], Vec::as_slice);
+        if row.is_empty() {
+            let ty = instantiate_to_bounds(
+                &self.snapshot.table,
+                &self.snapshot.facts,
+                &self.snapshot.decl_params,
+                decl,
+            )?;
+            return match self.snapshot.table.get(ty).kind() {
+                TypeKind::Interface { args, .. } => Some(self.snapshot.table.args(args)),
+                _ => Some(Vec::new()),
+            };
+        }
+        if row.len() != params.len() {
+            return None;
+        }
+        let mut mapped = Vec::with_capacity(row.len());
+        for arg in row {
+            let ty = self.map_node(arg, arena, names);
+            if matches!(self.snapshot.table.get(ty).kind(), TypeKind::Invalid) {
+                return None;
+            }
+            mapped.push(ty);
+        }
+        Some(mapped)
+    }
+
+    /// The scrutinee map `is_always_exhaustive` uses: `Base::Name`
+    /// resolves through `names` (fresh every probe — a new spelling
+    /// never needs a prior observation), everything else through the
+    /// base map.
+    fn map_scrutinee(
+        &self,
+        ty: FlowTy,
+        args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> TypeId {
+        match ty.base {
+            Base::Name(id) => {
+                let Some(lexeme) = names.get(id as usize) else {
+                    return self.invalid;
+                };
+                let name = self.strings.intern(lexeme);
+                if lexeme.as_ref() == "FutureOr" {
+                    return self.map_future_or(args, arena, names, ty.nullable);
+                }
+                let Some(&decl) = self
+                    .snapshot
+                    .registry
+                    .get(&name)
+                    .filter(|_| !self.snapshot.non_containers.contains(&name))
+                else {
+                    return self.invalid;
+                };
+                let Some(mapped_args) = self.map_args(args, arena, names, decl) else {
+                    return self.invalid;
+                };
+                self.snapshot.table.intern(
+                    UninternedType::Interface {
+                        decl,
+                        args: mapped_args,
+                    },
+                    ty.nullable,
+                )
+            }
+            _ => self.map_base(ty).unwrap_or(self.invalid),
+        }
+    }
+}
+
+impl TypeOps for ResolvedTypeOps<'_> {
+    /// `is_subtype` over the resolved world where both sides map; either
+    /// side unmapped answers through [`NameTypeOps`] — today's name-level
+    /// logic — so a `var`-inferred or unresolvable spelling keeps its
+    /// pre-mount answer and a resolved pair gains the real hierarchy
+    /// (`Resource` <: `Object`, `File` <: `Resource` cross-file).
+    fn is_subtype(&self, left: FlowTy, right: FlowTy) -> bool {
+        match (self.map_base(left), self.map_base(right)) {
+            (Some(l), Some(r)) => self.system.is_subtype(l, r),
+            _ => NameTypeOps.is_subtype(left, right),
+        }
+    }
+
+    /// `factor`: the remainder of `from` after `is what` removes it.
+    /// Mapped arms answer through `TypeSystem::is_subtype` plus the
+    /// name-level remainder shape; an unmapped arm falls back to
+    /// `NameTypeOps::factor` verbatim — the pre-mount answer.
+    fn factor(&self, from: FlowTy, what: FlowTy) -> FlowTy {
+        match (self.map_base(from), self.map_base(what)) {
+            (Some(f), Some(w)) if self.system.is_subtype(f, w) => FlowTy::NEVER,
+            (Some(f), Some(w)) => {
+                let _ = (f, w);
+                // Rule 2 of factorType: `R?` factors as
+                // `factor(R, what)` when `Null <: what` — the resolved
+                // face answers the null-half question through
+                // `is_subtype(Null, what)`.
+                if from.nullable
+                    && !matches!(
+                        from.base,
+                        Base::Dynamic | Base::Unknown | Base::Void | Base::Null | Base::Never
+                    )
+                {
+                    if self.system.is_subtype(self.null, w) {
+                        return self.factor(from.non_null(), what);
+                    }
+                    return self.factor(from.non_null(), what).make_nullable();
+                }
+                from
+            }
+            _ => NameTypeOps.factor(from, what),
+        }
+    }
+
+    /// `tryPromoteToType`: `to` must be a subtype of `from` (the
+    /// promotion adds information); resolved arms delegate to
+    /// `TypeSystem::is_subtype` for that judgment, then keep the
+    /// name-level nullability rules the official's lattice combines.
+    fn try_promote_to(&self, to: FlowTy, from: FlowTy) -> Option<FlowTy> {
+        if let (Some(t), Some(f)) = (self.map_base(to), self.map_base(from))
+            && self.system.is_subtype(t, f)
+        {
+            return Some(to);
+        }
+        NameTypeOps.try_promote_to(to, from)
+    }
+
+    /// `promoteToNonNull`: strip `?` / `Null`→`Never` / `dynamic` stays —
+    /// resolved where the name maps, name-level otherwise.
+    fn promote_to_non_null(&self, t: FlowTy) -> FlowTy {
+        if let Some(mapped) = self.map_base(t) {
+            return match self.system.is_bottom(mapped) {
+                true => FlowTy::NEVER,
+                false if self.system.is_nullable(mapped) => t.non_null(),
+                false => t,
+            };
+        }
+        NameTypeOps.promote_to_non_null(t)
+    }
+
+    /// `classifyType`: the resolved face answers through `TypeSystem`'s
+    /// nullability predicates; an unmapped arm keeps `NameTypeOps`'s
+    /// syntactic answer.
+    fn classify(&self, t: FlowTy) -> Classification {
+        match self.map_base(t) {
+            Some(mapped) if self.system.is_null(mapped) => Classification::NullOrEquivalent,
+            Some(mapped) if self.system.is_nullable(mapped) => {
+                Classification::PotentiallyNullable
+            }
+            Some(_) => Classification::NonNullable,
+            None => NameTypeOps.classify(t),
+        }
+    }
+
+    /// `is_bottom`: resolved `Never`/`Null`/`Invalid` answers through
+    /// `TypeSystem::is_bottom`; an unmapped arm keeps the name-level
+    /// `Never` check.
+    fn is_bottom(&self, t: FlowTy) -> bool {
+        match self.map_base(t) {
+            Some(mapped) => self.system.is_bottom(mapped),
+            None => NameTypeOps.is_bottom(t),
+        }
+    }
+
+    /// `TypeSystem.isAlwaysExhaustive` (type_system.dart:846-888) over
+    /// the resolved hierarchy: `Null`/`bool` split completely, enums and
+    /// sealed classes close by their element faces, `FutureOr<T>`
+    /// recurses into `T`. A `Base::Name` spelling resolves through
+    /// `names` (populating the `name_ty` cache for the base ops); an
+    /// unresolvable spelling is the under-report `false`.
+    fn is_always_exhaustive(
+        &self,
+        ty: FlowTy,
+        args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> bool {
+        self.observe_names(names);
+        let mapped = self.map_scrutinee(ty, args, arena, names);
+        let is_closed = |decl: TypeDeclId| -> bool {
+            *self.closed.borrow_mut().entry(decl).or_insert_with(|| {
+                self.snapshot.hierarchy.is_sealed(decl)
+                    || self.snapshot.hierarchy.enum_constant_count(decl).is_some()
+            })
+        };
+        match self.snapshot.table.get(mapped).kind() {
+            // `Null` splits completely — the official's `isDartCoreNull`
+            // arm. `Never?` interned as `Null` lands here too.
+            TypeKind::Null => true,
+            TypeKind::Interface { decl, .. } => is_closed(decl),
+            TypeKind::FutureOr { base } => match self.snapshot.table.get(base).kind() {
+                // `FutureOr<T>` recurses into `T` (type_system.dart:865):
+                // a closed base closes the `FutureOr` — `Null` splits
+                // completely, a sealed/enum base's decl answers.
+                TypeKind::Null => true,
+                TypeKind::Interface { decl, .. } => is_closed(decl),
+                // `FutureOr<FutureOr<…>>` unrolls one arm deeper than
+                // this single-level match reaches — under-report.
+                _ => false,
+            },
+            // `Never`, `dynamic`, `void`, `Invalid`, `Function`,
+            // `TypeParameter`, `Record` — the official's undecidable or
+            // open arms: `false` keeps the post-switch state live.
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collector::collect;
+    use crate::diagnose::{StrictModes, fold_unit_with_ops};
+    use dartq_flow::ty::{EMPTY_ARGS, Ty};
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{
+        Combinators, ImportEdge, LibraryClassModifiers, LibraryGraphBuilder,
+    };
+    use dartq_scanner::{ScanConfig, TokenTable};
+    use dartq_source::FileTable;
+    use std::path::Path;
+
+    /// Scans + collects one unit, interning its names into `strings`.
+    /// Mirrors `library.rs`'s `unit` helper — kept private so the pin's
+    /// dependency set stays visible.
+    fn unit(
+        source: &str,
+        strings: &StringTable,
+        files: &mut FileTable,
+        path: &str,
+    ) -> crate::model::FileElements {
+        let file = files.intern(Path::new(path));
+        let result = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(result.diagnostics.is_empty(), "{source:?}");
+        let tokens: &'static TokenTable = Box::leak(Box::new(result.tokens));
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        collect(source, tokens, features, strings)
+    }
+
+    /// The unit's flow-driven diagnostic code names — the same harness
+    /// `diagnose/tests.rs` runs, with the ops adapter mounted.
+    fn diagnose_codes(
+        source: &str,
+        make_edge: impl FnOnce(&StringTable) -> Option<ImportEdge>,
+    ) -> Vec<&'static str> {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty(), "{source:?}");
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        builder.unit(lib, file);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        if let Some(edge) = make_edge(&strings) {
+            builder.import(lib, edge);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
+        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let fold = fold_unit_with_ops(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+            Some(&ops),
+        );
+        fold.report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect()
+    }
+
+    /// A sealed-scrutinee switch closes: no `body_might_complete_normally`
+    /// on the non-void function — the exhaustive arms keep the
+    /// post-switch state unreachable, so the missing tail `return` never
+    /// reports. The resolved `is_always_exhaustive` answers `true`
+    /// through `is_sealed`, where the name-level `ClosedNames` only saw
+    /// same-file sealeds that parsed before the executable (the resolved
+    /// registry is complete at fold time, so a sealed declared *after*
+    /// `f` still closes).
+    #[test]
+    fn sealed_scrutinee_switch_stays_silent() {
+        let codes = diagnose_codes(
+            "sealed class S {} \
+             class A extends S {} \
+             class B extends S {} \
+             int f(S s) { \
+               switch (s) { case A(): return 0; case B(): return 1; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"body_might_complete_normally"),
+            "sealed switch should close: {codes:?}"
+        );
+        // The sealed decl follows its consumer in source order below —
+        // the parse-time `ClosedNames` capture would answer `false`
+        // (declaration unseen at record time); the resolved registry
+        // answers `true` either way.
+        let codes = diagnose_codes(
+            "int f(S s) { \
+               switch (s) { case A(): return 0; case B(): return 1; } \
+             } \
+             sealed class S {} \
+             class A extends S {} \
+             class B extends S {}",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"body_might_complete_normally"),
+            "later-declared sealed switch should still close: {codes:?}"
+        );
+    }
+
+    /// The non-sealed control: a switch over an open class still reports
+    /// `body_might_complete_normally` on the non-void function — the
+    /// post-switch state stays live (the case list is incomplete), so the
+    /// missing tail `return` reports.
+    #[test]
+    fn open_scrutinee_switch_still_reports() {
+        let codes = diagnose_codes(
+            "class S {} \
+             class A extends S {} \
+             int f(S s) { \
+               switch (s) { case A(): return 0; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            codes.contains(&"body_might_complete_normally"),
+            "open switch should keep reporting: {codes:?}"
+        );
+    }
+
+    /// The adapter's own verdict, exercised directly: a `Base::Name` id
+    /// resolving through `names` to a sealed decl answers `true`, a
+    /// registered non-sealed decl `false`, an unregistered spelling
+    /// `false` — and the `FutureOr<sealed>` arm recurses through the
+    /// `args` arena.
+    #[test]
+    fn ops_is_always_exhaustive_verdicts() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let elements = unit(
+            "sealed class S {} class A extends S {} class Open {}",
+            &strings,
+            &mut files,
+            "u.dart",
+        );
+        let file = files.try_file_id(Path::new("u.dart")).unwrap();
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/u.dart");
+        builder.unit(lib, file);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
+        let ops = ResolvedTypeOps::new(&library_types, &strings);
+
+        // `names` is the recorder's table — ids index into it.
+        let names: Vec<Box<str>> =
+            vec!["S".into(), "A".into(), "Open".into(), "Missing".into(), "FutureOr".into()];
+        let empty_arena: Vec<Vec<ArgTy>> = vec![Vec::new()];
+        // The `FutureOr` row: one arg node pointing at `S` (name id 0,
+        // EMPTY_ARGS row of its own).
+        let future_or_arena: Vec<Vec<ArgTy>> = vec![
+            Vec::new(),
+            vec![ArgTy {
+                base: Base::Name(0),
+                nullable: false,
+                args: EMPTY_ARGS,
+            }],
+        ];
+
+        assert!(ops.is_always_exhaustive(
+            Ty { base: Base::Name(0), nullable: false },
+            EMPTY_ARGS,
+            &empty_arena,
+            &names,
+        ));
+        assert!(!ops.is_always_exhaustive(
+            Ty { base: Base::Name(2), nullable: false },
+            EMPTY_ARGS,
+            &empty_arena,
+            &names,
+        ));
+        assert!(!ops.is_always_exhaustive(
+            Ty { base: Base::Name(3), nullable: false },
+            EMPTY_ARGS,
+            &empty_arena,
+            &names,
+        ));
+        // `FutureOr<S>` over a sealed base closes.
+        assert!(ops.is_always_exhaustive(
+            Ty { base: Base::Name(4), nullable: false },
+            1,
+            &future_or_arena,
+            &names,
+        ));
+        // `Null` and `bool` split completely.
+        assert!(ops.is_always_exhaustive(
+            Ty::NULL,
+            EMPTY_ARGS,
+            &empty_arena,
+            &names,
+        ));
+    }
+
+    /// Cross-file sealed closure: `S` declared in `s.dart`, diagnosed in
+    /// `main.dart` — the registry reaches the import's export scope, so
+    /// a `switch` over `S` in `main` still answers `true`. The name-level
+    /// `ClosedNames` never saw the imported decl.
+    #[test]
+    fn sealed_scrutinee_closes_across_an_import() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let s_elements = unit(
+            "sealed class S {} class A extends S {} class B extends S {}",
+            &strings,
+            &mut files,
+            "s.dart",
+        );
+        let s_file = files.try_file_id(Path::new("s.dart")).unwrap();
+        let main_file = files.intern(Path::new("main.dart"));
+        let main_source = "import 's.dart'; \
+                           void f(S s) { \
+                             switch (s) { case A(): return; case B(): return; } \
+                           }";
+        let scanned = dartq_scanner::scan(
+            main_source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            main_file,
+        );
+        assert!(scanned.diagnostics.is_empty());
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let main_elements = collect(main_source, &scanned.tokens, features, &strings);
+
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib_s = builder.intern("package:t/s.dart");
+        let lib_main = builder.intern("package:t/main.dart");
+        builder.unit(lib_s, s_file);
+        builder.unit(lib_main, main_file);
+        let mut index = ElementIndex::default();
+        index.insert(s_file, s_elements.clone());
+        index.insert(main_file, main_elements.clone());
+        for (name, decl) in s_elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_s, name, s_file);
+        }
+        for (name, decl) in main_elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_main, name, main_file);
+        }
+        builder.import(
+            lib_main,
+            ImportEdge {
+                target: Some(lib_s),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let library_types =
+            LibraryTypes::build(&graph, &namespaces, &index, &strings, lib_main);
+        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let fold = fold_unit_with_ops(
+            main_source,
+            &scanned.tokens,
+            features,
+            &strings,
+            main_file,
+            lib_main,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+            Some(&ops),
+        );
+        let codes: Vec<&'static str> = fold
+            .report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect();
+        assert!(
+            !codes.contains(&"body_might_complete_normally"),
+            "imported sealed switch should close: {codes:?}"
+        );
+    }
+}

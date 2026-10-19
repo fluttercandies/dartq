@@ -442,7 +442,14 @@ impl SemanticDiagnoser for Diagnoser {
                 local = face;
                 (feature_set, &local.tokens)
             };
-            let (report, face) = dartq_semantic::diagnose_unit(
+            // The resolved-type face (#2204 phase A): when the view
+            // carries the library's `LibraryTypes` snapshot, every type
+            // question this member's flow replay asks answers through it;
+            // the `None` path keeps the name-level `NameTypeOps` default.
+            let ops = library.types.map(|types| {
+                dartq_semantic::ResolvedTypeOps::new(types, library.strings)
+            });
+            let (report, face) = dartq_semantic::diagnose_unit_with_ops(
                 text,
                 tokens,
                 ParserFeatures::from_feature_set(feature_set),
@@ -469,6 +476,7 @@ impl SemanticDiagnoser for Diagnoser {
                 // persisted face or the re-derivation above) — so a
                 // pre-3.2 library analyzes with promotion off.
                 feature_set.is_enabled(Feature::InferenceUpdate2),
+                ops.as_ref(),
             );
             // The bake in `l1::duplicate_diagnostics` is the single source,
             // so the fold drops the re-issued rows; the filtered set is

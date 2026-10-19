@@ -178,6 +178,27 @@ pub trait TypeOps {
     /// Whether `t` is a bottom type (`Never`, or a type variable promoted
     /// to `Never` — name-level: `Never` itself).
     fn is_bottom(&self, t: Ty) -> bool;
+    /// `TypeSystem.isAlwaysExhaustive` (type_system.dart:846-888): whether a
+    /// switch over `ty`'s values is closed by construction — `Null`/`bool`
+    /// split completely, enums and sealed classes close by their element
+    /// faces, `FutureOr<T>` recurses into `T`. `args` is the scrutinee's
+    /// written-argument arena index into `arena` ([`EMPTY_ARGS`] when
+    /// argument-less) and `names` the recorder's interned-name lexeme table —
+    /// a resolved back-end resolves `Base::Name` ids through it and reads the
+    /// `FutureOr` argument through `args`/`arena`. The default answers
+    /// `false`: the under-report direction (a missed verdict keeps the
+    /// post-switch state live — conservative, never a false dead row).
+    /// Implementations may only answer `true` on a certain verdict.
+    fn is_always_exhaustive(
+        &self,
+        ty: Ty,
+        args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> bool {
+        let _ = (ty, args, arena, names);
+        false
+    }
 }
 
 /// The name-level default implementation. Rules, in order:

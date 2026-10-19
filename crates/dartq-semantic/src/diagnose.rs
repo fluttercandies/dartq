@@ -714,7 +714,7 @@ pub fn diagnose_unit(
     class_modifiers: &LibraryClassModifiers,
     field_promotion_enabled: bool,
 ) -> (FileReport, UnitUseFace) {
-    let fold = fold_unit(
+    diagnose_unit_with_ops(
         source,
         tokens,
         features,
@@ -727,6 +727,45 @@ pub fn diagnose_unit(
         strict,
         class_modifiers,
         field_promotion_enabled,
+        None,
+    )
+}
+
+/// [`diagnose_unit`] with the resolved-type face mounted (#2204 phase A):
+/// `ops`, when `Some`, is the library's [`crate::resolved_ops::ResolvedTypeOps`]
+/// over a per-library `LibraryTypes` snapshot; `None` keeps the
+/// name-level `NameTypeOps` default. The ops object's lifetime must cover
+/// the fold — it is owned by reference only.
+#[allow(clippy::too_many_arguments)] // the analysis context, one field each
+pub fn diagnose_unit_with_ops<'t>(
+    source: &'t str,
+    tokens: &'t TokenTable,
+    features: ParserFeatures,
+    strings: &StringTable,
+    file: FileId,
+    lib: LibraryId,
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    strict: StrictModes,
+    class_modifiers: &LibraryClassModifiers,
+    field_promotion_enabled: bool,
+    ops: Option<&'t crate::resolved_ops::ResolvedTypeOps<'t>>,
+) -> (FileReport, UnitUseFace) {
+    let fold = fold_unit_with_ops(
+        source,
+        tokens,
+        features,
+        strings,
+        file,
+        lib,
+        graph,
+        namespaces,
+        index,
+        strict,
+        class_modifiers,
+        field_promotion_enabled,
+        ops.map(|ops| ops as &dyn dartq_flow::TypeOps),
     );
     (fold.report, fold.face)
 }
@@ -876,7 +915,6 @@ pub(crate) fn overridden_member_context(
 /// [`diagnose_unit`]'s whole pipeline, exposed for the query face: the
 /// same fold, with the intermediates kept instead of dropped.
 #[allow(clippy::too_many_arguments)] // the analysis context, one field each
-#[allow(clippy::too_many_lines)] // one linear pipeline: parse, resolve, fold, merge
 pub fn fold_unit(
     source: &str,
     tokens: &TokenTable,
@@ -890,6 +928,46 @@ pub fn fold_unit(
     strict: StrictModes,
     class_modifiers: &LibraryClassModifiers,
     field_promotion_enabled: bool,
+) -> UnitFold {
+    fold_unit_with_ops(
+        source,
+        tokens,
+        features,
+        strings,
+        file,
+        lib,
+        graph,
+        namespaces,
+        index,
+        strict,
+        class_modifiers,
+        field_promotion_enabled,
+        None,
+    )
+}
+
+/// [`fold_unit`] with the resolved-type face mounted: `ops`, when `Some`,
+/// is the library's [`dartq_flow::TypeOps`] back-end (the design-2204
+/// `ResolvedTypeOps` over a per-library `LibraryTypes` snapshot); `None`
+/// keeps the name-level [`dartq_flow::ty::NameTypeOps`] default the flow
+/// layer falls back to. The ops object's lifetime must cover the parse —
+/// the fold owns it only by reference.
+#[allow(clippy::too_many_arguments)] // the analysis context, one field each
+#[allow(clippy::too_many_lines)] // one linear pipeline: parse, resolve, fold, merge
+pub fn fold_unit_with_ops<'t>(
+    source: &'t str,
+    tokens: &'t TokenTable,
+    features: ParserFeatures,
+    strings: &StringTable,
+    file: FileId,
+    lib: LibraryId,
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    strict: StrictModes,
+    class_modifiers: &LibraryClassModifiers,
+    field_promotion_enabled: bool,
+    ops: Option<&'t dyn dartq_flow::TypeOps>,
 ) -> UnitFold {
     let mut listener = DiagnoseListener {
         engine: Engine::new(
@@ -908,7 +986,17 @@ pub fn fold_unit(
             strict,
             class_modifiers,
         ),
-        flow: Flow::new(tokens, source),
+        flow: {
+            let mut flow = Flow::new(tokens, source);
+            // The resolved-type face (#2204 phase A): when the library's
+            // `LibraryTypes` snapshot mounted an adapter, every type
+            // question the replay asks answers through it; the `None`
+            // call sites keep the name-level default.
+            if let Some(ops) = ops {
+                flow.set_ops(ops);
+            }
+            flow
+        },
         pending_exit: None,
         file,
         parse_diagnostics: Vec::new(),

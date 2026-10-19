@@ -770,6 +770,18 @@ fn diagnose_library(
         // the `analyzer.language.strict-*` flags resolved through the
         // governing options entry.
         let strict = state.strict_modes_for(info.defining);
+        // The per-library resolved-type snapshot (#2204 phase A): one
+        // `dartq_types` table + hierarchy + name registry over the whole
+        // residency's element index, built once per library beside the
+        // shared index and shared by every member fold through the flow
+        // layer's `TypeOps` seam.
+        let types = dartq_semantic::LibraryTypes::build(
+            &resolved.graph,
+            namespaces,
+            index,
+            &state.strings,
+            resolved.graph_ids[&library],
+        );
         let view = LibraryView {
             library,
             files: &members,
@@ -784,6 +796,10 @@ fn diagnose_library(
             grants: &state.feature_grants,
             namespaces,
             index,
+            // The per-library resolved-type snapshot built above (#2204
+            // phase A) — the fold mounts its `TypeOps` face on each
+            // member's `Flow` through `set_ops`.
+            types: Some(&types),
             strict,
             scanned,
             // The per-library `class-modifiers` posture (#1294), resolved

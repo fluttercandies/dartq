@@ -1663,12 +1663,15 @@ impl<'o> Interp<'o> {
         ))
     }
 
-    /// `TypeSystem.isAlwaysExhaustive` (type_system.dart:846-888) at name
-    /// level, mirroring the official decision order: `Null` and `bool`
-    /// split completely, enums and sealed classes are closed by their
-    /// element faces (here: the recorder's declaration capture), and
-    /// `FutureOr<T>` recurses into its argument. Extension types (erasure
-    /// recursion), type parameters (bound recursion), records, and
+    /// `TypeSystem.isAlwaysExhaustive` (type_system.dart:846-888), delegated
+    /// to the mounted ops first: a resolved back-end answers through the
+    /// declared-type hierarchy (sealed classes and enums close cross-file,
+    /// `bool`/`FutureOr` by their core identity). The name-level fallback
+    /// mirrors the official decision order over the recorder's
+    /// declaration capture ([`ClosedNames`]): `Null` and `bool` split
+    /// completely, enums and sealed classes are closed by their element
+    /// faces, and `FutureOr<T>` recurses into its argument. Extension types
+    /// (erasure recursion), type parameters (bound recursion), records, and
     /// function types are undecidable at this level — `false`, the
     /// conservative arm: a missed verdict keeps the post-switch state live
     /// (the pre-mount behavior), never a false dead report. Nullability is
@@ -1676,6 +1679,12 @@ impl<'o> Interp<'o> {
     /// a sealed `S` is still always-exhaustive (the null half is the
     /// space model's split, not this gate's).
     pub(crate) fn is_always_exhaustive(&self, ty: Ty, args: u32) -> bool {
+        if self
+            .ops
+            .is_always_exhaustive(ty, args, self.args, self.names)
+        {
+            return true;
+        }
         let Base::Name(id) = ty.base else {
             return matches!(ty.base, Base::Null);
         };

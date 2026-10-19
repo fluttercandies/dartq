@@ -175,6 +175,12 @@ pub struct Flow<'t> {
     /// that switches over it is captured too late — the verdict
     /// under-reports there.
     closed: crate::ty::ClosedNames,
+    /// The resolved type-operations back-end ([`crate::ty::TypeOps`]) the
+    /// consumer mounts through [`Flow::set_ops`] before the parse — the
+    /// official `FlowAnalysisTypeOperations` slot. `None` keeps the
+    /// name-level default: `exec_end` falls back to a stack-local
+    /// [`NameTypeOps`], so tests and unmounted callers replay unchanged.
+    ops: Option<&'t dyn crate::ty::TypeOps>,
     /// The recording [`Flow::begin_variable_initializer`] opened for a
     /// declaration outside any executable (a field or top-level
     /// initializer is its own executable — the official folds it):
@@ -233,6 +239,7 @@ impl<'t> Flow<'t> {
             top_decl: None,
             container_depth: 0,
             closed: crate::ty::ClosedNames::default(),
+            ops: None,
             initializer_exec: false,
             init_starts: Vec::new(),
             facts: Vec::new(),
@@ -574,6 +581,16 @@ impl<'t> Flow<'t> {
         self.intern_lexeme(lexeme)
     }
 
+    /// Mounts the resolved type-operations back-end (the official
+    /// `FlowAnalysisTypeOperations` client seam) — every executable replay
+    /// then consults it instead of the name-level default, through the
+    /// `Ty`/`ArgTy` vocabulary the flow layer owns. Set once after
+    /// construction, before the parse: a mid-parse swap would split one
+    /// unit's verdicts across two worlds.
+    pub fn set_ops(&mut self, ops: &'t dyn crate::ty::TypeOps) {
+        self.ops = Some(ops);
+    }
+
     /// Stages one inferred local's declared type (#2140): the semantic
     /// layer's initializer-derived static type for a `var`/`final`
     /// declarator, keyed on the declarator name token's offset. The fold
@@ -675,8 +692,9 @@ impl<'t> Flow<'t> {
         // `FutureOr<T>` recurses into `T`.
         self.closed.bool_name = Some(self.intern_lexeme("bool"));
         self.closed.future_or = Some(self.intern_lexeme("FutureOr"));
-        let ops = NameTypeOps;
-        let mut interp = Interp::new(&ops, &self.type_args, &self.boundaries);
+        let fallback = NameTypeOps;
+        let ops = self.ops.unwrap_or(&fallback);
+        let mut interp = Interp::new(ops, &self.type_args, &self.boundaries);
         // The unit's top-level read face (captured so far — declarations
         // parsed after this executable under-report there), and the closed
         // declarations the switch-end verdict reads.

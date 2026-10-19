@@ -150,6 +150,7 @@ pub mod library;
 pub(crate) mod member_face;
 pub mod model;
 pub mod persisted;
+pub mod resolved_ops;
 pub mod signature;
 pub(crate) mod switch_tracker;
 pub mod use_face;
@@ -157,8 +158,9 @@ pub mod use_face;
 pub use analysis::{Analysis, Binding, BindingKind, CtorBinding, MemberBinding, analyze_unit};
 pub use collector::{DeclarationCollector, collect, container_modifiers};
 pub use diagnose::{
-    FileReport, NameRow, NameUse, StrictModes, UnitFold, diagnose, diagnose_unit, diagnose_with,
-    duplicate_definition_diagnostics, fold_unit,
+    FileReport, NameRow, NameUse, StrictModes, UnitFold, diagnose, diagnose_unit,
+    diagnose_unit_with_ops, diagnose_with, duplicate_definition_diagnostics, fold_unit,
+    fold_unit_with_ops,
 };
 pub use library::{
     ElementIndex, LibraryScopes, ScopeFace, ScopeKind, ScopedHit, lookup_scoped, member_lookup,
@@ -167,5 +169,6 @@ pub use model::{
     Container, ContainerKind, DuplicateDecl, FileElements, FnSig, MemberEntry, MemberKind,
     MicroKind, TopDecl,
 };
+pub use resolved_ops::{LibraryTypes, ResolvedTypeOps};
 pub use signature::{ApiSignature, SIGNATURE_VERSION};
 pub use use_face::{ExportUseFace, ImportUseFace, LibraryUsages, LibraryUseSet, UnitUseFace};
