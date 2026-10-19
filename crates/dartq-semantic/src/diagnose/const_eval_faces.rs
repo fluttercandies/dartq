@@ -1,4 +1,5 @@
 use super::*;
+use crate::const_eval::CreatedState;
 
 impl ConstLookup for CtorScope<'_, '_> {
     fn ident(&self, name: StringId) -> IdentVerdict {
@@ -23,6 +24,14 @@ impl ConstLookup for CtorScope<'_, '_> {
 
     fn is_identical(&self, name: StringId) -> bool {
         self.engine.is_identical(name)
+    }
+
+    fn created_state(&self, container: StringId) -> CreatedState {
+        self.engine.created_state(container)
+    }
+
+    fn shorthand_context(&self, span: SourceRange) -> bool {
+        self.engine.shorthand_context(span)
     }
 }
 
@@ -121,6 +130,29 @@ impl ConstLookup for Engine<'_> {
 
     fn is_identical(&self, name: StringId) -> bool {
         name == self.identical_id
+    }
+
+    /// The `Created(container)` values this file can push carry the
+    /// container's own name (`bool.fromEnvironment` → `Created(bool)`);
+    /// the oracle state class is the primitive-table lookup — every other
+    /// container is a generic instance whose operand asserts fault.
+    fn created_state(&self, container: StringId) -> CreatedState {
+        let ids = &self.members.primitive_ids;
+        if container == ids[3] {
+            CreatedState::Bool
+        } else if container == ids[0] {
+            CreatedState::Int
+        } else if container == ids[1] || container == ids[2] {
+            CreatedState::Num
+        } else if container == ids[4] {
+            CreatedState::String
+        } else {
+            CreatedState::Generic
+        }
+    }
+
+    fn shorthand_context(&self, span: SourceRange) -> bool {
+        self.dot_shorthand_context(span.offset)
     }
 }
 
@@ -279,16 +311,32 @@ impl<'a> Engine<'a> {
     pub(crate) fn resolve_const_verdict(&mut self, verdict: &Verdict) {
         match verdict {
             Verdict::Value(_) | Verdict::Constant => {}
-            // An unresolved root (`const a = x`) reports like a plain
-            // non-constancy: the oracle's evaluation of the unresolvable
-            // reference is known-invalid at the variable.
-            Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
+            Verdict::NotConstant(span) => {
                 self.emit(
                     SemanticCode::ConstInitializedWithNonConstantValue,
                     *span,
                     "",
                     "",
                 );
+            }
+            // An unresolved root (`const a = x`) reports like a plain
+            // non-constancy: the oracle's evaluation of the unresolvable
+            // reference is known-invalid at the variable. A leading-dot
+            // shorthand (`.blue` — `DotShorthandNameExpression` resolves
+            // against the context type) reads unresolved through the
+            // bare-name path the capture folds it to: the oracle answers
+            // `invalid_constant` only for the member the type cannot
+            // resolve, and the valid shorthands outnumber it — the
+            // under-report verdict stays silent.
+            Verdict::Unresolved(span) => {
+                if !self.dot_shorthand_context(span.offset) {
+                    self.emit(
+                        SemanticCode::ConstInitializedWithNonConstantValue,
+                        *span,
+                        "",
+                        "",
+                    );
+                }
             }
             Verdict::Fault(fault, span) => self.emit_const_fault(*fault, *span),
         }
@@ -476,6 +524,13 @@ impl<'a> Engine<'a> {
     /// `const_with_non_const` twin (no constructor exists to be
     /// non-const).
     pub(crate) fn const_creation_valid(&self, container: StringId, span: SourceRange) -> bool {
+        // The dot-shorthand creation (`.new(...)`/`.named(...)`) resolves
+        // against the context type's constructor — `classify_call`
+        // already adopted the valid-creation verdict for it, so the
+        // tail-pass re-decision answers the same.
+        if self.dot_shorthand_context(span.offset) {
+            return true;
+        }
         let Some(decl) = self.const_ctor_decl(container) else {
             return false;
         };
@@ -505,6 +560,28 @@ impl<'a> Engine<'a> {
     /// qualified-selector split detects — the tail pass needs the
     /// whole-file const-ctor set before it can verdict.
     pub(crate) fn classify_call(&mut self, name: StringId) -> CallClass {
+        // The dot-shorthand constructor invocation (`.new(...)` /
+        // `.named(...)`): a bare selector callee reaches here only through
+        // the shorthand's `_tryRewriteNewToIdentifier` identifier event —
+        // `C.new(...)` parses the constructor-reference path and
+        // `x.new(...)` folds its member before the group opens. The oracle
+        // resolves the shorthand against the context type
+        // (`visitDotShorthandConstructorInvocation2`, evaluation.dart
+        // :880-916) — a resolution this pass cannot perform — so the
+        // under-report verdict is the valid-creation face: its arguments
+        // still answer the const-argument check, and a static-method
+        // shorthand (`.create()` — the oracle's `constEvalMethodInvocation`
+        // when it reaches a call) stays silent beside it.
+        if let Some(offset) = self
+            .invokes
+            .last()
+            .and_then(|slot| *slot)
+            .and_then(|index| self.rows.get(index))
+            .map(|row| row.range.offset)
+            && self.dot_shorthand_context(offset)
+        {
+            return CallClass::ConstCtor;
+        }
         if self.const_ctor_target(name) {
             return CallClass::ConstCtor;
         }
@@ -616,6 +693,82 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Whether the name expression at `offset` is a leading-dot shorthand
+    /// (`.name`/`.new` — upstream `_isDotShorthand`, parser_impl.dart:6499):
+    /// the byte before the name's span is a `.` no receiver expression
+    /// precedes. `recv.name` never reaches this probe's callers — the
+    /// member fold merges it — so the qualified shapes left are the
+    /// keyword receivers (`this.new`, `super.new`: constructor-initializer
+    /// redirects) and the cascade section (`x..name`, whose selector binds
+    /// the cascade target). Every expression-opener, operator, `?`/`=>`
+    /// byte, and the const-context keywords before the dot is the
+    /// shorthand's context (`= .new`, `const .name`, `return .name`,
+    /// `foo(.name)`).
+    pub(crate) fn dot_shorthand_context(&self, offset: u32) -> bool {
+        let bytes = self.source.as_bytes();
+        // `offset` is a UTF-16 position — walk the source in byte space.
+        let mut i = self.byte_of(offset);
+        // The shorthand's `.` precedes the member with at most trivia
+        // between (the parser's `_isDotShorthand` decides on the token
+        // pair, so `. name` is still the shorthand shape).
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i == 0 || bytes[i - 1] != b'.' {
+            return false;
+        }
+        i -= 1;
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        let Some(byte) = i.checked_sub(1).and_then(|j| bytes.get(j)).copied() else {
+            return true;
+        };
+        match byte {
+            // A receiver-end byte: `x.name` (handled below), `f().name`,
+            // `x!.name`, `x..name` (cascade target), `'s'.name`.
+            b')' | b']' | b'}' | b'\'' | b'"' | b'!' | b'.' => false,
+            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'$' => {
+                // Read the identifier/keyword token back: `this`/`super`
+                // are keyword receivers (the redirect-invocation shapes
+                // reach this probe's call-classification caller as bare
+                // `new` heads); the literals spell receiver values; every
+                // other keyword (`const`, `return`, `case`, `await`,
+                // `throw`, `else`, `default`, `in`, `new`) opens the
+                // shorthand's context. A plain identifier is a receiver.
+                let mut start = i - 1;
+                while start > 0 {
+                    let Some(c) = bytes.get(start - 1).copied() else {
+                        break;
+                    };
+                    if !(c.is_ascii_alphanumeric() || c == b'_' || c == b'$') {
+                        break;
+                    }
+                    start -= 1;
+                }
+                matches!(
+                    &self.source[start..i],
+                    "const"
+                        | "new"
+                        | "return"
+                        | "case"
+                        | "yield"
+                        | "await"
+                        | "throw"
+                        | "else"
+                        | "default"
+                        | "in"
+                        | "assert"
+                )
+            }
+            // Every other byte — openers `(`/`[`/`{`, operators, `=`, `,`,
+            // `:`, `;`, `?`, `>` (of `=>`/`>=`/shift-writeback), `<`, `~`,
+            // `#`, `@` — opens an expression position: the shorthand's
+            // context.
+            _ => true,
+        }
+    }
+
     /// The `C.named(...)` creation span — the receiver's head offset through
     /// the call's closing paren. `arg_levels.last()` still holds this call's
     /// arguments at the `classify_call` point (the close drains it after),
@@ -673,9 +826,13 @@ impl<'a> Engine<'a> {
                 // An unresolved argument reports its own face but leaves the
                 // declaration's verdict silent (`B(x)`'s undefined `x`: the
                 // oracle's evaluation is unknown, not known-invalid — the
-                // ArgFailure staging stays out, #2138).
+                // ArgFailure staging stays out, #2138). A leading-dot
+                // shorthand resolves against the context type upstream —
+                // under-report beside the declaration-root arm.
                 Verdict::Unresolved(span) => {
-                    self.emit(SemanticCode::ConstWithNonConstantArgument, span, "", "");
+                    if !self.dot_shorthand_context(span.offset) {
+                        self.emit(SemanticCode::ConstWithNonConstantArgument, span, "", "");
+                    }
                 }
                 Verdict::Fault(fault, span) => {
                     self.emit_const_fault(fault, span);
@@ -993,11 +1150,32 @@ impl<'a> Engine<'a> {
         code: SemanticCode,
         parts: &[crate::const_eval::Node],
     ) -> Option<SourceRange> {
+        // `constantContext2` (ast.dart:17927-17983) walks a literal's
+        // ancestors: inside a `this(...)`/`this.named(...)`/`super(...)`/
+        // `super.named(...)` argument list it hits the
+        // `RedirectingConstructorInvocation`/`SuperConstructorInvocation`
+        // `default: return null` arm — the literal is never `isConst`, so
+        // no element face runs (only the arglist close's
+        // `_reportNotPotentialConstantsArguments` scan applies, owned by
+        // the init-invocation argument close).
+        if self.initializer_depth > 0
+            && self
+                .arg_levels
+                .iter()
+                .any(|level| self.init_invocation_level(level))
+        {
+            return None;
+        }
         let mut failed = None;
         for part in parts {
             match eval(part, self) {
                 Verdict::Value(_) | Verdict::Constant => {}
                 Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
+                    // A leading-dot shorthand resolves against the context
+                    // type upstream — the bare-name verdict is ambiguous.
+                    if self.dot_shorthand_context(span.offset) {
+                        continue;
+                    }
                     let info = code.code_info();
                     let repeat = self
                         .report
@@ -1017,6 +1195,52 @@ impl<'a> Engine<'a> {
             }
         }
         failed
+    }
+
+    /// Whether an open argument level's callee is a constructor-initializer
+    /// invocation head — a bare `this(`/`super(` keyword receiver, the
+    /// `this.named(` member shape, or the folded `super.named(` selector
+    /// ([`Engine::pending_init_super`], the same shapes
+    /// [`Engine::init_super_callee`] decides at the arglist close).
+    fn init_invocation_level(&self, level: &ArgLevel) -> bool {
+        let Some(head) = level
+            .callee_row
+            .and_then(|index| self.rows.get(index))
+        else {
+            return false;
+        };
+        match &head.shape {
+            RowShape::Receiver(Receiver::Super { .. } | Receiver::This { .. })
+            | RowShape::Member {
+                recv: Receiver::This { .. },
+            } => true,
+            _ => {
+                // The `this.named(`/`super.named(` selectors: the selector
+                // row (`Bare(Plain)` for `this._`, the folded `Value` for
+                // `super.name`) rides directly on the keyword receiver
+                // row — `x.m(` in the same position keeps its own receiver
+                // shape below, so the `callee_row - 1` probe is the
+                // redirect/super signature.
+                let on_keyword_receiver = level.callee_row.is_some_and(|index| {
+                    index > 0
+                        && self.rows.get(index - 1).is_some_and(|below| {
+                            matches!(
+                                below.shape,
+                                RowShape::Receiver(
+                                    Receiver::This { .. } | Receiver::Super { .. }
+                                )
+                            )
+                        })
+                });
+                on_keyword_receiver
+                    || self.init_rows.contains_key(&head.range.offset)
+                    || self
+                        .pending_init_super
+                        .iter()
+                        .rev()
+                        .any(|c| c.invoked && c.head && c.selector_offset == head.range.offset)
+            }
+        }
     }
 
     /// Pushes a closed const literal's value onto the capture: its
@@ -1159,5 +1383,251 @@ impl<'a> Engine<'a> {
     pub fn const_string_end(&mut self, count: usize, begin: SourceRange, end: SourceRange) {
         self.const_capture
             .end_literal_string(count, begin, end, ConstantValue::Str("".into()));
+    }
+}
+
+#[cfg(test)]
+mod face_tests {
+    use crate::collector::collect;
+    use crate::diagnose::{FileReport, StrictModes, diagnose_with};
+    use crate::library::ElementIndex;
+    use crate::model::MicroKind;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{LibraryClassModifiers, LibraryGraphBuilder, Namespaces};
+    use dartq_scanner::ScanConfig;
+    use dartq_source::{FileTable, StringTable};
+    use std::path::Path;
+
+    /// The one-library rig: `source` is the sole analyzed file of
+    /// `package:t`, no imports (the same rig `ticket_1351_tests` runs).
+    fn unit_report(source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        diagnose_with(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        )
+    }
+
+    fn code_names(report: &FileReport) -> Vec<&'static str> {
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name.as_ref())
+            .collect()
+    }
+
+    /// `!`/`-`/`~` on `null` and on a created primitive instance
+    /// (`bool.fromEnvironment`'s `BoolState`): the `NullState` operator
+    /// throws `constEvalThrowsException` where the assert gates used to
+    /// fault the operand's type; a created bool/int/num of unknown value
+    /// answers a valid constant (the drift `const _enable = !_releaseMode`
+    /// shape). `created_state` keys on the container's interned name — a
+    /// file-local `class bool`/`class int` models the core containers.
+    #[test]
+    fn unary_operator_states() {
+        // `!null`/`~null`/`-null`: `NullState.logicalNot` throws directly;
+        // the base `negated`/`bitNot` admit null through the assert and
+        // then throw (analyzer source
+        // pkg/analyzer/lib/src/dart/constant/value.dart:2830/:1967/:1724).
+        let rep = unit_report("const a = !null; const b = -null; const c = ~null;");
+        assert_eq!(
+            code_names(&rep),
+            [
+                "const_eval_throws_exception",
+                "const_eval_throws_exception",
+                "const_eval_throws_exception",
+            ],
+            "{:?}",
+            code_names(&rep)
+        );
+        // A created bool of unknown value: `!`, `&&`, `||`, `?:`, and the
+        // interpolation gate all admit `BoolState`. A created int answers
+        // `-`/`~`; a created non-state container still faults its gate.
+        let rep = unit_report(
+            "class V { const V(); }\n\
+             class bool { final V? v; const bool.fromEnvironment(this.v); }\n\
+             class int { final V? v; const int.fromEnvironment(this.v); }\n\
+             class C { const C(); }\n\
+             const f = bool.fromEnvironment(const V());\n\
+             const a = !f;\n\
+             const b = f && true;\n\
+             const c = f || false;\n\
+             const d = f ? 1 : 2;\n\
+             const s = 'v${f}e';\n\
+             const i = int.fromEnvironment(const V());\n\
+             const n = -i;\n\
+             const w = ~i;\n\
+             const g = C();\n\
+             const z = !g;",
+        );
+        assert_eq!(
+            code_names(&rep),
+            ["const_eval_type_bool"],
+            "{:?}",
+            code_names(&rep)
+        );
+        // Negative controls: the operand-type gates still fault non-state
+        // operands; `&&`'s non-bool right faults at the right operand.
+        let rep = unit_report(
+            "class V { const V(); }\n\
+             class bool { final V? v; const bool.fromEnvironment(this.v); }\n\
+             const f = bool.fromEnvironment(const V());\n\
+             const a = !1;\n\
+             const b = -'a';\n\
+             const c = ~'a';\n\
+             const d = f && 1;",
+        );
+        assert_eq!(
+            code_names(&rep),
+            [
+                "const_eval_type_bool",
+                "const_eval_type_num",
+                "const_eval_type_int",
+                "const_eval_type_bool",
+            ],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// `constantContext2` (ast.dart:17927-17983) returns `null` inside a
+    /// `this(...)`/`this.named(...)`/`super(...)`/`super.named(...)`
+    /// argument list — a literal there is never `isConst`, so its element
+    /// faces do not run; the init-invocation arglist close's
+    /// not-potentially-constant scan is the only verdict (the riverpod
+    /// `AsyncData` `this._((value, kind: kind, ...))` shape).
+    #[test]
+    fn elements_silent_inside_init_invocation_arguments() {
+        let rep = unit_report(
+            "class V { const V(); }\n\
+             class A {\n\
+             final V? v, e, l;\n\
+             const A._(this.v, {required this.e, required this.l});\n\
+             const A(V? value, V? kind) : this._((value, kind: kind, source: null), e: [kind], l: {value});\n\
+             }",
+        );
+        assert_eq!(code_names(&rep), Vec::<&str>::new(), "{:?}", code_names(&rep));
+        // A `super(...)` invocation's argument list suppresses the same
+        // faces.
+        let rep = unit_report(
+            "class V { const V(); }\n\
+             class B { const B([V? a, V? b]); }\n\
+             class C extends B { const C(V? x) : super((x,), {x: x}); }",
+        );
+        assert_eq!(code_names(&rep), Vec::<&str>::new(), "{:?}", code_names(&rep));
+        // Negative control: the same literals in a const initializer keep
+        // the element faces.
+        let rep = unit_report("void m() { var l = 1; const a = (l,); }");
+        assert_eq!(
+            code_names(&rep),
+            [
+                "unused_local_variable",
+                "non_constant_record_field",
+                "const_initialized_with_non_constant_value",
+            ],
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// Dot shorthands in const contexts (`.new(...)`, `.named(...)`,
+    /// `.name`): the shorthand resolves against the context type upstream
+    /// (`visitDotShorthandConstructorInvocation2` /
+    /// `visitDotShorthandNameExpression`, evaluation.dart:880-916) — the
+    /// capture folds the selector to a bare name and the verdict
+    /// under-reports the resolution it cannot perform, so the valid
+    /// shorthands stay silent beside the genuinely bare misses.
+    #[test]
+    fn dot_shorthands_stay_silent() {
+        let rep = unit_report(
+            "class V { const V(); }\n\
+             class P {\n\
+             final V? a, b;\n\
+             const P({required this.a, required this.b});\n\
+             const P._(this.a, this.b);\n\
+             static const P empty = .new(a: [], b: []);\n\
+             static const P origin = ._([], null);\n\
+             }\n\
+             enum E { low, high }\n\
+             const E picked = .low;",
+        );
+        assert_eq!(
+            code_names(&rep),
+            Vec::<&str>::new(),
+            "{:?}",
+            code_names(&rep)
+        );
+        // `const .named(...)` — the explicit-const spelling takes the same
+        // shorthand path.
+        let rep = unit_report(
+            "class V { const V(); }\n\
+             class Q {\n\
+             final V? x;\n\
+             const Q._(this.x);\n\
+             const Q.named() : this._(const V());\n\
+             }\n\
+             const q = const Q.named();\n\
+             class R { static const Q r = .named(); }",
+        );
+        assert_eq!(
+            code_names(&rep),
+            Vec::<&str>::new(),
+            "{:?}",
+            code_names(&rep)
+        );
+        // Negative controls: a bare missing callee and a bare missing name
+        // keep their declaration-root verdicts beside the resolution rows.
+        let rep = unit_report("const a = Missing(); const b = missing;");
+        assert_eq!(
+            code_names(&rep),
+            [
+                "const_initialized_with_non_constant_value",
+                "const_initialized_with_non_constant_value",
+                "undefined_function",
+                "undefined_identifier",
+            ],
+            "{:?}",
+            code_names(&rep)
+        );
     }
 }

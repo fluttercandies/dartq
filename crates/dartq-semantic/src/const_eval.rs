@@ -298,6 +298,45 @@ pub trait ConstLookup {
     /// Whether `name` is the callee spelling of `identical` (the one
     /// invocable function).
     fn is_identical(&self, name: StringId) -> bool;
+    /// The oracle `InstanceState` family a [`ConstantValue::Created`]
+    /// container folds to — `bool.fromEnvironment` pushes `Created(bool)`
+    /// whose `!` operand face is `BoolState` (valid, value unknown), not a
+    /// generic `assertBool` failure (value.dart's per-state methods).
+    /// [`CreatedState::Generic`] is the default: the lookup does not model
+    /// the container, so the operand asserts fault like the base states.
+    fn created_state(&self, _container: StringId) -> CreatedState {
+        CreatedState::Generic
+    }
+    /// Whether `span` anchors a leading-dot shorthand name expression
+    /// (`.name` / `.new` — `DotShorthandNameExpression` /
+    /// `DotShorthandConstructorInvocation`, which resolve against the
+    /// context type, never a bare name). The capture folds a shorthand's
+    /// member to a bare `Expr::Ident`, so a context-typed member reads as
+    /// an unresolved name unless this probe reclassifies it; `false` is
+    /// the default (the lookup has no source access).
+    fn shorthand_context(&self, _span: SourceRange) -> bool {
+        false
+    }
+}
+
+/// The oracle `InstanceState` family of a [`ConstantValue::Created`]
+/// container (`value.dart` 1627-2024: each state's operator methods assert
+/// its own operand kind and throw the `constEval*` fault otherwise; a
+/// state with an unknown value — `bool.fromEnvironment`'s `BoolState` —
+/// answers the operator with an unknown-but-constant result).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreatedState {
+    /// `BoolState` — `assertBool` admits it.
+    Bool,
+    /// `IntState` — `assertIntOrNull`/`assertNumOrNull` admit it.
+    Int,
+    /// `DoubleState`/`NumState` — `assertNumOrNull` admits it (the int/num
+    /// distinction is unobservable at the assert gates).
+    Num,
+    /// `StringState` — every operand gate fails it.
+    String,
+    /// `GenericState`/unmodeled container — every operand gate fails it.
+    Generic,
 }
 
 /// The bare-identifier classification.
@@ -371,7 +410,18 @@ fn collect_npc(node: &Node, lookup: &dyn ConstLookup, out: &mut Vec<SourceRange>
         Expr::Value(_) | Expr::Opaque => {}
         Expr::Other => out.push(node.span),
         Expr::Ident(name) => match lookup.ident(*name) {
-            IdentVerdict::NotConstant | IdentVerdict::Unresolved => out.push(node.span),
+            IdentVerdict::NotConstant => out.push(node.span),
+            // A leading-dot shorthand (`.name`) resolves against the
+            // context type upstream — `potentially_constant.dart`'s
+            // `DotShorthandNameExpression` arm collects only a member the
+            // type cannot answer. The lookup cannot name that type, so the
+            // unresolved-name verdict is ambiguous: under-report rather
+            // than invent a failure row for the valid shorthands.
+            IdentVerdict::Unresolved => {
+                if !lookup.shorthand_context(node.span) {
+                    out.push(node.span);
+                }
+            }
             // A const variable, a resolvable foreign const, or the
             // in-progress root — the oracle's const-element arms all pass
             // the potentially-constant gate.
@@ -500,16 +550,56 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
                 Verdict::Value(ConstantValue::Double(v)) => {
                     Verdict::Value(ConstantValue::Double(-v))
                 }
+                // `-null`: `assertNumOrNull` admits null and the base
+                // `InstanceState.negated` then throws (value.dart) —
+                // `constEvalThrowsException`, not the operand-type face.
+                Verdict::Value(ConstantValue::Null) => {
+                    Verdict::Fault(ConstFault::ThrowsException, node.span)
+                }
+                // A created num instance of unknown value (`const
+                // int.fromEnvironment(...)`): the assert passes, the
+                // result is a valid-but-unknown num.
+                Verdict::Value(ConstantValue::Created(c)) => {
+                    match lookup.created_state(c) {
+                        CreatedState::Int | CreatedState::Num => Verdict::Constant,
+                        _ => Verdict::Fault(ConstFault::TypeNum, node.span),
+                    }
+                }
                 Verdict::Value(_) => Verdict::Fault(ConstFault::TypeNum, node.span),
                 other => other,
             },
             UnOp::Not => match fold(operand, lookup, depth) {
                 Verdict::Value(ConstantValue::Bool(v)) => Verdict::Value(ConstantValue::Bool(!v)),
+                // `!null`: `NullState.logicalNot` throws (value.dart)
+                // — `constEvalThrowsException`, not `constEvalTypeBool`.
+                Verdict::Value(ConstantValue::Null) => {
+                    Verdict::Fault(ConstFault::ThrowsException, node.span)
+                }
+                // A created bool instance of unknown value
+                // (`bool.fromEnvironment`): `assertBool` passes, the
+                // result is a valid-but-unknown bool.
+                Verdict::Value(ConstantValue::Created(c)) => {
+                    match lookup.created_state(c) {
+                        CreatedState::Bool => Verdict::Constant,
+                        _ => Verdict::Fault(ConstFault::TypeBool, node.span),
+                    }
+                }
                 Verdict::Value(_) => Verdict::Fault(ConstFault::TypeBool, node.span),
                 other => other,
             },
             UnOp::BitNot => match fold(operand, lookup, depth) {
                 Verdict::Value(ConstantValue::Int(v)) => Verdict::Value(ConstantValue::Int(!v)),
+                // `~null`: `assertIntOrNull` admits null and the base
+                // `InstanceState.bitNot` then throws (value.dart).
+                Verdict::Value(ConstantValue::Null) => {
+                    Verdict::Fault(ConstFault::ThrowsException, node.span)
+                }
+                Verdict::Value(ConstantValue::Created(c)) => {
+                    match lookup.created_state(c) {
+                        CreatedState::Int => Verdict::Constant,
+                        _ => Verdict::Fault(ConstFault::TypeInt, node.span),
+                    }
+                }
                 Verdict::Value(_) => Verdict::Fault(ConstFault::TypeInt, node.span),
                 other => other,
             },
@@ -517,6 +607,23 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
         Expr::Cond { cond, then, els } => match fold(cond, lookup, depth) {
             Verdict::Value(ConstantValue::Bool(true)) => fold(then, lookup, depth),
             Verdict::Value(ConstantValue::Bool(false)) => fold(els, lookup, depth),
+            // A created bool instance of unknown value (`cond ? a : b` over
+            // `bool.fromEnvironment`): `applyBooleanConversion` passes and
+            // the condition is unknown — both branches must be constant.
+            Verdict::Value(ConstantValue::Created(c))
+                if lookup.created_state(c) == CreatedState::Bool =>
+            {
+                let t = fold(then, lookup, depth);
+                let e = fold(els, lookup, depth);
+                match (t, e) {
+                    (Verdict::Fault(f, s), _) | (_, Verdict::Fault(f, s)) => Verdict::Fault(f, s),
+                    (Verdict::NotConstant(s) | Verdict::Unresolved(s), _)
+                    | (_, Verdict::NotConstant(s) | Verdict::Unresolved(s)) => {
+                        Verdict::NotConstant(s)
+                    }
+                    _ => Verdict::Constant,
+                }
+            }
             // The oracle converts the condition to bool first
             // (`applyBooleanConversion`): a known non-bool faults.
             Verdict::Value(_) => Verdict::Fault(ConstFault::TypeBool, cond.span),
@@ -541,6 +648,11 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
             for part in parts {
                 match fold(part, lookup, depth) {
                     Verdict::Value(v) if v.is_bool_num_string_or_null() => {}
+                    // A created primitive instance (`'${bool.fromEnvironment
+                    // (...)}'`): its `InstanceState` family answers the same
+                    // `isBoolNumStringOrNull` gate.
+                    Verdict::Value(ConstantValue::Created(c))
+                        if lookup.created_state(c) != CreatedState::Generic => {}
                     Verdict::Value(_) => {
                         return Verdict::Fault(ConstFault::TypeBoolNumString, part.span);
                     }
@@ -684,6 +796,28 @@ fn eval_binary(
                             }
                             _ => Verdict::Constant,
                         }
+                    }
+                }
+                // An unknown bool left (`bool.fromEnvironment && x`):
+                // `BoolState.logicalAnd`/`logicalOr` assert the right is
+                // bool — the unknown-left value itself never decides, so
+                // the right's own verdict carries the result.
+                Verdict::Value(ConstantValue::Created(c))
+                    if lookup.created_state(c) == CreatedState::Bool =>
+                {
+                    match fold(right, lookup, depth) {
+                        Verdict::Value(ConstantValue::Bool(_)) => Verdict::Constant,
+                        Verdict::Value(ConstantValue::Created(rc))
+                            if lookup.created_state(rc) == CreatedState::Bool =>
+                        {
+                            Verdict::Constant
+                        }
+                        Verdict::Value(_) => Verdict::Fault(ConstFault::TypeBool, right.span),
+                        Verdict::Fault(f, s) => Verdict::Fault(f, s),
+                        Verdict::NotConstant(s) | Verdict::Unresolved(s) => {
+                            Verdict::NotConstant(s)
+                        }
+                        Verdict::Constant => Verdict::Constant,
                     }
                 }
                 Verdict::Value(_) => Verdict::Fault(ConstFault::TypeBool, left.span),
@@ -3049,6 +3183,22 @@ mod tests {
         fn is_identical(&self, name: StringId) -> bool {
             name == self.id("identical")
         }
+
+        /// Mirrors `members.primitive_ids`: `bool`/`int`/`double`/`num`/
+        /// `String` map to their `InstanceState` families.
+        fn created_state(&self, container: StringId) -> CreatedState {
+            if container == self.id("bool") {
+                CreatedState::Bool
+            } else if container == self.id("int") {
+                CreatedState::Int
+            } else if container == self.id("double") || container == self.id("num") {
+                CreatedState::Num
+            } else if container == self.id("String") {
+                CreatedState::String
+            } else {
+                CreatedState::Generic
+            }
+        }
     }
 
     fn w() -> World {
@@ -3364,6 +3514,93 @@ mod tests {
         assert_eq!(
             world.eval(&bad),
             Verdict::Fault(ConstFault::TypeBool, span(0))
+        );
+    }
+
+    /// The `InstanceState` family map for `Created` and the `NullState`
+    /// throw arms: `!`/`-`/`~` on `null` throw `constEvalThrowsException`
+    /// (the base operator admits null through its assert, then throws —
+    /// `NullState.logicalNot` throws directly); a created primitive of
+    /// unknown value answers a valid constant where its state admits the
+    /// operand, and the non-state containers fault their gates
+    /// (`value.dart`'s `InstanceState` methods).
+    #[test]
+    fn unary_operators_read_created_and_null_states() {
+        let world = w();
+        let unary = |op: UnOp, v: ConstantValue| {
+            world.eval(&World::node(
+                Expr::Unary {
+                    op,
+                    operand: Box::new(World::value_node(v)),
+                },
+                3,
+            ))
+        };
+        // `!null`/`-null`/`~null` all throw (not the operand-type faults).
+        for op in [UnOp::Not, UnOp::Neg, UnOp::BitNot] {
+            assert_eq!(
+                unary(op, ConstantValue::Null),
+                Verdict::Fault(ConstFault::ThrowsException, span(3))
+            );
+        }
+        // `bool.fromEnvironment`'s `Created(bool)`: `!`, `&&`, `?:`, and
+        // the interpolation gate all admit `BoolState` — the drift
+        // `const _enable = !_releaseMode` shape.
+        let created_bool = ConstantValue::Created(world.id("bool"));
+        assert_eq!(unary(UnOp::Not, created_bool.clone()), Verdict::Constant);
+        let and = World::node(
+            Expr::Binary {
+                op: BinOp::And,
+                left: Box::new(World::value_node(created_bool.clone())),
+                right: Box::new(World::value_node(ConstantValue::Bool(true))),
+            },
+            7,
+        );
+        assert_eq!(world.eval(&and), Verdict::Constant);
+        // A non-bool right still faults its gate at the right's span.
+        let and_bad = World::node(
+            Expr::Binary {
+                op: BinOp::And,
+                left: Box::new(World::value_node(created_bool.clone())),
+                right: Box::new(World::value_node(ConstantValue::Int(1))),
+            },
+            7,
+        );
+        assert_eq!(
+            world.eval(&and_bad),
+            Verdict::Fault(ConstFault::TypeBool, span(0))
+        );
+        let cond = World::node(
+            Expr::Cond {
+                cond: Box::new(World::value_node(created_bool.clone())),
+                then: Box::new(World::value_node(ConstantValue::Int(1))),
+                els: Box::new(World::value_node(ConstantValue::Int(2))),
+            },
+            7,
+        );
+        assert_eq!(world.eval(&cond), Verdict::Constant);
+        // `int.fromEnvironment`'s `Created(int)`: `-`/`~` admit `IntState`.
+        let created_int = ConstantValue::Created(world.id("int"));
+        assert_eq!(unary(UnOp::Neg, created_int.clone()), Verdict::Constant);
+        assert_eq!(unary(UnOp::BitNot, created_int), Verdict::Constant);
+        // A `Created` num answers `-` but not `~` (`assertIntOrNull`
+        // faults a `DoubleState`/`NumState`).
+        let created_num = ConstantValue::Created(world.id("num"));
+        assert_eq!(unary(UnOp::Neg, created_num.clone()), Verdict::Constant);
+        assert_eq!(
+            unary(UnOp::BitNot, created_num),
+            Verdict::Fault(ConstFault::TypeInt, span(3))
+        );
+        // Non-state containers fault every gate.
+        let created_c = ConstantValue::Created(world.id("C"));
+        assert_eq!(
+            unary(UnOp::Not, created_c.clone()),
+            Verdict::Fault(ConstFault::TypeBool, span(3))
+        );
+        let created_s = ConstantValue::Created(world.id("String"));
+        assert_eq!(
+            unary(UnOp::Neg, created_s),
+            Verdict::Fault(ConstFault::TypeNum, span(3))
         );
     }
 
