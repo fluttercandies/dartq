@@ -359,6 +359,16 @@ impl<'a> Engine<'a> {
         {
             let row = self.member_reads[index];
             let walk = match row.recv {
+                // An extension body's `this` member read resolves through
+                // the extended type's face too — the own-container walk
+                // answers first (the extension's members shadow the `on`
+                // type's), the `on`-face climb is the fallback.
+                Receiver::This { container, kind } if kind == ContainerKind::Extension => {
+                    match self.walk_members(container, row.name) {
+                        Walk::Missing => self.on_face_walk(container, kind, row.name),
+                        walk => walk,
+                    }
+                }
                 Receiver::This { container, .. }
                 | Receiver::Typed {
                     type_name: container,
@@ -713,6 +723,32 @@ impl<'a> Engine<'a> {
         name: StringId,
     ) -> Option<std::borrow::Cow<'a, Formals>> {
         let (container, super_walk) = match *recv {
+            // An extension body's `this` resolves its member through the
+            // extended type's face as well (`ExtensionMemberScope` — the
+            // member may live on the `on` type rather than the extension's
+            // own map). The own-container walk answers first (the
+            // extension's members shadow); the `on`-face climb is the
+            // fallback — the same union [`Self::on_face_walk`] computes for
+            // the bare-name face.
+            Receiver::This { container, kind } if kind == ContainerKind::Extension => {
+                let walk = match self.walk_members(container, name) {
+                    Walk::Missing => self.on_face_walk(container, kind, name),
+                    walk => walk,
+                };
+                return match walk {
+                    Walk::Found(entry) if entry.kind == MemberKind::Method => Some(match entry {
+                        Projected::Own(e) => match e.formals.as_deref() {
+                            Some(formals) => std::borrow::Cow::Borrowed(formals),
+                            None => return None,
+                        },
+                        Projected::Foreign(e) => match e.formals.as_deref() {
+                            Some(formals) => std::borrow::Cow::Owned(formals.to_owned()),
+                            None => return None,
+                        },
+                    }),
+                    _ => None,
+                };
+            }
             Receiver::This { container, .. } => (container, false),
             Receiver::Super { container, .. } => (container, true),
             Receiver::Typed { type_name, .. } => (type_name, false),
@@ -929,6 +965,41 @@ impl<'a> Engine<'a> {
                     RefTarget::Member { container },
                 );
             }
+            // The `on`-face member scope (#2186 S2): inside a mixin or an
+            // extension body a bare name also resolves through the
+            // `on`-constrained / `on`-typed member face — `this`'s
+            // interface includes it (upstream's `unpromotedThisType`,
+            // type_analyzer.dart). A hit is the same member resolution the
+            // own-face arm returns; a broken climb suppresses identically —
+            // the member could live on the unindexed hop. Only the clean
+            // miss is decidable: it leaves the member scope final and the
+            // scoped lookup decides the reference — the emit's
+            // `undefined_identifier` the blanket `on_opaque` skip used to
+            // steal.
+            if matches!(kind, ContainerKind::Mixin | ContainerKind::Extension) {
+                match self.on_face_walk(container, kind, name) {
+                    // The hit belongs to a constraint's face, not the
+                    // enclosing container's own map — `RefTarget::Opaque`
+                    // (the "resolved, cannot name the owner" answer) keeps
+                    // the read from being credited to the enclosing
+                    // container's member set, which would leave the owning
+                    // face's field looking unread downstream.
+                    Walk::Found(entry) => {
+                        let ty = match entry.kind {
+                            MemberKind::Field => self.fold_alias_ty(entry.var_ty),
+                            _ => Ty::UNKNOWN,
+                        };
+                        return (BareInfo::Plain { ty }, RefTarget::Opaque);
+                    }
+                    Walk::ChainBroken => {
+                        return (
+                            BareInfo::Plain { ty: Ty::UNKNOWN },
+                            RefTarget::Opaque,
+                        );
+                    }
+                    Walk::Missing => {}
+                }
+            }
             if kind == ContainerKind::Enum && self.members.enum_synth_members.contains(&name) {
                 return (BareInfo::Plain { ty: Ty::UNKNOWN }, RefTarget::Opaque);
             }
@@ -957,30 +1028,136 @@ impl<'a> Engine<'a> {
             ),
             ScopedHit::Found(entry) => self.bare_info_of_entry(name, entry),
             ScopedHit::Ambiguous(_) => (BareInfo::Plain { ty: Ty::UNKNOWN }, RefTarget::Opaque),
-            ScopedHit::NotFound => (self.missing_info(), RefTarget::Missing),
+            ScopedHit::NotFound => (self.missing_info(name), RefTarget::Missing),
         }
+    }
+
+    /// The `on`-face member walk for a bare name inside a mixin or an
+    /// extension body (#2186 S2): the member scope `this` carries beyond the
+    /// container's own map — a mixin's `on` constraints (each constraint's
+    /// members plus its supertypes, the same seed [`Engine::walk_super`]
+    /// applies for `super.m`) and an extension's `on` type (the extended
+    /// type's whole member face, `this`'s static type inside the body —
+    /// upstream `ExtensionMemberScope` / `unpromotedThisType`). Answers the
+    /// shared face-list climb's verdict: `Missing` only when every
+    /// constraint hop was decidable — an undefined `on` name contributes
+    /// nothing (the oracle's `InvalidType`, the member scope stays final) —
+    /// `ChainBroken` when a hop resolves to a declaration the index cannot
+    /// model (its members could carry the name). Every other container
+    /// kind answers `Missing`.
+    pub(crate) fn on_face_walk(&self, container: StringId, kind: ContainerKind, member: StringId) -> Walk<'a> {
+        let mut seen: FxHashSet<StringId> = FxHashSet::default();
+        seen.insert(container);
+        match kind {
+            ContainerKind::Mixin => {
+                let Some(decl) = self
+                    .index
+                    .get(self.file)
+                    .and_then(|f| f.container(container))
+                else {
+                    // The enclosing container the index cannot model — its
+                    // constraint face is unknowable, so a member could hide.
+                    return Walk::ChainBroken;
+                };
+                self.walk_face_list(
+                    decl.on_clause.iter().map(|face| (*face, self.file)),
+                    self.lib,
+                    member,
+                    &mut seen,
+                    true,
+                )
+            }
+            ContainerKind::Extension => {
+                let Some(on) = self.enclosing_extension_on_type(container) else {
+                    // No honest `on` name — the extended type contributes
+                    // nothing (the oracle's `InvalidType` extendedType).
+                    return Walk::Missing;
+                };
+                self.walk_face_list(
+                    [(on, self.file)].into_iter(),
+                    self.lib,
+                    member,
+                    &mut seen,
+                    true,
+                )
+            }
+            _ => Walk::Missing,
+        }
+    }
+
+    /// The `on` clause type name of the innermost extension frame: the
+    /// named container's application face by name, or the frame-latched
+    /// face for an unnamed extension (the same latch
+    /// [`Engine::unnamed_extension_members`] walks). `None` for a face whose
+    /// clause never produced an honest name and inside every non-extension
+    /// container.
+    pub(crate) fn enclosing_extension_on_type(&self, container: StringId) -> Option<StringId> {
+        let elements = self.index.get(self.file)?;
+        let innermost = self
+            .frames
+            .iter()
+            .rev()
+            .find(|f| matches!(f.kind, FrameKind::Container { .. }));
+        if let Some(FrameKind::Container {
+            extension_face: Some(face),
+            ..
+        }) = innermost.map(|f| &f.kind)
+        {
+            return elements
+                .extension_faces()
+                .iter()
+                .filter(|f| f.name.is_none())
+                .nth(*face)?
+                .on_type;
+        }
+        elements
+            .extension_faces()
+            .iter()
+            .find(|face| face.name == Some(container))
+            .and_then(|face| face.on_type)
     }
 
     /// The push-time context snapshot of a bare miss (pass 2 runs after the
     /// frames tear down — see [`BareInfo::Missing`]).
-    pub(crate) fn missing_info(&self) -> BareInfo {
+    pub(crate) fn missing_info(&self, name: StringId) -> BareInfo {
         let context = self.container_context();
         BareInfo::Missing {
-            // The UnqualifiedLookupDomain names the enclosing class whenever
-            // the miss sits inside the class's region — static members,
-            // field initializers, and nested locals included (upstream
-            // resolves the bare invocation through the class-member
-            // namespace first, so `static m() => C()` reports
+            // The UnqualifiedLookupDomain names the enclosing class-family
+            // element whenever the miss sits inside its region — static
+            // members, field initializers, and nested locals included
+            // (upstream resolves the bare invocation through the
+            // class-member namespace first, so `static m() => C()` reports
             // `undefined_method` on the class, never `undefined_function`).
-            // The header's clause text pushes TypeUse rows, never Bare
-            // rows, so no header-position guard is needed; a bare miss with
-            // no class frame keeps the top-level `undefined_function` face.
+            // `enclosingClass` upstream is an `InterfaceElement` — classes,
+            // enums AND mixins — but never an extension or an extension
+            // type, whose misses keep the top-level `undefined_function`
+            // face. The header's clause text pushes TypeUse rows, never
+            // Bare rows, so no header-position guard is needed.
             this_type: context
-                .filter(|(_, kind)| matches!(kind, ContainerKind::Class | ContainerKind::Enum))
+                .filter(|(_, kind)| {
+                    matches!(
+                        kind,
+                        ContainerKind::Class | ContainerKind::Enum | ContainerKind::Mixin
+                    )
+                })
                 .map(|(name, _)| name),
             in_exec: self.in_executable(),
-            on_opaque: context.is_some_and(|(_, kind)| {
+            // The constraint-member conservatism (#2186 S2), now the
+            // oracle's own decision procedure instead of the blanket skip:
+            // inside a mixin or an extension body a miss is suppressed only
+            // when a constraint member could actually hide behind a hop the
+            // index cannot model — the `on`-face climb's `ChainBroken`.
+            // Every decidable outcome reports exactly like the oracle: an
+            // `on` name that resolves to nothing contributes an
+            // `InvalidType` face, and a fully walked face carries the
+            // member set — the bare-name miss is `undefined_identifier`
+            // (lexical_lookup.dart's fall-through).
+            on_opaque: context.is_some_and(|(container, kind)| {
                 matches!(kind, ContainerKind::Mixin | ContainerKind::Extension)
+                    && matches!(
+                        self.on_face_walk(container, kind, name),
+                        Walk::ChainBroken
+                    )
             }),
         }
     }
@@ -1038,7 +1215,7 @@ impl<'a> Engine<'a> {
             // by the engine's type-parameter stack. The stale reference is a
             // plain miss whose code name follows the live invocation context
             // (`undefined_method`'s host inside a class instance member).
-            MicroKind::TypeParam => self.missing_info(),
+            MicroKind::TypeParam => self.missing_info(name),
             MicroKind::Class => BareInfo::Container {
                 name,
                 kind: ContainerKind::Class,

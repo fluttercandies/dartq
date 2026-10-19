@@ -5431,13 +5431,18 @@
         );
     }
 
-    /// Mixin `on` constraints and extension `on` types are invisible to the
-    /// model: bare names and `this.member` accesses inside their instance
-    /// bodies record only — the miss may be a constraint member.
+    /// The `on`-face member union inside instance bodies (#2186 S2): a bare
+    /// name or `this.member` access resolves against the constraint face —
+    /// hits stay silent; a member the constraint provably lacks reports.
     ///
-    /// Hand-trace: `real`/`real2` resolve against `C` in the oracle (the
-    /// `on` face), so emitting would false-positive; the walk on `M`/`X`
-    /// clean-misses but the container-kind gate suppresses.
+    /// Hand-trace: `real` hits `C`'s method through `mixin M on C`'s
+    /// constraint walk (silent); `this.real2`/`this.real4` record misses
+    /// the emit-side `this`-receiver arm still suppresses (out of this
+    /// scope — the union walk lands in `check_instance_member`). `real3` is
+    /// the decidable miss: `extension X on C` fully walks `C`, `C` lacks
+    /// the name, the member scope is final — the oracle emits
+    /// `undefined_function` (an extension is not an `InterfaceElement`, so
+    /// the miss keeps the top-level face rather than `undefined_method`).
     #[test]
     fn mixin_and_extension_bodies_suppress_member_misses() {
         let report = report(
@@ -5445,7 +5450,12 @@
              mixin M on C { void f() { real(); this.real2(); } } \
              extension X on C { void g() { real3(); this.real4(); } }",
         );
-        assert!(report.diagnostics.is_empty(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            ["undefined_function"],
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     // —— batch 2 (#197): undefined_operator (#120 residual 2) ————————————
@@ -15983,4 +15993,275 @@
         let source = "class Ok {\n  var field;\n}\nclass Object {}\nvoid f(Object v) {\n  if (v case Ok()) {}\n  if (v case Ok(field: _)) {}\n  var r = switch (v) { Ok() => 1, _ => 2 };\n  return r;\n}";
         let r = report(source);
         assert!(r.diagnostics.is_empty(), "{:?}", code_offsets(&r));
+    }
+
+    // —— #2186 S2 pins — `on`-face member scope inside mixin/extension ————
+
+    /// The unresolved `on` anchor: `extension E on Gone` carries an
+    /// `InvalidType` extended type — the member scope is the extension's own
+    /// map alone, so a bare miss inside the body reports
+    /// `undefined_identifier` (lexical_lookup.dart's fall-through) instead
+    /// of riding the old blanket `on_opaque` suppression. The oracle's
+    /// `undefined_class` on `Gone` stands beside it (the clause's own
+    /// type-miss face).
+    #[test]
+    fn extension_on_unresolved_reports_bare_miss() {
+        let r = report("extension E on Gone {\n  void m() { nope; }\n}");
+        assert_eq!(
+            code_names(&r),
+            ["undefined_class", "undefined_identifier"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// A mixin whose `on` constraint never resolves reports its body's bare
+    /// miss the same way — the dead edge contributes nothing to the member
+    /// scope (the oracle's `InvalidType`), and the clause's own `on`-face
+    /// miss is the type family's row, not this one's.
+    #[test]
+    fn mixin_on_unresolved_reports_bare_miss() {
+        let r = report("mixin M on Gone {\n  void m() { nope; }\n}");
+        // `mixin_super_class_constraint_non_interface` is the constraint's
+        // own face (a mixin `on` name must resolve to a class-family
+        // element); `undefined_class` is `Gone`'s type-miss row; the bare
+        // body's `undefined_identifier` is the row the blanket `on_opaque`
+        // skip used to steal.
+        assert_eq!(
+            code_names(&r),
+            [
+                "mixin_super_class_constraint_non_interface",
+                "undefined_class",
+                "undefined_identifier"
+            ],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// The decidable constraint: `mixin M on C` where `C` is indexed walks
+    /// `C`'s whole member face — a bare read of a `C` member resolves
+    /// silently (the `on`-face hit joins the member scope, the oracle's
+    /// `unpromotedThisType`), a name `C` lacks reports.
+    #[test]
+    fn mixin_on_indexed_constraint_decides_members() {
+        let r = report(
+            "class int {}\n\
+             class C {\n  int cf = 0;\n}\n\
+             mixin M on C {\n  void m() { cf; gone; }\n}",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["undefined_identifier"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// The extension twin: `extension E on C` resolves the `on` type's
+    /// members bare (upstream's `ExtensionMemberScope`), reports what the
+    /// extended type lacks.
+    #[test]
+    fn extension_on_indexed_type_decides_members() {
+        let r = report(
+            "class int {}\n\
+             class C {\n  int cf = 0;\n}\n\
+             extension E on C {\n  void m() { cf; gone; }\n}",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["undefined_identifier"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// The `on` type's INHERITED members are in scope too (the face-list
+    /// climb walks supertypes): a constraint member on `C`'s superclass
+    /// resolves bare inside `mixin M on C`, and the miss beside it reports.
+    #[test]
+    fn mixin_on_constraint_inherits_members() {
+        let r = report(
+            "class int {}\n\
+             class S {\n  int sf = 0;\n}\n\
+             class C extends S {}\n\
+             mixin M on C {\n  void m() { sf; gone; }\n}",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["undefined_identifier"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// A constraint member found through the `on`-face walk resolves bare
+    /// and stays silent — the read joins the member resolution exactly like
+    /// an own-container field hit (a second bare read of `gone` beside it
+    /// reports, pinning that the silence comes from the walk's Found arm,
+    /// not a suppression).
+    #[test]
+    fn on_face_member_carries_the_declared_type() {
+        let r = report(
+            "class int {}\n\
+             class C {\n  int cf = 0;\n}\n\
+             mixin M on C {\n  void m() { cf; gone; }\n}",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["undefined_identifier"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// The unnamed extension reads the frame-latched face: `extension on
+    /// Gone` has no container entry, yet its `on` type still decides the
+    /// bare miss the same way a named face does. (The `unused_element`
+    /// row is the member's own declaration face — unrelated to this arm.)
+    #[test]
+    fn unnamed_extension_on_unresolved_reports_bare_miss() {
+        let r = report("extension on Gone {\n  void m() { nope; }\n}");
+        let names = code_names(&r);
+        assert!(
+            names.contains(&"undefined_identifier"),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"undefined_class"),
+            "{names:?}"
+        );
+    }
+
+    /// A named extension whose `on` type resolves to a second EXTENSION's
+    /// application face is still just an `on` clause — the constraint's
+    /// member scope is the extended type's members, and an unresolvable
+    /// `on` name contributes nothing either way.
+    #[test]
+    fn extension_on_extension_still_decides_bare_misses() {
+        let r = report(
+            "class int {}\n\
+             extension X on int {}\n\
+             extension E on Gone {\n  void m() { nope; }\n}",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["undefined_class", "undefined_identifier"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// The interface-clause twin: `mixin M implements C` walks `C`'s
+    /// members through `walk_members`'s own `implements` faces — a hit
+    /// resolves, a miss reports through the same `on_opaque`-free path
+    /// (the implements face was never blanket-suppressed).
+    #[test]
+    fn mixin_implements_members_resolve_and_miss_reports() {
+        let r = report(
+            "class int {}\n\
+             class C {\n  int cf = 0;\n}\n\
+             mixin M implements C {\n  void m() { cf; gone; }\n}",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["undefined_identifier"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// The negative control — an `on` anchor the index cannot model: `on
+    /// Iterator` where `Iterator` resolves to an unindexed `dart:core` face
+    /// keeps the suppression (a member could hide on the face we cannot
+    /// walk). The mixin body's miss stays silent exactly like the old
+    /// blanket verdict — but only because the climb broke, not because the
+    /// container kind asked for it.
+    #[test]
+    fn mixin_on_unindexed_constraint_keeps_the_miss_silent() {
+        let r = report_with_core_faces(
+            "import 'dart:core';\n\
+             mixin M on Iterator {\n  void m() { nope; }\n}",
+        );
+        assert!(
+            r.diagnostics.is_empty(),
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// The invoke miss's `UnqualifiedLookupDomain`: inside `mixin M` the
+    /// bare callee names the enclosing interface element — `undefined_method`
+    /// on `M` (upstream's `enclosingClass` is an `InterfaceElement`, which
+    /// mixins are). An extension's miss keeps `undefined_function` (the
+    /// extension element is not an interface element upstream).
+    #[test]
+    fn mixin_invoke_miss_names_the_mixin_extension_keeps_function() {
+        let r = report(
+            "class int {}\n\
+             mixin M {\n  void m() { Foo(); }\n}\n\
+             extension E on int {\n  void g() { Bar(); }\n}",
+        );
+        let names = code_names(&r);
+        assert_eq!(names, ["undefined_method", "undefined_function"], "{names:?}");
+        assert!(
+            r.diagnostics[0]
+                .message
+                .contains("for the type 'M'"),
+            "{:?}",
+            r.diagnostics[0].message
+        );
+    }
+
+    /// The class-region baseline: `class C { m() { Foo(); } }` still names
+    /// `C` on the invoke miss — the `this_type` arm's pre-existing face,
+    /// unchanged by the mixin join.
+    #[test]
+    fn class_invoke_miss_still_names_the_class() {
+        let r = report("class C {\n  void m() { Foo(); }\n}");
+        let names = code_names(&r);
+        assert_eq!(names, ["undefined_method"], "{names:?}");
+        assert!(
+            r.diagnostics[0]
+                .message
+                .contains("for the type 'C'"),
+            "{:?}",
+            r.diagnostics[0].message
+        );
+    }
+
+    /// A bare WRITE inside a decidable `on`-face scope reports through the
+    /// write arm like the oracle — `mixin M on C`'s member scope was final,
+    /// so `gone = 1` is `undefined_identifier`, never a swallowed
+    /// constraint-member write.
+    #[test]
+    fn mixin_on_indexed_write_miss_reports() {
+        let r = report(
+            "class int {}\n\
+             class C {\n  int cf = 0;\n}\n\
+             mixin M on C {\n  void m() { gone = 1; }\n}",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["undefined_identifier"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// The constraint setter side: a write to a `C` member the `on` face
+    /// carries resolves the write too — `cf = 1` inside `mixin M on C` is
+    /// the field's own assignment, silent like the oracle.
+    #[test]
+    fn mixin_on_indexed_write_hit_stays_silent() {
+        let r = report(
+            "class int {}\n\
+             class C {\n  int cf = 0;\n}\n\
+             mixin M on C {\n  void m() { cf = 1; }\n}",
+        );
+        assert!(
+            r.diagnostics.is_empty(),
+            "{:?}",
+            code_names(&r)
+        );
     }
