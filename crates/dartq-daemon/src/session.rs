@@ -7816,6 +7816,21 @@ mod tests {
         ("t".to_owned(), fork)
     }
 
+    /// Writes the mapping-threshold fixture into `lib/pooled.dart`: a valid
+    /// Dart file of at least [`dartq_source::MMAP_MIN_BYTES`] bytes — the
+    /// size class discovery loads as a mapping (`open_source`; smaller
+    /// files read into exact-size owned buffers, the per-file page-rounding
+    /// and VM-region costs of tiny mappings being several times their
+    /// text) — and returns its byte length.
+    fn write_mapped_fixture(workspace: &Workspace) -> u64 {
+        let text = format!(
+            "void pooled() {{}}\n// {}\n",
+            "x".repeat(dartq_source::MMAP_MIN_BYTES as usize)
+        );
+        fs::write(workspace.path("lib/pooled.dart"), &text).expect("write pooled");
+        text.len() as u64
+    }
+
     /// The conditional fixture's workspace: `main` plus the two branch
     /// files on disk.
     fn cond_workspace() -> Workspace {
@@ -8151,13 +8166,18 @@ mod tests {
     /// ::pooled_mapped_store` rebinds every context's content store to one
     /// shared [`dartq_engine::MappedContentPool`] at assembly — the Arc
     /// content-identity contract holds (both contexts' engines resolve the
-    /// same three contents through the pool, so the pool holds each once),
-    /// canonical file text stays mapped (`mapped_bytes` counts the
-    /// workspace's on-disk corpus), and both contexts still route and
-    /// answer. The opted-out session reports `None` from the probes.
+    /// same contents through the pool, so the pool holds each once), and
+    /// both contexts still route and answer. The residency posture follows
+    /// `open_source`'s size split: the small fixture files land as
+    /// exact-size owned read copies (a mapping of a few-KiB source rounds
+    /// up to whole pages and costs a VM region — several times its text),
+    /// while a file at [`dartq_source::MMAP_MIN_BYTES`] stays a mapping —
+    /// the mapped share of the pool, shared across contexts by the same
+    /// refcounted slot.
     #[test]
     fn pooled_mapped_store_posture_shares_mapped_content_across_contexts() {
         let workspace = cond_workspace();
+        let mapped_bytes = write_mapped_fixture(&workspace);
         let mut fork = workspace.engine_config();
         fork.declared_variables
             .insert("dart.library.heavy".to_owned(), "true".to_owned());
@@ -8181,14 +8201,15 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
 
-        // Cross-context dedup: the workspace's three distinct contents land
-        // once in the pool — the same identity contract `pool.len() == 3`
-        // pins on the memory pool — observed through the deduplicated
-        // byte face (both contexts loaded the same files).
+        // Cross-context dedup: the workspace's distinct contents land once
+        // in the pool — the same identity contract `pool.len() == N` pins
+        // on the memory pool — observed through the deduplicated byte face
+        // (both contexts loaded the same files).
         let corpus_bytes = [COND_MAIN, HEAVY_DART, LIGHT_DART]
             .iter()
             .map(|text| text.len() as u64)
-            .sum::<u64>();
+            .sum::<u64>()
+            + mapped_bytes;
         assert_eq!(
             session.shared_store_bytes(),
             Some(corpus_bytes),
@@ -8196,8 +8217,9 @@ mod tests {
         );
         assert_eq!(
             session.shared_store_mapped_bytes(),
-            Some(corpus_bytes),
-            "discovery loads stay mapped — the whole corpus is page-cache"
+            Some(mapped_bytes),
+            "small files hold as owned read copies — the threshold file is \
+             the pool's whole mapped share"
         );
         // Routing is unaffected by the posture: the forked tag answers.
         // The fork's own apply runs here — its pending discovery drains on
@@ -8238,7 +8260,7 @@ mod tests {
         let _ = session.service();
         assert_eq!(
             session.shared_store_mapped_bytes(),
-            Some(corpus_bytes),
+            Some(mapped_bytes),
             "the mapped corpus is untouched by the overlay write"
         );
         assert_eq!(
@@ -8252,7 +8274,10 @@ mod tests {
     /// [`SessionRuntime`] flips the flag on, a default-constructed session
     /// assembles the pool at the seam (the probes report the armed face,
     /// not `None`), and a minimal real-path run loads the workspace's file
-    /// text as pooled mappings — the store actually engaged. The explicit
+    /// text into the pool on the first drain — the store actually engaged.
+    /// The residency posture follows `open_source`'s size split: small
+    /// files hold as exact-size owned read copies, a file at
+    /// [`dartq_source::MMAP_MIN_BYTES`] holds as a mapping. The explicit
     /// opt-out (`pooled_mapped_store: false`) keeps the caller-built
     /// stores untouched: no pool, probes `None` — the A/B posture for the
     /// store decomposition comparison.
@@ -8261,9 +8286,10 @@ mod tests {
         assert!(SessionRuntime::default().pooled_mapped_store);
 
         // The default runtime: the pool exists from assembly (armed, empty)
-        // and the workspace's file text lands as pooled mappings on the
-        // first drain.
+        // and the workspace's file text lands in the pool on the first
+        // drain.
         let workspace = cond_workspace();
+        let mapped_bytes = write_mapped_fixture(&workspace);
         let mut session = Session::with_runtime(
             workspace.engine_config(),
             Vec::new(),
@@ -8279,7 +8305,8 @@ mod tests {
         );
         session.sweep().expect("sweep");
         let _ = session.service();
-        let corpus_bytes = (COND_MAIN.len() + HEAVY_DART.len() + LIGHT_DART.len()) as u64;
+        let corpus_bytes =
+            (COND_MAIN.len() + HEAVY_DART.len() + LIGHT_DART.len()) as u64 + mapped_bytes;
         assert_eq!(
             session.shared_store_bytes(),
             Some(corpus_bytes),
@@ -8287,8 +8314,9 @@ mod tests {
         );
         assert_eq!(
             session.shared_store_mapped_bytes(),
-            Some(corpus_bytes),
-            "the engaged store holds file text as mappings"
+            Some(mapped_bytes),
+            "small files hold as owned read copies — the threshold file is \
+             the pool's whole mapped share"
         );
 
         // The explicit opt-out restores the caller-built stores: no pool,

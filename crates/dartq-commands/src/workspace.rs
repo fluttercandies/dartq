@@ -1993,34 +1993,53 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// Duplicate package names reach the same floor: the reader grammar
-    /// tolerates them in the file (package:package_config reports and
-    /// skips), the graph build rejects them, and the analyze path degrades
-    /// with the advisory naming the defect — the compat face is the one
-    /// that still refuses (its own `load_workspace_faces` call).
+    /// Duplicate package names resolve through the FIRST entry: the parse
+    /// layer dedups repeated names to their first entry (package_config's
+    /// package-table builder, package_config_impl.dart:86-92; the oracle
+    /// never surfaces a repeated name as a diagnostic — its packages.dart
+    /// face turns parse errors into a silent `Packages.empty` floor and
+    /// keeps analyzing), so the resolution stays usable as written: the
+    /// effective config holds one entry per name, the table attributes the
+    /// self package at the first entry's root, and no advisory fires.
     #[test]
-    fn duplicate_config_names_degrade_to_empty_floor() {
+    fn duplicate_config_names_resolve_to_the_first_entry() {
         let root = workspace("ws_dupes", &[]);
+        // The two spellings differ so first-vs-last wins is observable: the
+        // effective entry resolves at `../` (the workspace root), and a
+        // kept-later `../elsewhere` — a root with no pubspec — would fail
+        // the assembly or shift the attribution instead of passing here.
         fs::write(
             root.join(".dart_tool/package_config.json"),
-            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}, {"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}, {"name": "fixture", "rootUri": "../elsewhere", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
         )
 .expect("duplicate config");
 
         let root = root.canonicalize().expect("root");
         let (config, _, advisory) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
-            .expect("duplicate names degrade, never refuse");
-        assert!(config.pub_config.packages.is_empty(), "the empty floor");
-        assert_eq!(config.packages.len(), 1, "the self package stays");
-
-        let advisory = advisory.expect("one advisory");
-        let WorkspaceAdvisory::InvalidConfig(invalid) = &advisory else {
-            panic!("invalid-config advisory, got {advisory:?}")
-        };
+            .expect("duplicate names dedup, the resolution stays usable");
+        assert_eq!(
+            config.pub_config.packages.len(),
+            1,
+            "the later duplicate is skipped"
+        );
+        assert_eq!(config.pub_config.packages[0].name, "fixture");
+        assert_eq!(
+            config.pub_config.packages[0].root_uri, "../",
+            "first wins"
+        );
+        assert_eq!(
+            config.packages.len(),
+            1,
+            "the deduped entry is the self package"
+        );
+        let identity = config.packages.get("fixture").expect("self package");
+        assert_eq!(
+            identity.root, root,
+            "the first entry's rootUri is the effective root"
+        );
         assert!(
-            invalid.reason.contains("duplicate"),
-            "the reason names the defect: {}",
-            invalid.reason
+            advisory.is_none(),
+            "a repeated name is not a defect: {advisory:?}"
         );
 
         fs::remove_dir_all(&root).ok();
