@@ -884,23 +884,25 @@ mod tests {
         );
 
         // The creation retriggers until the thread answers (the substrate
-        // arms asynchronously; a pre-arm change is absorbed) — the batch is
-        // the new file — and the later deletion is provably post-arm.
+        // arms asynchronously; a pre-arm change is absorbed) — the answered
+        // batch carries the new file. The fixture's seeded main can coalesce
+        // into the same drain (the instrumented coverage build arms the
+        // substrate slower than the first write lands), so the batch is
+        // matched on the new file, not demanded to be alone.
         let extra = root.join("lib/extra.dart");
         let (created, _) = settle_rewrite(&extra, "var b = 2;\n", &receiver);
-        assert_eq!(
-            created,
-            vec![extra.clone()],
-            "the new file is the batch"
+        assert!(
+            created.contains(&extra),
+            "the new file is in the answered batch: {created:?}"
         );
 
         fs::remove_file(&extra).expect("delete");
-        // The same bounded window as `settle_rewrite`, minus the retry (a
-        // deletion cannot be re-triggered): sliced receives until the
-        // removal batch surfaces. One fixed 5-second `recv_timeout`
-        // mistook coverage instrumentation's slowdown for a dropped
-        // removal; the window is an upper bound, the slices keep the wait
-        // interruptible.
+        // The same bounded window and path-selective match as
+        // `settle_rewrite`, minus the retry (a deletion cannot be
+        // re-triggered): sliced receives until the removal batch surfaces.
+        // One fixed 5-second `recv_timeout` mistook coverage
+        // instrumentation's slowdown for a dropped removal; the window is
+        // an upper bound, the slices keep the wait interruptible.
         let deadline = Instant::now() + SETTLE_WINDOW;
         let deleted = loop {
             assert!(
@@ -908,17 +910,19 @@ mod tests {
                 "the deletion surfaced within the window"
             );
             match receiver.recv_timeout(Duration::from_secs(1)) {
-                Ok(item) => break item,
+                Ok(item) if watch_paths(&item).contains(&extra) => {
+                    break watch_paths(&item);
+                }
+                Ok(_) => {}
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     panic!("the watch thread exited before answering")
                 }
             }
         };
-        assert_eq!(
-            watch_paths(&deleted),
-            vec![extra],
-            "the removal is the batch"
+        assert!(
+            deleted.contains(&extra),
+            "the removal is in the batch: {deleted:?}"
         );
 
         drop(watcher);
@@ -1167,8 +1171,9 @@ mod tests {
     /// costs nothing on normal targets.
     const SETTLE_WINDOW: Duration = Duration::from_secs(15);
 
-    /// Rewrites `path` until the watch thread answers with a Watch batch,
-    /// and returns that batch plus the number of empty filler items skipped.
+    /// Rewrites `path` until the watch thread answers with a Watch batch
+    /// carrying it, and returns that batch plus the number of empty filler
+    /// items skipped.
     ///
     /// The substrate arms asynchronously on the watch thread, and a change
     /// landing before the arm is absorbed — the OS stream's since-now and
@@ -1176,8 +1181,11 @@ mod tests {
     /// thread answers instead of racing a fixed settle sleep. Later triggers
     /// are provably post-arm and never retried. Same-path rewrites dedup in
     /// the debounce, so the answered batch is still one entry per touched
-    /// path. Bounded: a thread that never answers fails the test, never
-    /// hangs it.
+    /// path. The match is on the path, not the whole batch: a pre-arm event
+    /// of another file can coalesce into the same drain (the instrumented
+    /// coverage build arms the substrate an order of magnitude slower), and
+    /// such batches are skipped until the rewritten path surfaces. Bounded:
+    /// a thread that never answers fails the test, never hangs it.
     fn settle_rewrite(
         path: &Path,
         content: &str,
@@ -1193,7 +1201,12 @@ mod tests {
             fs::write(path, content).expect("write");
             match receiver.recv_timeout(Duration::from_millis(500)) {
                 Ok(item) if item.is_empty() => fillers += 1,
-                Ok(item) => return (watch_paths(&item), fillers),
+                Ok(item) => {
+                    let touched = watch_paths(&item);
+                    if touched.iter().any(|touched| touched == path) {
+                        return (touched, fillers);
+                    }
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     panic!("the watch thread exited before answering")

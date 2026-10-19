@@ -546,6 +546,17 @@ pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 13] = [
 /// the one supertype edge (`int`/`double` fit it).
 pub(crate) const FINAL_PRIMITIVES: [&str; 5] = ["int", "double", "num", "bool", "String"];
 
+/// The dart:core static members whose declared return type the member walk
+/// cannot reach (the declaring containers are unindexed like every SDK
+/// unit, so `C.static()`'s send types `Unknown` and every downstream face
+/// over-reports against the unresolved read — `end =
+/// RangeError.checkValidRange(...)` never promotes `end`, #2172). Each row
+/// is `(container, member, return head)` from the reference SDK
+/// (`sdk/lib/core/errors.dart:375`); the answer is the non-nullable named
+/// head the declared return spells.
+pub(crate) const CORE_STATIC_RETURNS: [(&str, &str, &str); 1] =
+    [("RangeError", "checkValidRange", "int")];
+
 /// The dart:core interface member faces the element index never carries:
 /// `dart:core` declarations resolve through the namespace but land on
 /// unindexed (external) units, so the `@override` walk's

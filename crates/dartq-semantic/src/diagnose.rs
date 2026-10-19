@@ -353,8 +353,8 @@ use crate::library::{
     prefixed_container, resolve_container, supertype_hop_dead,
 };
 use crate::member_face::{
-    COLLECTION_INTERFACE_ALIASES, CORE_CONST_CTOR, CORE_INTERFACE_MEMBERS, CORE_TYPE_MEMBERS,
-    EqualsCheck, MemberFace, NsmCheck, NsmShape,
+    COLLECTION_INTERFACE_ALIASES, CORE_CONST_CTOR, CORE_INTERFACE_MEMBERS, CORE_STATIC_RETURNS,
+    CORE_TYPE_MEMBERS, EqualsCheck, MemberFace, NsmCheck, NsmShape,
 };
 use crate::model::{
     ArgListId, ArgPool, ArityViolation, Container, ContainerKind, ExtensionFace, FileElements,
@@ -4498,11 +4498,20 @@ impl<'a> Engine<'a> {
             return;
         }
         let Some(Ty::Named {
-            nullable: false, ..
+            name,
+            nullable: false,
+            ..
         }) = cast
         else {
             return;
         };
+        // An in-scope type-parameter target rides its bound: `null as T`
+        // over an unbounded `T` is a legal null cast (the bound is
+        // nullable — the model carries no bound on this face), so the
+        // always-throws verdict stays silent (#2172's `return null as T`).
+        if self.type_params.contains(&name) || self.pending_type_params.contains(&name) {
+            return;
+        }
         self.stage_usage(SemanticCode::CastFromNullAlwaysFails, at, "");
     }
 
@@ -5142,6 +5151,16 @@ impl<'a> Engine<'a> {
     fn refine_numeric_binary(&self, op: &str, left_ty: Ty, right_ty: Ty, declared: Ty) -> Ty {
         if !matches!(op, "+" | "-" | "*" | "%") {
             return declared;
+        }
+        // An unresolved operand keeps the node unresolved (upstream's
+        // `_refineNumericInvocationTypeNullSafe` reads both operands'
+        // static types; an `InvalidType` side skips the refinement and the
+        // node answers dynamic — the suppress-everything sentinel here).
+        // Answering the declared `num` over an unknown right operand made
+        // every resolved-left fold over-report downstream
+        // (`return_of_invalid_type` num->int, #2172's `_writeToList`).
+        if right_ty == Ty::UNKNOWN {
+            return Ty::UNKNOWN;
         }
         let (int, double, num) = (
             self.members.primitive_ids[0],
@@ -9491,6 +9510,12 @@ impl<'a> Engine<'a> {
             || mark
                 .checked_sub(1)
                 .and_then(|index| self.rows.get(index))
+                // An operator-marked or invoked row is the index/`+`/call
+                // geometry, never the read's own type (`m[k] ?? d` reads
+                // `Map.[]`'s `V?`; `m[k(e)] ?? d`'s nearest row is the key
+                // send — the receiver row's non-nullability is not the
+                // read's, #2172's `groupSetsBy`/`groupBy`/`groupBy` rows).
+                .filter(|lhs| !matches!(lhs.intent, Intent::Operator(..) | Intent::Invoke))
                 .is_some_and(|lhs| lhs.ty.is_strictly_non_nullable());
         if !non_null {
             return;
@@ -9503,17 +9528,40 @@ impl<'a> Engine<'a> {
 
     /// `handle_assignment_expression` for `??=`: the target's read type
     /// strictly non-nullable anchors the report at the value (the official
-    /// `_checkForDeadNullCoalesce`'s `??=` arm).
+    /// `_checkForDeadNullCoalesce`'s `??=` arm). An operator-marked row is
+    /// never the target: `m[k] ??= v` reads through `Map.[]`, whose `V?`
+    /// the name-level model does not type on the receiver row — the
+    /// receiver's own non-nullability is not the read's (#2172's
+    /// `groupSetsBy`/`groupBy` rows).
     fn check_dead_null_assignment(&mut self, operator: Token) {
         if self.text_of(operator) != Some("??=") {
             return;
         }
         let limit = operator.range.offset;
+        // The index-write shape reads through `Map.[]`, whose `V?` no row
+        // carries: the compound mark lands on the key expression's row (the
+        // nearest non-value before the operator), whose return type is not
+        // the read's — the index-read target's type is the unmodeled
+        // operator return, and the face stays silent (`groupBy`'s
+        // `(map[key(element)] ??= []).add(element)`, #2172).
+        if self
+            .rows
+            .iter()
+            .rev()
+            .filter(|row| row.range.end() <= limit)
+            .any(|row| matches!(row.write_op, Some(OpWrite::Compound)))
+        {
+            return;
+        }
         let non_null = self
             .rows
             .iter()
             .rev()
-            .find(|row| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))
+            .find(|row| {
+                row.range.end() <= limit
+                    && !matches!(row.shape, RowShape::Value)
+                    && !matches!(row.intent, Intent::Operator(..) | Intent::Invoke)
+            })
             .is_some_and(|target| target.ty.is_strictly_non_nullable());
         if non_null && let Some(value) = self.rows.last() {
             let range = value.range;
@@ -10465,6 +10513,27 @@ impl<'a> Engine<'a> {
     /// written arguments substituted (`typedef B = A<int>` over
     /// `A<X> = X Function()` resolves `B` to `int Function()`).
     fn alias_fn_sig(&self, name: StringId) -> Option<Box<FnVarSig>> {
+        // The dart:core function-alias face (SDK units are unindexed, so
+        // the bounds tables never carry it): `Comparator<T>` spells
+        // `int Function(T a, T b)` — the callable verdict and the send's
+        // `int` return read it (`isSorted`'s `Comparator<T> compare`
+        // invoked as `compare(a, b)`, #2172). The alias's own `T` stays a
+        // named leaf — the same face a written `Cmp<T>` use answers when
+        // the use-site substitution is not modeled — and a locally
+        // declared `Comparator` keeps its own shape.
+        if self.strings.resolve(name) == "Comparator"
+            && self.bounds.alias_fn_shape(name).is_none()
+            && self.bounds.alias_named_shape(name).is_none()
+        {
+            let t = self.intern("T");
+            return Some(Box::new(FnVarSig {
+                params: Box::default(),
+                positional: vec![Ty::named(t), Ty::named(t)].into(),
+                required_positional: 2,
+                named: Box::default(),
+                return_ty: Ty::named(self.members.primitive_ids[0]),
+            }));
+        }
         // The co-alias substitution maps a parameter name to its written
         // argument tree; it applies at the terminal `Fn` shape's leaves.
         let mut subst: FxHashMap<StringId, TypeTree> = FxHashMap::default();
@@ -11750,6 +11819,16 @@ impl<'a> Engine<'a> {
         if !spared && !in_extension && entry.kind == MemberKind::Field {
             let setter = self.setter_spelling(spelling);
             spared = self.face_member_any(decl, setter);
+        }
+        if !spared && !in_extension && entry.kind == MemberKind::Setter {
+            // The accessor-twin face: an inherited FIELD induces the setter
+            // face too (`_CastQueueList`'s `set _head` overrides
+            // `QueueList`'s `int _head` field — the field's implicit setter,
+            // #2172). The mirror arm above answers a declared field against
+            // an inherited setter's spelling.
+            let base_text = self.strings.resolve(spelling);
+            let base_text = base_text.strip_suffix('=').unwrap_or(base_text);
+            spared = self.face_member_any(decl, self.intern(base_text));
         }
         if spared {
             return;
@@ -14367,7 +14446,15 @@ impl<'a> Engine<'a> {
             let instance_member = match &target {
                 RefTarget::Member { container } => match self.walk_members(*container, name) {
                     Walk::Found(entry) => !entry.is_static,
-                    Walk::ChainBroken => true,
+                    // A chain-broken climb answers no: the name may be an
+                    // inherited member (suppress) or a scoped declaration
+                    // the broken chain preempted (`HashSet<T>()` in a field
+                    // initializer of a class `implements Iterator<T>` — the
+                    // unindexed hop claimed the scoped class as an instance
+                    // member and over-reported the initializer face,
+                    // #2172). The Object-member arm below keeps the
+                    // always-known faces reporting.
+                    Walk::ChainBroken => false,
                     Walk::Missing => false,
                 },
                 _ => {
@@ -16162,6 +16249,13 @@ impl<'a> Engine<'a> {
             return;
         };
         if super_container.constructors.contains(&name) {
+            // The super-ctor selector counts as the constructor's
+            // reference: `super._(...)` spares the named super constructor
+            // from `unused_element` (the official reference set includes
+            // superclass-constructor invocations — #2172's
+            // `QueueList._`/`BoolList._`, whose only uses are subclass
+            // `super._` initializers).
+            self.used_names.insert(name);
             return;
         }
         let class_text = self.strings.resolve(superclass).to_string();
@@ -17949,7 +18043,46 @@ impl<'a> Engine<'a> {
                 _ => formal.ty,
             };
             if self.assignable(*ty, formal_ty, *literal) == Some(false) {
-                self.stage(StagedKind::Argument, *range, *ty, formal_ty, *literal);
+                // The raw-generic face (#2172's `_base.equals(e1, e2)`): a
+                // member-invocation formal leaf that spells the declaring
+                // container's own type parameter (`Equality` used raw
+                // leaves `equals`'s `E` unsubstituted) is not a resolvable
+                // interface type — the oracle's raw-type erasure answers
+                // the bound, and the argument face stays silent. Creations
+                // keep the face (the unsolved formal of a raw creation is
+                // the dynamic-erasure argument the oracle reports — the
+                // #1351 pins); only an out-of-scope, unresolvable named
+                // head on a member send suppresses.
+                let creation = unnamed_creation || creation_container.is_some();
+                let unbound_formal = !creation
+                    && match formal_ty {
+                        Ty::Named {
+                            name,
+                            args: ArgListId::EMPTY,
+                            ..
+                        } => {
+                            !self.type_params.contains(&name)
+                                && !self.pending_type_params.contains(&name)
+                                // The final primitives never resolve as
+                                // containers (the harness's bare world, and
+                                // the unindexed SDK units) — their formals
+                                // keep the face.
+                                && !self.members.primitive_ids.contains(&name)
+                                && resolve_container(
+                                    self.graph,
+                                    self.namespaces,
+                                    self.index,
+                                    self.lib,
+                                    self.file,
+                                    name,
+                                )
+                                .is_none()
+                        }
+                        _ => false,
+                    };
+                if !unbound_formal {
+                    self.stage(StagedKind::Argument, *range, *ty, formal_ty, *literal);
+                }
             }
         }
         // The substituted return type (#1351, part d): a generic send's
@@ -18170,7 +18303,17 @@ impl<'a> Engine<'a> {
                         })
                         .and_then(|c| c.superclass)
                 } else {
-                    self.container_context().map(|(name, _)| name)
+                    // An extension's `this` types as its `on` type
+                    // ([`Self::this_static_ty`]) — the alias head is the
+                    // callable face the climb asks (`extension
+                    // ComparatorExtension<T> on Comparator<T>`'s
+                    // `this(...)` sends, #2172).
+                    self.container_context().map(|(name, kind)| {
+                        match self.this_static_ty(name, kind) {
+                            Ty::Named { name: head, .. } => head,
+                            _ => name,
+                        }
+                    })
                 };
                 let call = self.intern("call");
                 let mut callable = false;
@@ -18180,6 +18323,16 @@ impl<'a> Engine<'a> {
                 let mut seen = rustc_hash::FxHashSet::default();
                 while let Some(name) = link {
                     if !seen.insert(name) {
+                        break;
+                    }
+                    // The unindexed function-alias face (the
+                    // `this(...)` arm of the dart:core `Comparator<T>`
+                    // extension — `compareBy`'s `(R a, R b) => this(...)`,
+                    // #2172): the `on` type's head spells an alias the
+                    // bounds tables never carry, and the aliased signature
+                    // is the callable face.
+                    if self.alias_fn_sig(name).is_some() {
+                        callable = true;
                         break;
                     }
                     let Some(container) = self.index.get(self.file).and_then(|f| f.container(name))
@@ -20037,7 +20190,34 @@ impl<'a> Engine<'a> {
             Walk::Found(entry) if matches!(entry.kind, MemberKind::Method | MemberKind::Getter) => {
                 entry.return_ty
             }
-            _ => Ty::UNKNOWN,
+            // The unindexed dart:core container's static face
+            // ([`CORE_STATIC_RETURNS`]): the member walk chain-breaks on
+            // every SDK unit, so the declared return rides the table
+            // instead of the walk (`RangeError.checkValidRange(...)`,
+            // #2172). An indexed container keeps the miss face — a
+            // user-declared same-spelled container never borrows the SDK
+            // table.
+            _ => {
+                let indexed = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    container,
+                )
+                .is_some();
+                if indexed {
+                    return Ty::UNKNOWN;
+                }
+                CORE_STATIC_RETURNS
+                    .iter()
+                    .find(|(recv, member, _)| {
+                        *member == &self.strings.resolve(row.name)[..]
+                            && self.intern(recv) == container
+                    })
+                    .map_or(Ty::UNKNOWN, |(_, _, head)| Ty::named(self.intern(*head)))
+            }
         }
     }
 
@@ -29250,6 +29430,35 @@ impl ParserListener for DiagnoseListener<'_> {
             // record contract (the fold above answers it instead).
             engine.emit_is_type_miss();
         }
+        // The `is` expression's own row: statically `bool`. The operand row
+        // folds under it (deferred — its resolution still runs in pass 2),
+        // so the enclosing single-row checks read the node's type, never
+        // the operand's (`bool isValidKey(Object? o) => o is Iterable<E>;`
+        // returns the test's `bool`, not the promoted operand — #2172's
+        // equality.dart rows). The recovered fold pushes the same shape.
+        if let Some(index) = engine
+            .rows
+            .iter()
+            .rposition(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+        {
+            let start = engine.rows[index].range.offset;
+            let end = engine.rows.last().map_or(start, |row| row.range.end());
+            for row in engine.rows.drain(index..) {
+                engine.deferred_miss_rows.push(row);
+            }
+            engine.rows.push(Row {
+                name: engine.intern(""),
+                range: SourceRange {
+                    offset: start,
+                    length: end.saturating_sub(start),
+                },
+                qualified: false,
+                shape: RowShape::Value,
+                intent: Intent::Read,
+                write_op: None,
+                ty: Ty::named(engine.members.primitive_ids[3]),
+            });
+        }
     }
 
     fn handle_as_operator(&mut self, operator: Token) {
@@ -29325,6 +29534,38 @@ impl ParserListener for DiagnoseListener<'_> {
                 .operand_row()
                 .map_or(Ty::Unknown, |row| engine.operand_static_ty(row));
             engine.check_dead_cast_tail(operator, dead_operand);
+            // The `as` expression's own row: the cast target's resolved
+            // type (`AsExpression.staticType`). The operand row folds under
+            // it (deferred — its resolution still runs in pass 2), so the
+            // chain's next segment resolves on the target, never on the
+            // operand's type (`(value as Comparable<Object?>).compareTo(o)`
+            // reads Comparable's face, not Object's — #2172's utils.dart
+            // row). An unresolved target keeps the operand row (suppress as
+            // before).
+            if let Some(ty) = cast_ty.filter(|ty| *ty != Ty::UNKNOWN)
+                && let Some(index) = engine
+                    .rows
+                    .iter()
+                    .rposition(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+            {
+                let start = engine.rows[index].range.offset;
+                let end = engine.rows.last().map_or(start, |row| row.range.end());
+                for row in engine.rows.drain(index..) {
+                    engine.deferred_miss_rows.push(row);
+                }
+                engine.rows.push(Row {
+                    name: engine.intern(""),
+                    range: SourceRange {
+                        offset: start,
+                        length: end.saturating_sub(start),
+                    },
+                    qualified: false,
+                    shape: RowShape::Value,
+                    intent: Intent::Read,
+                    write_op: None,
+                    ty,
+                });
+            }
         }
         engine.const_capture.opaque_leaf(operator.range);
     }
@@ -32987,6 +33228,73 @@ mod tests {
             .collect();
         assert_eq!(rows, vec![(15, 1), (27, 3), (56, 3), (94, 1)], "{rows:?}");
     }
+
+    /// [`report`] over a library wired to a synthetic `dart:core` face node
+    /// (the `report_with_sdk_faces` shape): the names the #2172 pins
+    /// consume resolve through the namespace while their unit stays
+    /// unindexed — exactly the CLI's SDK posture the static-return table
+    /// and the frozen core faces answer under.
+    fn report_with_core_faces(source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let core_file = files.intern(Path::new("<dart:core>"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let core = builder.intern("dart:core");
+        for name in ["RangeError", "Iterator", "Comparable"] {
+            builder.declare(core, strings.intern(name), core_file);
+        }
+        builder.import(
+            lib,
+            ImportEdge {
+                target: Some(core),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        diagnose_with(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        )
+    }
+
     /// [`report`] over a library wired to synthetic `dart:async` and
     /// `dart:io` face nodes — the engine's `build_library_graph` SDK shape:
     /// names declared into unindexed `<dart:...>` files, joined by unfiltered
@@ -38383,6 +38691,195 @@ mod tests {
             report.diagnostics[1].message,
             "The argument type 'String' can't be assigned to the parameter type 'M'. "
         );
+    }
+
+    // —— #2172 (real-corpus family-4 remainder) ——————————————————————
+
+    /// The core static-return table types the send (`RangeError.checkValidRange`
+    /// declares `int`, sdk/lib/core/errors.dart:375): the known non-null RHS
+    /// promotes `end`, so the staged `int?`-against-`num` argument face at the
+    /// promoted read filters — the collection corpus's `binarySearchBy` row
+    /// dies at the root instead of per-read.
+    #[test]
+    fn core_static_return_types_the_range_error_send() {
+        let source = "class bool {} \
+                      class num { bool operator <(num other) => true; } \
+                      class int extends num {} \
+                      void f(int? e) { e = RangeError.checkValidRange(0, e, 3); if (e < 3) {} }";
+        let names = code_names(&report_with_core_faces(source));
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// The numeric refinement keeps the node unresolved over an unresolved
+    /// operand (`t + mystery()`'s declared `num` answer over-reports
+    /// downstream — the corpus's `_writeToList`/`_preGrow` `num`-to-`int`
+    /// rows). The callee's own miss is the only row left.
+    #[test]
+    fn unresolved_operand_keeps_the_numeric_fold_unresolved() {
+        let source = "class int { int operator +(int other) => this; } \
+                      class C { int t = 0; int f() { var fs = mystery() - 1; return t + fs; } }";
+        let names = code_names(&report(source));
+        assert_eq!(names, ["undefined_method"], "{names:?}");
+    }
+
+    /// The `is` expression folds to its own `bool` row: the operand row
+    /// defers (its resolution still runs in pass 2), so the expression-body
+    /// return reads the test's type — never the promoted operand (`bool
+    /// isValidKey(Object? o) => o is Key;`, the corpus's equality.dart
+    /// family).
+    #[test]
+    fn is_expression_folds_to_its_own_bool_row() {
+        let source = "class Object {} class bool {} class Key {} \
+                      bool isValidKey(Object? o) => o is Key;";
+        let names = code_names(&report(source));
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// The `as` expression folds to the cast target's type: the chain's next
+    /// segment resolves on the target, not the operand's type
+    /// (`(v as Comparable<Object?>).compareTo(o)` reads Comparable's face —
+    /// the corpus's utils.dart `defaultCompare` row).
+    #[test]
+    fn as_expression_folds_to_the_cast_target() {
+        let source = "class Object {} class int {} \
+                      class Comparable<T> { int compareTo(T other) => 1; } \
+                      int defaultCompare(Object? a, Object? b) => \
+                      (a as Comparable<Object?>).compareTo(b);";
+        let names = code_names(&report(source));
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// The dart:core `Comparator<T>` alias face: the callable verdict (the
+    /// invocation face spares it) and the send's `int` return both read it —
+    /// the corpus's `isSorted`/`compareBy` `invocation_of_non_function`
+    /// family (the SDK typedef is unindexed, the bounds tables never carry
+    /// it).
+    #[test]
+    fn core_comparator_alias_invokes_and_returns_int() {
+        let source = "class int {} class Comparator<T> {} \
+                      int f<T>(Comparator<T> compare, T a) { return compare(a, a); }";
+        let names = code_names(&report(source));
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// The raw-generic argument face: a member formal that still spells the
+    /// declaring container's own type parameter (`Equality` used raw leaves
+    /// `equals`'s `E` unsubstituted — the oracle's raw-type erasure answers
+    /// the bound) never stages an `argument_type_not_assignable` row — the
+    /// corpus's `_base.equals(e1, e2)` family.
+    #[test]
+    fn raw_generic_receiver_suppresses_the_unbound_formal_face() {
+        let source = "class Object {} class bool {} \
+                      class Equality<E> { bool equals(E a, E b) => true; } \
+                      class Deep { Equality base = Equality(); } \
+                      bool f(Deep d, Object? a) => d.base.equals(a, a);";
+        let names = code_names(&report(source));
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// The accessor-twin face: an inherited FIELD induces the setter face
+    /// (`_CastQueueList`'s `set _head` overrides `QueueList`'s
+    /// `int _head` field — the corpus's queue_list.dart setter rows).
+    #[test]
+    fn inherited_field_induces_the_setter_override_face() {
+        let source = "class int {} \
+                      class Q { int _head = 0; int read() => _head; } \
+                      class CQ extends Q { @override set _head(int v) {} }";
+        let names = code_names(&report(source));
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// The dead-coalesce left operand is the index READ, not the receiver:
+    /// `m[k] ??= v` reads through `Map.[]`'s `V?` — the receiver row's
+    /// non-nullability is not the read's (the corpus's `groupSetsBy`/
+    /// `groupBy` rows).
+    #[test]
+    fn index_compound_write_never_reads_the_receiver_nullability() {
+        let source = "class Object {} class V {} \
+                      class M { V? operator [](Object? k) => null; \
+                      void operator []=(Object? k, V v) {} } \
+                      void f(M m, Object? k, V v) { m[k] ??= v; }";
+        let names = code_names(&report(source));
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// A superclass-constructor invocation counts as the named constructor's
+    /// reference: `super._(...)` spares `A._` from `unused_element` (the
+    /// corpus's `QueueList._`/`BoolList._`, whose only uses are subclass
+    /// `super._` initializers).
+    #[test]
+    fn super_constructor_invocation_spared_the_named_ctor() {
+        let source = "class int {} \
+                      class A { A._(int x); A.p(int y); } \
+                      class B extends A { B() : super._(1); } \
+                      void f() { B(); }";
+        let names = code_names(&report(source));
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// A scoped container the broken chain preempted is not an instance
+    /// member: `HashSet<T>()` in a field initializer of a class whose
+    /// `implements Iterator<T>` hop is unindexed keeps the initializer face
+    /// silent (the corpus's `_DeduplicatingIterator._emitted` row).
+    #[test]
+    fn broken_chain_does_not_claim_the_field_initializer_face() {
+        let source = "class HashSet<T> {} \
+                      class D<T> implements Iterator<T> { final h = HashSet<T>(); }";
+        let names = code_names(&report_with_core_faces(source));
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// An in-scope type-parameter cast target rides its bound: `null as T`
+    /// over an unbounded `T` is a legal null cast, the folded row types `T`,
+    /// and the return face accepts it (the corpus's `CombinedIterator.current`
+    /// `return null as T` rows).
+    #[test]
+    fn null_cast_to_a_type_parameter_target_stays_silent() {
+        let source = "class I<T> { T get current => null as T; }";
+        let names = code_names(&report(source));
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// An extension's `this` types as its `on` type, and the unindexed
+    /// `Comparator<T>` alias head is the callable face (`compareBy`'s
+    /// `(R a, R b) => this(keyOf(a), keyOf(b))` — the corpus's
+    /// iterable_extensions.dart `this(...)` rows).
+    #[test]
+    fn extension_this_invokes_through_the_on_type_alias() {
+        let source = "class int {} class Comparator<T> {} \
+                      extension E<T> on Comparator<T> { int inv(T x) => this(x, x); }";
+        let names = code_names(&report(source));
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// The dead-coalesce target search skips the key send's row too:
+    /// `m[k(v)] ??= v` reads through `Map.[]`'s `V?` — the invoked key's
+    /// non-null return type is not the read's (the corpus's `groupBy` row,
+    /// `functions.dart:59`).
+    #[test]
+    fn invoked_key_never_anchors_the_dead_coalesce() {
+        let source = "class Object {} class V {} \
+                      class M { V? operator [](Object? k) => null; \
+                      void operator []=(Object? k, V v) {} } \
+                      Object? key(Object? o) => o; \
+                      void f(M m, V v) { m[key(v)] ??= v; }";
+        let names = code_names(&report(source));
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// The compound-write mark rides the receiver row BELOW the right
+    /// operand's rows, and bare rows between them (`k`, a non-null `K`) must
+    /// not become the target: the mark scan filters past the RHS rows
+    /// instead of stopping at the first one (the corpus's `groupBy` row,
+    /// `functions.dart:59` — a for-in header row kept the fallthrough alive).
+    #[test]
+    fn compound_mark_scan_reaches_through_the_right_operand_rows() {
+        let source = "class Object {} class V {} class K {} class I<T> {} \
+                      class M { V? operator [](Object? k) => null; \
+                      void operator []=(Object? k, V v) {} } \
+                      void f(I<M> ms, K k, V v) { for (var m in ms) { (m[k] ??= v); } }";
+        let names = code_names(&report(source));
+        assert!(names.is_empty(), "{names:?}");
     }
 
     /// `const x = Missing()` — an unresolved callee inside a const
