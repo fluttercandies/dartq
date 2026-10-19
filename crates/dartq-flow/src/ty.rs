@@ -199,6 +199,40 @@ pub trait TypeOps {
         let _ = (ty, args, arena, names);
         false
     }
+
+    /// Publishes the recorder's interned-name lexeme table to the back-end
+    /// before a replay begins (`Interp::run`'s single call). The base ops
+    /// take bare `Ty`s — a `Base::Name(id)` carries no lexeme of its own —
+    /// so a resolved back-end builds its `name id → type` bindings here,
+    /// incrementally: `names` only ever grows inside a unit, one forward
+    /// scan covers the ids seen since the last call. The default ignores the
+    /// table: [`NameTypeOps`] decides on the `Ty` spelling alone.
+    fn observe_names(&self, names: &[Box<str>]) {
+        let _ = names;
+    }
+
+    /// [`TypeOps::factor`] with the operand spellings' written-argument
+    /// trees: `from_args`/`what_args` are arena indices into `arena`
+    /// ([`EMPTY_ARGS`] when argument-less) and `names` the recorder's
+    /// lexeme table. The argument face decides questions the bare `Ty`s
+    /// cannot — `factor(Response, Response<T>)`: the bare `Ty`s compare
+    /// equal (same name, same nullability) yet the instantiated forms
+    /// `Response<dynamic>` vs `Response<T>` are not mutual subtypes, so the
+    /// remainder is `Response`, not `Never` (factor_type.dart's
+    /// instantiated-type arm). The default delegates to
+    /// [`TypeOps::factor`] — identical answers to the pre-hook behavior.
+    fn factor_typed(
+        &self,
+        from: Ty,
+        from_args: u32,
+        what: Ty,
+        what_args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> Ty {
+        let _ = (from_args, what_args, arena, names);
+        self.factor(from, what)
+    }
 }
 
 /// The name-level default implementation. Rules, in order:

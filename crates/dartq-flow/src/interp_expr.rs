@@ -1450,7 +1450,7 @@ impl Interp<'_> {
                 {
                     return None;
                 }
-                self.factored_candidate(var, tested)
+                self.factored_candidate_args(var, tested, tested_args)
             }
         }
     }
@@ -1467,11 +1467,40 @@ impl Interp<'_> {
     /// the remainder instead would promote `x` to `Never?` on the
     /// `x is int?`-after-`int` shape — the `bool`-corruption face.
     pub(crate) fn factored_candidate(&self, var: u32, tested: Ty) -> Option<Ty> {
+        self.factored_candidate_args(var, tested, crate::ty::EMPTY_ARGS)
+    }
+
+    /// [`Self::factored_candidate`] carrying the tested spelling's written
+    /// arguments: the coverage factoring compares instantiated forms, not
+    /// bare `Ty`s (`Response<T>` is not covered by a `Response` chain entry
+    /// — a strict narrowing is a real step, factor_type.dart's
+    /// instantiated-type arm). Callers without a tested-args face keep the
+    /// argument-less fast path ([`Self::factored_candidate`]).
+    pub(crate) fn factored_candidate_args(
+        &self,
+        var: u32,
+        tested: Ty,
+        tested_args: u32,
+    ) -> Option<Ty> {
         let model = self.current.model(var);
         let previous = self.promoted_type_of(var, &model);
         let mut remainder = tested;
-        for ty in self.lists.iter(model.promoted) {
-            remainder = self.ops.factor(remainder, ty);
+        let mut remainder_args = tested_args;
+        for (ty, args) in self.lists.iter_entries(model.promoted) {
+            remainder = self.ops.factor_typed(
+                remainder,
+                remainder_args,
+                ty,
+                args,
+                self.args,
+                self.names,
+            );
+            // `factor` answers with a `from`-derived spelling (the kept
+            // remainder) or `Never`; only the `Never` arm loses the
+            // argument face.
+            if remainder == Ty::NEVER {
+                remainder_args = crate::ty::EMPTY_ARGS;
+            }
         }
         if self.ops.is_bottom(remainder) || self.ops.is_subtype(previous, tested) {
             None
@@ -1588,7 +1617,18 @@ impl Interp<'_> {
             Some((tested, tested_args)),
             promoted.map(|ty| (ty, tested_args)),
         );
-        let factored = self.ops.factor(previous, tested);
+        // The unmatched remainder carries the operand spellings' written
+        // arguments: `factor(Response, Response<T>)` on bare `Ty`s compares
+        // equal and deads the else branch; the instantiated forms keep it
+        // live (factor_type.dart's instantiated-type arm, #2186 S4-C).
+        let factored = self.ops.factor_typed(
+            previous,
+            previous_args,
+            tested,
+            tested_args,
+            self.args,
+            self.names,
+        );
         let unmatched = if self.ops.is_bottom(factored) {
             self.current.clone().set_unreachable(&mut self.reach)
         } else {

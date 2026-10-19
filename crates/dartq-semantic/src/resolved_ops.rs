@@ -127,6 +127,18 @@ pub struct LibraryTypes {
     /// function or variable): a spelling that resolves to one maps
     /// `Invalid` rather than borrowing a same-named builtin.
     non_containers: FxHashSet<StringId>,
+    /// Type-parameter spellings → a synthetic parameter id each
+    /// (`MicroKind::TypeParam` declarations). Declaration-scoped in the
+    /// official element model but name-keyed here exactly like the flow
+    /// layer's own spelling-keyed model: a name declared as a type
+    /// parameter maps to a [`TypeKind::TypeParameter`] instead of
+    /// `Invalid` — `Response<T>`'s `T` keeps the subtype rules'
+    /// parameter arms live (`dynamic <: T` fails, so the instantiated
+    /// pair is not a subtype) rather than suppressing through `Invalid`
+    /// (#2186 S4-C). Two same-spelled parameters in sibling scopes share
+    /// the id — reflexive `T <: T` answers `true` either way, the only
+    /// question identity changes.
+    type_params: FxHashMap<StringId, TypeParamId>,
 }
 
 impl LibraryTypes {
@@ -170,6 +182,7 @@ impl LibraryTypes {
         let mut decl_params: FxHashMap<TypeDeclId, Vec<TypeParamId>> = FxHashMap::default();
         let decl_owner: FxHashMap<TypeDeclId, (FileId, LibraryId)> = FxHashMap::default();
         let non_containers: FxHashSet<StringId> = FxHashSet::default();
+        let type_params: FxHashMap<StringId, TypeParamId> = FxHashMap::default();
         let mut next_decl = FIRST_BUILTIN_RAW;
         let mut next_param = 2_u32;
 
@@ -217,6 +230,7 @@ impl LibraryTypes {
             decl_params,
             decl_owner,
             non_containers,
+            type_params,
             facts,
             next_decl: FIRST_CONTAINER_RAW,
             next_param,
@@ -274,6 +288,7 @@ impl LibraryTypes {
             decl_params,
             decl_owner,
             non_containers,
+            type_params,
             facts,
             ..
         } = registry;
@@ -377,6 +392,7 @@ impl LibraryTypes {
             facts,
             decl_params,
             non_containers,
+            type_params,
         }
     }
 }
@@ -414,6 +430,10 @@ struct Registry {
     decl_params: FxHashMap<TypeDeclId, Vec<TypeParamId>>,
     decl_owner: FxHashMap<TypeDeclId, (FileId, LibraryId)>,
     non_containers: FxHashSet<StringId>,
+    /// Type-parameter spellings → their synthetic parameter ids: the
+    /// `TypeKind::TypeParameter` map the adapter answers instead of
+    /// `Invalid` for a `T`-shaped name (#2186 S4-C).
+    type_params: FxHashMap<StringId, TypeParamId>,
     facts: ParamFactsTable,
     next_decl: u32,
     next_param: u32,
@@ -474,9 +494,21 @@ impl Registry {
         }
         // A non-container top-level declaration of a name stays out of
         // the registry — mark it so the adapter never borrows a
-        // same-named builtin or co-declared container.
+        // same-named builtin or co-declared container. Type parameters
+        // stay out of both sets: their spellings map to the synthetic
+        // `TypeParameter` ids below, one per name (declaration-scoped in
+        // the element model, name-keyed here like the flow layer).
         for (name, decl) in elements.declarations() {
             if self.registry.contains_key(&name) {
+                continue;
+            }
+            if decl.kind == MicroKind::TypeParam {
+                if !self.type_params.contains_key(&name) {
+                    let param = TypeParamId::from_raw(self.next_param);
+                    self.next_param += 1;
+                    self.facts.set(param, ParamFacts::LEGACY);
+                    self.type_params.insert(name, param);
+                }
                 continue;
             }
             let container_like = matches!(
@@ -626,10 +658,12 @@ impl<'a> ResolvedTypeOps<'a> {
     /// Extends the `name_id → (non-null, nullable)` binding through
     /// `names` — one forward scan covering the ids seen since the last
     /// call. A `Base::Name` spelling whose decl is registered maps to its
-    /// to-bounds interface (interned once per nullability face);
-    /// everything else (a type parameter, a local function, a synthetic
-    /// `#<handle>` token, an unindexed import) caches the `Invalid`
-    /// pair.
+    /// to-bounds interface (interned once per nullability face); a
+    /// type-parameter spelling maps to its synthetic [`TypeParameter`]
+    /// id; `FutureOr` maps to `FutureOr<dynamic>` (the raw-type face
+    /// `map_future_or`'s argument-less arm produces); everything else
+    /// (a typedef, a local function, a synthetic `#<handle>` token, an
+    /// unindexed import) caches the `Invalid` pair.
     fn observe_names(&self, names: &[Box<str>]) {
         let mut cache = self.name_ty.borrow_mut();
         let start = cache.len();
@@ -639,40 +673,62 @@ impl<'a> ResolvedTypeOps<'a> {
         cache.reserve(names.len() - start);
         for lexeme in &names[start..] {
             let name = self.strings.intern(lexeme);
-            let pair = self
-                .snapshot
-                .registry
-                .get(&name)
-                .filter(|_| !self.snapshot.non_containers.contains(&name))
-                .and_then(|&decl| {
-                    let params = self
-                        .snapshot
-                        .decl_params
-                        .get(&decl)
-                        .map_or(&[][..], Vec::as_slice);
-                    let args = if params.is_empty() {
-                        Vec::new()
-                    } else {
-                        instantiate_type_formals_to_bounds(
-                            &self.snapshot.table,
-                            &self.snapshot.facts,
-                            params,
-                        )
-                        .defaults
-                    };
-                    Some((decl, args))
-                })
-                .map_or((self.invalid, self.invalid), |(decl, args)| {
-                    let non_null = self.snapshot.table.intern(
-                        UninternedType::Interface { decl, args: args.clone() },
+            let pair = if let Some(&param) = self.snapshot.type_params.get(&name) {
+                (
+                    self.snapshot.table.intern(
+                        UninternedType::TypeParameter { parameter: param },
                         false,
-                    );
-                    let nullable = self.snapshot.table.intern(
-                        UninternedType::Interface { decl, args },
+                    ),
+                    self.snapshot.table.intern(
+                        UninternedType::TypeParameter { parameter: param },
                         true,
-                    );
-                    (non_null, nullable)
-                });
+                    ),
+                )
+            } else if lexeme.as_ref() == "FutureOr" {
+                let non_null = self.snapshot.table.intern(
+                    UninternedType::FutureOr { base: self.dynamic },
+                    false,
+                );
+                let nullable = self.snapshot.table.intern(
+                    UninternedType::FutureOr { base: self.dynamic },
+                    true,
+                );
+                (non_null, nullable)
+            } else {
+                self.snapshot
+                    .registry
+                    .get(&name)
+                    .filter(|_| !self.snapshot.non_containers.contains(&name))
+                    .and_then(|&decl| {
+                        let params = self
+                            .snapshot
+                            .decl_params
+                            .get(&decl)
+                            .map_or(&[][..], Vec::as_slice);
+                        let args = if params.is_empty() {
+                            Vec::new()
+                        } else {
+                            instantiate_type_formals_to_bounds(
+                                &self.snapshot.table,
+                                &self.snapshot.facts,
+                                params,
+                            )
+                            .defaults
+                        };
+                        Some((decl, args))
+                    })
+                    .map_or((self.invalid, self.invalid), |(decl, args)| {
+                        let non_null = self.snapshot.table.intern(
+                            UninternedType::Interface { decl, args: args.clone() },
+                            false,
+                        );
+                        let nullable = self.snapshot.table.intern(
+                            UninternedType::Interface { decl, args },
+                            true,
+                        );
+                        (non_null, nullable)
+                    })
+            };
             cache.push(pair);
         }
     }
@@ -742,6 +798,14 @@ impl<'a> ResolvedTypeOps<'a> {
                     return self.invalid;
                 };
                 let name = self.strings.intern(lexeme);
+                // A parameter named `FutureOr` shadows the core type — the
+                // same precedence `observe_names` uses.
+                if let Some(&param) = self.snapshot.type_params.get(&name) {
+                    return self
+                        .snapshot
+                        .table
+                        .intern(UninternedType::TypeParameter { parameter: param }, node.nullable);
+                }
                 if lexeme.as_ref() == "FutureOr" {
                     return self.map_future_or(node.args, arena, names, node.nullable);
                 }
@@ -844,6 +908,12 @@ impl<'a> ResolvedTypeOps<'a> {
                     return self.invalid;
                 };
                 let name = self.strings.intern(lexeme);
+                if let Some(&param) = self.snapshot.type_params.get(&name) {
+                    return self
+                        .snapshot
+                        .table
+                        .intern(UninternedType::TypeParameter { parameter: param }, ty.nullable);
+                }
                 if lexeme.as_ref() == "FutureOr" {
                     return self.map_future_or(args, arena, names, ty.nullable);
                 }
@@ -1005,6 +1075,67 @@ impl TypeOps for ResolvedTypeOps<'_> {
             // open arms: `false` keeps the post-switch state live.
             _ => false,
         }
+    }
+
+    /// The name-observation hook `Interp::run` calls once per replay: a
+    /// forward scan extends the `name_ty` bindings to every name the unit
+    /// has interned so far, so the base ops resolve through the hierarchy
+    /// even when no switch probe runs (#2204 phase B — the ops mounting
+    /// alone widened `is_always_exhaustive`; this widens the six base
+    /// ops to the same world).
+    fn observe_names(&self, names: &[Box<str>]) {
+        ResolvedTypeOps::observe_names(self, names);
+    }
+
+    /// [`NameTypeOps::factor`] over the instantiated forms: both operand
+    /// spellings map with their written arguments (`Response` reads
+    /// `Response<dynamic>`, `Response<T>` reads the parameter) and the
+    /// remainder verdict answers through [`TypeSystem::is_subtype`] —
+    /// `factor(Response, Response<T>)` keeps `Response` where the bare
+    /// `Ty`s' name equality would answer `Never` and dead the else
+    /// branch (#2186 S4-C). An unmappable arm — an unresolved head, an
+    /// arity mismatch, an `Invalid` face — falls back to the name-level
+    /// answer verbatim.
+    fn factor_typed(
+        &self,
+        from: FlowTy,
+        from_args: u32,
+        what: FlowTy,
+        what_args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> FlowTy {
+        self.observe_names(names);
+        let f = self.map_scrutinee(from, from_args, arena, names);
+        let w = self.map_scrutinee(what, what_args, arena, names);
+        if matches!(
+            self.snapshot.table.get(w).kind(),
+            TypeKind::Invalid
+        ) || matches!(self.snapshot.table.get(f).kind(), TypeKind::Invalid)
+        {
+            return NameTypeOps.factor(from, what);
+        }
+        if self.system.is_subtype(f, w) {
+            return FlowTy::NEVER;
+        }
+        // Rule 2 of factorType (factor_type.dart:25-31): `R?` factors as
+        // `factor(R, what)` when `Null <: what`, else `factor(R, what)?`
+        // — the resolved face answers the null-half question through
+        // `is_subtype(Null, what)` exactly like the arg-less arm.
+        if from.nullable
+            && !matches!(
+                from.base,
+                Base::Dynamic | Base::Unknown | Base::Void | Base::Null | Base::Never
+            )
+        {
+            if self.system.is_subtype(self.null, w) {
+                return self.factor_typed(from.non_null(), from_args, what, what_args, arena, names);
+            }
+            return self
+                .factor_typed(from.non_null(), from_args, what, what_args, arena, names)
+                .make_nullable();
+        }
+        from
     }
 }
 
@@ -1344,6 +1475,226 @@ mod tests {
         assert!(
             !codes.contains(&"body_might_complete_normally"),
             "imported sealed switch should close: {codes:?}"
+        );
+    }
+
+    /// Phase B widened base ops: `observe_names` lets `is_subtype`,
+    /// `classify`, `is_bottom`, `promote_to_non_null`, `try_promote_to`,
+    /// and `factor` answer through the hierarchy for every interned name,
+    /// and the observed-but-unregistered face keeps the `Invalid`
+    /// suppress posture rather than the name-level answer — while a
+    /// never-observed `Base::Name` id still falls back to
+    /// `NameTypeOps` verbatim.
+    #[test]
+    fn widened_ops_resolve_observed_names_and_fall_back_unobserved() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let elements = unit(
+            "class Base {} class Derived extends Base {} class Open {} typedef Alias = Base;",
+            &strings,
+            &mut files,
+            "u.dart",
+        );
+        let file = files.try_file_id(Path::new("u.dart")).unwrap();
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/u.dart");
+        builder.unit(lib, file);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
+        let ops = ResolvedTypeOps::new(&library_types, &strings);
+
+        // `names` is the recorder's table — ids index into it.
+        let names: Vec<Box<str>> = vec![
+            "Base".into(),    // 0
+            "Derived".into(), // 1
+            "Open".into(),    // 2
+            "Alias".into(),   // 3 — a typedef: registered non-container
+            "Missing".into(), // 4 — declared nowhere
+        ];
+        ops.observe_names(&names);
+        let base = Ty {
+            base: Base::Name(0),
+            nullable: false,
+        };
+        let derived = Ty {
+            base: Base::Name(1),
+            nullable: false,
+        };
+        let open = Ty {
+            base: Base::Name(2),
+            nullable: false,
+        };
+        let alias = Ty {
+            base: Base::Name(3),
+            nullable: false,
+        };
+        let missing = Ty {
+            base: Base::Name(4),
+            nullable: false,
+        };
+        // An id past the observed table — the unobserved arm.
+        let unobserved = Ty {
+            base: Base::Name(9),
+            nullable: false,
+        };
+
+        // `is_subtype`: the resolved face answers the real hierarchy
+        // (`Derived <: Base`, never `Base <: Derived`); the name level
+        // refuses both directions on distinct ids.
+        assert!(ops.is_subtype(derived, base));
+        assert!(!ops.is_subtype(base, derived));
+        assert!(ops.is_subtype(base, base));
+        // `classify`: a registered non-null interface is non-nullable.
+        assert_eq!(ops.classify(base), Classification::NonNullable);
+        assert_eq!(
+            ops.classify(Ty {
+                base: Base::Name(0),
+                nullable: true,
+            }),
+            Classification::PotentiallyNullable
+        );
+        // `is_bottom`: a registered decl is never bottom; `Never` is.
+        assert!(!ops.is_bottom(base));
+        assert!(ops.is_bottom(Ty::NEVER));
+        // `promote_to_non_null`: `Base?` strips to `Base`, `dynamic` stays.
+        assert_eq!(
+            ops.promote_to_non_null(Ty {
+                base: Base::Name(0),
+                nullable: true,
+            }),
+            base,
+        );
+        assert_eq!(ops.promote_to_non_null(Ty::DYNAMIC), Ty::DYNAMIC);
+        // `try_promote_to`: `Derived` is a valid promotion target under
+        // `Base` (a real subtype), `Base` under `Derived` is not — the
+        // resolved subtype gate, where the name level can only compare
+        // ids.
+        assert_eq!(ops.try_promote_to(derived, base), Some(derived));
+        assert_eq!(ops.try_promote_to(base, derived), None);
+        // `factor`: `factor(Derived, Base)` is `Never` (Derived <: Base),
+        // `factor(Base, Derived)` keeps `Base`.
+        assert_eq!(ops.factor(derived, base), Ty::NEVER);
+        assert_eq!(ops.factor(base, derived), base);
+
+        // The unobserved arm falls back to `NameTypeOps` verbatim:
+        // distinct ids are never subtypes, the spelling classifies
+        // non-nullable, and the promotion gate answers name-equality only.
+        assert!(!ops.is_subtype(unobserved, base));
+        assert!(!ops.is_subtype(base, unobserved));
+        assert_eq!(ops.classify(unobserved), Classification::NonNullable);
+        assert!(!ops.is_bottom(unobserved));
+        assert_eq!(
+            ops.try_promote_to(unobserved, base),
+            NameTypeOps.try_promote_to(unobserved, base)
+        );
+        assert_eq!(
+            ops.factor(unobserved, base),
+            NameTypeOps.factor(unobserved, base)
+        );
+
+        // The observed-but-unregistered face answers through `Invalid`
+        // (the suppress posture), not through the name-level rules: a
+        // typedef's name is never a decl, and `Missing` is declared
+        // nowhere — both map `Invalid`, so `is_subtype` answers `true`
+        // (subtype.dart's 0c arm) where `NameTypeOps` says `false`.
+        assert!(ops.is_subtype(alias, base));
+        assert!(ops.is_subtype(missing, open));
+    }
+
+    /// S4-C (#2186): a negated type test whose tested type carries
+    /// written arguments must not dead the else branch. `factor(Response,
+    /// Response<T>)` compares equal on bare `Ty`s (same name) but the
+    /// instantiated forms are not mutual subtypes, so the unmatched
+    /// remainder keeps `Response` — the promoted receiver's member read
+    /// resolves and no `undefined_getter`/`undefined_method` reports.
+    #[test]
+    fn is_not_promotion_keeps_the_remainder_under_generic_tested() {
+        let codes = diagnose_codes(
+            "class Response<T> { T? data; int get statusCode => 0; } \
+             void f<T>(Object response) { \
+               if (response is! Response) { return; } \
+               if (response is! Response<T>) { response.data; response.statusCode; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"undefined_getter"),
+            "the is! remainder must keep Response: {codes:?}"
+        );
+        assert!(
+            !codes.contains(&"undefined_method"),
+            "the is! remainder must keep Response: {codes:?}"
+        );
+        // The name-level parity: the same source must report nothing on
+        // the unmounted fold either — the name-level `factor` already
+        // compares `Ty`s, so this pins the absence of a regression where
+        // the resolved face would diverge.
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let source = "class Response<T> { T? data; int get statusCode => 0; } \
+                      void f<T>(Object response) { \
+                        if (response is! Response) { return; } \
+                        if (response is! Response<T>) { response.data; } \
+                      }";
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty());
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        builder.unit(lib, file);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let fold = fold_unit_with_ops(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+            None,
+        );
+        let codes: Vec<&'static str> = fold
+            .report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect();
+        assert!(
+            !codes.contains(&"undefined_getter"),
+            "the name-level fold must stay silent here too: {codes:?}"
         );
     }
 }

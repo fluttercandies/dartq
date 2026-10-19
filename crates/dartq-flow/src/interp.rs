@@ -959,6 +959,11 @@ impl<'o> Interp<'o> {
     /// Runs one executable's buffer: the pre-pass collect, then the real
     /// replay.
     pub(crate) fn run(&mut self, events: &[Ev]) {
+        // A resolved back-end builds its `Base::Name` bindings from the
+        // recorder's lexeme table before the first question arrives — the
+        // incremental scan costs one bounds check for a name-level impl
+        // (the default no-op) and one forward slice for a mounted one.
+        self.ops.observe_names(self.names);
         let match_of = build_match_map(events);
         self.anywhere = self.collect_ranges(events, 0..events.len(), &match_of);
         let mut i = 0;
