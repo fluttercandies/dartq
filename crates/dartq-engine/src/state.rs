@@ -434,6 +434,76 @@ pub(crate) fn use_view_of(surface: &LibraryIndex) -> UseView {
         .into_boxed_slice()
 }
 
+/// One member entry's owned heap bytes: the boxed slices behind its
+/// type-parameter names, annotations, and formals (the `Formals` shell
+/// itself is a `Box` in the entry, already inside the entry's
+/// `size_of::<MemberEntry>()` — only the payloads count).
+fn member_heap_bytes(member: &dartq_semantic::MemberEntry) -> usize {
+    std::mem::size_of_val(&*member.type_param_names)
+        + std::mem::size_of_val(&*member.annotations)
+        + member.formals.as_deref().map_or(0, |formals| {
+            std::mem::size_of_val(formals)
+                + std::mem::size_of_val(&*formals.positional)
+                + std::mem::size_of_val(&*formals.named)
+        })
+}
+
+/// One [`FileElements`] model's enumerable heap bytes — the element
+/// models ride `Arc<FileElements>` behind residency and the facts cache
+/// and are the parse side's standing product. Exact over the enumerable
+/// columns (the `NameMap` rows, the clause vectors, the boxed slices);
+/// the `ArgPool` interning tables and the `Ty` enum's nested payloads are
+/// not enumerable from this crate, so the total under-reports by that
+/// residue — bounded by the interned-type count, not file size (the
+/// family is tagged `est` for it).
+fn element_heap_bytes(elements: &FileElements) -> usize {
+    let mut bytes = std::mem::size_of_val(elements)
+        + elements.declarations().count()
+            * (size_of::<StringId>() + size_of::<dartq_semantic::TopDecl>())
+        + elements.containers().count()
+            * (size_of::<StringId>() + size_of::<dartq_semantic::Container>())
+        + std::mem::size_of_val(elements.container_order())
+        + std::mem::size_of_val(elements.extension_faces())
+        + std::mem::size_of_val(elements.duplicates())
+        + std::mem::size_of_val(elements.arity_violations())
+        + std::mem::size_of_val(elements.type_args());
+    for (_, container) in elements.containers() {
+        bytes += container.members.len()
+            * (size_of::<StringId>() + size_of::<dartq_semantic::MemberEntry>())
+            + std::mem::size_of_val(container.with_clause.as_slice())
+            + std::mem::size_of_val(container.implements_clause.as_slice())
+            + std::mem::size_of_val(container.on_clause.as_slice())
+            + std::mem::size_of_val(container.header_residue.as_slice())
+            + std::mem::size_of_val(&*container.primary_formals)
+            + std::mem::size_of_val(container.enum_constants.as_slice())
+            + std::mem::size_of_val(&*container.constructors)
+            + std::mem::size_of_val(&*container.annotations)
+            + container.ctor_formals.len()
+                * (size_of::<StringId>() + size_of::<usize>())
+            + container
+                .ctor_formals
+                .values()
+                .map(|formals| {
+                    std::mem::size_of_val(&**formals)
+                        + std::mem::size_of_val(&*formals.positional)
+                        + std::mem::size_of_val(&*formals.named)
+                })
+                .sum::<usize>()
+            + container
+                .members
+                .values()
+                .map(member_heap_bytes)
+                .sum::<usize>();
+    }
+    for face in elements.extension_faces() {
+        bytes += face.members.len()
+            * (size_of::<StringId>() + size_of::<dartq_semantic::MemberEntry>())
+            + std::mem::size_of_val(&*face.type_param_names)
+            + face.members.values().map(member_heap_bytes).sum::<usize>();
+    }
+    bytes
+}
+
 /// The deepest entry of `map` whose key contains `path`, probing the
 /// path's own ancestor chain deepest-first ([`Path::ancestors`] — the
 /// `Engine::apply_severity_options` lookup shape). The containing keys of
@@ -2063,35 +2133,74 @@ impl EngineState {
                 + unit.diagnostics.len() * size_of::<Diagnostic>();
         }
         let (captures, surfaces) = self.index_bytes();
-        let semdiag = {
+        let (semdiag, semdiag_slots) = {
             let memo = self.semdiag.lock().unwrap_or_else(PoisonError::into_inner);
-            memo.folds
-                .values()
-                .map(|fold| fold.heap_bytes())
-                .sum::<usize>()
+            (
+                memo.folds
+                    .values()
+                    .map(|fold| fold.heap_bytes())
+                    .sum::<usize>(),
+                memo.folds.capacity()
+                    * (size_of::<(FileId, Arc<crate::semdiag::MemberFold>)>() + 1),
+            )
         };
         let results = self
             .results
             .values()
             .map(|result| result.diagnostics.capacity() * size_of::<Arc<Diagnostic>>())
             .sum::<usize>();
-        let merged = self
-            .merged
-            .as_ref()
-            .map_or(0, |merged| merged.output.capacity() * size_of::<Diagnostic>());
+        let results_map = self.results.capacity()
+            * (size_of::<(LibraryId, LibraryResult)>() + 1);
+        let (merged, merged_contributors) = self.merged.as_ref().map_or((0, 0), |merged| {
+            (
+                merged.output.capacity() * size_of::<Diagnostic>(),
+                merged.contributors.capacity() * size_of::<(LibraryId, u32)>(),
+            )
+        });
         let scanned = self
             .scanned
             .values()
             .map(|face| face.tokens.len() * (size_of::<dartq_scanner::Token>() + 4))
             .sum::<usize>();
+        let scanned_slots = self.scanned.capacity()
+            * (size_of::<(FactsKey, Arc<ScannedFace>)>() + 1);
+        let element_models = self
+            .residency
+            .values()
+            .map(|unit| element_heap_bytes(&unit.elements))
+            .sum::<usize>();
+        // The facts cache's payloads share the residency shape; entries
+        // share `Arc`s with live facts (a live file's cache entry adds no
+        // payload), so summing the full composition double-counts what
+        // residency already reports. Counted anyway — the family answers
+        // "what the cache pins", the same conservatism `warm_start` gets.
+        let cached_facts = self
+            .facts_cache
+            .values()
+            .map(|unit| {
+                size_of::<UnitFacts>()
+                    + unit.line_index.line_count() as usize * size_of::<u32>()
+                    + unit.directives.capacity() * size_of::<DirectiveFacts>()
+                    + unit.diagnostics.capacity() * size_of::<Arc<Diagnostic>>()
+                    + element_heap_bytes(&unit.elements)
+            })
+            .sum::<usize>();
+        let facts_cache_slots = self.facts_cache.capacity()
+            * (size_of::<(FactsKey, Arc<UnitFacts>)>() + 1);
+        let (warm_start, warm_start_slots) = self.warm_start_bytes();
+        let session_scratch = self.session_scratch_bytes();
+        let residency_slots = self.residency.capacity()
+            * (size_of::<(FileId, Arc<UnitFacts>)>() + 1);
         let as_u64 = |bytes: usize| bytes as u64;
         vec![
             ("store_bytes", self.store.len_bytes(), "exact"),
             ("store_mapped_bytes", self.store.mapped_bytes(), "exact"),
             ("residency_facts_shell", as_u64(facts), "exact"),
+            ("residency_map_slots", as_u64(residency_slots), "exact"),
             ("residency_line_index", as_u64(line_index), "exact"),
             ("residency_directives", as_u64(directives), "exact"),
             ("residency_diagnostic_rows", as_u64(fact_rows), "est"),
+            ("residency_element_models", as_u64(element_models), "est"),
             ("index_captures", as_u64(captures), "exact"),
             ("index_library_surfaces", as_u64(surfaces), "exact"),
             (
@@ -2101,9 +2210,18 @@ impl EngineState {
             ),
             ("graph_maps", self.graph_maps_bytes(), "exact"),
             ("semdiag_memo", as_u64(semdiag), "exact"),
+            ("semdiag_map_slots", as_u64(semdiag_slots), "exact"),
             ("library_results_handles", as_u64(results), "exact"),
+            ("library_results_map", as_u64(results_map), "exact"),
             ("merged_output_rows", as_u64(merged), "exact"),
+            ("merged_contributor_rows", as_u64(merged_contributors), "exact"),
             ("scanned_cache_tokens", as_u64(scanned), "exact"),
+            ("scanned_map_slots", as_u64(scanned_slots), "exact"),
+            ("facts_cache_facts", as_u64(cached_facts), "est"),
+            ("facts_cache_map_slots", as_u64(facts_cache_slots), "exact"),
+            ("warm_start_payloads", as_u64(warm_start), "est"),
+            ("warm_start_map_slots", as_u64(warm_start_slots), "exact"),
+            ("session_scratch", as_u64(session_scratch), "exact"),
             ("scanned_cache_entries", self.scanned.len() as u64, "count"),
             ("facts_cache_entries", self.facts_cache.len() as u64, "count"),
             ("warm_start_entries", self.warm_start.len() as u64, "count"),
@@ -2111,6 +2229,95 @@ impl EngineState {
             ("string_table_entries", self.strings.len() as u64, "count"),
             ("structural_tables", self.structural_bytes(), "est"),
         ]
+    }
+
+    /// Warm-start staging's byte split: the payload heap at capacity (the
+    /// payload's own `Vec`/`String` columns — shallow over the
+    /// serde-mirrored tree, deep walks cost more than the family recovers,
+    /// so the column-level capacities plus the string bytes stand in as
+    /// `est`) plus the map slots (exact).
+    fn warm_start_bytes(&self) -> (usize, usize) {
+        let payloads = self
+            .warm_start
+            .values()
+            .map(|facts| {
+                size_of::<persist::PersistedFacts>()
+                    + facts.directives.capacity()
+                        * size_of::<persist::PersistedDirective>()
+                    + facts
+                        .directives
+                        .iter()
+                        .map(|d| {
+                            d.uri.as_ref().map_or(0, String::len)
+                                + d.prefix.as_ref().map_or(0, String::len)
+                                + d.name.as_ref().map_or(0, String::len)
+                        })
+                        .sum::<usize>()
+                    + facts.doc_imports.capacity() * size_of::<persist::PersistedDocImport>()
+                    + facts
+                        .doc_imports
+                        .iter()
+                        .map(|d| d.uri.as_ref().map_or(0, String::len))
+                        .sum::<usize>()
+                    + facts.diagnostics.capacity() * size_of::<persist::PersistedDiagnostic>()
+                    + facts
+                        .diagnostics
+                        .iter()
+                        .map(|d| {
+                            d.message.len()
+                                + d.code_name.len()
+                                + d.code_machine.len()
+                                + d.correction.as_ref().map_or(0, String::len)
+                        })
+                        .sum::<usize>()
+                    + facts
+                        .files
+                        .iter()
+                        .map(|path| path.as_os_str().len() + size_of::<PathBuf>())
+                        .sum::<usize>()
+            })
+            .sum::<usize>();
+        let slots = self.warm_start.capacity()
+            * (size_of::<(dartq_snapshot::EntryKey, persist::PersistedFacts)>() + 1);
+        (payloads, slots)
+    }
+
+    /// Session scratch with session lifetime: the apply/analyze queues
+    /// and membership sets that hold their reserved capacity between
+    /// passes — the recapture queue, the site-cache feed, the dirty and
+    /// digest bookkeeping, the pending overlay, the canonical-URI memo,
+    /// the per-library generation table, the pubspec lint face. Exact
+    /// over owned columns at capacity.
+    fn session_scratch_bytes(&self) -> usize {
+        self.capture_dirty.capacity() * size_of::<FileId>()
+            + self.sites_order.capacity() * size_of::<FileId>()
+            + self.sites_cached.capacity() * (size_of::<FileId>() + 1)
+            + self.invalidated.capacity() * size_of::<LibraryId>()
+            + self.structure_changed.capacity() * size_of::<FileId>()
+            + self.structure_removed.capacity() * size_of::<FileId>()
+            + self.pending_order.capacity() * size_of::<FileId>()
+            + self.pending.capacity() * (size_of::<(FileId, PendingChange)>() + 1)
+            + self.canonical_uris.capacity() * (size_of::<(FileId, Arc<str>)>() + 1)
+            + self
+                .canonical_uris
+                .values()
+                .map(|uri| uri.len())
+                .sum::<usize>()
+            + self.library_generations.capacity() * (size_of::<(LibraryId, u32)>() + 1)
+            + self.structure_digests.capacity() * (size_of::<(FileId, u64)>() + 1)
+            + self
+                .reported
+                .capacity()
+                * (size_of::<(FileId, (Arc<str>, LineIndex))>() + 1)
+            + self
+                .reported
+                .values()
+                .map(|(text, index)| {
+                    text.len()
+                        + index.line_count() as usize * size_of::<u32>()
+                        + size_of::<LineIndex>()
+                })
+                .sum::<usize>()
     }
 
     /// Drops `library`'s surface (the library retired); the reference

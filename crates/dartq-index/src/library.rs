@@ -181,15 +181,21 @@ pub struct SubtypeEdge {
 /// workspace query join's one-search-per-library shape (hub names were
 /// quadratic through the per-(decl file, library) probe the exact-target
 /// search forced).
+///
+/// Every frozen column is a boxed slice — a build writes each column once,
+/// the whole-unit law replaces the index on re-analysis, so the capacity
+/// field a `Vec` header carries would be dead weight and its push-growth
+/// slack resident for the session. `names_overflow` stays a `Vec`: the
+/// #120 seam appends after the build.
 #[derive(Debug, Default)]
 pub struct LibraryIndex {
-    refs: Vec<RefRow>,
-    runs: Vec<u32>,
-    name_runs: Vec<u32>,
-    name_refs: Vec<u32>,
-    names: Vec<NameRow>,
+    refs: Box<[RefRow]>,
+    runs: Box<[u32]>,
+    name_runs: Box<[u32]>,
+    name_refs: Box<[u32]>,
+    names: Box<[NameRow]>,
     names_overflow: Vec<NameRow>,
-    supers: Vec<SubtypeEdge>,
+    supers: Box<[SubtypeEdge]>,
 }
 
 impl LibraryIndex {
@@ -298,18 +304,19 @@ impl LibraryIndex {
         &self.refs
     }
 
-    /// The surface's owned heap bytes at reserved capacity — every table
-    /// column, the overflow rows included. Exact over the columns this type
-    /// owns; the allocator's per-block rounding is not counted. The
-    /// engine's memory decomposition reads it.
+    /// The surface's owned heap bytes: the boxed columns at their exact
+    /// lengths plus the overflow rows at reserved capacity. Exact over the
+    /// columns this type owns; the allocator's per-block rounding is not
+    /// counted. The engine's memory decomposition reads it.
     #[must_use]
     pub fn heap_bytes(&self) -> usize {
         use std::mem::size_of;
-        self.refs.capacity() * size_of::<RefRow>()
-            + (self.runs.capacity() + self.name_runs.capacity() + self.name_refs.capacity())
+        self.refs.len() * size_of::<RefRow>()
+            + (self.runs.len() + self.name_runs.len() + self.name_refs.len())
                 * size_of::<u32>()
-            + (self.names.capacity() + self.names_overflow.capacity()) * size_of::<NameRow>()
-            + self.supers.capacity() * size_of::<SubtypeEdge>()
+            + self.names.len() * size_of::<NameRow>()
+            + self.names_overflow.capacity() * size_of::<NameRow>()
+            + self.supers.len() * size_of::<SubtypeEdge>()
     }
 
     /// The number of resolved reference rows.
@@ -491,21 +498,20 @@ impl<'a> LibraryBuilder<'a> {
         self.names.sort_by_key(|row| (row.name, row.range.offset));
         self.supers
             .sort_by_key(|edge| (edge.file, edge.name, edge.clause));
-        // Freeze: the push-grown tables move into the long-lived index, so
-        // std's doubling slack (up to ~2× capacity resident for the session)
-        // must be shed here — the freeze-time shrink `SyntaxTable::from_parts`
-        // applies to its frozen vectors.
-        self.refs.shrink_to_fit();
-        self.names.shrink_to_fit();
-        self.supers.shrink_to_fit();
+        // Freeze: the push-grown tables move into the long-lived index as
+        // boxed slices, so std's doubling slack (up to ~2× capacity resident
+        // for the session) is shed by construction — `into_boxed_slice`
+        // reallocates to the exact row count on every column, run tables
+        // included (they were the slack the earlier `Vec` shape could not
+        // shed).
         LibraryIndex {
-            refs: self.refs,
-            runs,
-            name_runs,
-            name_refs,
-            names: self.names,
+            refs: self.refs.into_boxed_slice(),
+            runs: runs.into_boxed_slice(),
+            name_runs: name_runs.into_boxed_slice(),
+            name_refs: name_refs.into_boxed_slice(),
+            names: self.names.into_boxed_slice(),
             names_overflow: Vec::new(),
-            supers: self.supers,
+            supers: self.supers.into_boxed_slice(),
         }
     }
 }
@@ -522,6 +528,7 @@ pub(crate) mod tests {
     };
     use dartq_scanner::{ScanConfig, TokenTable};
     use dartq_source::{FileTable, StringTable};
+    use std::mem::size_of;
     use std::path::Path;
 
     const SRC_A: &str = "class A {\n  void m() {}\n}\n\nvoid fa() {}\nint top = 0;\n";
@@ -1356,9 +1363,9 @@ pub(crate) mod tests {
     }
 
     /// The freeze-time shrink: `finish` moves the push-grown tables into
-    /// the long-lived index with capacity == len — len-based memory
-    /// accounting cannot see capacity, so this pin is the slack's only
-    /// witness.
+    /// the long-lived index as boxed slices — len == capacity by
+    /// construction, so `heap_bytes` must equal the exact len sum and a
+    /// `Vec`-backed regression (up to ~2× resident slack) trips here.
     #[test]
     fn finish_sheds_push_growth_slack() {
         let fx = fixture();
@@ -1366,10 +1373,93 @@ pub(crate) mod tests {
         builder.add_file(&fx.capture_b);
         let surface = builder.finish();
         assert!(!surface.refs.is_empty(), "fixture has resolved uses");
-        assert_eq!(surface.refs.capacity(), surface.refs.len(), "refs");
         assert!(!surface.names.is_empty(), "fixture has an unresolved use");
-        assert_eq!(surface.names.capacity(), surface.names.len(), "names");
         assert!(!surface.supers.is_empty(), "fixture has a supertype edge");
-        assert_eq!(surface.supers.capacity(), surface.supers.len(), "supers");
+        let exact = surface.refs.len() * size_of::<RefRow>()
+            + (surface.runs.len() + surface.name_runs.len() + surface.name_refs.len())
+                * size_of::<u32>()
+            + surface.names.len() * size_of::<NameRow>()
+            + surface.supers.len() * size_of::<SubtypeEdge>();
+        assert_eq!(
+            surface.heap_bytes(),
+            exact,
+            "the frozen columns must hold no growth slack"
+        );
+    }
+
+    /// The compacted shape answers identically on a shared-name fixture:
+    /// two target files declaring the same name produce one name-keyed
+    /// group whose runs resolve to each target exactly — the join shape the
+    /// boxed-slice rebuild must not perturb (ordering, slicing, and run
+    /// boundaries checked against the exact-target probes).
+    #[test]
+    fn shared_name_targets_answer_identically() {
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut files = FileTable::new();
+        let dep_d = capture_one(strings, &mut files, "d.dart", "void fa() {}\n");
+        let dep_e = capture_one(strings, &mut files, "e.dart", "void fa() {}\n");
+        let main = capture_one(
+            strings,
+            &mut files,
+            "m.dart",
+            "import 'd.dart' as p;\nimport 'e.dart' as q;\n\nvoid main() {\n p.fa();\n q.fa();\n}\n",
+        );
+
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib_d = builder.intern("package:t/d.dart");
+        let lib_e = builder.intern("package:t/e.dart");
+        let lib_m = builder.intern("package:t/m.dart");
+        let file_d = files.try_file_id(Path::new("d.dart")).unwrap();
+        let file_e = files.try_file_id(Path::new("e.dart")).unwrap();
+        for (lib, cap) in [(lib_d, &dep_d), (lib_e, &dep_e), (lib_m, &main)] {
+            for row in cap.index.decls() {
+                if row.is_library_face() {
+                    builder.declare(lib, row.name, cap.file);
+                }
+            }
+        }
+        for (prefix, target) in [("p", lib_d), ("q", lib_e)] {
+            builder.import(
+                lib_m,
+                ImportEdge {
+                    target: Some(target),
+                    prefix: Some(strings.intern(prefix)),
+                    deferred: false,
+                    combinators: Combinators::unfiltered(),
+                },
+            );
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+
+        let mut builder = LibraryBuilder::new(lib_m, &graph, &namespaces);
+        builder.add_file(&main);
+        let surface = builder.finish();
+
+        // One name-keyed group spanning both targets; each run's rows are
+        // exactly what the exact-target probe answers — the boxed-slice
+        // layout serves the same slices.
+        let fa = strings.intern("fa");
+        let groups: Vec<&[RefRow]> = surface.references_named(fa).collect();
+        assert_eq!(groups.len(), 2, "one run per shared-name target");
+        let d_run = surface.references_of(file_d, fa).expect("d run");
+        let e_run = surface.references_of(file_e, fa).expect("e run");
+        assert!(groups.contains(&d_run) && groups.contains(&e_run));
+        // The distinct-name walk yields the shared name exactly once, and
+        // the name-keyed group order is the targets' ascending order.
+        let names: Vec<StringId> = surface.distinct_reference_names().collect();
+        assert_eq!(names, vec![fa]);
+        assert_eq!(groups[0][0].target_file, file_d);
+        assert_eq!(groups[1][0].target_file, file_e);
+        // Heap accounting covers the shared run index exactly: two runs,
+        // one name group.
+        let exact = surface.refs.len() * size_of::<RefRow>()
+            + (surface.runs.len() + surface.name_runs.len() + surface.name_refs.len())
+                * size_of::<u32>()
+            + surface.names.len() * size_of::<NameRow>()
+            + surface.supers.len() * size_of::<SubtypeEdge>();
+        assert_eq!(surface.heap_bytes(), exact);
+        assert_eq!(surface.runs.len(), 2);
+        assert_eq!(surface.name_runs.len(), 1);
     }
 }
