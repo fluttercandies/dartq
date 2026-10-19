@@ -1,5 +1,18 @@
 use super::*;
 
+/// The frozen-face member verdict (`Engine::frozen_member_verdict`): the
+/// three answers a [`Walk::ChainBroken`] member walk can still decide
+/// through [`CORE_INTERFACE_MEMBERS`] / [`CORE_TYPE_MEMBERS`] —
+/// `Defined` (a reachable frozen face carries the member), `Absent`
+/// (every hop was decidable and none carried it — the member family
+/// reports), `Unknown` (a genuinely unindexed, non-frozen declaration
+/// broke the climb — the under-report direction, same as `ChainBroken`).
+pub(crate) enum FrozenFace {
+    Defined,
+    Absent,
+    Unknown,
+}
+
 impl<'a> Engine<'a> {
     /// The named argument membership test against the active callee
     /// (`type_analyzer.dart:5820`): a resolved callee whose formal table
@@ -25,7 +38,14 @@ impl<'a> Engine<'a> {
                 // not a miss).
                 let (resolved, defined) = match self.super_ctor_named_formals(container, selector)
                 {
-                    Some(formals) => (true, formals.contains(&name)),
+                    // The membership test is the call-site face's own
+                    // (`named_formal_for`): a `super(x: v)` label binds a
+                    // `this._x` formal's public name like every other
+                    // invocation (upstream keys `NamedExpression.name`
+                    // against `ParameterElement.name`, which is the public
+                    // spelling — `correspondingPublicName`,
+                    // token_impl.dart:364).
+                    Some(formals) => (true, self.named_formal_for(&formals, name).is_some()),
                     None => (false, false),
                 };
                 if resolved && !defined {
@@ -72,15 +92,18 @@ impl<'a> Engine<'a> {
                     let formals = self.member_formals_full(&recv, callee_name);
                     (
                         formals.is_some(),
-                        formals.is_some_and(|f| f.named.iter().any(|entry| entry.name == name)),
+                        formals
+                            .is_some_and(|f| self.named_formal_for(&f, name).is_some()),
                     )
                 } else {
                     let decl = self
                         .top_level_decl(callee_name)
                         .filter(|d| d.kind == MicroKind::TopLevelFn && d.formals.is_some());
-                    let defined = decl
-                        .as_ref()
-                        .is_some_and(|d| Self::has_named_formal(d.formals.as_deref(), name));
+                    let defined = decl.as_ref().is_some_and(|d| {
+                        d.formals
+                            .as_deref()
+                            .is_some_and(|f| self.named_formal_for(f, name).is_some())
+                    });
                     (decl.is_some(), defined)
                 }
             }
@@ -88,7 +111,7 @@ impl<'a> Engine<'a> {
                 let formals = self.member_formals_full(recv, callee_name);
                 (
                     formals.is_some(),
-                    formals.is_some_and(|f| f.named.iter().any(|entry| entry.name == name)),
+                    formals.is_some_and(|f| self.named_formal_for(&f, name).is_some()),
                 )
             }
             _ => return,
@@ -133,19 +156,20 @@ impl<'a> Engine<'a> {
             .map(|c| (c.container, Some(c.name)))
     }
 
-    /// The resolved super-constructor's named-formal spellings
-    /// (`ctor_formals`' named half) for `check_named_argument`: `selector`
-    /// picks the named table, `None` the unnamed face's key (the enclosing
-    /// class's `superclass` spelling — `ctor_formals` keys the unnamed
-    /// entry under the declared name). `None` = unresolvable superclass or
-    /// a constructor the index does not model — the caller stays silent
-    /// (the under-report posture; the oracle's own
-    /// `undefined_constructor_in_initializer` owns that report).
+    /// The resolved super-constructor's formal table (`ctor_formals`) for
+    /// `check_named_argument`: `selector` picks the named table, `None` the
+    /// unnamed face's key (the enclosing class's `superclass` spelling —
+    /// `ctor_formals` keys the unnamed entry under the declared name).
+    /// `None` = unresolvable superclass or a constructor the index does not
+    /// model — the caller stays silent (the under-report posture; the
+    /// oracle's own `undefined_constructor_in_initializer` owns that
+    /// report). The table comes back owned so the caller can hand it to
+    /// [`Engine::named_formal_for`] and still `emit` under `&mut self`.
     pub(crate) fn super_ctor_named_formals(
         &self,
         container: StringId,
         selector: Option<StringId>,
-    ) -> Option<Vec<StringId>> {
+    ) -> Option<Formals> {
         let superclass = self
             .index
             .get(self.file)
@@ -159,10 +183,10 @@ impl<'a> Engine<'a> {
             self.file,
             superclass,
         )?;
-        let formals = super_container
+        super_container
             .ctor_formals
-            .get(&selector.unwrap_or(superclass))?;
-        Some(formals.named.iter().map(|f| f.name).collect())
+            .get(&selector.unwrap_or(superclass))
+            .map(|formals| (**formals).clone())
     }
 
     // —— pass 2 ———————————————————————————————————————————————————————
@@ -1333,7 +1357,29 @@ impl<'a> Engine<'a> {
                     self.check_operator_expr(ty, row);
                     return;
                 }
-                Walk::ChainBroken => return,
+                // The frozen interface faces decide a break at the root or
+                // a deeper hop the same as the plain member arm below: a
+                // carried member suppresses (its result type is beyond the
+                // name-level model — `check_operator_expr` reads `Unknown`),
+                // a decidable miss reports the getter read, a genuinely
+                // unindexed declaration keeps the under-report.
+                Walk::ChainBroken => {
+                    match self.frozen_member_verdict(container, row.name) {
+                        FrozenFace::Absent => {
+                            let name_text = self.strings.resolve(row.name);
+                            let type_text = self.strings.resolve(container).to_string();
+                            self.emit(
+                                SemanticCode::UndefinedGetter,
+                                row.range,
+                                name_text,
+                                &type_text,
+                            );
+                            self.record_miss(row.name, row.range, true, NameUse::Read);
+                        }
+                        FrozenFace::Defined | FrozenFace::Unknown => {}
+                    }
+                    return;
+                }
                 Walk::Missing => {
                     let name_text = self.strings.resolve(row.name);
                     let type_text = self.strings.resolve(container).to_string();
@@ -1396,11 +1442,136 @@ impl<'a> Engine<'a> {
         if matches!(self.walk_members(container, row.name), Walk::ChainBroken) {
             // A chain broken at the root type (`int x; x.noSuchGetter`) is
             // the external-primitive face: the core member table decides.
-            // A broken superclass hop suppresses as before. The receiver's
-            // nullability rides along (#2140): a member the core table
-            // defines is the dereference face's found-arm, gated exactly
-            // like the walkable-model face above.
-            self.check_core_type_member(container, row, receiver_nullable);
+            // A broken superclass hop is decidable through the frozen
+            // interface faces (`Comparable`, `Match`, `Stream`, …) the
+            // element index cannot carry — `face_member_frozen`'s same
+            // consult, three-valued so a genuinely unindexed declaration
+            // keeps the under-report. A write resolves its own pair of
+            // lookups exactly like `member_defined`'s write arm: the plain
+            // spelling satisfies the write through a field/getter hit (the
+            // assignment-to-* family owns that face), and only a miss on
+            // BOTH spellings reports `undefined_setter` — so the getter
+            // verdict consults first and the `name=` spelling breaks the
+            // tie (`Match`'s face carries no setters; `IOSink`'s and
+            // `StreamController`'s do). A compound write's read face is the
+            // getter verdict's own answer.
+            let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
+            let getter_verdict = self.frozen_member_verdict(container, row.name);
+            let setter_verdict = write.then(|| {
+                let setter = self.setter_spelling(row.name);
+                self.frozen_member_verdict(container, setter)
+            });
+            // The write-side defined answer joins the getter face's: a
+            // `name=` member satisfies the write like a field hit does.
+            let defined = matches!(getter_verdict, FrozenFace::Defined)
+                || matches!(setter_verdict, Some(FrozenFace::Defined));
+            let getter_absent = matches!(getter_verdict, FrozenFace::Absent);
+            let setter_absent =
+                matches!(setter_verdict, Some(FrozenFace::Absent)) || !write && getter_absent;
+            let undecidable = matches!(getter_verdict, FrozenFace::Unknown)
+                || matches!(setter_verdict, Some(FrozenFace::Unknown));
+            if defined {
+                // The member resolved on the frozen face — the found-arm's
+                // faces (`member_defined`'s nullable-deref gate plus the
+                // unused-result companion) apply exactly as a walkable
+                // hit's. A compound write judges its two faces separately:
+                // `m` absent under a defined `m=` still reports the getter
+                // read (the oracle resolves it first), and `m` defined
+                // under an absent `m=` reports the setter write.
+                if row.intent == Intent::ReadWrite {
+                    let name_text = self.strings.resolve(row.name);
+                    let type_text = self.strings.resolve(container).to_string();
+                    if getter_absent {
+                        self.emit(
+                            SemanticCode::UndefinedGetter,
+                            row.range,
+                            name_text,
+                            &type_text,
+                        );
+                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                        return;
+                    }
+                    if matches!(setter_verdict, Some(FrozenFace::Absent)) {
+                        self.emit(
+                            SemanticCode::UndefinedSetter,
+                            row.range,
+                            name_text,
+                            &type_text,
+                        );
+                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                        return;
+                    }
+                }
+                if receiver_nullable && !matches!(row.intent, Intent::Invoke) {
+                    let name_text = self.strings.resolve(row.name);
+                    self.emit_corrected(
+                        SemanticCode::UncheckedUseOfNullableValue,
+                        row.range,
+                        name_text,
+                    );
+                }
+                self.check_member_unused_result(
+                    row,
+                    container,
+                    &Receiver::Typed {
+                        type_name: container,
+                        ty: Ty::UNKNOWN,
+                    },
+                    false,
+                );
+                return;
+            }
+            if undecidable {
+                self.check_core_type_member(container, row, receiver_nullable);
+                return;
+            }
+            // `member_defined` already ran the extension pool and the
+            // `Object`-member/`==` arms — a miss decidable through the
+            // frozen faces reports the access-intent trio like a walkable
+            // clean miss, per face: the read face answers the getter
+            // verdict, the write face the pair.
+            let name_text = self.strings.resolve(row.name);
+            let type_text = self.strings.resolve(container).to_string();
+            match row.intent {
+                Intent::Invoke => {
+                    self.emit(
+                        SemanticCode::UndefinedMethod,
+                        row.range,
+                        name_text,
+                        &type_text,
+                    );
+                }
+                Intent::Read => {
+                    self.emit(
+                        SemanticCode::UndefinedGetter,
+                        row.range,
+                        name_text,
+                        &type_text,
+                    );
+                }
+                Intent::Write | Intent::ReadWrite => {
+                    // The oracle resolves the getter before the setter — a
+                    // compound write reports its absent read face first.
+                    if row.intent == Intent::ReadWrite && getter_absent {
+                        self.emit(
+                            SemanticCode::UndefinedGetter,
+                            row.range,
+                            name_text,
+                            &type_text,
+                        );
+                    }
+                    if setter_absent {
+                        self.emit(
+                            SemanticCode::UndefinedSetter,
+                            row.range,
+                            name_text,
+                            &type_text,
+                        );
+                    }
+                }
+                Intent::Operator(..) => {}
+            }
+            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
         }
         let Some(kind) = self.container_kind_of(container) else {
@@ -1490,7 +1661,26 @@ impl<'a> Engine<'a> {
                     let ty = Self::member_result_ty(&entry);
                     self.check_operator_expr(ty, row);
                 }
-                Walk::ChainBroken => {}
+                // The frozen faces decide a break on an unindexed SDK
+                // supertype (`class C extends Match { f() { super.m + 1 } }`)
+                // — carried member suppresses, decidable miss reports the
+                // getter shape, genuinely unknown hops stay silent.
+                Walk::ChainBroken => {
+                    if matches!(
+                        self.frozen_super_verdict(container, row.name),
+                        FrozenFace::Absent
+                    ) {
+                        let name_text = self.strings.resolve(row.name);
+                        let type_text = self.strings.resolve(container).to_string();
+                        self.emit(
+                            SemanticCode::UndefinedSuperMember(SuperShape::Getter),
+                            row.range,
+                            name_text,
+                            &type_text,
+                        );
+                        self.record_miss(row.name, row.range, true, NameUse::Read);
+                    }
+                }
                 Walk::Missing => {
                     let name_text = self.strings.resolve(row.name);
                     let type_text = self.strings.resolve(container).to_string();
@@ -1520,6 +1710,95 @@ impl<'a> Engine<'a> {
             return;
         }
         if matches!(self.walk_super(container, row.name), Walk::ChainBroken) {
+            // The broken-hop consult: the frozen SDK interface faces answer
+            // a break that the element index cannot carry (`class C extends
+            // Match` reaching `super.m`). A write resolves its pair of
+            // lookups like `member_defined`'s `name=` arm — the plain
+            // spelling satisfies the write through a field/getter hit, and
+            // only a miss on BOTH spellings reports the setter shape; a
+            // compound write's read face is the getter verdict's own
+            // answer. A genuinely unindexed face stays silent.
+            let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
+            let getter_verdict = self.frozen_super_verdict(container, row.name);
+            let setter_verdict = write.then(|| {
+                let setter = self.setter_spelling(row.name);
+                self.frozen_super_verdict(container, setter)
+            });
+            let defined = matches!(getter_verdict, FrozenFace::Defined)
+                || matches!(setter_verdict, Some(FrozenFace::Defined));
+            let getter_absent = matches!(getter_verdict, FrozenFace::Absent);
+            let setter_absent =
+                matches!(setter_verdict, Some(FrozenFace::Absent)) || !write && getter_absent;
+            let undecidable = matches!(getter_verdict, FrozenFace::Unknown)
+                || matches!(setter_verdict, Some(FrozenFace::Unknown));
+            let name_text = self.strings.resolve(row.name);
+            let type_text = self.strings.resolve(container).to_string();
+            if defined {
+                // The compound write judges its faces separately: `m`
+                // absent under a defined `m=` still reports the getter
+                // shape, `m` defined under an absent `m=` the setter's.
+                if row.intent == Intent::ReadWrite {
+                    if getter_absent {
+                        self.emit(
+                            SemanticCode::UndefinedSuperMember(SuperShape::Getter),
+                            row.range,
+                            name_text,
+                            &type_text,
+                        );
+                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                        return;
+                    }
+                    if matches!(setter_verdict, Some(FrozenFace::Absent)) {
+                        self.emit(
+                            SemanticCode::UndefinedSuperMember(SuperShape::Setter),
+                            row.range,
+                            name_text,
+                            &type_text,
+                        );
+                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                        return;
+                    }
+                }
+                self.check_member_unused_result(
+                    row,
+                    container,
+                    &Receiver::Super {
+                        container,
+                        kind: ContainerKind::Class,
+                    },
+                    false,
+                );
+                return;
+            }
+            if undecidable {
+                return;
+            }
+            let shape = match row.intent {
+                Intent::Invoke => SuperShape::Method,
+                Intent::Write | Intent::ReadWrite => SuperShape::Setter,
+                Intent::Read => SuperShape::Getter,
+                Intent::Operator(..) => unreachable!("operator intents returned above"),
+            };
+            // A compound write checks the read face first (the oracle
+            // resolves the getter before the setter); its absent faces
+            // report in that order.
+            if row.intent == Intent::ReadWrite && getter_absent {
+                self.emit(
+                    SemanticCode::UndefinedSuperMember(SuperShape::Getter),
+                    row.range,
+                    name_text,
+                    &type_text,
+                );
+            }
+            if !write || setter_absent {
+                self.emit(
+                    SemanticCode::UndefinedSuperMember(shape),
+                    row.range,
+                    name_text,
+                    &type_text,
+                );
+            }
+            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
         }
         let shape = match row.intent {
@@ -1549,6 +1828,222 @@ impl<'a> Engine<'a> {
             &type_text,
         );
         self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+    }
+
+    /// The frozen-face member verdict behind a [`Walk::ChainBroken`]
+    /// receiver: climbs the receiver type's supertype graph exactly like
+    /// [`Engine::face_member_frozen`] (the `@override` face's consult —
+    /// `extends` linear, `with` mixins in reverse application order,
+    /// `implements`/`on` faces through the pending queue), but three-valued.
+    /// Each `resolve_container` failure classifies by the same split the
+    /// member walk applies: a frozen-face spelling
+    /// ([`CORE_INTERFACE_MEMBERS`] / [`CORE_TYPE_MEMBERS`], aliased through
+    /// [`COLLECTION_INTERFACE_ALIASES`]) answers its member set outright; a
+    /// dead edge ([`Engine::supertype_hop_dead`]'s `true` arm — an
+    /// undefined, ambiguous, or non-class supertype, the oracle's
+    /// `InvalidType` that contributes nothing) keeps the climb decidable;
+    /// a resolved-but-unindexed declaration the tables do not know leaves
+    /// the chain genuinely broken (`Unknown`, the under-report direction —
+    /// its members could carry the name). `Defined` needs the write
+    /// spelling joined by its setter form upstream: call sites pass the
+    /// single spelling this access resolves through.
+    pub(crate) fn frozen_member_verdict(&self, face: StringId, spelling: StringId) -> FrozenFace {
+        self.frozen_faces_verdict([(face, self.file)].into_iter(), spelling, true)
+    }
+
+    /// The super-face twin of [`Self::frozen_member_verdict`]: `super.m`'s
+    /// lookup starts above the enclosing container's own members, so the
+    /// climb seeds with the declaration's supertype edges — its superclass,
+    /// `with` mixins, `implements` faces and `on` constraints (the same
+    /// seed [`Engine::face_member_any`] reads). An unindexed container
+    /// itself breaks the chain: `Unknown`.
+    pub(crate) fn frozen_super_verdict(&self, container: StringId, spelling: StringId) -> FrozenFace {
+        let Some(decl) = self
+            .index
+            .get(self.file)
+            .and_then(|f| f.container(container))
+        else {
+            return FrozenFace::Unknown;
+        };
+        let seeds = decl
+            .superclass
+            .into_iter()
+            .chain(decl.with_clause.iter().copied())
+            .chain(decl.implements_clause.iter().copied())
+            .chain(decl.on_clause.iter().copied())
+            .map(|face| (face, self.file));
+        self.frozen_faces_verdict(seeds, spelling, false)
+    }
+
+    /// The shared climb behind [`Self::frozen_member_verdict`] and
+    /// [`Self::frozen_super_verdict`] (see there for the three-valued
+    /// contract and the hop classification). `anchor` holds when the first
+    /// seed IS the receiver type's own spelling rather than a supertype
+    /// edge: an unresolvable anchor that no frozen face knows leaves the
+    /// receiver statically `InvalidType`, which answers every member face
+    /// silently — `Unknown`, never `Absent` (a genuinely undeclared
+    /// receiver type must not emit `undefined_*`).
+    fn frozen_faces_verdict(
+        &self,
+        seeds: impl Iterator<Item = (StringId, FileId)>,
+        spelling: StringId,
+        anchor: bool,
+    ) -> FrozenFace {
+        let spelling_text = self.strings.resolve(spelling);
+        // Whether `name` is a frozen SDK face the member tables carry (the
+        // `dart:core`/`dart:async`/`dart:io` interfaces plus the
+        // `dart:collection` bases that re-export them) — its members are
+        // known exactly, so a spelling it lacks contributes nothing.
+        let frozen_face = |name: &str| {
+            CORE_INTERFACE_MEMBERS
+                .iter()
+                .chain(CORE_TYPE_MEMBERS.iter())
+                .any(|(container, _)| name == *container)
+                || COLLECTION_INTERFACE_ALIASES
+                    .iter()
+                    .any(|(alias, _)| name == *alias)
+        };
+        let frozen_hit = |name: &str| {
+            let aliases: &[&str] = COLLECTION_INTERFACE_ALIASES
+                .iter()
+                .find(|(alias, _)| name == *alias)
+                .map_or(&[][..], |(_, aliases)| aliases);
+            CORE_INTERFACE_MEMBERS
+                .iter()
+                .chain(CORE_TYPE_MEMBERS.iter())
+                .any(|(container, members)| {
+                    (name == *container || aliases.contains(container))
+                        && members.contains(&spelling_text)
+                })
+        };
+        let mut seen = FxHashSet::default();
+        let mut undecidable = false;
+        // The `implements`/`on` faces a resolved hop leaves unclimbed — the
+        // linear superclass chain handles `extends`+`with`; when it
+        // dead-ends, the interface faces keep the climb alive in
+        // declaration order (mirrors `face_member_frozen`'s pending queue).
+        let mut pending: VecDeque<(StringId, FileId)> = seeds.collect();
+        let Some((first, first_owner)) = pending.pop_front() else {
+            return FrozenFace::Unknown;
+        };
+        let mut name = first;
+        let mut owner = first_owner;
+        let mut scope_lib = self.lib;
+        let mut at_anchor = anchor;
+        loop {
+            if !seen.insert(name) {
+                let Some((next, next_owner)) = pending.pop_front() else {
+                    break;
+                };
+                name = next;
+                owner = next_owner;
+                // A queued face is never the receiver type itself.
+                at_anchor = false;
+                continue;
+            }
+            let Some((found, found_owner)) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                scope_lib,
+                owner,
+                name,
+            ) else {
+                // The unindexed hop answers by its frozen member face: a
+                // hit defines the member, a known face without it
+                // contributes nothing (the frozen rows fold the whole
+                // instance face, inherited members included), a dead edge
+                // contributes nothing, and anything else breaks the climb's
+                // decidability — its members could carry the name. The
+                // anchor itself is the receiver's whole static type: not
+                // frozen-known means `InvalidType`, which never reports.
+                let text = self.strings.resolve(name);
+                if frozen_hit(text) {
+                    return FrozenFace::Defined;
+                }
+                if !frozen_face(text) {
+                    if at_anchor || !self.supertype_hop_dead(name, scope_lib, owner) {
+                        undecidable = true;
+                    }
+                }
+                at_anchor = false;
+                let Some((next, next_owner)) = pending.pop_front() else {
+                    break;
+                };
+                name = next;
+                owner = next_owner;
+                continue;
+            };
+            at_anchor = false;
+            if let Some(entry) = found.members.get(&spelling)
+                && !entry.is_static
+            {
+                return FrozenFace::Defined;
+            }
+            let owner_lib = self
+                .owner_library_of(found_owner, name)
+                .unwrap_or(scope_lib);
+            for mixin in found.with_clause.iter().rev() {
+                if !seen.insert(*mixin) {
+                    continue;
+                }
+                match resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    owner_lib,
+                    owner,
+                    *mixin,
+                ) {
+                    Some((mixin_container, _))
+                        if mixin_container
+                            .members
+                            .get(&spelling)
+                            .is_some_and(|entry| !entry.is_static) =>
+                    {
+                        return FrozenFace::Defined;
+                    }
+                    None => {
+                        let text = self.strings.resolve(*mixin);
+                        if frozen_hit(text) {
+                            return FrozenFace::Defined;
+                        }
+                        if !frozen_face(text) && !self.supertype_hop_dead(*mixin, owner_lib, owner)
+                        {
+                            undecidable = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for super_face in found
+                .implements_clause
+                .iter()
+                .chain(found.on_clause.iter())
+            {
+                pending.push_back((*super_face, found_owner));
+            }
+            match found.superclass {
+                Some(superclass) => {
+                    scope_lib = owner_lib;
+                    name = superclass;
+                    owner = found_owner;
+                }
+                None => {
+                    let Some((next, next_owner)) = pending.pop_front() else {
+                        break;
+                    };
+                    name = next;
+                    owner = next_owner;
+                    scope_lib = owner_lib;
+                }
+            }
+        }
+        if undecidable {
+            FrozenFace::Unknown
+        } else {
+            FrozenFace::Absent
+        }
     }
 
     /// The external-primitive member face (`int x; x.noSuchGetter`): the
@@ -1754,7 +2249,12 @@ impl<'a> Engine<'a> {
         let Ty::Named { name, .. } = ty else {
             return;
         };
-        if resolve_container(
+        // An unindexable receiver still answers through the frozen faces:
+        // `Match`/`Stream`-typed operands chain-break the walk at the root,
+        // but the interface table decides a user operator's absence exactly
+        // (`x + 1` on `Match` — `undefined_operator`); a genuinely
+        // unindexed declaration keeps the under-report.
+        let indexed = resolve_container(
             self.graph,
             self.namespaces,
             self.index,
@@ -1762,13 +2262,15 @@ impl<'a> Engine<'a> {
             self.file,
             name,
         )
-        .is_none()
-        {
-            return;
-        }
+        .is_some();
         let mut missing: Vec<String> = Vec::new();
         for spelling in [read, write].into_iter().flatten() {
-            if matches!(self.walk_members(name, spelling), Walk::Missing) {
+            let walk_missing = if indexed {
+                matches!(self.walk_members(name, spelling), Walk::Missing)
+            } else {
+                matches!(self.frozen_member_verdict(name, spelling), FrozenFace::Absent)
+            };
+            if walk_missing {
                 match self.extension_application(name, ty, spelling, false, false) {
                     ExtensionApp::None => {
                         missing.push(self.strings.resolve(spelling).to_string());
@@ -2960,6 +3462,259 @@ mod tests {
                 .iter()
                 .map(|d| d.message.to_string())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // —— #2225 S2 residue pins ——————————————————————————————————————————
+
+    /// [`report_two`] variant whose foreign unit declares `name` into the
+    /// library graph but is withheld from the element index — the
+    /// synthetic-SDK-face shape (`dart:core`/`dart:async`/`dart:io`
+    /// declarations resolve through the namespace but carry no indexed
+    /// members), which chain-breaks `walk_members` where an undeclared or
+    /// indexed name would not. The unit's source declares nothing else —
+    /// the frozen member tables answer for the face.
+    fn report_unindexed_unit(source_a: &str, source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file_m = files.intern(Path::new("main.dart"));
+        let file_a = files.intern(Path::new("a.dart"));
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let scan_cfg = ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        };
+        let scanned_m = dartq_scanner::scan(source, scan_cfg, file_m);
+        assert!(
+            scanned_m.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let scanned_a = dartq_scanner::scan(source_a, scan_cfg, file_a);
+        assert!(
+            scanned_a.diagnostics.is_empty(),
+            "scanner diagnostics: {source_a:?}"
+        );
+        let elements_m = collect(source, &scanned_m.tokens, features, &strings);
+        let elements_a = collect(source_a, &scanned_a.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib_m = builder.intern("package:t/main.dart");
+        let lib_a = builder.intern("package:t/a.dart");
+        builder.unit(lib_a, file_a);
+        let mut index = ElementIndex::default();
+        index.insert(file_m, elements_m.clone());
+        for (name, decl) in elements_m.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_m, name, file_m);
+        }
+        for (name, decl) in elements_a.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_a, name, file_a);
+        }
+        builder.import(
+            lib_m,
+            ImportEdge {
+                target: Some(lib_a),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        // `file_a` is deliberately absent from `index` — its declarations
+        // resolve through the namespace but model no members.
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut fold = fold_unit(
+            source,
+            &scanned_m.tokens,
+            features,
+            &strings,
+            file_m,
+            lib_m,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        fold.report.diagnostics =
+            merge_source_ordered(fold.parse_diagnostics, fold.report.diagnostics);
+        fold.report
+    }
+
+    /// `(x as dynamic)` keeps the operand's own static type — `dynamic` —
+    /// not the boolish latch's `bool` (the `AsExpression.staticType` face):
+    /// an `int` return position accepts a `dynamic` expression silently,
+    /// where a `bool`-collapsed row would report `return_of_invalid_type`.
+    /// The `bool`-target control keeps its own answer: `bool` is not
+    /// assignable to `int`, so the cast's row reports there. The trailing
+    /// bare-statement shape guards the #2225 face-4 false positive: a
+    /// discarded `(x as dynamic);` asks no type question at all.
+    #[test]
+    fn dynamic_cast_paren_keeps_the_dynamic_type() {
+        let report = report_units(
+            &[],
+            "main.dart",
+            "class Object {}\n\
+             class int {}\n\
+             int f(Object x) => (x as dynamic);\n\
+             int g(Object x) => (x as bool);\n\
+             void h(Object x) {\n\
+             \x20 (x as dynamic);\n\
+             \x20 ((x as dynamic));\n\
+             }",
+            false,
+        );
+        assert_eq!(
+            code_names(&report),
+            ["cast_to_non_type", "return_of_invalid_type"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The condition-sparing latch survives the `dynamic` fix: `x as bool`
+    /// in a condition context still spares `non_bool_condition` (a `bool`
+    /// cast is statically `bool`), and `x as dynamic` stays spared through
+    /// the `dynamic`-assignable arm rather than the latch — same oracle
+    /// verdict, no collapsed row. `bool` is undeclared in the harness, so
+    /// each `as bool` site carries its `cast_to_non_type` row — the
+    /// condition faces must not join them.
+    #[test]
+    fn bool_cast_condition_sparing_holds() {
+        let report = report_units(
+            &[],
+            "main.dart",
+            "class Object {}\n\
+             void f(Object x) {\n\
+             \x20 if (x as bool) {}\n\
+             \x20 if ((x as bool)) {}\n\
+             \x20 if (x as dynamic) {}\n\
+             \x20 if ((x as dynamic)) {}\n\
+             }",
+            false,
+        );
+        assert_eq!(
+            code_names(&report),
+            ["cast_to_non_type", "cast_to_non_type"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The interface-typed receiver face: a `Match`-typed local whose
+    /// declaration resolves to an unindexed unit (the synthetic-SDK shape)
+    /// chain-breaks the member walk — the frozen `Match` face
+    /// (`sdk/lib/core/pattern.dart:85`) answers: `absent` reports the
+    /// access-intent trio while `group`/`start`/`[]` stay silent.
+    #[test]
+    fn unindexed_interface_receiver_reports_absent_members() {
+        let report = report_unindexed_unit(
+            "abstract class Match {\n\
+             \x20 int get start;\n\
+             \x20 int get end;\n\
+             \x20 String? group(int group);\n\
+             }",
+            "import 'a.dart';\n\
+             void f(Match m) {\n\
+             \x20 m.absent;\n\
+             \x20 m.group(0);\n\
+             \x20 m.start;\n\
+             \x20 m.missing();\n\
+             \x20 m.gone = 1;\n\
+             }",
+        );
+        assert_eq!(
+            code_names(&report),
+            [
+                "undefined_getter",
+                "undefined_method",
+                "undefined_setter"
+            ],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The deep-chain shape: `class C implements Match` breaks the member
+    /// walk on the interface hop (`Match` resolves to the unindexed unit) —
+    /// the frozen face still answers, so `c.absent` reports and `c.group`
+    /// stays silent.
+    #[test]
+    fn unindexed_interface_hop_reports_absent_members() {
+        let report = report_unindexed_unit(
+            "abstract class Match {\n\
+             \x20 int get start;\n\
+             \x20 String? group(int group);\n\
+             }",
+            "import 'a.dart';\n\
+             class C implements Match {\n\
+             \x20 int get start => 0;\n\
+             \x20 String? group(int group) => '';\n\
+             }\n\
+             void f(C c) { c.absent; c.group(0); c.start; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_getter"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The anchor discipline: a receiver whose type is genuinely
+    /// undeclared (`Gone` resolves to nothing — the oracle's `InvalidType`)
+    /// answers every member face silently; only the frozen-face spellings
+    /// decide through a broken chain.
+    #[test]
+    fn undeclared_receiver_stays_silent() {
+        let report = report_units(
+            &[],
+            "main.dart",
+            "void f(Gone g) { g.absent; g.missing(); g.gone = 1; }",
+            false,
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_class"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The `super(name:)` public-name join (#2214's face, routed through
+    /// `named_formal_for`): a `this._x` field formal's element carries the
+    /// public `x` (`correspondingPublicName`, token_impl.dart:364), so
+    /// `super(x: 0)` binds silently while `super(y: 0)` keeps its
+    /// `undefined_named_parameter` miss.
+    #[test]
+    fn super_named_argument_binds_the_public_formal_name() {
+        let report = report_units(
+            &[],
+            "main.dart",
+            "class int {}\n\
+             class B {\n\
+             \x20 B({required this._x});\n\
+             \x20 final int _x;\n\
+             }\n\
+             class C extends B {\n\
+             \x20 C() : super(x: 0);\n\
+             }\n\
+             class D extends B {\n\
+             \x20 D() : super(y: 0);\n\
+             }",
+            false,
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_named_parameter"],
+            "{:?}",
+            code_names(&report)
         );
     }
 }

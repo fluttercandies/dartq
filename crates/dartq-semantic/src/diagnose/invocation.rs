@@ -1989,7 +1989,7 @@ impl<'a> Engine<'a> {
     /// the wildcard `_`, a leading digit, a second `_`, or a reserved word
     /// (`_if` has no public face and reports
     /// `private_named_parameter_without_public_name` upstream instead).
-    fn formal_public_name(&self, name: StringId) -> StringId {
+    pub(crate) fn formal_public_name(&self, name: StringId) -> StringId {
         let text = self.strings.resolve(name);
         let Some(rest) = text.strip_prefix('_') else {
             return name;
@@ -2015,7 +2015,11 @@ impl<'a> Engine<'a> {
     /// public name — `AsyncData._(…, error: e)` binds `required this._error`).
     /// A given `_x:` resolves nothing when `_x`'s public face exists — the
     /// element only answers `x:`.
-    fn named_formal_for<'f>(&self, formals: &'f Formals, name: StringId) -> Option<&'f Formal> {
+    pub(crate) fn named_formal_for<'f>(
+        &self,
+        formals: &'f Formals,
+        name: StringId,
+    ) -> Option<&'f Formal> {
         let public = self.formal_public_name(name);
         if public != name {
             // The written argument is already private (`_x:`): it resolves a

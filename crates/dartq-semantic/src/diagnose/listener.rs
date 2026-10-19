@@ -3360,15 +3360,29 @@ impl ParserListener for DiagnoseListener<'_> {
         // resolved interface type — `x as IntAlias` over an `int` operand
         // is dead.
         let cast_ty = engine.armed_ty.map(|ty| engine.fold_alias_ty(ty));
-        // A cast whose target is `bool` (or undecidable) is statically
-        // `bool` — the enclosing condition checkpoint spares the operand
-        // row. A known non-`bool` cast target leaves the row unlatched:
+        // A cast whose target is non-nullable `bool` is statically `bool`,
+        // and an undecidable target leaves the operand's own row answering
+        // the enclosing condition checkpoint — both spare the operand row.
+        // A `dynamic` target is NOT latched: `AsExpression.staticType` is
+        // the cast type itself (`dynamic`, never `bool`), so its fold pushes
+        // a `Value{Dynamic}` result row at the operand's exact span (no
+        // `TypeUse` row extends a builtin head) — latching that span let
+        // `end_parenthesized_expression` collapse the group's `inner_ty` to
+        // `bool` where the oracle answers `dynamic`. The checkpoint spares
+        // a `dynamic` result either way (`isAssignableTo(dynamic, bool)`;
+        // `known_non_bool` already answers `false` for it), so the latch
+        // only ever misled the paren collapse. A `bool?` target stays
+        // unlatched for the same reason — its result row must keep the
+        // nullable face for the condition's `unchecked_use_of_nullable_value`
+        // staging. A known non-`bool` cast target leaves the row unlatched:
         // the checkpoint then reports `non_bool_condition` at the operand
         // row, whose start is the cast expression's own start (the oracle's
         // anchor, `bool_expression_verifier.dart:47`).
         let cast_boolish = match cast_ty {
-            Some(Ty::Named { name, .. }) => name == engine.members.primitive_ids[3],
-            Some(Ty::Unknown | Ty::Dynamic) => true,
+            Some(Ty::Named {
+                name, nullable: false, ..
+            }) => name == engine.members.primitive_ids[3],
+            Some(Ty::Unknown) => true,
             _ => false,
         };
         if cast_boolish && let Some(row) = engine.operand_row() {
