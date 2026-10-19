@@ -3851,3 +3851,208 @@ impl<'a> Engine<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod extension_type_ctors {
+    //! #2212 (S1): extension types are constructor-carrying containers —
+    //! `X._(x)`, `X.named(x)`, and `X(x)` resolve through the same
+    //! `constructors`/`has_unnamed_constructor` face a class's creations
+    //! read (constructor_invocation_resolver.dart). The collector's
+    //! `end_primary_constructor` capture feeds the face; these pins fix the
+    //! oracle-verified verdicts at the semantic tier (`dart analyze`
+    //! 3.35.0, probed): a private-selector primary ctor invocation, a
+    //! factory-selector invocation, and an unnamed-primary-ctor invocation
+    //! are silent; a named-only extension type's bare `X()` reports
+    //! `new_with_undefined_constructor_default` with the class-family text.
+    //!
+    //! Production-side note: the element collector observes primary-
+    //! constructor events through the engine's `MultiplexListener` fan-out
+    //! (`dartq-engine l1.rs`), which does not forward
+    //! `begin_primary_constructor`/`end_primary_constructor` — the corpus
+    //! rows this family produces (`XFlags._(bits)` →
+    //! `undefined_extension_method`, `BaseName(str)` →
+    //! `new_with_undefined_constructor_default`) close only when that
+    //! forwarding lands; the in-test `collect` path is single-listener, so
+    //! the pins below exercise the verdict contract directly.
+
+    use crate::collector::collect;
+    use crate::diagnose::{FileReport, StrictModes, diagnose_with};
+    use crate::library::ElementIndex;
+    use crate::model::MicroKind;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{LibraryClassModifiers, LibraryGraphBuilder, Namespaces};
+    use dartq_scanner::ScanConfig;
+    use dartq_source::{FileTable, StringTable};
+    use std::path::Path;
+
+    /// The one-library rig: `source` is the sole analyzed file of
+    /// `package:t`, no imports (the same shape `tests.rs`'s `report`
+    /// builds — `collect` feeds the fold directly).
+    fn unit_report(source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        diagnose_with(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        )
+    }
+
+    fn count_code(report: &FileReport, name: &str) -> usize {
+        report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == name)
+            .count()
+    }
+
+    fn code_names(report: &FileReport) -> Vec<&'static str> {
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name.as_ref())
+            .collect()
+    }
+
+    /// The private-selector primary constructor (`X._(bits)` — the
+    /// `XFlags._(bits)` corpus shape): the selector resolves through the
+    /// container's `constructors` face, never the extension-member family —
+    /// no `undefined_extension_method`.
+    #[test]
+    fn private_primary_ctor_invocation_resolves() {
+        let report = unit_report(
+            "class int {} extension type E._(int bits) {\n  factory E.read(int x) => E._(x);\n}\n\
+             void f() { var a = E._(1); var b = E.read(2); }",
+        );
+        assert_eq!(
+            count_code(&report, "undefined_extension_method"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A public named primary constructor resolves identically
+    /// (`E.named(x)` — the selector the `A.named` face carries).
+    #[test]
+    fn named_primary_ctor_invocation_resolves() {
+        let report = unit_report(
+            "class int {} extension type E.named(int bits) {}\n\
+             void f() { var a = E.named(1); }",
+        );
+        assert_eq!(
+            count_code(&report, "undefined_extension_method"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            count_code(&report, "undefined_method"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The unnamed primary constructor (`X(x)`): the face answers through
+    /// `has_unnamed_constructor` — no `new_with_undefined_constructor_default`.
+    #[test]
+    fn unnamed_primary_ctor_invocation_resolves() {
+        let report = unit_report(
+            "class int {} extension type F(int it) {}\n\
+             void f() { var c = F(4); }",
+        );
+        assert_eq!(
+            count_code(&report, "new_with_undefined_constructor_default"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// An unnamed primary constructor beside a factory keeps the unnamed
+    /// face (`BaseName(str)` — the lookup_name.dart corpus shape):
+    /// `has_unnamed_constructor` reads the primary-ctor flag, not the
+    /// factory's declared count.
+    #[test]
+    fn unnamed_primary_ctor_beside_factory_resolves() {
+        let report = unit_report(
+            "class int {} class String {} extension type BaseName(String it) {\n\
+             factory BaseName.read(int r) => BaseName(\"x\");\n}\n\
+             void f() { var d = BaseName(\"s\"); }",
+        );
+        assert_eq!(
+            count_code(&report, "new_with_undefined_constructor_default"),
+            0,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A named-only extension type's bare `X()` is the same
+    /// `new_with_undefined_constructor_default` a named-only class
+    /// reports — the oracle's probe on `dart analyze` 3.35.0 confirms the
+    /// class-family text ("The class 'E' doesn't have an unnamed
+    /// constructor.") even on the extension-type head.
+    #[test]
+    fn named_only_extension_type_reports_default_ctor_code() {
+        let report = unit_report(
+            "class int {} extension type E.named(int i) {}\n\
+             void f() { var e = E(0); }",
+        );
+        assert_eq!(
+            count_code(&report, "new_with_undefined_constructor_default"),
+            1,
+            "{:?}",
+            code_names(&report)
+        );
+        let report = unit_report(
+            "class int {} extension type E._(int i) {}\n\
+             void f() { var e = E(0); }",
+        );
+        assert_eq!(
+            count_code(&report, "new_with_undefined_constructor_default"),
+            1,
+            "{:?}",
+            code_names(&report)
+        );
+    }
+}
