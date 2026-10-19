@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `prefer_for_elements_to_map_fromIterable`, `sort_child_properties_last`,
   `unnecessary_underscores`, and `use_key_in_widget_constructors`; the fix
   table's 232-entry count is unchanged (#1883).
+- Resolved type operations for flow analysis: per-library `LibraryTypes`
+  snapshots feed a `TypeOps` back-end through the flow layer's mount seam —
+  sealed-scrutinee exhaustiveness answers across imports, the six base ops
+  resolve every recorder-observed name, and `is!`-promotion factors generic
+  receivers through their written argument trees (#2204).
 
 ### Changed
 
@@ -95,6 +100,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Flutter framework lint rules: the structural refutation gates hoist ahead
   of framework-spelling resolution and share a per-run refutation memo,
   cutting repeated resolution work per widget-creation row (#1914).
+- The semantic diagnoser, the lint rules, and the fix engine now live as
+  module trees (`diagnose/`, `rules/**`, `fix/`) instead of three monolith
+  files — a pure layout split proven by exact test-count no-op runs; the
+  thin module roots stay in place until the final verified checkpoint.
 
 ### Removed
 
@@ -195,6 +204,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variable, a type parameter, or an import prefix (`[f.foo]`, `[v.foo]`) —
   as unresolved, matching the upstream analyzer's two-component resolution
   behavior (#1977).
+- Extension applicability is a set: a face reachable through several routes
+  (own unit, unit files, import edges) enters the application pool once;
+  `on`-clause arguments gate applications through the oracle's subtype
+  test; chained receivers keep their element types (#2207).
+- `@docImport` URI validation reports
+  `uri_does_not_exist_in_doc_import` through the production pipeline, one
+  row per coded directive, on the selected configuration's literal
+  (#2199, #2206).
+- Object-pattern heads push their type-name rows, so dot-qualified and
+  bare pattern heads diagnose through the type-use face like the oracle
+  (#2184).
+- Guards under labeled statements scope to their own span and stop leaking
+  into enclosing statements (#2221).
+- Sealed-class override folding: enum targets and non-abstract concrete
+  targets keep their concrete verdicts, and a sealed direct superclass
+  takes the abstract branch (#2202).
+- `dart:js_interop` extension faces apply off checked-in declarations
+  instead of missing silently (#2220).
+- `await` flattens the operand type one level through the type system's
+  `Future`/`FutureOr` unwrap, preserving nullability (#2223).
+- Nineteen SDK interfaces (`FormatException`, `Match`, `RegExp`, the
+  `Stream` family, `SocketException`, `IOSink`, …) carry their member
+  faces into the override check, and `(x as dynamic).member` receivers
+  keep the operand's type instead of collapsing to `bool` (#2213).
+- Pattern-arm variables scope to their arm — post-switch reads no longer
+  bind arm variables, receiver-position reads (`v.m = 1`, `v.m++`) keep
+  the local alive, and trailing same-line `// ignore:` comments suppress
+  `unused_local_variable` (#2189).
+- Primary-constructor declarations feed the declaration collector through
+  the parser mux, so production `Container` constructor faces populate for
+  classes, enums, and extension types alike; extension-type invocations
+  are pinned to the oracle's contract (#2212, #2226).
 
 ## [1.0.0] - 2026-10-12
 
