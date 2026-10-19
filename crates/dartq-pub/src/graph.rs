@@ -143,9 +143,8 @@ pub struct ResolvedPackageGraph {
 ///
 /// # Errors
 ///
-/// Returns [`PubError::Graph`] on duplicate config entry names — pub's
-/// hard error at config load (`package_config.dart:44-51`), which the
-/// oracle throws on too.
+/// Returns [`PubError::Graph`] when the canonical identity serialization
+/// fails (an internal invariant, not a config-content face).
 pub fn build_graph(
     config: &PackageConfig,
     lock: &LockFile,
@@ -164,12 +163,9 @@ pub fn build_graph(
     let mut instances = Vec::new();
     let mut names = BTreeSet::new();
     for entry in &config.packages {
-        if !names.insert(entry.name.clone()) {
-            return Err(PubError::Graph(format!(
-                "duplicate package_config entry for `{}`",
-                entry.name
-            )));
-        }
+        // Parse dedups by name (first entry wins); the set feeds edge
+        // collection and the membership lookup below.
+        names.insert(entry.name.clone());
         let (source, source_ref, version) = match lock.packages.get(&entry.name) {
             Some(locked) => (
                 locked.source,
@@ -730,7 +726,11 @@ dependency_overrides:
     }
 
     #[test]
-    fn duplicate_config_names_stay_a_hard_error() {
+    fn duplicate_names_build_from_the_first_entry() {
+        // Parse dedups by name (first entry wins), so the corpus shape — a
+        // self entry plus a second spelling of the same name — assembles
+        // into one instance instead of refusing the resolution. The oracle
+        // emits no diagnostic for a repeated name (packages.dart:28-37).
         let config = config_from(
             r#"{
               "configVersion": 2,
@@ -742,14 +742,24 @@ dependency_overrides:
             }"#,
         );
         let lock = lock_from(LOCK);
-        let result = build_graph(
+        let graph = build_graph(
             &config,
             &lock,
             &root_pubspec(),
             &BTreeMap::new(),
             None,
             Path::new("/proj/.dart_tool"),
+        )
+        .expect("first entry wins, no hard error");
+        assert_eq!(
+            graph
+                .instances
+                .iter()
+                .filter(|instance| instance.name == "app")
+                .count(),
+            1,
+            "one instance per name"
         );
-        assert!(matches!(result, Err(PubError::Graph(_))));
+        assert_eq!(graph.root, PackageInstanceId("app".into()));
     }
 }

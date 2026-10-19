@@ -74,8 +74,7 @@ pub enum PubError {
     /// Workspace discovery or artifact validation failed.
     #[error("workspace: {0}")]
     Workspace(String),
-    /// Graph inputs disagree (root absent from the config, duplicate
-    /// entries, unknown workspace member).
+    /// Graph assembly failed (canonical identity serialization).
     #[error("package graph: {0}")]
     Graph(String),
 }

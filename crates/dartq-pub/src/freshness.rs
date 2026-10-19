@@ -4,8 +4,9 @@
 //! pub's solver-based revalidation (dartq does no version solving):
 //! - environment fingerprint: `flutterRoot`/`flutterVersion`/`pubCache`
 //!   preserved in the config must match the caller's current environment,
-//!   and `generatorVersion` must match the current Dart SDK down to
-//!   major.minor (patch bumps do not stale);
+//!   and a recorded `generatorVersion` must match the current Dart SDK down
+//!   to major.minor (patch bumps do not stale; a config carrying no stamp
+//!   makes no SDK claim and stays fresh);
 //! - `pubspec.lock` must exist;
 //! - mtime chain, per file: every non-cache package's `pubspec.yaml` (and
 //!   `pubspec_overrides.yaml` when present) must be **strictly older** than
@@ -65,8 +66,9 @@ pub enum StaleReason {
     MalformedLockFile(String),
     /// The config's recorded environment key differs from the current one.
     EnvironmentChanged { key: &'static str },
-    /// `generatorVersion` major.minor differs from the running SDK
-    /// (or the config carries none).
+    /// A recorded `generatorVersion` whose major.minor differs from the
+    /// running SDK — or an unparsable running SDK version, which cannot be
+    /// shown equal to the recorded stamp.
     GeneratorSdkMismatch { config: String, current: String },
     /// A pubspec is not strictly older than the lock; equality is stale
     ///.
@@ -301,24 +303,30 @@ impl Freshness {
             }
         }
 
-        // generatorVersion vs the running SDK, major.minor only.
+        // A recorded generatorVersion vs the running SDK, major.minor only.
+        // The comparison needs both sides: the stamp is pub's claim about
+        // the SDK that wrote the config (entrypoint.dart:1193-1203), and a
+        // config without the stamp makes no claim to falsify — the oracle
+        // analyzes it as written (its packages.dart:28-37 face runs no
+        // freshness gate at all). Pub's own `null -> stale` branch prices a
+        // silent re-resolution, a different cost model than a user-facing
+        // advisory; reading it as "every unstamped config is stale" produced
+        // 13 corpus false rows. An unparsable observed version cannot be
+        // shown equal to a recorded stamp either: reported, not skipped.
         if let Some(dart_version) = env.dart_version.as_deref() {
             let current = crate::version::Version::parse(dart_version).ok();
-            let matches = match (current, config.generator_version.as_ref()) {
+            let mismatch = match (current, config.generator_version.as_ref()) {
                 (Some(current), Some(generator)) => {
-                    current.major == generator.major && current.minor == generator.minor
+                    current.major != generator.major || current.minor != generator.minor
                 }
-                // pub treats a missing generatorVersion as a different SDK; an
-                // unparsable version cannot be shown equal either: report the
-                // mismatch rather than silently skipping the check.
-                (_, None) | (None, Some(_)) => false,
+                (_, None) => false,
+                (None, Some(_)) => true,
             };
-            if !matches {
+            if mismatch
+                && let Some(generator) = config.generator_version.as_ref()
+            {
                 reasons.push(StaleReason::GeneratorSdkMismatch {
-                    config: config
-                        .generator_version
-                        .as_ref()
-                        .map_or_else(|| "(none)".to_owned(), ToString::to_string),
+                    config: generator.to_string(),
                     current: dart_version.to_owned(),
                 });
             }
@@ -647,6 +655,53 @@ mod tests {
         };
         let report = Freshness::check(&root, &patch, None);
         assert!(report.is_fresh(), "unexpected: {:?}", report.stale_reasons);
+    }
+
+    /// The sanitized/hand-written config shape (no `generatorVersion` key —
+    /// `configVersion`/`generator`/`packages` only) is fresh: the SDK face
+    /// has no stamp to compare against and the other faces are clean.
+    #[test]
+    fn missing_generator_version_is_fresh() {
+        let root = temp_dir("no-stamp");
+        write(&root.join("pubspec.yaml"), PUBSPEC);
+        write(&root.join("pubspec.lock"), "packages: {}\n");
+        write(
+            &root.join(".dart_tool").join("package_config.json"),
+            r#"{
+              "configVersion": 2,
+              "packages": [
+                {"name": "solo", "rootUri": "../", "languageVersion": "3.5"}
+              ],
+              "generator": "pub"
+            }"#,
+        );
+        set_file_mtime(
+            root.join("pubspec.yaml"),
+            FileTime::from_unix_time(1_000, 0),
+        )
+        .expect("set mtime");
+        set_file_mtime(
+            root.join("pubspec.lock"),
+            FileTime::from_unix_time(2_000, 0),
+        )
+        .expect("set mtime");
+        set_file_mtime(
+            root.join(".dart_tool").join("package_config.json"),
+            FileTime::from_unix_time(3_000, 0),
+        )
+        .expect("set mtime");
+
+        // A current SDK is observed; the unstamped config stays fresh.
+        let env = EnvSnapshot {
+            dart_version: Some("3.13.1".into()),
+            ..EnvSnapshot::default()
+        };
+        let report = Freshness::check(&root, &env, None);
+        assert!(
+            report.is_fresh(),
+            "unexpected reasons: {:?}",
+            report.stale_reasons
+        );
     }
 
     /// Unobservable env keys never stale: a config recording `flutterRoot`
