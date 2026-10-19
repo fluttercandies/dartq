@@ -1441,6 +1441,42 @@ fn promoted_reads_carry_their_written_arguments() {
     );
 }
 
+/// #2180 face-1 pin: the true-arm promotion of a type check is the
+/// analyzer's `tryPromoteToType(tested, previous)` gated by
+/// `isValidPromotionStep` (`flow_analysis.dart:4142-4151`), not the tested
+/// type factored against the promotion chain. The factor-shaped candidate
+/// promotes `x` to `Never?` on `x is int?` when `x` already stands at `int`
+/// (`factor(int?, int) = Never?`), where the official keeps the standing
+/// `int` — `tryPromoteToType(int?, int)` is null because `int?` is no
+/// subtype of `int` (`type_system.dart:1729-1760`). A `Never?` read then
+/// poisons every member check in the branch (the `bool`-corruption shape
+/// the face was reported on).
+#[test]
+fn type_check_on_a_promoted_var_never_promotes_to_the_factored_remainder() {
+    let source = "void f(int? x) { x = 1; if (x != null) { if (x is int?) { x; } } }";
+    let promoted = promoted_tys(source);
+    assert!(
+        promoted
+            .iter()
+            .all(|ty| !matches!(ty.base, crate::ty::Base::Never)),
+        "{promoted:?}"
+    );
+}
+
+/// The mirror pin: the official's `tryPromoteToType` answer for a real
+/// refinement still promotes — `x is int` on `num? x` already promoted to
+/// `num` by the null check promotes to `int` (`int <: num` decides at a
+/// resolved back-end; at the name level the optimistic arm keeps the
+/// existing contract). The inner `x` operand reads its `num` promotion,
+/// the branch read its `int`.
+#[test]
+fn type_check_refinement_still_promotes() {
+    let source = "void f(num? x) { x = 1; if (x != null) { if (x is int) { x; } } }";
+    let promoted = promoted_tys(source);
+    assert_eq!(promoted.len(), 2, "{promoted:?}");
+    assert!(promoted.iter().all(|ty| !ty.nullable));
+}
+
 /// (d) The name-recovery face: `Base::Name(id)` round-trips through
 /// `name_lexeme` to its source spelling, and ids are dense (every id
 /// below a fact's id resolves).
@@ -2795,6 +2831,7 @@ fn assert_condition_write_unassigned_after() {
             plain: true,
             if_null: false,
             end: 0,
+            field_init: false,
         },
         Ev::BinaryBegin {
             op: BinOp::Other,
@@ -3078,6 +3115,7 @@ fn closure_await_demotes_captured_reads() {
             plain: true,
             if_null: false,
             end: 0,
+            field_init: false,
         },
         Ev::ExprStmt { span: span(8) },
     ];
@@ -3179,6 +3217,7 @@ fn for_in_statement_replay_invariants() {
             plain: true,
             if_null: false,
             end: 0,
+            field_init: false,
         },
         Ev::ExprStmt { span: span(5) },
         Ev::ForInBodyEnd,
@@ -4031,6 +4070,7 @@ fn assignment_demotion_keeps_the_least_specific_suffix() {
                 plain: true,
                 if_null: false,
                 end: 0,
+                field_init: false,
             },
             Ev::ExecEnd {
                 is_expr: false,
@@ -4132,6 +4172,69 @@ fn bottom_remainder_marks_the_else_branch_unreachable() {
     );
 }
 
+/// #2180 face-3 pin: an invalid tested type (the oracle's `InvalidType`,
+/// spelled `Base::Unknown` at this seam — `bound_face` already classifies
+/// it "like the official invalid-type arm") produces the analyzer's
+/// `x is InvalidType` verdict: no promotion (the true arm's
+/// `isValidPromotionStep` is false — `prev <: InvalidType` always holds,
+/// subtype.dart:274-276 making the invalid type a supertype of all), the
+/// tested set still records it on both arms (official `_finishTypeTest`,
+/// flow_analysis.dart:4283-4293), and the else branch is unreachable
+/// (`factor(prev, InvalidType) = Never`, :4154-4166 sound arm). Hand-driven:
+/// the parser pipeline spells a missing name as `Base::Name`, so only the
+/// resolved back-end (or this buffer) can feed the invalid arm.
+#[test]
+fn invalid_tested_type_never_promotes_and_deads_the_else_branch() {
+    use crate::ev::Ev;
+    use crate::facts::FlowFact;
+    const INT: u32 = 102;
+    const X: u32 = 7;
+    let events: Vec<Ev> = [
+        declared(X, named_ty(INT, false)),
+        vec![Ev::IfBegin { span: tspan(2) }],
+        is_test(
+            X,
+            Ev::Type {
+                base: crate::ty::Base::Unknown,
+                nullable: false,
+                args: crate::ty::EMPTY_ARGS,
+            },
+            false,
+        ),
+        vec![
+            Ev::ThenBegin,
+            // The true arm reads `x` at its declared type: no promotion.
+            read(X),
+            Ev::ExprStmt { span: tspan(3) },
+            Ev::ElseBegin,
+            Ev::ExprStmt { span: tspan(4) },
+            Ev::OtherExpr { span: tspan(5) },
+            Ev::IfEnd { has_else: true },
+            Ev::ExecEnd {
+                is_expr: false,
+                end: tspan(0),
+            },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(&events);
+    let model = interp.current.model(0);
+    assert_eq!(model.promoted, crate::model::NIL, "no promotion may stand");
+    assert!(
+        interp.lists.iter(model.tested).count() == 1,
+        "the invalid type joins the tested set once: {:?}",
+        interp.lists.iter(model.tested).collect::<Vec<_>>()
+    );
+    assert!(
+        interp
+            .facts
+            .iter()
+            .any(|fact| matches!(fact, FlowFact::DeadCode { .. })),
+        "the else branch of `x is InvalidType` is dead: {:?}",
+        interp.facts
+    );
+}
+
 /// `??` types as the LHS's non-null form (official `ifNullExpression_end`,
 /// flow_analysis.dart:7071-7080, with the skip-path promotion mounted at
 /// `ifNullExpression_rightBegin`, :7086-7104). The old engine gave `??`
@@ -4199,6 +4302,7 @@ fn if_null_write_repromotes_via_types_of_interest() {
                 plain: true,
                 if_null: false,
                 end: 0,
+                field_init: false,
             },
             Ev::ExecEnd {
                 is_expr: false,
@@ -4243,6 +4347,7 @@ fn if_null_assign_repromotes_through_written_join() {
                 plain: false,
                 if_null: true,
                 end: 0,
+                field_init: false,
             },
             Ev::ExecEnd {
                 is_expr: false,
@@ -6272,5 +6377,163 @@ fn creation_rhs_types_the_write() {
         .filter(|t| matches!(t.base, Base::Name(_)) && !t.nullable)
         .count();
     assert_eq!(non_null_named, 5, "{promoted:?}");
+}
+
+/// #2180 face-2 pin: a `late` local written in the enclosing body and only
+/// read inside closures is not definitely unassigned at those reads — the
+/// closure's collect records the write into `anywhere.written` and the
+/// closure-entry conservative join clears the `unassigned` bit (official
+/// `_functionExpression_begin`'s `conservativeJoin(anywhere.written, …)`,
+/// `flow_analysis.dart:8731-8738` with `assigned_variables.dart:270`'s
+/// write-time `anywhere.written.add`). The pre-fix miss: `exec_end`'s
+/// collecting arm skipped the `is_expr` value push, so an `ArgumentsEnd`
+/// pop ate the enclosing assignment's target slot and `record_write`
+/// never ran — the whole-buffer `anywhere` stayed write-free.
+#[test]
+fn late_var_written_around_closure_reads_not_unassigned() {
+    let source = r#"void f(Stream s) {
+  late StreamSubscription sub;
+  sub = s.listen((d) {
+    sub.pause();
+  }, onDone: () {
+    sub.cancel();
+  });
+  sub.hashCode;
+}"#;
+    // Every read of `sub` emits a row (`!assigned` holds through the
+    // conservative join), but none may carry the definite bit — that bit
+    // alone drives `definitely_unassigned_late_local_variable`.
+    let facts = facts_of(source);
+    let unassigned_rows: Vec<bool> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::UnassignedRead {
+                definitely_unassigned,
+                ..
+            } => Some(*definitely_unassigned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(unassigned_rows.len(), 2, "{facts:?}");
+    assert!(unassigned_rows.iter().all(|d| !*d), "{facts:?}");
+}
+
+/// #2185 pin (prefixed `is` narrowing): `handle_type` fires on the
+/// qualified chain's FIRST token (`io` of `io.Directory` — official
+/// `handleType(typeRefOrPrefix)`, type_info_impl.dart:691), so the
+/// recorded type name must be the chain's LAST identifier, the element
+/// the spelling resolves to. Interning the prefix collapsed every `io.*`
+/// spelling onto `Name(io)`, and `factor(io-typed e, io)` bottomed —
+/// the `else` arm of a prefixed `is`-test read unreachable while the
+/// oracle reports none (the dartq-only dead-code direction).
+#[test]
+fn prefixed_is_test_else_arm_stays_reachable() {
+    let source = r#"FSE m(io.FSE e) {
+  if (e is io.PNFE) {
+    return P(e.p, e.m);
+  } else {
+    return F(e.p, e.m);
+  }
+}"#;
+    assert_eq!(dead_snippets(source), Vec::<String>::new());
+    // And the resolved tail name keeps the SAME spelled type factoring
+    // against itself: a variable declared `io.PNFE` promotes on
+    // `e is io.PNFE`, so a repeat test bottoms the second arm's true
+    // branch exactly like the unprefixed shape.
+    let source = r#"void f(io.PNFE e) {
+  if (e is io.PNFE) {
+    g(e);
+  } else if (e is io.PNFE) {
+    g(e);
+  }
+}"#;
+    assert_eq!(dead_snippets(source).len(), 1, "second arm must be dead");
+}
+
+/// #2185 pin (constructor field initializer): `f = e` in `C(...) : f = e`
+/// parses as a plain `Assign` event, but its LHS resolves to `this.f`
+/// (upstream `ConstructorFieldInitializer`) — never a local write. A
+/// like-named parameter must keep its declared nullability, so a later
+/// initializer's `param ?? fallback` RHS stays reachable (the oracle
+/// reports no dead code; the pre-fix fold wrote the param non-null and
+/// deaded the second `??` arm).
+#[test]
+fn field_initializer_does_not_write_like_named_parameter() {
+    let source = r#"class C {
+  C(int? f, int? g)
+      : f = f ?? 0,
+        _g = g ?? calc(g ?? 1);
+  final int f;
+  final int _g;
+}"#;
+    assert_eq!(dead_snippets(source), Vec::<String>::new());
+    // And the parameter still promotes on its own is-test afterwards —
+    // the suppression is the write, not the variable.
+    let source = r#"class C {
+  C(int? v) : _v = v ?? 0 {
+    if (v is int) {
+      g(v);
+    }
+  }
+  final int _v;
+}"#;
+    let facts = facts_of(source);
+    assert!(
+        facts
+            .iter()
+            .any(|fact| matches!(fact, FlowFact::PromotedRead { .. })),
+        "{facts:?}"
+    );
+}
+
+/// #2185 pin (prefixed constructor reference): `ConstructorReference`
+/// fires on the chain's first token too — `io.File()`'s implicit
+/// creation must carry `File`'s name so a write `x = io.File()`
+/// promotes `x` to the resolved type, not the shared `io` prefix.
+#[test]
+fn prefixed_constructor_write_promotes_tail_type() {
+    let source = r#"void f() {
+  var x = io.File();
+  if (x is io.File) {
+    g(x);
+  }
+}"#;
+    let facts = facts_of(source);
+    let promoted: Vec<String> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::PromotedRead { ty, .. } => Some(format!("{ty:?}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(promoted.len(), 1, "{facts:?}");
+}
+
+/// #2180 face-1 pin (the reported shape): a `final` local initialized to
+/// a constructor invocation and then used through member writes and
+/// member-tear-off argument reads inside closures never promotes — no
+/// `is`/`as`/null-check on the receiver exists, so no promotion source
+/// fires. The oracle-facing failure mode was the receiver reporting as
+/// `bool`; this face pins that nothing promotes here at all (a `bool`
+/// row could only come from a tested-set leak the source never spells).
+#[test]
+fn constructor_initialized_final_receiver_never_promotes() {
+    let source = r#"Stream f(Stream s) {
+  final c = StreamController.broadcast(sync: true);
+  c.onListen = () {
+    s.listen((d) {});
+  };
+  return c.stream;
+}"#;
+    let facts = facts_of(source);
+    assert!(
+        facts.iter().all(|fact| !matches!(
+            fact,
+            FlowFact::PromotedRead { .. }
+                | FlowFact::UnassignedRead { .. }
+                | FlowFact::DeadCode { .. }
+        )),
+        "{facts:?}"
+    );
 }
 

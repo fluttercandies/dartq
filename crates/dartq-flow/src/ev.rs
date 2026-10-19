@@ -366,6 +366,13 @@ pub enum Ev {
         /// `end`): a dead updater's row ends here (`i = 0`, `i += 1` — the
         /// header parts carry no statement wrapper).
         end: u32,
+        /// A constructor field initializer's write (`f = e` or `this.f = e`
+        /// in `C(...) : f = e`): the LHS resolves to `this.f`, not a local —
+        /// the fold must not write a like-named parameter/variable
+        /// (upstream parses it as `ConstructorFieldInitializer`, whose
+        /// field write never enters `flow.store_local`). Set at
+        /// `end_initializer` on the window's last matching-end assign.
+        field_init: bool,
     },
     PatternAssign,
     CondBegin,

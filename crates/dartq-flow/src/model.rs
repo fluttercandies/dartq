@@ -511,8 +511,18 @@ impl State {
                     );
                 }
             }
-            // The unique candidate that is a subtype of all the others wins.
-            if let Some((promoted_to, args)) = unique_subtype(ops, &candidates) {
+            // The exact-written-type shortcut (official
+            // `_tryPromoteToTypeOfInterest`'s `type == writtenType` arm,
+            // `flow_analysis.dart:4987-4990`): a candidate equal to the
+            // written type promotes immediately, ahead of the unique-subtype
+            // question — without it an `x is T`-tested `x = <T value>`
+            // fails to promote whenever a second interest type is
+            // incomparable. Otherwise the unique candidate that is a
+            // subtype of all the others wins.
+            if let Some((_, args)) = candidates.iter().find(|(c, _)| *c == written) {
+                let args = *args;
+                promoted = add_promoted(ops, lists, promoted, written, args);
+            } else if let Some((promoted_to, args)) = unique_subtype(ops, &candidates) {
                 promoted = add_promoted(ops, lists, promoted, promoted_to, args);
             }
         }
@@ -784,13 +794,20 @@ fn join_model(a: VarModel, b: VarModel, lists: &mut Lists) -> VarModel {
     let captured = a.captured() || b.captured();
     // Written on one path since the branch or not, the conservative join is
     // the common (less specific) chain prefix either way; write-captured on
-    // either path keeps no promotion at all (official `joinPromotionInfo`).
+    // either path keeps no promotion at all (official `joinPromotionInfo`)
+    // — and no types of interest either: the official's write-capture join
+    // hands back an empty `tested` set (`flow_analysis.dart:5123-5125`, the
+    // same shape `PromotionModel.writeCapture` builds at :4873-4879).
     let promoted = if captured {
         NIL
     } else {
         join_promoted(a.promoted, b.promoted, lists)
     };
-    let tested = union_tested(a.tested, b.tested, lists);
+    let tested = if captured {
+        NIL
+    } else {
+        union_tested(a.tested, b.tested, lists)
+    };
     let joined = VarModel {
         promoted,
         tested,

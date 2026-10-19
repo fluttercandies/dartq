@@ -180,6 +180,13 @@ pub struct Flow<'t> {
     /// initializer is its own executable — the official folds it):
     /// [`Flow::end_variable_initializer`] closes it.
     initializer_exec: bool,
+    /// Buffer indices of open constructor initializer entries
+    /// (`begin_initializer` pushes, `end_initializer` pops): the field
+    /// write `f = e` (or `this.f = e`) parses as a plain expression whose
+    /// `Assign` event ends exactly at `end_initializer`'s end token —
+    /// marked `field_init` there so the fold never writes a like-named
+    /// local (upstream `ConstructorFieldInitializer` writes `this.f`).
+    init_starts: Vec<usize>,
     facts: Vec<FlowFact>,
 }
 
@@ -227,6 +234,7 @@ impl<'t> Flow<'t> {
             container_depth: 0,
             closed: crate::ty::ClosedNames::default(),
             initializer_exec: false,
+            init_starts: Vec::new(),
             facts: Vec::new(),
         }
     }
@@ -402,6 +410,41 @@ impl<'t> Flow<'t> {
             // `Never <: Object`; any other non-nullable named or
             // signature-less function bound is a subtype of `Object` too.
             B::Never | B::Name(_) | B::Function => Some((C::NonNullable, None)),
+        }
+    }
+
+    /// The type-name token's own identifier id: `handle_type` fires on the
+    /// qualified chain's FIRST token (`io` of `io.Directory`, per the
+    /// official `handleType(typeRefOrPrefix)`), so the type name is the
+    /// chain's LAST identifier — the element the spelling resolves to.
+    /// Walking `Period`-separated continuations recovers it; an
+    /// unqualified name stays its own id, and a recovery tail (a `.`
+    /// followed by a synthetic or non-identifier token) keeps the last
+    /// real identifier seen.
+    fn qualified_name(&mut self, head: Token) -> u32 {
+        let mut index = head.id as usize;
+        loop {
+            let Some(dot) = self.tokens.next(index) else {
+                break;
+            };
+            if self.tokens.get(dot).map(|t| t.kind) != Some(dartq_scanner::TokenKind::Period) {
+                break;
+            }
+            let Some(tail) = self.tokens.next(dot) else {
+                break;
+            };
+            if self.tokens.get(tail).map(|t| t.kind)
+                != Some(dartq_scanner::TokenKind::Identifier)
+                || self.tokens.get(tail).is_none_or(|t| t.is_synthetic())
+            {
+                break;
+            }
+            index = tail;
+        }
+        if index == head.id as usize {
+            self.name(head)
+        } else {
+            self.intern_lexeme(self.tokens.lexeme(self.source, index))
         }
     }
 
@@ -1162,26 +1205,25 @@ impl ParserListener for Flow<'_> {
     // —— types ——————————————————————————————————————————————————————————
 
     fn handle_type(&mut self, name: Token, question: Option<Token>) {
-        let id = self.name(name);
-        // Classify on the type-name TOKEN's own lexeme: `name.id` is the
-        // token index while `id` is the interned name id — unrelated
-        // namespaces. Indexing the table by the interned id classified a
-        // special base only when the ids collided (every fixture starting
-        // `void f(` made `void` collide by accident).
-        let base = match self
-            .tokens
-            .get(name.id as usize)
-            .map(|_| self.tokens.lexeme(self.source, name.id as usize))
-        {
-            Some("dynamic") => crate::ty::Base::Dynamic,
-            Some("void") => crate::ty::Base::Void,
-            Some("Never") => crate::ty::Base::Never,
+        // The type name is the qualified chain's last identifier — the
+        // element the spelling resolves to. `name` is the chain's first
+        // token (`io` of `io.Directory`); keying on it collapsed every
+        // `io.*` type onto `Name(io)`, which deaded `x is io.File` after
+        // `x is io.Directory` (`factor` bottomed on the same id).
+        let id = self.qualified_name(name);
+        // Classify on the resolved name's lexeme: `name_lexeme` of the id
+        // is the last identifier's spelling — the prefix can never spell
+        // a special base (`void`, `dynamic`), the tail can.
+        let base = match self.name_lexeme(id) {
+            "dynamic" => crate::ty::Base::Dynamic,
+            "void" => crate::ty::Base::Void,
+            "Never" => crate::ty::Base::Never,
             // The written `Null` type name IS the core null type (upstream
             // Dart SDK flow analysis `_isNullType`'s `isDartCoreNull`): the
             // null-literal-equivalent classification that drives
             // disjointness (`_typesAreDisjointDueToNullability`) and
             // promotion faces.
-            Some("Null") => crate::ty::Base::Null,
+            "Null" => crate::ty::Base::Null,
             _ => crate::ty::Base::Name(id),
         };
         // Consumed per row, so the pending list can never leak across
@@ -1755,13 +1797,26 @@ impl ParserListener for Flow<'_> {
             | IdentifierContext::ExpressionContinuation
             | IdentifierContext::NamedArgumentReference
             | IdentifierContext::CatchParameter
-            | IdentifierContext::LocalVariableDeclaration
+            | IdentifierContext::LocalVariableDeclaration => {
+                let name = self.name(token);
+                self.record(Ev::Ident {
+                    name,
+                    token,
+                    context,
+                });
+            }
             // A constructor-reference head (`new C()`, `const C()`,
             // `C<T>.named(...)`): the creation's value carries the head's
             // named type — without it the invocation nets no stack entry
             // and a following `x = C()` write consumes the wrong operand.
-            | IdentifierContext::ConstructorReference => {
-                let name = self.name(token);
+            IdentifierContext::ConstructorReference => {
+                // Same qualified-head contract as `handle_type`: `io` of
+                // `io.File()` fires here, the type is the tail `File` —
+                // the implicit-creation write must promote to `File`, not
+                // the shared `io` prefix. (Expression identifiers keep the
+                // head token: `context.read()`'s `context` resolves to the
+                // receiver, not the selector.)
+                let name = self.qualified_name(token);
                 self.record(Ev::Ident {
                     name,
                     token,
@@ -1929,7 +1984,39 @@ impl ParserListener for Flow<'_> {
                 Some(dartq_scanner::TokenKind::QuestionQuestionEq)
             ),
             end: end.range.end(),
+            field_init: false,
         });
+    }
+
+    fn begin_initializer(&mut self, _token: Token) {
+        if let Some(buffer) = &self.buffer {
+            self.init_starts.push(buffer.len());
+        }
+    }
+
+    fn end_initializer(&mut self, end: Token) {
+        let Some(start) = self.init_starts.pop() else {
+            return;
+        };
+        // The field write `f = e` / `this.f = e` parses as the entry's own
+        // expression: its `Assign` is the last one in this window and ends
+        // exactly at the entry's end. `assert(...)` entries bracket their
+        // inner assigns inside `AssertBegin/End` with different ends, so
+        // only the field form matches. A redirect (`super(...)`/`this(...)`)
+        // fires no `end_initializer` — its window never reaches here.
+        if let Some(buffer) = &mut self.buffer {
+            let end = end.range.end();
+            if let Some(ev) = buffer[start..]
+                .iter_mut()
+                .rev()
+                .find(|ev| matches!(ev, Ev::Assign { end: e, .. } if *e == end))
+            {
+                let Ev::Assign { field_init, .. } = ev else {
+                    return;
+                };
+                *field_init = true;
+            }
+        }
     }
 
     fn handle_unary_prefix_assignment_expression(&mut self, operator: Token) {

@@ -2215,6 +2215,17 @@ impl Interp<'_> {
         // The enclosing statement boundaries resume: the body's own
         // boundaries never rewrite them.
         self.stmt_began_dead = began_dead;
+        // Net one value for the consumer (crate contract, see
+        // `SwitchExprBlockEnd`/`ListLitEnd`): a function expression leaves
+        // its value where the initializer/argument/assignment pops it. The
+        // push belongs to the stack contract, not the diagnostic face —
+        // collect runs need it too, or a downstream `ArgumentsEnd` pops the
+        // slot the consumer meant for the enclosing expression and every
+        // later pairing (an assignment target's `record_write`, an
+        // initializer's `pending_inits`) reads the wrong slot.
+        if is_expr {
+            self.exprs.push(Expr::trivial(Ty::UNKNOWN));
+        }
         if collecting {
             self.collect_pop(is_closure);
             return;
@@ -2229,12 +2240,6 @@ impl Interp<'_> {
         }
         if is_closure {
             self.current = saved;
-        }
-        // Net one value for the consumer (crate contract, see
-        // `SwitchExprBlockEnd`/`ListLitEnd`): a function expression leaves
-        // its value where the initializer/argument/assignment pops it.
-        if is_expr {
-            self.exprs.push(Expr::trivial(Ty::UNKNOWN));
         }
     }
 

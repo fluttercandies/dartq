@@ -649,10 +649,23 @@ impl Interp<'_> {
                     );
                 }
             }
-            Ev::Assign { plain, if_null, end } => {
+            Ev::Assign {
+                plain,
+                if_null,
+                end,
+                field_init,
+            } => {
                 let base = self.consumer_base(2);
                 let rhs = self.pop_value();
-                let target = self.pop_value();
+                let mut target = self.pop_value();
+                // A constructor field initializer's write targets `this.f`
+                // (upstream `ConstructorFieldInitializer`): the LHS name is
+                // a field name, so a like-named local must take no write —
+                // its read rows still retract below (the `f` of `f = e`
+                // reads no local either).
+                if *field_init {
+                    target.reference = None;
+                }
                 // The read-back value's written arguments are the right-hand
                 // side's when the write carried its type (a plain `=` or the
                 // `??=` if-null combination), and argument-less for the
@@ -1401,21 +1414,21 @@ impl Interp<'_> {
 
     /// The promotion target for a type check (official
     /// `tryPromoteForTypeCheck`'s true branch,
-    /// flow_analysis.dart:4137-4145): the tested type factored against
-    /// every existing promotion. A bottom candidate (`x is int` twice
-    /// factors to `Never`) and a candidate the current type already
-    /// subsumes (`x is int?` on `int x`) are not steps (official
-    /// `isValidPromotionStep`); anything else is the step. The official
-    /// `tryPromoteToType` further gates on `tested <: current`
-    /// (flow_analysis.dart:7229-7246) — a question the name-level seam
-    /// cannot decide (`int <: num` and `String <: num` are both false
-    /// without a class hierarchy) and the oracle pins require the
-    /// promotion on (`num n`, `is int`), so the undecided case promotes
-    /// optimistically; a resolved back-end re-tightens the gate through
-    /// [`crate::ty::TypeOps::try_promote_to`]. The written-argument face
-    /// of the same question IS decidable here (#611 step 4): the test is
-    /// refused when the tested arguments cannot be a subtype of the
-    /// declared ones — the official lattice refuses it too.
+    /// flow_analysis.dart:4137-4151): the tested type itself when it is a
+    /// step over the current type. A tested type already covered by the
+    /// promotion chain (`x is num` on `[int, num]`) and one the current
+    /// type already subsumes (`x is int?` on `int x`) are not steps
+    /// (official `isValidPromotionStep`, :7229-7247); anything else is the
+    /// step. The official `tryPromoteToType` further gates on
+    /// `tested <: current` (`type_system.dart:1729-1760`) — a question the
+    /// name-level seam cannot decide (`int <: num` and `String <: num` are
+    /// both false without a class hierarchy) and the oracle pins require
+    /// the promotion on (`num n`, `is int`), so the undecided case
+    /// promotes optimistically; a resolved back-end re-tightens the gate
+    /// through [`crate::ty::TypeOps::try_promote_to`]. The
+    /// written-argument face of the same question IS decidable here (#611
+    /// step 4): the test is refused when the tested arguments cannot be a
+    /// subtype of the declared ones — the official lattice refuses it too.
     fn promotion_candidate(&mut self, var: u32, tested: Ty, tested_args: u32) -> Option<Ty> {
         match tested.base {
             Base::Unknown | Base::Dynamic | Base::Void => None,
@@ -1433,21 +1446,27 @@ impl Interp<'_> {
     }
 
     /// The promotion candidate after the entry gates: the tested type
-    /// factored against every existing promotion ([`Self::promotion_candidate`]'s
-    /// documented seam). A bottom candidate (`x is int` twice factors to
-    /// `Never`) and a candidate the current type already subsumes (`x is
-    /// int?` on `int x`) are not steps (official `isValidPromotionStep`).
+    /// itself, gated by the official `tryPromoteForTypeCheck` decision —
+    /// `tryPromoteToType(tested, previous)` returns `to` (`flow_analysis.dart:4142-4151`
+    /// with `type_system.dart:1739-1741`), never a factored remainder.
+    /// The chain factoring survives only as the coverage test: a tested
+    /// type factored to bottom by an earlier promotion is already implied
+    /// (`x is num` on an `[int, num]` chain adds nothing), and a tested
+    /// type the current type already subsumes (`x is int?` on `int x`) is
+    /// no step (official `isValidPromotionStep`, :7229-7247). Returning
+    /// the remainder instead would promote `x` to `Never?` on the
+    /// `x is int?`-after-`int` shape — the `bool`-corruption face.
     pub(crate) fn factored_candidate(&self, var: u32, tested: Ty) -> Option<Ty> {
         let model = self.current.model(var);
         let previous = self.promoted_type_of(var, &model);
-        let mut candidate = tested;
+        let mut remainder = tested;
         for ty in self.lists.iter(model.promoted) {
-            candidate = self.ops.factor(candidate, ty);
+            remainder = self.ops.factor(remainder, ty);
         }
-        if self.ops.is_bottom(candidate) || self.ops.is_subtype(previous, candidate) {
+        if self.ops.is_bottom(remainder) || self.ops.is_subtype(previous, tested) {
             None
         } else {
-            Some(candidate)
+            Some(tested)
         }
     }
 
