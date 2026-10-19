@@ -687,11 +687,6 @@ impl<'a> Engine<'a> {
             .any(|(_, container)| container.members.get(&name).is_some_and(conflicts))
     }
 
-    /// Whether the formal table declares a named formal under `name`.
-    pub(crate) fn has_named_formal(formals: Option<&Formals>, name: StringId) -> bool {
-        formals.is_some_and(|f| f.named.iter().any(|formal| formal.name == name))
-    }
-
     /// The resolved top-level declaration under `name` (`None` = no check).
     /// An imported declaration projects into the diagnosing pool (F5) —
     /// its declared types are local slots from here on.
@@ -1128,16 +1123,24 @@ impl<'a> Engine<'a> {
             // (upstream resolves the bare invocation through the
             // class-member namespace first, so `static m() => C()` reports
             // `undefined_method` on the class, never `undefined_function`).
-            // `enclosingClass` upstream is an `InterfaceElement` — classes,
-            // enums AND mixins — but never an extension or an extension
-            // type, whose misses keep the top-level `undefined_function`
-            // face. The header's clause text pushes TypeUse rows, never
-            // Bare rows, so no header-position guard is needed.
+            // `enclosingInstanceElement` upstream is an `InstanceElement` —
+            // classes, enums, mixins, AND extension types
+            // (`ExtensionTypeElementImpl extends InterfaceElementImpl`; the
+            // implicit `this` of an extension-type body carries the
+            // extension type itself, so its bare miss names the head like a
+            // class body names the class) — but never an extension, whose
+            // bare miss keeps the top-level `undefined_function` face (the
+            // on-type names only the explicit-`this` member walks). The
+            // header's clause text pushes TypeUse rows, never Bare rows, so
+            // no header-position guard is needed.
             this_type: context
                 .filter(|(_, kind)| {
                     matches!(
                         kind,
-                        ContainerKind::Class | ContainerKind::Enum | ContainerKind::Mixin
+                        ContainerKind::Class
+                            | ContainerKind::Enum
+                            | ContainerKind::Mixin
+                            | ContainerKind::ExtensionType
                     )
                 })
                 .map(|(name, _)| name),

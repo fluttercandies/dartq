@@ -731,13 +731,18 @@
     /// (the superclass and an interface extending it) stays pointer-equal,
     /// so the face-chain dedup still emits a single verdict, and the
     /// message renders the inherited signature with its arguments through
-    /// the diagnosing pool, pool-valid for message rendering.
+    /// the diagnosing pool, pool-valid for message rendering. The
+    /// dependency declares its own `int`/`List` spellings so `S.m`'s
+    /// formal carries a real declared type — an undeclared spelling is a
+    /// genuine `InvalidType` there, and the #2192 leniency (the oracle's
+    /// own InvalidType posture) leaves that member mismatch silent.
     #[test]
     fn foreign_member_surfaces_once_across_two_faces() {
         let report = foreign_unit_report(
             "import 'other.dart'; class int {} class List<T> {} \
              class B extends S implements I { void m(List<int> x) {} }",
-            "class S { void m(List<int>? x) {} } class I extends S {}",
+            "class int {} class List<T> {} \
+             class S { void m(List<int>? x) {} } class I extends S {}",
         );
         assert_eq!(
             code_names(&report),

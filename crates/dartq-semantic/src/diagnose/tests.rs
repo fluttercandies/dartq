@@ -5431,6 +5431,27 @@
         );
     }
 
+    /// A bare miss inside an extension-type body keeps the class-family
+    /// face: the extension type is an `InterfaceElement` upstream
+    /// (`ExtensionTypeElementImpl extends InterfaceElementImpl` — the
+    /// implicit `this` of the body carries the extension type itself), so
+    /// the UnqualifiedLookupDomain names the head exactly like a class
+    /// body names its class, never the context-free `undefined_function`.
+    #[test]
+    fn extension_type_body_miss_names_the_extension_type() {
+        let report = report("extension type E(int i) { void f() { miss(); } }");
+        assert_eq!(
+            code_names(&report),
+            ["undefined_method"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The method 'miss' isn't defined for the type 'E'."
+        );
+    }
+
     /// The `on`-face member union inside instance bodies (#2186 S2): a bare
     /// name or `this.member` access resolves against the constraint face —
     /// hits stay silent; a member the constraint provably lacks reports.

@@ -1125,24 +1125,6 @@ impl<'a> Engine<'a> {
 
     // —— class-modifier restriction families (#600) ——————————————————————
 
-    /// The declaration-site combination face (`parser_impl.dart:2976-3015`
-    /// through [`declaration_violations`]): the written header keywords
-    /// decide, and each violation anchors on its keyword token(s) — the
-    /// single keyword for the one-anchor rows, the `final`→`base`/
-    /// `interface` coverage for the spanned `abstract final …` pairs.
-    /// `anchors` carries the present keywords' spans.
-    pub(crate) fn check_modifier_declaration(
-        &mut self,
-        modifiers: ClassModifiers,
-        anchors: &[(ModifierKeyword, SourceRange)],
-    ) {
-        for violation in declaration_violations(&modifiers) {
-            let range = violation_span(&violation, anchors);
-            // The declaration-site rows are frozen zero-argument templates.
-            self.emit_modifier(violation.code, range, "", "");
-        }
-    }
-
     /// Arms the deferred class-modifier restriction checks at the
     /// container's name event: the element model is complete (the collect
     /// pass ran first), but the supertype entries have not streamed yet —
