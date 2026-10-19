@@ -2279,6 +2279,29 @@ fn maintain_and_close(
     // know their defining file at the recompute.
     let mut library_keys: FxHashMap<LibraryId, FileId> = FxHashMap::default();
     let mut movers: Vec<(FileId, Option<LibraryId>, LibraryId)> = Vec::new();
+    // The canonical URI is a pure function of the interned path and the
+    // package table: compose every uncached changed file's spelling in
+    // parallel up front, so the serial ownership loop below only reads the
+    // memo (a cold walk otherwise composes 10^5 URIs on one thread).
+    {
+        let pending: Vec<(FileId, std::path::PathBuf)> = changed
+            .iter()
+            .map(|(file, _, _)| *file)
+            .filter(|file| !state.canonical_uris.contains_key(file))
+            .filter_map(|file| state.files.path(file).map(|path| (file, path.to_path_buf())))
+            .collect();
+        let packages = &state.uri_packages;
+        let composed: Vec<(FileId, Arc<str>)> = pending
+            .par_iter()
+            .map(|(file, path)| {
+                (
+                    *file,
+                    Arc::from(dartq_resolution::compose_canonical_uri(packages, path)),
+                )
+            })
+            .collect();
+        state.canonical_uris.extend(composed);
+    }
     // Unchanged part files whose claim may have moved. Raw offers can name
     // defining files (they claim nothing) and removed files (nothing left to
     // resolve); both skip.
