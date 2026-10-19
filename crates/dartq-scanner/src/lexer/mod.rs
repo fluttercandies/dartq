@@ -181,8 +181,13 @@ impl<'s> Lexer<'s> {
         self.drive();
         let curly_begin = self.close_unclosed_groups();
         self.emit(TokenKind::Eof, source_len, 0);
-        let tokens = std::mem::take(&mut self.tokens);
-        let end_of = std::mem::take(&mut self.end_of);
+        // The tables outlive the scan (the engine retains them per file for
+        // the lint fan-out): drop the `src.len() / 4` reservation's slack so
+        // residency is the stream's own length.
+        let mut tokens = std::mem::take(&mut self.tokens);
+        tokens.shrink_to_fit();
+        let mut end_of = std::mem::take(&mut self.end_of);
+        end_of.shrink_to_fit();
         let diags = std::mem::take(&mut self.diags);
         let unmatched = std::mem::take(&mut self.unmatched);
         let result = ScanResult {
