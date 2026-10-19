@@ -1,0 +1,1478 @@
+use super::*;
+
+impl<'a> Engine<'a> {
+    /// The with-clause entry face (`class_used_as_mixin`, messages.yaml
+    /// :2737-2741): every entry span whose name resolves to a plain class —
+    /// neither `mixin` nor `mixin class` — reports at the entry name. Runs
+    /// after the parse so a same-file later declaration resolves; an
+    /// unresolvable entry stays with the clause ledger's own faces.
+    pub(crate) fn finalize_mixin_uses(&mut self) {
+        for span in std::mem::take(&mut self.pending_mixin_uses) {
+            let start = span.offset as usize;
+            let end = (start + span.length as usize).min(self.source.len());
+            if start >= end {
+                continue;
+            }
+            let name = self.intern(&self.source[start..end]);
+            let Some((container, _)) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                name,
+            ) else {
+                continue;
+            };
+            if container.kind != ContainerKind::Class
+                || container_modifiers(container).is_mixin_class
+            {
+                continue;
+            }
+            let name_text = self.strings.resolve(name).to_string();
+            self.emit(SemanticCode::ClassUsedAsMixin, span, &name_text, "");
+        }
+    }
+
+    /// The end-of-unit boundedness checks (#610): the deferred explicit
+    /// type-argument sites and enum values-field faces, in source order,
+    /// against the whole-file snapshot; then the deferred
+    /// `strict_raw_type` rows, their `{0}` display rendered from the
+    /// instantiated-to-bounds form. Runs after the parse, when every
+    /// in-file container is captured.
+    /// `_verifyExtensionElementImplements` (scope_analyzer.dart:1312-1360):
+    /// every interface `implements` face must be a supertype of the
+    /// representation type (`isSubtypeOf(declaredRepresentation, type)`),
+    /// else `extension_type_implements_not_supertype` at the face. The
+    /// argument-bearing snapshot decides first (`int` against
+    /// `Comparable<Score>` — `int`'s `Comparable` instantiation is
+    /// `Comparable<num>`); a face it cannot model falls back to the
+    /// name-level lattice for bare heads, which answers `None` across any
+    /// unresolvable edge — the under-report direction.
+    /// `resolveObjectPatternPropertyGet` (type_analyzer.dart:1669-1715):
+    /// each object-pattern field reads a getter on the head type; a clean
+    /// miss reports `undefined_getter` at the field's name token (the
+    /// written name, or the shorthand's variable). Found members of any
+    /// kind (a method field reads its tear-off), `Object` members, and an
+    /// applicable extension face resolve; a broken chain, an unresolvable
+    /// or core head, and mixin/extension/extension-type heads (their
+    /// `on`/representation faces are invisible here) stay silent.
+    pub(crate) fn finalize_pattern_getters(&mut self) {
+        for (head, getter, at) in std::mem::take(&mut self.pending_pattern_getters) {
+            let kind = match self.container_kind_of(head) {
+                Some(kind @ (ContainerKind::Class | ContainerKind::Enum)) => kind,
+                _ => continue,
+            };
+            if !matches!(self.walk_members(head, getter), Walk::Missing)
+                || getter == self.intern("==")
+                || self.members.object_members.contains(&getter)
+                || (kind == ContainerKind::Enum && self.members.enum_synth_members.contains(&getter))
+                || !matches!(
+                    self.extension_application(head, Ty::UNKNOWN, getter, false, false),
+                    ExtensionApp::None
+                )
+            {
+                continue;
+            }
+            let name_text = self.strings.resolve(getter).to_string();
+            let type_text = self.strings.resolve(head).to_string();
+            self.stage_typed(SemanticCode::UndefinedGetter, at, &name_text, &type_text);
+        }
+    }
+
+    pub(crate) fn finalize_ext_faces(&mut self) {
+        let strings = self.strings;
+        let elements = self.index.get(self.file);
+        let declared = |name: StringId| elements.is_some_and(|f| f.container(name).is_some());
+        for row in self.bounds.ext_face_rows(strings, declared) {
+            let (face_text, rep_text) = match (row.verdict, row.displays) {
+                (Some(true), _) => continue,
+                (Some(false), Some(displays)) => displays,
+                _ => {
+                    let (Some(face), Some(rep)) = (row.face_bare, row.rep_bare) else {
+                        continue;
+                    };
+                    if self.name_world().decide_subtype(rep, face) != Some(false) {
+                        continue;
+                    }
+                    (
+                        strings.resolve(face).to_string(),
+                        strings.resolve(rep).to_string(),
+                    )
+                }
+            };
+            self.stage_typed(
+                SemanticCode::ExtensionTypeImplementsNotSupertype,
+                row.range,
+                &face_text,
+                &rep_text,
+            );
+        }
+    }
+
+    pub(crate) fn finalize_bounds(&mut self) {
+        let strings = self.strings;
+        for check in std::mem::take(&mut self.pending_bounded_checks) {
+            match check {
+                PendingBoundedCheck::Site {
+                    head,
+                    args,
+                    in_scope,
+                    site,
+                } => {
+                    let issues = self.bounds.check_site(strings, head, &args, &in_scope);
+                    for issue in issues {
+                        // The inverted-type context row rides every
+                        // super-bounded-path report; the extension-type face
+                        // carries none (the raw-type row keys on absent
+                        // written arguments, which this capture's sites
+                        // always have).
+                        match issue.inverted_type {
+                            Some(inverted) => self.emit3_with_context(
+                                SemanticCode::TypeArgumentNotMatchingBounds,
+                                issue.range,
+                                &issue.argument,
+                                &issue.parameter,
+                                &issue.bound,
+                                vec![ContextMessage {
+                                    message: format!(
+                                        "The inverted type '{inverted}' is also not regular-bounded, \
+                                         so the type is not well-bounded."
+                                    )
+                                    .into(),
+                                    file: self.file,
+                                    range: site,
+                                }],
+                            ),
+                            None => self.emit3(
+                                SemanticCode::TypeArgumentNotMatchingBounds,
+                                issue.range,
+                                &issue.argument,
+                                &issue.parameter,
+                                &issue.bound,
+                            ),
+                        }
+                    }
+                }
+                PendingBoundedCheck::Enum { name, range } => {
+                    if self.bounds.check_enum_values(strings, name) {
+                        let code = SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded;
+                        self.report.diagnostics.push(Diagnostic::new(
+                            code.severity(),
+                            code.code_info(),
+                            code.message("", ""),
+                            self.file,
+                            range,
+                            code.correction_message(""),
+                        ));
+                    }
+                }
+            }
+        }
+        for (name, range) in std::mem::take(&mut self.raw_type_sites) {
+            let display = self
+                .bounds
+                .raw_display(strings, name)
+                .unwrap_or_else(|| self.strings.resolve(name).to_string());
+            self.stage_usage(SemanticCode::StrictRawType, range, &display);
+        }
+    }
+
+    /// The usage cluster's library-level pass, after every use is indexed:
+    /// the declaration sites of this file walk against the use index (the
+    /// official `UnusedLocalElementsVerifier`), then the import directives
+    /// against the contributed-element index (`imports_verifier.dart`).
+    /// Each arm's gate mirrors the official `_isUsed*` split; every
+    /// unmodelable corner suppresses (the under-report direction).
+    pub(crate) fn finalize_usage(&mut self) {
+        for site_index in 0..self.decl_sites.len() {
+            let site = self.decl_sites[site_index].clone();
+            let bare = self.bare_name(site.name);
+            // The nameless recovery face renders `<unnamed>` (`ElementImpl
+            // .displayName`'s `name ?? '<unnamed>'`).
+            let raw_text = self.strings.resolve(site.name);
+            let name_text = if raw_text.is_empty() {
+                "<unnamed>".to_string()
+            } else {
+                raw_text.to_string()
+            };
+            // The `strict-inference` return-type face
+            // (`_checkStrictInferenceReturnType`,
+            // best_practices_verifier.dart:1587-1606): a top-level function
+            // or getter that declares no return type reports. Setters are
+            // exempt (`!node.isSetter`, and the getter visitor names
+            // `TopLevelGetterDeclaration` only); local functions are the
+            // oracle's own TODO (its visit skips them) and members stay
+            // deferred — the override exemption needs the full supertype
+            // walk M1's name edges cannot answer.
+            if self.strict.inference
+                && matches!(site.kind, DeclKind::TopLevelFn)
+                && !name_text.ends_with('=')
+                && self
+                    .top_level_decl(site.name)
+                    .is_some_and(|decl| decl.return_ty == Ty::Unknown)
+            {
+                self.stage_usage(
+                    SemanticCode::InferenceFailureOnFunctionReturnType,
+                    site.range,
+                    &name_text,
+                );
+            }
+            match site.kind {
+                DeclKind::TopLevelFn | DeclKind::TopLevelVar | DeclKind::TypeAlias => {
+                    // `_isUsedElement`'s else arm: a public name is used;
+                    // otherwise any indexed use spares the declaration.
+                    if !site.annotated
+                        && (self.is_private_name(site.name) || self.is_nameless(site.name))
+                        && !self.used_names.contains(&bare)
+                    {
+                        // A nameless recovery declaration anchors at the file
+                        // start — the spliced synthetic name never reaches
+                        // the written source, so its splice offset is not
+                        // the oracle's row anchor (`<unnamed>` at 1:1, the
+                        // corpus nameless-declaration capture).
+                        let range = if self.is_nameless(site.name) {
+                            self.nameless_site_range()
+                        } else {
+                            site.range
+                        };
+                        self.stage_usage(SemanticCode::UnusedElement, range, &name_text);
+                    }
+                }
+                DeclKind::Container => {
+                    // `_visitClassElement` (classes, enums, mixins, and
+                    // extension types; extensions are never visited): the
+                    // same public/used gate.
+                    if !site.annotated
+                        && (self.is_private_name(site.name) || self.is_nameless(site.name))
+                        && !self.used_names.contains(&bare)
+                    {
+                        self.stage_usage(SemanticCode::UnusedElement, site.range, &name_text);
+                    }
+                }
+                DeclKind::Member {
+                    kind: MemberKind::Field,
+                    is_static,
+                    container,
+                } => {
+                    // `_isReadMember`: a public field of a public container
+                    // is used; a public static field of a private container
+                    // is checked like a private one. Used only when READ
+                    // (the implicit getter enters the read set; writes never
+                    // spare it), or when a super-name it overrides is read.
+                    // The read credit is element-scoped: the receiver
+                    // handles joined against this container's supertype
+                    // closure (`Sub`'s read of an inherited `_f` counts;
+                    // a sibling class's same-spelled field does not).
+                    let eligible = !site.annotated
+                        && (self.is_private_name(site.name)
+                            || (self.is_private_name(container) && is_static));
+                    if !eligible || self.member_was_read(container, &bare) {
+                        continue;
+                    }
+                    self.stage_usage(SemanticCode::UnusedField, site.range, &name_text);
+                }
+                DeclKind::Member { container, .. } => {
+                    // `_isUsedMember` for methods/getters/setters: the
+                    // accessibility gate first, then indexed uses, then the
+                    // override face (a member overriding a super-name is
+                    // spared — the walk cannot see whether the overridden
+                    // member is itself used, so this only under-reports).
+                    // The parameter pass below runs regardless — the
+                    // official `visitFormalParameterList` is independent of
+                    // the member's own unused-ness.
+                    let spared = site.annotated
+                        || (!self.is_nameless(site.name)
+                            && self.is_publicly_accessible(site.name, site.kind))
+                        || self.used_names.contains(&bare)
+                        || matches!(self.walk_super(container, site.name), Walk::Found(_));
+                    if !spared {
+                        self.stage_usage(SemanticCode::UnusedElement, site.range, &name_text);
+                    }
+                }
+                DeclKind::Constructor { container } => {
+                    // `_visitConstructorElement`: named constructors only —
+                    // the official visit gates on `node.name != null`
+                    // (unused_local_elements_verifier.dart:716-723), so an
+                    // unnamed constructor is never reported even when the
+                    // class declares several (the class face owns the
+                    // reference). The capture side stores the written head's
+                    // selector; an unnamed head keeps the container spelling.
+                    // The named-only gate stops the element face alone — the
+                    // parameter pass at the loop bottom still runs for an
+                    // unnamed head (`visitFormalParameterList` visits every
+                    // formal list; unused_local_elements_verifier.dart:781).
+                    if bare != container {
+                        // Only when the class declares more than one — a
+                        // single constructor may serve to prevent extension.
+                        // The upstream count is
+                        // `enclosingElement.constructors.length` — every
+                        // declared constructor, named and unnamed alike; the
+                        // written constructor sites carry exactly that set
+                        // (one site per head, the selector's rewrite updating
+                        // the provisional in place), so the declaration walk
+                        // counts them rather than reading the element model's
+                        // flags.
+                        let multi = self
+                            .decl_sites
+                            .iter()
+                            .filter(|s| {
+                                matches!(
+                                    s.kind,
+                                    DeclKind::Constructor { container: c } if c == container
+                                )
+                            })
+                            .count()
+                            > 1;
+                        let spared = !multi
+                            || site.annotated
+                            || (!self.is_nameless(site.name)
+                                && self.is_publicly_accessible(site.name, site.kind))
+                            || self.used_names.contains(&bare)
+                            || matches!(self.walk_super(container, site.name), Walk::Found(_));
+                        if !spared {
+                            // The element's displayName qualifies the selector
+                            // with its container (`E.foo`); the site stores the
+                            // selector spelling only. A provisional head never
+                            // rewritten stays at the container spelling — the
+                            // unnamed face is never visited (named-only gate).
+                            let container_text = self.strings.resolve(container);
+                            let display = format!("{container_text}.{name_text}");
+                            self.stage_usage(SemanticCode::UnusedElement, site.range, &display);
+                        }
+                    }
+                }
+            }
+            self.report_optional_parameters(site_index, &site);
+        }
+        // The recursive-constant-constructor face: a const constructor
+        // whose own formal default values const-instantiate the SAME
+        // constructor depends on itself (`const A({A e = const A()})` —
+        // evaluating the constructor requires evaluating its own default).
+        // The default's leading `const Name(` / `const Name.sel(` spelling
+        // decides the target identity; anything else (generic arguments,
+        // non-const news, other classes) never reports. A non-const
+        // constructor's defaults are evaluation-time and stay outside the
+        // face.
+        // Snapshot the candidate facts before the staging pass (the loop
+        // body borrows the engine immutably, `stage_usage` mutably).
+        let const_ctor_sites: Vec<(StringId, StringId, SourceRange)> = self
+            .decl_sites
+            .iter()
+            .filter_map(|site| {
+                let DeclKind::Constructor { container } = site.kind else {
+                    return None;
+                };
+                site.const_ctor.then_some((container, site.name, site.range))
+            })
+            .collect();
+        for (container, name, range) in const_ctor_sites {
+            let Some(formals) = self
+                .index
+                .get(self.file)
+                .and_then(|f| f.container(container))
+                .and_then(|c| c.ctor_formals.get(&name))
+            else {
+                continue;
+            };
+            let class_text = self.strings.resolve(container);
+            let self_key = self.strings.resolve(name).to_string();
+            let depends_on_self = formals.positional.iter().chain(formals.named.iter()).any(
+                |formal| {
+                    formal
+                        .default_value
+                        .map(|d| self.strings.resolve(d))
+                        .is_some_and(|text| {
+                            let rest = text.trim_start();
+                            let Some(rest) = rest.strip_prefix("const ") else {
+                                return false;
+                            };
+                            let rest = rest.trim_start();
+                            let Some(head) = rest.strip_prefix(class_text) else {
+                                return false;
+                            };
+                            head.starts_with('(')
+                                || head
+                                    .strip_prefix('.')
+                                    .and_then(|sel| sel.trim_start().strip_prefix(&self_key))
+                                    .is_some_and(|tail| tail.starts_with('('))
+                        })
+                },
+            );
+            if depends_on_self {
+                self.stage_usage(SemanticCode::RecursiveConstantConstructor, range, &self_key);
+            }
+        }
+        // The `unused_field_from_primary_constructor` face
+        // (unused_local_elements_verifier.dart:887-920): each field-declaring
+        // primary-constructor formal of a class or enum whose field no read
+        // spares. A public name is always readable (`_isReadMember`'s
+        // public-instance arm returns used), extension-type representation
+        // formals are exempt (the official switch's third arm), and the
+        // anchor is the parameter's name token.
+        for field in std::mem::take(&mut self.primary_fields) {
+            let bare = self.bare_name(field.name);
+            if !self.is_private_name(field.name) || self.member_was_read(field.container, &bare) {
+                continue;
+            }
+            let code = SemanticCode::UnusedFieldFromPrimaryConstructor;
+            let name_text = self.strings.resolve(field.name).to_string();
+            let keyword_text = self.strings.resolve(field.keyword).to_string();
+            let correction = code.correction_message(&keyword_text);
+            self.report.usage.push(Diagnostic::new(
+                code.severity(),
+                code.code_info(),
+                code.message(&name_text, ""),
+                self.file,
+                field.range,
+                correction,
+            ));
+        }
+        // Members of an unnamed extension (`_isPubliclyAccessible`'s
+        // extension arm — an unnamed extension is never public, so its
+        // members are checked like private declarations): a member no
+        // implicit application resolved reports. Named extensions'
+        // members ride the decl-site arms above; a write-only field still
+        // needs a READ (the `unused_field` rule). The candidates clone
+        // out first — the staging below mutates the engine.
+        let unnamed_members: Vec<(StringId, SourceRange, MemberKind, bool)> = self
+            .index
+            .get(self.file)
+            .map(|f| {
+                f.extension_faces()
+                    .iter()
+                    .filter(|face| face.name.is_none())
+                    .flat_map(|face| {
+                        face.members.iter().map(|(spelling, entry)| {
+                            (
+                                *spelling,
+                                entry.name_range,
+                                entry.kind,
+                                !entry.annotations.is_empty(),
+                            )
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (spelling, range, kind, annotated) in unnamed_members {
+            if range == MemberEntry::MISSING_NAME_RANGE {
+                continue;
+            }
+            let bare = self.bare_name(spelling);
+            let spared = annotated
+                || self.used_names.contains(&bare)
+                || self.extension_member_used.contains(&spelling)
+                || (matches!(kind, MemberKind::Field) && self.read_names.contains(&bare));
+            if !spared {
+                let code = if matches!(kind, MemberKind::Field) {
+                    SemanticCode::UnusedField
+                } else {
+                    SemanticCode::UnusedElement
+                };
+                let name_text = self.strings.resolve(spelling).to_string();
+                self.stage_usage(code, range, &name_text);
+            }
+        }
+        self.report_unused_imports();
+    }
+
+    /// `_isPubliclyAccessible` (`unused_local_elements_verifier.dart`:
+    /// 1002-1028) over the site's facts: a private name is never
+    /// accessible; an instance member of a private interface stays
+    /// reachable through exported instances; a static member or
+    /// constructor of a private interface is not; a member of an extension
+    /// is accessible exactly when the extension is; a constructor of an
+    /// enum never is.
+    pub(crate) fn is_publicly_accessible(&self, name: StringId, kind: DeclKind) -> bool {
+        if self.is_private_name(name) {
+            return false;
+        }
+        let (container, is_static, is_ctor) = match kind {
+            DeclKind::Member {
+                is_static,
+                container,
+                ..
+            } => (container, is_static, false),
+            DeclKind::Constructor { container } => (container, false, true),
+            // A top-level executable's accessibility is just its name.
+            _ => return !self.is_private_name(name),
+        };
+        let Some(c) = self
+            .index
+            .get(self.file)
+            .and_then(|f| f.container(container))
+        else {
+            return true;
+        };
+        match c.kind {
+            ContainerKind::Enum => !(is_ctor || (self.is_private_name(container) && is_static)),
+            ContainerKind::Extension => !self.is_private_name(container),
+            _ => !(self.is_private_name(container) && (is_static || is_ctor)),
+        }
+    }
+
+    /// The `unused_element_parameter` pass over one executable's
+    /// declaration site (`visitFormalParameterList` +
+    /// `_isUsedElement`'s parameter arm,
+    /// unused_local_elements_verifier.dart:1064-1115): optional parameters
+    /// of constructors, methods, and top-level functions that no body use
+    /// resolves to and no invocation supplies. The official exemptions in
+    /// order: a required parameter, a constructor of a generic class, a
+    /// generic executable, a publicly accessible executable, an executable
+    /// overriding a super-name, and the super-parameter face (unmodelable —
+    /// suppressed).
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+    pub(crate) fn report_optional_parameters(&mut self, site_index: usize, site: &DeclSite) {
+        let (member_kind, container) = match &site.kind {
+            DeclKind::Member {
+                kind, container, ..
+            } => (Some(*kind), Some(*container)),
+            DeclKind::Constructor { container } => (None, Some(*container)),
+            _ => (None, None),
+        };
+        if matches!(member_kind, Some(MemberKind::Field | MemberKind::Setter)) {
+            return;
+        }
+        let formals = match container {
+            Some(c) => self
+                .index
+                .get(self.file)
+                .and_then(|f| f.container(c))
+                .and_then(|x| {
+                    if matches!(site.kind, DeclKind::Constructor { .. }) {
+                        x.ctor_formals.get(&site.name).map(Box::as_ref)
+                    } else {
+                        x.members.get(&site.name).and_then(|m| m.formals.as_deref())
+                    }
+                }),
+            None => self
+                .index
+                .get(self.file)
+                .and_then(|f| f.decl(site.name))
+                .and_then(|d| d.formals.as_deref()),
+        };
+        let Some(formals) = formals else {
+            return;
+        };
+        // The 47839 exemptions: a constructor of a generic class, or an
+        // executable with its own type parameters, is never reported.
+        let executable = self.index.get(self.file).and_then(|f| {
+            container.and_then(|c| f.container(c)).map(|x| {
+                (
+                    x.type_params > 0,
+                    x.members.get(&site.name).is_some_and(|m| m.type_params > 0),
+                )
+            })
+        });
+        let (class_generic, member_generic) = match (site.kind, executable) {
+            (DeclKind::Constructor { .. }, Some((class_generic, _))) => (class_generic, false),
+            (_, Some((class_generic, member_generic))) => (class_generic, member_generic),
+            _ => (false, false),
+        };
+        if member_generic || (class_generic && matches!(site.kind, DeclKind::Constructor { .. })) {
+            return;
+        }
+        // The accessibility and override gates.
+        if self.is_publicly_accessible(site.name, site.kind) {
+            return;
+        }
+        if let Some(c) = container
+            && matches!(self.walk_super(c, site.name), Walk::Found(_))
+        {
+            return;
+        }
+        // A redirecting factory's target receives every parameter the
+        // factory forwards — its optional formals are all supplied.
+        if let (DeclKind::Constructor { container }, Some(_)) = (site.kind, container) {
+            let unnamed = site.name == container
+                || self.is_bare_new_head(site.name)
+                || site.name == self.intern("new");
+            if self.factory_redirect_targets.contains(&(container, site.name))
+                || (unnamed && self.factory_redirect_targets.contains(&(container, container)))
+            {
+                return;
+            }
+        }
+        let bare = self.bare_name(site.name);
+        // Cloned: the emit below mutates the report while the set is read.
+        let body_uses = self.site_param_uses.get(&site_index).cloned();
+        let given_positional = self.positional_given.get(&bare).copied().unwrap_or(0);
+        let name_span = |engine: &Self, formal: StringId| -> SourceRange {
+            engine
+                .site_params
+                .get(&site_index)
+                .and_then(|ps| ps.iter().find(|(n, _)| *n == formal).map(|(_, r)| *r))
+                .unwrap_or(site.range)
+        };
+        for (index, formal) in formals.positional.iter().enumerate() {
+            if formal.required {
+                continue;
+            }
+            let referenced = body_uses.as_ref().is_some_and(|u| u.contains(&formal.name));
+            if referenced || given_positional > index as u16 {
+                continue;
+            }
+            let text = self.strings.resolve(formal.name).to_string();
+            let range = name_span(self, formal.name);
+            self.stage_usage(SemanticCode::UnusedElementParameter, range, &text);
+        }
+        for formal in &formals.named {
+            if formal.required {
+                continue;
+            }
+            let referenced = body_uses.as_ref().is_some_and(|u| u.contains(&formal.name));
+            if referenced || self.named_given.contains(&(bare, formal.name)) {
+                continue;
+            }
+            let text = self.strings.resolve(formal.name).to_string();
+            let range = name_span(self, formal.name);
+            self.stage_usage(SemanticCode::UnusedElementParameter, range, &text);
+        }
+    }
+
+    /// The `unused_import` pass: an import with a resolved, existing,
+    /// non-`dart:core` target reports when it contributed no used element
+    /// (`generateUnusedImportWarnings`, imports_verifier.dart:228-268).
+    /// Edge matching is positional and only when the directive count agrees
+    /// with the library's edge count — a mismatch suppresses (under-report).
+    /// The engine's merge prepends each library's implicit `dart:core`
+    /// import in front of the written directives; the alignment excludes
+    /// that prelude edge so the gate compares written directives only.
+    pub(crate) fn report_unused_imports(&mut self) {
+        if self.imports.is_empty() {
+            return;
+        }
+        let mut edges = self.graph.import_edges(self.lib);
+        // The implicit prelude edge is exactly one leading entry (the merge
+        // inserts it before every written edge), targets `dart:core`, and
+        // carries no prefix, no deferral, and no combinator clauses. A
+        // written `import 'dart:core';` is payload-identical but sits in
+        // written order behind it; the one-extra count keeps the skip
+        // honest, and the harness graph (no prelude) aligns unchanged.
+        if edges.len() == self.imports.len() + 1
+            && edges.first().is_some_and(|edge| {
+                edge.prefix.is_none()
+                    && !edge.deferred
+                    && edge.combinators.written().next().is_none()
+                    && edge
+                        .target
+                        .is_some_and(|t| self.graph.uri(t) == "dart:core")
+            })
+        {
+            edges = &edges[1..];
+        }
+        if edges.len() != self.imports.len() {
+            return;
+        }
+        // A failed unqualified lookup still consulted the combined
+        // unprefixed namespace: the attempt itself spares the unprefixed
+        // imports from the whole face — the file with a bare miss reports
+        // `undefined_function`/`undefined_identifier` alone, no
+        // `unused_import` on the imports it consulted and no
+        // `unused_shown_name` on their shown lists (probed: dart analyze
+        // 3.13.1 — a bare `zz()` miss leaves even a wholly unused unprefixed
+        // import unreported, while a named-argument label miss does not
+        // spare). The named-argument label is the excluded miss kind: its
+        // check runs against the resolved callee's formal table, never the
+        // namespace (upstream Dart SDK source, pkg/analyzer/lib/src/dart/
+        // resolver/scope_analyzer.dart:913-921 — the unqualified lookup
+        // walks the scope chain through the imports for every bare name;
+        // method_invocation_resolver.dart:146-156 — "the prefix is still
+        // used, so its imports must not be reported as unused").
+        let bare_miss = self
+            .report
+            .names
+            .iter()
+            .any(|row| !row.qualified && row.use_kind != NameUse::NamedArgument);
+        let used: Vec<StringId> = self
+            .used_names
+            .iter()
+            .chain(&self.import_used)
+            .copied()
+            .collect();
+        for (index, edge) in edges.iter().enumerate() {
+            // Copied first: the emit below mutates the report.
+            let (uri_text, uri_range, prefix, shown) = {
+                let site = &self.imports[index];
+                (
+                    site.uri_text.clone(),
+                    site.uri_range,
+                    site.prefix,
+                    site.shown.clone(),
+                )
+            };
+            let Some(target) = edge.target else {
+                continue;
+            };
+            if self.graph.uri(target) == "dart:core" {
+                continue;
+            }
+            let is_used = match prefix {
+                Some(prefix) => {
+                    self.used_names.contains(&prefix) || self.import_used.contains(&prefix)
+                }
+                None => {
+                    bare_miss
+                        || used.iter().any(|&n| {
+                            edge.combinators.allows(n) && self.graph.exported(target, n).is_some()
+                        })
+                }
+            };
+            if !is_used {
+                self.stage_usage(SemanticCode::UnusedImport, uri_range, &uri_text);
+                continue;
+            }
+            // The shown-name face (`generateUnusedShownNameHints`,
+            // imports_verifier.dart:270-324): runs only when the whole
+            // import is used — a wholly unused import keeps its single
+            // `unused_import` row — and reports each shown name this
+            // import's namespace resolved but never credited. The
+            // resolution gate (the official `element == null` skip) leaves
+            // an undefined shown name to its own code.
+            for (name, range) in shown {
+                // The consultation silences the shown-name face too: the
+                // spared import's list never reports (probed: dart analyze
+                // 3.13.1 — a used show list plus a bare miss stays silent).
+                if (bare_miss && prefix.is_none()) || self.graph.exported(target, name).is_none() {
+                    continue;
+                }
+                let name_used = (self.used_names.contains(&name)
+                    || self.import_used.contains(&name))
+                    && edge.combinators.allows(name);
+                if !name_used {
+                    let text = self.strings.resolve(name).to_string();
+                    self.stage_usage(SemanticCode::UnusedShownName, range, &text);
+                }
+            }
+        }
+    }
+
+    /// Moves the pass's accumulated use sets into the unit's use-face
+    /// (the M3 U1 substrate, `use_face` module). Runs after
+    /// [`Self::finalize_usage`] — the per-file consumers above have read
+    /// the sets by then — so the hot path pays nothing: the face re-homes
+    /// the sets the diagnosis already kept. The directive faces map the
+    /// diagnostic-side import sites (spans dropped: the face is the use
+    /// index, not the report).
+    pub(crate) fn take_use_face(&mut self) -> UnitUseFace {
+        UnitUseFace {
+            used: std::mem::take(&mut self.used_names),
+            reads: std::mem::take(&mut self.read_names),
+            annotations: std::mem::take(&mut self.annotation_uses),
+            imports: self
+                .imports
+                .drain(..)
+                .map(|site| ImportUseFace {
+                    prefix: site.prefix,
+                    shown: site.shown.into_iter().map(|(name, _)| name).collect(),
+                })
+                .collect(),
+            exports: std::mem::take(&mut self.exports),
+        }
+    }
+
+    /// The `_`-wildcard test (`_wildCardVariablesEnabled` +
+    /// `_isNamedWildcard`, unused_local_elements_verifier.dart:690-698,
+    /// 986-995): with the wildcard-variables feature (`enabledIn: 3.7.0`,
+    /// `tools/experimental_features.yaml`) only the exact name `_` is a
+    /// wildcard — `__`/`___` report; the all-underscores fallback is the
+    /// feature-off branch, live only below 3.7. dartq's supported universe
+    /// runs the modern posture (the same modern-library default
+    /// [`Self::library_facts`] documents for class-modifiers): a pre-3.7
+    /// `// @dart=` library under-reports its `__`-shaped bindings — a
+    /// documented divergence, unreachable in the oracle corpus.
+    pub(crate) const WILDCARD_VARIABLES_ENABLED: bool = true;
+
+    pub(crate) fn is_wildcard(&self, name: StringId) -> bool {
+        let text = self.strings.resolve(name);
+        if Self::WILDCARD_VARIABLES_ENABLED {
+            text == "_"
+        } else {
+            !text.is_empty() && text.bytes().all(|b| b == b'_')
+        }
+    }
+
+    /// The offset of the first non-whitespace byte at or after `from`,
+    /// when it opens an index (`[`): the `?.[` recovery's member anchor —
+    /// the dot access folded the `[...]` operand, and the oracle resolves
+    /// its member at the bracket.
+    /// The next non-whitespace byte position after `from` (a UTF-16
+    /// offset), returned as a UTF-16 offset when it is `[`. Byte-vs-UTF-16:
+    /// `from` is a source range end (`member.range.end()`), so the byte
+    /// cursor goes through `byte_of` — a wide char upstream of the bracket
+    /// would otherwise desync the probe (#2161's doc-comment `—` row).
+    pub(crate) fn bracket_after(&self, from: u32) -> Option<u32> {
+        let start = self.byte_of(from).min(self.source.len());
+        let bytes = self.source.as_bytes();
+        bytes[start..]
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .map(|index| self.utf16_of(start + index))
+            .filter(|&offset| self.byte_at(offset) == Some(b'['))
+    }
+
+    /// The staged null-aware faces re-decide against the flow's promoted
+    /// receiver types (`_checkForUnnecessaryNullAware` reads the
+    /// flow-augmented static type, which the walk-time row cannot see).
+    pub(crate) fn flush_null_aware_staged(&mut self, promotions: &PromotionStaging) {
+        let accesses = std::mem::take(&mut self.null_aware_staged);
+        for (read, op_range, kind) in accesses {
+            if promotions
+                .promoted(read)
+                .is_some_and(Ty::is_strictly_non_nullable)
+            {
+                let (op, replacement) = kind.lexemes();
+                self.emit3(
+                    SemanticCode::InvalidNullAwareOperator,
+                    op_range,
+                    op,
+                    replacement,
+                    "",
+                );
+            }
+        }
+        let asserts = std::mem::take(&mut self.null_assert_staged);
+        for (read, bang) in asserts {
+            if promotions
+                .promoted(read)
+                .is_some_and(Ty::is_strictly_non_nullable)
+            {
+                self.stage_usage(SemanticCode::UnnecessaryNonNullAssertion, bang, "");
+            }
+        }
+    }
+
+    /// The enclosing executable's lookup spelling once its name has fired
+    /// (the official `_enclosingExec`); constructors, factories stay
+    /// `None` (their `ret` latch is unset by design). A local function's
+    /// own body is covered by the open local-function stack.
+    pub(crate) fn exec_self_name(&self) -> Option<StringId> {
+        if let Some((depth, name)) = self.local_fn_stack.last()
+            && *depth == self.frames.len().saturating_sub(1)
+        {
+            return Some(*name);
+        }
+        self.frames.last().and_then(|f| match &f.kind {
+            FrameKind::Executable { ret: Some(ret), .. } => Some(ret.name),
+            _ => None,
+        })
+    }
+
+    /// The official self-reference test: `name` names the enclosing
+    /// executable or the enclosing container (`_useIdentifierElement`'s
+    /// identical checks).
+    pub(crate) fn in_own_named_scope(&self, name: StringId) -> bool {
+        self.exec_self_name() == Some(name)
+            || self.container_context().is_some_and(|(c, _)| c == name)
+    }
+
+    /// Drains the pending annotation latch: the annotations since the last
+    /// declaration site, each with its captured `UseResult.unless` face
+    /// (the `@override`-family gates compare names; non-empty marks the
+    /// pragma/JS exemption gates' under-report superset).
+    pub(crate) fn take_annotations(&mut self) -> Vec<PendingAnnotation> {
+        std::mem::take(&mut self.pending_annotations)
+    }
+
+    /// Pushes one library-level declaration site (the usage cluster's
+    /// library-level side) and returns its index.
+    pub(crate) fn note_decl_site(&mut self, name: StringId, range: SourceRange, kind: DeclKind) -> usize {
+        let pending = self.take_annotations();
+        let annotated = !pending.is_empty();
+        // The `@UseResult` face (`isUseResult`, element.dart:2014-2019):
+        // the meta getter (`@useResult`) or the class face (`@UseResult`,
+        // whose `unless` selector carries the `parameterDefined` value).
+        // The first recognized annotation wins (the official walk returns
+        // the first isUseResult entry); the resolution walks run once per
+        // annotation — metadata is rare and the graph lookups are set
+        // probes.
+        let mut use_result = None;
+        for annotation in &pending {
+            let face = crate::model::Annotation {
+                name: annotation.name,
+                range,
+                args_text: None,
+            };
+            // The unless face rode the latch (the `end_metadata` source
+            // walk); re-shaping it as the helper's argument faces keeps the
+            // selector + meta-import resolution in one place — the value
+            // face for a literal, the written face for a reference.
+            let args = annotation.unless.map(|(arg, span)| match arg {
+                UnlessArg::Literal(value) => crate::annotation::AnnotationArg {
+                    label: Some(self.strings.intern("parameterDefined")),
+                    string: Some((value, span)),
+                    reference: None,
+                },
+                UnlessArg::Reference(name) => crate::annotation::AnnotationArg {
+                    label: Some(self.strings.intern("parameterDefined")),
+                    string: None,
+                    reference: Some((name, span)),
+                },
+            });
+            let args = args.as_slice();
+            if let Some(unless) = crate::annotation::use_result_unless(
+                &face,
+                args,
+                self.strings,
+                self.graph,
+                self.lib,
+            ) {
+                let (arg, span) = match unless {
+                    crate::annotation::UnlessFace::Literal { value, span } => {
+                        (UnlessArg::Literal(value), span)
+                    }
+                    crate::annotation::UnlessFace::Reference { name, span } => {
+                        (UnlessArg::Reference(name), span)
+                    }
+                };
+                use_result = Some(UrFace {
+                    unless: Some((arg, span)),
+                });
+                break;
+            }
+            if crate::annotation::is_meta_getter(
+                &face,
+                "useResult",
+                self.strings,
+                self.graph,
+                self.lib,
+            ) || crate::annotation::is_meta_class(
+                &face,
+                "UseResult",
+                self.strings,
+                self.graph,
+                self.lib,
+            ) {
+                use_result = Some(UrFace { unless: None });
+                break;
+            }
+        }
+        let annotations = pending.iter().map(|a| a.name).collect();
+        self.decl_sites.push(DeclSite {
+            name,
+            range,
+            kind,
+            annotated,
+            annotations,
+            use_result,
+            // The const latch rides onto the site at creation; the named
+            // selector's in-place rewrite keeps it (`begin_constructor` /
+            // `begin_factory` set it before any site of theirs exists).
+            const_ctor: self.in_const_ctor,
+            is_factory: false,
+        });
+        self.decl_sites.len() - 1
+    }
+
+    /// Whether one of the pending annotations carries the spelling (the
+    /// `@override`-family gates read the latch before any site drains it).
+    pub(crate) fn pending_annotation_is(&self, spelling: &str) -> bool {
+        self.pending_annotations
+            .iter()
+            .any(|a| self.strings.resolve(a.name) == spelling)
+    }
+
+    // —— the discarded-value machine (`use_result_verifier.dart`) ————————
+
+    /// Registers one completed expression whose value may be discarded:
+    /// the send callee's or selector's name token offset. The expression
+    /// stays pending until a context event answers its parent-chain walk.
+    pub(crate) fn ur_register(&mut self, offset: u32) {
+        self.ur_pending.push(offset);
+    }
+
+    /// Registers a creation fold: the official anchor spans the whole
+    /// invocation (`nodeToAnnotate` — the `A()` shape), not just the head
+    /// token.
+    pub(crate) fn ur_register_creation(&mut self, offset: u32, span: SourceRange, container: StringId) {
+        self.ur_spans.insert(offset, span);
+        self.ur_creations.push((offset, span, container));
+        self.ur_pending.push(offset);
+    }
+
+    /// Seals every pending expression as used (`_isUsed` true — the value
+    /// flows somewhere observable).
+    pub(crate) fn ur_seal_used(&mut self) {
+        self.ur_used.extend(self.ur_pending.drain(..));
+    }
+
+    /// Seals every pending expression as discarded (statement end, cascade
+    /// sections, for updaters): the offsets simply stay absent from the
+    /// used set, and the resolve arms emit against them.
+    pub(crate) fn ur_seal_discard(&mut self) {
+        self.ur_pending.clear();
+    }
+
+    /// `end_arguments`: seals only the pendings registered inside the
+    /// closing argument list used (the official `ArgumentList` parent arm)
+    /// — the callee's own candidate predates the bracket watermark and
+    /// stays pending for the enclosing context to answer.
+    pub(crate) fn ur_seal_used_within(&mut self) {
+        if let Some(base) = self.ur_arg_base.pop() {
+            let tail = self.ur_pending.split_off(base.min(self.ur_pending.len()));
+            self.ur_used.extend(tail);
+        }
+    }
+
+    /// `handle_expression_statement`: outside for-parts, the statement's
+    /// value is discarded (the official parent, `ExpressionStatement`, is
+    /// absent from both `_isUsed` sets); the for-condition arm fires here,
+    /// while the updaters drain at `handle_for_loop_parts`.
+    pub(crate) fn ur_expression_statement(&mut self) {
+        if self.in_for_parts.last() == Some(&1) || self.in_for_parts.last() == Some(&2) {
+            self.ur_seal_used();
+        } else {
+            self.ur_seal_discard();
+        }
+    }
+
+    /// Registers the non-invoked identifier expression completing at
+    /// `begin` (the read row sits on the row stack): the
+    /// `checkNameExpression` candidate face.
+    pub(crate) fn ur_register_bare_read(&mut self, begin: Token) {
+        if let Some(row) = self
+            .rows
+            .iter()
+            .rev()
+            .find(|row| row.range.offset == begin.range.offset)
+        {
+            let offset = row.range.offset;
+            self.ur_register(offset);
+        }
+    }
+
+    /// `end_metadata`: captures the `parameterDefined:` face of the
+    /// annotation that just closed — a source-level walk of the annotation
+    /// span finding `parameterDefined` `:` value at argument depth. A
+    /// string literal captures its cooked value; a bare identifier
+    /// captures the written name (the official `toString` fallback's
+    /// message face) with the gate value resolving from the const
+    /// environment at the check. Any other shape under-captures (`None`),
+    /// under-reporting.
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+    pub(crate) fn note_metadata_args(&mut self, begin: Token, end: Token) {
+        let start = begin.range.offset as usize;
+        let stop = (end.range.offset + end.range.length) as usize;
+        let Some(open) = self.pending_annotations.last_mut() else {
+            return;
+        };
+        if open.unless.is_some() {
+            return;
+        }
+        let text = self.source.get(start..stop).unwrap_or_default();
+        let bytes = text.as_bytes();
+        let label = b"parameterDefined";
+        let mut cursor = 0usize;
+        while let Some(rel) = bytes[cursor.min(bytes.len())..]
+            .windows(label.len())
+            .position(|w| w == label)
+        {
+            let at = cursor + rel;
+            cursor = at + label.len();
+            // The label must start an argument: preceded by `(` or `,`
+            // (whitespace between), so a mention inside another string
+            // never matches.
+            let head = text[..at].trim_end();
+            if !matches!(head.as_bytes().last(), Some(b'(' | b',')) {
+                continue;
+            }
+            // Between label and value sits exactly a `:` (whitespace
+            // around); anything else is a different argument shape.
+            let tail = &text[cursor..];
+            let Some(colon) = tail.find(':') else {
+                continue;
+            };
+            if !tail[..colon].bytes().all(|b| b.is_ascii_whitespace()) {
+                continue;
+            }
+            let body = tail[colon + 1..].trim_start();
+            let at = (start + text.len() - body.len()) as u32;
+            let Some((_, quote, triple)) = Self::string_literal_at(body) else {
+                // A bare reference argument: the official walk messages
+                // the written text (`undefinedParameter.toString()`) and
+                // gates on the const value it resolves to. Prefixed
+                // (`p.s`) and invoked (`f()`) shapes under-capture — the
+                // under-report direction.
+                if let Some((name, len)) = Self::bare_identifier_at(body) {
+                    let name = self.strings.intern(name);
+                    open.unless = Some((
+                        UnlessArg::Reference(name),
+                        SourceRange {
+                            offset: at,
+                            length: len as u32,
+                        },
+                    ));
+                    return;
+                }
+                continue;
+            };
+            let Some(value_len) = Self::string_literal_len(body, quote, triple) else {
+                continue;
+            };
+            let raw = &body[..value_len];
+            let inner = raw
+                .trim_start_matches('r')
+                .trim_start_matches('#')
+                .trim_matches(|c| c == '\'' || c == '"');
+            let cooked = inner.replace("\\'", "'").replace("\\\"", "\"");
+            open.unless = Some((
+                UnlessArg::Literal(self.strings.intern(&cooked)),
+                SourceRange {
+                    offset: at,
+                    length: value_len as u32,
+                },
+            ));
+            return;
+        }
+    }
+
+    /// The string literal starting at `text[0]`, if any: its quote byte
+    /// and whether it is the triple-quoted shape. A raw marker (`r`)
+    /// before the quote is admitted (the len walk then takes the body
+    /// verbatim).
+    pub(crate) fn string_literal_at(text: &str) -> Option<(usize, u8, bool)> {
+        let bytes = text.as_bytes();
+        let mut at = 0usize;
+        if bytes.first() == Some(&b'r') {
+            at = 1;
+        }
+        match bytes.get(at)? {
+            b'\'' | b'"' => {
+                let quote = bytes[at];
+                let triple = bytes.get(at + 1) == Some(&quote) && bytes.get(at + 2) == Some(&quote);
+                Some((at, quote, triple))
+            }
+            _ => None,
+        }
+    }
+
+    /// The full literal length at `body[0]` for `quote`/`triple`,
+    /// terminator included. Escapes (`\x`) never end the literal; an
+    /// unterminated literal yields `None` (recovery — the under-report).
+    pub(crate) fn string_literal_len(body: &str, quote: u8, triple: bool) -> Option<usize> {
+        let bytes = body.as_bytes();
+        let close: &[u8] = if triple {
+            &[quote, quote, quote]
+        } else {
+            &[quote]
+        };
+        let mut at = if triple { 3 } else { 1 };
+        while at < bytes.len() {
+            if bytes[at] == b'\\' {
+                at += 2;
+                continue;
+            }
+            if bytes[at..].starts_with(close) {
+                return Some(at + close.len());
+            }
+            at += 1;
+        }
+        None
+    }
+
+    /// The bare identifier starting at `body[0]`: its slice and byte
+    /// length. ASCII identifier shape (the official scanner's identifier
+    /// face); a following `(` (an invocation) or `.` (a prefixed
+    /// reference) is a message face the walk cannot name — `None`, the
+    /// under-report.
+    pub(crate) fn bare_identifier_at(body: &str) -> Option<(&str, usize)> {
+        let bytes = body.as_bytes();
+        let ok = |b: u8, first: bool| {
+            b == b'_' || b == b'$' || b.is_ascii_alphabetic() || (!first && b.is_ascii_digit())
+        };
+        let mut end = 0;
+        while bytes.get(end).is_some_and(|&b| ok(b, end == 0)) {
+            end += 1;
+        }
+        if end == 0 || matches!(bytes.get(end), Some(b'(' | b'.')) {
+            return None;
+        }
+        Some((&body[..end], end))
+    }
+
+    /// Builds the face lookup (the face-bearing sites keyed by their
+    /// declaring container) once, at resolve time.
+    pub(crate) fn build_ur_sites(&mut self) {
+        for index in 0..self.decl_sites.len() {
+            if self.decl_sites[index].use_result.is_some() {
+                let (container, spelling) = match &self.decl_sites[index].kind {
+                    DeclKind::Member { container, .. } | DeclKind::Constructor { container } => {
+                        (Some(*container), self.decl_sites[index].name)
+                    }
+                    _ => (None, self.decl_sites[index].name),
+                };
+                self.ur_sites.insert((container, spelling), index);
+            }
+        }
+    }
+
+    /// The face-bearing site of `member` on `container`'s chain (the
+    /// resolution's same-file walk; a hop into another file's index
+    /// chain-breaks, under-reporting).
+    pub(crate) fn ur_member_site(&self, container: StringId, member: StringId) -> Option<usize> {
+        let mut current = Some(container);
+        while let Some(c) = current {
+            if let Some(&site) = self.ur_sites.get(&(Some(c), member)) {
+                return Some(site);
+            }
+            current = self
+                .index
+                .get(self.file)
+                .and_then(|f| f.container(c))
+                .and_then(|x| x.superclass);
+        }
+        None
+    }
+
+    /// The unless gate parameter (`computeConstantValue`'s
+    /// `toStringValue`): a literal's cooked value, or a bare reference's
+    /// const value from the file scope. `None` when the reference names no
+    /// string constant — the official null arm: no gate, no bypass, no
+    /// report. Class statics are out of a top-level annotation's scope on
+    /// both sides; cross-file constants under-resolve (the const
+    /// environment is per-file), the under-report direction.
+    pub(crate) fn unless_param(&self, arg: UnlessArg) -> Option<StringId> {
+        match arg {
+            UnlessArg::Literal(value) => Some(value),
+            UnlessArg::Reference(name) => match self.const_scopes.first()?.get(&name) {
+                Some(ConstBinding::Value(ConstantValue::Str(text))) => {
+                    Some(self.strings.intern(text))
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// The unless bypass (`_passesUsingParam`): the invocation supplies an
+    /// argument that maps to a formal named
+    /// `p` — a named argument spelled `p`, or a positional argument whose
+    /// mapped formal is `p` (the official walk reads the argument list's
+    /// resolved static parameters). Reads and constructor invocations
+    /// carry no argument list the official switch accepts — their callers
+    /// pass `None` formals.
+    pub(crate) fn unless_bypassed(
+        &self,
+        callee: StringId,
+        unless: StringId,
+        formals: Option<&Formals>,
+    ) -> bool {
+        let Some(formals) = formals else {
+            return false;
+        };
+        if self.named_given.contains(&(callee, unless)) && formals.named_formal(unless).is_some() {
+            return true;
+        }
+        self.positional_given.get(&callee).is_some_and(|count| {
+            formals
+                .positional
+                .get(..(*count as usize))
+                .is_some_and(|given| given.iter().any(|formal| formal.name == unless))
+        })
+    }
+
+    /// The member-row emission (`_check`): `row` resolved against
+    /// `container`'s chain — or, for a constructor selector, against the
+    /// container's own constructor set. The `unless` bypass reads the
+    /// invocation's supplied-argument faces on the invoke intent only
+    /// (constructor invocations pass no argument list to the official
+    /// switch; a selector row anchors at the selector token — the
+    /// whole-invocation span needs the receiver extent the row fold
+    /// dropped, a documented under-length).
+    pub(crate) fn check_member_unused_result(
+        &mut self,
+        row: &Row,
+        container: StringId,
+        recv: &Receiver,
+        selector: bool,
+    ) {
+        let site_index = if selector {
+            self.ur_sites.get(&(Some(container), row.name)).copied()
+        } else {
+            self.ur_member_site(container, row.name)
+        };
+        let Some(site_index) = site_index else {
+            return;
+        };
+        let bypassed = matches!(row.intent, Intent::Invoke)
+            && !selector
+            && self.decl_sites[site_index].use_result.is_some_and(|face| {
+                face.unless
+                    .as_ref()
+                    .and_then(|(arg, _)| self.unless_param(*arg))
+                    .is_some_and(|param| {
+                        let formals = self.member_formals_full(recv, row.name);
+                        self.unless_bypassed(row.name, param, formals.as_deref())
+                    })
+            });
+        let display = self.strings.resolve(row.name).to_string();
+        self.check_unused_result(row.range.offset, row.range, site_index, &display, bypassed);
+    }
+
+    /// Emits the discarded-use row for a resolved reference unless its
+    /// context sealed it used or its `unless` bypass applied (`_check`'s
+    /// final gates; the anchor is the name token, or the whole invocation
+    /// for the creation folds).
+    pub(crate) fn check_unused_result(
+        &mut self,
+        offset: u32,
+        span: SourceRange,
+        _site_index: usize,
+        display: &str,
+        bypassed: bool,
+    ) {
+        if bypassed || self.ur_used.contains(&offset) {
+            return;
+        }
+        let span = self.ur_spans.get(&offset).copied().unwrap_or(span);
+        self.stage_usage(SemanticCode::UnusedResult, span, display);
+    }
+
+    /// The discarded-value face of a name resolved by scope (the
+    /// `checkNameExpression` arm, and the cascade section whose target type
+    /// the model cannot name): an invocation or bare read of a
+    /// UseResult-carrying top-level declaration, not sealed used. The
+    /// `unless` bypass reads the declaration's own formals.
+    pub(crate) fn check_top_level_unused_result(&mut self, row: &Row) {
+        let Some(&site_index) = self.ur_sites.get(&(None, row.name)) else {
+            return;
+        };
+        let bypassed = matches!(row.intent, Intent::Invoke)
+            && self.decl_sites[site_index].use_result.is_some_and(|face| {
+                face.unless
+                    .as_ref()
+                    .and_then(|(arg, _)| self.unless_param(*arg))
+                    .is_some_and(|param| {
+                        self.top_level_decl(row.name).is_some_and(|decl| {
+                            self.unless_bypassed(row.name, param, decl.formals.as_deref())
+                        })
+                    })
+            });
+        let display = self.strings.resolve(row.name).to_string();
+        self.check_unused_result(row.range.offset, row.range, site_index, &display, bypassed);
+    }
+
+    /// The creation-fold emissions (`checkConstructorInvocation`): a
+    /// folded `A()` whose unnamed-constructor site carries the face. The
+    /// display name is the class name (the unnamed constructor's
+    /// `displayName`), and the anchor the whole `A()` span.
+    pub(crate) fn finalize_unused_result(&mut self) {
+        for (offset, span, container) in std::mem::take(&mut self.ur_creations) {
+            if self.ur_used.contains(&offset) {
+                continue;
+            }
+            let Some(&site) = self.ur_sites.get(&(Some(container), container)) else {
+                continue;
+            };
+            if self.decl_sites[site].use_result.is_none() {
+                continue;
+            }
+            let text = self.strings.resolve(container).to_string();
+            self.stage_usage(SemanticCode::UnusedResult, span, &text);
+        }
+    }
+
+    /// The `_findUndefinedUseResultParameter` co-row
+    /// (`annotation_verifier.dart:669-731`): a
+    /// `@UseResult.unless(parameterDefined: ...)` on a top-level function
+    /// or method whose formal list names no gate parameter reports at the
+    /// written value expression (`{0}` the parameter, `{1}` the member).
+    /// The gate reads the const value (a literal's cooked text, a
+    /// reference's const-environment value — an unresolvable reference is
+    /// the official null arm, silent); the message face is the literal's
+    /// value (the `SimpleStringLiteral` arm) or the reference's written
+    /// text (the `toString` fallback). Getters carry no parameter list and
+    /// constructors are not `MethodDeclaration` parents — both stay
+    /// silent; local functions are out of the declaration-site walk.
+    pub(crate) fn finalize_undefined_use_result_params(&mut self) {
+        // `(site name, member container — `None` for top-level — captured
+        // argument face, written value span)` per `unless`-carrying
+        // function/method site.
+        let flagged: Vec<(StringId, Option<StringId>, UnlessArg, SourceRange)> = self
+            .decl_sites
+            .iter()
+            .filter_map(|site| {
+                let (arg, span) = site.use_result.as_ref().and_then(|face| face.unless)?;
+                match &site.kind {
+                    DeclKind::TopLevelFn => Some((site.name, None, arg, span)),
+                    DeclKind::Member {
+                        kind: MemberKind::Method | MemberKind::Setter,
+                        container,
+                        ..
+                    } => Some((site.name, Some(*container), arg, span)),
+                    _ => None,
+                }
+            })
+            .collect();
+        for (name, container, arg, span) in flagged {
+            // The official predicate requires a parent declaration WITH a
+            // formal parameter list: the null `parameterList` arm returns —
+            // getters carry none, and a list the walk cannot fetch
+            // (cross-file container) stays silent the same way. A known
+            // list that names no gate parameter reports.
+            let Some(param) = self.unless_param(arg) else {
+                continue;
+            };
+            let message = match arg {
+                UnlessArg::Literal(_) => param,
+                UnlessArg::Reference(written) => written,
+            };
+            let names_parameter = |formals: &Formals| {
+                formals.positional.iter().any(|formal| formal.name == param)
+                    || formals.named.iter().any(|formal| formal.name == param)
+            };
+            let defined = match container {
+                None => self
+                    .top_level_decl(name)
+                    .and_then(|decl| decl.formals.as_deref().map(names_parameter)),
+                Some(container) => {
+                    let entry = resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        container,
+                    )
+                    .and_then(|(resolved, _)| resolved.members.get(&name));
+                    match entry {
+                        Some(entry)
+                            if matches!(entry.kind, MemberKind::Method | MemberKind::Setter) =>
+                        {
+                            entry.formals.as_deref().map(names_parameter)
+                        }
+                        _ => None,
+                    }
+                }
+            };
+            match defined {
+                Some(true) | None => continue,
+                Some(false) => {}
+            }
+            let param_text = self.strings.resolve(message).to_string();
+            let member_text = self.strings.resolve(name).to_string();
+            self.stage_typed(
+                SemanticCode::UndefinedReferencedParameter,
+                span,
+                &param_text,
+                &member_text,
+            );
+        }
+    }
+
+    /// Whether the already-collected declaration site of `member` in
+    /// `container` carries the annotation (`@mustCallSuper` /
+    /// `@mustBeOverridden` lookups against the walk's ancestors). Sites
+    /// exist for this file's declarations only — cross-file ancestors
+    /// under-report.
+    pub(crate) fn site_annotation(&self, container: StringId, member: StringId, spelling: &str) -> bool {
+        self.decl_sites.iter().any(|site| {
+            matches!(site.kind, DeclKind::Member { container: c, .. } if c == container)
+                && site.name == member
+                && site
+                    .annotations
+                    .iter()
+                    .any(|a| self.strings.resolve(*a) == spelling)
+        })
+    }
+}

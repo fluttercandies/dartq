@@ -1,0 +1,2090 @@
+use super::*;
+
+impl<'a> Engine<'a> {
+    /// The name after the dot of a qualified type arrived: the prefix slot
+    /// is consumed.
+    pub(crate) fn consume_type_prefix(&mut self) {
+        self.type_prefix = None;
+    }
+
+    pub(crate) fn enter_non_type_pos(&mut self) {
+        self.non_type_pos += 1;
+    }
+
+    pub(crate) fn leave_non_type_pos(&mut self) {
+        self.non_type_pos -= 1;
+    }
+
+    pub(crate) fn enter_ctor_pos(&mut self) {
+        self.ctor_pos += 1;
+    }
+
+    pub(crate) fn leave_ctor_pos(&mut self) {
+        self.ctor_pos -= 1;
+    }
+
+    /// A bare name's declared type, innermost frame first.
+    pub(crate) fn typed_local(&self, name: StringId) -> Option<Ty> {
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|f| f.var_types.get(&name).copied())
+    }
+
+    /// The declared-type alias fold: a named type whose head resolves to a
+    /// non-parameterized type alias rewrites to the alias's captured
+    /// right-hand type, carrying the use-site `?` (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/element.dart — a `TypeAliasElement`
+    /// use resolves through its aliased type before any type question reads
+    /// it). The loop depth bounds chains and cycles; a parameterized alias
+    /// use and an unresolvable head answer as written (the under-report
+    /// direction); a function/record right-hand side rewrites to that
+    /// right-hand shape whole (`typedef V = void Function();` — the
+    /// use-site `?` joins).
+    pub(crate) fn fold_alias_ty(&self, ty: Ty) -> Ty {
+        let Ty::Named {
+            name,
+            nullable,
+            args: ArgListId::EMPTY,
+        } = ty
+        else {
+            return ty;
+        };
+        let (mut head, mut head_nullable) = (name, nullable);
+        for _ in 0..8 {
+            let Some(rhs) = self.alias_rhs(head) else {
+                break;
+            };
+            match rhs {
+                Ty::Named {
+                    name: next,
+                    nullable: rhs_nullable,
+                    args: ArgListId::EMPTY,
+                } => {
+                    head = next;
+                    head_nullable |= rhs_nullable;
+                }
+                Ty::Named { .. } => break,
+                // A non-named right-hand side stands for the use whole
+                // (`typedef V = void Function();`): the use-site `?` joins.
+                Ty::Dynamic => return Ty::Dynamic,
+                Ty::Record {
+                    shape,
+                    nullable: rhs_nullable,
+                } => {
+                    return Ty::Record {
+                        shape,
+                        nullable: rhs_nullable | head_nullable,
+                    };
+                }
+                Ty::Function {
+                    shape,
+                    nullable: rhs_nullable,
+                } => {
+                    return Ty::Function {
+                        shape,
+                        nullable: rhs_nullable | head_nullable,
+                    };
+                }
+                // `Null`/`void`/`Never`/`Unknown` right-hand sides keep the
+                // written use (an alias to them is not the modeled face).
+                _ => break,
+            }
+        }
+        Ty::Named {
+            name: head,
+            nullable: head_nullable,
+            args: ArgListId::EMPTY,
+        }
+    }
+
+    /// A record field getter's static type (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/type.dart `RecordTypeImpl`
+    /// `namedField`/`positionalField` — the property-access resolver reads
+    /// the field off the receiver's record type, `$1`-based positional
+    /// spellings included). `receiver` folds through a type alias first
+    /// (`typedef R = ({bool? strict}); r.strict`). A nullable record
+    /// receiver answers `None` unless the access is null-aware (a plain
+    /// access is the unchecked dereference face, not a field read; `r?.f`
+    /// reads the field off the promoted non-null record and the caller
+    /// joins the `?`), as does any non-record receiver, a
+    /// `$0`/out-of-range/non-numeric spelling, and an absent named field
+    /// (the `Object` members stay unmodeled — under-report).
+    pub(crate) fn record_field_ty(&self, receiver: Ty, field: StringId, null_aware: bool) -> Option<Ty> {
+        let Ty::Record { shape, nullable } = self.fold_alias_ty(receiver) else {
+            return None;
+        };
+        if nullable && !null_aware {
+            return None;
+        }
+        let pool = self.boundary.pool();
+        let shape = pool.record_shape(shape);
+        let ty = match shape.named.iter().find(|(name, _)| *name == field) {
+            Some(&(_, ty)) => ty,
+            None => {
+                // Positional getters are `$1`, `$2`, … (1-based decimal, no
+                // sign and no leading zero — `$01` is not a field getter).
+                let index = self
+                    .strings
+                    .resolve(field)
+                    .strip_prefix('$')
+                    .filter(|digits| {
+                        !digits.starts_with('0') && digits.bytes().all(|b| b.is_ascii_digit())
+                    })
+                    .and_then(|digits| digits.parse::<usize>().ok())?;
+                *shape.positional.get(index.checked_sub(1)?)?
+            }
+        };
+        drop(pool);
+        // A field spelled through an alias reads as the aliased type, like
+        // every declared type the frames bind.
+        Some(self.fold_alias_ty(ty))
+    }
+
+    /// The captured right-hand type of the non-parameterized type alias
+    /// `name`: this file's declaration table first, then the library
+    /// namespace (the same resolution order a container use walks).
+    pub(crate) fn alias_rhs(&self, name: StringId) -> Option<Ty> {
+        let (owner, decl) = match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::Local(decl) => (self.file, decl),
+            ScopedHit::Found(NamespaceEntry::Decl(file)) => {
+                (file, self.index.get(file).and_then(|f| f.decl(name))?)
+            }
+            _ => return None,
+        };
+        match decl.kind {
+            // A foreign alias's RHS is a slot of its owner's pool: project it
+            // into the diagnosing universe before anything reads it.
+            MicroKind::TypeAlias if decl.type_params == 0 && decl.var_ty != Ty::UNKNOWN => {
+                Some(self.boundary.ty(owner, decl.var_ty))
+            }
+            _ => None,
+        }
+    }
+
+    /// The callable signature a parameterized function-type alias spells
+    /// (`typedef Predicate<T> = bool Function(T)`): the element model keeps
+    /// no RHS for a parameterized alias (its substitution face is
+    /// unmodeled), but the bounds capture stores the written shape — the
+    /// use-site callable verdict (`Predicate<T> test` invoked as
+    /// `test(item)`), the invocation's return type, and its formal table
+    /// all read it. Type parameters stay as leaf names (the written-shape
+    /// face; `T`-typed formals/returns answer `T`, matching the oracle's
+    /// unsubstituted-name behavior at this layer).
+    /// `None` when `name` is no this-file alias or aliases a non-function
+    /// type; a cross-file alias is invisible to the capture (under-report).
+    /// A named-type RHS chases its co-alias's function shape with the
+    /// written arguments substituted (`typedef B = A<int>` over
+    /// `A<X> = X Function()` resolves `B` to `int Function()`).
+    pub(crate) fn alias_fn_sig(&self, name: StringId) -> Option<Box<FnVarSig>> {
+        // The dart:core function-alias face (SDK units are unindexed, so
+        // the bounds tables never carry it): `Comparator<T>` spells
+        // `int Function(T a, T b)` — the callable verdict and the send's
+        // `int` return read it (`isSorted`'s `Comparator<T> compare`
+        // invoked as `compare(a, b)`, #2172). The alias's own `T` stays a
+        // named leaf — the same face a written `Cmp<T>` use answers when
+        // the use-site substitution is not modeled — and a locally
+        // declared `Comparator` keeps its own shape.
+        if self.strings.resolve(name) == "Comparator"
+            && self.bounds.alias_fn_shape(name).is_none()
+            && self.bounds.alias_named_shape(name).is_none()
+        {
+            let t = self.intern("T");
+            return Some(Box::new(FnVarSig {
+                params: Box::default(),
+                positional: vec![Ty::named(t), Ty::named(t)].into(),
+                required_positional: 2,
+                named: Box::default(),
+                return_ty: Ty::named(self.members.primitive_ids[0]),
+            }));
+        }
+        // The co-alias substitution maps a parameter name to its written
+        // argument tree; it applies at the terminal `Fn` shape's leaves.
+        let mut subst: FxHashMap<StringId, TypeTree> = FxHashMap::default();
+        let mut seen: FxHashSet<StringId> = FxHashSet::default();
+        let mut cur = name;
+        // Deferred binding: a `Named` RHS's written arguments bind the NEXT
+        // alias's parameters, whose names only surface once that alias's own
+        // shape answers — carry the (substituted) argument trees forward and
+        // zip them against the arriving param list. `B = A<int, String>`
+        // over `A<S, T>` binds `S → int`, `T → String`.
+        let mut pending_args: Vec<TypeTree> = Vec::new();
+        let (ret, positional, named, required_positional) = loop {
+            if !seen.insert(cur) {
+                return None;
+            }
+            let args = std::mem::take(&mut pending_args);
+            let subst_args: Vec<TypeTree> =
+                args.iter().map(|a| subst_tree(a, &subst)).collect();
+            if let Some((params, ret, positional, named, required_positional)) =
+                self.bounds.alias_fn_shape(cur)
+            {
+                subst.clear();
+                for ((param, _, _), arg) in params.iter().zip(subst_args.iter()) {
+                    subst.insert(*param, arg.clone());
+                }
+                break (
+                    ret.cloned(),
+                    positional.to_vec(),
+                    named.to_vec(),
+                    required_positional,
+                );
+            }
+            let (_params, tree) = self.bounds.alias_named_shape(cur)?;
+            pending_args = tree.args.clone();
+            cur = tree.head;
+        };
+        let sig = FnVarSig {
+            // The alias's own type parameters are bound by the written use
+            // (`Predicate<T> test` already instantiates them) — they are
+            // not call-site inference variables, so the signature carries
+            // none; their leaves stay named `T` in the formal types.
+            params: Box::default(),
+            positional: positional
+                .iter()
+                .map(|tree| self.tree_ty(&subst_tree(tree, &subst)))
+                .collect(),
+            required_positional: u16::try_from(
+                required_positional.unwrap_or(positional.len()),
+            )
+            .unwrap_or(u16::MAX),
+            named: named
+                .iter()
+                .map(|(name, tree, required)| {
+                    (*name, self.tree_ty(&subst_tree(tree, &subst)), *required)
+                })
+                .collect(),
+            return_ty: ret
+                .map(|tree| self.tree_ty(&subst_tree(&tree, &subst)))
+                .unwrap_or(Ty::Dynamic),
+        };
+        Some(Box::new(sig))
+    }
+
+    /// A container member's declared field type from a clean walk
+    /// (`Unknown` for executables and broken chains). The answer folds
+    /// through a type alias first — the member read's static type is the
+    /// resolved interface type (`c.f as int` over `IntAlias f` is dead).
+    /// The fold is idempotent, so the promotable-field substitution that
+    /// reads these rows' types re-folds harmlessly (#1409).
+    pub(crate) fn member_declared_ty(&self, container: StringId, member: StringId) -> Ty {
+        match self.walk_members(container, member) {
+            Walk::Found(entry) if entry.kind == MemberKind::Field => {
+                self.fold_alias_ty(entry.var_ty)
+            }
+            _ => Ty::UNKNOWN,
+        }
+    }
+
+    /// The write target's `getWriteType` — the assignment resolver's
+    /// `writeAcceptedType` face: a field answers its declared type; a
+    /// setter answers its single value formal's declared type (the write
+    /// resolves against `name=`, never the getter's return). `Unknown` for
+    /// executables, accessors with uncaptured formals, and broken chains —
+    /// the under-report direction.
+    pub(crate) fn member_write_ty(&mut self, container: StringId, member: StringId) -> Ty {
+        match self.walk_members(container, member) {
+            Walk::Found(entry) if entry.kind == MemberKind::Field => {
+                self.fold_alias_ty(entry.var_ty)
+            }
+            _ => {
+                let setter = self.setter_spelling(member);
+                match self.walk_members(container, setter) {
+                    Walk::Found(entry) if entry.kind == MemberKind::Setter => entry
+                        .formals
+                        .as_deref()
+                        .and_then(|f| f.positional.first())
+                        .map_or(Ty::UNKNOWN, |formal| self.fold_alias_ty(formal.ty)),
+                    _ => Ty::UNKNOWN,
+                }
+            }
+        }
+    }
+
+    /// The promoted-property substitution (#1409): when a flow
+    /// [`dartq_flow::FlowFact::PromotedPropertyRead`] row stands at
+    /// exactly `range` (a staged check's own span — the merged member
+    /// row's) and the member it names resolves to a promotable field, the
+    /// parse-time type substitutes with its NON-NULL face — the official
+    /// read's static type is the promoted one
+    /// (`property_element_resolver.dart:2158-2166`), and the flow layer's
+    /// marker cannot spell the promoted type (the field's declared type is
+    /// this layer's knowledge). `None` leaves the staged verdict as-is.
+    ///
+    /// Eligibility is the official `isPropertyPromotable` verdict
+    /// (upstream Dart SDK source,
+    /// pkg/_fe_analyzer_shared/lib/src/field_promotability.dart:70-76): a
+    /// field, private, final, not external — and no conflicting
+    /// non-final field or concrete getter of the same name in the unit
+    /// ([`Engine::unit_field_name_conflicted`]; the current file's
+    /// containers only — a `part`-split library under-reports the
+    /// conflict) — under the
+    /// unit's field-promotion grant ([`Engine::field_promotion_enabled`],
+    /// the settled language version ≥ 3.2).
+    pub(crate) fn promotable_field_substitution(
+        &self,
+        props: &PropPromotionStaging,
+        range: SourceRange,
+        from: Ty,
+    ) -> Option<Ty> {
+        if !props.staged(range) {
+            return None;
+        }
+        let (entry, name, _origin) = self.member_read_resolution(range.offset)?;
+        Self::promotable_field_entry(self, &entry, name).then_some(self.non_null_face(from))
+    }
+
+    /// The member entry behind one promotable-shaped read, with its
+    /// spelling and defining file: the merge-time record's receiver walk
+    /// (the live stack is gone by the teardown — pass 2 took it), else the
+    /// published bare resolution (`RefTarget::Member` names the enclosing
+    /// container). The eligibility gate
+    /// ([`Engine::promotable_field_substitution`]) and the why-not-promoted
+    /// context face (#1877) share the resolution.
+    pub(crate) fn member_read_resolution(
+        &self,
+        read: u32,
+    ) -> Option<(Projected<'a, MemberEntry>, StringId, FileId)> {
+        if let Ok(index) = self
+            .member_reads
+            .binary_search_by(|row| row.offset.cmp(&read))
+            && self.member_reads[index].offset == read
+        {
+            let row = self.member_reads[index];
+            let walk = match row.recv {
+                Receiver::This { container, .. }
+                | Receiver::Typed {
+                    type_name: container,
+                    ..
+                } => self.walk_members(container, row.name),
+                Receiver::Super { container, .. } => self.walk_super(container, row.name),
+                _ => return None,
+            };
+            return match walk {
+                Walk::Found(entry) => {
+                    let origin = self.boundary.member_origin(&entry)?;
+                    Some((entry, row.name, origin))
+                }
+                _ => None,
+            };
+        }
+        let found = self.refs.iter().rev().find(|r| r.range.offset == read)?;
+        let RefTarget::Member { container } = found.target else {
+            return None;
+        };
+        match self.walk_members(container, found.name) {
+            Walk::Found(entry) => {
+                let origin = self.boundary.member_origin(&entry)?;
+                Some((entry, found.name, origin))
+            }
+            _ => None,
+        }
+    }
+
+    // —— why-not-promoted context rows (#1877) ————————————————————————
+
+    /// Stages one non-promotion fact row for the context face: the flow
+    /// fact's entries resolve to [`NonPromotionReason`]s through
+    /// `flow.non_promotion_reasons` (the property verdict this engine
+    /// derives — [`Self::property_non_promotability`]), and the upstream
+    /// nullable-key filter drops every potentially-nullable row (upstream
+    /// Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/type_analyzer.dart:783-791 — the
+    /// consumer skips nullable keys and takes the FIRST contributing
+    /// entry). The filter reads the flow layer's own nullability flag: the
+    /// slot's non-null evidence marker (Unknown, non-nullable) keeps its
+    /// row, and `void`/`Never` keys drop with it (upstream's filter skips
+    /// `void` as potentially nullable; the M1 lattice has no bottom type).
+    /// Facts arrive offset-sorted, so the push keeps the table sorted.
+    pub(crate) fn stage_non_promotion(&mut self, flow: &Flow<'_>, fact: &FlowFact, span: Token) {
+        let property = self.property_non_promotability(flow, fact);
+        let Some(entries) = flow.non_promotion_context(fact) else {
+            return;
+        };
+        let reasons = flow.non_promotion_reasons(fact, property);
+        let filtered: Vec<NonPromotionReason> = entries
+            .iter()
+            .zip(reasons)
+            .filter(|(entry, _)| match entry.ty.base {
+                FlowBase::Void | FlowBase::Never => false,
+                _ => !entry.ty.nullable,
+            })
+            .map(|(_, reason)| reason)
+            .collect();
+        // The read's spelling: the variable family reads the fact row's own
+        // token, the property family the interned member name (the flow
+        // layer's `'<prop>'` id).
+        let name = match fact {
+            FlowFact::NonPromotedPropertyRead { name, .. } => {
+                let spelling = flow.name_lexeme(*name);
+                self.strings.intern(spelling)
+            }
+            _ => {
+                let text = self
+                    .tokens
+                    .get(span.id as usize)
+                    .map(|token| &self.source[token.byte_range()])
+                    .unwrap_or_default();
+                self.strings.intern(text)
+            }
+        };
+        self.non_promotions.push((
+            span.range.offset,
+            StagedNonPromotion {
+                read: span.range,
+                name,
+                reasons: filtered,
+            },
+        ));
+    }
+
+    /// The element-layer verdict for one non-promotion fact row — the
+    /// mirror of upstream's `whyPropertyIsNotPromotable` operation (upstream
+    /// Dart SDK source,
+    /// pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:8769-8772,
+    /// the analyzer's element answer at
+    /// flow_analysis_visitor.dart:1070-1094): a public member name answers
+    /// [`PropertyNonPromotability::NotPrivate`] statically, a private one
+    /// resolves through the member walk (`isNotField` → `isExternal` →
+    /// `isNotFinal` → promotable), and `None` is the non-inherent conflict.
+    /// An unresolvable member answers `None` too: upstream reports nothing
+    /// for an unresolved `propertyMember` (the `propertyMember != null`
+    /// gate), and the context face degrades the same way.
+    pub(crate) fn property_non_promotability(
+        &self,
+        flow: &Flow<'_>,
+        fact: &FlowFact,
+    ) -> Option<PropertyNonPromotability> {
+        let FlowFact::NonPromotedPropertyRead { name, .. } = fact else {
+            return None;
+        };
+        let spelling = flow.name_lexeme(*name);
+        if !spelling.starts_with('_') {
+            return Some(PropertyNonPromotability::NotPrivate);
+        }
+        // The resolution keys on the read's own offset: the fact row's span
+        // is the member read token — the same anchor the merge record and
+        // the published bare resolution carry.
+        let FlowFact::NonPromotedPropertyRead { span, .. } = fact else {
+            return None;
+        };
+        let (entry, _name, _origin) = self.member_read_resolution(span.range.offset)?;
+        if entry.kind != MemberKind::Field {
+            return Some(PropertyNonPromotability::NotField);
+        }
+        if entry.is_external {
+            return Some(PropertyNonPromotability::External);
+        }
+        if !entry.is_final {
+            return Some(PropertyNonPromotability::NotFinal);
+        }
+        None
+    }
+
+    /// The why-not-promoted context rows for one read offset (#1877) —
+    /// the oracle's `computeWhyNotPromotedMessages` face (upstream Dart SDK
+    /// source, pkg/analyzer/lib/src/dart/resolver/type_analyzer.dart:772-813):
+    /// the first contributing entry renders, per the #1873 variant→payload→
+    /// anchor table —
+    ///
+    /// * `ExplicitWrite`/`Suspension`: "Variable '<name>' could not be
+    ///   promoted due to an assignment / an 'await' or 'yield'" at the write
+    ///   / suspension node, this file.
+    /// * `PropertyInherent`: "'<prop>' refers to a getter/public
+    ///   property/external field/non-final field so it couldn't be
+    ///   promoted." at the property's declaration anchor, cross-file through
+    ///   the defining file. An unresolvable member renders nothing — the
+    ///   anchor never guesses.
+    /// * `PropertyConflict`: renders nothing. Upstream enumerates the
+    ///   conflicting declarations from the library-level
+    ///   `fieldNameNonPromotabilityInfo`; this engine's conflict face is
+    ///   unit-level only, so the row omits rather than fakes a partial
+    ///   enumeration.
+    /// * `This`: "'this' can't be promoted" at the read itself (the error
+    ///   entity). Unreachable today — the flow layer emits no
+    ///   `ThisNotPromoted` rows — kept for taxonomy completeness.
+    ///
+    /// An empty answer means "no context", never a dropped diagnostic.
+    pub(crate) fn non_promotion_context_at(&self, read: u32) -> Vec<ContextMessage> {
+        let Ok(index) = self.non_promotions.binary_search_by(|row| row.0.cmp(&read)) else {
+            return Vec::new();
+        };
+        let staged = &self.non_promotions[index].1;
+        let Some(reason) = staged.reasons.first() else {
+            return Vec::new();
+        };
+        let name = self.strings.resolve(staged.name);
+        match *reason {
+            NonPromotionReason::ExplicitWrite { span } => {
+                vec![ContextMessage {
+                    message: SharedStr::from(format!(
+                        "Variable '{name}' could not be promoted due to an assignment"
+                    )),
+                    file: self.file,
+                    range: span,
+                }]
+            }
+            NonPromotionReason::Suspension { span } => {
+                vec![ContextMessage {
+                    message: SharedStr::from(format!(
+                        "Variable '{name}' could not be promoted due to an 'await' or 'yield'"
+                    )),
+                    file: self.file,
+                    range: span,
+                }]
+            }
+            NonPromotionReason::PropertyInherent { why } => {
+                let kind = match why {
+                    PropertyNonPromotability::NotField => "getter",
+                    PropertyNonPromotability::NotPrivate => "public property",
+                    PropertyNonPromotability::External => "external field",
+                    PropertyNonPromotability::NotFinal => "non-final field",
+                };
+                let Some((entry, _name, origin)) = self.member_read_resolution(read) else {
+                    return Vec::new();
+                };
+                if entry.name_range.offset == u32::MAX {
+                    return Vec::new();
+                }
+                vec![ContextMessage {
+                    message: SharedStr::from(format!(
+                        "'{name}' refers to a {kind} so it couldn't be promoted."
+                    )),
+                    file: origin,
+                    range: entry.name_range,
+                }]
+            }
+            NonPromotionReason::PropertyConflict => Vec::new(),
+            NonPromotionReason::This => {
+                vec![ContextMessage {
+                    message: SharedStr::from("'this' can't be promoted"),
+                    file: self.file,
+                    range: staged.read,
+                }]
+            }
+        }
+    }
+
+    /// Drains the parse-time context requests (#1877): the facts are
+    /// staged by now, so each deferred diagnostic takes its rows. An empty
+    /// answer leaves the diagnostic untouched — the zero-cost no-context
+    /// face.
+    pub(crate) fn attach_non_promotion_contexts(&mut self) {
+        for (index, read) in std::mem::take(&mut self.pending_non_promotion) {
+            let context = self.non_promotion_context_at(read);
+            if context.is_empty() {
+                continue;
+            }
+            self.report.diagnostics[index].context = Some(context.into_boxed_slice());
+        }
+    }
+
+    /// The parse-time emission that defers its why-not-promoted rows
+    /// (#1877): the diagnostic pushes now, the context attaches at the
+    /// teardown (the flow facts only exist after an executable replays).
+    /// The report index holds — nothing removes report rows between push
+    /// and drain.
+    pub(crate) fn emit_non_promotion(
+        &mut self,
+        code: SemanticCode,
+        range: SourceRange,
+        a0: &str,
+        a1: &str,
+        read: u32,
+    ) {
+        let index = self.report.diagnostics.len();
+        self.emit(code, range, a0, a1);
+        self.pending_non_promotion.push((index, read));
+    }
+
+    /// The property-access span of a member read staged at `member`: the
+    /// receiver's read span through the member's end (B5). `None` when the
+    /// span is not a recorded member read or the receiver's span never
+    /// materialized (a receiver-less recovery fold).
+    pub(crate) fn property_access_span(&self, member: SourceRange) -> Option<SourceRange> {
+        let index = self
+            .member_reads
+            .binary_search_by(|read| read.offset.cmp(&member.offset))
+            .ok()?;
+        let read = self.member_reads[index];
+        (read.offset == member.offset && read.recv_span.length > 0).then_some(SourceRange {
+            offset: read.recv_span.offset,
+            length: member.end().saturating_sub(read.recv_span.offset),
+        })
+    }
+
+    /// The promotable-field verdict on one resolved member entry (the
+    /// flags half of [`Engine::promotable_field_substitution`]'s contract).
+    /// The language-version grant ANDs in first (the official
+    /// `isPromotable` conjunction, `flow_analysis.dart:7811-7815`):
+    /// `fieldPromotionEnabled` comes from the *accessing* library's
+    /// feature set (`ast_resolver.dart:139-140`), so a pre-3.2 unit never
+    /// promotes — even a field declared in a 3.2 library.
+    pub(crate) fn promotable_field_entry(&self, entry: &Projected<'_, MemberEntry>, name: StringId) -> bool {
+        if !self.field_promotion_enabled {
+            return false;
+        }
+        if entry.kind != MemberKind::Field || entry.is_static || !entry.is_final {
+            return false;
+        }
+        if entry.is_external {
+            return false;
+        }
+        if !self.strings.resolve(name).starts_with('_') {
+            return false;
+        }
+        !self.unit_field_name_conflicted(name)
+    }
+
+    /// Whether any unit member of the given private name defeats field
+    /// promotion: a non-final or external instance field, or a concrete
+    /// (non-abstract) instance getter, under the same name — the official
+    /// name-poisoning rule (`addField`/`addGetter`,
+    /// field_promotability.dart:100-172). `noSuchMethod`-forwarder faces
+    /// are not modeled here (under-report). Scans the current file's
+    /// class-family containers only: upstream registers classes, enums,
+    /// and mixins with the promotability pass and nothing else — named
+    /// extensions and extension types are excluded (upstream Dart SDK
+    /// source, pkg/analyzer/lib/src/summary2/library_builder.dart:885-905)
+    /// — an extension getter is not a field, and a same-name extension
+    /// getter is dead at every read site (the instance member wins), so
+    /// scanning extension faces could only reject valid promotions
+    /// (over-report).
+    pub(crate) fn unit_field_name_conflicted(&self, name: StringId) -> bool {
+        let Some(elements) = self.index.get(self.file) else {
+            return false;
+        };
+        let conflicts = |entry: &MemberEntry| {
+            let instance = !entry.is_static;
+            (entry.kind == MemberKind::Field && instance && (entry.is_external || !entry.is_final))
+                || (entry.kind == MemberKind::Getter && instance && !entry.is_abstract)
+        };
+        elements
+            .containers()
+            .filter(|(_, container)| {
+                !matches!(
+                    container.kind,
+                    ContainerKind::Extension | ContainerKind::ExtensionType
+                )
+            })
+            .any(|(_, container)| container.members.get(&name).is_some_and(conflicts))
+    }
+
+    /// Whether the formal table declares a named formal under `name`.
+    pub(crate) fn has_named_formal(formals: Option<&Formals>, name: StringId) -> bool {
+        formals.is_some_and(|f| f.named.iter().any(|formal| formal.name == name))
+    }
+
+    /// The resolved top-level declaration under `name` (`None` = no check).
+    /// An imported declaration projects into the diagnosing pool (F5) —
+    /// its declared types are local slots from here on.
+    pub(crate) fn top_level_decl(&self, name: StringId) -> Option<Projected<'a, TopDecl>> {
+        match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::Local(decl) => Some(Projected::Own(decl)),
+            ScopedHit::Found(NamespaceEntry::Decl(file)) => {
+                let decl = self.index.get(file).and_then(|f| f.decl(name))?;
+                Some(self.boundary.top(file, name, decl))
+            }
+            _ => None,
+        }
+    }
+
+    /// The full formal table of a resolved member callee, walked from `recv`.
+    /// A foreign find's table comes back owned ([`std::borrow::Cow::Owned`],
+    /// cloned off the boundary's projected copy); a local find borrows the
+    /// unit's own (`'a`).
+    pub(crate) fn member_formals_full(
+        &self,
+        recv: &Receiver,
+        name: StringId,
+    ) -> Option<std::borrow::Cow<'a, Formals>> {
+        let (container, super_walk) = match *recv {
+            Receiver::This { container, .. } => (container, false),
+            Receiver::Super { container, .. } => (container, true),
+            Receiver::Typed { type_name, .. } => (type_name, false),
+            // A folded creation (`C().m(...)`): the instance face — the
+            // constructor-argument membership check walks the superclass
+            // chain like a declaration-typed receiver. The table is not
+            // name-level only: `check_arguments` stages and renders formal
+            // types against it, and those renders stay single-pool because
+            // the walks below route every find through the boundary.
+            Receiver::Created { name, .. } => (name, false),
+            Receiver::Container {
+                name: container, ..
+            } => {
+                // F1: the hit may belong to a foreign unit's pool — project
+                // it through the boundary before its formals flow into rows
+                // or message text (the arms below reach the projection via
+                // `walk_members`/`walk_super`; this arm resolves directly).
+                let hit = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    container,
+                )
+                .and_then(|(c, owner)| c.members.get(&name).map(|entry| (owner, entry)));
+                return match hit {
+                    Some((owner, entry)) if entry.kind == MemberKind::Method => {
+                        match self.boundary.member(owner, container, name, entry) {
+                            Projected::Own(e) => {
+                                e.formals.as_deref().map(std::borrow::Cow::Borrowed)
+                            }
+                            Projected::Foreign(e) => e
+                                .formals
+                                .as_deref()
+                                .map(|formals| std::borrow::Cow::Owned(formals.to_owned())),
+                        }
+                    }
+                    _ => None,
+                };
+            }
+            // A prefixed container callee (`io.Directory.new()`): same
+            // foreign-unit projection as the bare-container arm, resolved
+            // through the prefix table — the name sits behind the prefix,
+            // never in the diagnosing library's own scope.
+            Receiver::PrefixedContainer {
+                prefix,
+                name: container,
+                ..
+            } => {
+                let hit = prefixed_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    prefix,
+                    container,
+                )
+                .and_then(|(c, owner)| c.members.get(&name).map(|entry| (owner, entry)));
+                return match hit {
+                    Some((owner, entry)) if entry.kind == MemberKind::Method => {
+                        match self.boundary.member(owner, container, name, entry) {
+                            Projected::Own(e) => {
+                                e.formals.as_deref().map(std::borrow::Cow::Borrowed)
+                            }
+                            Projected::Foreign(e) => e
+                                .formals
+                                .as_deref()
+                                .map(|formals| std::borrow::Cow::Owned(formals.to_owned())),
+                        }
+                    }
+                    _ => None,
+                };
+            }
+            // A prefixed top-level callee (`p.f(...)` through `import as`):
+            // the same unmerged-placeholder shape as the plain arm above —
+            // the prefix resolves to its target file and the declaration's
+            // formals project through the boundary (foreign slots re-intern
+            // into the diagnosing pool, single-pool with the argument rows).
+            // An unregistered prefix, an ambiguous or absent name, and a
+            // non-executable target all keep the under-report.
+            Receiver::Prefix { name: prefix } => {
+                let dartq_resolution::Lookup::Found(NamespaceEntry::Decl(file)) = self
+                    .namespaces
+                    .lookup_prefixed(self.graph, self.lib, prefix, name)
+                else {
+                    return None;
+                };
+                let decl = self.index.get(file).and_then(|f| f.decl(name))?;
+                return match self.boundary.top(file, name, decl) {
+                    Projected::Own(decl) => decl.formals.as_deref().map(std::borrow::Cow::Borrowed),
+                    Projected::Foreign(decl) => decl
+                        .formals
+                        .as_deref()
+                        .map(|formals| std::borrow::Cow::Owned(formals.to_owned())),
+                };
+            }
+            Receiver::Unknown => return None,
+        };
+        let walk = if super_walk {
+            self.walk_super(container, name)
+        } else {
+            self.walk_members(container, name)
+        };
+        match walk {
+            Walk::Found(entry) if entry.kind == MemberKind::Method => Some(match entry {
+                Projected::Own(e) => match e.formals.as_deref() {
+                    Some(formals) => std::borrow::Cow::Borrowed(formals),
+                    None => return None,
+                },
+                Projected::Foreign(e) => match e.formals.as_deref() {
+                    Some(formals) => std::borrow::Cow::Owned(formals.to_owned()),
+                    None => return None,
+                },
+            }),
+            _ => None,
+        }
+    }
+
+    /// The receiver an unmerged member placeholder resolves against: the
+    /// classification [`Self::merge_member`] applies at the dot event, plus
+    /// the call-result arm — a plain row whose send already completed reads
+    /// its callee's declared return type (`g().m(...)`; the result's static
+    /// type IS the return type, the [`Self::receiver_static_ty`] invoke
+    /// face). The merge itself keeps such receivers untyped (under-report);
+    /// only the argument check widens, because it sees the placeholder
+    /// before the merge runs.
+    pub(crate) fn argument_receiver(&self, row: &Row) -> Receiver {
+        match &row.shape {
+            RowShape::Bare(info) => {
+                let recv = Engine::receiver_of_bare(*info);
+                if matches!(recv, Receiver::Unknown)
+                    && matches!(row.intent, Intent::Invoke)
+                    && let ty @ Ty::Named { name, .. } = self.callee_return_ty(row)
+                {
+                    Receiver::Typed {
+                        type_name: name,
+                        ty,
+                    }
+                } else {
+                    recv
+                }
+            }
+            RowShape::Receiver(recv) => *recv,
+            _ => Receiver::Unknown,
+        }
+    }
+
+    // —— resolution ——————————————————————————————————————————————————
+
+    /// Resolves a bare name in value position: locals, type parameters, the
+    /// member face (own-file container chain), the extension pool, enum
+    /// synthesized members, then the scoped library lookup.
+    pub(crate) fn resolve_bare(&self, name: StringId) -> (BareInfo, RefTarget) {
+        if self.frames.iter().rev().any(|f| f.locals.contains(&name)) {
+            return (
+                BareInfo::Plain {
+                    ty: self.typed_local(name).unwrap_or(Ty::UNKNOWN),
+                },
+                RefTarget::Local,
+            );
+        }
+        // The frameless initializer world: a pattern variable of a switch /
+        // if-case expression in a top-level variable's initializer binds
+        // here (no executable frame exists to join). The clause's reads —
+        // the case guard, the case body — resolve to it; the type stays
+        // unknown (the binding carried none without a frame), so
+        // member/type faces over it under-report.
+        if self.initializer_locals.contains(&name) {
+            return (BareInfo::Plain { ty: Ty::UNKNOWN }, RefTarget::Local);
+        }
+        if self.type_params.contains(&name) || self.pending_type_params.contains(&name) {
+            // A still-parked parameter belongs to the header being parsed:
+            // its own bound and its later siblings' bounds are in scope from
+            // its declaration (`class C<T extends A<T>>`).
+            return (
+                BareInfo::Plain {
+                    ty: Ty::named(name),
+                },
+                RefTarget::TypeParam,
+            );
+        }
+        if let Some((container, kind)) = self.container_context() {
+            // #1701: an unnamed extension resolves bare names against its
+            // application face's member map — upstream treats named and
+            // unnamed declarations alike on this face (upstream Dart SDK
+            // source, pkg/analyzer/lib/src/dart/resolver/
+            // property_element_resolver.dart:2138-2141, the scope lookup
+            // then the implicit-this getter on the on-type). A face hit
+            // suppresses exactly like a named container's member hit; a
+            // miss falls through as a clean `Walk::Missing` would — the
+            // placeholder frame name's own walk always answers
+            // `ChainBroken` (the collector registers no "" container) and
+            // must not suppress every bare name in the body.
+            let member_found = match self.unnamed_extension_members() {
+                Some(members) => {
+                    if let Some(entry) = members.get(&name) {
+                        let ty = match entry.kind {
+                            MemberKind::Field => entry.var_ty,
+                            _ => Ty::UNKNOWN,
+                        };
+                        return (BareInfo::Plain { ty }, RefTarget::Member { container });
+                    }
+                    false
+                }
+                None => !matches!(self.walk_members(container, name), Walk::Missing),
+            };
+            if member_found {
+                // Found, or a broken chain — both suppress.
+                return (
+                    BareInfo::Plain {
+                        ty: self.member_declared_ty(container, name),
+                    },
+                    RefTarget::Member { container },
+                );
+            }
+            if kind == ContainerKind::Enum && self.members.enum_synth_members.contains(&name) {
+                return (BareInfo::Plain { ty: Ty::UNKNOWN }, RefTarget::Opaque);
+            }
+            if self.instance_context() && self.members.object_members.contains(&name) {
+                return (BareInfo::Plain { ty: Ty::UNKNOWN }, RefTarget::Opaque);
+            }
+        }
+        if self
+            .index
+            .get(self.file)
+            .is_some_and(|f| f.has_extension_member(name))
+        {
+            return (BareInfo::Plain { ty: Ty::UNKNOWN }, RefTarget::Opaque);
+        }
+        match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::Local(decl) => (
+                self.bare_info_of(name, decl),
+                RefTarget::Decl { file: self.file },
+            ),
+            ScopedHit::Found(entry) => self.bare_info_of_entry(name, entry),
+            ScopedHit::Ambiguous(_) => (BareInfo::Plain { ty: Ty::UNKNOWN }, RefTarget::Opaque),
+            ScopedHit::NotFound => (self.missing_info(), RefTarget::Missing),
+        }
+    }
+
+    /// The push-time context snapshot of a bare miss (pass 2 runs after the
+    /// frames tear down — see [`BareInfo::Missing`]).
+    pub(crate) fn missing_info(&self) -> BareInfo {
+        let context = self.container_context();
+        BareInfo::Missing {
+            // The UnqualifiedLookupDomain names the enclosing class whenever
+            // the miss sits inside the class's region — static members,
+            // field initializers, and nested locals included (upstream
+            // resolves the bare invocation through the class-member
+            // namespace first, so `static m() => C()` reports
+            // `undefined_method` on the class, never `undefined_function`).
+            // The header's clause text pushes TypeUse rows, never Bare
+            // rows, so no header-position guard is needed; a bare miss with
+            // no class frame keeps the top-level `undefined_function` face.
+            this_type: context
+                .filter(|(_, kind)| matches!(kind, ContainerKind::Class | ContainerKind::Enum))
+                .map(|(name, _)| name),
+            in_exec: self.in_executable(),
+            on_opaque: context.is_some_and(|(_, kind)| {
+                matches!(kind, ContainerKind::Mixin | ContainerKind::Extension)
+            }),
+        }
+    }
+
+    pub(crate) fn bare_info_of_entry(&self, name: StringId, entry: NamespaceEntry) -> (BareInfo, RefTarget) {
+        match entry {
+            NamespaceEntry::Prefix => (BareInfo::Prefix { name }, RefTarget::Prefix),
+            NamespaceEntry::Decl(file) => match self.index.get(file) {
+                Some(elements) => match elements.decl(name) {
+                    Some(decl) => {
+                        // F5: an imported declaration's declared type
+                        // projects before it arms a row.
+                        let projected = self.boundary.top(file, name, decl);
+                        (
+                            self.bare_info_of(name, &projected),
+                            RefTarget::Decl { file },
+                        )
+                    }
+                    None => (
+                        self.bare_info_of(name, &TopDecl::bare(MicroKind::TopLevelVar)),
+                        RefTarget::Decl { file },
+                    ),
+                },
+                // A declaring file outside the element index is the
+                // pipeline's synthetic SDK face (`<dart:*>` files carry
+                // graph declarations but no model). A primitive spelling
+                // there is the definitional core class — the class-static
+                // face the member read resolves against (`double.nan`'s
+                // `isDoubleNan`, best_practices_verifier.dart:2264-2277) —
+                // so the receiver classifies like an indexed class instead
+                // of the untyped `Plain` shape, which folds to
+                // `Receiver::Unknown` at the dot merge and silences every
+                // container face downstream. Every other unindexed name
+                // keeps `Plain` (kind unknown, the under-report posture).
+                None if self.members.primitive_ids.contains(&name) => (
+                    BareInfo::Container {
+                        name,
+                        kind: ContainerKind::Class,
+                    },
+                    RefTarget::Decl { file },
+                ),
+                None => (
+                    self.bare_info_of(name, &TopDecl::bare(MicroKind::TopLevelVar)),
+                    RefTarget::Decl { file },
+                ),
+            },
+        }
+    }
+
+    /// The [`BareInfo`] of a resolved top-level declaration.
+    pub(crate) fn bare_info_of(&self, name: StringId, decl: &TopDecl) -> BareInfo {
+        match decl.kind {
+            // Type parameters are declaration-scoped: the per-unit tag is
+            // stale outside its declaration, and in-scope uses were answered
+            // by the engine's type-parameter stack. The stale reference is a
+            // plain miss whose code name follows the live invocation context
+            // (`undefined_method`'s host inside a class instance member).
+            MicroKind::TypeParam => self.missing_info(),
+            MicroKind::Class => BareInfo::Container {
+                name,
+                kind: ContainerKind::Class,
+            },
+            MicroKind::Enum => BareInfo::Container {
+                name,
+                kind: ContainerKind::Enum,
+            },
+            MicroKind::Mixin => BareInfo::Container {
+                name,
+                kind: ContainerKind::Mixin,
+            },
+            MicroKind::Extension => BareInfo::Container {
+                name,
+                kind: ContainerKind::Extension,
+            },
+            // A `TypeAlias` falls here (the container kinds answer above):
+            // reachable only from a value-position alias reference — invalid
+            // Dart, recovery territory — it answers the captured right-hand
+            // type, so the undefined-name row stays suppressed and the
+            // oracle's invalid-use diagnostic stays under-reported. Type
+            // positions never walk this face (the type parser arms them).
+            _ => BareInfo::Plain { ty: decl.var_ty },
+        }
+    }
+
+    /// Whether `name` resolves to the SDK projection's names-only stub of a
+    /// dart:core collection head — the resolution grade a generic class
+    /// type literal takes in a value position (`List` of `List < 1` names
+    /// the class through an unindexed `<dart:core>` file, landing in the
+    /// untyped `Plain` shape). A user declaration of the same name resolves
+    /// first and keeps its own face.
+    pub(crate) fn sdk_collection_type_literal(&self, name: StringId) -> bool {
+        if !self.collection_heads.contains(&name) {
+            return false;
+        }
+        match self.resolve_bare(name) {
+            (BareInfo::Plain { .. }, RefTarget::Decl { file }) => self.index.get(file).is_none(),
+            _ => false,
+        }
+    }
+
+    // —— row stack ———————————————————————————————————————————————————
+
+    pub(crate) fn push_row(&mut self, row: Row) {
+        // The conditional-URI window: the configuration is never resolved
+        // as an expression, so its rows drop at the resolution pass.
+        if self.conditional_uri_window {
+            self.conditional_uri_rows.insert(row.range.offset);
+        }
+        self.rows.push(row);
+    }
+
+    /// A bare identifier in value position: resolved immediately (the
+    /// verdict is the snapshot pass 2 emits from). A miss under `new`/`const`
+    /// is a creation head: it names a class, so the guarded miss is the
+    /// oracle's `creation_with_non_type` head face (`new Missing()`),
+    /// never an invocation read — the row reclassifies as a type use.
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+    pub(crate) fn push_bare(&mut self, name: StringId, range: SourceRange) {
+        let (info, target) = self.resolve_bare(name);
+        // The query face's publication (#1056): the push-time decision
+        // ships as-is — the resolution is final even where a later fold
+        // retracts the row (a creation fold's truncated callee resolved
+        // where it resolved).
+        self.refs.push(UnitRef {
+            range,
+            name,
+            target,
+        });
+        // The usage cluster's local-use capture: a bare read that resolves
+        // into the frame stack counts for the declaration it lands on.
+        // (A local function's own name is absent from the tracked stack
+        // while its body parses, so in-body self-references never count —
+        // the official `_enclosingExec` exclusion.) The final intent may
+        // still cancel it (write-only, statement-discarded reads).
+        if let Some(hit) = self.resolve_local(name) {
+            let hit = hit as usize;
+            self.locals[hit].uses += 1;
+            self.local_hits.insert(range.offset, hit as u32);
+        }
+        // The official self-reference exclusions (`_useIdentifierElement`):
+        // a reference to the enclosing container or the enclosing executable
+        // itself never marks that declaration used. The row offset joins the
+        // skip set so the resolve-time marking obeys the same rule.
+        if self.exec_self_name() == Some(name)
+            || self.container_context().is_some_and(|(c, _)| c == name)
+        {
+            self.self_scope_rows.insert(range.offset);
+        }
+        // A bare mention of a field name inside its own container: the
+        // final intent decides read vs write at resolve time.
+        if let Some((container, _)) = self.container_context()
+            && self
+                .index
+                .get(self.file)
+                .and_then(|f| f.container(container))
+                .is_some_and(|c| {
+                    c.members
+                        .get(&name)
+                        .is_some_and(|m| m.kind == MemberKind::Field)
+                })
+        {
+            self.field_read_rows.insert(range.offset, container);
+        }
+        // The implicit-this face's push-time snapshots: the field-group
+        // state tears down before pass 2 resolves the row. The second set
+        // carries the member-ness verdict (an instance member of the
+        // enclosing container only — statics and non-members never ride
+        // `this`).
+        if self.in_instance_field_initializer() {
+            self.field_init_rows.insert(range.offset);
+            let instance_member = match &target {
+                RefTarget::Member { container } => match self.walk_members(*container, name) {
+                    Walk::Found(entry) => !entry.is_static,
+                    // A chain-broken climb answers no: the name may be an
+                    // inherited member (suppress) or a scoped declaration
+                    // the broken chain preempted (`HashSet<T>()` in a field
+                    // initializer of a class `implements Iterator<T>` — the
+                    // unindexed hop claimed the scoped class as an instance
+                    // member and over-reported the initializer face,
+                    // #2172). The Object-member arm below keeps the
+                    // always-known faces reporting.
+                    Walk::ChainBroken => false,
+                    Walk::Missing => false,
+                },
+                _ => {
+                    self.container_context().is_some_and(|(_, kind)| {
+                        kind == ContainerKind::Enum
+                            && self.members.enum_synth_members.contains(&name)
+                    }) || self.members.object_members.contains(&name)
+                }
+            };
+            if instance_member {
+                self.field_init_this_rows.insert(range.offset);
+            }
+        }
+        if self.ctor_pos > 0 && matches!(info, BareInfo::Missing { .. }) {
+            self.push_row(Row {
+                name,
+                range,
+                qualified: false,
+                shape: RowShape::TypeUse(TypeVerdict::Missing, false),
+                intent: Intent::Read,
+                write_op: None,
+                ty: Ty::UNKNOWN,
+            });
+            return;
+        }
+        // F-C: a bare name inside the constructor-initializer list joins
+        // the initializer world — the write intent is the field-initializer
+        // LHS (`x = e`) and resolves through that face at pass 2, never
+        // `undefined_identifier`. Reads keep the ordinary resolution.
+        if self.initializer_depth > 0
+            && let Some((container, _)) = self.container_context()
+        {
+            self.init_rows.insert(range.offset, container);
+        }
+        let ty = match info {
+            BareInfo::Plain { ty } if ty != Ty::UNKNOWN => ty,
+            // #279 type folding: an in-file const top-level variable's
+            // declared type folds to its evaluated constant's type (the
+            // oracle infers the variable's type from the initializer). A
+            // shadowing local keeps its own (already-folded) type.
+            BareInfo::Plain { .. } => {
+                let from_local = self.frames.iter().any(|f| f.locals.contains(&name));
+                let is_top_var = self
+                    .top_level_decl(name)
+                    .is_some_and(|d| d.kind == MicroKind::TopLevelVar);
+                if !from_local && is_top_var {
+                    self.const_top_level_ty(name).unwrap_or(Ty::UNKNOWN)
+                } else {
+                    Ty::UNKNOWN
+                }
+            }
+            _ => Ty::UNKNOWN,
+        };
+        // The implicit-`this` member read's query row (#1869-2): a bare
+        // name the enclosing container's instance face resolved carries the
+        // member's declared type — the same static type `this.name` reads.
+        // The flow layer cannot type these reads (its rows are local
+        // bindings), so the merge at the teardown join never collides.
+        if matches!(target, RefTarget::Member { .. }) && ty != Ty::UNKNOWN {
+            self.query_type_rows.push((range, ty));
+        }
+        self.push_row(Row {
+            name,
+            range,
+            qualified: false,
+            shape: RowShape::Bare(info),
+            intent: Intent::Read,
+            write_op: None,
+            ty,
+        });
+    }
+
+    /// An identifier after a dot, awaiting the merge at the dot event.
+    pub(crate) fn push_member(&mut self, name: StringId, range: SourceRange) {
+        // The implicit-this face's push-time snapshot (see `push_bare`).
+        if self.in_instance_field_initializer() {
+            self.field_init_rows.insert(range.offset);
+        }
+        // A record-typed receiver's field access is resolvable without the
+        // member face: the record shape the receiver's row carries names
+        // the positional `$n` and named slots (`rect.width` on
+        // `({int width, int height})`). The row keeps the resolved field
+        // type so the binary fold and the initializer faces read the
+        // access's own type (record fields carry no member walk — the
+        // `Receiver` is `Unknown`, so pass-2 stays silent on it either way).
+        let recv_ty = self.rows.last().map(|recv| {
+            if recv.ty != Ty::UNKNOWN {
+                recv.ty
+            } else if let RowShape::Bare(BareInfo::Plain { ty }) = &recv.shape {
+                *ty
+            } else {
+                Ty::UNKNOWN
+            }
+        });
+        let ty = match recv_ty {
+            Some(Ty::Record { shape, .. }) => {
+                let pool = self.boundary.pool();
+                let shape = pool.record_shape(shape);
+                let text = self.strings.resolve(name);
+                let field_ty = if let Some(index) = text
+                    .strip_prefix('$')
+                    .and_then(|digits| digits.parse::<usize>().ok())
+                    .and_then(|index| index.checked_sub(1))
+                {
+                    shape.positional.get(index).copied()
+                } else {
+                    shape
+                        .named
+                        .iter()
+                        .find(|(field, _)| *field == name)
+                        .map(|(_, ty)| *ty)
+                };
+                field_ty.unwrap_or(Ty::UNKNOWN)
+            }
+            _ => Ty::UNKNOWN,
+        };
+        self.push_row(Row {
+            name,
+            range,
+            qualified: true,
+            shape: RowShape::Bare(BareInfo::Plain { ty }),
+            intent: Intent::Read,
+            write_op: None,
+            ty,
+        });
+    }
+
+    /// A resolved non-receiver value (literal, parenthesized group, closure,
+    /// collection): member merges past it see an unknown receiver. The row
+    /// carries the construct's span so the assignment/operator scans can
+    /// tell "before the operator" (candidate) from "after" (skip).
+    pub(crate) fn push_value_row(&mut self, token: Token) {
+        self.push_row(Row {
+            name: self.intern(""),
+            range: token.range,
+            qualified: false,
+            shape: RowShape::Value,
+            intent: Intent::Read,
+            write_op: None,
+            ty: Ty::UNKNOWN,
+        });
+    }
+
+    /// The `null` literal: the only literal whose type M1 knows exactly.
+    pub(crate) fn push_null_row(&mut self, token: Token) {
+        self.push_row(Row {
+            name: self.intern(""),
+            range: token.range,
+            qualified: false,
+            shape: RowShape::Value,
+            intent: Intent::Read,
+            write_op: None,
+            ty: Ty::Null,
+        });
+    }
+
+    /// The recovered `is` expression's result row (`<synthetic> is T`, the
+    /// operand-splice recovery face): the expression's static type is `bool`
+    /// whatever the operand's recovery shape (`visitIsExpression`), so the
+    /// enclosing single-row check reads the expression's own type instead of
+    /// the recovery residue below it.
+    pub(crate) fn push_bool_row(&mut self, token: Token) {
+        self.push_row(Row {
+            name: self.intern(""),
+            range: token.range,
+            qualified: false,
+            shape: RowShape::Value,
+            intent: Intent::Read,
+            write_op: None,
+            ty: Ty::named(self.members.primitive_ids[3]),
+        });
+    }
+
+    /// A record literal's result row: the field types decided by
+    /// [`Engine::record_field_tys`] ride the row — the positional list in
+    /// `shape` (the render spells the oracle's record type display,
+    /// `(int, {String s})`), the full shape interned into `ty` for the
+    /// assignability face.
+    pub(crate) fn push_record_row(
+        &mut self,
+        token: Token,
+        positional: Box<[Ty]>,
+        named: Box<[(StringId, Ty)]>,
+    ) {
+        let ty = self
+            .boundary
+            .args
+            .borrow_mut()
+            .record(&positional, &named, false);
+        self.push_row(Row {
+            name: self.intern(""),
+            range: token.range,
+            qualified: false,
+            shape: RowShape::Record(positional),
+            intent: Intent::Read,
+            write_op: None,
+            ty,
+        });
+    }
+
+    /// The record literal's field types, from the field window its begin
+    /// event marked: the window's top-level commas split the fields
+    /// (`(a, b, c)` — a comma inside a nested group does not split), and
+    /// each field's type is the last row strictly inside its token span.
+    /// An empty field (`(42, ,)`) carries [`Ty::Unknown`] — the recovery's
+    /// `InvalidType` splice, the under-report direction. The named fields
+    /// are the trailing [`Self::record_literal_names`] entries of the
+    /// split. A field whose window rows disagree on one known type stays
+    /// undecided (`None`, the literal keeps its opaque value row). The
+    /// stacks pop either way — the literal's own `(` window never leaks
+    /// into the enclosing expression.
+    pub(crate) fn record_field_tys(
+        &mut self,
+        count: usize,
+    ) -> Option<(usize, Box<[Ty]>, Box<[(StringId, Ty)]>)> {
+        let (mark, open) = self.record_marks.pop()?;
+        let names = self.record_literal_names.pop().unwrap_or_default();
+        if count == 0 || mark > self.rows.len() {
+            return None;
+        }
+        let rows = &self.rows[mark..];
+        // The field spans: the window's `(` through the literal's `)`
+        // (the open token's matching close — never a comma), split on the
+        // depth-0 commas between them.
+        let close = self.tokens.matching_end(open.id as usize)?;
+        let mut boundaries = vec![open.id];
+        let mut depth = 0u32;
+        for id in open.id + 1..close as u32 {
+            let kind = self.tokens.get(id as usize).map(|t| t.kind);
+            match kind {
+                Some(kind) if kind.is_begin_group() => depth += 1,
+                Some(kind) if kind.matching_opens().first().is_some() => {
+                    depth = depth.saturating_sub(1);
+                }
+                Some(dartq_scanner::TokenKind::Comma) if depth == 0 => boundaries.push(id),
+                _ => {}
+            }
+        }
+        if boundaries.len() == count + 1 {
+            // A trailing comma's empty tail is not a field — drop it.
+            boundaries.pop();
+        }
+        if boundaries.len() != count {
+            // The written count and the split disagree — a recovery shape
+            // the span walk cannot trust; the opaque row stands.
+            return None;
+        }
+        let mut fields = Vec::with_capacity(count);
+        for window in boundaries
+            .windows(2)
+            .map(|w| (w[0], w[1]))
+            .chain(std::iter::once((*boundaries.last()?, close as u32)))
+        {
+            let (lo, hi) = (
+                self.tokens
+                    .get(window.0 as usize)
+                    .map(|t| t.utf16_offset)
+                    .unwrap_or(0),
+                self.tokens
+                    .get(window.1 as usize)
+                    .map(|t| t.utf16_offset)
+                    .unwrap_or(u32::MAX),
+            );
+            let field_rows: Vec<&Row> = rows
+                .iter()
+                .filter(|row| row.range.offset > lo && row.range.end() <= hi)
+                .collect();
+            match field_rows.as_slice() {
+                [] => fields.push(Ty::Unknown),
+                [single] => fields.push(single.ty),
+                many => {
+                    let first = many[0].ty;
+                    if first == Ty::UNKNOWN || !many.iter().all(|row| row.ty == first) {
+                        return None;
+                    }
+                    fields.push(first);
+                }
+            }
+        }
+        // The named pairs trail the positional list (the parser's own
+        // field order — `(1, s: 'x', b: true)` keeps `s` before `b`).
+        let named_start = fields.len().saturating_sub(names.len());
+        let named: Vec<(StringId, Ty)> = names
+            .into_iter()
+            .zip(fields[named_start..].iter().copied())
+            .collect();
+        Some((mark, fields[..named_start].into(), named.into_boxed_slice()))
+    }
+
+    /// The record type's official display (`(int,)`, `(int, String)`): the
+    /// positional fields comma-joined, a lone field keeping its trailing
+    /// comma (`RecordType`'s `toString`, records.dart's written form).
+    pub(crate) fn render_record(&self, fields: &[Ty]) -> String {
+        let mut text = String::from("(");
+        for (index, ty) in fields.iter().enumerate() {
+            if index > 0 {
+                text.push_str(", ");
+            }
+            text.push_str(&ty.render(&self.strings, &self.boundary.pool()));
+        }
+        if fields.len() == 1 {
+            text.push(',');
+        }
+        text.push(')');
+        text
+    }
+
+    /// The operator application on a record-typed receiver (`(x-1) + 1`): a
+    /// record declares no user operators, so each applied spelling that
+    /// `Object` does not define reports `undefined_operator` at the
+    /// operator's own span (`pkg/analyzer/lib/src/dart/ast/ast.dart`
+    /// `RecordLiteralImpl.staticType`; the type display rides the message).
+    /// An extension application on a record shape is an inference face M1
+    /// does not model — a program that declares the operator through
+    /// `extension on (…)` over-reports here (a documented divergence; the
+    /// corpus carries no such declaration).
+    pub(crate) fn resolve_record_row(&mut self, row: &Row, fields: &[Ty]) {
+        let Intent::Operator(_, op_range) = row.intent else {
+            return;
+        };
+        let (read, write) = self.operator_spellings(row);
+        let type_text = self.render_record(fields);
+        for spelling in [read, write].into_iter().flatten() {
+            if spelling == self.intern("==") {
+                continue;
+            }
+            let op_text = self.strings.resolve(spelling).to_string();
+            self.emit(
+                SemanticCode::UndefinedOperator,
+                op_range,
+                &op_text,
+                &type_text,
+            );
+        }
+    }
+
+    /// The recovered operand's fold (`return is(x-1)` parses as
+    /// `<synthetic> is (x-1)`): the synthetic head fired no identifier
+    /// event, so no operand row exists, and the suppressed `TypeUse` rows
+    /// the recovered type left would stand in as the expression's row — an
+    /// `unknown` that silences the enclosing single-row check. The oracle
+    /// still types the expression `bool` and runs the return matrix on it
+    /// (`return_of_invalid_type` bool->int,
+    /// keyword_named_class_methods_2.dart:184).
+    ///
+    /// The dropped residue keeps its push-time faces: a suppressed miss
+    /// still feeds the names table exactly as its pass-2 resolve would (the
+    /// emit is suppression-gated off), so only the row leaves. A window that
+    /// holds anything but suppressed misses (an unresolved prefixed head
+    /// keeps its own emission) folds nothing — the under-report posture
+    /// stands for the exotic recovery shape.
+    pub(crate) fn fold_recovered_is(&mut self, at: Token) {
+        let Some(mark) = self.is_type_mark.take() else {
+            return;
+        };
+        if mark > self.rows.len() {
+            return;
+        }
+        let residue: Vec<Row> = self.rows.drain(mark..).collect();
+        let mut misses = Vec::with_capacity(residue.len());
+        let mut retained: Vec<Row> = Vec::new();
+        let mut decidable = true;
+        for row in &residue {
+            match row.shape {
+                // The recovery shape's undefined type names: the miss joins
+                // the face's own report set.
+                RowShape::TypeUse(TypeVerdict::Missing, true) => {
+                    misses.push((row.name, row.range));
+                }
+                // A resolved non-type inside the recovered operand (the
+                // golden `x isn't a type` on the recursion parameter): the
+                // row stays for the resolve pass, and the recovered
+                // expression itself is still statically `bool`.
+                RowShape::TypeUse(TypeVerdict::NonType, true) => {
+                    retained.push(row.clone());
+                }
+                _ => {
+                    decidable = false;
+                    break;
+                }
+            }
+        }
+        if decidable {
+            for (name, range) in misses {
+                self.record_miss(name, range, false, NameUse::Type);
+            }
+            self.rows.extend(retained);
+            self.push_bool_row(at);
+        } else {
+            self.rows.extend(residue);
+        }
+    }
+
+    /// The `is`/`as` operand's undefined-type face
+    /// (`visitIsExpression`'s `type_test_with_undefined_name`,
+    /// `visitAsExpression`'s `cast_to_non_type`): the operand window's
+    /// suppressed `Missing` row reports the dedicated code — the resolver's
+    /// plain path never fires for the operand (the non-type-pos
+    /// suppression holds), and the resolve pass keeps its miss record.
+    pub(crate) fn emit_operand_type_miss(&mut self, mark: Option<usize>, code: SemanticCode) {
+        let Some(start) = mark else {
+            return;
+        };
+        if start >= self.rows.len() {
+            return;
+        }
+        let hit = self.rows[start..].iter().find_map(|row| match row.shape {
+            RowShape::TypeUse(TypeVerdict::Missing, true) => Some((row.name, row.range)),
+            _ => None,
+        });
+        if let Some((name, range)) = hit {
+            if !self.guard.ignore(None, name) {
+                let name_text = self.strings.resolve(name).to_string();
+                self.emit(code, range, &name_text, "");
+            }
+        }
+    }
+
+    pub(crate) fn emit_is_type_miss(&mut self) {
+        let mark = self.is_type_mark.take();
+        self.emit_operand_type_miss(mark, SemanticCode::TypeTestWithUndefinedName);
+    }
+
+    pub(crate) fn emit_as_type_miss(&mut self) {
+        let mark = self.as_type_mark.take();
+        self.emit_operand_type_miss(mark, SemanticCode::CastToNonType);
+    }
+
+    /// `this`/`super` in expression position: a typed receiver when a
+    /// container is in scope, unknown otherwise (top-level recovery). The
+    /// declaration-context faces ride the push: an invalid context reports
+    /// `invalid_reference_to_this` / `super_in_invalid_context` at the
+    /// keyword (type_analyzer.dart's `isThisAccessible` /
+    /// element_resolver.dart:360-369), before the row's uses decide.
+    /// Exception: at an initializer item's head the keyword is a bare token
+    /// of the folded initializer node (`ConstructorFieldInitializer`,
+    /// `RedirectingConstructorInvocation`, `SuperConstructorInvocation` —
+    /// upstream `buildInitializer`), never an expression reference, so the
+    /// context verdict does not apply to it.
+    pub(crate) fn push_keyword_receiver(&mut self, token: Token, is_super: bool) {
+        let item_head =
+            self.initializer_depth > 0 && self.init_item_head == Some(token.range.offset);
+        if !item_head {
+            match self.keyword_receiver_state(is_super) {
+                ReceiverState::Invalid => {
+                    let code = if is_super {
+                        SemanticCode::SuperInInvalidContext
+                    } else {
+                        SemanticCode::InvalidReferenceToThis
+                    };
+                    self.emit(code, token.range, "", "");
+                }
+                // The extension/extension-type `super` faces live outside the
+                // code set; the extension instance `this` is legal.
+                ReceiverState::Skip | ReceiverState::Valid => {}
+            }
+        } else if !is_super {
+            // `this` as the bare initializer TARGET — `this = 0` parses its
+            // `this` as the field-initializer's head but no `.field` follows.
+            // Upstream `buildInitializer` (ast_builder.dart:634-756) folds
+            // `this = expr` as a `ConstructorFieldInitializer` whose target
+            // is a bare `ThisExpression` — the verifier reports
+            // `invalid_reference_to_this` at the keyword
+            // (element_resolver.dart:357-374's `isThisAccessible` is true,
+            // so the `invalidReferenceToThis` fallthrough reports), and the
+            // empty field name then walks `initializer_for_non_existent_field`
+            // at `''`. Peek past the keyword: `= ` ends the target, `.`
+            // opens a selector, `(` opens a redirect invocation — only the
+            // bare `=` shape is the misfire.
+            let next = self.skip_whitespace(token.range.end());
+            if self.byte_at(next) == Some(b'=') {
+                self.emit(
+                    SemanticCode::InvalidReferenceToThis,
+                    token.range,
+                    "",
+                    "",
+                );
+                // The empty-name field-initializer face — oracle's
+                // `_checkForInvalidField` walks `''` against the field set,
+                // misses, and reports `initializer_for_non_existent_field`
+                // at the same span.
+                self.emit(
+                    SemanticCode::InitializerForNonExistentField,
+                    token.range,
+                    "",
+                    "",
+                );
+            }
+        }
+        let recv = match self.container_context() {
+            Some((container, kind)) => {
+                if is_super {
+                    Receiver::Super { container, kind }
+                } else {
+                    // The query face's `this` publication (#1869-2): the
+                    // reference row binds the keyword to the enclosing
+                    // container and the read-type row answers `type_of`
+                    // with its type ([`Self::this_static_ty`] — the same
+                    // answer the null-aware receiver classification
+                    // reads). Both rows join their outlets' offset sorts,
+                    // so the publication is order-free.
+                    self.refs.push(UnitRef {
+                        range: token.range,
+                        name: self.intern("this"),
+                        target: RefTarget::This,
+                    });
+                    // The extension face publishes the `on` type (an
+                    // `extension E on B?` makes `this : B?`) — the same
+                    // answer the null-aware receiver classification reads.
+                    let this_ty = self.this_static_ty(container, kind);
+                    self.query_type_rows.push((token.range, this_ty));
+                    Receiver::This { container, kind }
+                }
+            }
+            None => Receiver::Unknown,
+        };
+        self.push_row(Row {
+            name: self.intern(""),
+            range: token.range,
+            qualified: false,
+            shape: RowShape::Receiver(recv),
+            intent: Intent::Read,
+            write_op: None,
+            ty: Ty::UNKNOWN,
+        });
+    }
+
+    /// A type-annotation position. Defined types push no row; the names
+    /// table carries misses only. The declaration binding arms at
+    /// `handle_type` now — this only classifies the reference.
+    pub(crate) fn push_type_use(&mut self, name: StringId, range: SourceRange, head: TypeHead) {
+        // The query face's publication (#1056): every bare type-reference
+        // position ships `(span, name)` — a creation head's container
+        // resolution keys on it.
+        self.type_uses.push((range, name));
+        let suppressed = self.non_type_pos > 0;
+        match head {
+            TypeHead::Bare => {
+                if self.members.builtin_types.contains(&name) {
+                    return;
+                }
+                // #1595/#1596: the plain resolver path's three answers
+                // (named_type_resolver.dart:190-330 + reportNullOrNonTypeElement
+                // :730-810). A creation head never reaches the plain path —
+                // the constructor-reference dispatch answers it (a resolving
+                // non-type head is `creation_with_non_type`, a miss
+                // `undefined_class` via the context rows below) — and a
+                // redirecting-factory target keeps its dedicated silent
+                // verdict.
+                if self.redirect_target_depth == 0 {
+                    match self.type_resolution(name) {
+                        (TypeResolution::NonType, anchor) if self.ctor_pos == 0 => {
+                            // A resolving name credits its import in every
+                            // position — `ImportsTracking` counts the scope
+                            // lookup itself (`is`/`as` operand, self-scope
+                            // reference), while `used_names` keeps the
+                            // `unused_element` face's narrower exclusions.
+                            self.import_used.insert(name);
+                            // The use-count face rides the same guards as a
+                            // defined type (`_useIdentifierElement` — inside
+                            // an `is` operand and self-references excepted).
+                            if self.is_type_pos == 0 && !self.in_own_named_scope(name) {
+                                self.used_names.insert(name);
+                            }
+                            // A type-argument position replaces the plain
+                            // face (`non_type_as_type_argument`, the same
+                            // context chain the miss rows ride).
+                            if self.type_arg_depth > 0 {
+                                self.type_arg_miss_rows.push(range.offset);
+                            }
+                            // The plain face's declaration anchor rides the
+                            // row for the resolve pass's context row.
+                            if let Some(anchor) = anchor {
+                                self.non_type_anchors.push((range.offset, anchor));
+                            }
+                            self.push_row(Row {
+                                name,
+                                range,
+                                qualified: false,
+                                shape: RowShape::TypeUse(TypeVerdict::NonType, suppressed),
+                                intent: Intent::Read,
+                                write_op: None,
+                                ty: Ty::UNKNOWN,
+                            });
+                            return;
+                        }
+                        (TypeResolution::Type, _) => {
+                            // The import credit is unconditional (see the
+                            // NonType arm): the scope lookup succeeded, so
+                            // the providing import is used.
+                            self.import_used.insert(name);
+                            // A defined type reference uses the type (the
+                            // official `visitNamedType` →
+                            // `_useIdentifierElement` face) — except inside
+                            // an `is` type operand, where the oracle
+                            // deliberately does not count it
+                            // (`_useIdentifierElement`'s
+                            // `_insideIsExpression` early return), and
+                            // except a self-reference from inside the
+                            // declaration itself (`_enclosingClass` /
+                            // `_enclosingExec`). A creation head resolves
+                            // through the same lookup — a defined class is
+                            // silent here (the constructor-reference
+                            // dispatch owns its remaining faces).
+                            if self.is_type_pos == 0 && !self.in_own_named_scope(name) {
+                                self.used_names.insert(name);
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                // #1314 FAM13: the resolver's context chain decides the
+                // miss's code — a type-argument reference reports
+                // `non_type_as_type_argument`, a creation head
+                // `creation_with_non_type`, everything else keeps
+                // `undefined_class` (named_type_resolver.dart:720-770; the
+                // offset joins the face's row for the resolve pass).
+                // A redirecting-factory target rides the dedicated silent
+                // verdict ALONE — the oracle's `redirect_to_non_class` face
+                // sits outside the frozen gate, and the plain-path `Missing`
+                // row would score `undefined_class` beside it (the
+                // resolver's plain path never runs: the constructor-reference
+                // dispatch answers the target head).
+                if self.redirect_target_depth > 0 {
+                    self.push_row(Row {
+                        name,
+                        range,
+                        qualified: false,
+                        shape: RowShape::TypeUse(TypeVerdict::RedirectTarget, suppressed),
+                        intent: Intent::Read,
+                        write_op: None,
+                        ty: Ty::UNKNOWN,
+                    });
+                } else {
+                    // A type-argument position codes through the context
+                    // chain whatever its head resolved to: the oracle walks
+                    // an unresolvable NamedType's arguments too (probed:
+                    // `W<L>` reports `undefined_class` on `W` AND
+                    // `non_type_as_type_argument` on `L`, in declarations,
+                    // creations, and typedefs alike).
+                    if self.type_arg_depth > 0 {
+                        self.type_arg_miss_rows.push(range.offset);
+                    } else if self.ctor_pos > 0 && self.type_arg_depth == 0 {
+                        let explicit = self.implicit_creation_depth == 0;
+                        self.creation_miss_rows.push((range.offset, explicit));
+                    }
+                    self.push_row(Row {
+                        name,
+                        range,
+                        qualified: false,
+                        shape: RowShape::TypeUse(TypeVerdict::Missing, suppressed),
+                        intent: Intent::Read,
+                        write_op: None,
+                        ty: Ty::UNKNOWN,
+                    });
+                }
+            }
+            TypeHead::Continuation => {
+                let Some(tp) = self.type_prefix.as_ref() else {
+                    return;
+                };
+                if !tp.live {
+                    return; // the head already reports; the name is dead
+                }
+                let prefix = tp.prefix;
+                let hit = self.prefixed_hit(prefix, name);
+                if !hit {
+                    // The local-prefix face snapshots here: a head naming a
+                    // local or parameter element is not an import prefix, and
+                    // the frame stack answering that question exists only at
+                    // push time.
+                    let local = self.frames.iter().rev().any(|f| f.locals.contains(&prefix));
+                    self.push_row(Row {
+                        name,
+                        range,
+                        qualified: true,
+                        shape: RowShape::TypeUse(TypeVerdict::Prefixed { prefix, local }, false),
+                        intent: Intent::Read,
+                        write_op: None,
+                        ty: Ty::UNKNOWN,
+                    });
+                } else {
+                    // The prefixed type resolved: the prefix scope lookup
+                    // credits the import (`ImportsTracking` — the `is`
+                    // exclusion is the used-elements visitor's, not the
+                    // tracker's).
+                    self.import_used.insert(name);
+                    if self.is_type_pos == 0 && !self.in_own_named_scope(name) {
+                        self.used_names.insert(name);
+                    }
+                }
+            }
+        }
+    }
+
+
+    /// The type-position lookup's full answer for a bare type head — the
+    /// official chain (`named_type_resolver.dart:129-131` `_lookupGetter
+    /// (nameScope, …)` over the member's scope), keeping the element kind
+    /// (`_lookupGetter` + `_instantiateElement`'s non-interface fall,
+    /// named_type_resolver.dart:197-330, and the
+    /// `reportNullOrNonTypeElement` tail :780-806): a resolving non-type
+    /// element reports `not_a_type` unless it is a local variable or local
+    /// function (the `referenced_before_declaration` face, outside this
+    /// engine), a multiply-defined element stays silent
+    /// (`InvalidType` with no report), and a miss keeps the existing
+    /// `undefined_class` machinery. The container step is the face the
+    /// expression lookup lacks: `InstanceScope.lookup`
+    /// (scope.dart:355-372) — an instance member with the basename yields
+    /// NOTHING, so the enclosing scopes (the library and its imports) are
+    /// never consulted and the reference reports `undefined_class` even when
+    /// a top-level type of the same name exists; a static member returns
+    /// itself (the resolver's `notAType` face — defined here, no row).
+    /// Unlike [`Engine::resolve_bare`] — the expression face — a container
+    /// member is never a satisfying type answer, so a recovery-created
+    /// field named `augment` leaves every `augment` annotation undefined
+    /// (#1445: the gated-off augmentation fixtures). The answer pairs the
+    /// resolution with the `not_a_type` context anchor — the resolved
+    /// element's declaration (file, name span) when the face fires and the
+    /// span is carried; `None` keeps the plain row.
+    pub(crate) fn type_resolution(&self, name: StringId) -> (TypeResolution, Option<(FileId, SourceRange)>) {
+        if self.type_params.contains(&name)
+            || self.pending_type_params.contains(&name)
+            || self
+                .fn_type_capture
+                .iter()
+                .any(|capture| capture.scope.contains(&name))
+        {
+            return (TypeResolution::Type, None);
+        }
+        // A formal parameter in type position reports (`FormalParameterElement`
+        // is not a local variable — the golden face `x isn't a type` on the
+        // method's own parameter); a local variable or catch parameter
+        // routes to the referenced-before face and stays silent.
+        if let Some(index) = self.resolve_local(name) {
+            let decl = &self.locals[index as usize];
+            return match decl.kind {
+                LocalKind::Parameter { .. } => {
+                    (TypeResolution::NonType, Some((self.file, decl.range)))
+                }
+                _ => (TypeResolution::Type, None),
+            };
+        }
+        if let Some((container, _)) = self.container_context()
+            && let Some(entry) = self
+                .index
+                .get(self.file)
+                .and_then(|f| f.container(container))
+                .and_then(|c| c.members.get(&name))
+        {
+            return if entry.is_static {
+                // The static member's own site: the declaration capture
+                // keeps the member's name span (the context row's anchor).
+                (
+                    TypeResolution::NonType,
+                    self.decl_sites
+                        .iter()
+                        .find(|site| {
+                            site.name == name
+                                && match &site.kind {
+                                    DeclKind::Member {
+                                        container: owner, ..
+                                    } => *owner == container,
+                                    _ => false,
+                                }
+                        })
+                        .map(|site| (self.file, site.range)),
+                )
+            } else {
+                (TypeResolution::Missing, None)
+            };
+        }
+        // The getter namespace answers before the type table
+        // (`_lookupGetter(nameScope, …)` runs first): an extension's name
+        // lives there as a sole entry — class/mixin/typedef declarations
+        // sharing the name sit in the type namespace only (the corpus's
+        // `class Function {}` + `extension Function on List {}` shape) — so
+        // a type position resolving to an extension's name finds a
+        // non-type element and reports `not_a_type`. Every closer scope
+        // (type parameters, locals, the container's own members) already
+        // answered above; the built-in type names sit behind it (they are
+        // the no-declaration fallback).
+        if self
+            .index
+            .get(self.file)
+            .is_some_and(|f| f.extension_faces.iter().any(|face| face.name == Some(name)))
+        {
+            return (TypeResolution::NonType, None);
+        }
+        if self.members.builtin_types.contains(&name) {
+            return (TypeResolution::Type, None);
+        }
+        match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::NotFound => (TypeResolution::Missing, None),
+            ScopedHit::Local(decl) => self.scoped_resolution(name, self.file, decl.kind),
+            ScopedHit::Found(NamespaceEntry::Decl(file)) => {
+                match self.index.get(file).and_then(|f| f.decl(name)) {
+                    Some(decl) => self.scoped_resolution(name, file, decl.kind),
+                    None => (TypeResolution::Type, None),
+                }
+            }
+            // A bare import prefix in type position resolves to the prefix
+            // element — a non-type (`PrefixElement` falls through the
+            // resolver's interface/alias checks to `not_a_type`). The
+            // prefix's declaration span is not captured (the import site
+            // keeps the URI span) — the plain row.
+            ScopedHit::Found(NamespaceEntry::Prefix) => (TypeResolution::NonType, None),
+            // MultiplyDefinedElement → `InvalidType` with no report.
+            ScopedHit::Ambiguous(_) => (TypeResolution::Type, None),
+        }
+    }
+
+    /// The scoped top-level answer with its `not_a_type` anchor: the
+    /// declaration capture supplies the kept declaration's name span only
+    /// for this file's own top-level functions and variables — a
+    /// cross-file element's span is not carried, and that face degrades to
+    /// the plain row (the under-attach direction).
+    pub(crate) fn scoped_resolution(
+        &self,
+        name: StringId,
+        file: FileId,
+        kind: MicroKind,
+    ) -> (TypeResolution, Option<(FileId, SourceRange)>) {
+        let resolution = type_resolution_of(kind);
+        let anchor = (resolution == TypeResolution::NonType && file == self.file)
+            .then(|| {
+                self.decl_sites
+                    .iter()
+                    .find(|site| {
+                        site.name == name
+                            && matches!(site.kind, DeclKind::TopLevelFn | DeclKind::TopLevelVar)
+                    })
+                    .map(|site| (self.file, site.range))
+            })
+            .flatten();
+        (resolution, anchor)
+    }
+
+    /// Arms the type-prefix slot for a `PrefixedTypeReference` head; a miss
+    /// also pushes the head's own report row. A live prefix head counts as
+    /// a prefix use (the `unused_import` prefix face).
+    pub(crate) fn arm_type_prefix(&mut self, name: StringId, range: SourceRange) {
+        let (info, target) = self.resolve_bare(name);
+        // The importPrefix gate's fall-through: a head naming a local scope
+        // element (local, parameter, in-scope type parameter) is not an
+        // import prefix — the oracle reports `prefixShadowedByLocalDeclaration
+        // ` at the prefix token and marks the NamedType invalid (upstream
+        // Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
+        // named_type_resolver.dart:86-120 — the scope lookup's non-prefix,
+        // non-class answer). Such a use never counts as a use of the
+        // shadowing element (the oracle's `var p = 1; p.T q;` still
+        // reports `p` unused).
+        let shadowed = matches!(target, RefTarget::Local | RefTarget::TypeParam);
+        let live = !matches!(info, BareInfo::Missing { .. }) && !shadowed;
+        if live {
+            self.used_names.insert(name);
+        }
+        self.type_prefix = Some(TypePrefix { prefix: name, live });
+        if !live {
+            if shadowed {
+                let name_text = self.strings.resolve(name).to_string();
+                self.emit(
+                    SemanticCode::PrefixShadowedByLocalDeclaration,
+                    range,
+                    &name_text,
+                    "",
+                );
+            } else {
+                self.push_row(Row {
+                    name,
+                    range,
+                    qualified: false,
+                    shape: RowShape::TypeUse(TypeVerdict::PrefixHead, false),
+                    intent: Intent::Read,
+                    write_op: None,
+                    ty: Ty::UNKNOWN,
+                });
+            }
+        }
+    }
+
+    /// Rewrites a qualified creation head's miss (`prefix.C` of `new
+    /// prefix.C.new()`): a three-segment reference resolves its head as a
+    /// prefixed NamedType — the official importPrefix face reports
+    /// `undefined_identifier` over the written `prefix.C` span, never the
+    /// creation-head type-miss a bare head carries (`new Missing()` keeps
+    /// `creation_with_non_type`). The head row converts in place and the
+    /// creation-head context entry it armed is consumed (a dead prefix
+    /// never asks the type-miss question).
+    pub(crate) fn requalify_creation_head(&mut self, start: Token, period: Token) {
+        let end = period.range.offset;
+        self.requalify_creation_head_to(start, end);
+    }
+
+    /// [`Engine::requalify_creation_head`] with a written span end — the
+    /// two-segment qualified reference (`Missing.new`) spans through the
+    /// selector's name, its `.new` having ridden the qualified rest.
+    pub(crate) fn requalify_creation_head_to(&mut self, start: Token, end: u32) {
+        let offset = start.range.offset;
+        let Some(index) = self.rows.iter().rposition(|row| {
+            row.range.offset == offset && matches!(row.shape, RowShape::TypeUse(..))
+        }) else {
+            return;
+        };
+        let row = &mut self.rows[index];
+        if let RowShape::TypeUse(TypeVerdict::Missing, suppressed) = row.shape {
+            row.range.length = end.saturating_sub(offset);
+            row.shape = RowShape::TypeUse(TypeVerdict::PrefixHead, suppressed);
+            if let Ok(entry) = self
+                .creation_miss_rows
+                .binary_search_by_key(&offset, |entry| entry.0)
+            {
+                self.creation_miss_rows.remove(entry);
+            }
+        }
+    }
+}
