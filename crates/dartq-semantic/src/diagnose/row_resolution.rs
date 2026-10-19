@@ -458,9 +458,15 @@ impl<'a> Engine<'a> {
                         // `undefined_function`.
                         if let Some(container) = this_type {
                             let type_text = self.strings.resolve(container).to_string();
+                            // `_reportUndefinedMethodOrNew` is guard-free in
+                            // the observed oracle (analyzer 8.1.1
+                            // method_invocation_resolver.dart:424-431): a
+                            // `show`-listed name of a broken import does NOT
+                            // suppress `undefined_method` — only
+                            // `undefined_function`/`undefined_identifier`
+                            // consult `shouldIgnoreUndefined`.
                             if !Self::synthetic_reference(row.range)
                                 && !self.keyword_bare_reference(row.range)
-                                && !self.guard.ignore(None, row.name)
                             {
                                 self.emit(
                                     SemanticCode::UndefinedMethod,
@@ -479,10 +485,13 @@ impl<'a> Engine<'a> {
                     }
                     Intent::Read if row.name == self.intern("await") && in_exec => {
                         // `await` in a sync body is never a lookup miss: the
-                        // frozen code names the missing async marker.
-                        if !self.guard.ignore(None, row.name) {
-                            self.emit(SemanticCode::UndefinedIdentifierAwait, row.range, "", "");
-                        }
+                        // frozen code names the missing async marker. The
+                        // oracle's arm fires before the guard is consulted
+                        // (simple_identifier_resolver.dart 8.1.1:217-221 —
+                        // `undefined_identifier_await` reports unconditionally,
+                        // the `shouldIgnoreUndefinedIdentifier` check rides
+                        // the `else if` below it).
+                        self.emit(SemanticCode::UndefinedIdentifierAwait, row.range, "", "");
                         self.record_miss(row.name, row.range, false, NameUse::Read);
                     }
                     Intent::Read | Intent::Write | Intent::ReadWrite => {
@@ -972,9 +981,12 @@ impl<'a> Engine<'a> {
                         Intent::Write | Intent::ReadWrite => SemanticCode::UndefinedSetter,
                         _ => SemanticCode::UndefinedGetter,
                     };
-                    if !self.guard.ignore(None, row.name) {
-                        self.emit(code, row.range, name_text, "InvalidType");
-                    }
+                    // The member family on an invalid receiver is
+                    // guard-free like every member face (the oracle's
+                    // `_isIgnored` consults `shouldIgnoreUndefined` only on
+                    // the unqualified/prefixed *name* domains — an
+                    // instance-member miss never reaches it).
+                    self.emit(code, row.range, name_text, "InvalidType");
                     self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                     return;
                 }
@@ -2331,5 +2343,203 @@ impl<'a> Engine<'a> {
             container,
         )
         .map(|(c, _)| c.kind)
+    }
+}
+
+/// Pins for the `UndefinedGuard` face scoping (#2186 S1): the observed
+/// oracle (analyzer 8.1.1, the 3.13.1 SDK of record) consults
+/// `shouldIgnoreUndefined` only on the unqualified/prefixed *name* faces —
+/// `undefined_function` (`_reportUndefinedFunction`,
+/// method_invocation_resolver.dart:403) and `undefined_identifier`
+/// (`shouldIgnoreUndefinedIdentifier`, simple_identifier_resolver.dart:222)
+/// plus the named-type family (`shouldIgnoreUndefinedNamedType`,
+/// named_type_resolver.dart:326) and `undefined_prefixed_name`
+/// (property_element_resolver.dart:891). The member faces — the
+/// `undefined_method`/`_getter`/`_setter` trio — never consult it
+/// (`_reportUndefinedMethodOrNew` is guard-free, same file :424-431), and
+/// `undefined_identifier_await` fires before the guard in its else-if
+/// chain (simple_identifier_resolver.dart:217-221).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collector::collect;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_resolution::{CombinatorClause, Combinators, LibraryGraphBuilder};
+    use dartq_scanner::ScanConfig;
+    use dartq_source::FileTable;
+    use std::path::Path;
+
+    /// Diagnoses `source` as the sole file of a library carrying one
+    /// broken import edge (`target: None`) built by `make_edge`.
+    fn report_with_edge(
+        source: &str,
+        make_edge: impl FnOnce(&StringTable) -> ImportEdge,
+    ) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        builder.import(lib, make_edge(&strings));
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let fold = fold_unit(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        let mut report = fold.report;
+        report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+        report
+    }
+
+    /// A broken import showing `name` (the S1 trigger shape).
+    fn broken_show(name: &'static str) -> impl FnOnce(&StringTable) -> ImportEdge {
+        move |strings| ImportEdge {
+            target: None,
+            prefix: None,
+            deferred: false,
+            combinators: Combinators::new(
+                [CombinatorClause::Show(
+                    vec![strings.intern(name)].into_boxed_slice(),
+                )],
+                strings,
+            ),
+        }
+    }
+
+    /// An unfiltered broken import (the guard's no-show arm never fires on
+    /// bare names — only the prefixed arm can).
+    fn broken_bare() -> impl FnOnce(&StringTable) -> ImportEdge {
+        |_| ImportEdge {
+            target: None,
+            prefix: None,
+            deferred: false,
+            combinators: Combinators::unfiltered(),
+        }
+    }
+
+    fn code_names(report: &FileReport) -> Vec<&'static str> {
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
+    }
+
+    /// S1 fixture (a): a `show`-listed name of a broken import invoked as a
+    /// constructor inside a class body is `undefined_method` — the oracle's
+    /// `_reportUndefinedMethodOrNew` consults no suppression, so the guard
+    /// must not silence it (the ~430 oracle-only rows' root cause).
+    #[test]
+    fn shown_name_invoked_in_class_reports_undefined_method() {
+        let report = report_with_edge(
+            "class C { void m() { Foo(); } }",
+            broken_show("Foo"),
+        );
+        assert_eq!(code_names(&report), ["undefined_method"]);
+        let row = &report.diagnostics[0];
+        assert_eq!(
+            &"class C { void m() { Foo(); } }"[row.range.offset as usize..row.range.end() as usize],
+            "Foo"
+        );
+    }
+
+    /// S1 fixture (b): the same `show`-listed name invoked at top level
+    /// stays silent — `undefined_function` is a guarded face
+    /// (`_reportUndefinedFunction` consults `shouldIgnoreUndefined`). The
+    /// miss still lands in the names table.
+    #[test]
+    fn shown_name_invoked_at_top_level_stays_suppressed() {
+        let report = report_with_edge("void f() { Foo(); }", broken_show("Foo"));
+        assert!(report.diagnostics.is_empty(), "{:?}", code_names(&report));
+        assert_eq!(report.names.len(), 1);
+        assert_eq!(report.names[0].use_kind, NameUse::Invoke);
+    }
+
+    /// The guarded read face keeps its suppression: a `show`-listed name
+    /// read as a bare identifier stays silent (`undefined_identifier`
+    /// consults `shouldIgnoreUndefinedIdentifier`).
+    #[test]
+    fn shown_name_bare_read_stays_suppressed() {
+        let report = report_with_edge("void f() { gone; }", broken_show("gone"));
+        assert!(report.diagnostics.is_empty(), "{:?}", code_names(&report));
+        assert_eq!(report.names.len(), 1);
+        assert_eq!(report.names[0].use_kind, NameUse::Read);
+    }
+
+    /// S1 fixture (c): an unfiltered broken import never suppresses a bare
+    /// miss — `undefined_method` reports for the in-class invocation, the
+    /// same verdict the show-listed shape now reaches.
+    #[test]
+    fn unfiltered_broken_import_invoke_in_class_reports() {
+        let report = report_with_edge(
+            "class C { void m() { Foo(); } }",
+            broken_bare(),
+        );
+        assert_eq!(code_names(&report), ["undefined_method"]);
+    }
+
+    /// S1 fixture (d): a `show`-listed name read in a const context (the
+    /// `const Foo.bar()`-class prefixed-ctor head shape) reports
+    /// `undefined_identifier` through the guarded read face — the guard
+    /// still applies, so this stays silent.
+    #[test]
+    fn shown_name_prefixed_ctor_head_stays_suppressed() {
+        let report = report_with_edge(
+            "const x = Foo.bar();",
+            broken_show("Foo"),
+        );
+        assert!(
+            !code_names(&report).contains(&"undefined_method"),
+            "{:?}",
+            code_names(&report)
+        );
+        // The `Foo` head of `Foo.bar` resolves through the guarded
+        // identifier face: show-listed on a broken import stays silent.
+        assert!(
+            !code_names(&report).contains(&"undefined_identifier"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The `.new` selector on an unresolved receiver: the member family on
+    /// `InvalidType` is guard-free like every member face — a `show`-listed
+    /// receiver name suppresses its own `undefined_identifier`, but the
+    /// `.new` member miss still reports.
+    #[test]
+    fn new_selector_on_shown_broken_receiver_reports() {
+        let report = report_with_edge("void f() { gone.new(); }", broken_show("gone"));
+        assert_eq!(code_names(&report), ["undefined_method"]);
     }
 }
