@@ -288,6 +288,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assignment codes, and assignment-target reports anchor on the LHS's
   beginToken (`const (q,) = g()` 3:12 → 3:3, binary-tail anchors fixed
   for free) (#2157).
+- Const-eval created states: unary `!`/`-`/`~` and boolean/conditional
+  folds read the created container's InstanceState family (null throws,
+  bool/int/num states fold to unknown constants, wrong families keep
+  the type faults); literals inside redirecting/super constructor
+  argument lists stop reporting non_constant_*_element; leading-dot
+  shorthands stay silent (#2215).
+
+### Performance
+
+- Discovery collapses the per-package-root serial walk+read phases into
+  one parallel fan-out plus one global 4096-file chunked load with the
+  sorted enqueue order and first-error position preserved; the library
+  surface merges reference listings in one sorted pass instead of
+  per-(name, library) memmoves; L3 blob writes fan out over rayon with
+  serial bookkeeping; the final oracle sort uses a stable parallel
+  sort; removed-lint-use rescans run per-file in parallel with an
+  ignore-free skip (#2209).
+- Memory: `DARTQ_RSS_DECOMPOSITION=1` dumps ~20 exact/estimated byte
+  families of the resident state, and the semdiag memo stores per-file
+  use faces as sorted boxed slices instead of three hash sets
+  (est. 30–60 MB at 100k files) (#2210).
+- The lint fan-out reuses the semantic context's token table for its
+  parse instead of re-lexing every semantic-lint file — one full scan
+  less per file, posture-pinned by a const assert (#2233).
 
 ## [1.0.0] - 2026-10-12
 
