@@ -404,9 +404,13 @@ impl State {
     /// interest (the declared type's non-null form or a previously tested
     /// type) when the written value matches. `declared_args` is the
     /// declared type's written-argument tree — the declared non-null
-    /// candidate's rows (#1010). `write_span` is the write expression's own
-    /// range — the `DemoteViaExplicitWrite.node` anchor (upstream passes
-    /// the assignment node, `assignment_expression_resolver.dart:324`);
+    /// candidate's rows (#1010); `written_args` the written type's (#2204
+    /// phase D — the demotion's coverage questions compare instantiated
+    /// spellings through the typed seam). `arena`/`names` are the
+    /// recorder's argument arena and interned-name lexeme table the typed
+    /// ops read. `write_span` is the write expression's own range — the
+    /// `DemoteViaExplicitWrite.node` anchor (upstream passes the
+    /// assignment node, `assignment_expression_resolver.dart:324`);
     /// `None` for writes that are not the official's real-write events
     /// (declaration initializers, the declared for-in head — upstream's
     /// `declare`/`_initialize` carry no demotion reason).
@@ -420,8 +424,11 @@ impl State {
         declared: Ty,
         declared_args: u32,
         written: Ty,
+        written_args: u32,
         promote_to_interest: bool,
         write_span: Option<dartq_source::SourceRange>,
+        arena: &[Vec<crate::ty::ArgTy>],
+        names: &[Box<str>],
     ) -> Self {
         let model = self.model(var);
         if model.captured() {
@@ -446,10 +453,16 @@ impl State {
         // largest k with `written <: promotedTypes[k-1]`; dartq chains store
         // the mirror order — most-specific first — so the kept prefix of the
         // official list is a suffix here). Rebuild the kept suffix in order.
+        // The coverage questions run over the instantiated spellings: a
+        // written `List<int>` keeps a `List<num>` promotion the bare
+        // name-equality would drop, and drops a `Map<..>` promotion through
+        // the resolved hierarchy where the name level guessed.
         let nodes: Vec<(Ty, u32)> = lists.iter_entries(model.promoted).collect();
         let keep_from = nodes
             .iter()
-            .position(|&(ty, _)| ops.is_subtype(written, ty))
+            .position(|&(ty, args)| {
+                ops.is_subtype_typed(written, written_args, ty, args, arena, names)
+            })
             .unwrap_or(nodes.len());
         let mut promoted = NIL;
         for (ty, args) in nodes[keep_from..].iter().rev() {
@@ -475,15 +488,20 @@ impl State {
         // The rebuilt chain id before type-of-interest re-promotion (see
         // the no-change early return below).
         let post_demote = promoted;
-        if promote_to_interest && !promoted_is(lists, promoted, written) {
+        if promote_to_interest
+            && !promoted_is(ops, lists, promoted, written, written_args, arena, names)
+        {
             // Types of interest: the declared type's non-null form, then the
             // tested types and their non-null forms (official
             // `_tryPromoteToTypeOfInterest`). The written type must be a
-            // proper subtype of the currently promoted type.
-            let current = if promoted == NIL {
-                declared
+            // proper subtype of the currently promoted type. Every coverage
+            // question compares the instantiated spellings — the written
+            // type's `written_args`, the current head's chain rows, each
+            // candidate's own rows.
+            let (current, current_args) = if promoted == NIL {
+                (declared, declared_args)
             } else {
-                lists.head(promoted)
+                (lists.head(promoted), lists.head_args(promoted))
             };
             let mut candidates: Vec<(Ty, u32)> = Vec::new();
             let declared_non_null = ops.promote_to_non_null(declared);
@@ -491,22 +509,41 @@ impl State {
                 consider(
                     ops,
                     written,
+                    written_args,
                     current,
+                    current_args,
                     declared_non_null,
                     declared_args,
+                    arena,
+                    names,
                     &mut candidates,
                 );
             }
             for (tested, args) in lists.iter_entries(model.tested) {
-                consider(ops, written, current, tested, args, &mut candidates);
+                consider(
+                    ops,
+                    written,
+                    written_args,
+                    current,
+                    current_args,
+                    tested,
+                    args,
+                    arena,
+                    names,
+                    &mut candidates,
+                );
                 let tested_non_null = ops.promote_to_non_null(tested);
                 if tested_non_null != tested {
                     consider(
                         ops,
                         written,
+                        written_args,
                         current,
+                        current_args,
                         tested_non_null,
                         args,
+                        arena,
+                        names,
                         &mut candidates,
                     );
                 }
@@ -521,9 +558,11 @@ impl State {
             // subtype of all the others wins.
             if let Some((_, args)) = candidates.iter().find(|(c, _)| *c == written) {
                 let args = *args;
-                promoted = add_promoted(ops, lists, promoted, written, args);
-            } else if let Some((promoted_to, args)) = unique_subtype(ops, &candidates) {
-                promoted = add_promoted(ops, lists, promoted, promoted_to, args);
+                promoted = add_promoted(ops, lists, promoted, written, args, arena, names);
+            } else if let Some((promoted_to, args)) =
+                unique_subtype(ops, &candidates, arena, names)
+            {
+                promoted = add_promoted(ops, lists, promoted, promoted_to, args, arena, names);
             }
         }
         // A write that changed nothing (no demotion, no re-promotion) on an
@@ -554,7 +593,9 @@ impl State {
     /// `tested` (official `_finishTypeTest`). Each optional side is a
     /// `(type, written-argument tree)` pair (#1010): the tested side joins
     /// the types-of-interest chain, the promoted side the promotion chain,
-    /// both with their rows.
+    /// both with their rows. `arena`/`names` are the recorder's argument
+    /// arena and interned-name lexeme table the typed seam reads (#2204
+    /// phase D).
     pub(crate) fn finish_type_test(
         self,
         ops: &dyn TypeOps,
@@ -562,6 +603,8 @@ impl State {
         var: u32,
         tested: Option<(Ty, u32)>,
         promoted: Option<(Ty, u32)>,
+        arena: &[Vec<crate::ty::ArgTy>],
+        names: &[Box<str>],
     ) -> Self {
         let model = self.model(var);
         let mut new_tested = model.tested;
@@ -572,7 +615,8 @@ impl State {
         }
         let mut new_promoted = model.promoted;
         if let Some((promoted, args)) = promoted {
-            new_promoted = add_promoted(ops, lists, model.promoted, promoted, args);
+            new_promoted =
+                add_promoted(ops, lists, model.promoted, promoted, args, arena, names);
         }
         self.with_model(
             var,
@@ -599,12 +643,22 @@ impl State {
         lists: &mut Lists,
         slot: u32,
         marker: Ty,
+        arena: &[Vec<crate::ty::ArgTy>],
+        names: &[Box<str>],
     ) -> Self {
         let model = self.prop(slot);
         if model.captured() {
             return self;
         }
-        let promoted = add_promoted(ops, lists, model.promoted, marker, crate::ty::EMPTY_ARGS);
+        let promoted = add_promoted(
+            ops,
+            lists,
+            model.promoted,
+            marker,
+            crate::ty::EMPTY_ARGS,
+            arena,
+            names,
+        );
         if promoted == model.promoted {
             return self;
         }
@@ -891,49 +945,105 @@ fn append_tested(lists: &mut Lists, chain: u32, ty: Ty, args: u32) -> u32 {
     rebuilt
 }
 
-fn add_promoted(ops: &dyn TypeOps, lists: &mut Lists, chain: u32, ty: Ty, args: u32) -> u32 {
+fn add_promoted(
+    ops: &dyn TypeOps,
+    lists: &mut Lists,
+    chain: u32,
+    ty: Ty,
+    args: u32,
+    arena: &[Vec<crate::ty::ArgTy>],
+    names: &[Box<str>],
+) -> u32 {
     // The official invariant: each promoted type is a strict subtype of the
     // previous; a repeated or mutual promotion is rejected by
-    // `isValidPromotionStep` before this call.
-    if promoted_is(lists, chain, ty) {
+    // `isValidPromotionStep` before this call. The comparisons run over the
+    // instantiated spellings (#2204 phase D) — a `List<int>` chain head and
+    // a `List<num>` candidate are no longer name-equal, so the
+    // strict-subtype gate is the hierarchy's verdict, not a spelling
+    // coincidence.
+    if promoted_is(ops, lists, chain, ty, args, arena, names) {
         return chain;
     }
-    if chain != NIL && ops.is_subtype(lists.head(chain), ty) {
+    if chain != NIL
+        && ops.is_subtype_typed(
+            lists.head(chain),
+            lists.head_args(chain),
+            ty,
+            args,
+            arena,
+            names,
+        )
+    {
         // New type is a supertype of the current head — not a refinement.
         return chain;
     }
     lists.cons(ty, args, chain)
 }
 
-fn promoted_is(lists: &Lists, chain: u32, ty: Ty) -> bool {
-    lists.iter(chain).any(|t| t == ty)
+/// The same-type dedup of the promotion chain (official `isSameType` —
+/// mutual subtyping over the instantiated spellings): `x is int` then
+/// `x is int` again stands down, while a `List<int>` head and a
+/// `List<num>` candidate stay distinct — the name-level `t == ty` read
+/// them as separate spellings too, but could not see that
+/// `Response<dynamic>` and `Response<T>` are *not* the same type.
+fn promoted_is(
+    ops: &dyn TypeOps,
+    lists: &Lists,
+    chain: u32,
+    ty: Ty,
+    args: u32,
+    arena: &[Vec<crate::ty::ArgTy>],
+    names: &[Box<str>],
+) -> bool {
+    lists.iter_entries(chain).any(|(t, t_args)| {
+        ops.is_subtype_typed(t, t_args, ty, args, arena, names)
+            && ops.is_subtype_typed(ty, args, t, t_args, arena, names)
+    })
 }
 
+#[expect(clippy::too_many_arguments)] // one slot per operand spelling of the official gate
 fn consider(
     ops: &dyn TypeOps,
     written: Ty,
+    written_args: u32,
     current: Ty,
+    current_args: u32,
     candidate: Ty,
     args: u32,
+    arena: &[Vec<crate::ty::ArgTy>],
+    names: &[Box<str>],
     out: &mut Vec<(Ty, u32)>,
 ) {
-    if ops.is_subtype(written, candidate)
-        && ops.is_subtype(candidate, current)
-        && candidate != current
-        && !ops.is_subtype(current, candidate)
+    // Official `_tryPromoteToTypeOfInterest`'s per-candidate gate
+    // (flow_analysis.dart:4958-4999): the written value must satisfy the
+    // candidate, the candidate must be a STRICT subtype of the current
+    // type (`isValidPromotionStep` — `candidate <: current` and not the
+    // reverse), and the candidate must not already be in the running.
+    // Every subtype question compares the instantiated spellings.
+    if ops.is_subtype_typed(written, written_args, candidate, args, arena, names)
+        && ops.is_subtype_typed(candidate, args, current, current_args, arena, names)
+        && !ops.is_subtype_typed(current, current_args, candidate, args, arena, names)
         && !out.iter().any(|&(existing, _)| existing == candidate)
     {
         out.push((candidate, args));
     }
 }
 
-fn unique_subtype(ops: &dyn TypeOps, candidates: &[(Ty, u32)]) -> Option<(Ty, u32)> {
+fn unique_subtype(
+    ops: &dyn TypeOps,
+    candidates: &[(Ty, u32)],
+    arena: &[Vec<crate::ty::ArgTy>],
+    names: &[Box<str>],
+) -> Option<(Ty, u32)> {
     let mut found: Option<(Ty, u32)> = None;
     for &(candidate, args) in candidates {
-        if candidates
-            .iter()
-            .all(|&(other, _)| other == candidate || ops.is_subtype(candidate, other))
-        {
+        // "Subtype of every candidate, itself included" — the typed seam's
+        // reflexivity makes the self-pair trivially true, so no identity
+        // shortcut is needed; two same-name candidates with different
+        // written arguments still compare their trees.
+        if candidates.iter().all(|&(other, other_args)| {
+            ops.is_subtype_typed(candidate, args, other, other_args, arena, names)
+        }) {
             if found.is_some() {
                 return None; // not unique
             }

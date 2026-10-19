@@ -65,6 +65,7 @@ use dartq_types::{
     instantiate_type_formals_to_bounds,
 };
 
+use crate::bounds::TypeTree;
 use crate::library::ElementIndex;
 use crate::model::{ContainerKind, MicroKind};
 
@@ -143,7 +144,84 @@ pub struct LibraryTypes {
     type_params: FxHashMap<StringId, TypeParamId>,
 }
 
+/// One container's parse-time supertype capture: the type-parameter
+/// spellings in declaration order (the scope the clause trees resolve
+/// their parameter arguments through) and the written supertype trees
+/// (`extends`/`with`/`implements`, in clause order — the `on` constraints
+/// of a mixin are constraints, not edges, and ride the name-level arm).
+/// The capture's `open` bit never reaches here: an unfaithful capture
+/// contributes no entry at all, so [`LibraryTypes`] keeps the name-level
+/// edge set — the under-report direction.
+pub(crate) struct ClauseCapture {
+    /// The container's own type-parameter spellings, declaration order.
+    pub(crate) params: Box<[StringId]>,
+    /// The written supertype trees (extends/with/implements), clause order.
+    pub(crate) supers: Vec<TypeTree>,
+}
+
+/// The real supertype-clause trees of the residency, keyed by declaring
+/// file and container name — the argument-bearing faces the element
+/// model's `Container` strips to names. Fed from the parse-time
+/// `crate::bounds` capture once the engine threads it through (the engine
+/// one-liner lands beside `semdiag::build_index`; until then
+/// [`ClauseTrees::empty`] keeps the instantiate-to-bounds edges). Opaque
+/// to the engine: the tree type stays crate-internal, so the transport
+/// is construction-by-the-semantic-side only.
+#[derive(Default)]
+pub struct ClauseTrees {
+    /// `(declaring file, container name)` → the captured clause facts.
+    pub(crate) trees: FxHashMap<(FileId, StringId), ClauseCapture>,
+}
+
+impl ClauseTrees {
+    /// An empty face: every container's edges instantiate to bounds, the
+    /// pre-Phase-D behavior.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Records one container's captured clause facts. Insertion is
+    /// first-wins on a shared `(file, name)` key — the duplicate-name
+    /// discipline `BoundsIndex`'s own capture keeps. Currently no
+    /// producer calls it — the engine-side wiring lands beside
+    /// `semdiag::build_index` (Phase D's engine one-liner).
+    #[allow(dead_code)] // the transport face; consumed once the engine threads captures through
+    pub(crate) fn insert(
+        &mut self,
+        file: FileId,
+        name: StringId,
+        capture: ClauseCapture,
+    ) {
+        self.trees.entry((file, name)).or_insert(capture);
+    }
+
+    /// The captured clause facts of one declaring file's container.
+    pub(crate) fn get(&self, file: FileId, name: StringId) -> Option<&ClauseCapture> {
+        self.trees.get(&(file, name))
+    }
+}
+
 impl LibraryTypes {
+    /// [`LibraryTypes::build`] over the name-level clause names only —
+    /// the pre-Phase-D face. Equivalent to [`Self::build_with_clauses`]
+    /// over an empty [`ClauseTrees`].
+    pub fn build(
+        graph: &LibraryGraph,
+        namespaces: &Namespaces,
+        index: &ElementIndex,
+        strings: &StringTable,
+        lib: LibraryId,
+    ) -> Self {
+        Self::build_with_clauses(
+            graph,
+            namespaces,
+            index,
+            strings,
+            lib,
+            &ClauseTrees::empty(),
+        )
+    }
+
     /// Builds the snapshot for one library. `index` is the analyze-wide
     /// element index (`build_index`'s product); `graph`/`namespaces` the
     /// resolution pair the unit's own resolves run on. The registered
@@ -151,12 +229,18 @@ impl LibraryTypes {
     /// namespace can resolve a name to (import edges' targets' export
     /// scopes, transitively through re-exports), keyed on the shared
     /// `StringTable` so the adapter's lookups cost one hash probe.
-    pub fn build(
+    /// `clauses`, when populated, carries the real written supertype
+    /// trees — `class A extends S<int>` edges as `A → S<int>` rather
+    /// than the to-bounds `A → S<dynamic>` the name-level arm produces.
+    /// A container absent from `clauses` keeps the name-level edges
+    /// (the open direction: missing edges only ever under-report).
+    pub fn build_with_clauses(
         graph: &LibraryGraph,
         namespaces: &Namespaces,
         index: &ElementIndex,
         strings: &StringTable,
         lib: LibraryId,
+        clauses: &ClauseTrees,
     ) -> Self {
         let table = TypeTable::new();
         let object = TypeDeclId::from_raw(OBJECT_RAW);
@@ -335,6 +419,55 @@ impl LibraryTypes {
             let Some(container) = elements.container(name) else {
                 continue;
             };
+            // The real clause trees when the capture reaches this build —
+            // `class A extends S<int>` maps the written `S<int>` against
+            // `A`'s own parameter scope, replacing the to-bounds
+            // `S<dynamic>` the name-level arm produces. A container with
+            // no capture keeps the clause-name fallback verbatim; a
+            // capture that fails to map contributes no edge (the open
+            // direction — a dropped edge only ever under-reports).
+            if let Some(capture) = clauses.get(file, name) {
+                let params = decl_params.get(&decl).map_or(&[][..], Vec::as_slice);
+                let scope: FxHashMap<StringId, TypeParamId> = capture
+                    .params
+                    .iter()
+                    .copied()
+                    .zip(params.iter().copied())
+                    .collect();
+                for tree in &capture.supers {
+                    if let Some(ty) =
+                        clause_tree_ty(&table, &registry, &decl_params, &facts, &scope, tree)
+                        && matches!(
+                            table.get(ty).kind(),
+                            TypeKind::Interface { .. }
+                        )
+                    {
+                        builder = builder.supertype(decl, ty);
+                    }
+                }
+                // A mixin's `on` constraints still join at name level —
+                // the capture's `On` trees are discarded upstream of
+                // `ClauseCapture::supers`, exactly like today's clause-name
+                // arm keeps them.
+                if container.kind == ContainerKind::Mixin {
+                    for &target_name in &container.on_clause {
+                        if let Some(ty) = clause_head_instantiation(
+                            &table,
+                            &registry,
+                            &decl_params,
+                            &facts,
+                            namespaces,
+                            graph,
+                            index,
+                            owner,
+                            target_name,
+                        ) {
+                            builder = builder.supertype(decl, ty);
+                        }
+                    }
+                }
+                continue;
+            }
             let clause_names = container
                 .superclass
                 .iter()
@@ -348,21 +481,17 @@ impl LibraryTypes {
                 )
                 .copied();
             for target_name in clause_names {
-                let target_decl = registry.get(&target_name).copied().or_else(|| {
-                    match namespaces.lookup(graph, owner, target_name) {
-                        Lookup::Found(NamespaceEntry::Decl(owner_file)) => index
-                            .get(owner_file)
-                            .and_then(|els| els.container(target_name))
-                            .and_then(|_| registry.get(&target_name).copied()),
-                        _ => None,
-                    }
-                });
-                let Some(target_decl) = target_decl else {
-                    continue;
-                };
-                if let Some(ty) =
-                    instantiate_to_bounds(&table, &facts, &decl_params, target_decl)
-                {
+                if let Some(ty) = clause_head_instantiation(
+                    &table,
+                    &registry,
+                    &decl_params,
+                    &facts,
+                    namespaces,
+                    graph,
+                    index,
+                    owner,
+                    target_name,
+                ) {
                     builder = builder.supertype(decl, ty);
                 }
             }
@@ -575,6 +704,137 @@ fn builtin_super(
         }
     };
     Some(table.intern(UninternedType::Interface { decl, args }, false))
+}
+
+/// The name-level edge of a `superclass`/`with`/`implements`/`on` clause:
+/// the head resolves through the registry, then the owner library's own
+/// scope chain (an imported container's `extends` resolves in its own
+/// scope — the discipline `resolve_container` climbs with); a resolved
+/// head instantiates to bounds. `None` on an unresolvable name — the
+/// declaration keeps its remaining edges plus the implicit `Object` the
+/// builder adds (the open direction).
+#[expect(clippy::too_many_arguments)] // one operand per snapshot face the resolution reads
+fn clause_head_instantiation(
+    table: &TypeTable,
+    registry: &FxHashMap<StringId, TypeDeclId>,
+    decl_params: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
+    facts: &ParamFactsTable,
+    namespaces: &Namespaces,
+    graph: &LibraryGraph,
+    index: &ElementIndex,
+    owner: LibraryId,
+    target_name: StringId,
+) -> Option<TypeId> {
+    let target_decl = registry.get(&target_name).copied().or_else(|| {
+        match namespaces.lookup(graph, owner, target_name) {
+            Lookup::Found(NamespaceEntry::Decl(owner_file)) => index
+                .get(owner_file)
+                .and_then(|els| els.container(target_name))
+                .and_then(|_| registry.get(&target_name).copied()),
+            _ => None,
+        }
+    })?;
+    instantiate_to_bounds(table, facts, decl_params, target_decl)
+}
+
+/// Maps one captured supertype tree onto the snapshot: the written
+/// head resolves through the registry, its written arguments recurse,
+/// and a leaf inside `scope` (the declaring container's own parameters
+/// by spelling) interns a [`TypeKind::TypeParameter`]. `None` on a
+/// poisoned tree, a nullable root (hierarchy edges are non-nullable),
+/// an unresolvable head, an arity mismatch, or a record/function shape —
+/// the clause then contributes no edge (the open direction, matching
+/// `crate::bounds`'s unmodelable-face suppression). A bare generic head
+/// (`extends S` under `S<T>`) instantiates to bounds exactly like the
+/// clause-name arm.
+fn clause_tree_ty(
+    table: &TypeTable,
+    registry: &FxHashMap<StringId, TypeDeclId>,
+    decl_params: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
+    facts: &ParamFactsTable,
+    scope: &FxHashMap<StringId, TypeParamId>,
+    tree: &TypeTree,
+) -> Option<TypeId> {
+    if tree.poisoned || tree.nullable || tree.record.is_some() || tree.function.is_some() {
+        return None;
+    }
+    // A type-parameter leaf: the declaring container's own spelling —
+    // `class B<T> extends S<T>` carries `T` into the edge, the official
+    // `InterfaceType(T)` face.
+    if tree.args.is_empty()
+        && let Some(&parameter) = scope.get(&tree.head)
+    {
+        return Some(
+            table.intern(UninternedType::TypeParameter { parameter }, false),
+        );
+    }
+    let &decl = registry.get(&tree.head)?;
+    let args = if tree.args.is_empty() {
+        instantiate_type_formals_to_bounds(
+            table,
+            facts,
+            decl_params.get(&decl).map_or(&[][..], Vec::as_slice),
+        )
+        .defaults
+    } else {
+        let params = decl_params.get(&decl).map_or(&[][..], Vec::as_slice);
+        if tree.args.len() != params.len() {
+            return None;
+        }
+        let mut args = Vec::with_capacity(tree.args.len());
+        for arg in &tree.args {
+            // Clause arguments keep their own `?` faces — an argument
+            // tree nullable at ITS root maps nullable (subtype.dart's
+            // argument nullability is per-node), so the `tree.nullable`
+            // gate above is root-only.
+            args.push(clause_arg_ty(table, registry, decl_params, facts, scope, arg)?);
+        }
+        args
+    };
+    Some(table.intern(UninternedType::Interface { decl, args }, false))
+}
+
+/// The argument-node face of [`clause_tree_ty`]: identical mapping but
+/// `nullable` honored per node (a `T?` argument is legal where the
+/// supertype root is not).
+fn clause_arg_ty(
+    table: &TypeTable,
+    registry: &FxHashMap<StringId, TypeDeclId>,
+    decl_params: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
+    facts: &ParamFactsTable,
+    scope: &FxHashMap<StringId, TypeParamId>,
+    tree: &TypeTree,
+) -> Option<TypeId> {
+    if tree.poisoned || tree.record.is_some() || tree.function.is_some() {
+        return None;
+    }
+    if tree.args.is_empty()
+        && let Some(&parameter) = scope.get(&tree.head)
+    {
+        return Some(
+            table.intern(UninternedType::TypeParameter { parameter }, tree.nullable),
+        );
+    }
+    let &decl = registry.get(&tree.head)?;
+    let args = if tree.args.is_empty() {
+        instantiate_type_formals_to_bounds(
+            table,
+            facts,
+            decl_params.get(&decl).map_or(&[][..], Vec::as_slice),
+        )
+        .defaults
+    } else {
+        let params = decl_params.get(&decl).map_or(&[][..], Vec::as_slice);
+        if tree.args.len() != params.len() {
+            return None;
+        }
+        let mut args = Vec::with_capacity(tree.args.len());
+        for arg in &tree.args {
+            args.push(clause_arg_ty(table, registry, decl_params, facts, scope, arg)?);
+        }
+        args
+    };
+    Some(table.intern(UninternedType::Interface { decl, args }, tree.nullable))
 }
 
 /// Instantiates a registered declaration to its parameter bounds —
@@ -998,15 +1258,19 @@ impl TypeOps for ResolvedTypeOps<'_> {
         }
     }
 
-    /// `tryPromoteToType`: `to` must be a subtype of `from` (the
-    /// promotion adds information); resolved arms delegate to
-    /// `TypeSystem::is_subtype` for that judgment, then keep the
-    /// name-level nullability rules the official's lattice combines.
+    /// `tryPromoteToType`: the strict-subtype gate verbatim
+    /// (`isValidPromotionStep`, flow_analysis.dart:7229-7247) — `to <:
+    /// from` and not the reverse (mutual subtypes, identical types
+    /// included, are no step). Phase D tightened this from the bare
+    /// `is_subtype(t, f)`-else-fallback shape: the model.rs migration
+    /// moved every production caller to the typed seam, and the
+    /// `promoted_is` dedup in `add_promoted` already stands down on
+    /// `to == from`, so no consumer needed the non-strict answer.
+    /// Unmapped arms keep `NameTypeOps`'s pre-mount posture.
     fn try_promote_to(&self, to: FlowTy, from: FlowTy) -> Option<FlowTy> {
-        if let (Some(t), Some(f)) = (self.map_base(to), self.map_base(from))
-            && self.system.is_subtype(t, f)
-        {
-            return Some(to);
+        if let (Some(t), Some(f)) = (self.map_base(to), self.map_base(from)) {
+            return (self.system.is_subtype(t, f) && !self.system.is_subtype(f, t))
+                .then_some(to);
         }
         NameTypeOps.try_promote_to(to, from)
     }
@@ -1929,6 +2193,223 @@ mod tests {
         assert!(
             !codes.contains(&"dead_code"),
             "the var else branch must stay live: {codes:?}"
+        );
+    }
+
+    /// Phase D acceptance pin: a real supertype clause tree reaches the
+    /// hierarchy. `class A extends S<int>` edges `A → S<int>` (not the
+    /// to-bounds `S<dynamic>` the name-level arm produces), so the
+    /// cross-declaration questions answer on the written `int`:
+    /// `A <: S<num>` admits through the covariant `int <: num` (the
+    /// `S<dynamic>` edge refuses — `dynamic <: num` is not a top-arm
+    /// hit); `S<num> <: A` refuses (`num <: int` fails) where the
+    /// `S<dynamic>` edge admitted it (`num <: dynamic`, right-top).
+    /// `A <: S<String>` refuses either way (`int <: String` and
+    /// `dynamic <: String` both fail) — pinned for completeness, not as
+    /// the discriminator. The `ClauseTrees` map is the transport face
+    /// Phase D routes the `BoundsIndex` captures through.
+    #[test]
+    fn clause_trees_carry_the_written_supertype_arguments() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let elements = unit(
+            "sealed class S<T> {} class A extends S<int> {} class B<T> extends S<T> {}",
+            &strings,
+            &mut files,
+            "u.dart",
+        );
+        let file = files.try_file_id(Path::new("u.dart")).unwrap();
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/u.dart");
+        builder.unit(lib, file);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+
+        // The `A extends S<int>` capture, hand-shaped the way the
+        // `Bounds` header sink produces it: one supertype tree `S<int>`
+        // and `A`'s own (empty) parameter list.
+        let range = dartq_source::SourceRange {
+            offset: 0,
+            length: 0,
+        };
+        let mut s_of_int = TypeTree::leaf(strings.intern("S"), false, range);
+        s_of_int
+            .args
+            .push(TypeTree::leaf(strings.intern("int"), false, range));
+        let mut clauses = ClauseTrees::empty();
+        clauses.insert(
+            file,
+            strings.intern("A"),
+            ClauseCapture {
+                params: Vec::new().into_boxed_slice(),
+                supers: vec![s_of_int],
+            },
+        );
+        let library_types = LibraryTypes::build_with_clauses(
+            &graph,
+            &namespaces,
+            &index,
+            &strings,
+            lib,
+            &clauses,
+        );
+        let ops = ResolvedTypeOps::new(&library_types, &strings);
+
+        // `names` is the recorder's table — ids index into it.
+        let names: Vec<Box<str>> = vec![
+            "A".into(), // 0
+            "S".into(), // 1
+            "num".into(), // 2
+            "String".into(), // 3
+        ];
+        // Arena rows: [num] = 1, [String] = 2 — `S<num>`/`S<String>`
+        // spellings the questions write.
+        let arena: Vec<Vec<ArgTy>> = vec![
+            Vec::new(),
+            vec![ArgTy {
+                base: Base::Name(2),
+                nullable: false,
+                args: EMPTY_ARGS,
+            }],
+            vec![ArgTy {
+                base: Base::Name(3),
+                nullable: false,
+                args: EMPTY_ARGS,
+            }],
+        ];
+        let a_ty = Ty {
+            base: Base::Name(0),
+            nullable: false,
+        };
+        let s_ty = Ty {
+            base: Base::Name(1),
+            nullable: false,
+        };
+
+        // Admit: `A <: S<num>` through `A → S<int>` + `int <: num`.
+        assert!(ops.is_subtype_typed(a_ty, EMPTY_ARGS, s_ty, 1, &arena, &names));
+        // Reject: `A <: S<String>` — `int <: String` fails; the
+        // to-bounds `S<dynamic>` edge would have refused it too
+        // (`dynamic <: String` is not a top-arm hit), so this direction
+        // alone does not distinguish the two edges. The direction that
+        // DOES: `S<num> <: A` is refused (`num <: int` fails) where the
+        // `S<dynamic>` edge admitted it (`num <: dynamic`, right-top).
+        assert!(!ops.is_subtype_typed(a_ty, EMPTY_ARGS, s_ty, 2, &arena, &names));
+        assert!(!ops.is_subtype_typed(s_ty, 1, a_ty, EMPTY_ARGS, &arena, &names));
+        // The promotion gate follows the strict subtype rule:
+        // `A <: S<num>` through the real `S<int>` edge promotes; the
+        // reverse `S<num> <: A` has no step (`S<num>` is wider); and
+        // `S<String> <: A` is refused — the to-bounds edge would have
+        // admitted `S<dynamic> <: A` and promoted the impossibility.
+        assert_eq!(
+            ops.try_promote_to_typed(a_ty, EMPTY_ARGS, s_ty, 1, &arena, &names),
+            Some(a_ty),
+        );
+        assert_eq!(
+            ops.try_promote_to_typed(s_ty, 1, a_ty, EMPTY_ARGS, &arena, &names),
+            None,
+        );
+        assert_eq!(
+            ops.try_promote_to_typed(s_ty, 2, a_ty, EMPTY_ARGS, &arena, &names),
+            None,
+        );
+    }
+
+    /// Phase D acceptance pin (name-level arm): the same `A extends
+    /// S<int>` declaration WITHOUT a `ClauseTrees` entry keeps the
+    /// to-bounds `A → S<dynamic>` edge — and the `dynamic` argument
+    /// loses the declaration's own supertype face: `A <: S<int>` itself
+    /// refuses (`dynamic <: int` fails, the Left-Top arm reducing to
+    /// `Object? <: int`), where the captured `int` argument answers
+    /// true. `A <: S<num>` refuses too (`dynamic <: num` fails where
+    /// `int <: num` holds).
+    #[test]
+    fn missing_clause_capture_keeps_the_to_bounds_edge() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let elements = unit(
+            "sealed class S<T> {} class A extends S<int> {}",
+            &strings,
+            &mut files,
+            "u.dart",
+        );
+        let file = files.try_file_id(Path::new("u.dart")).unwrap();
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/u.dart");
+        builder.unit(lib, file);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
+        let ops = ResolvedTypeOps::new(&library_types, &strings);
+
+        let names: Vec<Box<str>> = vec!["A".into(), "S".into(), "num".into(), "int".into()];
+        let arena: Vec<Vec<ArgTy>> = vec![
+            Vec::new(),
+            vec![ArgTy {
+                base: Base::Name(2),
+                nullable: false,
+                args: EMPTY_ARGS,
+            }],
+            vec![ArgTy {
+                base: Base::Name(3),
+                nullable: false,
+                args: EMPTY_ARGS,
+            }],
+        ];
+        let a_ty = Ty {
+            base: Base::Name(0),
+            nullable: false,
+        };
+        let s_ty = Ty {
+            base: Base::Name(1),
+            nullable: false,
+        };
+        // `A → S<dynamic>` refuses `A <: S<num>` (`dynamic <: num` fails)
+        // and refuses `A <: S<int>` itself (`dynamic <: int` fails) —
+        // the declaration's own supertype is unrecoverable at name
+        // level, where the real `int` argument answers both correctly.
+        assert!(!ops.is_subtype_typed(a_ty, EMPTY_ARGS, s_ty, 1, &arena, &names));
+        assert!(!ops.is_subtype_typed(a_ty, EMPTY_ARGS, s_ty, 2, &arena, &names));
+    }
+
+    /// Phase D acceptance pin (model.rs write-demotion): a write whose
+    /// written type no longer covers the standing promotion drops it —
+    /// `o is List<int>` promotes, then `o = <num>[]` demotes back to the
+    /// declared `Object` (`List<num> <: List<int>` fails on the
+    /// instantiated spellings where the bare `Ty`s compare equal), so
+    /// `o.length` reads `Object`'s missing member and reports
+    /// `undefined_getter`. The name-level demotion kept `List<int>` —
+    /// `num` and `int` share the `List` base — and the read resolved.
+    #[test]
+    fn write_demotion_drops_a_generic_promotion() {
+        let codes = diagnose_codes(
+            "void f() { \
+               Object? o = <int>[]; \
+               if (o is List<int>) {} \
+               o = <num>[]; \
+               o.first; \
+             }",
+            |_| None,
+        );
+        assert!(
+            codes.contains(&"undefined_getter"),
+            "the demoted Object read must miss `length`: {codes:?}"
         );
     }
 }

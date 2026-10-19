@@ -1074,11 +1074,12 @@ impl<'o> Interp<'o> {
         &mut self,
         var: u32,
         written: Ty,
+        written_args: u32,
         promote_to_interest: bool,
         write_span: Option<SourceRange>,
     ) {
         self.record_write(var);
-        self.apply_write(var, written, promote_to_interest, write_span);
+        self.apply_write(var, written, written_args, promote_to_interest, write_span);
     }
 
     /// The state half of [`Self::write_var`], without the
@@ -1088,10 +1089,13 @@ impl<'o> Interp<'o> {
     /// (`prefer_final_locals` treats the variables as never assigned), so
     /// they pass `None`: the official `declare`/`_initialize` carry no
     /// `nonPromotionReason` (`flow_analysis.dart:4914-4916`).
+    /// `written_args` is the written type's arena index — the demotion's
+    /// instantiated-spelling compares read it (#2204 phase D).
     pub(crate) fn apply_write(
         &mut self,
         var: u32,
         written: Ty,
+        written_args: u32,
         promote_to_interest: bool,
         write_span: Option<SourceRange>,
     ) {
@@ -1110,8 +1114,11 @@ impl<'o> Interp<'o> {
             declared,
             declared_args,
             written,
+            written_args,
             promote_to_interest,
             write_span,
+            self.args,
+            self.names,
         );
         // The receiver's value version changed (official `write` allocates
         // a fresh one), so its property promotions do not carry over
@@ -1272,6 +1279,8 @@ impl<'o> Interp<'o> {
                 var,
                 None,
                 Some((promoted, promoted_args)),
+                self.args,
+                self.names,
             );
             self.current = next;
             matched = Some(self.current.clone());
@@ -2645,7 +2654,7 @@ impl Interp<'_> {
             // state moves without the write-site record.
             // (The searched names declared in this buffer always resolve
             // local — the top-level face never reaches this write.)
-            self.apply_write(var, Ty::UNKNOWN, false, None);
+            self.apply_write(var, Ty::UNKNOWN, crate::ty::EMPTY_ARGS, false, None);
         }
         let body_start = (i..end).find(|&j| matches!(events[j], Ev::ForInBodyBegin));
         let body = match body_start {

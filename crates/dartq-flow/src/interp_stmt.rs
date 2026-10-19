@@ -1075,7 +1075,7 @@ impl Interp<'_> {
                     // demotion reason attaches (the official
                     // `declare`/`_initialize` carry no
                     // `nonPromotionReason`, `flow_analysis.dart:4914-4916`).
-                    self.apply_write(var, rhs.ty, true, None);
+                    self.apply_write(var, rhs.ty, rhs.args, true, None);
                 }
             }
             Ev::VarDeclEnd => {

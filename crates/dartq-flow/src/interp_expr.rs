@@ -48,7 +48,13 @@ impl Interp<'_> {
                         // top-level target carries no definite-assignment
                         // face.
                         if let Some(Resolved::Local(var)) = self.resolve(*name) {
-                            self.write_var(var, Ty::UNKNOWN, false, Some(token.range));
+                            self.write_var(
+                                var,
+                                Ty::UNKNOWN,
+                                crate::ty::EMPTY_ARGS,
+                                false,
+                                Some(token.range),
+                            );
                         }
                     }
                     Ctx::Expression | Ctx::ExpressionContinuation => match self.resolve(*name) {
@@ -287,6 +293,8 @@ impl Interp<'_> {
                         var,
                         None,
                         Some((promoted, promoted_args)),
+                        self.args,
+                        self.names,
                     );
                 }
                 self.exprs.push(Expr::trivial(promoted));
@@ -306,10 +314,12 @@ impl Interp<'_> {
                 };
                 let target = self.pop_value();
                 if let Some(var) = target.reference {
-                    let declared = self
+                    let (declared, declared_args) = self
                         .vars
                         .get(var as usize)
-                        .map_or(Ty::UNKNOWN, |meta| meta.ty);
+                        .map_or((Ty::UNKNOWN, crate::ty::EMPTY_ARGS), |meta| {
+                            (meta.ty, meta.args)
+                        });
                     let write_span = match (
                         prefix_op,
                         target.read_span.map(|token| token.range),
@@ -332,6 +342,7 @@ impl Interp<'_> {
                     self.write_var(
                         var,
                         self.ops.promote_to_non_null(declared),
+                        declared_args,
                         false,
                         write_span,
                     );
@@ -399,6 +410,8 @@ impl Interp<'_> {
                                     var,
                                     None,
                                     Some((promoted, promoted_args)),
+                                    self.args,
+                                    self.names,
                                 )
                             }
                             _ => self.current.clone(),
@@ -631,6 +644,8 @@ impl Interp<'_> {
                             var,
                             None,
                             Some((promoted, self.as_cast_args)),
+                            self.args,
+                            self.names,
                         );
                     }
                     self.exprs.push(Expr::trivial(cast_ty));
@@ -646,6 +661,8 @@ impl Interp<'_> {
                         var,
                         None,
                         Some((cast_ty, self.as_cast_args)),
+                        self.args,
+                        self.names,
                     );
                 }
             }
@@ -720,13 +737,13 @@ impl Interp<'_> {
                     // `int + 1` keeps the promoted `int`, and the write
                     // therefore never demotes what the read had
                     // promoted).
-                    let written = if *plain {
+                    let (written, written_args) = if *plain {
                         if let Some(span) = target.read_span
                             && let Some(&staged) = self.staged_rhs.get(&span.range.offset)
                         {
-                            staged
+                            (staged, rhs_args)
                         } else {
-                            rhs.ty
+                            (rhs.ty, rhs_args)
                         }
                     } else if *if_null {
                         // `LUB(NonNull(readType), rhsType)` — the boundary-
@@ -735,16 +752,25 @@ impl Interp<'_> {
                         // hierarchy LUB is the semantic layer's question).
                         // An untyped RHS still leaves the lvalue non-null —
                         // `x ??= e` can never widen x back to nullable.
-                        let (lhs_nn, _) = self.promote_to_non_null(target.ty, target.args);
+                        // The winning side's written arguments ride beside
+                        // the joined type (#2204 phase D).
+                        let (lhs_nn, lhs_nn_args) =
+                            self.promote_to_non_null(target.ty, target.args);
                         if rhs.ty == Ty::UNKNOWN || rhs.ty == Ty::UNKNOWN_NULLABLE {
                             // An information-less RHS (an SDK static's return
                             // this layer cannot see; a tear-off of a
                             // top-level function the flow walk does not
                             // resolve) still leaves the lvalue non-null —
                             // `x ??= e` can never widen x back to nullable.
-                            lhs_nn
+                            (lhs_nn, lhs_nn_args)
                         } else {
-                            self.name_lub(lhs_nn, rhs.ty)
+                            let joined = self.name_lub(lhs_nn, rhs.ty);
+                            let joined_args = if joined == rhs.ty {
+                                rhs_args
+                            } else {
+                                lhs_nn_args
+                            };
+                            (joined, joined_args)
                         }
                     } else {
                         // The read-modify-write face: the operator result is
@@ -754,7 +780,7 @@ impl Interp<'_> {
                         // UNKNOWN here would demote what the read promoted —
                         // `initialCapacity += 1` after a null-check early
                         // return must stay promoted.
-                        self.promote_to_non_null(target.ty, target.args).0
+                        self.promote_to_non_null(target.ty, target.args)
                     };
                     // The write's own range: the assignment expression (the
                     // official `flow.write` node,
@@ -765,7 +791,13 @@ impl Interp<'_> {
                         offset: token.range.offset,
                         length: end.saturating_sub(token.range.offset),
                     });
-                    self.write_var(var, written, *plain || *if_null, write_span);
+                    self.write_var(
+                        var,
+                        written,
+                        written_args,
+                        *plain || *if_null,
+                        write_span,
+                    );
                     // The assignment expression reads back the variable.
                     self.exprs.push(Expr::of_reference(var, written, rhs_args));
                 } else {
@@ -790,7 +822,7 @@ impl Interp<'_> {
                 // demotions carry no reason link and the history drops: the
                 // official's unreasoned-write shape.
                 for var in std::mem::take(&mut self.pending_writes) {
-                    self.write_var(var, rhs.ty, true, None);
+                    self.write_var(var, rhs.ty, rhs.args, true, None);
                 }
             }
             Ev::CondBegin => {
@@ -1505,6 +1537,8 @@ impl Interp<'_> {
             var,
             Some((tested, tested_args)),
             promoted.map(|ty| (ty, tested_args)),
+            self.args,
+            self.names,
         );
         // The unmatched remainder carries the operand spellings' written
         // arguments: `factor(Response, Response<T>)` on bare `Ty`s compares
@@ -1545,6 +1579,8 @@ impl Interp<'_> {
                 var,
                 Some((tested, tested_args)),
                 factored.map(|ty| (ty, previous_args)),
+                self.args,
+                self.names,
             )
         };
         (matched, unmatched)
@@ -1612,6 +1648,8 @@ impl Interp<'_> {
                         var,
                         None,
                         Some((promoted, promoted_args)),
+                        self.args,
+                        self.names,
                     );
                     // `x == null`: the true-branch saw null; the
                     // false-branch saw non-null. `!=` inverts.
@@ -1653,6 +1691,8 @@ impl Interp<'_> {
                         &mut self.lists,
                         slot,
                         Ty::UNKNOWN,
+                        self.args,
+                        self.names,
                     );
                     let (eq_true, eq_false) = (self.current.clone(), matched);
                     let (if_true, if_false) = if inverted {

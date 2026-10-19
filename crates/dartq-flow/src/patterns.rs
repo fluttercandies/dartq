@@ -155,6 +155,8 @@ impl Interp<'_> {
                             var,
                             None,
                             Some((non_null, non_null_args)),
+                            self.args,
+                            self.names,
                         )
                     } else {
                         self.current.clone()
@@ -224,6 +226,8 @@ impl Interp<'_> {
                         var,
                         None,
                         Some((non_null, non_null_args)),
+                        self.args,
+                        self.names,
                     );
                 }
                 if let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) {
