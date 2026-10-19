@@ -356,7 +356,12 @@ impl<'a> Engine<'a> {
             {
                 continue;
             }
-            if self.override_broken(entry, &inherited) {
+            if self.override_broken(
+                entry,
+                (self.file, container),
+                &inherited,
+                (origin, face_name),
+            ) {
                 broken_seen.push(inherited.clone());
                 let display = self.strings.resolve(spelling);
                 let display = display.strip_suffix('=').unwrap_or(display);
@@ -2059,9 +2064,15 @@ impl<'a> Engine<'a> {
             return false;
         }
         let has_valid = list.iter().enumerate().any(|(i, a)| {
-            list.iter()
-                .enumerate()
-                .all(|(j, b)| i == j || !self.override_broken(&a.entry, &b.entry))
+            list.iter().enumerate().all(|(j, b)| {
+                i == j
+                    || !self.override_broken(
+                        &a.entry,
+                        (a.owner_file, a.owner_name),
+                        &b.entry,
+                        (b.owner_file, b.owner_name),
+                    )
+            })
         });
         if has_valid {
             return false;
@@ -2347,7 +2358,12 @@ impl<'a> Engine<'a> {
             if concrete.entry.ptr() == specific.entry.ptr() {
                 continue;
             }
-            if !self.override_broken(&concrete.entry, &specific.entry) {
+            if !self.override_broken(
+                &concrete.entry,
+                (concrete.owner_file, concrete.owner_name),
+                &specific.entry,
+                (specific.owner_file, specific.owner_name),
+            ) {
                 continue;
             }
             let display = self.strings.resolve(*name);
@@ -2381,7 +2397,12 @@ impl<'a> Engine<'a> {
         hits.iter().copied().find(|candidate| {
             hits.iter().all(|other| {
                 std::ptr::eq(*candidate, *other)
-                    || !self.override_broken(&candidate.entry, &other.entry)
+                    || !self.override_broken(
+                        &candidate.entry,
+                        (candidate.owner_file, candidate.owner_name),
+                        &other.entry,
+                        (other.owner_file, other.owner_name),
+                    )
             })
         })
     }
@@ -2389,7 +2410,14 @@ impl<'a> Engine<'a> {
     /// The name's inherited concrete implementation, `_addImplemented`'s
     /// source order: the `with` mixins first, then the superclass chain
     /// (never an `implements` face — its hits are interface members only).
-    /// The mixin-before-superclass order is load-bearing: the oracle's
+    /// Within a concrete face only `concrete_source` hits count: a member
+    /// reached through the face's own `implements` clause is an interface
+    /// member, not an implementation the face contributes (the oracle's
+    /// `implemented` map carries own members, mixins, and the super chain
+    /// only — `inheritance_manager3.dart:333-351` `_addImplemented` /
+    /// `_addMixinMembers`; `C extends R with M implements I` takes `M`'s
+    /// and `R`'s chain's members, never `I`'s or `M`'s interfaces'). The
+    /// mixin-before-superclass order is load-bearing: the oracle's
     /// concrete resolution for `C extends A with M implements I` is the
     /// *mixin's* member, and the superclass's would manufacture a conflict
     /// the oracle resolves away. The class's own members are deliberately
@@ -2406,9 +2434,11 @@ impl<'a> Engine<'a> {
                 .and_then(|i| view.face_hits.get(i))
         };
         for face in decl.with_clause.iter().copied().chain(decl.superclass) {
-            if let Some(hit) = hits_of(face)
-                .and_then(|hits| hits.iter().find(|h| h.name == name && !h.entry.is_abstract))
-            {
+            if let Some(hit) = hits_of(face).and_then(|hits| {
+                hits.iter().find(|h| {
+                    h.name == name && h.concrete_source && !h.entry.is_abstract
+                })
+            }) {
                 return Some(hit.clone());
             }
         }
@@ -2785,13 +2815,49 @@ impl<'a> Engine<'a> {
     /// and only an undecided pair (an unresolvable head or a cut walk —
     /// forward references, type parameters, cross-file chains) suppresses,
     /// the under-report direction.
-    pub(crate) fn override_broken(&self, declared: &MemberEntry, inherited: &MemberEntry) -> bool {
+    ///
+    /// The InvalidType arm (`subtype.dart:274-276` — `T0 is InvalidType ||
+    /// T1 is InvalidType` answers the subtype question `true`, so the
+    /// override is satisfied and stays silent): a `Ty::Named` whose head
+    /// resolves to no type in the *member's defining scope* is the oracle's
+    /// `InvalidType` — a broken import's name, a misspelling, an ambiguous
+    /// import, a prefix, or a non-type element (the same set
+    /// [`Engine::named_type_is_type`] refuses, asked in the declaring
+    /// file's scope rather than the diagnosing one). The leniency applies
+    /// at the compared pair's own head: an invalid head on either operand
+    /// makes the pair compatible outright, while an invalid *argument*
+    /// inside an otherwise-resolved pair still descends through
+    /// `assignable`'s covariant-argument arm — matching the oracle, where
+    /// `List<InvalidType> <: Set<int>` still fails on the head walk.
+    /// `owner` is `(defining file, declaring container name)` per side;
+    /// the file's scope resolves the head and the container's library
+    /// climbs to it via [`Engine::owner_library_of`].
+    pub(crate) fn override_broken(
+        &self,
+        declared: &MemberEntry,
+        declared_owner: (FileId, StringId),
+        inherited: &MemberEntry,
+        inherited_owner: (FileId, StringId),
+    ) -> bool {
         let world = self.name_world();
         // The single type-decision point for every face below: the M1
         // assignability first, the name lattice on its `None`. No consumer
         // of this verdict re-derives either half.
-        let decide = |from: Ty, to: Ty| {
-            self.assignable(from, to, false).or_else(|| {
+        let decide = |from: (Ty, (FileId, StringId), &MemberEntry),
+                      to: (Ty, (FileId, StringId), &MemberEntry)| {
+            let (from_ty, from_scope, from_entry) = from;
+            let (to_ty, to_scope, to_entry) = to;
+            if let Ty::Named { name, .. } = from_ty
+                && self.named_head_is_invalid(name, from_scope, from_entry)
+            {
+                return Some(true);
+            }
+            if let Ty::Named { name, .. } = to_ty
+                && self.named_head_is_invalid(name, to_scope, to_entry)
+            {
+                return Some(true);
+            }
+            self.assignable(from_ty, to_ty, false).or_else(|| {
                 let (
                     Ty::Named {
                         name: from_name,
@@ -2803,7 +2869,7 @@ impl<'a> Engine<'a> {
                         nullable: false,
                         ..
                     },
-                ) = (from, to)
+                ) = (from_ty, to_ty)
                 else {
                     return None;
                 };
@@ -2815,6 +2881,8 @@ impl<'a> Engine<'a> {
                 world.decide_subtype(from_name, to_name)
             })
         };
+        let declared_at = |ty: Ty| (ty, declared_owner, declared);
+        let inherited_at = |ty: Ty| (ty, inherited_owner, inherited);
         // A field's face is its declared type; every executable's is its
         // return type.
         let member_ty = |e: &MemberEntry| {
@@ -2866,7 +2934,7 @@ impl<'a> Engine<'a> {
                 // there).
                 for (d, i) in a.positional.iter().zip(&b.positional) {
                     if i.covariant {
-                        match decide(d.ty, i.ty) {
+                        match decide(declared_at(d.ty), inherited_at(i.ty)) {
                             Some(false) => return true,
                             _ => {}
                         }
@@ -2875,7 +2943,7 @@ impl<'a> Engine<'a> {
                     if d.covariant {
                         continue;
                     }
-                    match decide(i.ty, d.ty) {
+                    match decide(inherited_at(i.ty), declared_at(d.ty)) {
                         Some(false) => return true,
                         Some(true) => {}
                         None => return false,
@@ -2889,13 +2957,13 @@ impl<'a> Engine<'a> {
                         return false;
                     };
                     if i.covariant {
-                        match decide(d.ty, i.ty) {
+                        match decide(declared_at(d.ty), inherited_at(i.ty)) {
                             Some(false) => return true,
                             _ => {}
                         }
                         continue;
                     }
-                    match decide(i.ty, d.ty) {
+                    match decide(inherited_at(i.ty), declared_at(d.ty)) {
                         Some(false) => return true,
                         Some(true) => {}
                         None => return false,
@@ -2909,9 +2977,64 @@ impl<'a> Engine<'a> {
         // The result face, covariant (the function-subtype rule's return
         // arm): the declared result must fit the inherited one.
         matches!(
-            decide(member_ty(declared), member_ty(inherited)),
+            decide(
+                declared_at(member_ty(declared)),
+                inherited_at(member_ty(inherited))
+            ),
             Some(false)
         )
+    }
+
+    /// Whether a `Ty::Named` head is the oracle's `InvalidType` — a
+    /// spelling that resolves to no type in the member's *defining* scope
+    /// (`named_type_resolver.dart`'s `_resolveToElement`: a miss is
+    /// `undefined_class`, a non-type element is `notAType`, an ambiguous
+    /// import is a `MultiplyDefinedElement`, a bare prefix is never a type —
+    /// all four leave the annotation invalid). `owner` is the member's
+    /// `(defining file, declaring container)`: the file's own declarations
+    /// plus its library's import face decide, and the container's and the
+    /// member's type parameters count as types (declaration-scoped
+    /// [`MicroKind::TypeParam`] rows ride the file's declaration set; the
+    /// member's own ride [`MemberEntry::type_param_names`]). A name the
+    /// index cannot model (a namespace hit whose declaring file carries no
+    /// model — the SDK projection's names-only stubs) counts as a type, the
+    /// same under-report posture [`Engine::named_type_is_type`] keeps.
+    fn named_head_is_invalid(
+        &self,
+        name: StringId,
+        owner: (FileId, StringId),
+        entry: &MemberEntry,
+    ) -> bool {
+        let (file, container) = owner;
+        if self.members.primitive_ids.contains(&name)
+            || entry.type_param_names.contains(&name)
+        {
+            return false;
+        }
+        // The declaring container's own members are never types
+        // (`InstanceScope.lookup` — the same arm
+        // [`Engine::named_type_is_type`] keeps): a member name shadows any
+        // same-spelled outer class for type uses inside that container.
+        if self
+            .index
+            .get(file)
+            .and_then(|f| f.container(container))
+            .is_some_and(|c| c.members.contains_key(&name))
+        {
+            return true;
+        }
+        let lib = self.owner_library_of(file, container).unwrap_or(self.lib);
+        match lookup_scoped(self.graph, self.namespaces, self.index, lib, file, name) {
+            ScopedHit::Local(decl) => !Self::decl_is_type(decl.kind),
+            ScopedHit::Found(NamespaceEntry::Decl(owner_file)) => self
+                .index
+                .get(owner_file)
+                .and_then(|f| f.decl(name))
+                .is_some_and(|decl| !Self::decl_is_type(decl.kind)),
+            ScopedHit::Found(NamespaceEntry::Prefix)
+            | ScopedHit::Ambiguous(_)
+            | ScopedHit::NotFound => true,
+        }
     }
 
     /// The member's name-level signature text (the message's type slots, in
@@ -3145,6 +3268,234 @@ mod sealed_abstract_fold_tests {
         assert!(
             names.iter().all(|n| *n == "abstract_sealed_class"),
             "only the combination violation may report: {names:?}"
+        );
+    }
+}
+
+/// The InvalidType-leniency and concrete-source pins (#2192): the oracle's
+/// `isCorrectOverrideOf` is one subtype question whose `T0/T1 is
+/// InvalidType` arm answers `true` (`subtype.dart:274-276`), so a member
+/// signature carrying an unresolvable head always reads as a satisfied
+/// override; and `implemented` — the concrete-implementation map the
+/// `invalid_implementation_override` loop consults — carries own members,
+/// mixins, and the super chain only (`inheritance_manager3.dart:333-351`),
+/// never an `implements` face's members.
+#[cfg(test)]
+mod invalid_type_override_tests {
+    use crate::collector::collect;
+    use crate::diagnose::{FileReport, StrictModes, diagnose, fold_unit, merge_source_ordered};
+    use crate::library::ElementIndex;
+    use crate::model::MicroKind;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{
+        Combinators, ImportEdge, LibraryClassModifiers, LibraryGraphBuilder, Namespaces,
+    };
+    use dartq_scanner::ScanConfig;
+    use dartq_source::{FileTable, StringTable};
+    use std::path::Path;
+
+    /// Diagnoses `source` as the sole file of a library with no imports —
+    /// the same single-file rig the sibling module keeps.
+    fn report(source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let fold = fold_unit(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        let mut report = fold.report;
+        report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+        report
+    }
+
+    fn code_names(report: &FileReport) -> Vec<&'static str> {
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
+    }
+
+    /// The `with` face's concrete source: `C extends R with M` takes `R`'s
+    /// chain member as the concrete implementation, never a member reached
+    /// through `M`'s `implements` clause — `M implements I` contributes
+    /// `I`'s members to the *interface* only (the oracle's `implemented`
+    /// map, `inheritance_manager3.dart:333-351`). Before the
+    /// `concrete_source` gate, the loop compared `I.contentLength` (`int?`)
+    /// as the concrete implementation against `R.contentLength` (`int`)
+    /// and reported `invalid_implementation_override` — the http
+    /// `AbortableRequest`/`BaseRequest` shape.
+    #[test]
+    fn mixin_interface_member_is_no_concrete_implementation() {
+        let report = report(
+            "abstract class I { int? get contentLength; } \
+             abstract class R extends I { @override int get contentLength => 0; } \
+             abstract mixin class M implements I {} \
+             final class C extends R with M {}",
+        );
+        let names = code_names(&report);
+        assert!(
+            !names.contains(&"invalid_implementation_override"),
+            "I.x reached through M.implements is interface-only: {names:?}"
+        );
+    }
+
+    /// The InvalidType arm on the result face: `Missing?` over `Missing`
+    /// compares `InvalidType` against `InvalidType` upstream — the subtype
+    /// question answers `true` regardless of the `?`, so the override is
+    /// satisfied and stays silent (`subtype.dart:274-276`). Only the
+    /// `undefined_class` rows for the `Missing` mentions report.
+    #[test]
+    fn invalid_head_nullability_pair_stays_silent() {
+        let report = report(
+            "class A { Missing f() => throw 0; } class B extends A { Missing? f() => throw 0; }",
+        );
+        let names = code_names(&report);
+        assert!(
+            !names.contains(&"invalid_override"),
+            "an InvalidType operand satisfies the override: {names:?}"
+        );
+        assert!(
+            names.iter().all(|n| *n == "undefined_class"),
+            "only the Missing mentions may report: {names:?}"
+        );
+    }
+
+    /// The negative control: a genuinely mismatched override — both heads
+    /// resolvable, the declared side widened past the inherited — still
+    /// reports `invalid_override` (`int? <: int` is the decidable break;
+    /// the `class int` declarations stand the name world's primitive in
+    /// for the fixture, the established rig convention).
+    #[test]
+    fn resolvable_mismatch_still_reports() {
+        let report = report(
+            "class int {} class A { int f() => int(); } class B extends A { int? f() => int(); }",
+        );
+        let names = code_names(&report);
+        assert_eq!(names, ["invalid_override"], "{names:?}");
+    }
+
+    /// The cross-file family shape: the inherited member's type resolves
+    /// to nothing in its *defining* file's scope (the broken import the
+    /// corpus rows carry — `file_state.dart`'s `FileSource get source`).
+    /// The subtype question is satisfied by the `InvalidType` arm on the
+    /// defining side, so the per-member override verdict stays silent;
+    /// the `undefined_class` rows for `Missing` remain.
+    #[test]
+    fn broken_import_member_type_stays_silent_cross_file() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file_a = files.intern(Path::new("a.dart"));
+        let file_m = files.intern(Path::new("main.dart"));
+        // `Missing` resolves to nothing in a.dart's scope — the broken
+        // import face (a `URI_DOES_NOT_EXIST` import contributes no names).
+        let source_a = "class P { Missing get s => throw 0; }";
+        let source_m = "import 'a.dart';\nclass C extends P { @override Missing? get s => throw 0; }\n";
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let scanned_a = dartq_scanner::scan(
+            source_a,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file_a,
+        );
+        let scanned_m = dartq_scanner::scan(
+            source_m,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file_m,
+        );
+        assert!(scanned_a.diagnostics.is_empty() && scanned_m.diagnostics.is_empty());
+        let elements_a = collect(source_a, &scanned_a.tokens, features, &strings);
+        let elements_m = collect(source_m, &scanned_m.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib_a = builder.intern("package:other/a.dart");
+        let lib_m = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file_a, elements_a.clone());
+        index.insert(file_m, elements_m.clone());
+        for (name, decl) in elements_a.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_a, name, file_a);
+        }
+        for (name, decl) in elements_m.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_m, name, file_m);
+        }
+        builder.import(
+            lib_m,
+            ImportEdge {
+                target: Some(lib_a),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let report = diagnose(
+            source_m,
+            &scanned_m.tokens,
+            features,
+            &strings,
+            file_m,
+            lib_m,
+            &graph,
+            &namespaces,
+            &index,
+        );
+        let names = code_names(&report);
+        assert!(
+            !names.contains(&"invalid_override"),
+            "InvalidType on the defining side satisfies the override: {names:?}"
         );
     }
 }
