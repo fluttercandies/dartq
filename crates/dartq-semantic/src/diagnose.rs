@@ -23582,20 +23582,61 @@ impl<'a> Engine<'a> {
         // (`unchecked_use_of_nullable_value`): the `UnsafeSingle` verdict
         // carries that distinction. Equal on-types answer equal — two
         // non-nullable faces stay ambiguous.
-        let mut specific: Vec<(String, String)> = Vec::new();
-        let mut nullable: Vec<(String, String)> = Vec::new();
         let empty: Vec<ExtensionFace> = Vec::new();
         let faces = self.index.get(self.file).map_or(
             empty.as_slice(),
             super::model::FileElements::extension_faces,
         );
+        // Applicability is the receiver's subtype relation to the `on`
+        // type (`extension_member_resolver.dart` `_getApplicable`: the
+        // receiver is assignable to the instantiated extended type), so an
+        // extension on `I<T>` applies to `J extends I<T>` — the declared
+        // supertype lattice, not name equality.
+        let world = self.name_world();
+        let object = self.intern("Object");
+        let iterable = self.intern("Iterable");
+        let strings = self.strings;
+        // The name-level subtype walk plus the faces it cannot see: every
+        // type reaches `Object`, and the unindexed SDK collection roots
+        // (`List`/`Set` and the `dart:collection` bases, all `Iterable`).
+        let reaches = |sub: StringId, sup: StringId| {
+            sub == sup
+                || sup == object
+                || world.named_sub(sub, sup)
+                || (sup == iterable && {
+                    let text = strings.resolve(sub);
+                    matches!(text, "List" | "Set")
+                        || crate::member_face::COLLECTION_INTERFACE_ALIASES
+                            .iter()
+                            .any(|(alias, roots)| *alias == text && roots.contains(&"Iterable"))
+                })
+        };
+        let mut applicable: Vec<(&ExtensionFace, StringId)> = Vec::new();
         for face in faces {
-            if face.on_type != Some(receiver) {
-                continue;
-            }
+            let Some(on) = face.on_type else { continue };
             if !(face.members.contains_key(&member)
                 || (accept_setter && face.members.contains_key(&setter)))
             {
+                continue;
+            }
+            if !reaches(receiver, on) {
+                continue;
+            }
+            applicable.push((face, on));
+        }
+        // `_isMoreSpecific` steps 3-4 at the name level: a face whose `on`
+        // type is a strict subtype of another applicable face's dominates
+        // it. Equal (or unrelated) `on` types stay mutually unordered —
+        // the ambiguity the caller reports.
+        let dominated = |on: StringId| {
+            applicable
+                .iter()
+                .any(|&(_, other)| other != on && reaches(other, on) && !reaches(on, other))
+        };
+        let mut specific: Vec<(String, String)> = Vec::new();
+        let mut nullable: Vec<(String, String)> = Vec::new();
+        for &(face, on) in &applicable {
+            if dominated(on) {
                 continue;
             }
             let display = self.extension_display(face);
@@ -23618,13 +23659,15 @@ impl<'a> Engine<'a> {
         } else {
             (specific, false)
         };
-        // An applied member is used (the official `usedElements.members`
+        // A uniquely applied member is used (the official `usedElements.members`
         // face): the application resolves the access, so the member's
         // declaration is spared. Both the read and — when the write
         // accepted it — the setter spelling join; a spelling no face
         // declares never matches a finalize key, so over-inserting is
         // inert.
-        if !candidates.is_empty() {
+        // An ambiguous access resolves no member (the oracle leaves every
+        // candidate unreferenced — `unused_element` still fires on each).
+        if candidates.len() == 1 {
             self.extension_member_used.insert(member);
             if accept_setter {
                 self.extension_member_used.insert(setter);
@@ -43041,6 +43084,50 @@ mod tests {
              void f(C? x) { x.m(); }",
         );
         assert_eq!(code_names(&plain), ["unchecked_use_of_nullable_value"]);
+    }
+
+    /// Extension applicability is the receiver's subtype relation to the
+    /// `on` type, not name equality (oracle-probed): an extension on a
+    /// supertype — generic `I<T>`, a mixin, `Object` — applies to the
+    /// subtype receiver; a strictly more specific
+    /// `on` type wins; equal-rank unrelated `on` types stay ambiguous.
+    #[test]
+    fn extension_applies_to_subtype_receivers_by_specificity() {
+        let applies = report(
+            "class I<T> {} class J<T> extends I<T> {} class K extends I<J> {} \
+             mixin M {} class D with M {} \
+             extension<T> on I<T> { void get a {} } \
+             extension on M { void get b {} } \
+             extension on Object { void get c {} } \
+             void f(J<K> j, K k, D d) { j.a; k.a; d.b; d.c; }",
+        );
+        let misses: Vec<&str> = code_names(&applies)
+            .into_iter()
+            .filter(|c| c.starts_with("undefined_getter") || c.starts_with("ambiguous"))
+            .collect();
+        assert!(misses.is_empty(), "{:?}", code_names(&applies));
+        let specific = report(
+            "class I {} class J extends I {} \
+             extension on I { void get m {} } \
+             extension on J { void get m {} } \
+             void f(J j) { j.m; }",
+        );
+        assert!(
+            !code_names(&specific).contains(&"ambiguous_extension_member_access"),
+            "{:?}",
+            code_names(&specific)
+        );
+        let ambiguous = report(
+            "abstract class A {} abstract class B {} class C implements A, B {} \
+             extension on A { void get m {} } \
+             extension on B { void get m {} } \
+             void f(C c) { c.m; }",
+        );
+        assert!(
+            code_names(&ambiguous).contains(&"ambiguous_extension_member_access"),
+            "{:?}",
+            code_names(&ambiguous)
+        );
     }
 
     // —— #476 item 2: extension-type representation ———————————————————————

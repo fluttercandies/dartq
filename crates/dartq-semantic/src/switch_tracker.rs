@@ -1017,7 +1017,7 @@ impl<'a> NameWorld<'a> {
 
     /// Whether `sub`'s supertype chain reaches `sup`: the unit's declared
     /// superclass and `with`/`implements` edges plus the fixed core chain.
-    fn named_sub(&self, sub: StringId, sup: StringId) -> bool {
+    pub(crate) fn named_sub(&self, sub: StringId, sup: StringId) -> bool {
         if sub == sup {
             return true;
         }
