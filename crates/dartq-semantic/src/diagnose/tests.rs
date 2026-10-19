@@ -5437,17 +5437,19 @@
     /// implicit `this` of the body carries the extension type itself), so
     /// the UnqualifiedLookupDomain names the head exactly like a class
     /// body names its class, never the context-free `undefined_function`.
+    /// The rig has no dart:core, so the `int i` field formal's undeclared
+    /// `int` spelling carries its `undefined_class` row beside the miss.
     #[test]
     fn extension_type_body_miss_names_the_extension_type() {
         let report = report("extension type E(int i) { void f() { miss(); } }");
         assert_eq!(
             code_names(&report),
-            ["undefined_method"],
+            ["undefined_class", "undefined_method"],
             "{:?}",
             code_names(&report)
         );
         assert_eq!(
-            report.diagnostics[0].message,
+            report.diagnostics[1].message,
             "The method 'miss' isn't defined for the type 'E'."
         );
     }
@@ -9527,7 +9529,11 @@
     /// Three or more candidates take the joined-list variant with the
     /// `commaSeparatedWithAnd` rendering
     /// (`utilities/extensions/string.dart:41-104`: Oxford 'and'), including
-    /// the unnamed-extension display.
+    /// the unnamed-extension display. The unnamed extension's `m` carries
+    /// its own row: an unnamed extension is never publicly accessible, so
+    /// its members check like private declarations — and an ambiguous
+    /// application resolves to no unique member, so nothing credits it
+    /// (`usedElements.members` joins on a resolved element only).
     #[test]
     fn three_applicable_extensions_use_the_list_variant() {
         let report = report(
@@ -9536,9 +9542,12 @@
              extension on C { void m() {} } \
              void main() { C().m(); }",
         );
-        assert_eq!(code_names(&report), ["ambiguous_extension_member_access"]);
         assert_eq!(
-            report.diagnostics[0].message,
+            code_names(&report),
+            ["unused_element", "ambiguous_extension_member_access"]
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
             "A member named 'm' is defined in extension 'E1', extension 'E2', and unnamed extension on 'C', and none are more specific."
         );
     }
@@ -9614,9 +9623,11 @@
         assert!(code_names(&applied).is_empty(), "{:?}", code_names(&applied));
         // A preceding declaration's own type-variable group must not leak
         // into a parameterless extension's `on` type: `T` below is `class
-        // C`'s parameter, not `E`'s — `List<int>` against `on List<T>`
-        // treats `T` as the concrete (undeclared) name it is, so the face
-        // never applies and the access reports.
+        // C`'s parameter, not `E`'s — it resolves to nothing and reports
+        // `non_type_as_type_argument`. The failed argument slots the `on`
+        // type as the oracle's `InvalidType` (`List<InvalidType>`), which
+        // `List<int>` still satisfies — the face applies and the access
+        // resolves silently.
         let leaked = report(
             "class C<T> {} class List<T> {} \
              extension E on List<T> { void m() {} } \
@@ -9626,8 +9637,7 @@
             code_names(&leaked),
             [
                 "non_type_as_type_argument",
-                "non_type_as_type_argument",
-                "undefined_method"
+                "non_type_as_type_argument"
             ],
             "{:?}",
             code_names(&leaked)
