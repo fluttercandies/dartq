@@ -5452,20 +5452,22 @@
         );
     }
 
-    /// The `on`-face member union inside instance bodies (#2186 S2): a bare
-    /// name or `this.member` access resolves against the constraint face —
-    /// hits stay silent; a member the constraint provably lacks reports.
+    /// The `on`-face member union inside instance bodies (#2186 S2, emit
+    /// side #2230): a bare name or `this.member` access resolves against
+    /// the constraint face — hits stay silent; a member the constraint
+    /// provably lacks reports, naming `this`'s static type (the oracle's
+    /// `InstanceLookupDomain` receiver type): the mixin itself for a mixin
+    /// body, the `on` type for an extension body.
     ///
     /// Hand-trace: `real` hits `C`'s method through `mixin M on C`'s
-    /// constraint walk (silent); `this.real2`/`this.real4` record misses
-    /// the emit-side `this`-receiver arm still suppresses (out of this
-    /// scope — the union walk lands in `check_instance_member`). `real3` is
-    /// the decidable miss: `extension X on C` fully walks `C`, `C` lacks
-    /// the name, the member scope is final — the oracle emits
-    /// `undefined_function` (an extension is not an `InterfaceElement`, so
-    /// the miss keeps the top-level face rather than `undefined_method`).
+    /// constraint walk (silent). `this.real2` misses and names `M`.
+    /// `real3` is the bare decidable miss: `extension X on C` fully walks
+    /// `C`, `C` lacks the name, the member scope is final — the oracle
+    /// keeps the top-level `undefined_function` face (the on-type names
+    /// only the explicit-`this` member walks). `this.real4` misses and
+    /// names the `on`-type head `C`.
     #[test]
-    fn mixin_and_extension_bodies_suppress_member_misses() {
+    fn mixin_and_extension_bodies_decidable_misses_report_on_this_type() {
         let report = report(
             "class C { void real() {} } \
              mixin M on C { void f() { real(); this.real2(); } } \
@@ -5473,9 +5475,24 @@
         );
         assert_eq!(
             code_names(&report),
-            ["undefined_function"],
+            [
+                // this.real2() — a mixin body's `this` is the mixin itself.
+                "undefined_method",
+                // real3() — the bare miss keeps the top-level face.
+                "undefined_function",
+                // this.real4() — an extension body's `this` is the on type.
+                "undefined_method",
+            ],
             "{:?}",
             code_names(&report)
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The method 'real2' isn't defined for the type 'M'."
+        );
+        assert_eq!(
+            report.diagnostics[2].message,
+            "The method 'real4' isn't defined for the type 'C'."
         );
     }
 

@@ -1610,32 +1610,42 @@ impl<'a> Engine<'a> {
             }
             return;
         }
+        // The `on`-face union (#2186 S2): `walk_members` never climbs a
+        // mixin's `on` constraints or an extension's extended type, but
+        // those members ride the receiver's interface (`this`'s static
+        // type inside an extension IS the `on` type). A carried member
+        // resolves the access; a face the model cannot walk keeps the
+        // record-only path (the constraint may carry the member). A
+        // decidable miss reports like the oracle's `InstanceLookupDomain` —
+        // the miss names `this`'s static type: the mixin itself for a mixin
+        // body, the `on` type for an extension body. An unresolved on-name
+        // is the oracle's `InvalidType` extendedType — its member misses
+        // stay silent. A declared-type receiver's decidable miss keeps
+        // naming the written static type (the class-family tail below owns
+        // the shared emission).
+        let mut report_on = container;
         if matches!(kind, ContainerKind::Mixin | ContainerKind::Extension) {
-            // The `on`-face union (#2186 S2): `walk_members` never climbs a
-            // mixin's `on` constraints or an extension's extended type, but
-            // those members ride the receiver's interface (`this`'s static
-            // type inside an extension IS the `on` type). A carried member
-            // resolves the access; a face the model cannot walk keeps the
-            // record-only path (the constraint may carry the member). A
-            // `this` receiver keeps the pinned record-only arm on a
-            // decidable miss — the emit-side flip rides with the union's
-            // resolution follow-up, where the `on`-type head, never the
-            // extension, names the report.
-            let silent = matches!(recv, Receiver::This { .. })
-                || !matches!(
-                    self.on_face_walk(container, kind, row.name),
-                    Walk::Missing
-                );
-            if silent {
+            if !matches!(
+                self.on_face_walk(container, kind, row.name),
+                Walk::Missing
+            ) {
                 self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                 return;
             }
-            // A declared-type receiver's decidable miss reports its access
-            // intent naming the static type (the class-family tail below
-            // owns the shared emission).
+            if kind == ContainerKind::Extension && matches!(recv, Receiver::This { .. }) {
+                match self.enclosing_extension_on_type(container) {
+                    Some(on) => report_on = on,
+                    // The on-name never resolved — nothing honest names the
+                    // report, so the record-only posture holds here too.
+                    None => {
+                        self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                        return;
+                    }
+                }
+            }
         }
         let name_text = self.strings.resolve(row.name);
-        let type_text = self.strings.resolve(container).to_string();
+        let type_text = self.strings.resolve(report_on).to_string();
         match row.intent {
             Intent::Invoke => {
                 self.emit(
