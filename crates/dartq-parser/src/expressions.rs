@@ -255,6 +255,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let is_dot_shorthand = self.peek_kind() == TokenKind::Period
             && (is_identifier(self.cursor.look_kind(1))
                 || self.cursor.look_kind(1) == TokenKind::Keyword(Keyword::New));
+        // The first token of this frame's operand: the official
+        // assignment-target reports anchor on the whole LHS's `beginToken`
+        // (`missingAssignableSelector` at `lhs.beginToken`,
+        // ast_builder.dart:3831-3836; `illegalAssignmentToNonAssignable` at
+        // the invalid target's begin, :4429-4432), and every assignment arm
+        // in this frame carries exactly this operand as its LHS.
+        let lhs_begin = self.peek_span();
         let mut left;
         let mut type_arg = TypeParamOrArg::None;
         if is_dot_shorthand {
@@ -272,7 +279,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             self.listener.handle_dot_shorthand_head(dot);
             self.report_dot_shorthands_gate(dot);
             self.listener.handle_dot_shorthand_context(dot);
-            let end = self.precedence_loop(precedence, allow_cascades, type_arg, left, false);
+            let end =
+                self.precedence_loop(precedence, allow_cascades, type_arg, left, false, lhs_begin);
             self.leave_depth();
             return end;
         } else {
@@ -284,7 +292,14 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
 
         if is_dot_shorthand {
             let dot = self.peek_span();
-            left = self.precedence_loop(SELECTOR_PRECEDENCE, allow_cascades, type_arg, left, true);
+            left = self.precedence_loop(
+                SELECTOR_PRECEDENCE,
+                allow_cascades,
+                type_arg,
+                left,
+                true,
+                lhs_begin,
+            );
             // Capture a trailing null assert before the context event
             // (:6587-6600).
             if self.peek_kind() == TokenKind::Bang {
@@ -297,7 +312,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             type_arg = TypeParamOrArg::None;
         }
 
-        let end = self.precedence_loop(precedence, allow_cascades, type_arg, left, false);
+        let end = self.precedence_loop(precedence, allow_cascades, type_arg, left, false, lhs_begin);
         self.leave_depth();
         end
     }
@@ -305,7 +320,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// The binary walk (`_parsePrecedenceExpressionLoop` :6617). `left` is
     /// the already-parsed operand span; `type_arg` carries a pending method
     /// type-argument group into the selector arms; `is_dot_shorthand` marks
-    /// the first selector step as the dot-shorthand member.
+    /// the first selector step as the dot-shorthand member; `lhs_begin` is
+    /// the operand's first token (the official assignment-target report
+    /// anchor, `lhs.beginToken`).
     #[allow(clippy::too_many_lines)] // mirrors the official arm structure
     fn precedence_loop(
         &mut self,
@@ -314,7 +331,20 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         mut type_arg: TypeParamOrArg,
         mut left: TokenSpan,
         mut is_dot_shorthand: bool,
+        lhs_begin: TokenSpan,
     ) -> TokenSpan {
+        // Whether the operand currently ends in an assignable `]` shape: a
+        // selector-attached index group (`a[i]`) or a `.`/`?.` bracket
+        // operand replaced by a synthetic name (`c1?.[0]` — null-aware
+        // property extraction). The official assignability test is the
+        // parsed EXPRESSION shape (`_isAssignable`, ast_builder.dart:6607):
+        // index expressions and property extractions are assignable, a list
+        // literal is not — both end in `]`, so the shape is carried here
+        // instead of re-derived from the last token. Set by the selector
+        // index arms and the dot bracket-operand face; every other operand
+        // rebinding (binary, cascade, postfix, written-out operators)
+        // yields a different shape and clears it.
+        let mut lhs_ends_index = false;
         // An identifier here has no precedence (`NO_PRECEDENCE`, :7079) —
         // both the `Some`-below-floor and `None` cases land in the entry
         // recovery attempt (:6644-6659). An accepted written-out operator
@@ -332,6 +362,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             // Entry-floor recovery attempt (currentLevel = -1).
             if let Some((new_left, _)) = self.attempt_written_out_operator(-1, allow_cascades) {
                 left = new_left;
+                lhs_ends_index = false;
                 is_dot_shorthand = false;
                 continue;
             }
@@ -358,6 +389,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
                 last_cascade = true;
                 left = self.parse_cascade_expression(left);
+                lhs_ends_index = false;
             } else if token_level == ASSIGNMENT_PRECEDENCE {
                 // AstBuilder assignment-target checks: `handleAssignment-
                 // Expression` (ast_builder.dart:3824-3841) reports
@@ -373,12 +405,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // no separate target re-check. The statement-level
                 // postfix variant (:5849-5860) keeps its own shape.
                 // `Token.isOperator`-style proxy for the assignability check
-                // (:5856): the LHS must end in an identifier (or `]` of an
-                // index target). The final LHS token's kind: a table id is
-                // read back by offset (a span id can alias an inserted
-                // token); an inserted (synthetic) token is read by id — its
-                // offset points at the real token it stands in for, never at
-                // itself.
+                // (:5856): the LHS must end in an identifier (or the `]` of
+                // a selector-attached index target — `lhs_ends_index`
+                // distinguishes it from a list literal's closer). The final
+                // LHS token's kind: a table id is read back by offset (a
+                // span id can alias an inserted token); an inserted
+                // (synthetic) token is read by id — its offset points at the
+                // real token it stands in for, never at itself.
                 let lhs_last = self.cursor.last_consumed_id().map(|id| {
                     if (id as usize) < self.table.len() {
                         self.kind_at(self.offset_of(id))
@@ -400,13 +433,24 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // lane), so a real `this`-ending target only occurs
                     // through selector chains ending in a name.
                     Some(kind) if is_identifier(kind) => {}
-                    Some(TokenKind::CloseSquare | TokenKind::Keyword(Keyword::This)) => {}
+                    // An index target (`a[i] = 1`, `super[i] = 1`) — the
+                    // `]` must close a selector-attached group; a
+                    // literal-topped `]` is a list literal and falls through
+                    // to the non-assignable arm (`const [r] = g()`).
+                    Some(TokenKind::CloseSquare) if lhs_ends_index => {}
+                    Some(TokenKind::Keyword(Keyword::This)) => {}
                     Some(TokenKind::Keyword(Keyword::Super)) => {
                         self.report(msg::missing_assignable_selector(), left);
                     }
+                    // `missingAssignableSelector` at `lhs.beginToken`
+                    // (ast_builder.dart:3831-3836) and the statement-level
+                    // `illegalAssignmentToNonAssignable` rider at the
+                    // invalid target's begin (:4429-4432) — both anchor on
+                    // the LHS's first token (`const [r] = g()` reports at
+                    // the `const` head, never at the literal closer).
                     _ => {
-                        self.report(msg::missing_assignable_selector(), left);
-                        self.report(msg::illegal_assignment_to_non_assignable(), left);
+                        self.report(msg::missing_assignable_selector(), lhs_begin);
+                        self.report(msg::illegal_assignment_to_non_assignable(), lhs_begin);
                     }
                 }
                 // Right associative: recurse at the same level (:6671-6691).
@@ -492,6 +536,17 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         ) {
                             self.report(msg::missing_identifier(), operand);
                         }
+                        // A bracket operand (`c1?.[0] = 1`) is replaced by a
+                        // synthetic name: the official shape is (null-aware)
+                        // property extraction, an assignable target (oracle
+                        // null_shorting_index line 13 reports only the
+                        // missing_identifier row on the assignment — no
+                        // selector rows). The last real token is the `]`, so
+                        // the shape flag must carry the assignability.
+                        lhs_ends_index = matches!(
+                            operand_kind,
+                            TokenKind::OpenSquare | TokenKind::Index
+                        );
                         if is_dot_shorthand {
                             self.listener.handle_dot_shorthand_head(dot);
                             self.report_dot_shorthands_gate(dot);
@@ -508,30 +563,37 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         type_arg = ta;
                     }
                     TokenKind::OpenParen | TokenKind::OpenSquare => {
-                        let (end, ta) = self.parse_argument_or_index_star(left, type_arg, false);
+                        let (end, ta, ends_index) =
+                            self.parse_argument_or_index_star(left, type_arg, false);
                         left = end;
                         type_arg = ta;
+                        lhs_ends_index = ends_index;
                     }
                     TokenKind::Question => {
                         // Selector-level `?` is a null-aware index (decided
                         // by `precedence_of` via speculation).
-                        let (end, ta) = self.parse_argument_or_index_star(left, type_arg, true);
+                        let (end, ta, ends_index) =
+                            self.parse_argument_or_index_star(left, type_arg, true);
                         left = end;
                         type_arg = ta;
+                        lhs_ends_index = ends_index;
                     }
                     TokenKind::Index => {
                         // Split `[]` so the index machinery sees `[`
                         // (official `rewriteSquareBrackets` :4743).
                         self.rewrite_square_brackets();
-                        let (end, ta) = self.parse_argument_or_index_star(left, type_arg, false);
+                        let (end, ta, ends_index) =
+                            self.parse_argument_or_index_star(left, type_arg, false);
                         left = end;
                         type_arg = ta;
+                        lhs_ends_index = ends_index;
                     }
                     TokenKind::Bang => {
                         let bang = self.peek_span();
                         self.listener.handle_non_null_assert_expression(bang);
                         self.cursor.advance();
                         left = bang;
+                        lhs_ends_index = false;
                     }
                     _ => {
                         // Recovery (:6796-6801).
@@ -539,14 +601,18 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
                         self.cursor.advance();
                         left = at;
+                        lhs_ends_index = false;
                     }
                 }
             } else if kind == TokenKind::Keyword(Keyword::Is) {
                 left = self.parse_is_operator_rest();
+                lhs_ends_index = false;
             } else if kind == TokenKind::Keyword(Keyword::As) {
                 left = self.parse_as_operator_rest();
+                lhs_ends_index = false;
             } else if kind == TokenKind::Question {
                 left = self.parse_conditional_expression_rest();
+                lhs_ends_index = false;
             } else {
                 // Plain binary (:6818-6851). Equality/relational chains are
                 // rejected once per tier.
@@ -565,6 +631,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 let right = self.parse_precedence(level + 1, allow_cascades);
                 self.listener.end_binary_expression(operator, right);
                 left = right;
+                lhs_ends_index = false;
             }
             // Loop bookkeeping (:6874-6920). A `None` precedence is an
             // identifier position — exactly where the official recovery
@@ -576,6 +643,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         self.attempt_written_out_operator(-1, allow_cascades)
                     {
                         left = new_left;
+                        lhs_ends_index = false;
                         // Official post-acceptance bookkeeping: recompute the
                         // follower's level and re-run the `<= level` check
                         // with it (:6905-6920).
@@ -944,14 +1012,17 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// Official `parseArgumentOrIndexStar`: the `(...)`/`[...]` selector
     /// loop. `begin` is the receiving-expression span, `type_arg` a pending
     /// method type-argument group, `checked_null_aware` whether the caller
-    /// already resolved the `?[` ambiguity.
+    /// already resolved the `?[` ambiguity. The third return value is
+    /// whether the loop's FINAL step was an index group (the operand ends in
+    /// a selector-attached `]`, the assignable index shape).
     fn parse_argument_or_index_star(
         &mut self,
         begin: TokenSpan,
         mut type_arg: TypeParamOrArg,
         checked_null_aware: bool,
-    ) -> (TokenSpan, TypeParamOrArg) {
+    ) -> (TokenSpan, TypeParamOrArg, bool) {
         let mut end = begin;
+        let mut ends_index = false;
         loop {
             let mut potential_null_aware = self.peek_kind() == TokenKind::Question
                 && self.cursor.look_kind(1) == TokenKind::OpenSquare;
@@ -1039,6 +1110,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
                 self.listener
                     .handle_indexed_expression(question, open, close);
+                ends_index = true;
                 let (next_end, ta) = self.parse_method_type_args_block(end);
                 end = next_end;
                 type_arg = ta;
@@ -1049,6 +1121,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 }
                 end = self.parse_arguments_rest();
                 self.listener.handle_send(begin, end);
+                ends_index = false;
                 let (next_end, ta) = self.parse_method_type_args_block(end);
                 end = next_end;
                 type_arg = ta;
@@ -1056,7 +1129,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 break;
             }
         }
-        (end, type_arg)
+        (end, type_arg, ends_index)
     }
 
     // ------------------------------------------------------------------
@@ -1208,7 +1281,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // Split `[]` here or the cascade stops parsing (:7145-7151).
                 self.rewrite_square_brackets();
             }
-            let (sel_end, _) = self.parse_argument_or_index_star(end, type_arg, false);
+            let (sel_end, _, _) = self.parse_argument_or_index_star(end, type_arg, false);
             end = sel_end;
             if self.cursor.peek_id() == before {
                 break;

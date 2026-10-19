@@ -1035,6 +1035,70 @@ fn builtin_identifier_assignment_target_stays_assignable() {
 }
 
 #[test]
+fn const_list_literal_lhs_reports_both_codes_at_const_head() {
+    // `const [r] = g();` (live oracle probe, Dart 3.13): the `const` prefix
+    // breaks the outer-pattern probe (assignment patterns never take a
+    // const prefix), so the statement parses as an expression whose LHS is
+    // a const list literal — `_isAssignable` (ast_builder.dart:6607)
+    // rejects ListLiteral, and BOTH assignment-target rows anchor on the
+    // `const` head (oracle: illegal_assignment_to_non_assignable +
+    // missing_assignable_selector at 3:3). The pre-#2157 admission read any
+    // `]`-ending LHS as an index target and stayed silent here.
+    let c = parse("int g() => 0;\nvoid f() {\n  const [r] = g();\n}\n");
+    // `const` at line 3 col 3 = byte offset 27, length 5.
+    assert_eq!(
+        c.error_rows(),
+        [
+            ("missing_assignable_selector", 27, 5),
+            ("illegal_assignment_to_non_assignable", 27, 5),
+        ],
+        "const list literal LHS reports both codes at the const head"
+    );
+}
+
+#[test]
+fn const_record_lhs_codes_anchor_at_const_head() {
+    // `const (q,) = g();` — the record twin of the list-literal face; the
+    // official rows anchor on the `const` head (oracle 3:3), never on the
+    // literal's closer (the pre-#2157 anchor).
+    let c = parse("int g() => 0;\nvoid f() {\n  const (q,) = g();\n}\n");
+    assert_eq!(
+        c.error_rows(),
+        [
+            ("missing_assignable_selector", 27, 5),
+            ("illegal_assignment_to_non_assignable", 27, 5),
+        ],
+        "const record literal LHS anchors at the const head"
+    );
+}
+
+#[test]
+fn index_target_shapes_stay_assignable() {
+    // Selector-attached index groups keep the official silence
+    // (ReceiverIndexExpressionImpl / CascadeIndexExpressionImpl are
+    // assignable — oracle probes: `a[i] = 1`, `a[i][j] = 1`, `(a)[i] = 1`,
+    // `const [0][i] = 1` all parser-silent; the last one indexes the
+    // literal, which is still a receiver-index shape), while a
+    // literal-topped `]` never is. A binary operand rebinding clears the
+    // index shape: `b[0] + b[i] = 3` assigns to a binary expression and
+    // reports both codes at the operand head `b` (oracle 2:3).
+    let c = parse(
+        "void f(List<int> a, int i, int j) {\n  a[i] = 1;\n  a[i][j] = 1;\n  (a)[i] = 1;\n  const [0][i] = 1;\n}\n",
+    );
+    assert!(c.errors.is_empty(), "{:?}", c.error_rows());
+    let c = parse("void f(List<int> b, int i) {\n  b[0] + b[i] = 3;\n}\n");
+    // `b` at line 2 col 3 = byte offset 31, length 1.
+    assert_eq!(
+        c.error_rows(),
+        [
+            ("missing_assignable_selector", 31, 1),
+            ("illegal_assignment_to_non_assignable", 31, 1),
+        ],
+        "binary LHS ending in an index reports at the operand head"
+    );
+}
+
+#[test]
 fn const_dot_shorthand_incomplete_member_recovers() {
     // `Color c = const .;` (oracle dot_shorthands/const_no_identifier_recovery):
     // the member after `.` is missing. The pinned 3.13.1 oracle faces
