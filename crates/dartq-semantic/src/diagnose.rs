@@ -23756,6 +23756,13 @@ impl ConstLookup for CtorScope<'_, '_> {
         self.engine.member(recv, name)
     }
 
+    fn prefixed(&self, prefix: StringId, name: StringId) -> Option<IdentVerdict> {
+        if self.env.contains_key(&prefix) {
+            return None;
+        }
+        self.engine.prefixed(prefix, name)
+    }
+
     fn is_identical(&self, name: StringId) -> bool {
         self.engine.is_identical(name)
     }
@@ -23833,6 +23840,25 @@ impl ConstLookup for Engine<'_> {
             return Verdict::Value(v.clone());
         }
         Verdict::Constant
+    }
+
+    /// `p.name` through an import prefix: a name the prefix's namespace
+    /// answers stays a deferring constant (its value is foreign); a miss —
+    /// a broken import, or a name its library does not export — is
+    /// unresolved (`const x = [diag.a]` over a missing import reports at
+    /// the reference, exactly like a bare undefined name).
+    fn prefixed(&self, prefix: StringId, name: StringId) -> Option<IdentVerdict> {
+        if self.const_scopes.iter().any(|s| s.contains_key(&prefix))
+            || self.frames.iter().any(|f| f.locals.contains(&prefix))
+            || !matches!(self.resolve_bare(prefix).0, BareInfo::Prefix { .. })
+        {
+            return None;
+        }
+        Some(if self.prefixed_hit(prefix, name) {
+            IdentVerdict::Constant
+        } else {
+            IdentVerdict::Unresolved
+        })
     }
 
     fn is_identical(&self, name: StringId) -> bool {
@@ -24516,15 +24542,65 @@ impl<'a> Engine<'a> {
     /// Elements of a closed explicit const literal: each evaluates
     /// against its `non_constant_*_element` default (the
     /// `_ConstLiteralVerifier` site).
-    pub fn check_const_elements(&mut self, code: SemanticCode, parts: &[crate::const_eval::Node]) {
+    /// Checks each element of a const literal against `code`. Returns the
+    /// first non-constant element's anchor: the literal itself is then not
+    /// a constant, and the enclosing declaration's verdict reports there
+    /// (`const x = [nc]` carries both `non_constant_list_element` and
+    /// `const_initialized_with_non_constant_value` at `nc`). A nested
+    /// literal's failure re-surfaces at the outer element with the same
+    /// anchor; the oracle's diagnostic set collapses the identical row
+    /// (`RecordingDiagnosticListener` stores a `Set<Diagnostic>`), so the
+    /// emit skips an exact repeat.
+    pub fn check_const_elements(
+        &mut self,
+        code: SemanticCode,
+        parts: &[crate::const_eval::Node],
+    ) -> Option<SourceRange> {
+        let mut failed = None;
         for part in parts {
             match eval(part, self) {
                 Verdict::Value(_) | Verdict::Constant => {}
                 Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
-                    self.emit(code, span, "", "")
+                    let info = code.code_info();
+                    let repeat = self
+                        .report
+                        .diagnostics
+                        .iter()
+                        .rev()
+                        .any(|d| d.range == span && d.code == info);
+                    if !repeat {
+                        self.emit(code, span, "", "");
+                    }
+                    failed.get_or_insert(span);
                 }
-                Verdict::Fault(fault, span) => self.emit_const_fault(fault, span),
+                Verdict::Fault(fault, span) => {
+                    self.emit_const_fault(fault, span);
+                    failed.get_or_insert(span);
+                }
             }
+        }
+        failed
+    }
+
+    /// Pushes a closed const literal's value onto the capture: its
+    /// instance when every element was constant, else a non-constant leaf
+    /// anchored at the first failing element (so the enclosing
+    /// initializer's verdict reports there). Inside a creation's argument
+    /// list the failure stays local — the oracle's argument faces there
+    /// are `invalid_constant`, which this face does not model.
+    fn push_literal_value(
+        &mut self,
+        failed: Option<SourceRange>,
+        end: SourceRange,
+        kind: crate::const_eval::InstanceKind,
+    ) {
+        match failed {
+            Some(span) if !self.const_capture.in_arguments() => {
+                self.const_capture.push_non_constant(span);
+            }
+            _ => self
+                .const_capture
+                .push_value(end, ConstantValue::Instance(kind)),
         }
     }
 
@@ -30707,8 +30783,11 @@ impl ParserListener for DiagnoseListener<'_> {
         // the oracle's `InvalidType` early-return maps to the same silence.
         if let Some(node) = engine.const_capture.close_constant_pattern() {
             match eval(&node, engine) {
-                Verdict::Value(_) | Verdict::Constant => {}
-                Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
+                // An unresolved reference is the oracle's `InvalidType`
+                // early-return (constant_verifier.dart:134-136): the
+                // resolution row (`undefined_prefixed_name`, ...) answers.
+                Verdict::Value(_) | Verdict::Constant | Verdict::Unresolved(_) => {}
+                Verdict::NotConstant(span) => {
                     // The oracle's `InvalidType` early-return
                     // (constant_verifier.dart:134-136): when resolution
                     // already answered inside the expression's span — an
@@ -31562,11 +31641,9 @@ impl ParserListener for DiagnoseListener<'_> {
             // Implicit const literals in a const context check per element
             // with the element code too (the oracle evaluates the literal
             // at the enclosing site).
-            engine.check_const_elements(SemanticCode::NonConstantListElement, &elements);
-            engine.const_capture.push_value(
-                right.range,
-                ConstantValue::Instance(crate::const_eval::InstanceKind::List),
-            );
+            let failed =
+                engine.check_const_elements(SemanticCode::NonConstantListElement, &elements);
+            engine.push_literal_value(failed, right.range, crate::const_eval::InstanceKind::List);
         }
         engine.check_list_literal_elements(left, right);
         // The literal folds to one expression node upstream: its element
@@ -31678,17 +31755,25 @@ impl ParserListener for DiagnoseListener<'_> {
         {
             match shape {
                 SetOrMap::Map(entries) => {
-                    let flat: Vec<_> = entries.into_iter().flat_map(|(k, v)| [k, v]).collect();
-                    engine.check_const_elements(SemanticCode::NonConstantMapElement, &flat);
-                    engine
-                        .const_capture
-                        .push_value(right.range, ConstantValue::Instance(InstanceKind::Map));
+                    // The oracle names the failing side
+                    // (`_validateMapLiteralEntry`): `non_constant_map_key` /
+                    // `non_constant_map_value` at each entry's key and value.
+                    let mut failed = None;
+                    for (key, value) in entries {
+                        for (code, part) in [
+                            (SemanticCode::NonConstantMapKey, key),
+                            (SemanticCode::NonConstantMapValue, value),
+                        ] {
+                            let at = engine.check_const_elements(code, std::slice::from_ref(&part));
+                            failed = failed.or(at);
+                        }
+                    }
+                    engine.push_literal_value(failed, right.range, InstanceKind::Map);
                 }
                 SetOrMap::Set(elements) => {
-                    engine.check_const_elements(SemanticCode::NonConstantSetElement, &elements);
-                    engine
-                        .const_capture
-                        .push_value(right.range, ConstantValue::Instance(InstanceKind::Set));
+                    let failed =
+                        engine.check_const_elements(SemanticCode::NonConstantSetElement, &elements);
+                    engine.push_literal_value(failed, right.range, InstanceKind::Set);
                 }
             }
         }
@@ -31807,10 +31892,12 @@ impl ParserListener for DiagnoseListener<'_> {
         // `RecordLiteral` is in the official used set.
         engine.ur_seal_used();
         if let Some(fields) = engine.const_capture.record_literal(count, token.range) {
-            engine.check_const_elements(SemanticCode::NonConstantRecordField, &fields);
-            engine.const_capture.push_value(
+            let failed =
+                engine.check_const_elements(SemanticCode::NonConstantRecordField, &fields);
+            engine.push_literal_value(
+                failed,
                 token.range,
-                ConstantValue::Instance(crate::const_eval::InstanceKind::Record),
+                crate::const_eval::InstanceKind::Record,
             );
         }
         // The literal's row: a single positional field whose type the field
@@ -36060,6 +36147,57 @@ mod tests {
         assert!(report.diagnostics.is_empty());
         assert_eq!(report.names.len(), 1);
         assert_eq!(report.names[0].use_kind, NameUse::Read);
+    }
+
+    /// The const cascade (oracle-pinned, dart 3.15): a prefixed name
+    /// through a broken import is an unresolved reference, so a const list
+    /// holding it reports `non_constant_list_element` AND the declaration
+    /// reports `const_initialized_with_non_constant_value` at the same
+    /// element; a nested literal's failure surfaces once per code; map
+    /// entries name the failing side (`non_constant_map_key` / `_value`).
+    #[test]
+    fn const_literal_failures_cascade_to_the_declaration() {
+        let source = "int nc = 1; const a = [diag.x]; const b = [[nc]]; const c = {nc: 1}; \
+                      const d = (nc, 1);";
+        let report = report_with_edge(source, |strings| {
+            Some(ImportEdge {
+                target: None,
+                prefix: Some(strings.intern("diag")),
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            })
+        });
+        let rows: Vec<(&str, &str)> = report
+            .diagnostics
+            .iter()
+            .map(|d| {
+                let at = &source[d.range.offset as usize..d.range.end() as usize];
+                (d.code.name, at)
+            })
+            .collect();
+        let expect = [
+            ("non_constant_list_element", "diag.x"),
+            ("const_initialized_with_non_constant_value", "diag.x"),
+            ("non_constant_list_element", "nc"),
+            ("const_initialized_with_non_constant_value", "nc"),
+            ("non_constant_map_key", "nc"),
+            ("non_constant_record_field", "nc"),
+        ];
+        for row in expect {
+            assert!(rows.contains(&row), "{row:?} missing from {rows:?}");
+        }
+        let nested = rows
+            .iter()
+            .filter(|r| r.0 == "non_constant_list_element" && r.1 == "nc")
+            .count();
+        assert_eq!(nested, 1, "{rows:?}");
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.0 == "const_initialized_with_non_constant_value")
+                .count(),
+            4,
+            "{rows:?}"
+        );
     }
 
     /// A bare miss under an *unfiltered* broken import still reports — the
@@ -40751,18 +40889,23 @@ mod tests {
         );
         // The const locals `a`/`b`/`c`/`d` are never read (the official
         // read-only use rule); each element verdict anchors at its `l`
-        // element, interleaving in source order.
+        // element, and the failed literal fails the declaration at the same
+        // element (oracle-pinned); map entries name the failing side.
         assert_eq!(
             code_names(&rep),
             [
                 "unused_local_variable",
                 "non_constant_list_element",
+                "const_initialized_with_non_constant_value",
                 "unused_local_variable",
                 "non_constant_set_element",
+                "const_initialized_with_non_constant_value",
                 "unused_local_variable",
-                "non_constant_map_element",
+                "non_constant_map_key",
+                "const_initialized_with_non_constant_value",
                 "unused_local_variable",
                 "non_constant_record_field",
+                "const_initialized_with_non_constant_value",
             ],
             "{:?}",
             code_names(&rep)

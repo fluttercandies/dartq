@@ -287,6 +287,14 @@ pub trait ConstLookup {
     fn ident(&self, name: StringId) -> IdentVerdict;
     /// Resolves `recv.name` where `recv` evaluated to a non-null value.
     fn member(&self, recv: &ConstantValue, name: StringId) -> Verdict;
+    /// Classifies `prefix.name` when `prefix` is an import prefix; `None`
+    /// when it is not one (the member path decides). A prefixed name the
+    /// prefix's namespace cannot answer — a broken import or a missing
+    /// export — is [`IdentVerdict::Unresolved`] (the oracle's `InvalidType`
+    /// reference, `isUnresolved: true`).
+    fn prefixed(&self, _prefix: StringId, _name: StringId) -> Option<IdentVerdict> {
+        None
+    }
     /// Whether `name` is the callee spelling of `identical` (the one
     /// invocable function).
     fn is_identical(&self, name: StringId) -> bool;
@@ -343,6 +351,17 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
             IdentVerdict::Unresolved => Verdict::Unresolved(node.span),
         },
         Expr::Member { recv, name } => {
+            if let Expr::Ident(prefix) = recv.expr
+                && let Some(verdict) = lookup.prefixed(prefix, *name)
+            {
+                return match verdict {
+                    IdentVerdict::Value(v) => Verdict::Value(v),
+                    IdentVerdict::Constant => Verdict::Constant,
+                    IdentVerdict::InProgress => Verdict::Fault(ConstFault::Recursive, node.span),
+                    IdentVerdict::NotConstant => Verdict::NotConstant(node.span),
+                    IdentVerdict::Unresolved => Verdict::Unresolved(node.span),
+                };
+            }
             let r = fold(recv, lookup, depth);
             match r {
                 Verdict::Value(v) if v != ConstantValue::Null => lookup.member(&v, *name),
@@ -2011,6 +2030,7 @@ impl ConstCapture {
         let Some(name) = self.pop_clamped(base) else {
             return;
         };
+        let name_end = name.span.end();
         let Expr::Ident(name) = name.expr else {
             // A malformed receiver part (recovery): restore and drop.
             self.stack.push(name);
@@ -2030,9 +2050,11 @@ impl ConstCapture {
         let Some(recv) = self.pop_clamped(base) else {
             return;
         };
+        // The access ends at its selector: `end` is the parser's following
+        // token, so the selector node's own span is the oracle anchor.
         let span = SourceRange {
             offset: recv.span.offset,
-            length: end.end().saturating_sub(recv.span.offset),
+            length: name_end.saturating_sub(recv.span.offset),
         };
         self.push(
             Node {
@@ -2597,6 +2619,27 @@ impl ConstCapture {
             },
             true,
         );
+    }
+
+    /// Pushes a provably non-constant leaf anchored at `span` (a const
+    /// literal whose element failed).
+    pub fn push_non_constant(&mut self, span: SourceRange) {
+        if self.open() {
+            self.push(
+                Node {
+                    expr: Expr::Other,
+                    span,
+                },
+                true,
+            );
+        }
+    }
+
+    /// Whether the capture sits inside an open argument list (of any
+    /// window).
+    #[must_use]
+    pub fn in_arguments(&self) -> bool {
+        !self.args.is_empty()
     }
 
     /// Pushes a known constant leaf (an opaque collection/creation value

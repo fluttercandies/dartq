@@ -274,6 +274,10 @@ pub enum SemanticCode {
     NonConstantSetElement,
     /// `The elements in a const map literal must be constant.`
     NonConstantMapElement,
+    /// `The keys in a const map literal must be constant.`
+    NonConstantMapKey,
+    /// `The values in a const map literal must be constant.`
+    NonConstantMapValue,
     /// `The fields in a const record literal must be constants.`
     NonConstantRecordField,
     /// `The expression of a constant pattern must be a valid constant.` —
@@ -1387,6 +1391,8 @@ impl SemanticCode {
             }
             Self::NonConstantSetElement => ("non_constant_set_element", "NON_CONSTANT_SET_ELEMENT"),
             Self::NonConstantMapElement => ("non_constant_map_element", "NON_CONSTANT_MAP_ELEMENT"),
+            Self::NonConstantMapKey => ("non_constant_map_key", "NON_CONSTANT_MAP_KEY"),
+            Self::NonConstantMapValue => ("non_constant_map_value", "NON_CONSTANT_MAP_VALUE"),
             Self::NonConstantRecordField => {
                 ("non_constant_record_field", "NON_CONSTANT_RECORD_FIELD")
             }
@@ -2204,6 +2210,10 @@ impl SemanticCode {
             }
             Self::NonConstantMapElement => {
                 "The elements in a const map literal must be constant.".to_string()
+            }
+            Self::NonConstantMapKey => "The keys in a const map literal must be constant.".to_string(),
+            Self::NonConstantMapValue => {
+                "The values in a const map literal must be constant.".to_string()
             }
             Self::NonConstantRecordField => {
                 "The fields in a const record literal must be constants.".to_string()
@@ -3351,6 +3361,8 @@ mod tests {
             SemanticCode::NonConstantListElement,
             SemanticCode::NonConstantSetElement,
             SemanticCode::NonConstantMapElement,
+            SemanticCode::NonConstantMapKey,
+            SemanticCode::NonConstantMapValue,
             SemanticCode::NonConstantRecordField,
             SemanticCode::ConstantPatternWithNonConstantExpression,
             SemanticCode::NonConstantCaseExpression,
@@ -3629,6 +3641,8 @@ mod tests {
         SemanticCode::NonConstantListElement,
         SemanticCode::NonConstantSetElement,
         SemanticCode::NonConstantMapElement,
+        SemanticCode::NonConstantMapKey,
+        SemanticCode::NonConstantMapValue,
         SemanticCode::NonConstantRecordField,
         SemanticCode::ConstEvalTypeBool,
         SemanticCode::ConstEvalTypeBoolInt,
@@ -4171,6 +4185,8 @@ mod tests {
             | SemanticCode::NonConstCallToLiteralConstructor
             | SemanticCode::NonConstantListElement
             | SemanticCode::NonConstantMapElement
+            | SemanticCode::NonConstantMapKey
+            | SemanticCode::NonConstantMapValue
             | SemanticCode::NonConstantRecordField
             | SemanticCode::NonConstantSetElement
             | SemanticCode::NonExhaustiveSwitchExpression
@@ -4378,6 +4394,8 @@ mod tests {
             SemanticCode::NonConstCallToLiteralConstructor,
             SemanticCode::NonConstantListElement,
             SemanticCode::NonConstantMapElement,
+            SemanticCode::NonConstantMapKey,
+            SemanticCode::NonConstantMapValue,
             SemanticCode::NonConstantRecordField,
             SemanticCode::NonConstantSetElement,
             SemanticCode::NonExhaustiveSwitchExpression,
