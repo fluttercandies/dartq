@@ -56,6 +56,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sealed-scrutinee exhaustiveness answers across imports, the six base ops
   resolve every recorder-observed name, and `is!`-promotion factors generic
   receivers through their written argument trees (#2204).
+- Clause trees for generic subtyping: per-clause captures (type
+  parameters, supertype spellings) travel through the library snapshot
+  into `is_subtype_typed`, so subtype and promotion verdicts penetrate
+  written type arguments per clause instead of comparing bare heads;
+  the flow model's four base sites consume the typed seam and
+  `try_promote` keeps the strict `is_subtype(t, f) && !is_subtype(f, t)`
+  gate (#2204).
 
 ### Changed
 
@@ -236,6 +243,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the parser mux, so production `Container` constructor faces populate for
   classes, enums, and extension types alike; extension-type invocations
   are pinned to the oracle's contract (#2212, #2226).
+- The cast bool-latch no longer roots at `bool?`-blind gates, and frozen
+  interface member verdicts (Defined/Absent/Unknown) report per member
+  instead of blanket-suppressing (#2225).
+- Named-argument checks compare the formal's public name
+  (correspondingPublicName), cascade targets latch their receiver across
+  the chain, and type-argument depth stays guarded against regressions
+  (#2214, #2194).
+- Const-eval faces: duplicate const map keys compare bytes (UTF-16→byte
+  conversion kills phantom equal_keys), the callee-pop guard survives
+  nested argument groups, const method invocations evaluate their
+  receiver split, and the site-default latch drains at finish
+  (#2187, #2194).
+- `ignore:` citations join the canonical diagnostic name, so
+  case-variant spellings of the same code suppress the row they target
+  (#2137).
+- On-face member scope resolves through the constraint union: mixin `on`
+  constraints and extension extended types surface their members to bare
+  and `this.`-receiver accesses inside the body, with honest
+  Found/ChainBroken/Missing verdicts per member (#2186).
+- Override checking requires the inherited concrete implementation's
+  provenance (implements-reached hits no longer count), and InvalidType
+  heads at top-level granularity take the oracle's lenient posture
+  (#2192).
+- Async return checking follows the analyzer's futureValueType
+  three-branch matrix — `Future<T>`/`FutureOr<T>` unwrap one level,
+  `dynamic`/`void` pass through, everything else checks against
+  `Future<Object?>` (#2224).
+- Extension types resolve their member faces through the resolved-kind
+  lens (class-family codes for unresolved heads), frames carry their
+  extension-type context, sealed dedup no longer double-reports, and
+  `this`-captures bind per the oracle (#2218, #2222).
+- A bare miss inside an extension-type body names the extension type's
+  head (`undefined_method` on `E`, never the context-free
+  `undefined_function`), and the sealed-contract fixture declares its
+  foreign spellings so the mismatch stays real after the InvalidType
+  leniency (#2227, #2228).
+- `this`-receiver decidable misses inside mixins and extensions report
+  naming `this`'s static type — the mixin itself, or the extension's
+  `on` type; unresolved on-names stay record-only like the oracle's
+  InvalidType extendedType (#2230).
+- Parser const destructuring-target faces: a const list/record literal
+  LHS no longer rides the index-target admission and reports both
+  assignment codes, and assignment-target reports anchor on the LHS's
+  beginToken (`const (q,) = g()` 3:12 → 3:3, binary-tail anchors fixed
+  for free) (#2157).
 
 ## [1.0.0] - 2026-10-12
 
