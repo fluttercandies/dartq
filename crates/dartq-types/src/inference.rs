@@ -35,6 +35,11 @@ pub trait InferenceLattice {
     /// Whether `ty` is the unknown sentinel itself (`UnknownInferredType`).
     fn is_unknown(&self, ty: Self::Ty) -> bool;
 
+    /// The unknown sentinel itself (the official operations'
+    /// `unknownType`): what an absent bound stands for, returned when
+    /// neither bound carries information (:1063-1066).
+    fn unknown(&self) -> Self::Ty;
+
     /// Whether the sentinel occurs anywhere inside `ty`'s structure.
     fn mentions_unknown(&self, ty: Self::Ty) -> bool;
 
@@ -190,8 +195,13 @@ fn choose_type_from_constraint<T: Copy, L: InferenceLattice<Ty = T>>(
             (true, true) => lattice.least_closure(bound),
         };
     }
-    // Both bounds absent or pure unknowns (:1063-1066): the unknown stands.
-    first.unwrap_or_else(|| second.unwrap())
+    // Both bounds absent or pure unknowns (:1063-1066): the unknown
+    // stands. The official store's fields are sentinel-initialized (never
+    // absent), so a `None` bound here means the sentinel itself.
+    match first {
+        Some(bound) => bound,
+        None => second.unwrap_or_else(|| lattice.unknown()),
+    }
 }
 
 #[cfg(test)]
@@ -210,6 +220,9 @@ mod tests {
         }
         fn is_unknown(&self, ty: i32) -> bool {
             ty == 0
+        }
+        fn unknown(&self) -> i32 {
+            0
         }
         fn mentions_unknown(&self, ty: i32) -> bool {
             ty < 2
@@ -245,7 +258,10 @@ mod tests {
         assert_eq!(choose_final_type(&c, &lattice), 5);
     }
 
-    /// A known upper answers only without a known lower (:1024-1026).
+    /// A known upper answers only without a known lower (:1024-1026): a
+    /// sentinel-carrying lower does not block it, a known lower outranks
+    /// it. Upper merges join by the GLB (`mergeInTypeSchemaUpper`), so
+    /// merging 7 over 4 leaves the bound at 4.
     #[test]
     fn known_upper_after_lower() {
         let lattice = IntLattice;
@@ -254,7 +270,10 @@ mod tests {
         assert_eq!(choose_preliminary_type(&c, &lattice), 4);
         c.merge_lower(0, &lattice);
         c.merge_upper(7, &lattice);
-        assert_eq!(choose_final_type(&c, &lattice), 7);
+        assert_eq!(c.upper(), Some(4));
+        assert_eq!(choose_final_type(&c, &lattice), 4);
+        c.merge_lower(5, &lattice);
+        assert_eq!(choose_final_type(&c, &lattice), 5);
     }
 
     /// The partial-upper grounding: the downward phase keeps the schema,
