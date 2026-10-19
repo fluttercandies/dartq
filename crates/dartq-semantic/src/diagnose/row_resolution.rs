@@ -1189,6 +1189,16 @@ impl<'a> Engine<'a> {
         } else {
             resolved.members.contains_key(&row.name)
         };
+        // The row's `kind` is the receiver's push-time spelling — the
+        // micro tag conflates `extension` and `extension type` into
+        // `ContainerKind::Extension`. The verdict keys on the RESOLVED
+        // container's kind instead (upstream `StaticLookupDomain`'s element
+        // switch, analyzer source `lookup_failure_reporter.dart`:437-463 —
+        // `ExtensionElementImpl` alone takes the extension trio; an
+        // `ExtensionTypeElement` is an `InterfaceElement` and reports the
+        // class-family `undefined_method`/`_getter`/`_setter` "for the
+        // type").
+        let resolved_kind = resolved.kind;
         // An enum's synthesized STATIC `values` getter joins the
         // interface face without an entry in `members` — a static read
         // through the container's own name resolves the accessor
@@ -1196,7 +1206,7 @@ impl<'a> Engine<'a> {
         // `index`/`name` synth twins are instance members and keep the
         // miss at this face).
         if !defined
-            && kind == ContainerKind::Enum
+            && resolved_kind == ContainerKind::Enum
             && row.name == self.members.enum_synth_members[0]
         {
             return;
@@ -1204,7 +1214,7 @@ impl<'a> Engine<'a> {
         if !defined
             && (resolved.constructors.contains(&row.name)
                 || (row.name == self.intern("new")
-                    && kind != ContainerKind::Extension
+                    && resolved_kind != ContainerKind::Extension
                     && resolved.has_unnamed_constructor))
         {
             // A named-constructor selector (`C.named`) resolves through the
@@ -1212,7 +1222,9 @@ impl<'a> Engine<'a> {
             // declaration, never an undefined member. The `.new` spelling
             // answers the unnamed constructor the same way
             // (ast_rewrite.dart's `name.lexeme == 'new'` →
-            // `unnamedConstructor`); extensions have no constructors.
+            // `unnamedConstructor`); extensions have no constructors — an
+            // extension TYPE does (its primary and named forms), so the
+            // `Extension` exclusion is the resolved kind's, not the row's.
             self.check_member_unused_result(row, container, &Receiver::Unknown, true);
             return;
         }
@@ -1233,7 +1245,7 @@ impl<'a> Engine<'a> {
         // A compound write checks both faces (the oracle resolves the read
         // first): the read-face text, then the setter text.
         let read_face_missing = !resolved.members.contains_key(&row.name);
-        let (invoke_code, read_code, write_code) = match kind {
+        let (invoke_code, read_code, write_code) = match resolved_kind {
             ContainerKind::Extension => (
                 SemanticCode::UndefinedExtensionMethod,
                 SemanticCode::UndefinedExtensionGetter,
@@ -1241,7 +1253,7 @@ impl<'a> Engine<'a> {
             ),
             _ => (
                 SemanticCode::UndefinedMethod,
-                if kind == ContainerKind::Enum {
+                if resolved_kind == ContainerKind::Enum {
                     SemanticCode::UndefinedEnumConstant
                 } else {
                     SemanticCode::UndefinedGetter
@@ -1599,9 +1611,28 @@ impl<'a> Engine<'a> {
             return;
         }
         if matches!(kind, ContainerKind::Mixin | ContainerKind::Extension) {
-            // The `on` face is invisible: a miss may be a constraint member.
-            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
-            return;
+            // The `on`-face union (#2186 S2): `walk_members` never climbs a
+            // mixin's `on` constraints or an extension's extended type, but
+            // those members ride the receiver's interface (`this`'s static
+            // type inside an extension IS the `on` type). A carried member
+            // resolves the access; a face the model cannot walk keeps the
+            // record-only path (the constraint may carry the member). A
+            // `this` receiver keeps the pinned record-only arm on a
+            // decidable miss — the emit-side flip rides with the union's
+            // resolution follow-up, where the `on`-type head, never the
+            // extension, names the report.
+            let silent = matches!(recv, Receiver::This { .. })
+                || !matches!(
+                    self.on_face_walk(container, kind, row.name),
+                    Walk::Missing
+                );
+            if silent {
+                self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                return;
+            }
+            // A declared-type receiver's decidable miss reports its access
+            // intent naming the static type (the class-family tail below
+            // owns the shared emission).
         }
         let name_text = self.strings.resolve(row.name);
         let type_text = self.strings.resolve(container).to_string();
@@ -3713,6 +3744,71 @@ mod tests {
         assert_eq!(
             code_names(&report),
             ["undefined_named_parameter"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The `on`-face union in `check_instance_member` (#2186 S2's
+    /// `on_face_walk`, routed through the Mixin/Extension arm): a
+    /// declared-typed receiver's miss decidable through the constraint
+    /// climb reports the access intent naming the static type — the
+    /// oracle's interface lookup (the constraint members ride `M`'s
+    /// interface; `lookup_failure_reporter.dart`'s instance domain).
+    #[test]
+    fn mixin_typed_receiver_miss_names_the_mixin() {
+        let report = report_units(
+            &[],
+            "main.dart",
+            "class C { void hit() {} } \
+             mixin M on C {} \
+             void f(M m) { m.miss(); }",
+            false,
+        );
+        let names = code_names(&report);
+        assert_eq!(names, ["undefined_method"], "{names:?}");
+        assert!(
+            report.diagnostics[0].message.contains("'M'"),
+            "{:?}",
+            report.diagnostics[0].message
+        );
+    }
+
+    /// The union's resolved side: a constraint member reached through the
+    /// `on` climb silences the access exactly like an own member.
+    #[test]
+    fn mixin_typed_receiver_hit_on_the_constraint_stays_silent() {
+        let report = report_units(
+            &[],
+            "main.dart",
+            "class C { void hit() {} } \
+             mixin M on C {} \
+             void f(M m) { m.hit(); }",
+            false,
+        );
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// `this` receivers keep the pinned record-only arm on a decidable
+    /// `on`-face miss (the tests.rs `this.real2`/`this.real4` pin): the
+    /// emit-side flip rides with the resolution follow-up.
+    #[test]
+    fn this_miss_inside_extension_body_keeps_the_record_only_arm() {
+        let report = report_units(
+            &[],
+            "main.dart",
+            "class C { void hit() {} } \
+             extension X on C { void g() { this.miss(); } }",
+            false,
+        );
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
             "{:?}",
             code_names(&report)
         );

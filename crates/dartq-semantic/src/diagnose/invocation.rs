@@ -2959,6 +2959,16 @@ impl<'a> Engine<'a> {
     /// listener records `Flow::handle_exit` for it (official decision order —
     /// the resolver's bottom-callee check at the name's end, then the
     /// expression-level bottom check at the expression's end).
+    /// Whether `this` binds inside a field initializer at the current
+    /// frame depth: the oracle's `bindsThis` (`variable_declaration_
+    /// resolver.dart:47-49` — `!element.isStatic && element.isLate`), a
+    /// `withThisAccessibility` region spanning the whole initializer —
+    /// nested closures included, which is why the closure latches OR this
+    /// into their `instance` bit rather than re-asking.
+    pub(crate) fn field_initializer_binds_this(&self) -> bool {
+        self.field_group_open && !self.open_member_static && self.group_late
+    }
+
     /// The `this`/`super` context verdict (`SuperContext.of`,
     /// super_context.dart:37-85, and the `isThisAccessible` flag): valid
     /// inside an instance member of a class-family container (constructor
@@ -3006,7 +3016,7 @@ impl<'a> Engine<'a> {
                     // keywords legal (super_context.dart's FieldDeclaration
                     // arm falls through to the declaring class); a static
                     // or non-late group does not.
-                    return if self.field_group_open && !self.open_member_static && self.group_late {
+                    return if self.field_initializer_binds_this() {
                         ReceiverState::Valid
                     } else {
                         ReceiverState::Invalid
@@ -3470,10 +3480,15 @@ impl<'a> Engine<'a> {
             name,
             kind: ContainerKind::Extension,
         }) = &shape
+            && self.container_kind_of(*name) == Some(ContainerKind::Extension)
         {
             // An explicit extension override reached through the send
             // (`Ex<int>(list)`) — the group's deferred check dispatches by
-            // shape here (`extension_member_resolver.dart:380`).
+            // shape here (`extension_member_resolver.dart:380`). The row
+            // kind conflates extension types: `E<int>(x)` on an extension
+            // type is a creation invocation whose group checks the TYPE's
+            // arity like a class's — the resolved kind decides, not the
+            // micro tag.
             return self.check_extension_arity(*name, count, range);
         }
         let declared = match &shape {
@@ -4107,6 +4122,24 @@ impl<'a> Engine<'a> {
                             }),
                             RowShape::Bare(_),
                         ) => Some((*class_name, ctor.name)),
+                        // An extension type's constructor selector
+                        // (`E.named<int>()`) — the row kind carries the
+                        // conflated `Extension` tag, so the resolved kind
+                        // discriminates: only an `ExtensionType` counts as
+                        // a constructable container here (a plain
+                        // extension's `Ext.named` is a member, not a
+                        // constructor).
+                        (
+                            RowShape::Bare(BareInfo::Container {
+                                name: class_name,
+                                kind: ContainerKind::Extension,
+                            }),
+                            RowShape::Bare(_),
+                        ) if self.container_kind_of(*class_name)
+                            == Some(ContainerKind::ExtensionType) =>
+                        {
+                            Some((*class_name, ctor.name))
+                        }
                         _ => None,
                     }
                 })
@@ -4137,10 +4170,13 @@ impl<'a> Engine<'a> {
                 RowShape::Bare(BareInfo::Container {
                     name,
                     kind: ContainerKind::Extension,
-                }) => {
+                }) if self.container_kind_of(*name) == Some(ContainerKind::Extension) => {
                     // Explicit extension override `Ext<int>(list)` — any
                     // arity mismatch reports at the group
-                    // (`extension_member_resolver.dart:380`).
+                    // (`extension_member_resolver.dart:380`). An extension
+                    // TYPE falls through to the container arm: `E<int>(x)`
+                    // is a constructor invocation, and its group checks the
+                    // type's declared arity like a class's.
                     self.check_extension_arity(*name, count, range);
                 }
                 RowShape::Bare(BareInfo::Container { name, .. }) => {
@@ -4601,5 +4637,64 @@ mod tests {
             .filter(|name| name.starts_with("wrong_number_of_type_arguments"))
             .collect();
         assert!(arity.is_empty(), "{:?}", code_names(&report));
+    }
+
+    // —— #2218 S8: `this` accessibility ——————————————————————————————
+
+    /// `this` inside a `late` instance field's initializer is bound — the
+    /// oracle's `bindsThis` (`variable_declaration_resolver.dart:47-49`:
+    /// `!isStatic && isLate`) wraps the whole initializer, arguments and
+    /// nested closures included. The webview `late final _webView =
+    /// WebView(x: withWeakReferenceTo(this, (r) => r))` shape reports
+    /// nothing.
+    #[test]
+    fn this_inside_late_field_initializer_arguments() {
+        let report = report(
+            "Object g(Object a, Object b) => a; \
+             class C { \
+               late final Object f = g(this, (int r) => r); \
+             }",
+        );
+        assert!(
+            !code_names(&report).contains(&"invalid_reference_to_this"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A closure nested inside a `late` instance field's initializer keeps
+    /// `this` bound — the accessibility latch survives the closure's own
+    /// executable frame (upstream never re-gates `this` at function
+    /// boundaries inside an accessible span).
+    #[test]
+    fn this_inside_closure_in_late_field_initializer() {
+        let report = report(
+            "class C { \
+               late final Object f = () => this; \
+             }",
+        );
+        assert!(
+            !code_names(&report).contains(&"invalid_reference_to_this"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The accessibility is scoped, not leaked: `this` inside a NON-`late`
+    /// instance field's initializer still reports — the oracle's
+    /// `bindsThis` is `false` there and the enclosing `thisType` is not
+    /// consulted at field level.
+    #[test]
+    fn this_inside_plain_field_initializer_reports() {
+        let report = report(
+            "class C { \
+               final Object f = () => this; \
+             }",
+        );
+        assert!(
+            code_names(&report).contains(&"invalid_reference_to_this"),
+            "{:?}",
+            code_names(&report)
+        );
     }
 }

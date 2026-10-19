@@ -27,37 +27,14 @@ impl ParserListener for DiagnoseListener<'_> {
             name,
         );
         let engine = &mut self.engine;
-        // The declaration-site combination face reads the written header
-        // keywords (parser_impl.dart:2976-3015); each violation anchors on
-        // its own keyword tokens.
-        let mut anchors: Vec<(ModifierKeyword, SourceRange)> = Vec::new();
-        if let Some(token) = abstract_kw {
-            anchors.push((ModifierKeyword::Abstract, token.range));
-        }
-        if let Some(token) = sealed_kw {
-            anchors.push((ModifierKeyword::Sealed, token.range));
-        }
-        if let Some(token) = base_kw {
-            anchors.push((ModifierKeyword::Base, token.range));
-        }
-        if let Some(token) = interface_kw {
-            anchors.push((ModifierKeyword::Interface, token.range));
-        }
-        if let Some(token) = final_kw {
-            anchors.push((ModifierKeyword::Final, token.range));
-        }
-        engine.check_modifier_declaration(
-            ClassModifiers {
-                kind: dartq_resolution::modifiers::DeclKind::Class,
-                is_abstract: abstract_kw.is_some(),
-                is_sealed: sealed_kw.is_some(),
-                is_base: base_kw.is_some(),
-                is_interface: interface_kw.is_some(),
-                is_final: final_kw.is_some(),
-                is_mixin_class: mixin_kw.is_some(),
-            },
-            &anchors,
-        );
+        // The declaration-site combination rows (`abstract sealed class`,
+        // `abstract final base/interface class`, the `mixin class`
+        // modifier trio) are the parser's own `SYNTACTIC_ERROR` family —
+        // `parser_impl.dart:2984-3002` reports them recoverable at the
+        // keyword tokens and the analyzer layer never re-reports — so the
+        // engine emits none of them here (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/generated/error_verifier.dart: no matching
+        // code — the single oracle row is the parser's).
         let name_range = name.range;
         engine.note_container_type_variables(Some(name), false, false);
         let name = engine.name_of(name);
@@ -109,46 +86,21 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_named_mixin_application(
         &mut self,
         begin: Token,
-        abstract_kw: Option<Token>,
-        sealed_kw: Option<Token>,
-        base_kw: Option<Token>,
-        interface_kw: Option<Token>,
-        final_kw: Option<Token>,
+        _abstract_kw: Option<Token>,
+        _sealed_kw: Option<Token>,
+        _base_kw: Option<Token>,
+        _interface_kw: Option<Token>,
+        _final_kw: Option<Token>,
         _augment_kw: Option<Token>,
         _mixin_kw: Option<Token>,
         name: Token,
     ) {
         let engine = &mut self.engine;
-        // The same declaration-site combination face as a class header
-        // (the official parser shares the production).
-        let mut anchors: Vec<(ModifierKeyword, SourceRange)> = Vec::new();
-        if let Some(token) = abstract_kw {
-            anchors.push((ModifierKeyword::Abstract, token.range));
-        }
-        if let Some(token) = sealed_kw {
-            anchors.push((ModifierKeyword::Sealed, token.range));
-        }
-        if let Some(token) = base_kw {
-            anchors.push((ModifierKeyword::Base, token.range));
-        }
-        if let Some(token) = interface_kw {
-            anchors.push((ModifierKeyword::Interface, token.range));
-        }
-        if let Some(token) = final_kw {
-            anchors.push((ModifierKeyword::Final, token.range));
-        }
-        engine.check_modifier_declaration(
-            ClassModifiers {
-                kind: dartq_resolution::modifiers::DeclKind::Class,
-                is_abstract: abstract_kw.is_some(),
-                is_sealed: sealed_kw.is_some(),
-                is_base: base_kw.is_some(),
-                is_interface: interface_kw.is_some(),
-                is_final: final_kw.is_some(),
-                is_mixin_class: false,
-            },
-            &anchors,
-        );
+        // A named mixin application parses through the same
+        // `parseClassOrNamedMixinApplication` production — the modifier
+        // combination rows are the parser's `SYNTACTIC_ERROR` family,
+        // reported once parse-tier; the engine emits none here (the class
+        // header arm documents the upstream citation).
         let name_range = name.range;
         engine.note_container_type_variables(Some(name), false, false);
         let name = engine.name_of(name);
@@ -204,19 +156,9 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow()
             .begin_mixin_declaration(begin, augment_kw, base_kw, mixin, name);
         let engine = &mut self.engine;
-        // `base` is the only legal mixin modifier; the declaration-site
-        // face still runs so a written `final`/`interface`/`sealed` the
-        // parser surfaces would decide through the frozen matrix.
-        if let Some(token) = base_kw {
-            engine.check_modifier_declaration(
-                ClassModifiers {
-                    kind: dartq_resolution::modifiers::DeclKind::Mixin,
-                    is_base: true,
-                    ..ClassModifiers::default()
-                },
-                &[(ModifierKeyword::Base, token.range)],
-            );
-        }
+        // `base` is the only legal mixin modifier; the `final`/`interface`/
+        // `sealed` violations are the parser's `SYNTACTIC_ERROR` family,
+        // reported once parse-tier — no engine emission here.
         let name_range = name.range;
         engine.note_container_type_variables(Some(name), false, false);
         let name = engine.name_of(name);
@@ -419,7 +361,17 @@ impl ParserListener for DiagnoseListener<'_> {
             let anchor = engine.nameless_site_range();
             engine.note_decl_site(empty, anchor, DeclKind::Container);
         }
-        engine.push_container_frame(ContainerKind::Extension, name);
+        // The extension-type frame carries its own kind: upstream
+        // `visitExtensionTypeDeclaration` opens an `InstanceScope` (the
+        // class/mixin scope shape — analyzer source
+        // `scope_context.dart:187-222`), not `visitExtensionDeclaration`'s
+        // `ExtensionScope`, and `enclosingInstanceElement` is the
+        // extension-type element — so in-body bare lookups answer like a
+        // class's (own members plus the `implements` interface), and an
+        // unqualified miss names `thisType` = `E`
+        // (`UnqualifiedLookupDomain`, analyzer source
+        // `lookup_failure_reporter.dart:507-553`).
+        engine.push_container_frame(ContainerKind::ExtensionType, name);
     }
 
     fn handle_no_extension_type_body(&mut self, semicolon: Token) {
@@ -1275,7 +1227,12 @@ impl ParserListener for DiagnoseListener<'_> {
         // official `_isUsedElement` enclosing-element gate), and its locals
         // close with their own frame. The wildcard-dead check latches the
         // declaration start; the name event patches the verdict.
-        let instance = self.engine.instance_context();
+        // `instance` inherits the enclosing accessibility — including a
+        // `late` instance field's initializer, whose `withThisAccessibility`
+        // span covers nested closures (the local fn has no executable of its
+        // own below it to inherit from).
+        let instance =
+            self.engine.instance_context() || self.engine.field_initializer_binds_this();
         let engine = &mut self.engine;
         engine.open_exec_site = None;
         engine.pending_local_fn = None;
@@ -1340,7 +1297,11 @@ impl ParserListener for DiagnoseListener<'_> {
 
         self.engine.nsm_poison();
         self.engine.const_capture.begin_opaque_group();
-        let instance = self.engine.instance_context();
+        // A closure inside a `late` instance field's initializer binds
+        // `this` too — the `bindsThis` accessibility region covers the
+        // whole initializer.
+        let instance =
+            self.engine.instance_context() || self.engine.field_initializer_binds_this();
         let engine = &mut self.engine;
         engine.open_exec_site = None;
         engine.pending_local_fn = None;
@@ -1370,7 +1331,9 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().begin_named_function_expression(token);
 
         self.engine.nsm_poison();
-        let instance = self.engine.instance_context();
+        // Same `this`-accessibility inheritance as the anonymous form.
+        let instance =
+            self.engine.instance_context() || self.engine.field_initializer_binds_this();
         let engine = &mut self.engine;
         engine.open_exec_site = None;
         engine.pending_local_fn = None;
