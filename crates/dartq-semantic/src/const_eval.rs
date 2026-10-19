@@ -2615,9 +2615,32 @@ impl ConstCapture {
                     );
                     return None;
                 }
+                // The oracle's invocation node spans the receiver: `x.f()`,
+                // `a().f()`, `DateTime.now().toString()` all report the
+                // whole `recv.name(args)` span at `constEvalMethodInvocation`.
+                // `dot_access` merges the receiver operand AFTER this close,
+                // so the callee arrives here bare — the node left on the
+                // stack when the receiver immediately precedes the selector
+                // (the `.`/`?.`/`()` gap is at most three bytes: `x.f` reads
+                // one, `a().f` reads one past the `)` leaf, `x?.f` reads
+                // two) extends the span back to it. A binary/conditional
+                // operand at the same position (`x + f()`, `c ? f() : y`)
+                // is latched, not a receiver — the latches discriminate
+                // where the byte-gap cannot.
+                let offset = self
+                    .stack
+                    .last()
+                    .filter(|prev| {
+                        let mark = self.stack.len() - 1;
+                        let gap = node.span.offset.saturating_sub(prev.span.end());
+                        (1..=3).contains(&gap)
+                            && !self.bin_latches.iter().any(|&(_, m, _)| m == mark)
+                            && !self.cond_latches.iter().any(|&(m, _)| m == mark)
+                    })
+                    .map_or(node.span.offset, |prev| prev.span.offset);
                 let span = SourceRange {
-                    offset: node.span.offset,
-                    length: end.end().saturating_sub(node.span.offset),
+                    offset,
+                    length: end.end().saturating_sub(offset),
                 };
                 return Some(ClosedArgs {
                     callee: Some(name),
@@ -2847,7 +2870,7 @@ impl ConstCapture {
         if self.stack.len() > base
             && let Some(head) = self.stack.last()
             && matches!(head.expr, Expr::Ident(n) if n == container)
-            && head.span.offset < span.offset
+            && head.span.offset <= span.offset
         {
             span = SourceRange {
                 offset: head.span.offset,
@@ -4214,5 +4237,88 @@ final Map<String, String> cur = {"A": "A", "B": "B", "C": "C"};
             "entry 2 keeps its own key (the argument list must not eat it), got {:?}",
             entries[1].0.expr
         );
+    }
+}
+
+/// #2194 F2 — `DateTime.now().toString()` in a const initializer: the oracle
+/// (dart 3.13.1) reports `const_eval_method_invocation` at the whole
+/// `recv.name(args)` invocation and `const_with_non_const` at the
+/// `DateTime.now()` creation. The engine-level pair rides the
+/// `ClosedArgs::span` the capture hands up — these capture-level pins lock
+/// the span extension's receiver-vs-operand discrimination (`dot_access`
+/// merges `recv.name` only AFTER the argument list closes, so the callee
+/// arrives here bare with the receiver below it).
+#[cfg(test)]
+mod method_invocation_2194 {
+    use super::{ConstCapture, ConstantValue, Expr};
+    use dartq_source::{SourceRange, StringTable};
+
+    fn span(offset: u32, end: u32) -> SourceRange {
+        SourceRange {
+            offset,
+            length: end - offset,
+        }
+    }
+
+    /// `x.m(` — the selector's send closes with the receiver operand below
+    /// it: `ClosedArgs::span` extends back through the dot to `x` (the
+    /// oracle's method-invocation node is the whole `x.m()`).
+    #[test]
+    fn selector_call_span_extends_to_the_receiver() {
+        let strings = StringTable::new();
+        let mut capture = ConstCapture::new(strings.intern("identical"));
+        capture.open_initializer();
+        // `x` receiver operand, `.m` selector callee, then `()`.
+        capture.identifier(strings.intern("x"), span(0, 1));
+        capture.identifier(strings.intern("m"), span(2, 3));
+        capture.begin_arguments();
+        let closed = capture
+            .end_arguments(span(4, 5))
+            .expect("a bare identifier callee closes into ClosedArgs");
+        assert_eq!(closed.callee, Some(strings.intern("m")));
+        assert_eq!(
+            (closed.span.offset, closed.span.end()),
+            (0, 5),
+            "the invocation node covers `x.m()` — receiver through `)`"
+        );
+    }
+
+    /// `x + m(` — a binary operand is latched, not a receiver: the span
+    /// stays at `m()` (the plus's left operand must not extend it).
+    #[test]
+    fn binary_left_operand_does_not_extend_the_call_span() {
+        let strings = StringTable::new();
+        let mut capture = ConstCapture::new(strings.intern("identical"));
+        capture.open_initializer();
+        capture.identifier(strings.intern("x"), span(0, 1));
+        capture.begin_binary(super::BinOp::Add, span(1, 2));
+        capture.identifier(strings.intern("m"), span(2, 3));
+        capture.begin_arguments();
+        let closed = capture
+            .end_arguments(span(4, 5))
+            .expect("a bare identifier callee closes into ClosedArgs");
+        assert_eq!(closed.callee, Some(strings.intern("m")));
+        assert_eq!(
+            (closed.span.offset, closed.span.end()),
+            (2, 5),
+            "the `+` left operand is not a receiver — the span stays at `m()`"
+        );
+    }
+
+    /// `f(` with nothing below the callee — the bare-name span is the
+    /// call's own (`const_eval_method_invocation` on `void f() {}` reports
+    /// `f()`, not a receiver-extended span).
+    #[test]
+    fn bare_call_span_is_the_call() {
+        let strings = StringTable::new();
+        let mut capture = ConstCapture::new(strings.intern("identical"));
+        capture.open_initializer();
+        capture.identifier(strings.intern("f"), span(0, 1));
+        capture.begin_arguments();
+        let closed = capture
+            .end_arguments(span(2, 3))
+            .expect("a bare identifier callee closes into ClosedArgs");
+        assert_eq!(closed.callee, Some(strings.intern("f")));
+        assert_eq!((closed.span.offset, closed.span.end()), (0, 3));
     }
 }

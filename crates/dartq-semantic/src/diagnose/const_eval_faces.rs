@@ -196,9 +196,56 @@ impl<'a> Engine<'a> {
         // codes one row per initializer, so the deferred entries drop; a
         // passing verdict promotes them to the tail pass, whose whole-file
         // const-ctor set decides.
+        // The `const_init` verdict is the oracle's site default — it fires
+        // only when the root's own error code is NOT allow-listed
+        // (`_reportError`'s constEval* override). An allow-list fault row
+        // emitted inside this initializer whose span contains a staged
+        // entry's span already reported that node, so the entry's
+        // `const_init` twin drops; a `Creation` entry's `const_with_non_const`
+        // face is per-node and still fires (it is the allow-list row's
+        // sibling, not the site default). The spans snapshot first — the
+        // loop below emits and pushes through `&mut self`.
+        // The `const_init` verdict anchors at the deepest node whose error
+        // is NOT allow-listed (`_reportError`'s constEval* override). An
+        // allow-list row whose span contains a staged entry's span already
+        // reported that subtree at a `constEval*` code — UNLESS the entry
+        // itself already took a non-allow-listed row at its own span (the
+        // `const_with_non_constant_argument` of a bad creation argument —
+        // the arg's own face is what `const_init` anchors on). The spans
+        // snapshot first — the loop below emits and pushes through `&mut
+        // self`.
+        let (fault_spans, named_spans): (Vec<SourceRange>, Vec<SourceRange>) = {
+            let mut faults = Vec::new();
+            let mut named = Vec::new();
+            for row in &self.report.diagnostics {
+                if row.code.name.starts_with("const_eval") {
+                    faults.push(row.range);
+                } else {
+                    named.push(row.range);
+                }
+            }
+            (faults, named)
+        };
+        let fault_covers = |span: SourceRange| {
+            fault_spans
+                .iter()
+                .any(|f| f.offset <= span.offset && span.end() <= f.end())
+                && !named_spans.iter().any(|&s| s == span)
+        };
         for (init, span, kind) in std::mem::take(&mut self.open_const_creations) {
-            if matches!(verdict, Verdict::Value(_) | Verdict::Constant) {
-                self.pending_const_creations.push((init, span, kind));
+            if !matches!(verdict, Verdict::Value(_) | Verdict::Constant) {
+                continue;
+            }
+            match kind {
+                ConstCreationEntry::ArgFailure if fault_covers(span) => {}
+                ConstCreationEntry::Creation { container } if fault_covers(span) => {
+                    // The node's own creation face still fires (the
+                    // `const_init` site-default is what the fault replaces).
+                    if !self.const_ctor_target(container) {
+                        self.emit(SemanticCode::ConstWithNonConst, span, "", "");
+                    }
+                }
+                _ => self.pending_const_creations.push((init, span, kind)),
             }
         }
         if let Verdict::Value(value) = &verdict {
@@ -453,13 +500,110 @@ impl<'a> Engine<'a> {
     }
 
     /// The callee classification a closed bare-identifier call resolves
-    /// to (`evaluation.dart` `_invalidConstantForMethodInvocation`).
-    pub(crate) fn classify_call(&self, name: StringId) -> CallClass {
+    /// to (`evaluation.dart` `_invalidConstantForMethodInvocation`). The
+    /// `&mut` receiver stages the `C.named(` implicit-const creation the
+    /// qualified-selector split detects — the tail pass needs the
+    /// whole-file const-ctor set before it can verdict.
+    pub(crate) fn classify_call(&mut self, name: StringId) -> CallClass {
         if self.const_ctor_target(name) {
             return CallClass::ConstCtor;
         }
         if matches!(self.resolve_bare(name).0, BareInfo::Missing { .. }) {
             return CallClass::Unknown;
+        }
+        // A qualified selector (`recv.name(`) reaches here as a bare
+        // `Ident` callee — `dot_access` folds `recv.name` into `Member`
+        // only after the argument list closes. `invokes.last()` indexes the
+        // selector row and the receiver row sits immediately below it; the
+        // receiver's shape decides the face: a name resolving to a type is
+        // the implicit `const C.named(...)` creation (staged for the tail
+        // pass beside the unnamed-`C(...)` arm), a value/creation result is
+        // the `constEvalMethodInvocation` fault.
+        let recv = self
+            .invokes
+            .last()
+            .and_then(|slot| *slot)
+            .filter(|&callee| {
+                self.rows
+                    .get(callee)
+                    .is_some_and(|row| row.qualified)
+            })
+            .and_then(|callee| {
+                callee
+                    .checked_sub(1)
+                    .and_then(|index| self.rows.get(index))
+            });
+        if let Some(recv) = recv {
+            match &recv.shape {
+                RowShape::Bare(BareInfo::Plain { .. }) => {
+                    let (info, target) = self.resolve_bare(recv.name);
+                    let decl_type = matches!(target, RefTarget::Decl { .. })
+                        && !matches!(info, BareInfo::Missing { .. })
+                        && self.type_resolution(recv.name).0 == TypeResolution::Type;
+                    // `C.named(` — the receiver's resolution decides: a
+                    // type-valued decl is the implicit const creation, a
+                    // value-typed read (a local, a member, a const var) is
+                    // the method-invocation fault.
+                    let is_const_ctor = decl_type
+                        && {
+                            let container = self.strings.resolve(recv.name);
+                            let selector = self.strings.resolve(name);
+                            CORE_CONST_CTOR.iter().any(|(c, sels)| {
+                                *c == container && sels.iter().any(|s| *s == selector)
+                            })
+                        };
+                    if decl_type && !is_const_ctor {
+                        // The `const_with_non_const` face fires when the
+                        // container's constructor exists but is not const
+                        // (an unindexed `DateTime` answers the under-report
+                        // side the same way — `resolve_container` cannot
+                        // reach `<dart:core>`'s decl, `const_ctor_target`
+                        // stays false, the oracle's row is the creation's).
+                        let span = self.creation_span(recv.range);
+                        if let Some(init) = self.pending_init_names.last().copied() {
+                            self.open_const_creations.push((
+                                init,
+                                span,
+                                ConstCreationEntry::Creation {
+                                    container: recv.name,
+                                },
+                            ));
+                        }
+                        return CallClass::Unknown;
+                    }
+                    if matches!(
+                        target,
+                        RefTarget::Local
+                            | RefTarget::This
+                            | RefTarget::Member { .. }
+                            | RefTarget::Opaque
+                    ) || (matches!(target, RefTarget::Decl { .. })
+                        && self.type_resolution(recv.name).0 == TypeResolution::NonType)
+                    {
+                        return CallClass::Invocable;
+                    }
+                    return CallClass::Unknown;
+                }
+                // A value or folded-creation result receiver — the
+                // method-invocation fault (`DateTime.now().toString()`,
+                // `C().m()`, `this.m()`). The container-family receivers
+                // (`Bare(Container)`, `Receiver::Container`, prefixed) stay
+                // out — `named_ctor`/`resolve_container` below own the
+                // `C.named(` creation face there.
+                RowShape::Member { .. }
+                | RowShape::Value
+                | RowShape::Record(_)
+                | RowShape::Receiver(
+                    Receiver::Unknown
+                        | Receiver::Typed { .. }
+                        | Receiver::Created { .. }
+                        | Receiver::This { .. }
+                        | Receiver::Super { .. },
+                ) => {
+                    return CallClass::Invocable;
+                }
+                _ => {}
+            }
         }
         if self.frames.iter().any(|f| f.locals.contains(&name))
             || self.const_scopes.iter().any(|s| s.contains_key(&name))
@@ -469,6 +613,33 @@ impl<'a> Engine<'a> {
         match self.top_level_decl(name).map(|d| d.kind) {
             Some(MicroKind::TopLevelFn | MicroKind::TopLevelVar) => CallClass::Invocable,
             _ => CallClass::Unknown,
+        }
+    }
+
+    /// The `C.named(...)` creation span — the receiver's head offset through
+    /// the call's closing paren. `arg_levels.last()` still holds this call's
+    /// arguments at the `classify_call` point (the close drains it after),
+    /// so the `)` sits one byte past the last argument's end; a zero-arg
+    /// `()` sits two bytes past the callee's end. The tail pass re-reads the
+    /// written selector from this span (`const_creation_valid`), so it must
+    /// cover `C.named` exactly — never the arguments.
+    fn creation_span(&self, recv: SourceRange) -> SourceRange {
+        let callee_end = self
+            .invokes
+            .last()
+            .and_then(|slot| *slot)
+            .and_then(|index| self.rows.get(index))
+            .map(|row| row.range.end())
+            .unwrap_or(recv.end());
+        let close = self
+            .arg_levels
+            .last()
+            .and_then(|level| level.args.last())
+            .map(|arg| arg.3.end() + 1)
+            .unwrap_or(callee_end + 2);
+        SourceRange {
+            offset: recv.offset,
+            length: close.saturating_sub(recv.offset),
         }
     }
 
