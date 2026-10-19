@@ -1398,7 +1398,38 @@ fn extract_directives(
             _ => break,
         }
     }
-    (directives, i)
+    let region_end = i;
+    // Late directives: the official parser recovers an `import`/`export`/
+    // `part` that follows a declaration (`directive_after_declaration`,
+    // directive_context.dart:50-104) and keeps it in the unit's directive
+    // list, so its namespace effect stands. A top-level (brace-depth 0)
+    // directive keyword followed by a string literal is that recovered
+    // shape; the region end above still bounds the API-face hash.
+    let mut depth: u32 = 0;
+    while let Some(token) = tokens.get(i) {
+        match token.kind {
+            TokenKind::OpenCurly => depth += 1,
+            TokenKind::CloseCurly => depth = depth.saturating_sub(1),
+            TokenKind::Keyword(Keyword::Import | Keyword::Export | Keyword::Part)
+                if depth == 0 && kind_at(tokens, i + 1) == Some(TokenKind::String) =>
+            {
+                let kind = match token.kind {
+                    TokenKind::Keyword(Keyword::Import) => Some(DirectiveKind::Import),
+                    TokenKind::Keyword(Keyword::Export) => Some(DirectiveKind::Export),
+                    _ => None,
+                };
+                let next = match kind {
+                    Some(kind) => walk_import_export(text, tokens, i, strings, &mut directives, kind),
+                    None => walk_part(text, tokens, i, strings, &mut directives),
+                };
+                i = next.max(i + 1);
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (directives, region_end)
 }
 
 /// Reads the URI literal starting at `i`. Adjacent string literals

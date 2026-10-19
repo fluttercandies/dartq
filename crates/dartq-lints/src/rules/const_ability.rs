@@ -679,6 +679,38 @@ fn written_type_args_name_type_variable(
     false
 }
 
+/// Whether the tear-off `send` (`C.m<T>`) is instantiated with an in-scope
+/// type variable: the instantiation's `TypeArguments` row tiles beside the
+/// send in its owner run, starting where the send ends (the owner's own
+/// span stops at the selector, so the extent scan never sees it).
+fn instantiation_names_type_variable(unit: &Unit<'_>, send: u32) -> bool {
+    let Some(owner) = unit.ast.parent(send) else {
+        return false;
+    };
+    let send_end = unit.ast.token_range(send).end;
+    let Some(args) = child_rows(unit, owner).into_iter().find(|&kid| {
+        unit.ast.kind(kid) == NodeKind::TypeArguments
+            && unit.ast.token_range(kid).start + 1 == send_end
+    }) else {
+        return false;
+    };
+    let mut names = Vec::new();
+    let mut current = unit.ast.parent(send);
+    while let Some(node) = current {
+        for kid in child_rows(unit, node) {
+            if unit.ast.kind(kid) == NodeKind::TypeVariables {
+                for var in child_rows(unit, kid) {
+                    if unit.ast.kind(var) == NodeKind::TypeVariable {
+                        names.push(lexeme(unit, head_token(unit, var)));
+                    }
+                }
+            }
+        }
+        current = unit.ast.parent(node);
+    }
+    !names.is_empty() && type_args_name_variable(unit, args, &names)
+}
+
 /// Whether any [`NodeKind::TypeArguments`] row in `row`'s subtree names
 /// `names` (the arguments-subtree descent; spans nest strictly, so the
 /// recursion terminates).
@@ -861,7 +893,13 @@ fn send_able(unit: &Unit<'_>, index: &ConstIndex<'_>, send: u32) -> bool {
         (None, None) => index.consts.contains_key(callee.name),
         // Member read `Color.red` / `K.z`: an enum value or a `static
         // const` field.
-        (None, Some(selector)) => member_const_face(unit, index, callee.name, selector),
+        // A tear-off instantiated with an in-scope type variable
+        // (`C.m<T>`) is never constant (upstream
+        // `test_staticFunctionTearoff_instantiatedWithTypeVariable`).
+        (None, Some(selector)) => {
+            member_const_face(unit, index, callee.name, selector)
+                && !instantiation_names_type_variable(unit, send)
+        }
     }
 }
 

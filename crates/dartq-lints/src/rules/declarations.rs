@@ -21349,6 +21349,21 @@ set size(int input) {\n    _size = input;\n  }\n}\n";
         assert_eq!(lints.len(), 3, "static tear-off blocks: {lints:?}");
     }
 
+    /// upstream `test_staticFunctionTearoff_instantiatedWithTypeVariable`:
+    /// a tear-off instantiated with an in-scope type variable is never
+    /// constant, while the concrete instantiation reports.
+    #[test]
+    fn prefer_const_declarations_type_variable_instantiation_stays_silent() {
+        let f = Fixture::parse(
+            "void f<T>() {\n  final c = C.m<T>;\n}\nclass C<X> {\n  static C<X> m<X>() => C<X>();\n}\n",
+        );
+        assert!(f.run(&one_rule("prefer_const_declarations")).is_empty());
+        let f = Fixture::parse(
+            "void f() {\n  final c = C.m<int>;\n}\nclass C<X> {\n  static C<X> m<X>() => C<X>();\n}\n",
+        );
+        assert_eq!(f.run(&one_rule("prefer_const_declarations")).len(), 1);
+    }
+
     /// `test_localVariable_final_constructorInvocation_new` vs `_const` —
     /// a creation is a constant only when `const` is written.
     #[test]

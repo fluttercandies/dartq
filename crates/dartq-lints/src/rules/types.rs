@@ -5303,9 +5303,28 @@ fn leak_detector_check(c: &mut Check<'_>, predicates: &LeakPredicates) {
         }
         // The container (:77-82/:115-119): the compilation unit for fields
         // and primary formals, the enclosing function body for locals.
+        // Upstream walks the unit but matches by element identity, so a
+        // same-named field of another class never counts as this field's
+        // use; the declaring container's body is the name-level proxy (the
+        // oracle reports a field cancelled only outside its class too —
+        // upstream's `@FailingTest` canceled_outsideTheClass).
         let container =
             if candidate.field {
-                c.unit.ast.root()
+                c.path
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&row| {
+                        matches!(
+                            c.kind(row),
+                            NodeKind::ClassDeclaration
+                                | NodeKind::MixinDeclaration
+                                | NodeKind::EnumDeclaration
+                                | NodeKind::ExtensionDeclaration
+                                | NodeKind::ExtensionTypeDeclaration
+                        )
+                    })
+                    .or_else(|| c.unit.ast.root())
             } else {
                 c.path.iter().rev().copied().find(|&row| {
                     matches!(c.kind(row), NodeKind::BlockBody | NodeKind::ExpressionBody)
@@ -5524,7 +5543,15 @@ fn leak_send_use(
         return false;
     }
     if marker.is_some() {
-        let receiver = slice::access_run(c, &kids[..=head]);
+        // A `!` on the receiver (`_s!.cancel()`) is transparent — the
+        // postfix-operand face (`_isPostfixExpressionOperandEqualToVariable`,
+        // leak_detector_visitor.dart:37-44): the `!` row tiles right before
+        // the selector, so the receiver is the run before it.
+        let window = match kids[..head].last() {
+            Some(&bang) if c.kind(bang) == NodeKind::NonNullAssert => &kids[..head - 1],
+            _ => &kids[..=head],
+        };
+        let receiver = slice::access_run(c, window);
         let mut names = receiver
             .iter()
             .filter(|&&row| c.kind(row) == NodeKind::Identifier)
@@ -6656,6 +6683,21 @@ mod wave1_types_tests {
     }
 
     // —— cancel_subscriptions ————————————————————————————————————————————
+
+    /// Oracle-pinned (dart 3.13.1): a field cancelled through `!`
+    /// (`_s!.cancel()`) is released, and a same-named field of another
+    /// class never releases this one (upstream matches by element).
+    #[test]
+    fn cancel_subscriptions_bang_receiver_and_class_scoped_fields() {
+        let f = Fixture::parse(
+            "class A {\n  StreamSubscription? _s;\n  void g() { _s!.cancel(); }\n}\n",
+        );
+        assert!(f.run(&one_rule("cancel_subscriptions")).is_empty());
+        let f = Fixture::parse(
+            "class A {\n  StreamSubscription? _s;\n}\nclass B {\n  StreamSubscription? _s;\n  void g() { _s?.cancel(); }\n}\n",
+        );
+        assert_eq!(f.run(&one_rule("cancel_subscriptions")).len(), 1);
+    }
 
     /// `test/rules/cancel_subscriptions_test.dart` — an uncancelled local
     /// and an uncancelled field each report at their declaration.

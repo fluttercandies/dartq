@@ -101,7 +101,15 @@ use dartq_source::{ContentId, FileId, LineIndex};
 pub fn enable_set(rules: Option<&[String]>) -> EnableSet {
     match rules {
         None => EnableSet::none(),
-        Some(names) => EnableSet::resolve(names.iter().map(String::as_str)).0,
+        // A name the pinned registry does not know reports `undefined_lint`
+        // and never runs, even when dartq implements a later SDK's rule.
+        Some(names) => EnableSet::resolve(
+            names
+                .iter()
+                .map(String::as_str)
+                .filter(|name| crate::lint_names::is_known(name)),
+        )
+        .0,
     }
 }
 
@@ -1151,6 +1159,70 @@ fn neutralize_ignore_keywords(text: &str, comments: &Comments) -> String {
     String::from_utf8(bytes).expect("same-length ASCII substitution keeps UTF-8")
 }
 
+/// The library's prefixed imports in the per-file lint graph: every
+/// `import … as p` member directive registers its prefix (the official
+/// `PrefixScope`) with a target node seeded from the imported surface —
+/// a resident file's declarations, or the generated SDK face of a `dart:`
+/// library. An unresolvable target still registers the prefix with an
+/// empty table, so `p.x` answers "prefix" and a miss reports. Without the
+/// edges `[p.X]` doc references never see `p` and all report.
+fn seed_prefixed_imports(
+    engine: &Engine,
+    builder: &mut LibraryGraphBuilder<'_>,
+    lib: dartq_resolution::LibraryId,
+    members: &[FileId],
+    core_file: FileId,
+) {
+    let strings = engine.strings();
+    for &member in members {
+        let Some(facts) = engine.file_facts(member) else {
+            continue;
+        };
+        for directive in &facts.directives {
+            if directive.kind != dartq_engine::DirectiveKind::Import || directive.prefix.is_none() {
+                continue;
+            }
+            let target = match (&directive.target, directive.uri.as_deref()) {
+                (dartq_resolution::ResolvedTarget::Resolved(file), _) => {
+                    engine.file_facts(*file).map(|target_facts| {
+                        let node = builder.intern(&format!("lint_import:{}", file.index()));
+                        for (name, declaration) in target_facts.elements.declarations() {
+                            if declaration.kind != MicroKind::TypeParam {
+                                builder.declare(node, name, *file);
+                            }
+                        }
+                        node
+                    })
+                }
+                (dartq_resolution::ResolvedTarget::External, Some(uri)) => uri
+                    .strip_prefix("dart:")
+                    .and_then(|short| {
+                        dartq_engine::sdk_faces_gen::SDK_LIBRARY_FACES
+                            .iter()
+                            .find(|(face, _)| *face == short)
+                    })
+                    .map(|(_, names)| {
+                        let node = builder.intern(uri);
+                        for name in *names {
+                            builder.declare(node, strings.intern(name), core_file);
+                        }
+                        node
+                    }),
+                _ => None,
+            };
+            builder.import(
+                lib,
+                dartq_resolution::ImportEdge {
+                    target,
+                    prefix: directive.prefix,
+                    deferred: directive.deferred,
+                    combinators: directive.combinators.clone(),
+                },
+            );
+        }
+    }
+}
+
 /// One file's semantic-fold substrate, job-local: the owning library's
 /// isolated context (its member files' declarations declared into a
 /// per-file [`LibraryGraphBuilder`] graph — the class family with its
@@ -1224,6 +1296,7 @@ pub(crate) fn build_semantic_context(
         .find(|(uri, _)| *uri == "core")
         .expect("generated SDK table carries dart:core");
     builder.seed_implicit_core(lib, core_file, core_face);
+    seed_prefixed_imports(engine, &mut builder, lib, members, core_file);
     let graph = builder.finish();
     let namespaces = Namespaces::build(&graph);
     let mut index = ElementIndex::default();

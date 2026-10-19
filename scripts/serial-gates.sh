@@ -964,9 +964,17 @@ step_runner() { # <step> — runs every watchdogged phase of the step
     # gate instead of slipping through (corpus README, adjudications).
     [ -x ./target/release/dartq ] ||
       step_fail "./target/release/dartq not found — the N5 face drives the release face; run the release-rebuild step first" || return 2
+    # Exit codes 1-3 are `dart analyze`'s issue tiers (info/warning/error
+    # found) — this corpus carries compile errors by design, so the oracle
+    # itself exits 3; only a crash code or a watchdog kill fails the step.
+    local analyze_rc=0
     watchdog_run "$1" "$(cap_for_step "$1")" \
 ./target/release/dartq analyze --format=machine --sdk "$SDK_ROOT" \
-      tests/corpus/lints-new || return 1
+      tests/corpus/lints-new || analyze_rc=$?
+    if [ "$analyze_rc" -gt 3 ] || grep -q '^WATCHDOG_KILL' "$WATCH_LOG"; then
+      step_fail "dartq analyze over tests/corpus/lints-new exited $analyze_rc (crash or watchdog kill — issue tiers 1-3 are expected)"
+      return 1
+    fi
     local expected_set actual_set
     expected_set="$(jq -r '
 .expected | to_entries[] as $f |

@@ -774,7 +774,10 @@ fn unnecessary_ignore_rows(
                 // codes' rows are the analyzer layer's, so their facts live
                 // at the shell's analyzer half — the run and late halves
                 // skip them unconditionally.
-                if half != JoinHalf::Analyzer || !known_code(&entry.name) {
+                if half != JoinHalf::Analyzer
+                    || !known_code(&entry.name)
+                    || PARTIAL_ANALYZER_CODES.contains(&entry.name.as_str())
+                {
                     continue;
                 }
             }
@@ -799,6 +802,15 @@ fn unnecessary_ignore_rows(
         });
     }
 }
+
+/// Analyzer codes whose dartq production is known to under-report: the
+/// receiver static type of a member read over an SDK type (`x?.abs()`,
+/// `a.g` on a getter) is not modelled, so `invalid_null_aware_operator`
+/// on a null-shorted chain (`x?.abs()?.isEven`) is missed. The absence of
+/// a row is then no evidence the citation is unnecessary, so the analyzer
+/// half stays silent on these names (an under-report, never a false
+/// `unnecessary_ignore`).
+const PARTIAL_ANALYZER_CODES: [&str; 1] = ["invalid_null_aware_operator"];
 
 /// Which walk's facts the join answers over — the ownership split that
 /// keeps each citation answered by the record that actually saw its drops.

@@ -13,6 +13,11 @@
 //! silently. Removed rules register too (`rules.dart:293` registers the
 //! `RemovedAnalysisRule avoidAs`), so their names belong here as well.
 //!
+//! Probe-pinned against the oracle SDK (`dart analyze` 3.13.1): names that
+//! SDK reports as `undefined_lint` (`analyzer_to_be_deprecated_use`,
+//! `future_sync_value`, `unnecessary_this_alias` — registered only in later
+//! linters) are absent, and the enable set never mounts them.
+//!
 //! Version-pinned data like the engine's `known_error_codes::NAMES`;
 //! sorted, lowercase — membership is a binary search over the lowercased
 //! key.
@@ -25,7 +30,6 @@ pub(crate) const NAMES: &[&str] = &[
     "always_use_package_imports",
     "analyzer_element_model_tracking",
     "analyzer_public_api",
-    "analyzer_to_be_deprecated_use",
     "annotate_overrides",
     "annotate_redeclares",
     "async_return_with_no_await",
@@ -105,7 +109,6 @@ pub(crate) const NAMES: &[&str] = &[
     "exhaustive_cases",
     "file_names",
     "flutter_style_todos",
-    "future_sync_value",
     "hash_and_equals",
     "implementation_imports",
     "implicit_call_tearoffs",
@@ -251,7 +254,6 @@ pub(crate) const NAMES: &[&str] = &[
     "unnecessary_string_escapes",
     "unnecessary_string_interpolations",
     "unnecessary_this",
-    "unnecessary_this_alias",
     "unnecessary_to_list_in_spreads",
     "unnecessary_type_name_in_constructor",
     "unnecessary_unawaited",
