@@ -5802,6 +5802,27 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.nsm_poison();
         engine.const_capture.end_opaque_group(begin.range);
+        // The await expression's static type is `flatten(operand)`
+        // (`analyzeAwaitExpression`, type_analyzer.dart:542-548 —
+        // `Future<S>`/`FutureOr<S>` → `S`, nullability preserved, every
+        // other type its own flatten). The operand's row is the stack top
+        // (await pushes no row of its own), so rewriting its `ty` types
+        // the whole expression for every downstream consumer — a
+        // `var`-inferred local binds `T`, not `Future<T>`, and a chained
+        // `(await f()).g` receiver reads `T` through the parenthesized
+        // close's `inner_ty` copy. The gate mirrors the operand window: a
+        // row that starts inside the operand extent (after the `await`
+        // keyword) is the operand's; a rowless operand leaves an older
+        // outer row on top and the rewrite skips it — the same shape the
+        // `end_const_literal` guard uses.
+        let flat_ty = engine
+            .rows
+            .last()
+            .filter(|row| row.range.offset >= begin.range.end())
+            .map(|row| engine.flatten(engine.operand_static_ty(row)));
+        if let (Some(row), Some(ty)) = (engine.rows.last_mut(), flat_ty) {
+            row.ty = ty;
+        }
     }
 
     fn handle_throw_expression(&mut self, throw: Token, end: Token) {

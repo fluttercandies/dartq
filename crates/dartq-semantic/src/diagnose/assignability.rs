@@ -933,10 +933,18 @@ impl<'a> Engine<'a> {
             }
             match &row.intent {
                 Intent::Read => {
-                    // A write alone never uses a local variable (the
-                    // official `_useAssignmentTargetElement` early return);
-                    // the plain-write hit cancels.
-                    if !compound && let Some(hit) = self.local_hits.remove(&row.range.offset) {
+                    // A write alone never uses its target local (the
+                    // official `_useAssignmentTargetElement` early return)
+                    // — and only a bare row IS that local. A member row's
+                    // hit is the RECEIVER's occurrence credit: `v.m = 1`
+                    // reads `v`, and the official `_visitNameExpression`
+                    // spares it through the lexical resolution regardless
+                    // of the member access resolving (#2189-b — the
+                    // receiver-write census rows).
+                    if !compound
+                        && matches!(row.shape, RowShape::Bare(_))
+                        && let Some(hit) = self.local_hits.remove(&row.range.offset)
+                    {
                         self.locals[hit as usize].uses -= 1;
                     }
                     row.intent = if compound {

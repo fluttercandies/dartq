@@ -1295,6 +1295,11 @@ impl<'a> Engine<'a> {
         self.callee_return_ty(row)
     }
 
+    /// `TypeSystem::flatten` at name level — see [`flatten_ty`].
+    pub(crate) fn flatten(&self, ty: Ty) -> Ty {
+        flatten_ty(self.strings, &self.boundary.pool(), ty)
+    }
+
     /// `this`'s static type (the nullability checks and inferred-local
     /// initializers read it): the enclosing container for class-shaped
     /// members, the written `on` type — nullability included — inside a
@@ -2705,5 +2710,289 @@ impl<'a> Engine<'a> {
         // instantiated-to-bounds form (`Box<dynamic>`), which the whole-file
         // bounds snapshot renders at the finalize pass.
         self.raw_type_sites.push((name, range));
+    }
+}
+
+/// `TypeSystem::flatten` (type_system.dart:425-471) at name level — the
+/// await expression's static type is `flatten(operand)`
+/// (`analyzeAwaitExpression`, type_analyzer.dart:542-548).
+///
+/// Mirrored decision order:
+/// * `S?` strips the suffix, flattens, and re-applies it (:431-435) —
+///   `Future<int>?` awaits to `int?`;
+/// * a `Future<S>`/`FutureOr<S>` head unwraps one level to `S`
+///   (:456-465) — the oracle returns `S` directly, never re-flattens it,
+///   so `Future<Future<int>>` awaits to `Future<int>`;
+/// * a bare `Future`/`FutureOr` spells `Future<dynamic>`/
+///   `FutureOr<dynamic>` — the implicit argument awaits to `dynamic`;
+/// * the type-parameter arms (:437-454) have no reach here: a parameter's
+///   bound never interned into this `Ty` (name only), so the
+///   promoted-bound face falls back to identity;
+/// * every other type is its own flatten (:469-470) — `await` on a
+///   non-Future operand is legal and yields the operand's type.
+///
+/// The subtype-driven `asInstanceOf` face (a user class `implements
+/// Future<int>` awaiting to `int`) stays an under-report: the name level
+/// carries no instantiated supertype walk.
+pub(crate) fn flatten_ty(strings: &StringTable, args: &crate::model::ArgPool, ty: Ty) -> Ty {
+    let Ty::Named {
+        name,
+        nullable,
+        args: list,
+    } = ty
+    else {
+        return ty;
+    };
+    if nullable {
+        return match flatten_ty(
+            strings,
+            args,
+            Ty::Named {
+                name,
+                nullable: false,
+                args: list,
+            },
+        ) {
+            Ty::Named { name, args, .. } => Ty::Named {
+                name,
+                nullable: true,
+                args,
+            },
+            Ty::Record { shape, .. } => Ty::Record {
+                shape,
+                nullable: true,
+            },
+            Ty::Function { shape, .. } => Ty::Function {
+                shape,
+                nullable: true,
+            },
+            // `Null`, `dynamic`, `Never`, `void`, `Unknown`: the suffix is
+            // identity on these faces upstream.
+            flat => flat,
+        };
+    }
+    if name != strings.intern("Future") && name != strings.intern("FutureOr") {
+        return ty;
+    }
+    if list == ArgListId::EMPTY {
+        return Ty::Dynamic;
+    }
+    let flat = args.get(list);
+    if flat.len() != 1 {
+        return ty;
+    }
+    flat[0]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collector::collect;
+    use crate::model::ArgPool;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_resolution::LibraryGraphBuilder;
+    use dartq_scanner::ScanConfig;
+    use dartq_source::FileTable;
+    use std::path::Path;
+
+    /// One pool + table pair the `flatten_ty` pins intern through.
+    fn rig() -> (StringTable, ArgPool) {
+        (StringTable::new(), ArgPool::default())
+    }
+
+    /// `flatten(Future<S>)` is `S` — one level, the oracle's direct
+    /// `return S` (type_system.dart:461-465).
+    #[test]
+    fn flatten_unwraps_future_one_level() {
+        let (strings, mut args) = rig();
+        let int = Ty::named(strings.intern("int"));
+        let inner = args.named(strings.intern("Future"), false, &[int]);
+        let nested = args.named(strings.intern("Future"), false, &[inner]);
+        assert_eq!(flatten_ty(&strings, &args, nested), inner);
+        assert_eq!(flatten_ty(&strings, &args, inner), int);
+    }
+
+    /// `flatten(FutureOr<S>)` is `S` — the same head arm
+    /// (`_futureTypeOfBounded`'s non-nullable `FutureOr` case,
+    /// type_system.dart:1835).
+    #[test]
+    fn flatten_unwraps_future_or() {
+        let (strings, mut args) = rig();
+        let list = args.named(strings.intern("List"), false, &[Ty::named(strings.intern("int"))]);
+        let fut_or = args.named(strings.intern("FutureOr"), false, &[list]);
+        assert_eq!(flatten_ty(&strings, &args, fut_or), list);
+    }
+
+    /// `flatten(S?)` is `flatten(S)?` — the suffix strips, the recursion
+    /// runs, the suffix re-applies (type_system.dart:430-435).
+    #[test]
+    fn flatten_preserves_nullable_suffix() {
+        let (strings, mut args) = rig();
+        let int = Ty::named(strings.intern("int"));
+        let fut = args.named(strings.intern("Future"), true, &[int]);
+        let want = Ty::Named {
+            name: strings.intern("int"),
+            nullable: true,
+            args: ArgListId::EMPTY,
+        };
+        assert_eq!(flatten_ty(&strings, &args, fut), want);
+        // A nullable non-Future face stays itself (`int?` → `int?`).
+        assert_eq!(flatten_ty(&strings, &args, want), want);
+    }
+
+    /// A bare `Future`/`FutureOr` spells `Future<dynamic>`/
+    /// `FutureOr<dynamic>` — the implicit argument awaits to `dynamic`.
+    #[test]
+    fn flatten_bare_future_is_dynamic() {
+        let (strings, args) = rig();
+        for head in ["Future", "FutureOr"] {
+            let bare = Ty::named(strings.intern(head));
+            assert_eq!(flatten_ty(&strings, &args, bare), Ty::Dynamic, "{head}");
+        }
+    }
+
+    /// Every other type is its own flatten (type_system.dart:469-470):
+    /// non-Future heads, `dynamic`, `Null`, `Unknown` pass through.
+    #[test]
+    fn flatten_non_future_is_identity() {
+        let (strings, mut args) = rig();
+        for ty in [
+            Ty::named(strings.intern("int")),
+            Ty::named(strings.intern("DB")),
+            Ty::Dynamic,
+            Ty::Null,
+            Ty::Unknown,
+            args.named(strings.intern("List"), false, &[Ty::Dynamic]),
+        ] {
+            assert_eq!(flatten_ty(&strings, &args, ty), ty, "{ty:?}");
+        }
+    }
+
+    /// Diagnoses `source` as the sole file of a library with no imports —
+    /// the same single-file rig `diagnose/tests.rs` runs (the await-fold
+    /// pins need declared `Future`/`FutureOr` containers for the member
+    /// walk's entity face).
+    fn report(source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let fold = fold_unit(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        let mut report = fold.report;
+        report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+        report
+    }
+
+    fn code_names(report: &FileReport) -> Vec<&'static str> {
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
+    }
+
+    /// The corpus shape (evidence-2186 §A fixture 1): `var`-inferred local
+    /// bound from `await f()` — the member accesses resolve on the
+    /// flattened `DB`, not `Future<DB>`.
+    #[test]
+    fn await_inferred_local_resolves_flattened_members() {
+        let report = report(
+            "class Future<T> {}\n\
+             class DB { void run() {} }\n\
+             Future<DB> f() => throw 0;\n\
+             void g() async {\n\
+             \x20 final db = await f();\n\
+             \x20 db.run();\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// `await` on a `Future<DB>?` operand flattens to `DB?` — the
+    /// null-asserted member read resolves on the `DB` face.
+    #[test]
+    fn await_nullable_future_preserves_suffix() {
+        let report = report(
+            "class Future<T> {}\n\
+             class DB { void run() {} }\n\
+             Future<DB>? h() => throw 0;\n\
+             void g() async {\n\
+             \x20 final n = await h();\n\
+             \x20 n!.run();\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// `await` on `FutureOr<DB>` flattens to `DB` — the member resolves
+    /// (evidence-2186 §A fixture 3's `FutureOr` arm).
+    #[test]
+    fn await_future_or_operand_flattens() {
+        let report = report(
+            "class FutureOr<T> {}\n\
+             class DB { void run() {} }\n\
+             FutureOr<DB> h() => h();\n\
+             void g() async {\n\
+             \x20 final n = await h();\n\
+             \x20 n.run();\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// True-positive pin (evidence-2186 §A fixture 4's under-report bias):
+    /// no `await` — a `Future`-typed receiver's member genuinely misses
+    /// and the report keeps firing. The flatten is scoped to the await
+    /// close; a plain `Future` binding is untouched.
+    #[test]
+    fn unawaited_future_receiver_still_reports() {
+        let report = report(
+            "class Future<T> {}\n\
+             class DB {}\n\
+             void g(Future<DB> x) {\n\
+             \x20 x.isEven;\n\
+             }",
+        );
+        assert_eq!(code_names(&report), ["undefined_getter"], "{:?}", code_names(&report));
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The getter 'isEven' isn't defined for the type 'Future'."
+        );
     }
 }

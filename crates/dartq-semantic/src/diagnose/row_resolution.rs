@@ -2755,7 +2755,6 @@ mod tests {
     /// `#[ignore]`d so the oracle-truth pin rides in the tree and flips to
     /// live the moment the flatten lands.
     #[test]
-    #[ignore = "await-fold gap: receiver binds Future<T>; fix lives in listener.rs/engine_core.rs"]
     fn drift_wrapper_await_receiver_discriminator() {
         let report = report_two(
             "abstract interface class DriftSession {\n\
