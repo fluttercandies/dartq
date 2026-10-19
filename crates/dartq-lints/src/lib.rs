@@ -230,7 +230,7 @@ mod rules;
 #[cfg(test)]
 mod testsupport;
 
-pub use bridge::{ParsedUnit, parse_unit};
+pub use bridge::{ParsedUnit, parse_unit, parse_unit_with_tokens};
 pub use comments::{Comment, CommentKind, Comments};
 pub use engine::{
     AsyncContextUse, Check, Features, Lint, ReachabilityFace, Unit, WorkspaceFacts, run,

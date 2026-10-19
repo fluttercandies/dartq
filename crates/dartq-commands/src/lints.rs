@@ -79,9 +79,9 @@ use dartq_lints::{
     AsyncContextUse, Comments, EnableSet, Features, IgnoreInfo, Lint, PathVerdict, RULES,
     ReachabilityFace, RuleId, UnignorableIgnore, WorkspaceFacts, check_name, check_path_entry,
     check_section, check_url, is_breaking_version, mounts_semantics, parse_unit,
-    resolve_dependency_path, rule_by_name, run, run_breaking_version_annotations,
-    scan_path_entries, scan_screenshot_entries, type_use_counts, unignorable_ignores,
-    unnecessary_ignore_analyzer_rows, unnecessary_ignore_late_rows,
+    parse_unit_with_tokens, resolve_dependency_path, rule_by_name, run,
+    run_breaking_version_annotations, scan_path_entries, scan_screenshot_entries, type_use_counts,
+    unignorable_ignores, unnecessary_ignore_analyzer_rows, unnecessary_ignore_late_rows,
 };
 use dartq_package::PackageIdentity;
 use dartq_parser::ParserFeatures;
@@ -237,6 +237,13 @@ pub(crate) const SEMANTIC_PARSE_FEATURES: ParserFeatures = ParserFeatures {
     enhanced_parts_enabled: false,
     dot_shorthands_enabled: true,
 };
+
+const _: () = assert!(
+    SEMANTIC_SCAN_CONFIG.enable_triple_shift && SEMANTIC_SCAN_CONFIG.enable_augmentations,
+    "the semantic fold's scan posture is the lint bridge's production surface \
+     (both scanner gates on); the lint parse adopts the fold's token table, so \
+     relaxing a gate here would parse a stream a fresh scan would never build",
+);
 
 /// Whether `set` enables the library type-use face's consumer
 /// (`avoid_private_typedef_functions`, #1640). The face's mounted counts
@@ -907,7 +914,19 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
                 } else {
                     None
                 };
-            let parsed = parse_unit(text, features);
+            // The fold's scan is the parse's scan: the context scanned these
+            // exact job-local bytes with the bridge's production posture
+            // ([`SEMANTIC_SCAN_CONFIG`], const-pinned to it above), so the
+            // parse adopts a copy of that table instead of rescanning. The
+            // context keeps its own table — the fold faces read the raw
+            // pre-parse stream (`analyze_unit` above, the `unnecessary_ignore`
+            // neutralized re-fold below), never the parse's unified one.
+            let parsed = match &context {
+                Some((context, _)) => {
+                    parse_unit_with_tokens(text, context.scanned.tokens.clone(), features)
+                }
+                None => parse_unit(text, features),
+            };
             // The library type-use seam (#1640): the owning library's
             // named-type-row counts by name lexeme, folded across the
             // registration-order units — defining first, then parts in

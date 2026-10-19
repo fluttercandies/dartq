@@ -302,7 +302,13 @@ const FLAG_SYNTHETIC: u8 = 1;
 pub(crate) const NO_END: u32 = u32::MAX;
 
 /// Linear token table (EOF is always the last element; interpolation nesting is also linear in order).
-#[derive(Debug)]
+///
+/// `Clone` is a plain copy of the three backing vecs — the table is a pure
+/// function of the scanned bytes and the [`crate::ScanConfig`], so a clone is
+/// always substitutable for the original (consumers that need to keep the raw
+/// table while handing an owned copy to the parse, e.g. the lint fan-out's
+/// scan adoption).
+#[derive(Clone, Debug)]
 pub struct TokenTable {
     tokens: Vec<Token>,
     /// begin token index → matching close token index (`NO_END` = no match;

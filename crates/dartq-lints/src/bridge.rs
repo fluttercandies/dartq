@@ -132,8 +132,28 @@ pub fn parse_unit(source: &str, features: Features) -> ParsedUnit {
     // needs a token-table stamp only, interned into a throwaway table.
     let mut files = dartq_source::FileTable::default();
     let file = files.intern(Path::new("unit.dart"));
-    let scanned = scan(source, SCAN_CONFIG, file);
-    let mut tokens = scanned.tokens;
+    parse_unit_with_tokens(source, scan(source, SCAN_CONFIG, file).tokens, features)
+}
+
+/// The scan-less core of [`parse_unit`]: the same parser → arena walk over an
+/// already-scanned table, adopted by value. The semantic fold's context build
+/// scans each linted file with this bridge's production [`SCAN_CONFIG`] over
+/// the job's own bytes — adopting that table seals the unit with the parser's
+/// inserted tokens exactly as a fresh scan would (`TokenTable` is a pure
+/// function of the source bytes and the config), and removes the second scan
+/// the per-file job otherwise paid. The caller keeps its own table when the
+/// fold faces still read it (the raw pre-parse stream); the adoption here
+/// takes an owned copy, never a shared borrow — the fan-out stays lock-free.
+///
+/// # Contract
+///
+/// `tokens` must come from `scan(source, SCAN_CONFIG, ..)` over these exact
+/// bytes. Any other posture (a relaxed gate, a different file's table) is a
+/// silent divergence the type system cannot see — the commands side pins the
+/// posture with a const assert at the adoption site.
+#[must_use]
+pub fn parse_unit_with_tokens(source: &str, tokens: TokenTable, features: Features) -> ParsedUnit {
+    let mut tokens = tokens;
     let base = tokens.len() as u32;
     let mut listener = AstListener::new(base);
     let inserted = dartq_parser::parse_unit_with(source, &tokens, PARSE_FEATURES, &mut listener);
@@ -3797,6 +3817,63 @@ mod tests {
             assert_eq!(listener.pairing_miss_count, 0);
             let _ = listener.finish();
         }
+    }
+
+    #[test]
+    fn parse_unit_with_tokens_matches_a_fresh_scan_parse() {
+        // The lint fan-out adopts the semantic fold's scanned table into the
+        // parse instead of rescanning the file (identical scan posture, the
+        // same job-local bytes — the commands side pins the posture with a
+        // const assert). The adopted-table parse must be indistinguishable
+        // from the fresh-scan parse: unified token table elementwise (the
+        // fold faces read that stream by index), begin/end pairing included,
+        // and the full AST kind/span walk. The fixture forces parser
+        // insertions (missing `]` closer, missing `)` in the if-header), so
+        // `append_inserted` runs on both sides — the comparison covers the
+        // unified tables, not a clean-file coincidence.
+        let source = "var r = switch (x) { _ => [1, 2 };\nvoid f() { if (a { g(); }\n";
+        let mut files = dartq_source::FileTable::default();
+        let file = files.intern(Path::new("unit.dart"));
+        let scanned = scan(source, SCAN_CONFIG, file).tokens;
+        let adopted = parse_unit_with_tokens(source, scanned, Features::default());
+        let fresh = parse_unit(source, Features::default());
+        assert_eq!(adopted.tokens.len(), fresh.tokens.len(), "table lengths");
+        for (index, (a, f)) in adopted
+            .tokens
+            .as_slice()
+            .iter()
+            .zip(fresh.tokens.as_slice())
+            .enumerate()
+        {
+            assert_eq!(a, f, "token {index} diverges");
+            assert_eq!(
+                adopted.tokens.matching_end(index),
+                fresh.tokens.matching_end(index),
+                "pairing of token {index} diverges"
+            );
+        }
+        let mut seen_a = rustc_hash::FxHashSet::default();
+        let mut seen_f = rustc_hash::FxHashSet::default();
+        let mut stack_a = vec![adopted.ast.root().expect("root")];
+        let mut stack_f = vec![fresh.ast.root().expect("root")];
+        while let (Some(a), Some(f)) = (stack_a.pop(), stack_f.pop()) {
+            if seen_a.insert(a) {
+                stack_a.extend(adopted.ast.children(a));
+            }
+            if seen_f.insert(f) {
+                stack_f.extend(fresh.ast.children(f));
+            }
+            assert_eq!(adopted.ast.kind(a), fresh.ast.kind(f), "node kind");
+            assert_eq!(
+                adopted.ast.token_range(a),
+                fresh.ast.token_range(f),
+                "node span"
+            );
+        }
+        assert!(
+            stack_a.is_empty() && stack_f.is_empty(),
+            "tree shapes diverge"
+        );
     }
 
     #[test]
