@@ -342,11 +342,52 @@ impl ContentStore {
         self.put_at(payload, now_secs())
     }
 
-    /// [`Self::put`] for a payload whose content id the caller already
-    /// holds (the residency's `facts.content` is the same blake3 face):
-    /// skips the re-hash.
-    pub(crate) fn put_known(&mut self, id: ContentId, payload: &[u8]) -> ContentId {
-        self.put_known_at(id, payload, now_secs())
+    /// [`Self::put`] over a whole apply batch whose content ids the caller
+    /// already holds (the residency's `facts.content` is the same blake3
+    /// face, so nothing re-hashes). The blob writes — one
+    /// create + write + rename per new content, the batch's only I/O — fan
+    /// out over rayon instead of serializing the cold walk's whole
+    /// workspace on the main thread; the books then mutate serially in
+    /// batch order, standing as the one-by-one puts leave them: dedup hits
+    /// re-touch, landed writes book, failed writes book nothing. An id
+    /// repeated inside the batch (same-content files) writes once — the
+    /// one-by-one form would retry a failed first write at the repeat, a
+    /// difference confined to the accelerator's best-effort face (a failed
+    /// write is retried by the next batch carrying the content either way).
+    pub(crate) fn put_known_batch(&mut self, batch: &[(ContentId, &[u8])]) {
+        use rayon::prelude::*;
+        let now = now_secs();
+        let mut seen: rustc_hash::FxHashSet<ContentId> = rustc_hash::FxHashSet::default();
+        let fresh: Vec<(ContentId, &[u8])> = batch
+            .iter()
+            .filter(|(id, _)| !self.entries.contains_key(id) && seen.insert(*id))
+            .copied()
+            .collect();
+        let landed: Vec<bool> = fresh
+            .par_iter()
+            .map(|(id, payload)| self.write_blob(id, payload))
+            .collect();
+        for (id, _) in batch {
+            if let Some(entry) = self.entries.get_mut(id) {
+                entry.last_touch = now;
+            }
+        }
+        for ((id, payload), landed) in fresh.into_iter().zip(landed) {
+            if !landed {
+                continue;
+            }
+            let size = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+            self.total = self.total.saturating_add(size);
+            self.entries.insert(
+                id,
+                EntryMeta {
+                    size,
+                    refcount: 0,
+                    last_touch: now,
+                },
+            );
+            self.delta.insert(id);
+        }
     }
 
     fn put_at(&mut self, payload: &[u8], now: u64) -> ContentId {
@@ -998,6 +1039,39 @@ mod tests {
             reopened.contains(&b) && !reopened.contains(&d),
             "open-time eviction enforces the cap, manifest-carried pin intact"
         );
+    }
+
+    /// The batch put books exactly what the one-by-one puts book: a
+    /// standing entry re-touches without a delta, a batch-internal repeat
+    /// writes and books once, and every fresh blob reads back byte-equal.
+    #[test]
+    fn batch_put_books_like_one_by_one_puts() {
+        let scratch = Scratch::new("batch-put");
+        let mut store = ContentStore::open(&scratch.config(u64::MAX)).expect("open");
+        let standing = store.put_at(b"standing", 1);
+        store.flush();
+        let fresh_a = content_hash(b"fresh-a");
+        let fresh_b = content_hash(b"fresh-b");
+        let batch: [(ContentId, &[u8]); 4] = [
+            (standing, b"standing"),
+            (fresh_a, b"fresh-a"),
+            (fresh_b, b"fresh-b"),
+            (fresh_a, b"fresh-a"),
+        ];
+        store.put_known_batch(&batch);
+        assert_eq!(store.len(), 3, "one row per distinct id");
+        assert_eq!(
+            store.total_bytes(),
+            (b"standing".len() + b"fresh-a".len() + b"fresh-b".len()) as u64,
+            "the repeat books its bytes once"
+        );
+        assert_eq!(store.read(&fresh_a).expect("landed"), b"fresh-a");
+        assert_eq!(store.read(&fresh_b).expect("landed"), b"fresh-b");
+        assert!(
+            !store.delta.contains(&standing),
+            "a dedup hit is a re-touch, not a book delta"
+        );
+        assert!(store.delta.contains(&fresh_a) && store.delta.contains(&fresh_b));
     }
 
     /// The books' entry cap ([`MAX_BOOK_ENTRIES`] via the probe knob)

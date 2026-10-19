@@ -399,6 +399,41 @@ pub struct ScannedFace {
     pub version: LanguageVersion,
 }
 
+/// One library surface's reference rows regrouped by use file: per file,
+/// the row indices into [`LibraryIndex::refs`], offset-ascending — the
+/// position face's per-file probe domain.
+pub(crate) type UseView = Box<[(FileId, Box<[u32]>)]>;
+
+/// Builds `surface`'s [`UseView`]: a pure function of the surface's rows,
+/// so the analyze fan-out derives it in the job that built the surface and
+/// the serial store loop only installs it.
+pub(crate) fn use_view_of(surface: &LibraryIndex) -> UseView {
+    let mut grouped: Vec<(FileId, u32, u32)> = surface
+        .refs()
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            (
+                row.file,
+                row.range.offset,
+                u32::try_from(i).expect("ref rows fit u32"),
+            )
+        })
+        .collect();
+    grouped.sort_unstable_by_key(|&(file, offset, _)| (file, offset));
+    let mut view: Vec<(FileId, Vec<u32>)> = Vec::new();
+    for (file, _, i) in grouped {
+        match view.last_mut() {
+            Some((current, rows)) if *current == file => rows.push(i),
+            _ => view.push((file, vec![i])),
+        }
+    }
+    view.into_iter()
+        .map(|(file, rows)| (file, rows.into_boxed_slice()))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
 /// The deepest entry of `map` whose key contains `path`, probing the
 /// path's own ancestor chain deepest-first ([`Path::ancestors`] — the
 /// `Engine::apply_severity_options` lookup shape). The containing keys of
@@ -1513,7 +1548,7 @@ pub(crate) struct EngineState {
     /// stay in the arenas — and both swap at the mutators below in
     /// lockstep with the structure they index, so they cannot drift.
     decl_order: Vec<Option<Box<[u32]>>>,
-    use_views: Vec<Option<Box<[(FileId, Box<[u32]>)]>>>,
+    use_views: Vec<Option<UseView>>,
     /// The postings directories over those arenas (the `postings` module of
     /// dartq-index): name → declaring files and name → libraries with
     /// resolved uses, so `query symbol` is a hash probe plus the answer's
@@ -1922,9 +1957,24 @@ impl EngineState {
     }
 
     /// Stores (or replaces, at the `LibraryAnalyzed` point) `library`'s
-    /// reference surface, re-listing the reference postings for the
-    /// whole-unit swap (the crate's `SymbolIndex::insert_library` law).
-    pub(crate) fn set_surface(&mut self, library: LibraryId, surface: LibraryIndex) {
+    /// reference surface with its precomputed use view ([`use_view_of`],
+    /// built in the analyze fan-out beside the surface), unlisting the
+    /// replaced surface's reference postings at once and deferring the
+    /// fresh listings into `listings` — the caller lands every stored
+    /// library's listings in one [`Postings::list_batch`] after its store
+    /// loop. The deferral is the cost fix: the store loop walks libraries
+    /// in topological order, so per-library listing paid a sorted-insert
+    /// memmove per (name, library) pair, quadratic in a shared name's
+    /// library count; nothing reads the reference postings between the
+    /// loop's stores (the loop holds the engine exclusively), and the
+    /// batch leaves exactly the directory the per-library calls built.
+    pub(crate) fn set_surface(
+        &mut self,
+        library: LibraryId,
+        surface: LibraryIndex,
+        view: UseView,
+        listings: &mut Vec<(StringId, LibraryId)>,
+    ) {
         let index = library.index() as usize;
         if index >= self.library_surfaces.len() {
             self.library_surfaces.resize_with(index + 1, || None);
@@ -1935,40 +1985,132 @@ impl EngineState {
             }
         }
         let fresh = self.library_surfaces[index].as_ref().expect("just stored");
-        for name in fresh.distinct_reference_names() {
-            self.ref_postings.list(name, library);
-        }
-        // The use view regroups the fresh rows by use file (row indices
-        // offset-ascending within a file), in lockstep with the swap.
+        listings.extend(fresh.distinct_reference_names().map(|name| (name, library)));
         if index >= self.use_views.len() {
             self.use_views.resize_with(index + 1, || None);
         }
-        let mut grouped: Vec<(FileId, u32, u32)> = fresh
-            .refs()
-            .iter()
-            .enumerate()
-            .map(|(i, row)| {
-                (
-                    row.file,
-                    row.range.offset,
-                    u32::try_from(i).expect("ref rows fit u32"),
-                )
-            })
-            .collect();
-        grouped.sort_unstable_by_key(|&(file, offset, _)| (file, offset));
-        let mut view: Vec<(FileId, Vec<u32>)> = Vec::new();
-        for (file, _, i) in grouped {
-            match view.last_mut() {
-                Some((current, rows)) if *current == file => rows.push(i),
-                _ => view.push((file, vec![i])),
-            }
+        self.use_views[index] = Some(view);
+    }
+
+    /// Lands the reference listings [`Self::set_surface`] deferred.
+    pub(crate) fn list_references(&mut self, listings: &mut Vec<(StringId, LibraryId)>) {
+        self.ref_postings.list_batch(listings);
+    }
+
+    /// The owned heap bytes of every maintained capture and library
+    /// surface plus their views — the index segment of the memory
+    /// decomposition. Exact over the owned columns (allocator rounding
+    /// aside); a capture shared by refcount with an in-flight holder counts
+    /// once, here.
+    pub(crate) fn index_bytes(&self) -> (usize, usize) {
+        let captures = self.captures.capacity() * size_of::<Option<Arc<FileCapture>>>()
+            + self
+                .captures
+                .iter()
+                .flatten()
+                .map(|capture| size_of::<FileCapture>() + capture.heap_bytes())
+                .sum::<usize>()
+            + self.decl_order.capacity() * size_of::<Option<Box<[u32]>>>()
+            + self
+                .decl_order
+                .iter()
+                .flatten()
+                .map(|order| order.len() * size_of::<u32>())
+                .sum::<usize>();
+        let surfaces = self.library_surfaces.capacity() * size_of::<Option<LibraryIndex>>()
+            + self
+                .library_surfaces
+                .iter()
+                .flatten()
+                .map(LibraryIndex::heap_bytes)
+                .sum::<usize>()
+            + self.use_views.capacity() * size_of::<Option<UseView>>()
+            + self
+                .use_views
+                .iter()
+                .flatten()
+                .map(|view| {
+                    view.len() * size_of::<(FileId, Box<[u32]>)>()
+                        + view.iter().map(|(_, rows)| rows.len() * size_of::<u32>()).sum::<usize>()
+                })
+                .sum::<usize>();
+        (captures, surfaces)
+    }
+
+    /// The memory decomposition (#2210): one line per resident family with
+    /// its byte total, each tagged `exact` (owned columns at capacity,
+    /// allocator rounding aside) or `est` (per-entry constant × count).
+    /// Read-only and O(residency); called only when the
+    /// `DARTQ_RSS_DECOMPOSITION` probe is armed, so a disarmed run pays
+    /// nothing. The process RSS readings ride beside it in the caller's
+    /// dump — the gap between the two is allocator slack plus the
+    /// families no counter covers (the transient fan-out products).
+    pub(crate) fn memory_report(&self) -> Vec<(&'static str, u64, &'static str)> {
+        let mut facts = 0usize;
+        let mut line_index = 0usize;
+        let mut directives = 0usize;
+        let mut fact_rows = 0usize;
+        for unit in self.residency.values() {
+            facts += size_of::<UnitFacts>() + size_of::<(FileId, Arc<UnitFacts>)>();
+            line_index += unit.line_index.line_count() as usize * size_of::<u32>();
+            directives += unit.directives.capacity() * size_of::<DirectiveFacts>()
+                + unit
+                    .directives
+                    .iter()
+                    .map(|d| d.uri.as_ref().map_or(0, |uri| uri.len()))
+                    .sum::<usize>();
+            fact_rows += unit.diagnostics.capacity() * size_of::<Arc<Diagnostic>>()
+                + unit.diagnostics.len() * size_of::<Diagnostic>();
         }
-        self.use_views[index] = Some(
-            view.into_iter()
-                .map(|(file, rows)| (file, rows.into_boxed_slice()))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        );
+        let (captures, surfaces) = self.index_bytes();
+        let semdiag = {
+            let memo = self.semdiag.lock().unwrap_or_else(PoisonError::into_inner);
+            memo.folds
+                .values()
+                .map(|fold| fold.heap_bytes())
+                .sum::<usize>()
+        };
+        let results = self
+            .results
+            .values()
+            .map(|result| result.diagnostics.capacity() * size_of::<Arc<Diagnostic>>())
+            .sum::<usize>();
+        let merged = self
+            .merged
+            .as_ref()
+            .map_or(0, |merged| merged.output.capacity() * size_of::<Diagnostic>());
+        let scanned = self
+            .scanned
+            .values()
+            .map(|face| face.tokens.len() * (size_of::<dartq_scanner::Token>() + 4))
+            .sum::<usize>();
+        let as_u64 = |bytes: usize| bytes as u64;
+        vec![
+            ("store_bytes", self.store.len_bytes(), "exact"),
+            ("store_mapped_bytes", self.store.mapped_bytes(), "exact"),
+            ("residency_facts_shell", as_u64(facts), "exact"),
+            ("residency_line_index", as_u64(line_index), "exact"),
+            ("residency_directives", as_u64(directives), "exact"),
+            ("residency_diagnostic_rows", as_u64(fact_rows), "est"),
+            ("index_captures", as_u64(captures), "exact"),
+            ("index_library_surfaces", as_u64(surfaces), "exact"),
+            (
+                "index_postings",
+                as_u64(self.decl_postings.bytes() + self.ref_postings.bytes()),
+                "exact",
+            ),
+            ("graph_maps", self.graph_maps_bytes(), "exact"),
+            ("semdiag_memo", as_u64(semdiag), "exact"),
+            ("library_results_handles", as_u64(results), "exact"),
+            ("merged_output_rows", as_u64(merged), "exact"),
+            ("scanned_cache_tokens", as_u64(scanned), "exact"),
+            ("scanned_cache_entries", self.scanned.len() as u64, "count"),
+            ("facts_cache_entries", self.facts_cache.len() as u64, "count"),
+            ("warm_start_entries", self.warm_start.len() as u64, "count"),
+            ("residency_files", self.residency.len() as u64, "count"),
+            ("string_table_entries", self.strings.len() as u64, "count"),
+            ("structural_tables", self.structural_bytes(), "est"),
+        ]
     }
 
     /// Drops `library`'s surface (the library retired); the reference

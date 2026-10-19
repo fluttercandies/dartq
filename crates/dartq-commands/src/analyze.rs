@@ -242,13 +242,17 @@ pub fn run_overlaid<'a>(
             diagnostics.extend(engine.apply_severity_options(removed_rows));
         }
     }
+    report_memory(engine);
     // The layout snapshot covers every location the writers resolve — a
     // context message may anchor in a file that carries no row of its own
     // (#2164: its id joins the output set or the merged lookups panic).
     let layout = EngineLayout::over(engine, diagnostics.iter().flat_map(|d| {
         std::iter::once(d.file).chain(d.context.iter().flatten().map(|m| m.file))
     }));
-    diagnostics.sort_by(|a, b| oracle_cmp(a, b, &layout));
+    // Stable like `sort_by` (rayon's merge sort), so ties keep their
+    // arrival order and the output is byte-identical; the comparator walks
+    // path bytes per pair, so 10⁵-row runs split across workers.
+    diagnostics.par_sort_by(|a, b| oracle_cmp(a, b, &layout));
     Ok(AnalyzeRun {
         diagnostics,
         discovery,
@@ -468,13 +472,17 @@ pub fn run_targets<'a>(
         );
         diagnostics = plugin_rows;
     }
+    report_memory(engine);
     // The layout snapshot covers every location the writers resolve — a
     // context message may anchor in a file that carries no row of its own
     // (#2164: its id joins the output set or the merged lookups panic).
     let layout = EngineLayout::over(engine, diagnostics.iter().flat_map(|d| {
         std::iter::once(d.file).chain(d.context.iter().flatten().map(|m| m.file))
     }));
-    diagnostics.sort_by(|a, b| oracle_cmp(a, b, &layout));
+    // Stable like `sort_by` (rayon's merge sort), so ties keep their
+    // arrival order and the output is byte-identical; the comparator walks
+    // path bytes per pair, so 10⁵-row runs split across workers.
+    diagnostics.par_sort_by(|a, b| oracle_cmp(a, b, &layout));
     Ok(AnalyzeRun {
         diagnostics,
         discovery,
@@ -1267,36 +1275,59 @@ fn removed_lint_use_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> 
     files.sort_unstable();
     files.dedup();
     // Governance is by ancestry, so one directory always maps to one
-    // governing entry; the memo keeps the options walk off the per-file
-    // hot path.
-    let mut governing: FxHashMap<PathBuf, Option<&analysis_options::AnalysisOptions>> =
+    // governing entry: a serial pre-pass resolves each distinct directory
+    // once (the options walk stats ancestors) and keeps only the enabled
+    // ones, so the fan-out below reads a frozen map.
+    let mut governing: FxHashMap<&Path, Option<&analysis_options::AnalysisOptions>> =
         FxHashMap::default();
-    let mut rows = Vec::new();
+    let mut work: Vec<(FileId, &analysis_options::AnalysisOptions)> = Vec::new();
     for file in files {
         let Some(path) = engine.file_table().path(file) else {
             continue;
         };
         let dir = path.parent().unwrap_or(Path::new(""));
-        let options = *governing
-            .entry(dir.to_path_buf())
-            .or_insert_with(|| crate::lints::governing_options(engine, dir, roots));
-        let Some(options) = options else {
-            continue;
-        };
-        if !options
-            .lint_rules
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case("unnecessary_ignore"))
-        {
-            continue;
+        let options = *governing.entry(dir).or_insert_with(|| {
+            crate::lints::governing_options(engine, dir, roots).filter(|options| {
+                options
+                    .lint_rules
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case("unnecessary_ignore"))
+            })
+        });
+        if let Some(options) = options {
+            work.push((file, options));
         }
+    }
+    // One independent job per file, rows joined in ascending file order —
+    // the serial walk's emission order. A file whose bytes never spell
+    // `ignore` carries no ignore comment (both recognized forms,
+    // `// ignore:` and `// ignore_for_file:`, contain it), so it skips the
+    // scan outright: the walk re-scans only the files that can answer.
+    let per_file: Vec<Vec<Diagnostic>> = work
+        .par_iter()
+        .map(|&(file, options)| removed_lint_use_rows_of(engine, file, options))
+        .collect();
+    per_file.into_iter().flatten().collect()
+}
+
+/// One file's `removed_lint_use` rows (see [`removed_lint_use_rows`]).
+fn removed_lint_use_rows_of(
+    engine: &Engine,
+    file: FileId,
+    options: &analysis_options::AnalysisOptions,
+) -> Vec<Diagnostic> {
+    let mut rows = Vec::new();
+    {
         let unignorable = options.unignorable();
         let Some(bytes) = engine.content(file) else {
-            continue;
+            return rows;
         };
         let Ok(text) = std::str::from_utf8(bytes) else {
-            continue;
+            return rows;
         };
+        if !text.contains("ignore") {
+            return rows;
+        }
         let scanned = dartq_scanner::scan(text, SCAN_CONFIG, file);
         let comments = dartq_lints::Comments::extract(text, &scanned.tokens);
         for (name, offset, length) in dartq_lints::ignored_name_entries(text, &comments) {
@@ -1326,6 +1357,26 @@ fn removed_lint_use_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> 
         }
     }
     rows
+}
+
+/// The memory-decomposition probe (#2210): with `DARTQ_RSS_DECOMPOSITION`
+/// set (any value), the analyze faces print the engine's per-family
+/// resident bytes ([`Engine::memory_report`]) to stderr once the run's
+/// rows are final — the residency peak of a one-shot run — as
+/// `dartq-rss <family> <bytes> <kind>` lines. Stderr only: the data
+/// channel (stdout, every format) is untouched, so the parity face is
+/// byte-identical armed or not. Disarmed, the probe is one environment
+/// read per run.
+fn report_memory(engine: &Engine) {
+    use std::fmt::Write as _;
+    if std::env::var_os("DARTQ_RSS_DECOMPOSITION").is_none() {
+        return;
+    }
+    let mut out = String::new();
+    for (family, bytes, kind) in engine.memory_report() {
+        let _ = writeln!(out, "dartq-rss {family} {bytes} {kind}");
+    }
+    eprint!("{out}");
 }
 
 /// Whether `name` names a lint rule the official validity faces accept: any

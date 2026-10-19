@@ -81,6 +81,46 @@ impl<U: Copy + Ord> Postings<U> {
         }
     }
 
+    /// Lists every `(name, unit)` pair of `pairs` — the batch form of
+    /// [`Self::list`], leaving the directory exactly as the one-by-one
+    /// calls would (each unit list ascending, no duplicates) at a cost
+    /// independent of the arrival order. The one-by-one form pays a
+    /// sorted-insert memmove per pair, so a cold build that lists units in
+    /// a non-ascending order (the engine's analyze store loop walks
+    /// libraries in topological order) is quadratic in a shared name's
+    /// unit count; here the pairs sort once and each name's run merges
+    /// into its list in one linear pass.
+    pub fn list_batch(&mut self, pairs: &mut Vec<(StringId, U)>) {
+        pairs.sort_unstable();
+        pairs.dedup();
+        let mut rest = pairs.as_slice();
+        while let Some(&(name, _)) = rest.first() {
+            let run = rest.partition_point(|&(other, _)| other == name);
+            let fresh = rest[..run].iter().map(|&(_, unit)| unit);
+            rest = &rest[run..];
+            let units = self.dir.entry(name).or_default();
+            if units.is_empty() {
+                units.extend(fresh);
+                continue;
+            }
+            // A sorted-run merge: both sides ascend and the batch side is
+            // duplicate-free, so one pass yields the ascending union.
+            let mut merged = Vec::with_capacity(units.len() + run);
+            let mut old = std::mem::take(units).into_iter().peekable();
+            for unit in fresh {
+                while let Some(prior) = old.next_if(|prior| *prior < unit) {
+                    merged.push(prior);
+                }
+                if old.peek() != Some(&unit) {
+                    merged.push(unit);
+                }
+            }
+            merged.extend(old);
+            *units = merged;
+        }
+        pairs.clear();
+    }
+
     /// Drops `unit`'s listing under `name`; a name left with no units
     /// leaves the map, so the directory never grows past the live name set.
     pub fn unlist(&mut self, name: StringId, unit: U) {
@@ -472,5 +512,46 @@ mod tests {
         assert!(dir.units(name).is_empty());
         dir.unlist(name, b);
         assert!(dir.is_empty(), "unlisting an absent unit is a no-op");
+    }
+
+    /// The batch listing lands the exact directory the one-by-one calls
+    /// build, whatever the arrival order: duplicates within the batch and
+    /// against the standing lists collapse, every list stays ascending,
+    /// and the batch buffer comes back empty for reuse.
+    #[test]
+    fn batch_listing_matches_one_by_one_listing() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let units: Vec<FileId> = (0..12)
+            .map(|i| files.intern(Path::new(&format!("u{i}.dart"))))
+            .collect();
+        let names: Vec<StringId> = ["x", "y", "z"].iter().map(|n| strings.intern(n)).collect();
+        // Standing listings first (both forms start from the same state),
+        // then a descending, duplicated arrival over a shared name.
+        let standing = [(names[0], units[3]), (names[0], units[9]), (names[1], units[5])];
+        let arrivals: Vec<(StringId, FileId)> = (0..12)
+            .rev()
+            .flat_map(|i| [(names[0], units[i]), (names[2], units[i % 4])])
+            .chain([(names[1], units[5]), (names[1], units[0])])
+            .collect();
+
+        let mut one_by_one: Postings<FileId> = Postings::default();
+        let mut batched: Postings<FileId> = Postings::default();
+        for &(name, unit) in &standing {
+            one_by_one.list(name, unit);
+            batched.list(name, unit);
+        }
+        for &(name, unit) in &arrivals {
+            one_by_one.list(name, unit);
+        }
+        let mut pending = arrivals.clone();
+        batched.list_batch(&mut pending);
+
+        assert!(pending.is_empty(), "the buffer drains for reuse");
+        for &name in &names {
+            assert_eq!(batched.units(name), one_by_one.units(name));
+            assert!(batched.units(name).windows(2).all(|w| w[0] < w[1]));
+        }
+        assert_eq!(batched.bytes() > 0, one_by_one.bytes() > 0);
     }
 }

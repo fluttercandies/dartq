@@ -74,14 +74,17 @@ pub(crate) fn flush_l3(state: &mut EngineState, changed: &[FileId]) {
     let Some(mut l3) = state.l3.take() else {
         return;
     };
-    for file in changed {
-        let Some(content) = state.residency.get(file).map(|facts| facts.content) else {
-            continue;
-        };
-        if let Some(bytes) = state.store.get(content) {
-            l3.put_known(content, bytes);
-        }
-    }
+    // One batch put: the blob writes fan out, the books land serially in
+    // the changed order (`ContentStore::put_known_batch`).
+    let batch: Vec<(dartq_source::ContentId, &[u8])> = changed
+        .iter()
+        .filter_map(|file| {
+            let content = state.residency.get(file)?.content;
+            state.store.get(content).map(|bytes| (content, bytes))
+        })
+        .collect();
+    l3.put_known_batch(&batch);
+    drop(batch);
     l3.flush();
     state.l3 = Some(l3);
 }
@@ -281,7 +284,14 @@ pub(crate) fn analyze(
     // store loop below — where re-deriving every shed capture's sites (a
     // scan + parse per member past the site cache's cap) serialized a full
     // workspace parse on the main thread.
-    let computed: Vec<Option<(Duration, Vec<Arc<Diagnostic>>, dartq_index::LibraryIndex)>> = order
+    let computed: Vec<
+        Option<(
+            Duration,
+            Vec<Arc<Diagnostic>>,
+            dartq_index::LibraryIndex,
+            crate::state::UseView,
+        )>,
+    > = order
         .par_iter()
         .map(|library| {
             if cancel.check().is_err() {
@@ -309,7 +319,10 @@ pub(crate) fn analyze(
             diagnostics.sort_by(|a, b| compare_canonical(&state.files, a, b));
             let info = state.libraries.info(*library).expect("live library");
             let surface = library_surface(state, resolved, *library, info);
-            Some((start.elapsed(), diagnostics, surface))
+            // The surface's use view is a pure function of its rows: it
+            // rides the job too, so the serial store loop only installs it.
+            let view = crate::state::use_view_of(&surface);
+            Some((start.elapsed(), diagnostics, surface, view))
         })
         .collect();
 
@@ -322,8 +335,12 @@ pub(crate) fn analyze(
     // scheduling) — so `query_symbols` serves maintained surfaces instead of
     // recapturing the whole workspace per query.
     let mut completed: FxHashSet<LibraryId> = FxHashSet::default();
+    // The reference listings of every stored surface land in one batch
+    // after the loop (`EngineState::set_surface`): nothing reads the
+    // reference postings inside it.
+    let mut listings: Vec<(StringId, LibraryId)> = Vec::new();
     for (library, slot) in order.iter().zip(computed) {
-        let Some((duration, diagnostics, surface)) = slot else {
+        let Some((duration, diagnostics, surface, view)) = slot else {
             continue;
         };
         // The reuse key rides the record (g485 W2): the condensation is
@@ -355,7 +372,7 @@ pub(crate) fn analyze(
         *state.library_generations.entry(*library).or_insert(0) += 1;
         let info = state.libraries.info(*library).expect("live library");
         let defining = info.defining;
-        state.set_surface(*library, surface);
+        state.set_surface(*library, surface, view, &mut listings);
         completed.insert(*library);
         // Library-boundary budget poll: sustained pressure walks
         // the ladder across these sequential boundaries, one tier each.
@@ -388,6 +405,11 @@ pub(crate) fn analyze(
             duration,
         });
     }
+
+    // The stored surfaces' reference listings land before either exit: a
+    // cancelled run's completed libraries keep their surfaces, and those
+    // must answer the query faces exactly as a full run's do.
+    state.list_references(&mut listings);
 
     if cancelled.load(AtomicOrdering::Relaxed) {
         // Cancelled run: completed libraries keep their results (complete

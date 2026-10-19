@@ -298,7 +298,7 @@ pub(crate) struct MemberFold {
     content: ContentId,
     diagnostics: Arc<[Arc<Diagnostic>]>,
     unused: Arc<[(Arc<Diagnostic>, StringId)]>,
-    face: Arc<UnitUseFace>,
+    face: CompactUseFace,
 }
 
 impl MemberFold {
@@ -312,6 +312,101 @@ impl MemberFold {
             && self.inputs.fingerprint == inputs.fingerprint
             && self.inputs.strict == inputs.strict
             && self.inputs.posture_epoch == inputs.posture_epoch
+    }
+
+    /// The product's owned heap bytes: the row-handle slices (the rows
+    /// themselves are shared with the library runs and counted there) plus
+    /// the compact use face — the memory decomposition's memo segment.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.diagnostics.len() * size_of::<Arc<Diagnostic>>()
+            + self.unused.len() * size_of::<(Arc<Diagnostic>, StringId)>()
+            + self.face.heap_bytes()
+    }
+}
+
+/// The memo's resident form of a [`UnitUseFace`]: the three name sets as
+/// sorted, duplicate-free boxed slices and the directive faces as boxed
+/// slices. The live face's hash sets cost ~5 B per bucket at a ≥ 8/7
+/// load-factor bound rounded up to a power of two, plus group padding —
+/// 5–10 B per name — where a slice costs exactly 4; one memo entry stands
+/// per resident file for the whole session, so the hash slack was paid
+/// 10⁵-fold. The library close only tests set membership
+/// (`LibraryUsages::close_library_usage` unions the three sets), so a
+/// served face re-expands to an equal set — byte-identical verdicts.
+struct CompactUseFace {
+    used: Box<[StringId]>,
+    reads: Box<[StringId]>,
+    annotations: Box<[StringId]>,
+    imports: Box<[(Option<StringId>, Box<[StringId]>)]>,
+    exports: Box<[Box<[StringId]>]>,
+}
+
+impl CompactUseFace {
+    fn of(face: &UnitUseFace) -> Self {
+        let sorted = |set: &rustc_hash::FxHashSet<StringId>| -> Box<[StringId]> {
+            let mut names: Vec<StringId> = set.iter().copied().collect();
+            names.sort_unstable();
+            names.into_boxed_slice()
+        };
+        Self {
+            used: sorted(&face.used),
+            reads: sorted(&face.reads),
+            annotations: sorted(&face.annotations),
+            imports: face
+                .imports
+                .iter()
+                .map(|import| (import.prefix, import.shown.clone()))
+                .collect(),
+            exports: face
+                .exports
+                .iter()
+                .map(|export| export.shown.clone().into_boxed_slice())
+                .collect(),
+        }
+    }
+
+    /// The live face back, for the library close. A new `UnitUseFace`
+    /// field breaks this compile-time, so the expansion cannot silently
+    /// drop one.
+    fn expand(&self) -> UnitUseFace {
+        UnitUseFace {
+            used: self.used.iter().copied().collect(),
+            reads: self.reads.iter().copied().collect(),
+            annotations: self.annotations.iter().copied().collect(),
+            imports: self
+                .imports
+                .iter()
+                .map(|(prefix, shown)| ImportUseFace {
+                    prefix: *prefix,
+                    shown: shown.clone(),
+                })
+                .collect(),
+            exports: self
+                .exports
+                .iter()
+                .map(|shown| ExportUseFace {
+                    shown: shown.to_vec(),
+                })
+                .collect(),
+        }
+    }
+
+    fn heap_bytes(&self) -> usize {
+        (self.used.len() + self.reads.len() + self.annotations.len()) * size_of::<StringId>()
+            + self
+                .imports
+                .iter()
+                .map(|(_, shown)| {
+                    size_of::<(Option<StringId>, Box<[StringId]>)>()
+                        + shown.len() * size_of::<StringId>()
+                })
+                .sum::<usize>()
+            + self
+                .exports
+                .iter()
+                .map(|shown| size_of::<Box<[StringId]>>() + shown.len() * size_of::<StringId>())
+                .sum::<usize>()
     }
 }
 
@@ -348,33 +443,6 @@ impl MemoHandle<'_> {
     }
 }
 
-/// Clones a unit use face — the memo serves faces into the substrate by
-/// value and `UnitUseFace` is not `Clone` upstream. Kept here because only
-/// the memo needs it; a new `UnitUseFace` field breaks this compile-time,
-/// so the clone cannot silently drop one.
-fn clone_use_face(face: &UnitUseFace) -> UnitUseFace {
-    UnitUseFace {
-        used: face.used.clone(),
-        reads: face.reads.clone(),
-        annotations: face.annotations.clone(),
-        imports: face
-            .imports
-            .iter()
-            .map(|import| ImportUseFace {
-                prefix: import.prefix,
-                shown: import.shown.clone(),
-            })
-            .collect(),
-        exports: face
-            .exports
-            .iter()
-            .map(|export| ExportUseFace {
-                shown: export.shown.clone(),
-            })
-            .collect(),
-    }
-}
-
 impl SemanticDiagnoser for Diagnoser {
     fn diagnose_library(&self, library: LibraryView<'_>, out: &mut Vec<Arc<Diagnostic>>) {
         let duplicate = duplicate_definition_name();
@@ -408,7 +476,7 @@ impl SemanticDiagnoser for Diagnoser {
                         .iter()
                         .map(|(row, name)| (Arc::clone(row), *name)),
                 );
-                usages.add_unit(library.graph_library, clone_use_face(&fold.face));
+                usages.add_unit(library.graph_library, fold.face.expand());
                 continue;
             }
             // The member's facts' content is resident in the store (the
@@ -514,7 +582,10 @@ impl SemanticDiagnoser for Diagnoser {
                     .iter()
                     .map(|(row, name)| (Arc::clone(row), *name)),
             );
-            usages.add_unit(library.graph_library, clone_use_face(&face));
+            // The memo keeps the compact form; the live face moves into the
+            // substrate as-is (no clone on the fresh path).
+            let compact = CompactUseFace::of(&face);
+            usages.add_unit(library.graph_library, face);
             library.memo.insert(
                 file,
                 MemberFold {
@@ -522,7 +593,7 @@ impl SemanticDiagnoser for Diagnoser {
                     content: facts.content,
                     diagnostics: live.into(),
                     unused: candidates.into(),
-                    face: Arc::new(face),
+                    face: compact,
                 },
             );
         }
@@ -546,6 +617,61 @@ impl SemanticDiagnoser for Diagnoser {
 #[must_use]
 pub fn diagnoser() -> Arc<dyn SemanticDiagnoser> {
     Arc::new(Diagnoser)
+}
+
+#[cfg(test)]
+mod compact_face_tests {
+    use super::*;
+
+    /// The memo's compact face expands back to a face equal field by
+    /// field — the sets as sets (the close only tests membership), the
+    /// directive faces in written order — and its byte count is the exact
+    /// slice payload.
+    #[test]
+    fn compact_use_face_round_trips_every_field() {
+        let strings = StringTable::new();
+        let id = |text: &str| strings.intern(text);
+        let face = UnitUseFace {
+            used: [id("a"), id("b"), id("c")].into_iter().collect(),
+            reads: [id("b")].into_iter().collect(),
+            annotations: [id("override")].into_iter().collect(),
+            imports: vec![
+                ImportUseFace {
+                    prefix: Some(id("p")),
+                    shown: vec![id("x"), id("y")].into_boxed_slice(),
+                },
+                ImportUseFace {
+                    prefix: None,
+                    shown: Box::default(),
+                },
+            ],
+            exports: vec![ExportUseFace {
+                shown: vec![id("z")],
+            }],
+        };
+        let compact = CompactUseFace::of(&face);
+        let back = compact.expand();
+        assert_eq!(back.used, face.used);
+        assert_eq!(back.reads, face.reads);
+        assert_eq!(back.annotations, face.annotations);
+        assert_eq!(back.imports.len(), 2);
+        assert_eq!(back.imports[0].prefix, Some(id("p")));
+        assert_eq!(&*back.imports[0].shown, &[id("x"), id("y")]);
+        assert_eq!(back.imports[1].prefix, None);
+        assert!(back.imports[1].shown.is_empty());
+        assert_eq!(back.exports.len(), 1);
+        assert_eq!(back.exports[0].shown, vec![id("z")]);
+        assert!(compact.used.windows(2).all(|w| w[0] < w[1]), "sorted, deduped");
+        let ids = size_of::<StringId>();
+        assert_eq!(
+            compact.heap_bytes(),
+            5 * ids
+                + 2 * size_of::<(Option<StringId>, Box<[StringId]>)>()
+                + 2 * ids
+                + size_of::<Box<[StringId]>>()
+                + ids
+        );
+    }
 }
 
 #[cfg(test)]

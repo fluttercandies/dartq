@@ -109,6 +109,14 @@ pub const DEFAULT_TARGET: &str = "vm";
 /// the saving pass's path order), keeping the pick deterministic.
 const WARM_START_STAGING_CAP: usize = 1 << 17;
 
+/// Discovery's load chunk in files: one chunk's read results are in flight
+/// at a time, each chunk enqueued before the next loads. Sized to keep
+/// every worker busy across ~128 32-path normalization slices while the
+/// result vector (text lease + LOC + normalized path, ~80 B/row plus the
+/// path) stays ~1 MB; the texts themselves live in the pending overlay
+/// until apply regardless of chunking.
+const DISCOVERY_LOAD_CHUNK: usize = 4096;
+
 /// Everything immutable across the engine's lifetime: the M1 slice
 /// of the six context fields — store, SDK, packages — plus the pub
 /// config + config directory the URI-resolution table derives from. The
@@ -947,7 +955,87 @@ impl Engine {
         // the nested package's files belong to the nested walk (each file
         // is discovered exactly once, attributed to its own package).
         let all_roots: FxHashSet<PathBuf> = roots.iter().cloned().collect();
-        for root in &roots {
+        // Phase 1 — every root's walk fans out at once (each is pure,
+        // independent directory I/O). The per-root walks used to run one
+        // after another, each closing on its own sort and read barrier: on
+        // a many-package workspace (the 10⁵-file corpus carries 402 roots)
+        // that serialized hundreds of short phases whose read batches held
+        // only a handful of parallel slices. The roots' accepted lists come
+        // back in the sorted root order, each list sorted — exactly the
+        // order the serial per-root loop enqueued in.
+        let options = &self.state.options;
+        let accepted: Vec<Vec<PathBuf>> = roots
+            .par_iter()
+            .map(|root| discover_root(options, root, &all_roots))
+            .collect();
+        let accepted: Vec<PathBuf> = accepted.into_iter().flatten().collect();
+        // Phase 2 — one global load over the whole ordered list: small
+        // files owned, large ones mapped (`open_source`), LOC counted, and
+        // the path normalization (one `realpath` per distinct parent per
+        // 32-path slice, `normalize_paths`) riding the same jobs, so the
+        // serial id pass below mints ids syscall-free. The loads run in
+        // chunks of `DISCOVERY_LOAD_CHUNK`, each chunk enqueued before the
+        // next loads: the bound caps the in-flight result vector, while the
+        // texts themselves are retained by the pending overlay until apply
+        // whatever the chunking (the mapping store then shares the leases
+        // into the CAS table by refcount at apply — the text never copies
+        // off the page cache; an owned store copies once at apply's
+        // `put_text`). Per file the intern/enqueue path and the stats are
+        // identical to the per-root form.
+        for chunk in accepted.chunks(DISCOVERY_LOAD_CHUNK) {
+            let reads: Vec<Result<(SourceText, u64, PathBuf), OpenError>> = chunk
+                .par_chunks(32)
+                .flat_map_iter(|slice| {
+                    let refs: Vec<&Path> = slice.iter().map(PathBuf::as_path).collect();
+                    let normalized = dartq_source::normalize_paths(&refs);
+                    slice.iter().zip(normalized).map(|(path, normalized)| {
+                        dartq_source::open_source(path).map(|text| {
+                            let loc = u64::from(
+                                u32::try_from(memchr::memchr_iter(b'\n', text.as_bytes()).count())
+                                    .unwrap_or(u32::MAX),
+                            );
+                            (text, loc, normalized)
+                        })
+                    })
+                })
+                .collect();
+            // Enqueue in the sorted order the loads were issued in. The
+            // pending overlay is last-wins per path, so content would land
+            // identically in any order, but a fixed enqueue order keeps the
+            // differential harness byte-stable. A load failure surfaces at
+            // its sorted position with everything before it already
+            // enqueued — the surfaced error is the first in sorted order.
+            // The span-capacity rejections are not failures: the file is
+            // recorded for the notice face and skipped, and the walk
+            // continues (an over-capacity file must cost a notice, not the
+            // run).
+            for (path, read) in chunk.iter().zip(reads) {
+                match read {
+                    Ok((text, loc, normalized)) => {
+                        stats.loc_total += loc;
+                        stats.file_count += 1;
+                        self.set_source_normalized(path, normalized, text);
+                    }
+                    Err(OpenError::TooLarge { .. }) => stats.oversized.push(path.clone()),
+                    Err(OpenError::Io(error)) => return Err(error),
+                }
+            }
+        }
+        Ok(stats)
+    }
+}
+
+/// One package root's accepted `.dart` files, sorted: the root's own files
+/// plus the parallel walk of every non-dot, non-excluded child directory
+/// that is not itself a package root. Reads only the options map, so the
+/// roots fan out without sharing the engine across workers.
+fn discover_root(
+    options: &FxHashMap<PathBuf, Arc<analysis_options::AnalysisOptions>>,
+    root: &Path,
+    all_roots: &FxHashSet<PathBuf>,
+) -> Vec<PathBuf> {
+    {
+        {
             // The governing options: the root's entry plus every
             // nested options directory under it. Excluded paths leave the
             // analysis set — directories are not descended into, files are
@@ -956,9 +1044,7 @@ impl Engine {
             // anchored to their declaring directories (the official
             // `root.excludedGlobs` accumulation, context_locator.dart
             // :402-409), so a nested file's excludes prune only its subtree.
-            let governing: Vec<(PathBuf, Arc<analysis_options::AnalysisOptions>)> = self
-                .state
-                .options
+            let governing: Vec<(PathBuf, Arc<analysis_options::AnalysisOptions>)> = options
                 .iter()
                 .filter(|(key, _)| key.starts_with(root))
                 .map(|(key, options)| (key.clone(), Arc::clone(options)))
@@ -1071,85 +1157,19 @@ impl Engine {
             accepted.extend(
                 std::mem::take(&mut queue)
                     .par_iter()
-                    .flat_map_iter(|dir| walk(dir, &is_excluded, &all_roots))
+                    .flat_map_iter(|dir| walk(dir, &is_excluded, all_roots))
                     .collect::<Vec<_>>(),
             );
             // `read_dir` yields entries in platform-dependent order, so the
             // serial walk's enqueue order was never stable run-to-run;
             // sorting pins discovery to one deterministic path order.
             accepted.par_sort_unstable();
-            // Cold-path I/O: load every accepted file (small files owned,
-            // large ones mapped — `open_source`) and count its LOC in
-            // parallel — the load is I/O-bound (page-cache
-            // faults) and rayon's blocking pool absorbs that (the sanctioned
-            // parallel form, same as the l1 batch fan-out). The walk and its
-            // acceptance predicate stay serial on purpose: the predicate is
-            // pure and the walk's `queue` stack is inherently sequential.
-            // Loads run in bounded batches of 256, each batch enqueued and
-            // dropped before the next one loads: peak transient memory is
-            // one batch's mappings, not the whole workspace's (the mapping
-            // store then shares the leases into the CAS table by refcount at
-            // apply — the text never copies off the page cache; an owned
-            // store copies once at apply's `put_text`, the read being the
-            // map). Sorting precedes chunking, so the enqueue order, the
-            // byte-stable differential face, and the
-            // first-failure-in-sorted-order error surface are unchanged; per
-            // file the intern/enqueue path and the stats are identical to
-            // the unbatched form.
-            for batch in accepted.chunks(256) {
-                // The path normalization (one `realpath` per file) rides the
-                // read fan-out too: a pure function of the path, so the
-                // serial id pass below mints ids syscall-free.
-                // Sorted batches share a few parent directories: normalize
-                // per 32-path slice with one canonicalization per distinct
-                // parent (`normalize_paths`) instead of a full `realpath`
-                // per file.
-                let reads: Vec<Result<(SourceText, u64, PathBuf), OpenError>> = batch
-                    .par_chunks(32)
-                    .flat_map_iter(|slice| {
-                        let refs: Vec<&Path> = slice.iter().map(PathBuf::as_path).collect();
-                        let normalized = dartq_source::normalize_paths(&refs);
-                        slice.iter().zip(normalized).map(|(path, normalized)| {
-                            dartq_source::open_source(path).map(|text| {
-                                let loc = u64::from(
-                                    u32::try_from(
-                                        memchr::memchr_iter(b'\n', text.as_bytes()).count(),
-                                    )
-                                    .unwrap_or(u32::MAX),
-                                );
-                                (text, loc, normalized)
-                            })
-                        })
-                    })
-                    .collect();
-                // Enqueue in the same sorted order the loads were issued in.
-                // The pending overlay is last-wins per path, so content would
-                // land identically in any order, but a fixed enqueue order
-                // keeps the differential harness byte-stable. A load failure
-                // surfaces at its sorted position with everything before it
-                // already enqueued — the surfaced error is the first in sorted
-                // order (the old serial version surfaced whichever read failed
-                // first in platform-dependent read_dir order, itself never
-                // stable). The span-capacity rejections are not failures: the
-                // file is recorded for the notice face and skipped, and the
-                // walk continues (an over-capacity file must cost a notice,
-                // not the run).
-                for (path, read) in batch.iter().zip(reads) {
-                    match read {
-                        Ok((text, loc, normalized)) => {
-                            stats.loc_total += loc;
-                            stats.file_count += 1;
-                            self.set_source_normalized(path, normalized, text);
-                        }
-                        Err(OpenError::TooLarge { .. }) => stats.oversized.push(path.clone()),
-                        Err(OpenError::Io(error)) => return Err(error),
-                    }
-                }
-            }
+            accepted
         }
-        Ok(stats)
     }
+}
 
+impl Engine {
     /// The engine's file table (the CLI's `FileLayoutProvider` backing).
     #[must_use]
     pub fn file_table(&self) -> &FileTable {
@@ -1335,6 +1355,18 @@ impl Engine {
     #[must_use]
     pub fn graph_maps_bytes(&self) -> u64 {
         self.state.graph_maps_bytes()
+    }
+
+    /// The memory decomposition (#2210): `(family, bytes, kind)` rows over
+    /// every resident family the engine holds, `kind` one of `exact`
+    /// (owned columns at capacity), `est` (per-entry constant × count) or
+    /// `count` (an entry count, not bytes). O(residency), read-only; the
+    /// analyze face prints it only under the `DARTQ_RSS_DECOMPOSITION`
+    /// probe, so a disarmed run never calls it.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn memory_report(&self) -> Vec<(&'static str, u64, &'static str)> {
+        self.state.memory_report()
     }
 
     /// Exact byte footprint of the two postings directories (name →
@@ -1917,6 +1949,70 @@ mod tests {
             features.is_enabled(Feature::Patterns),
             "the unpinned 3.5 package keeps the baseline posture"
         );
+    }
+
+    /// The memory decomposition (#2210) after a cold discover + analyze:
+    /// every family row is present once, the residency/store faces count
+    /// what the run admitted, and the counters move with the workspace.
+    #[test]
+    fn memory_report_counts_the_admitted_workspace() {
+        let (root, mut engine) = facade_engine();
+        std::fs::create_dir_all(root.join("lib")).expect("lib dir");
+        std::fs::write(root.join("lib/a.dart"), "import 'b.dart';\nvoid a() { b(); }\n")
+            .expect("a");
+        std::fs::write(root.join("lib/b.dart"), "void b() {}\n").expect("b");
+        let stats = engine.discover_workspace().expect("discover");
+        assert!(stats.file_count >= 2);
+        engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        let report = engine.memory_report();
+        let row = |family: &str| {
+            let rows: Vec<_> = report.iter().filter(|(name, _, _)| *name == family).collect();
+            assert_eq!(rows.len(), 1, "{family} reported once");
+            rows[0].1
+        };
+        assert_eq!(row("residency_files"), engine.state.residency.len() as u64);
+        assert!(row("residency_files") >= 2);
+        assert_eq!(row("store_bytes"), engine.stored_bytes());
+        assert!(row("residency_line_index") > 0);
+        assert!(row("index_captures") > 0, "every resident file carries a capture");
+        assert!(row("index_library_surfaces") > 0, "the analyze built surfaces");
+        assert_eq!(
+            row("index_postings"),
+            engine.postings_bytes(),
+            "the postings row is the public counter"
+        );
+        assert!(
+            report
+                .iter()
+                .all(|(_, _, kind)| matches!(*kind, "exact" | "est" | "count"))
+        );
+    }
+
+    /// Discovery over several package roots enqueues exactly the per-root
+    /// sorted order concatenated in sorted root order — the order the
+    /// serial per-root loop produced before the roots fanned out.
+    #[test]
+    fn discovery_enqueues_roots_in_sorted_order() {
+        let (root, mut engine) = facade_engine();
+        for relative in ["lib/z.dart", "lib/a.dart", "test/m_test.dart", "tool/t.dart"] {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(&path, "void f() {}\n").expect("file");
+        }
+        engine.discover_workspace().expect("discover");
+        let order: Vec<PathBuf> = engine
+            .state
+            .pending_order
+            .iter()
+            .filter_map(|file| engine.state.files.path(*file).map(Path::to_path_buf))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "dart"))
+            .collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order, sorted, "one root: the enqueue order is the sorted walk");
+        assert_eq!(order.len(), 4);
     }
 
     /// The residency-epoch gate on the nested-pubspec scan (#1527): a

@@ -462,6 +462,20 @@ impl FileCapture {
         !self.shed
     }
 
+    /// The capture's owned heap bytes at reserved capacity: the
+    /// declaration rows, the supertype edges, and the five site columns
+    /// (`u32` name + kind byte + family byte + `u32` offset + `u32` length
+    /// per site). Exact over the columns this type owns; the allocator's
+    /// per-block rounding is not counted. The engine's memory
+    /// decomposition reads it.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        self.index.decls.capacity() * size_of::<DeclRow>()
+            + self.index.supers.capacity() * size_of::<SuperEdge>()
+            + self.sites.capacity() * (size_of::<StringId>() + 2 + 2 * size_of::<u32>())
+    }
+
     /// The shed twin: the same file and declaration surface with the site
     /// columns emptied and [`FileCapture::sites_present`] cleared — the
     /// drop-the-payload half of the engine's site LRU (`#1859`), which

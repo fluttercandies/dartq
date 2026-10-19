@@ -298,6 +298,20 @@ impl LibraryIndex {
         &self.refs
     }
 
+    /// The surface's owned heap bytes at reserved capacity — every table
+    /// column, the overflow rows included. Exact over the columns this type
+    /// owns; the allocator's per-block rounding is not counted. The
+    /// engine's memory decomposition reads it.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        self.refs.capacity() * size_of::<RefRow>()
+            + (self.runs.capacity() + self.name_runs.capacity() + self.name_refs.capacity())
+                * size_of::<u32>()
+            + (self.names.capacity() + self.names_overflow.capacity()) * size_of::<NameRow>()
+            + self.supers.capacity() * size_of::<SubtypeEdge>()
+    }
+
     /// The number of resolved reference rows.
     #[must_use]
     pub fn reference_count(&self) -> usize {
