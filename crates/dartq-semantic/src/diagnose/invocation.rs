@@ -174,6 +174,23 @@ impl<'a> Engine<'a> {
         } else {
             self.rows.pop()
         };
+        // S4-B cascade-target collapse: after a `..x = rhs` section the RHS's
+        // leftover row sits on the stack top, so the next section's
+        // `popped_receiver` is that RHS (`C()..p = 1..q = true` reads `q`'s
+        // receiver as `int`). Upstream resolves EVERY section against
+        // `cascade.target2`'s static type (`cascadeReceiver`,
+        // type_analyzer.dart:611-618). `member_reads`'s last entry — when it
+        // belongs to this cascade (its selector offset was already pushed
+        // into `cascade_sections` by `handle_cascade_access`) — carries the
+        // latched target `Receiver`, substituted in below.
+        let cascade_recv = (self.in_cascade
+            && popped_receiver
+                .as_ref()
+                .is_some_and(|row| matches!(row.shape, RowShape::Value | RowShape::Record(..))))
+        .then(|| self.member_reads.last())
+        .flatten()
+        .filter(|last| self.cascade_sections.contains(&last.offset))
+        .map(|last| last.recv);
         let receiver_offset = popped_receiver
             .as_ref()
             .map(|r| r.range.offset)
@@ -467,6 +484,12 @@ impl<'a> Engine<'a> {
             }
             None => Receiver::Unknown,
         };
+        // S4-B: a cascade section's receiver is the latched cascade target —
+        // the RHS-value leftover popped above is never the real receiver
+        // (`C()..p = 1..q` resolves `q` on `C`, not the `1` row). The normal
+        // merge already recorded `member_reads` for this section; only the
+        // classification feeds the override.
+        let recv = cascade_recv.unwrap_or(recv);
         if is_null_aware {
             // The receiver's expression static type decides the face
             // (`_checkForUnnecessaryNullAware` reads the flow-aware static
@@ -1049,7 +1072,18 @@ impl<'a> Engine<'a> {
             None => None,
         };
         let associated = match formals {
-            Some(formals) if named => formals.named.iter().any(|f| f.name == name_id),
+            Some(formals) if named => {
+                // The super constructor's `this._x` named formal carries the
+                // public element name `x` upstream (`correspondingPublicName`)
+                // — a `super._x` forwarding it is associated (the parameter's
+                // own name stays private, the *associated* lookup spells the
+                // public face).
+                let public = self.formal_public_name(name_id);
+                formals
+                    .named
+                    .iter()
+                    .any(|f| f.name == name_id || f.name == public)
+            }
             Some(formals) => formals
                 .positional
                 .get(usize::try_from(super_index).unwrap_or(usize::MAX))
@@ -1870,7 +1904,7 @@ impl<'a> Engine<'a> {
         let mut positional_index = 0usize;
         for (name, ty, literal, range) in &level.args {
             let formal = if let Some(n) = name {
-                match formals.named_formal(*n) {
+                match self.named_formal_for(&formals, *n) {
                     Some(formal) => formal,
                     // The unknown named parameter: `undefined_named_parameter`
                     // anchors at the label (the constant's own name anchors
@@ -1945,6 +1979,60 @@ impl<'a> Engine<'a> {
             }
         }
     }
+
+    /// The public spelling a private named formal resolves to at call sites
+    /// (upstream `correspondingPublicName`,
+    /// pkg/_fe_analyzer_shared/lib/src/scanner/token_impl.dart:364): a
+    /// `this._x`/`super._x` named formal's element stores the public `x`,
+    /// so callers spell `x:` — never `_x:` — and `missing_required_argument`
+    /// renders `x`. `None` keeps the written name: a non-private spelling,
+    /// the wildcard `_`, a leading digit, a second `_`, or a reserved word
+    /// (`_if` has no public face and reports
+    /// `private_named_parameter_without_public_name` upstream instead).
+    fn formal_public_name(&self, name: StringId) -> StringId {
+        let text = self.strings.resolve(name);
+        let Some(rest) = text.strip_prefix('_') else {
+            return name;
+        };
+        let valid = rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '$')
+            && !matches!(
+                dartq_scanner::keyword_from_str(rest),
+                Some(k) if k.style() == dartq_scanner::KeywordStyle::Reserved
+            );
+        if valid {
+            self.intern(rest)
+        } else {
+            name
+        }
+    }
+
+    /// The named formal a written `name:` argument resolves to: exact
+    /// spelling first, then the private-formal public face (upstream keys
+    /// `NamedExpression.name` against `ParameterElement.name`, which is the
+    /// public name — `AsyncData._(…, error: e)` binds `required this._error`).
+    /// A given `_x:` resolves nothing when `_x`'s public face exists — the
+    /// element only answers `x:`.
+    fn named_formal_for<'f>(&self, formals: &'f Formals, name: StringId) -> Option<&'f Formal> {
+        let public = self.formal_public_name(name);
+        if public != name {
+            // The written argument is already private (`_x:`): it resolves a
+            // formal whose element name is exactly `_x` — a formal carrying
+            // no public face (else its element name is `x`).
+            return formals.named_formal(name).filter(|f| {
+                self.formal_public_name(f.name) == f.name
+            });
+        }
+        formals.named_formal(name).or_else(|| {
+            formals
+                .named
+                .iter()
+                .find(|f| self.formal_public_name(f.name) == name)
+        })
+    }
+
 
     /// Pairs the closed argument list against the callee's declared formals:
     /// positional by index, named by spelling. The count decisions precede
@@ -2309,8 +2397,20 @@ impl<'a> Engine<'a> {
             .named
             .iter()
             .filter(|f| f.required)
-            .filter(|f| !level.args.iter().any(|(name, ..)| *name == Some(f.name)))
-            .map(|f| f.name)
+            .filter(|f| {
+                // A required `this._x`/`super._x` formal is covered when any
+                // named argument resolves to it — by the public spelling
+                // (the element's name) or the raw one.
+                !level.args.iter().any(|(name, ..)| {
+                    name.is_some_and(|n| {
+                        self.named_formal_for(&formals, n)
+                            .is_some_and(|m| m.name == f.name)
+                    })
+                })
+            })
+            // The reported name is the element's public spelling — a
+            // `required this._error` formal reports `'error'` upstream.
+            .map(|f| self.formal_public_name(f.name))
             .collect();
         let callee_range = row.range;
         // #1314 FAM10: the callee's declared type parameters (same-file
@@ -2596,7 +2696,7 @@ impl<'a> Engine<'a> {
             let mut positional_index = 0usize;
             for (name, ty, _literal, _range) in &level.args {
                 let formal = if let Some(n) = name {
-                    formals.named_formal(*n)
+                    self.named_formal_for(&formals, *n)
                 } else {
                     let formal = formals.positional.get(positional_index);
                     positional_index += 1;
@@ -2644,7 +2744,7 @@ impl<'a> Engine<'a> {
         for (name, ty, literal, range) in &level.args {
             let mut positional_slot = None;
             let formal = if let Some(n) = name {
-                formals.named_formal(*n)
+                self.named_formal_for(&formals, *n)
             } else {
                 let formal = formals.positional.get(positional_index);
                 positional_slot = Some(positional_index);
@@ -3978,7 +4078,14 @@ impl<'a> Engine<'a> {
         let Some(callee) = self.rows.len().checked_sub(1) else {
             return;
         };
-        if self.ctor_pos > 0 {
+        // A type-argument group inside an open argument list belongs to the
+        // argument expression's own head — never the enclosing creation's
+        // callee row (`Report(List<String>.of)` reads `rows[callee]`/`callee
+        // -1` for `Report`'s send head, mis-attributing `List`'s group to the
+        // outer constructor). The `creation_ref` block above already gates on
+        // `arg_levels.is_empty()`; this `ctor_pos` branch must too — the
+        // argument's arity defers to its own send through `deferred_args`.
+        if self.ctor_pos > 0 && self.arg_levels.is_empty() {
             // A creation reference head. `parse_constructor_reference` keeps
             // its segments unmerged on the row stack: `C<int>` is a bare
             // container row (base code), `C.named<int>` is two bare rows —
@@ -4333,5 +4440,162 @@ mod tests {
             "{:?}",
             code_names(&report)
         );
+    }
+
+    // —— #2214 S3: private-named field-formal call-site spelling ————————————
+
+    /// A `this._x` named formal is spelled `x:` at call sites — the element
+    /// stores the public name (`correspondingPublicName`,
+    /// token_impl.dart:364), so the oracle's `AsyncData._(…, error: e)` binds
+    /// `required this._error` and stays silent. The pin reproduces the
+    /// riverpod `async_value.dart` shape: a private named required field
+    /// formal satisfied by its public-spelled argument.
+    #[test]
+    fn private_named_field_formal_binds_by_public_spelling() {
+        let report = report(
+            "class C { \
+               final int _err; \
+               final int _load; \
+               const C._(this._val, {required this._err, required this._load}); \
+               final int _val; \
+             } \
+             void f(C c) { C._(0, err: 1, load: 2); }",
+        );
+        assert!(
+            !code_names(&report).contains(&"missing_required_argument"),
+            "{:?}",
+            code_names(&report)
+        );
+        assert!(
+            !code_names(&report).contains(&"undefined_named_parameter"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The public spelling is exact, not a renamed free-for-all: a private
+    /// named required formal never supplied still reports
+    /// `missing_required_argument` — rendered with the public face (the
+    /// element's `name`, not the private `privateName`).
+    #[test]
+    fn private_named_field_formal_reports_public_name() {
+        let report = report(
+            "class C { \
+               final int _err; \
+               const C._(this._val, {required this._err}); \
+               final int _val; \
+             } \
+             void f(C c) { C._(0); }",
+        );
+        let report_names: Vec<&str> = code_names(&report);
+        assert!(
+            report_names.contains(&"missing_required_argument"),
+            "{:?}",
+            report_names
+        );
+    }
+
+    /// A `super._x` formal associates against the superclass constructor's
+    /// `this._x` named formal through the public face — upstream matches the
+    /// element names (`superConstructorParameter` keys both on the public
+    /// spelling), so the forwarding is associated, never
+    /// `super_formal_parameter_without_associated_named`.
+    #[test]
+    fn super_formal_associates_by_public_name() {
+        let report = report(
+            "class B { \
+               final int _err; \
+               const B({required this._err}); \
+             } \
+             class C extends B { \
+               const C({required super._err}); \
+             }",
+        );
+        assert!(
+            !code_names(&report)
+                .contains(&"super_formal_parameter_without_associated_named"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    // —— #2214 S4-B: cascade target collapse ——————————————————————————————
+
+    /// A `..p = literal` section's RHS row must not become the next
+    /// section's receiver: `C()..p = 1..q = true` resolves every section
+    /// against the cascade target `C` (`cascadeReceiver`,
+    /// type_analyzer.dart:611-618), so `q` — declared on `C` — stays silent.
+    #[test]
+    fn cascade_section_resolves_against_the_target_not_the_rhs() {
+        let report = report(
+            "class C { \
+               int p = 0; \
+               bool q = false; \
+             } \
+             void f() { C()..p = 1..q = true; }",
+        );
+        assert!(
+            !code_names(&report).contains(&"undefined_setter"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The collapse is receiver-correct, not a blanket silence: a cascade
+    /// section naming a member the target does not declare still reports —
+    /// the latched `Receiver` resolves `missing` on `C` the same way a
+    /// first-section miss does.
+    #[test]
+    fn cascade_section_still_reports_a_target_miss() {
+        let report = report(
+            "class C { int p = 0; } \
+             void f() { C()..p = 1..missing = true; }",
+        );
+        assert!(
+            code_names(&report).contains(&"undefined_setter"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A fresh cascade re-latches its own target: the second cascade in
+    /// `C()..p = 1; D()..q = true;` resolves `q` on `D`, not the first
+    /// cascade's `C` (the latched `member_reads` entry is gated on the popped
+    /// leftover being a `Value`, so `D()`'s real receiver row wins).
+    #[test]
+    fn second_cascade_latches_its_own_target() {
+        let report = report(
+            "class C { int p = 0; } \
+             class D { bool q = false; } \
+             void f() { C()..p = 1; D()..q = true; }",
+        );
+        assert!(
+            !code_names(&report).contains(&"undefined_setter"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    // —— #2194-F3: argument-depth type-argument delimitation ———————————————
+
+    /// A type-argument group inside a call's argument list belongs to the
+    /// argument's own head: `Report(List<String>.of(rows))` checks `List`'s
+    /// arity (1 == 1 → silent), never attributes the group to `Report` —
+    /// `end_type_arguments`' creation branches gate on `arg_levels.is_empty()`
+    /// so the argument's send resolves the arity itself.
+    #[test]
+    fn nested_type_arguments_belong_to_the_argument_head() {
+        let report = report(
+            "class Report { \
+               final List<String> rows; \
+               const Report(this.rows); \
+             } \
+             void f(List<String> rows) { Report(List<String>.of(rows)); }",
+        );
+        let arity: Vec<&'static str> = code_names(&report)
+            .into_iter()
+            .filter(|name| name.starts_with("wrong_number_of_type_arguments"))
+            .collect();
+        assert!(arity.is_empty(), "{:?}", code_names(&report));
     }
 }
