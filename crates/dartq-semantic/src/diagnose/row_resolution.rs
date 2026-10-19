@@ -2542,4 +2542,261 @@ mod tests {
         let report = report_with_edge("void f() { gone.new(); }", broken_show("gone"));
         assert_eq!(code_names(&report), ["undefined_method"]);
     }
+
+    /// Diagnoses `source` as a single-file library with a clean unfiltered
+    /// import edge to a second unit `a.dart` (the two-unit counterpart of
+    /// [`report_with_edge`] — the drift repro's cross-file member faces).
+    fn report_two(source_a: &str, source: &str) -> FileReport {
+        report_units(&[("a.dart", source_a)], "main.dart", source, false)
+    }
+
+    /// Diagnoses `source` as the defining unit of a library whose
+    /// declarations live partly in `part` files (the drift `part of`
+    /// receiver shape): `parts` is `(path, source)` pairs joined to the
+    /// main unit's library through `part of`.
+    fn report_with_parts(parts: &[(&str, &str)], source: &str) -> FileReport {
+        report_units(parts, "main.dart", source, true)
+    }
+
+    /// The shared two-shape rig behind [`report_two`] and
+    /// [`report_with_parts`]: `units` are foreign units (imported) when
+    /// `as_parts` is false, or same-library parts when true — the part
+    /// files declare into the main library's namespace either way, so the
+    /// member walk reaches them identically (upstream `part of` units
+    /// share the enclosing library's scope).
+    fn report_units(
+        units: &[(&str, &str)],
+        main_path: &str,
+        source: &str,
+        as_parts: bool,
+    ) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file_m = files.intern(Path::new(main_path));
+        let unit_files: Vec<FileId> = units
+            .iter()
+            .map(|(path, _)| files.intern(Path::new(path)))
+            .collect();
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let scan_cfg = ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        };
+        let scanned_m = dartq_scanner::scan(source, scan_cfg, file_m);
+        assert!(
+            scanned_m.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let scanned_units: Vec<_> = units
+            .iter()
+            .zip(&unit_files)
+            .map(|((_, unit_source), unit_file)| {
+                let scanned = dartq_scanner::scan(unit_source, scan_cfg, *unit_file);
+                assert!(
+                    scanned.diagnostics.is_empty(),
+                    "scanner diagnostics: {unit_source:?}"
+                );
+                scanned
+            })
+            .collect();
+        let elements_m = collect(source, &scanned_m.tokens, features, &strings);
+        let elements_units: Vec<_> = units
+            .iter()
+            .zip(&scanned_units)
+            .map(|((_, unit_source), scanned)| {
+                collect(unit_source, &scanned.tokens, features, &strings)
+            })
+            .collect();
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib_m = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file_m, elements_m.clone());
+        for (name, decl) in elements_m.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_m, name, file_m);
+        }
+        for (i, elements_u) in elements_units.iter().enumerate() {
+            let unit_file = unit_files[i];
+            index.insert(unit_file, elements_u.clone());
+            if as_parts {
+                // A part file folds into the main library's own namespace
+                // (upstream `part of` shares the enclosing library scope).
+                builder.unit(lib_m, unit_file);
+                for (name, decl) in elements_u.declarations() {
+                    if decl.kind == MicroKind::TypeParam {
+                        continue;
+                    }
+                    builder.declare(lib_m, name, unit_file);
+                }
+            } else {
+                let lib_u = builder.intern(&format!("package:t/unit{i}.dart"));
+                builder.unit(lib_u, unit_file);
+                for (name, decl) in elements_u.declarations() {
+                    if decl.kind == MicroKind::TypeParam {
+                        continue;
+                    }
+                    builder.declare(lib_u, name, unit_file);
+                }
+                builder.import(
+                    lib_m,
+                    ImportEdge {
+                        target: Some(lib_u),
+                        prefix: None,
+                        deferred: false,
+                        combinators: Combinators::unfiltered(),
+                    },
+                );
+            }
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let mut fold = fold_unit(
+            source,
+            &scanned_m.tokens,
+            features,
+            &strings,
+            file_m,
+            lib_m,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        fold.report.diagnostics =
+            merge_source_ordered(fold.parse_diagnostics, fold.report.diagnostics);
+        fold.report
+    }
+
+    /// #2190 shape 1 — the drift3_preview `abstract interface class
+    /// DriftSession` face: its abstract getter and method members are own
+    /// members of a same-library declaration, resolved through a declared
+    /// parameter type. The oracle's interface walk resolves both silently.
+    #[test]
+    fn drift_wrapper_interface_members_resolve() {
+        let report = report_two(
+            "abstract interface class DriftSession {\n\
+             \x20 Future<DriftSession> exec(int i);\n\
+             \x20 int? get transactionParent;\n\
+             }\n\
+             class Future<T> {}",
+            "void f(DriftSession s) { s.transactionParent; s.exec(1); }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// #2190 shape 2 — the `_CollectByDialect` record-type field whose
+    /// annotation runs onto the next line (`final List<({…})>\n
+    /// collectedStatements = [];`): the field must land in the member map
+    /// under its written name regardless of the annotation split.
+    #[test]
+    fn drift_wrapper_record_field_multiline_resolves() {
+        let report = report_two(
+            "class B {}\n\
+             final class C extends B {\n\
+             \x20 final List<({int x, String y})>\n\
+             \x20 collectedStatements = [];\n\
+             }\n\
+             class List<T> {}",
+            "void f(C c) { c.collectedStatements; }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// #2190 shape 3 — the `part of` plain-class field
+    /// (`DatabaseConnection.executor`): a trivial field declared in a part
+    /// file of the diagnosing library resolves through the member walk.
+    /// Its constructor initializer carries a `switch` expression (the
+    /// corpus shape) — included to keep the population honest.
+    #[test]
+    fn drift_wrapper_part_file_field_resolves() {
+        let report = report_with_parts(
+            &[(
+                "conn.dart",
+                "part of 'main.dart';\n\
+                 class QueryExecutor {}\n\
+                 class StreamQueryStore {}\n\
+                 class DatabaseConnection implements QueryExecutor {\n\
+                 \x20 final QueryExecutor executor;\n\
+                 \x20 final StreamQueryStore streamQueries;\n\
+                 \x20 DatabaseConnection(this.executor, {StreamQueryStore? streamQueries})\n\
+                 \x20   : streamQueries = streamQueries ?? switch (executor) {\n\
+                 \x20       DatabaseConnection() => executor.streamQueries,\n\
+                 \x20       _ => StreamQueryStore(),\n\
+                 \x20     };\n\
+                 }",
+            )],
+            "void f(DatabaseConnection db) { db.executor; }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// #2190 discriminator — every corpus receiver is bound from
+    /// `await expr` (`final s = await currentSession()`). The var-inferred
+    /// declarator binds the initializer's expression type; the oracle's
+    /// `await` flattens `Future<T>` to `T` before the member lookup runs
+    /// (upstream `typeSystem.flatten`, type_system.dart:425-471 —
+    /// `Future<S>`/`FutureOr<S>` → `S`, nullability preserved).
+    ///
+    /// Measured on HEAD: dartq emits `undefined_getter`/`undefined_method`
+    /// **naming `Future`** — the receiver binds `Future<DriftSession>`
+    /// because `end_await_expression` never folds the operand row's `ty`
+    /// and `initializer_static_ty`/`bind_var_type` record the callee's raw
+    /// return type. This is the await-fold loss (evidence-2186 §S4), NOT a
+    /// member-face miss — all three member shapes verify clean below. The
+    /// fix site is the inference/flow side (`listener.rs
+    /// end_await_expression` folding `rows.last().ty`, or
+    /// `engine_core.rs::initializer_static_ty` unwrapping `Future<T>` when
+    /// the row sits under an await span) — outside this lane's file scope.
+    /// `#[ignore]`d so the oracle-truth pin rides in the tree and flips to
+    /// live the moment the flatten lands.
+    #[test]
+    #[ignore = "await-fold gap: receiver binds Future<T>; fix lives in listener.rs/engine_core.rs"]
+    fn drift_wrapper_await_receiver_discriminator() {
+        let report = report_two(
+            "abstract interface class DriftSession {\n\
+             \x20 int? get transactionParent;\n\
+             \x20 Future<int> exec(int i);\n\
+             }\n\
+             class Future<T> {}",
+            "Future<DriftSession> g() => g();\n\
+             void f() async {\n\
+             \x20 final s = await g();\n\
+             \x20 s.transactionParent;\n\
+             \x20 s.exec(1);\n\
+             }",
+        );
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// #2190 control — a genuinely missing member on the same wrapper face
+    /// still reports `undefined_getter` (the under-report bias guard: the
+    /// fix must not silence true misses).
+    #[test]
+    fn drift_wrapper_missing_member_still_reports() {
+        let report = report_two(
+            "abstract interface class DriftSession {\n\
+             \x20 int? get transactionParent;\n\
+             }",
+            "void f(DriftSession s) { s.onMissing; }",
+        );
+        assert_eq!(code_names(&report), ["undefined_getter"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The getter 'onMissing' isn't defined for the type 'DriftSession'."
+        );
+    }
 }
