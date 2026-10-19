@@ -140,6 +140,7 @@
 pub mod analysis;
 pub mod annotation;
 pub mod bounds;
+pub(crate) mod clause_capture;
 pub(crate) mod capture;
 pub mod codes;
 pub mod collector;
@@ -156,6 +157,7 @@ pub(crate) mod switch_tracker;
 pub mod use_face;
 
 pub use analysis::{Analysis, Binding, BindingKind, CtorBinding, MemberBinding, analyze_unit};
+pub use clause_capture::capture_clause_trees;
 pub use collector::{DeclarationCollector, collect, container_modifiers};
 pub use diagnose::{
     FileReport, NameRow, NameUse, StrictModes, UnitFold, diagnose, diagnose_unit,
@@ -169,6 +171,6 @@ pub use model::{
     Container, ContainerKind, DuplicateDecl, FileElements, FnSig, MemberEntry, MemberKind,
     MicroKind, TopDecl,
 };
-pub use resolved_ops::{LibraryTypes, ResolvedTypeOps};
+pub use resolved_ops::{ClauseTrees, LibraryTypes, ResolvedTypeOps};
 pub use signature::{ApiSignature, SIGNATURE_VERSION};
 pub use use_face::{ExportUseFace, ImportUseFace, LibraryUsages, LibraryUseSet, UnitUseFace};

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use dartq_diagnostics::{CodeInfo, DARTQ_INTERNAL_ERROR, Diagnostic};
 use dartq_index::FileCapture;
+use dartq_parser::ParserFeatures;
 use dartq_resolution::{
     ClassModifiers, Combinators, DUPLICATE_EXPORT, DUPLICATE_HIDDEN_NAME, DUPLICATE_IMPORT,
     DUPLICATE_SHOWN_NAME, ExportEdge, ImportEdge, LibraryClassModifiers, LibraryGraph,
@@ -278,6 +279,28 @@ pub(crate) fn analyze(
     let class_modifiers =
         fold_graph.map(|graph| crate::semdiag::build_class_modifiers(state, graph));
 
+    // The generic-container name set (#2229): the clause-tree capture
+    // gates on it — a member file whose containers clause none of these
+    // names keeps the name-level edges byte-identically, so only
+    // clause-bearing files re-parse their headers once for the written
+    // argument trees. One residency scan per analyze, the same
+    // shared-artifact shape as the index and the posture above.
+    let generic_containers = folding.then(|| {
+        let mut names = FxHashSet::default();
+        for facts in state.residency.values() {
+            let elements = &facts.elements;
+            for &name in elements.container_order() {
+                if elements
+                    .container(name)
+                    .is_some_and(|container| container.type_params > 0)
+                {
+                    names.insert(name);
+                }
+            }
+        }
+        names
+    });
+
     // Each job also rebuilds its library's symbol-index surface: the build
     // reads only the member captures (fresh from the drain above) and the
     // graph namespaces, so it rides the fan-out instead of the sequential
@@ -312,6 +335,7 @@ pub(crate) fn analyze(
                 seam,
                 index.as_ref(),
                 class_modifiers.as_ref(),
+                generic_containers.as_ref(),
                 *library,
             );
             // The run's canonical sort rides the job too (a pure read of the
@@ -682,6 +706,28 @@ fn budget_anchor(state: &EngineState, order: &[LibraryId]) -> Option<FileId> {
         .or_else(|| state.libraries.live().find_map(defining))
 }
 
+/// Whether any of the unit's containers clauses a name that declares type
+/// parameters — the only supertype face a written argument tree can
+/// sharpen (`Box<int>` vs the to-bounds `Box<dynamic>`; a bare head maps
+/// to the same instantiate-to-bounds edge both arms produce). Mixin `on`
+/// constraints join the walk too: they ride the same clause capture.
+fn clauses_a_generic_head(facts: &UnitFacts, generic: &FxHashSet<StringId>) -> bool {
+    let elements = &facts.elements;
+    elements.container_order().iter().any(|&name| {
+        let Some(container) = elements.container(name) else {
+            return false;
+        };
+        container
+            .superclass
+            .iter()
+            .copied()
+            .chain(container.with_clause.iter().copied())
+            .chain(container.implements_clause.iter().copied())
+            .chain(container.on_clause.iter().copied())
+            .any(|head| generic.contains(&head))
+    })
+}
+
 /// Diagnoses one library: the member files' syntax + URI-layer diagnostics,
 /// the overlay-corrected URI staleness (removals the baked set cannot
 /// express), then the semantic seam when configured (#120/#121 plug point).
@@ -696,6 +742,7 @@ fn diagnose_library(
     seam: Option<&Namespaces>,
     index: Option<&ElementIndex>,
     class_modifiers: Option<&LibraryClassModifiers>,
+    generic_containers: Option<&FxHashSet<StringId>>,
     library: LibraryId,
 ) -> Vec<Arc<Diagnostic>> {
     let info = state.libraries.info(library).expect("live library");
@@ -792,17 +839,54 @@ fn diagnose_library(
         // the `analyzer.language.strict-*` flags resolved through the
         // governing options entry.
         let strict = state.strict_modes_for(info.defining);
+        // The clause-tree capture (#2229): member files whose containers
+        // clause a generic head re-parse their headers once here, threading
+        // the written argument trees (`class A extends S<int>`'s real edge)
+        // into the per-library snapshot. Every other container keeps the
+        // name-level edges — an absent entry only ever under-reports, the
+        // transport's own posture — and a bare-head tree maps to the same
+        // instantiate-to-bounds edge the name-level arm produces, so the
+        // default corpus folds byte-identically.
+        let mut clause_trees = dartq_semantic::ClauseTrees::empty();
+        if let Some(generic_containers) = generic_containers {
+            for file in &members {
+                let facts = &state.residency[file];
+                if !clauses_a_generic_head(facts, generic_containers) {
+                    continue;
+                }
+                // A settled-face, store, or UTF-8 miss skips the capture —
+                // the name-level edges stand (the under-report direction).
+                let Some(face) = scanned.get(file) else {
+                    continue;
+                };
+                let Some(bytes) = state.store.get(facts.content()) else {
+                    continue;
+                };
+                let Ok(text) = std::str::from_utf8(bytes) else {
+                    continue;
+                };
+                dartq_semantic::capture_clause_trees(
+                    *file,
+                    text,
+                    &face.tokens,
+                    ParserFeatures::from_feature_set(face.features),
+                    &state.strings,
+                    &mut clause_trees,
+                );
+            }
+        }
         // The per-library resolved-type snapshot (#2204 phase A): one
         // `dartq_types` table + hierarchy + name registry over the whole
         // residency's element index, built once per library beside the
         // shared index and shared by every member fold through the flow
         // layer's `TypeOps` seam.
-        let types = dartq_semantic::LibraryTypes::build(
+        let types = dartq_semantic::LibraryTypes::build_with_clauses(
             &resolved.graph,
             namespaces,
             index,
             &state.strings,
             resolved.graph_ids[&library],
+            &clause_trees,
         );
         let view = LibraryView {
             library,
@@ -2070,13 +2154,149 @@ fn csr_from_rows(rows: &[Vec<u32>]) -> CsrGraph {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use dartq_diagnostics::{CodeInfo, DiagnosticType, Severity};
+    use dartq_package::PackageTable;
+    use dartq_pub::{LockFile, PackageConfig, Pubspec, build_graph};
     use dartq_resolution::CombinatorClause;
+    use dartq_sdk::SdkSnapshot;
     use dartq_source::{FileTable, SourceRange, StringId};
 
     use super::*;
+    use crate::semdiag::diagnoser;
+    use crate::{Engine, EngineConfig, memory_store};
+
+    /// A throwaway single-package workspace + synthetic core-only SDK —
+    /// the semdiag fixture shape trimmed to what a default-diagnoser
+    /// [`Engine::new`] binds — backing the clause-tree fold pins.
+    fn clause_workspace(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dartq-engine-clause-{}-{}-{}",
+            tag,
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, content).expect("file");
+        };
+        write(
+            "pubspec.yaml",
+            "name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            "pubspec.lock",
+            "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+        );
+        write(
+            ".dart_tool/package_config.json",
+            r#"{"configVersion": 2, "packages": [{"name": "t", "rootUri": "../", "languageVersion": "3.5"}], "generator": "pub"}"#,
+        );
+        write("sdk/version", "3.13.1\n");
+        write(
+            "sdk/lib/libraries.json",
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+        );
+        write(
+            "sdk/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        );
+        // Canonicalize before the pub faces resolve it (the #287 spelling
+        // universe — macOS /var vs /private/var).
+        root.canonicalize().expect("fixture root resolves")
+    }
+
+    /// A fresh default-diagnoser engine over [`clause_workspace`]'s faces.
+    fn clause_engine(root: &Path) -> Engine {
+        let config_dir = root.join(".dart_tool");
+        let config = Arc::new(
+            PackageConfig::parse(
+                &std::fs::read_to_string(config_dir.join("package_config.json")).expect("config"),
+            )
+            .expect("valid config"),
+        );
+        let lock = LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
+            .expect("valid lock");
+        let root_pubspec = Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
+            .expect("valid pubspec");
+        let graph = build_graph(
+            &config,
+            &lock,
+            &root_pubspec,
+            &BTreeMap::new(),
+            None,
+            &config_dir,
+        )
+        .expect("graph");
+        Engine::new(EngineConfig {
+            store: memory_store(),
+            sdk: SdkSnapshot::load(&root.join("sdk"), None).expect("synthetic SDK loads"),
+            packages: PackageTable::build(&config, &graph, &config_dir).expect("table"),
+            pub_config: Arc::clone(&config),
+            config_dir,
+            semdiag: Some(diagnoser()),
+            target: crate::DEFAULT_TARGET.to_owned(),
+            declared_variables: FxHashMap::default(),
+            experiments: Vec::new(),
+        })
+        .expect("engine")
+    }
+
+    /// Runs the cross-unit clause fixture and answers whether the write's
+    /// demotion read reports `undefined_getter`. `a.dart` declares the
+    /// generic `Seq<T>`; `b.dart` declares `class IntSeq extends
+    /// Seq<int>` and writes an `IntSeq` back into a variable promoted to
+    /// `Seq<num>`: the demotion question `IntSeq <: Seq<num>` answers
+    /// through the written `Seq<int>` clause edge (`int <: num` covariant)
+    /// — the to-bounds `Seq<dynamic>` edge refuses and demotes the
+    /// variable, whose follow-up read misses.
+    fn demotion_reports_undefined_getter(write_ty: &str) -> bool {
+        let root = clause_workspace(write_ty);
+        let mut engine = clause_engine(&root);
+        let a = engine.set_content(
+            &root.join("lib/a.dart"),
+            b"class Seq<T> {\n  int get length => 0;\n}\n",
+        );
+        let b = engine.set_content(
+            &root.join("lib/b.dart"),
+            format!(
+                "import 'a.dart';\n\n class IntSeq extends Seq<int> {{}}\n\n \
+                 void f(Object? o) {{\n  if (o is Seq<num>) {{\n    o.length;\n    \
+                 o = {write_ty}();\n    o.length;\n  }}\n}}\n"
+            )
+            .as_bytes(),
+        );
+        engine.apply_pending(&mut |_| {});
+        let rows = engine
+            .analyze(&[a, b], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        rows.iter()
+            .any(|row| row.code.name == "undefined_getter")
+    }
+
+    /// The clause-tree wiring's engine-level pin (#2229): the cross-unit
+    /// written `Seq<int>` clause edge keeps the `Seq<num>` promotion
+    /// through the `IntSeq` write, so the follow-up read resolves — the
+    /// bare-head comparison (the to-bounds `Seq<dynamic>` edge) demotes
+    /// and reports `undefined_getter` at the same read, which the control
+    /// proves the fold face still fires for a genuinely-uncovered write.
+    #[test]
+    fn cross_unit_generic_clause_resolves_through_the_written_tree() {
+        assert!(
+            !demotion_reports_undefined_getter("IntSeq"),
+            "the written Seq<int> edge keeps the promotion; the read must resolve"
+        );
+        assert!(
+            demotion_reports_undefined_getter("Seq<String>"),
+            "the control's Seq<String> write must demote: String is not a subtype of num"
+        );
+    }
 
     fn diagnostic(
         files: &mut FileTable,
