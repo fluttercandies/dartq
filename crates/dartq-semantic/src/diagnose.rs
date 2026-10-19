@@ -24225,6 +24225,10 @@ impl<'a> Engine<'a> {
         if !gate {
             return;
         }
+        // The oracle evaluates the creation as one constant and reports only
+        // its first invalid argument (probed `const C(nc, nc)` → one row at
+        // the first `nc`); an unresolved argument continues with a
+        // placeholder, so later arguments still evaluate.
         for arg in args {
             let verdict = eval(arg, self);
             match verdict {
@@ -24235,6 +24239,7 @@ impl<'a> Engine<'a> {
                         self.open_const_creations
                             .push((init, span, ConstCreationEntry::ArgFailure));
                     }
+                    return;
                 }
                 // An unresolved argument reports its own face but leaves the
                 // declaration's verdict silent (`B(x)`'s undefined `x`: the
@@ -24243,7 +24248,10 @@ impl<'a> Engine<'a> {
                 Verdict::Unresolved(span) => {
                     self.emit(SemanticCode::ConstWithNonConstantArgument, span, "", "");
                 }
-                Verdict::Fault(fault, span) => self.emit_const_fault(fault, span),
+                Verdict::Fault(fault, span) => {
+                    self.emit_const_fault(fault, span);
+                    return;
+                }
             }
         }
     }
