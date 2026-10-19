@@ -1811,8 +1811,13 @@ impl<'a> Engine<'a> {
         };
         if kind != ContainerKind::Mixin {
             // The official loop's gate: concrete classes and enums only
-            // (`ClassElementImpl && !isAbstract || EnumElementImpl`).
-            let concrete_target = kind == ContainerKind::Enum || !decl.is_abstract;
+            // (`ClassElementImpl && !isAbstract || EnumElementImpl`). The
+            // element folds `sealed` into abstractness
+            // (element.dart:150 `isAbstract = isAbstract || isSealed`), so
+            // a sealed declaration never enters the completeness,
+            // implementation-override, or mustBeOverridden loops.
+            let concrete_target =
+                kind == ContainerKind::Enum || (!decl.is_abstract && !decl.sealed);
             if concrete_target && let Some(view) = self.collect_interface(decl) {
                 self.abstract_completeness(kind, decl, &conflicted, &view, name_range);
                 self.implementation_overrides(decl, &view, name_range);
@@ -2139,7 +2144,12 @@ impl<'a> Engine<'a> {
                 ) else {
                     return;
                 };
-                if super_container.kind == ContainerKind::Class && super_container.is_abstract {
+                // A sealed superclass is abstract at the element level
+                // (element.dart:150): its interface names stay the concrete
+                // subclass's to implement — no exemption.
+                if super_container.kind == ContainerKind::Class
+                    && (super_container.is_abstract || super_container.sealed)
+                {
                     None
                 } else {
                     let Some(hits) = self.face_entries(superclass, true) else {
@@ -2983,5 +2993,158 @@ impl<'a> Engine<'a> {
                 self.render_ty(named)
             }
         }
+    }
+}
+
+/// The sealed⇒abstract fold pins (#2202): the element model folds `sealed`
+/// into abstractness (`element.dart:150`,
+/// `isAbstract = isAbstract || isSealed`), so a sealed declaration never
+/// enters the completeness / implementation-override /
+/// mustBeOverridden loops, and a sealed direct superclass grants its
+/// concrete subclass no concreteness exemption.
+#[cfg(test)]
+mod sealed_abstract_fold_tests {
+    use crate::collector::collect;
+    use crate::diagnose::{FileReport, StrictModes, fold_unit, merge_source_ordered};
+    use crate::library::ElementIndex;
+    use crate::model::MicroKind;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{LibraryClassModifiers, LibraryGraphBuilder, Namespaces};
+    use dartq_scanner::ScanConfig;
+    use dartq_source::{FileTable, StringTable};
+    use std::path::Path;
+
+    /// Diagnoses `source` as the sole file of a library with no imports —
+    /// the single-file rig, local to this module.
+    fn report(source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let fold = fold_unit(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            // The same derivation the engine's fold call site makes from
+            // the settled set (the `inference-update-2` release gate).
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        let mut report = fold.report;
+        report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+        report
+    }
+
+    fn code_names(report: &FileReport) -> Vec<&'static str> {
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
+    }
+
+    /// (a) A sealed declaration is abstract at the element level: an
+    /// unimplemented interface member never reports on it.
+    #[test]
+    fn sealed_class_never_reports_missing_interface_member() {
+        let report = report("abstract class I { void m(); }\nsealed class S implements I {}\n");
+        let names = code_names(&report);
+        assert!(names.is_empty(), "expected no rows: {names:?}");
+    }
+
+    /// (b) The extends-head face: sealed over an abstract base stays
+    /// silent.
+    #[test]
+    fn sealed_class_over_abstract_base_stays_silent() {
+        let report = report("abstract class B { void m(); }\nsealed class S extends B {}\n");
+        let names = code_names(&report);
+        assert!(names.is_empty(), "expected no rows: {names:?}");
+    }
+
+    /// (c) The concrete subclass of a sealed superclass still reports: a
+    /// sealed direct super grants no concreteness exemption.
+    #[test]
+    fn concrete_subclass_of_sealed_reports_missing_member() {
+        let report = report("sealed class S { void m(); }\nclass C extends S {}\n");
+        let names = code_names(&report);
+        assert_eq!(
+            names,
+            ["non_abstract_class_inherits_abstract_member"],
+            "expected the concrete subclass row: {names:?}"
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Missing concrete implementation of 'S.m'."
+        );
+    }
+
+    /// (d) The declared-`abstract` control: the gate still admits concrete
+    /// subclasses of genuinely abstract supers.
+    #[test]
+    fn concrete_subclass_of_declared_abstract_still_reports() {
+        let report = report("abstract class B { void m(); }\nclass D extends B {}\n");
+        let names = code_names(&report);
+        assert_eq!(
+            names,
+            ["non_abstract_class_inherits_abstract_member"],
+            "expected the concrete subclass row: {names:?}"
+        );
+        assert_eq!(
+            report.diagnostics[0].message,
+            "Missing concrete implementation of 'B.m'."
+        );
+    }
+
+    /// The written `abstract sealed` combination is a modifier violation
+    /// and the class stays abstract for the completeness face — the fold
+    /// keys on the sealed bit, not on the abstract keyword's absence. (The
+    /// combination row itself ships twice — the parser emits it
+    /// parse-tier and the engine's combination face emits it again; a
+    /// pre-existing dedup defect outside this fold's scope — so the pin
+    /// asserts the completeness silence and the row shapes, not a count.)
+    #[test]
+    fn abstract_sealed_combo_stays_abstract_for_completeness() {
+        let report = report(
+            "abstract class I { void m(); }\nabstract sealed class S implements I {}\n",
+        );
+        let names = code_names(&report);
+        assert!(
+            names.iter().all(|n| *n == "abstract_sealed_class"),
+            "only the combination violation may report: {names:?}"
+        );
     }
 }
