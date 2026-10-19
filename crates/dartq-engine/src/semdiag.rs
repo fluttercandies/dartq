@@ -630,7 +630,9 @@ mod tests {
         write("sdk/version", "3.13.1\n");
         write(
             "sdk/lib/libraries.json",
-            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+            // `js_interop` rides the table so the dart:js_interop import
+            // fixtures classify External; nothing reads the library file.
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}, "js_interop": {"uri": "js_interop/js_interop.dart"}}}}"#,
         );
         write(
             "sdk/lib/_internal/allowed_experiments.json",
@@ -707,6 +709,60 @@ mod tests {
             overrides[0].message,
             "'B.f' ('void Function()') isn't a valid override of 'A.f' ('void Function(int)')."
         );
+    }
+
+    /// The dart:js_interop extension faces (#2186 S5): the bundled
+    /// extension-member source indexes under the `<dart:js_interop>` face
+    /// file, so `toJS` on every core-typed receiver resolves silently
+    /// through the extension pool — the exact positions the missing SDK
+    /// surface over-fired `undefined_getter` on (the drift web corpus
+    /// rows). The `double` receiver also pins the specificity split:
+    /// `DoubleToJSNumber` (`on double`) dominates `NumToJSExtension`
+    /// (`on num`), so the access resolves instead of reporting the
+    /// ambiguity pair.
+    #[test]
+    fn js_interop_conversion_members_resolve_silently() {
+        let (_, diagnostics) = analyze_libraries(
+            diagnoser(),
+            concat!(
+                "import 'dart:js_interop';\n",
+                "void f(String s, bool b, int i, double d, List<String> l) {\n",
+                "  s.toJS; b.toJS; i.toJS; d.toJS; l.toJS;\n",
+                "}\n"
+            ),
+            "class A {}\n",
+            "class O {}\n",
+        );
+        let misses: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.code.name.starts_with("undefined")
+                    || d.code.name == "ambiguous_extension_member_access"
+            })
+            .collect();
+        assert!(misses.is_empty(), "{misses:?}");
+    }
+
+    /// The residue contract under the extension faces: a member the core
+    /// type genuinely lacks still reports under an import whose faces are
+    /// present — the bundled faces gate the specific names they declare,
+    /// never blanket-suppress the member face.
+    #[test]
+    fn core_member_miss_still_reports_with_extension_faces_present() {
+        let (main_file, diagnostics) = analyze_libraries(
+            diagnoser(),
+            concat!(
+                "import 'dart:js_interop';\n",
+                "void f(String s) { s.notAMember; }\n"
+            ),
+            "class A {}\n",
+            "class O {}\n",
+        );
+        let rows: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.file == main_file && d.code.name == "undefined_getter")
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
     }
 
     /// The residue contract under the widened index (5d0d1ae): `extends A, B`

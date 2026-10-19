@@ -252,7 +252,21 @@ pub(crate) fn analyze(
     // transient residency-sized map per worker. The facts cannot move under
     // the fold (the jobs read `&EngineState`), so the index is a stable
     // snapshot; entries are the facts' own `Arc`s (see `semdiag`).
-    let index = folding.then(|| crate::semdiag::build_index(&state.residency));
+    let index = folding.then(|| {
+        let mut index = crate::semdiag::build_index(&state.residency);
+        // The SDK extension-member faces (#2186 S5): the synthetic
+        // `<dart:…>` face files carry no element model, so the semantic
+        // extension pool saw nothing for them and `dart:js_interop`'s
+        // implicit-application members over-fired the undefined family.
+        // The bundled excerpts index under the same face-file ids the
+        // graph build interned — one fixed ~15-line parse per analyze.
+        crate::sdk_extension_faces::insert_sdk_extension_faces(
+            &mut index,
+            &mut state.files,
+            &state.strings,
+        );
+        index
+    });
     // The per-library `class-modifiers` posture (#1294): every live
     // library's defining file's settled version (the `@dart` override
     // applied) resolved through the feature registry — built once per

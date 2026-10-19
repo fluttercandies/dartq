@@ -51,6 +51,7 @@ pub mod pipeline;
 pub mod query;
 pub mod reachability;
 pub mod scheduler;
+pub mod sdk_extension_faces;
 pub mod sdk_faces_gen;
 pub mod semdiag;
 pub mod state;
