@@ -217,6 +217,39 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     normalize_keyed(&lexical_key(path))
 }
 
+/// [`normalize_path`] over a batch with one canonicalization per distinct
+/// parent directory: `realpath` costs one `getattrlist` per component, and
+/// a discovery batch shares a handful of directories across hundreds of
+/// files. The leaf rides an `lstat` — a symlinked or missing leaf takes the
+/// exact per-path walk, so the result is identical to [`normalize_path`]
+/// path by path.
+#[must_use]
+pub fn normalize_paths(paths: &[&Path]) -> Vec<PathBuf> {
+    let mut parents: rustc_hash::FxHashMap<PathBuf, Option<PathBuf>> =
+        rustc_hash::FxHashMap::default();
+    paths
+        .iter()
+        .map(|path| {
+            let cleaned = lexical_key(path);
+            let (Some(parent), Some(leaf)) = (cleaned.parent(), cleaned.file_name()) else {
+                return normalize_keyed(&cleaned);
+            };
+            let plain_leaf = std::fs::symlink_metadata(&*cleaned)
+                .is_ok_and(|meta| !meta.file_type().is_symlink());
+            if !plain_leaf {
+                return normalize_keyed(&cleaned);
+            }
+            let base = parents
+                .entry(parent.to_path_buf())
+                .or_insert_with(|| parent.canonicalize().ok());
+            match base {
+                Some(base) => base.join(leaf),
+                None => normalize_keyed(&cleaned),
+            }
+        })
+        .collect()
+}
+
 /// The walk of [`normalize_path`] over an already-cleaned absolute key.
 fn normalize_keyed(cleaned: &Path) -> PathBuf {
     for ancestor in cleaned.ancestors() {
@@ -738,6 +771,37 @@ mod tests {
         assert_eq!(table.intern(&path), id, "hits keep resolving to one id");
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// The batched normalization is [`normalize_path`] path by path: plain
+    /// files, a symlinked leaf, a symlinked directory, a missing file, and a
+    /// dotted spelling all agree.
+    #[test]
+    fn normalize_paths_matches_normalize_path() {
+        let base = temp_dir("batched");
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        std::fs::write(real.join("a.dart"), "").expect("write");
+        std::fs::write(real.join("b.dart"), "").expect("write");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, base.join("link")).expect("dir link");
+            std::os::unix::fs::symlink(real.join("a.dart"), real.join("leaf.dart"))
+                .expect("leaf link");
+        }
+        let inputs = [
+            real.join("a.dart"),
+            real.join("b.dart"),
+            real.join("leaf.dart"),
+            base.join("link").join("b.dart"),
+            real.join("missing.dart"),
+            real.join("..").join("real").join("a.dart"),
+        ];
+        let refs: Vec<&Path> = inputs.iter().map(PathBuf::as_path).collect();
+        let batched = normalize_paths(&refs);
+        for (input, got) in inputs.iter().zip(batched) {
+            assert_eq!(got, normalize_path(input), "{input:?}");
+        }
     }
 
     /// `intern_normalized` with the off-thread normalization is the same

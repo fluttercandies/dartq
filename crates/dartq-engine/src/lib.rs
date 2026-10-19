@@ -1079,15 +1079,25 @@ impl Engine {
                 // The path normalization (one `realpath` per file) rides the
                 // read fan-out too: a pure function of the path, so the
                 // serial id pass below mints ids syscall-free.
+                // Sorted batches share a few parent directories: normalize
+                // per 32-path slice with one canonicalization per distinct
+                // parent (`normalize_paths`) instead of a full `realpath`
+                // per file.
                 let reads: Vec<Result<(SourceText, u64, PathBuf), OpenError>> = batch
-                    .par_iter()
-                    .map(|path| {
-                        dartq_source::open_source(path).map(|text| {
-                            let loc = u64::from(
-                                u32::try_from(memchr::memchr_iter(b'\n', text.as_bytes()).count())
+                    .par_chunks(32)
+                    .flat_map_iter(|slice| {
+                        let refs: Vec<&Path> = slice.iter().map(PathBuf::as_path).collect();
+                        let normalized = dartq_source::normalize_paths(&refs);
+                        slice.iter().zip(normalized).map(|(path, normalized)| {
+                            dartq_source::open_source(path).map(|text| {
+                                let loc = u64::from(
+                                    u32::try_from(
+                                        memchr::memchr_iter(b'\n', text.as_bytes()).count(),
+                                    )
                                     .unwrap_or(u32::MAX),
-                            );
-                            (text, loc, dartq_source::normalize_path(path))
+                                );
+                                (text, loc, normalized)
+                            })
                         })
                     })
                     .collect();

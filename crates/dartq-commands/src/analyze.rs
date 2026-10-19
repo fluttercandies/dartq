@@ -566,11 +566,17 @@ pub fn merge_runs<'a>(runs: Vec<AnalyzeRun<'a>>) -> MergedRun<'a> {
             .collect();
         locations.sort_unstable();
         locations.dedup();
+        // Sorted locations cluster by directory: one canonicalization per
+        // distinct parent per slice (`normalize_paths`).
         locations
-            .into_par_iter()
-            .map(|(run_index, id)| {
-                let path = dartq_source::normalize_path(runs[run_index].layout.file_path(id));
-                ((run_index, id), path)
+            .par_chunks(64)
+            .flat_map_iter(|slice| {
+                let paths: Vec<&Path> = slice
+                    .iter()
+                    .map(|&(run_index, id)| runs[run_index].layout.file_path(id))
+                    .collect();
+                let normalized = dartq_source::normalize_paths(&paths);
+                slice.iter().copied().zip(normalized)
             })
             .collect()
     };
