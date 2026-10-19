@@ -1511,11 +1511,14 @@ pub(crate) const MAX_DIAGNOSTICS_PER_FILE: usize = 10_000;
 /// assembled semantic run (`ignore_info.dart`'s line attribution, mirrored
 /// in dartq-lints for the lint rows): a standalone comment line suppresses
 /// the NEXT line, `ignore_for_file:` the whole file; names match the
-/// diagnostic code case-insensitively; ERROR rows never suppress (the
-/// official severity gate — only warnings/hints/lints are ignorable). The
-/// comment recognition covers standalone comment lines only — a line whose
-/// first non-whitespace characters are `//` (trailing comments stay a
-/// dartq-lints face); the under-report direction.
+/// diagnostic code's `name` OR `uniqueName` case-insensitively
+/// (`IgnoredDiagnosticName._matches`, `ignore_info.dart`:39-52 — the
+/// uniqueName leg resolves through [`canonical_diagnostic_name`]); ERROR
+/// rows never suppress (the official severity gate — only
+/// warnings/hints/lints are ignorable). The comment recognition covers
+/// standalone comment lines only — a line whose first non-whitespace
+/// characters are `//` (trailing comments stay a dartq-lints face); the
+/// under-report direction.
 pub(crate) struct IgnoreSuppression {
     /// 1-based line -> lowercased names (`ignore:` entries).
     pub(crate) on_line: FxHashMap<u32, Box<[String]>>,
@@ -1588,20 +1591,793 @@ impl IgnoreSuppression {
     }
 
     /// Whether `code` (the diagnostic's lowercased code name) is suppressed
-    /// at `offset` (UTF-16).
+    /// at `offset` (UTF-16). A citation matches on the diagnostic's `name`
+    /// OR on its `uniqueName` (`IgnoredDiagnosticName._matches`,
+    /// `ignore_info.dart`:39-52): the entries are the comment's lowercased
+    /// spellings, so the second leg canonicalizes each spelling through
+    /// [`canonical_diagnostic_name`] — the name a `uniqueName` citation
+    /// resolves to — before comparing against `code` (a uniqueName
+    /// citation suppresses every diagnostic reported under the shared
+    /// name; the name-level join is the fold's resolution, the variant
+    /// split lives in the upstream constant, not in our `CodeInfo`).
     pub(crate) fn suppresses(&self, offset: u32, line_of: impl Fn(u32) -> u32, code: &str) -> bool {
         if self
             .for_file
             .iter()
-            .any(|name| name.eq_ignore_ascii_case(code))
+            .any(|name| citation_matches(name, code))
         {
             return true;
         }
         self.on_line
             .get(&line_of(offset))
-            .is_some_and(|names| names.iter().any(|name| name.eq_ignore_ascii_case(code)))
+            .is_some_and(|names| names.iter().any(|name| citation_matches(name, code)))
     }
 }
+
+/// One ignore-comment citation spelling vs a diagnostic's registry `name`:
+/// the upstream `IgnoredDiagnosticName._matches` verdict
+/// (`ignore_info.dart`:39-52) — equal to the `name`, or a `uniqueName`
+/// spelling whose canonical name it is. The name-level join is the fold's
+/// resolution: the variant split lives in the upstream constant, not in
+/// our `CodeInfo` — a `uniqueName` citation suppresses every diagnostic
+/// reported under the shared `name` on its scope.
+fn citation_matches(entry: &str, code: &str) -> bool {
+    entry.eq_ignore_ascii_case(code)
+        || canonical_diagnostic_name(entry).is_some_and(|c| c.eq_ignore_ascii_case(code))
+}
+
+/// The registry `name` a lowercased `uniqueName` citation spelling resolves
+/// to — `None` when the spelling is not a registry `uniqueName`. The
+/// suppression join's second leg (`ignore_info.dart`:39-52): a citation
+/// names either spelling of the diagnostic it suppresses.
+///
+/// The table is the pinned registry's 225 `(uniqueName, name)` divergent
+/// constants — the same upstream derivation `dartq-engine`'s
+/// `known_error_codes::UNIQUE_NAME_ALIASES` captures for the
+/// `analyzer.errors`/`unnecessary_ignore` faces. The crate boundary keeps
+/// the shared source out of reach (semantic cannot depend on the engine),
+/// so the fold carries its own copy: version-pinned oracle data, sorted by
+/// the `uniqueName` column for binary search. Keep both copies in lockstep
+/// with the registry pin — a hoisted shared home is the dartq-diagnostics
+/// code registry's to give.
+fn canonical_diagnostic_name(unique: &str) -> Option<&'static str> {
+    UNIQUE_NAME_ALIASES
+        .binary_search_by(|&(spelling, _)| spelling.cmp(unique))
+        .ok()
+        .map(|index| UNIQUE_NAME_ALIASES[index].1)
+}
+
+/// `(uniqueName, name)` pairs of the pinned diagnostic registry whose two
+/// spellings diverge (225 rows, sorted by `uniqueName`; the other 935
+/// constants spell both alike and never reach this lookup — the first leg
+/// covers them). Upstream derivation: the registry's `lowerCaseUniqueName`
+/// minus its class prefix vs `lowerCaseName`
+/// (`IgnoredDiagnosticName._matches`, `ignore_info.dart`:44-51).
+const UNIQUE_NAME_ALIASES: &[(&str, &str)] = &[
+    (
+        "abstract_field_constructor_initializer",
+        "abstract_field_initializer",
+    ),
+    (
+        "ambiguous_comment_reference_name",
+        "ambiguous_comment_reference",
+    ),
+    (
+        "ambiguous_comment_reference_prefix",
+        "ambiguous_comment_reference",
+    ),
+    (
+        "ambiguous_extension_member_access_three_or_more",
+        "ambiguous_extension_member_access",
+    ),
+    (
+        "ambiguous_extension_member_access_two",
+        "ambiguous_extension_member_access",
+    ),
+    (
+        "analysis_option_deprecated_with_replacement",
+        "analysis_option_deprecated",
+    ),
+    (
+        "augmentation_induced_getter_already_complete",
+        "declaration_already_complete",
+    ),
+    (
+        "augmentation_induced_getter_return_type_mismatch",
+        "augmentation_return_type_mismatch",
+    ),
+    (
+        "augmentation_induced_setter_already_complete",
+        "declaration_already_complete",
+    ),
+    (
+        "augmentation_without_getter_declaration",
+        "augmentation_without_declaration",
+    ),
+    (
+        "augmentation_without_setter_declaration",
+        "augmentation_without_declaration",
+    ),
+    (
+        "base_class_implemented_outside_of_library",
+        "invalid_use_of_type_outside_library",
+    ),
+    (
+        "base_mixin_implemented_outside_of_library",
+        "invalid_use_of_type_outside_library",
+    ),
+    (
+        "built_in_identifier_as_extension_name",
+        "built_in_identifier_in_declaration",
+    ),
+    (
+        "built_in_identifier_as_extension_type_name",
+        "built_in_identifier_in_declaration",
+    ),
+    (
+        "built_in_identifier_as_prefix_name",
+        "built_in_identifier_in_declaration",
+    ),
+    (
+        "built_in_identifier_as_type_name",
+        "built_in_identifier_in_declaration",
+    ),
+    (
+        "built_in_identifier_as_type_parameter_name",
+        "built_in_identifier_in_declaration",
+    ),
+    (
+        "built_in_identifier_as_typedef_name",
+        "built_in_identifier_in_declaration",
+    ),
+    (
+        "class_instantiation_access_to_instance_member",
+        "class_instantiation_access_to_member",
+    ),
+    (
+        "class_instantiation_access_to_static_member",
+        "class_instantiation_access_to_member",
+    ),
+    (
+        "class_instantiation_access_to_unknown_member",
+        "class_instantiation_access_to_member",
+    ),
+    (
+        "conflicting_constructor_and_static_field",
+        "conflicting_constructor_and_static_member",
+    ),
+    (
+        "conflicting_constructor_and_static_getter",
+        "conflicting_constructor_and_static_member",
+    ),
+    (
+        "conflicting_constructor_and_static_method",
+        "conflicting_constructor_and_static_member",
+    ),
+    (
+        "conflicting_constructor_and_static_setter",
+        "conflicting_constructor_and_static_member",
+    ),
+    (
+        "conflicting_type_variable_and_class",
+        "conflicting_type_variable_and_container",
+    ),
+    (
+        "conflicting_type_variable_and_enum",
+        "conflicting_type_variable_and_container",
+    ),
+    (
+        "conflicting_type_variable_and_extension",
+        "conflicting_type_variable_and_container",
+    ),
+    (
+        "conflicting_type_variable_and_extension_type",
+        "conflicting_type_variable_and_container",
+    ),
+    (
+        "conflicting_type_variable_and_member_class",
+        "conflicting_type_variable_and_member",
+    ),
+    (
+        "conflicting_type_variable_and_member_enum",
+        "conflicting_type_variable_and_member",
+    ),
+    (
+        "conflicting_type_variable_and_member_extension",
+        "conflicting_type_variable_and_member",
+    ),
+    (
+        "conflicting_type_variable_and_member_extension_type",
+        "conflicting_type_variable_and_member",
+    ),
+    (
+        "conflicting_type_variable_and_member_mixin",
+        "conflicting_type_variable_and_member",
+    ),
+    (
+        "conflicting_type_variable_and_mixin",
+        "conflicting_type_variable_and_container",
+    ),
+    (
+        "const_constructor_constant_from_deferred_library",
+        "collection_element_from_deferred_library",
+    ),
+    (
+        "const_constructor_with_mixin_with_fields",
+        "const_constructor_with_mixin_with_field",
+    ),
+    (
+        "const_field_initializer_not_assignable",
+        "field_initializer_not_assignable",
+    ),
+    (
+        "const_primary_constructor_with_block_body",
+        "const_primary_constructor_with_body",
+    ),
+    (
+        "const_primary_constructor_with_expression_body",
+        "const_primary_constructor_with_body",
+    ),
+    ("const_with_non_type", "creation_with_non_type"),
+    (
+        "const_with_type_parameters_constructor_tearoff",
+        "const_with_type_parameters",
+    ),
+    (
+        "const_with_type_parameters_function_tearoff",
+        "const_with_type_parameters",
+    ),
+    (
+        "constructor_already_complete",
+        "declaration_already_complete",
+    ),
+    ("dead_code_late_wildcard_variable_initializer", "dead_code"),
+    (
+        "deprecated_extends_function",
+        "deprecated_subtype_of_function",
+    ),
+    (
+        "deprecated_implements_function",
+        "deprecated_subtype_of_function",
+    ),
+    (
+        "deprecated_member_use_implicit_super_constructor_invocation",
+        "deprecated_member_use",
+    ),
+    (
+        "deprecated_member_use_implicit_super_constructor_invocation_with_message",
+        "deprecated_member_use",
+    ),
+    (
+        "deprecated_member_use_implicit_type",
+        "deprecated_member_use",
+    ),
+    (
+        "deprecated_member_use_implicit_type_with_message",
+        "deprecated_member_use",
+    ),
+    (
+        "deprecated_member_use_with_message",
+        "deprecated_member_use",
+    ),
+    (
+        "deprecated_mixin_function",
+        "deprecated_subtype_of_function",
+    ),
+    (
+        "doc_directive_missing_one_argument",
+        "doc_directive_missing_argument",
+    ),
+    (
+        "doc_directive_missing_three_arguments",
+        "doc_directive_missing_argument",
+    ),
+    (
+        "doc_directive_missing_two_arguments",
+        "doc_directive_missing_argument",
+    ),
+    (
+        "dot_shorthand_undefined_getter",
+        "dot_shorthand_undefined_member",
+    ),
+    (
+        "dot_shorthand_undefined_invocation",
+        "dot_shorthand_undefined_member",
+    ),
+    ("duplicate_constructor_default", "duplicate_constructor"),
+    ("duplicate_constructor_name", "duplicate_constructor"),
+    ("expected_catch_clause_body", "expected_body"),
+    ("expected_class_body", "expected_body"),
+    ("expected_extension_body", "expected_body"),
+    ("expected_extension_type_body", "expected_body"),
+    ("expected_finally_clause_body", "expected_body"),
+    ("expected_mixin_body", "expected_body"),
+    ("expected_named_type_extends", "expected_named_type"),
+    ("expected_named_type_implements", "expected_named_type"),
+    ("expected_named_type_on", "expected_named_type"),
+    ("expected_named_type_with", "expected_named_type"),
+    ("expected_switch_expression_body", "expected_body"),
+    ("expected_switch_statement_body", "expected_body"),
+    ("expected_try_statement_body", "expected_body"),
+    ("extends_deferred_class", "subtype_of_deferred_class"),
+    ("extends_disallowed_class", "subtype_of_disallowed_type"),
+    (
+        "extends_type_alias_expands_to_type_parameter",
+        "supertype_expands_to_type_parameter",
+    ),
+    (
+        "external_field_constructor_initializer",
+        "external_with_initializer",
+    ),
+    ("external_field_initializer", "external_with_initializer"),
+    ("external_variable_initializer", "external_with_initializer"),
+    (
+        "final_class_extended_outside_of_library",
+        "invalid_use_of_type_outside_library",
+    ),
+    (
+        "final_class_implemented_outside_of_library",
+        "invalid_use_of_type_outside_library",
+    ),
+    (
+        "final_class_used_as_mixin_constraint_outside_of_library",
+        "invalid_use_of_type_outside_library",
+    ),
+    (
+        "final_not_initialized_constructor_1",
+        "final_not_initialized_constructor",
+    ),
+    (
+        "final_not_initialized_constructor_2",
+        "final_not_initialized_constructor",
+    ),
+    (
+        "final_not_initialized_constructor_3_plus",
+        "final_not_initialized_constructor",
+    ),
+    ("function_already_complete", "declaration_already_complete"),
+    (
+        "illegal_concrete_enum_member_declaration",
+        "illegal_concrete_enum_member",
+    ),
+    (
+        "illegal_concrete_enum_member_inheritance",
+        "illegal_concrete_enum_member",
+    ),
+    ("illegal_enum_values_declaration", "illegal_enum_values"),
+    ("illegal_enum_values_inheritance", "illegal_enum_values"),
+    ("implements_deferred_class", "subtype_of_deferred_class"),
+    ("implements_disallowed_class", "subtype_of_disallowed_type"),
+    (
+        "implements_type_alias_expands_to_type_parameter",
+        "supertype_expands_to_type_parameter",
+    ),
+    ("incompatible_lint_files", "incompatible_lint"),
+    ("incompatible_lint_included", "incompatible_lint"),
+    (
+        "instance_access_to_static_member_of_unnamed_extension",
+        "instance_access_to_static_member",
+    ),
+    (
+        "interface_class_extended_outside_of_library",
+        "invalid_use_of_type_outside_library",
+    ),
+    ("invalid_field_name_from_object", "invalid_field_name"),
+    ("invalid_field_name_positional", "invalid_field_name"),
+    ("invalid_field_name_private", "invalid_field_name"),
+    (
+        "invalid_implementation_override_setter",
+        "invalid_implementation_override",
+    ),
+    (
+        "invalid_language_version_override_at_sign",
+        "invalid_language_version_override",
+    ),
+    (
+        "invalid_language_version_override_equals",
+        "invalid_language_version_override",
+    ),
+    (
+        "invalid_language_version_override_greater",
+        "invalid_language_version_override",
+    ),
+    (
+        "invalid_language_version_override_location",
+        "invalid_language_version_override",
+    ),
+    (
+        "invalid_language_version_override_lower_case",
+        "invalid_language_version_override",
+    ),
+    (
+        "invalid_language_version_override_number",
+        "invalid_language_version_override",
+    ),
+    (
+        "invalid_language_version_override_prefix",
+        "invalid_language_version_override",
+    ),
+    (
+        "invalid_language_version_override_trailing_characters",
+        "invalid_language_version_override",
+    ),
+    (
+        "invalid_language_version_override_two_slashes",
+        "invalid_language_version_override",
+    ),
+    ("invalid_null_aware_element", "invalid_null_aware_operator"),
+    (
+        "invalid_null_aware_map_entry_key",
+        "invalid_null_aware_operator",
+    ),
+    (
+        "invalid_null_aware_map_entry_value",
+        "invalid_null_aware_operator",
+    ),
+    (
+        "invalid_null_aware_operator_after_short_circuit",
+        "invalid_null_aware_operator",
+    ),
+    ("invalid_override_setter", "invalid_override"),
+    (
+        "invalid_reference_to_generative_enum_constructor_tearoff",
+        "invalid_reference_to_generative_enum_constructor",
+    ),
+    (
+        "invalid_type_argument_in_const_list",
+        "invalid_type_argument_in_const_literal",
+    ),
+    (
+        "invalid_type_argument_in_const_map",
+        "invalid_type_argument_in_const_literal",
+    ),
+    (
+        "invalid_type_argument_in_const_set",
+        "invalid_type_argument_in_const_literal",
+    ),
+    (
+        "list_element_type_not_assignable_nullability",
+        "list_element_type_not_assignable",
+    ),
+    (
+        "map_key_type_not_assignable_nullability",
+        "map_key_type_not_assignable",
+    ),
+    (
+        "map_value_type_not_assignable_nullability",
+        "map_value_type_not_assignable",
+    ),
+    (
+        "missing_default_value_for_parameter_positional",
+        "missing_default_value_for_parameter",
+    ),
+    (
+        "missing_default_value_for_parameter_with_annotation",
+        "missing_default_value_for_parameter",
+    ),
+    (
+        "missing_override_of_must_be_overridden_one",
+        "missing_override_of_must_be_overridden",
+    ),
+    (
+        "missing_override_of_must_be_overridden_three_plus",
+        "missing_override_of_must_be_overridden",
+    ),
+    (
+        "missing_override_of_must_be_overridden_two",
+        "missing_override_of_must_be_overridden",
+    ),
+    (
+        "missing_required_param_with_details",
+        "missing_required_param",
+    ),
+    (
+        "mixin_application_no_concrete_super_invoked_setter",
+        "mixin_application_no_concrete_super_invoked_member",
+    ),
+    ("mixin_deferred_class", "subtype_of_deferred_class"),
+    ("mixin_of_disallowed_class", "subtype_of_disallowed_type"),
+    (
+        "mixin_of_type_alias_expands_to_type_parameter",
+        "supertype_expands_to_type_parameter",
+    ),
+    (
+        "mixin_on_type_alias_expands_to_type_parameter",
+        "supertype_expands_to_type_parameter",
+    ),
+    (
+        "mixin_subtype_of_base_is_not_base",
+        "subtype_of_base_or_final_is_not_base_final_or_sealed",
+    ),
+    (
+        "mixin_subtype_of_final_is_not_base",
+        "subtype_of_base_or_final_is_not_base_final_or_sealed",
+    ),
+    (
+        "mixin_super_class_constraint_disallowed_class",
+        "subtype_of_disallowed_type",
+    ),
+    ("mixins_super_class", "implements_super_class"),
+    ("multiple_combinators_deprecated", "multiple_combinators"),
+    ("new_with_non_type", "creation_with_non_type"),
+    (
+        "no_default_super_constructor_explicit",
+        "no_default_super_constructor",
+    ),
+    (
+        "no_default_super_constructor_implicit",
+        "no_default_super_constructor",
+    ),
+    (
+        "non_abstract_class_inherits_abstract_member_five_plus",
+        "non_abstract_class_inherits_abstract_member",
+    ),
+    (
+        "non_abstract_class_inherits_abstract_member_four",
+        "non_abstract_class_inherits_abstract_member",
+    ),
+    (
+        "non_abstract_class_inherits_abstract_member_one",
+        "non_abstract_class_inherits_abstract_member",
+    ),
+    (
+        "non_abstract_class_inherits_abstract_member_three",
+        "non_abstract_class_inherits_abstract_member",
+    ),
+    (
+        "non_abstract_class_inherits_abstract_member_two",
+        "non_abstract_class_inherits_abstract_member",
+    ),
+    (
+        "non_const_call_to_literal_constructor_using_new",
+        "non_const_call_to_literal_constructor",
+    ),
+    (
+        "non_constant_list_element_from_deferred_library",
+        "collection_element_from_deferred_library",
+    ),
+    (
+        "non_constant_map_key_from_deferred_library",
+        "collection_element_from_deferred_library",
+    ),
+    (
+        "non_constant_map_value_from_deferred_library",
+        "collection_element_from_deferred_library",
+    ),
+    (
+        "non_exhaustive_switch_expression_private",
+        "non_exhaustive_switch_expression",
+    ),
+    (
+        "non_exhaustive_switch_statement_private",
+        "non_exhaustive_switch_statement",
+    ),
+    (
+        "not_enough_positional_arguments_name_plural",
+        "not_enough_positional_arguments",
+    ),
+    (
+        "not_enough_positional_arguments_name_singular",
+        "not_enough_positional_arguments",
+    ),
+    (
+        "not_enough_positional_arguments_plural",
+        "not_enough_positional_arguments",
+    ),
+    (
+        "not_enough_positional_arguments_singular",
+        "not_enough_positional_arguments",
+    ),
+    (
+        "not_initialized_non_nullable_instance_field_constructor",
+        "not_initialized_non_nullable_instance_field",
+    ),
+    (
+        "override_on_non_overriding_field",
+        "override_on_non_overriding_member",
+    ),
+    (
+        "override_on_non_overriding_getter",
+        "override_on_non_overriding_member",
+    ),
+    (
+        "override_on_non_overriding_method",
+        "override_on_non_overriding_member",
+    ),
+    (
+        "override_on_non_overriding_setter",
+        "override_on_non_overriding_member",
+    ),
+    (
+        "pattern_variable_shared_case_scope_different_finality_or_type",
+        "invalid_pattern_variable_in_shared_case_scope",
+    ),
+    (
+        "pattern_variable_shared_case_scope_has_label",
+        "invalid_pattern_variable_in_shared_case_scope",
+    ),
+    (
+        "pattern_variable_shared_case_scope_not_all_cases",
+        "invalid_pattern_variable_in_shared_case_scope",
+    ),
+    (
+        "record_literal_one_positional_no_trailing_comma_by_type",
+        "record_literal_one_positional_no_trailing_comma",
+    ),
+    (
+        "recursive_factory_redirect",
+        "recursive_constructor_redirect",
+    ),
+    (
+        "recursive_interface_inheritance_extends",
+        "recursive_interface_inheritance",
+    ),
+    (
+        "recursive_interface_inheritance_implements",
+        "recursive_interface_inheritance",
+    ),
+    (
+        "recursive_interface_inheritance_on",
+        "recursive_interface_inheritance",
+    ),
+    (
+        "recursive_interface_inheritance_with",
+        "recursive_interface_inheritance",
+    ),
+    (
+        "return_of_invalid_type_from_catch_error",
+        "invalid_return_type_for_catch_error",
+    ),
+    (
+        "return_of_invalid_type_from_constructor",
+        "return_of_invalid_type",
+    ),
+    (
+        "return_of_invalid_type_from_function",
+        "return_of_invalid_type",
+    ),
+    (
+        "return_of_invalid_type_from_method",
+        "return_of_invalid_type",
+    ),
+    (
+        "return_of_invalid_type_from_then",
+        "invalid_return_type_for_then",
+    ),
+    (
+        "return_type_invalid_for_catch_error",
+        "invalid_return_type_for_catch_error",
+    ),
+    (
+        "return_type_invalid_for_then",
+        "invalid_return_type_for_then",
+    ),
+    (
+        "sealed_class_subtype_outside_of_library",
+        "invalid_use_of_type_outside_library",
+    ),
+    (
+        "set_element_from_deferred_library",
+        "collection_element_from_deferred_library",
+    ),
+    (
+        "set_element_type_not_assignable_nullability",
+        "set_element_type_not_assignable",
+    ),
+    (
+        "subtype_of_base_is_not_base_final_or_sealed",
+        "subtype_of_base_or_final_is_not_base_final_or_sealed",
+    ),
+    (
+        "subtype_of_final_is_not_base_final_or_sealed",
+        "subtype_of_base_or_final_is_not_base_final_or_sealed",
+    ),
+    (
+        "subtype_of_struct_class_in_extends",
+        "subtype_of_struct_class",
+    ),
+    (
+        "subtype_of_struct_class_in_implements",
+        "subtype_of_struct_class",
+    ),
+    ("subtype_of_struct_class_in_with", "subtype_of_struct_class"),
+    ("type_check_is_not_null", "type_check_with_null"),
+    ("type_check_is_null", "type_check_with_null"),
+    (
+        "unchecked_invocation_of_nullable_value",
+        "unchecked_use_of_nullable_value",
+    ),
+    (
+        "unchecked_method_invocation_of_nullable_value",
+        "unchecked_use_of_nullable_value",
+    ),
+    (
+        "unchecked_operator_invocation_of_nullable_value",
+        "unchecked_use_of_nullable_value",
+    ),
+    (
+        "unchecked_property_access_of_nullable_value",
+        "unchecked_use_of_nullable_value",
+    ),
+    (
+        "unchecked_use_of_nullable_value_as_condition",
+        "unchecked_use_of_nullable_value",
+    ),
+    (
+        "unchecked_use_of_nullable_value_as_iterator",
+        "unchecked_use_of_nullable_value",
+    ),
+    (
+        "unchecked_use_of_nullable_value_in_spread",
+        "unchecked_use_of_nullable_value",
+    ),
+    (
+        "unchecked_use_of_nullable_value_in_yield_each",
+        "unchecked_use_of_nullable_value",
+    ),
+    ("undefined_class_boolean", "undefined_class"),
+    (
+        "undefined_constructor_in_initializer_default",
+        "undefined_constructor_in_initializer",
+    ),
+    (
+        "undefined_enum_constructor_named",
+        "undefined_enum_constructor",
+    ),
+    (
+        "undefined_enum_constructor_unnamed",
+        "undefined_enum_constructor",
+    ),
+    ("undefined_getter_on_function_type", "undefined_getter"),
+    ("undefined_method_on_function_type", "undefined_method"),
+    ("undefined_method_on_type_literal", "undefined_method"),
+    ("undefined_setter_on_function_type", "undefined_setter"),
+    ("undefined_super_getter", "undefined_super_member"),
+    ("undefined_super_method", "undefined_super_member"),
+    ("undefined_super_operator", "undefined_super_member"),
+    ("undefined_super_setter", "undefined_super_member"),
+    (
+        "unnecessary_nan_comparison_false",
+        "unnecessary_nan_comparison",
+    ),
+    (
+        "unnecessary_nan_comparison_true",
+        "unnecessary_nan_comparison",
+    ),
+    (
+        "unnecessary_null_comparison_always_null_false",
+        "unnecessary_null_comparison",
+    ),
+    (
+        "unnecessary_null_comparison_always_null_true",
+        "unnecessary_null_comparison",
+    ),
+    (
+        "unnecessary_null_comparison_never_null_false",
+        "unnecessary_null_comparison",
+    ),
+    (
+        "unnecessary_null_comparison_never_null_true",
+        "unnecessary_null_comparison",
+    ),
+    ("unnecessary_type_check_false", "unnecessary_type_check"),
+    ("unnecessary_type_check_true", "unnecessary_type_check"),
+    ("unsupported_option_with_legal_value", "unsupported_option"),
+    ("unsupported_option_with_legal_values", "unsupported_option"),
+    ("unsupported_option_without_values", "unsupported_option"),
+    ("unused_result_with_message", "unused_result"),
+    ("use_of_private_parameter_name", "undefined_named_parameter"),
+    (
+        "wrong_number_of_parameters_for_operator_minus",
+        "wrong_number_of_parameters_for_operator",
+    ),
+    (
+        "wrong_number_of_type_arguments_dot_shorthand_constructor",
+        "wrong_number_of_type_arguments_constructor",
+    ),
+    ("yield_each_in_non_generator", "yield_in_non_generator"),
+    ("yield_each_of_invalid_type", "yield_of_invalid_type"),
+];
 
 /// Applies the ignore-comment face to one file's assembled run: non-ERROR
 /// rows whose code a suppression entry names drop (`_filterIgnoredDiagnostics`
@@ -1664,4 +2440,92 @@ pub(crate) fn use_kind_of(intent: &Intent) -> NameUse {
     }
 }
 
+#[cfg(test)]
+mod suppression_tests {
+    //! The `IgnoreSuppression` join pins (#2137): the citation match is the
+    //! upstream `IgnoredDiagnosticName._matches` two-leg verdict
+    //! (`ignore_info.dart`:39-52) — a comment name suppresses a diagnostic
+    //! whose `name` OR `uniqueName` it equals.
 
+    use super::*;
+
+    /// One parsed face, one `line_of` table: the `// ignore:` on line 1
+    /// targets line 2, the `ignore_for_file:` covers every line. Offsets
+    /// are UTF-16 — the corpus is ASCII, so byte offsets serve.
+    fn parse_face(source: &str) -> (IgnoreSuppression, impl Fn(u32) -> u32 + '_) {
+        let face = IgnoreSuppression::parse(source);
+        let starts: Vec<u32> = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(i, _)| (i + 1) as u32))
+            .collect();
+        let line_of = move |offset: u32| starts.partition_point(|s| *s <= offset) as u32;
+        (face, line_of)
+    }
+
+    /// The divergence this ticket closes: a citation spelling the
+    /// diagnostic's `uniqueName` (`invalid_null_aware_operator`'s second
+    /// registry constant spells `..._after_short_circuit`) suppresses the
+    /// row reported under the shared `name` — upstream `_matches`'s second
+    /// leg, which the name-only join let fire.
+    #[test]
+    fn unique_name_citation_suppresses_the_shared_name_row() {
+        let (face, line_of) = parse_face(
+            "// ignore: invalid_null_aware_operator_after_short_circuit\nvar x = a?.b ?? c;\n",
+        );
+        assert!(face.suppresses(59, &line_of, "invalid_null_aware_operator"));
+        // The same citation never reaches an unrelated code on that line.
+        assert!(!face.suppresses(59, &line_of, "dead_code"));
+    }
+
+    /// `ignore_for_file:` joins the same canonical leg file-wide.
+    #[test]
+    fn unique_name_for_file_citation_suppresses_every_line() {
+        let (face, line_of) =
+            parse_face("// ignore_for_file: undefined_super_getter\nclass C {}\nvar x = 0;\n");
+        // `undefined_super_getter` is the getter variant's uniqueName; the
+        // row reports under `undefined_super_member`.
+        assert!(face.suppresses(43, &line_of, "undefined_super_member"));
+        assert!(face.suppresses(54, &line_of, "undefined_super_member"));
+    }
+
+    /// The name leg is unchanged: a `name` spelling still suppresses, a
+    /// spelling that is neither `name` nor a registry `uniqueName`
+    /// resolving to it never does (the under-report direction — no
+    /// widening past the oracle's match).
+    #[test]
+    fn name_citation_still_suppresses_and_unknown_spellings_never_do() {
+        let (face, line_of) = parse_face("// ignore: dead_code\nvar x = 0;\n");
+        assert!(face.suppresses(21, &line_of, "dead_code"));
+        assert!(face.suppresses(21, &line_of, "DEAD_CODE"));
+        assert!(!face.suppresses(21, &line_of, "unused_local_variable"));
+        // A uniqueName of a DIFFERENT code family never crosses.
+        let (face, line_of) = parse_face("// ignore: undefined_super_setter\nvar x = 0;\n");
+        assert!(face.suppresses(34, &line_of, "undefined_super_member"));
+        assert!(!face.suppresses(34, &line_of, "undefined_method"));
+        // Registry-silent spellings resolve to nothing.
+        assert_eq!(canonical_diagnostic_name("not_a_real_code"), None);
+        assert_eq!(canonical_diagnostic_name("dead_code"), None);
+    }
+
+    /// The alias table walks upstream-clean: sorted by the `uniqueName`
+    /// column (the binary search's precondition), row count pinned at the
+    /// registry's 225 divergent constants, no self-alias row.
+    #[test]
+    fn the_alias_table_walks_upstream_clean() {
+        assert_eq!(UNIQUE_NAME_ALIASES.len(), 225);
+        for window in UNIQUE_NAME_ALIASES.windows(2) {
+            assert!(
+                window[0].0 < window[1].0,
+                "alias column unsorted at {}: {}",
+                window[0].0,
+                window[1].0
+            );
+        }
+        for &(unique, name) in UNIQUE_NAME_ALIASES {
+            assert_ne!(unique, name, "self-alias row {unique}");
+        }
+        assert_eq!(
+            canonical_diagnostic_name("invalid_null_aware_operator_after_short_circuit"),
+            Some("invalid_null_aware_operator")
+        );
+    }
+}
