@@ -661,32 +661,39 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
             continue;
         };
         let dir = path.parent().unwrap_or(Path::new(""));
-        // One governing-options walk per distinct directory feeds both faces
-        // (the enable set and the cannot-ignore set read the same entry).
-        let options = governing_options(engine, dir, roots);
-        enabled
-            .entry(dir.to_path_buf())
-            .or_insert_with(|| enable_set(options.map(|options| options.lint_rules.as_slice())));
-        unignorable.entry(dir.to_path_buf()).or_insert_with(|| {
-            Arc::new(
-                options
-                    .map(|options| options.unignorable().clone())
-                    .unwrap_or_default(),
-            )
-        });
-        stricts
-            .entry(dir.to_path_buf())
-            .or_insert_with(|| StrictModes {
-                casts: options
-                    .and_then(|options| options.strict_casts)
-                    .unwrap_or(false),
-                inference: options
-                    .and_then(|options| options.strict_inference)
-                    .unwrap_or(false),
-                raw_types: options
-                    .and_then(|options| options.strict_raw_types)
-                    .unwrap_or(false),
-            });
+        // One governing-options walk per distinct directory feeds all three
+        // faces (the enable set, the cannot-ignore set, and the strict modes
+        // read the same entry); a directory already seen skips the
+        // ancestry stat walk outright.
+        if !enabled.contains_key(dir) {
+            let options = governing_options(engine, dir, roots);
+            enabled.insert(
+                dir.to_path_buf(),
+                enable_set(options.map(|options| options.lint_rules.as_slice())),
+            );
+            unignorable.insert(
+                dir.to_path_buf(),
+                Arc::new(
+                    options
+                        .map(|options| options.unignorable().clone())
+                        .unwrap_or_default(),
+                ),
+            );
+            stricts.insert(
+                dir.to_path_buf(),
+                StrictModes {
+                    casts: options
+                        .and_then(|options| options.strict_casts)
+                        .unwrap_or(false),
+                    inference: options
+                        .and_then(|options| options.strict_inference)
+                        .unwrap_or(false),
+                    raw_types: options
+                        .and_then(|options| options.strict_raw_types)
+                        .unwrap_or(false),
+                },
+            );
+        }
         if let Some(identity) = engine.packages().containing(path) {
             faces
                 .entry(identity.root.clone())

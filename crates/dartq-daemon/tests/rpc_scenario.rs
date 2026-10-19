@@ -52,19 +52,24 @@ fn scenario_workspace() -> Workspace {
 }
 
 const A_SOURCE: &str = "class Foo {\n  void meth() {}\n}\nvoid foo() {}\n";
-/// Every local is read (`f?.meth()`), so no `unused_local_variable` row ever
-/// fires and the clean baseline holds. The `Foo` rows stay at
-/// `reference@33` / `invoked@42` — the fix appends after line 3.
+/// Every local is read (`f.meth()`), so no `unused_local_variable` row ever
+/// fires and the clean baseline holds. The reads are plain member accesses:
+/// `Foo? f = Foo()` promotes `f` to non-null (assignment promotion), so the
+/// earlier `f?.meth()` shape carried a real `invalid_null_aware_operator`
+/// row per use (oracle-probed against the shipped SDK — `?.` on a local the
+/// initializer promoted is unnecessary) and the scenario's clean-premise
+/// assertions could not hold. The `Foo` rows stay at `reference@33` /
+/// `invoked@42` — the fix appends after line 3.
 const B_SOURCE: &str =
-    "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f?.meth();\n  foo();\n}\n";
+    "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  foo();\n}\n";
 const TEST_SOURCE: &str =
-    "import 'package:fixture/a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f?.meth();\n}\n";
+    "import 'package:fixture/a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n}\n";
 /// Agent A's staged rewrite of lib/b.dart: one more `Foo` use pair than the
 /// base — the delta the overlay-view query must surface. Lint-clean like
-/// the base; its second pair sits at `reference@64` / `invoked@73`
-/// (ASCII-counted: line 3 ends at 48, the `f?.meth();` line runs 49–61,
-/// line 5 starts at 62 with `Foo` at 62+2 and 62+11).
-const AGENT_B_SOURCE: &str = "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f?.meth();\n  Foo? g = Foo();\n  g?.meth();\n  foo();\n}\n";
+/// the base; its second pair sits at `reference@63` / `invoked@72`
+/// (ASCII-counted: line 3 ends at 48, the `f.meth();` line runs 49–60,
+/// line 5 starts at 61 with `Foo` at 61+2 and 61+11).
+const AGENT_B_SOURCE: &str = "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  f.meth();\n  Foo? g = Foo();\n  g.meth();\n  foo();\n}\n";
 
 /// One scripted step: the wire message, the transcript growth to settle on
 /// (0 = settle through a probe answer, for frame-less steps), and the
@@ -268,13 +273,13 @@ fn agent_script_over_the_daemon_rpc_surface() {
                 let mut expected: Vec<(String, &str, i64)> = vec![
                     (b_label.to_owned(), "reference", 33),
                     (b_label.to_owned(), "invoked", 42),
-                    (b_label.to_owned(), "reference", 64),
-                    (b_label.to_owned(), "invoked", 73),
+                    (b_label.to_owned(), "reference", 63),
+                    (b_label.to_owned(), "invoked", 72),
                     (a_test.display().to_string(), "reference", 49),
                     (a_test.display().to_string(), "invoked", 58),
                 ];
                 expected.sort();
-                assert_eq!(uses, expected, "the overlay pair lands at 64/73");
+                assert_eq!(uses, expected, "the overlay pair lands at 63/72");
                 assert_schema_valid(&result, dartq_schema::Domain::Query);
             },
         ),

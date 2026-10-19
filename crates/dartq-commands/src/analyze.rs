@@ -5,6 +5,7 @@
 //! UTF-16 offset (line/column are monotone in it), so no line-column
 //! computation is spent on sorting.
 
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::io;
@@ -547,6 +548,32 @@ pub fn merge_runs<'a>(runs: Vec<AnalyzeRun<'a>>) -> MergedRun<'a> {
     // existing id for a repeated path, so the table is filled by id, not
     // by push order (the `resize` keeps the sparse positions defaultable).
     let mut owners: Vec<Option<(usize, FileId)>> = Vec::new();
+    // `(run, original id) → merged id`: each distinct source file interns
+    // (and canonicalizes, one `realpath`) once, not once per row.
+    let mut seen: FxHashMap<(usize, FileId), FileId> = FxHashMap::default();
+    // The normalizations (one `realpath` each, the pass's whole cost at
+    // 10⁵ files) are pure per path, so they run as one parallel pre-pass
+    // over the distinct `(run, id)` locations; the serial walk below then
+    // mints merged ids in the canonical row order exactly as before.
+    let normalized: FxHashMap<(usize, FileId), PathBuf> = {
+        let mut locations: Vec<(usize, FileId)> = keyed
+            .iter()
+            .flat_map(|(run_index, diagnostic)| {
+                std::iter::once(diagnostic.file)
+                    .chain(diagnostic.context.iter().flatten().map(|message| message.file))
+                    .map(move |file| (*run_index, file))
+            })
+            .collect();
+        locations.sort_unstable();
+        locations.dedup();
+        locations
+            .into_par_iter()
+            .map(|(run_index, id)| {
+                let path = dartq_source::normalize_path(runs[run_index].layout.file_path(id));
+                ((run_index, id), path)
+            })
+            .collect()
+    };
     // Every location the writers resolve — the diagnostic's own and each
     // context message's — interns onto the merged table: context messages
     // point at secondary locations, often in other files, whose ids would
@@ -554,8 +581,16 @@ pub fn merge_runs<'a>(runs: Vec<AnalyzeRun<'a>>) -> MergedRun<'a> {
     // merged provider; a colliding id silently resolves a different
     // file's line and column).
     let mut remap = |run_index: usize, id: FileId| -> FileId {
+        if let Some(&merged) = seen.get(&(run_index, id)) {
+            return merged;
+        }
         let original = id;
-        let merged = files.intern(runs[run_index].layout.file_path(id));
+        let path = runs[run_index].layout.file_path(id);
+        let merged = match normalized.get(&(run_index, id)) {
+            Some(canonical) => files.intern_normalized(path, canonical.clone()),
+            None => files.intern(path),
+        };
+        seen.insert((run_index, id), merged);
         let slot = merged.index() as usize;
         if owners.len() <= slot {
             owners.resize_with(slot + 1, || None);

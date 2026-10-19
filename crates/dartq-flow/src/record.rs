@@ -70,6 +70,15 @@ pub struct Flow<'t> {
     /// annotated ones. Entries whose executable never replays are inert
     /// (bounded by the unit's declarator count).
     inferred_locals: FxHashMap<u32, crate::ty::Ty>,
+    /// Assignment right-hand-side types keyed on the write target token's
+    /// offset: the semantic layer resolves a plain assignment's RHS shape
+    /// its own rows carry (an SDK static's declared return — `RangeError
+    /// .checkValidRange` — is invisible to the name-level flow walk, whose
+    /// RHS reads `Unknown`), and stages it here before the assignment's
+    /// fold runs. The fold adopts it when its own answer is the unknown
+    /// face; a resolved RHS keeps its own type. Entries whose assignment
+    /// never folds are inert (bounded by the unit's write count).
+    staged_rhs: FxHashMap<u32, crate::ty::Ty>,
     /// The most recent label-reference identifier (a break/continue
     /// target's name, consumed by the next break/continue event).
     pending_label_ref: Option<u32>,
@@ -196,6 +205,7 @@ impl<'t> Flow<'t> {
             non_promotions: vec![Vec::new()],
             pending_type_args: crate::ty::EMPTY_ARGS,
             inferred_locals: FxHashMap::default(),
+            staged_rhs: FxHashMap::default(),
             pending_label_ref: None,
             pending_labels: Vec::new(),
             pending_label_token: None,
@@ -349,7 +359,9 @@ impl<'t> Flow<'t> {
             return Some(match base {
                 B::Dynamic | B::Void | B::Unknown | B::Null => (C::PotentiallyNullable, None),
                 B::Never => (C::NullOrEquivalent, None),
-                other @ B::Name(_) => (
+                // A signature-less function head subtypes `Object?` the
+                // same way; its non-null face is the suffix-less head.
+                other @ (B::Name(_) | B::Function) => (
                     C::PotentiallyNullable,
                     Some((
                         crate::ty::Ty {
@@ -387,9 +399,9 @@ impl<'t> Flow<'t> {
                     };
                 Some((class, None))
             }
-            // `Never <: Object`; any other non-nullable named bound is a
-            // subtype of `Object` too.
-            B::Never | B::Name(_) => Some((C::NonNullable, None)),
+            // `Never <: Object`; any other non-nullable named or
+            // signature-less function bound is a subtype of `Object` too.
+            B::Never | B::Name(_) | B::Function => Some((C::NonNullable, None)),
         }
     }
 
@@ -530,6 +542,16 @@ impl<'t> Flow<'t> {
         self.inferred_locals.insert(decl_offset, ty);
     }
 
+    /// Stages one assignment's right-hand-side type (#2174): the semantic
+    /// layer's resolved RHS static type for a plain `=` write, keyed on the
+    /// write target token's offset. The fold adopts it at `Ev::Assign` when
+    /// its own RHS read is the unknown face; shapes the flow lattice cannot
+    /// spell never arrive (the stager drops them, the unknown-written
+    /// demotion stands).
+    pub fn stage_assignment_rhs(&mut self, target_offset: u32, ty: crate::ty::Ty) {
+        self.staged_rhs.insert(target_offset, ty);
+    }
+
     /// Records the `handleExit` contract: a subexpression's static type is
     /// Never, so the flow state goes unreachable from the expression's end
     /// (official `FlowAnalysis.handleExit`, flow_analysis.dart:919-925).
@@ -621,6 +643,12 @@ impl<'t> Flow<'t> {
         // for this unit (#2140) — read-only here, adopted at
         // `InitializerEnd`.
         interp.inferred_locals = &self.inferred_locals;
+        // The staged assignment RHS types (#2174) — read-only here,
+        // adopted at `Ev::Assign` when the fold's own answer is unknown.
+        interp.staged_rhs = &self.staged_rhs;
+        // The interned name lexemes: the send fold's class-head face reads
+        // the callee's spelling (`x = C()` vs a lowercase function call).
+        interp.names = &self.names_by_id;
         interp.run(&events);
         // The async-gap context face: one linear replay over the same
         // buffer (the ids are interned lazily — already-present names keep
@@ -1211,7 +1239,9 @@ impl ParserListener for Flow<'_> {
     }
 
     fn end_function_type(&mut self, _function: Token, question: Option<Token>) {
-        self.record(Ev::FunctionType);
+        self.record(Ev::FunctionType {
+            nullable: question.is_some(),
+        });
         // A function-typed header has no name-level row; its own
         // return/parameter rows must not leak into the latch.
         if self.buffer.is_none() {

@@ -262,7 +262,13 @@ pub(crate) fn analyze(
     let class_modifiers =
         fold_graph.map(|graph| crate::semdiag::build_class_modifiers(state, graph));
 
-    let computed: Vec<Option<(Duration, Vec<Arc<Diagnostic>>)>> = order
+    // Each job also rebuilds its library's symbol-index surface: the build
+    // reads only the member captures (fresh from the drain above) and the
+    // graph namespaces, so it rides the fan-out instead of the sequential
+    // store loop below — where re-deriving every shed capture's sites (a
+    // scan + parse per member past the site cache's cap) serialized a full
+    // workspace parse on the main thread.
+    let computed: Vec<Option<(Duration, Vec<Arc<Diagnostic>>, dartq_index::LibraryIndex)>> = order
         .par_iter()
         .map(|library| {
             if cancel.check().is_err() {
@@ -276,7 +282,7 @@ pub(crate) fn analyze(
                 // library skips this run — under-report, never a panic.
                 return None;
             };
-            let diagnostics = diagnose_library(
+            let mut diagnostics = diagnose_library(
                 state,
                 resolved,
                 semdiag,
@@ -285,29 +291,28 @@ pub(crate) fn analyze(
                 class_modifiers.as_ref(),
                 *library,
             );
-            Some((start.elapsed(), diagnostics))
+            // The run's canonical sort rides the job too (a pure read of the
+            // file table).
+            diagnostics.sort_by(|a, b| compare_canonical(&state.files, a, b));
+            let info = state.libraries.info(*library).expect("live library");
+            let surface = library_surface(state, resolved, *library, info);
+            Some((start.elapsed(), diagnostics, surface))
         })
         .collect();
 
     // Store completed results and emit their events in work order. The run
-    // enters the cache in canonical order — sorted once per recompute — and
-    // moves in without a clone; every later analyze merges the stored runs
+    // enters the cache in canonical order — sorted once per recompute, in
+    // its job — and moves in without a clone; every later analyze merges the stored runs
     // as-is (see `merge_canonical`). The library's symbol-index surface
-    // rebuilds at the same point (whole-unit
+    // (built in the job) installs at the same point (whole-unit
     // replacement at the `LibraryAnalyzed` point, the Engine owning dirty
     // scheduling) — so `query_symbols` serves maintained surfaces instead of
     // recapturing the whole workspace per query.
     let mut completed: FxHashSet<LibraryId> = FxHashSet::default();
     for (library, slot) in order.iter().zip(computed) {
-        let Some((duration, mut diagnostics)) = slot else {
+        let Some((duration, diagnostics, surface)) = slot else {
             continue;
         };
-        // Mirrors the fan-out arm: a completed slot exists only when the
-        // graph stood, so this skips nothing in any correct run.
-        let Some(resolved) = resolved else {
-            continue;
-        };
-        diagnostics.sort_by(|a, b| compare_canonical(&state.files, a, b));
         // The reuse key rides the record (g485 W2): the condensation is
         // fresh for this analyze (rebuilt above under the structure gate,
         // else standing over unchanged signatures), so every live dirty
@@ -337,7 +342,6 @@ pub(crate) fn analyze(
         *state.library_generations.entry(*library).or_insert(0) += 1;
         let info = state.libraries.info(*library).expect("live library");
         let defining = info.defining;
-        let surface = library_surface(state, resolved, *library, info);
         state.set_surface(*library, surface);
         completed.insert(*library);
         // Library-boundary budget poll: sustained pressure walks
@@ -1290,6 +1294,12 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
         .map(|(uri, names)| {
             let node = builder.intern(&format!("dart:{uri}"));
             let file = state.files.intern(Path::new(&format!("<dart:{uri}>")));
+            // The face file registers as the node's unit so the graph's
+            // `library_of_file` answers it: the namespace merge's SDK
+            // preference reads the declaring library's URI (a `dart:` name
+            // loses to a same-spelling package declaration,
+            // `element/scope.dart:811-832`).
+            builder.unit(node, file);
             for name in *names {
                 builder.declare(node, state.strings.intern(name), file);
             }
@@ -3335,6 +3345,7 @@ mod tests {
             .map(|(uri, names)| {
                 let node = builder.intern(&format!("dart:{uri}"));
                 let file = state.files.intern(Path::new(&format!("<dart:{uri}>")));
+                builder.unit(node, file);
                 for name in *names {
                     builder.declare(node, state.strings.intern(name), file);
                 }

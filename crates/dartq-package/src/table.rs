@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{PoisonError, RwLock};
 
 use dartq_pub::{LanguageVersion, PackageConfig, ResolvedPackageGraph, normalize};
 use dartq_source::normalize_path;
@@ -64,10 +64,11 @@ pub struct PackageTable {
     /// in bound; the fallback also owns the chain". Keys are directories
     /// only — file queries are never memoized, so entries are bounded by
     /// the walked directory count, not the file count. Interior mutability
-    /// because attribution is a query over shared immutable state; callers
-    /// are the engine's sequential pre-fanout pass, so the lock is
-    /// uncontended.
-    ancestor_memo: Mutex<FxHashMap<Box<Path>, Option<PackageName>>>,
+    /// because attribution is a query over shared immutable state. The
+    /// parallel fan-outs query it per file, so the dominant hit — the
+    /// file's parent directory already walked — is served under the read
+    /// lock; only a walk takes the write lock.
+    ancestor_memo: RwLock<FxHashMap<Box<Path>, Option<PackageName>>>,
 }
 
 impl Clone for PackageTable {
@@ -80,7 +81,7 @@ impl Clone for PackageTable {
             workspace_members: self.workspace_members.clone(),
             workspace_root: self.workspace_root.clone(),
             // The memo is a pure cache; a clone starts cold.
-            ancestor_memo: Mutex::new(FxHashMap::default()),
+            ancestor_memo: RwLock::new(FxHashMap::default()),
         }
     }
 }
@@ -244,7 +245,7 @@ impl PackageTable {
             root: Some(root_name),
             workspace_members,
             workspace_root,
-            ancestor_memo: Mutex::new(FxHashMap::default()),
+            ancestor_memo: RwLock::new(FxHashMap::default()),
         })
     }
 
@@ -296,7 +297,7 @@ impl PackageTable {
             root,
             workspace_members: None,
             workspace_root: root_dir,
-            ancestor_memo: Mutex::new(FxHashMap::default()),
+            ancestor_memo: RwLock::new(FxHashMap::default()),
         })
     }
 
@@ -365,9 +366,27 @@ impl PackageTable {
         // own segment is skipped) and attributes to the enclosing package,
         // never to itself.
         let file_query = path.extension().is_some();
+        // The read-locked fast path: the query itself, else (a file query)
+        // its parent directory — exactly the first memo probes the walk
+        // below makes, so a hit here answers what the walk would.
+        {
+            let memo = self
+                .ancestor_memo
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            let probe = if file_query {
+                memo.get(path.as_path())
+                    .or_else(|| path.parent().and_then(|parent| memo.get(parent)))
+            } else {
+                memo.get(path.as_path())
+            };
+            if let Some(hit) = probe {
+                return hit.as_ref().map(|name| &self.packages[name]);
+            }
+        }
         let mut memo = self
             .ancestor_memo
-            .lock()
+            .write()
             .unwrap_or_else(PoisonError::into_inner);
         if let Some(hit) = memo.get(path.as_path()) {
             return hit.as_ref().map(|name| &self.packages[name]);
@@ -447,7 +466,7 @@ impl PackageTable {
     fn memo_keys(&self) -> Vec<PathBuf> {
         let mut keys: Vec<PathBuf> = self
             .ancestor_memo
-            .lock()
+            .read()
             .unwrap_or_else(PoisonError::into_inner)
             .keys()
             .map(|dir| dir.to_path_buf())

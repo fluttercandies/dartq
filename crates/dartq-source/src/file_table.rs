@@ -78,6 +78,25 @@ impl FileTable {
     /// would exhaust the [`FileId`] space.
     pub fn intern(&mut self, path: &Path) -> FileId {
         let normalized = self.memo.normalize(path);
+        self.intern_canonical(normalized)
+    }
+
+    /// [`intern`](Self::intern) with the normalization already computed:
+    /// `normalized` must be [`normalize_path`]`(path)`. The file-system walk
+    /// the rule performs (`realpath` per spelling) is the only expensive
+    /// step and a pure function of the path, so batch callers run it
+    /// off-thread and hand the result here, keeping the serial id-minting
+    /// pass free of syscalls. The memo fills exactly as `intern` would.
+    ///
+    /// # Panics
+    ///
+    /// Panics when interning more than [`u32::MAX`] distinct paths.
+    pub fn intern_normalized(&mut self, path: &Path, normalized: PathBuf) -> FileId {
+        let normalized = self.memo.prime(path, normalized);
+        self.intern_canonical(normalized)
+    }
+
+    fn intern_canonical(&mut self, normalized: Arc<Path>) -> FileId {
         if let Some(&id) = self.ids_by_path.get(normalized.as_ref()) {
             return id;
         }
@@ -347,6 +366,19 @@ impl PathMemo {
     pub(crate) fn retract(&mut self, path: &Path) {
         let key = lexical_key(path);
         self.canonical.remove(key.as_ref());
+    }
+
+    /// [`PathMemo::normalize`] with the walk's result supplied by the caller
+    /// (`normalized == normalize_path(path)`); a memoized spelling keeps its
+    /// first-sight value, exactly as `normalize` would return it.
+    pub(crate) fn prime(&mut self, path: &Path, normalized: PathBuf) -> Arc<Path> {
+        let key = lexical_key(path);
+        if let Some(cached) = self.canonical.get(key.as_ref()) {
+            return Arc::clone(cached);
+        }
+        let shared: Arc<Path> = Arc::from(normalized);
+        self.canonical.insert(key.into_owned(), Arc::clone(&shared));
+        shared
     }
 }
 
@@ -704,6 +736,30 @@ mod tests {
             "memoized intern hit regressed to filesystem speed: {per_op:?}/op"
         );
         assert_eq!(table.intern(&path), id, "hits keep resolving to one id");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// `intern_normalized` with the off-thread normalization is the same
+    /// table as `intern`: same ids, same stored spellings, and a later
+    /// `intern` of the spelling hits the primed memo.
+    #[test]
+    fn intern_normalized_matches_intern() {
+        let base = temp_dir("primed");
+        let file = base.join("a.dart");
+        fs::write(&file, "x").expect("write");
+        let dotted = base.join(".").join("a.dart");
+
+        let mut plain = FileTable::new();
+        let mut primed = FileTable::new();
+        for path in [&file, &dotted] {
+            let expected = plain.intern(path);
+            let got = primed.intern_normalized(path, normalize_path(path));
+            assert_eq!(got, expected);
+            assert_eq!(primed.path(got), plain.path(expected));
+        }
+        assert_eq!(primed.intern(&file), plain.intern(&file));
+        assert_eq!(primed.len(), 1, "both spellings name one file");
 
         let _ = fs::remove_dir_all(&base);
     }

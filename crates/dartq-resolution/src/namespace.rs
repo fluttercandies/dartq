@@ -30,15 +30,18 @@
 //!
 //! # Ambiguity
 //!
-//! Import merging follows the lazy rule (Dart 18.1; `front_end`
-//! `computeAmbiguousDeclarationForImport`): the **same** target
+//! Import merging follows the lazy rule (Dart 18.1): the **same** target
 //! arriving through several paths is one entry; **different** targets under
 //! one name make the entry ambiguous with all candidates kept — the
 //! diagnosis surfaces at the use point (`ambiguous_import`), never at build
-//! time. Because the composition walks imports in source order on every
-//! probe, the full candidate set is discovered per lookup and returned
-//! **owned** ([`Lookup::Ambiguous`]) — an allocation is paid only on the
-//! ambiguous (error) path; hits and misses allocate nothing.
+//! time. One exception, the oracle's SDK preference: a non-SDK declaration
+//! hides a same-named SDK one (`scope.dart:811-832`) — a package spelling
+//! and the `dart:` import of the same name never conflict, the package wins
+//! in either directive order. Because the composition walks imports in
+//! source order on every probe, the full candidate set is discovered per
+//! lookup and returned **owned** ([`Lookup::Ambiguous`]) — an allocation is
+//! paid only on the ambiguous (error) path; hits and misses allocate
+//! nothing.
 //!
 //! Lookup order is the oracle's scope chain (`LibraryFragmentScope.lookup`,
 //! scope.dart:419-433): the name-coupled locals layer first (a local face
@@ -66,13 +69,16 @@
 //! - Targets are declaring files, not `DefId`s: this layer has no element
 //!   table, and `(file, lookup-key name)` identifies a top-level declaration
 //!   for the semantic layer to resolve.
-//! - External (`dart:`) namespaces are opaque at this layer — the SDK's
-//!   names are grafted downstream (analyzer fills them from summaries). The
-//!   non-`dart:`-over-`dart:` merge priority — `PrefixScope._merge`'s
-//!   `_isSdkElement` preference (`element/scope.dart:675-697`, predicate at
-//!   `:721`; CFE agreement in `source_library_builder.dart:401-434`, which
-//!   `library_graph.rs` already pins) — becomes relevant only once SDK
-//!   namespaces exist and is deferred with that graft.
+//! - The SDK-vs-package merge priority is pinned here: when one name arrives
+//!   from two distinct declarations, a non-SDK declaration hides an SDK one
+//!   regardless of arrival order and no ambiguity is recorded — the oracle's
+//!   `PrefixScope._merge` preference (`element/scope.dart:811-832`,
+//!   `_isSdkElement` at `:860`: the *declaring* library is in the SDK). Only
+//!   same-sidedness collisions are ambiguous. Sidedness reads the declaring
+//!   file's library URI ([`LibraryGraph::library_of_file`] +
+//!   [`LibraryGraph::uri`]), so an SDK name re-exported through a package
+//!   still counts as SDK; the check runs only on genuine distinct-target
+//!   collisions, never on the hit/miss fast path.
 //! - The spec's `Namespace`/`Scope` type split is folded into one index
 //!   ([`Namespaces`]) with the chain order fixed (locals → prefixes →
 //!   imports): M1 has a single two-level chain, and a parent-delegation
@@ -290,6 +296,7 @@ impl Namespaces {
             return Lookup::Found(NamespaceEntry::Prefix);
         }
         fold(
+            graph,
             rows.iter()
                 .filter(|row| row.prefix == NO_PREFIX)
                 .filter_map(|row| self.probe(graph, row, name)),
@@ -320,6 +327,7 @@ impl Namespaces {
     ) -> Lookup {
         let prefix = prefix.index();
         fold(
+            graph,
             self.rows_of(lib)
                 .iter()
                 .filter(|row| row.prefix == prefix)
@@ -373,12 +381,17 @@ impl Namespaces {
 }
 
 /// Folds one composition walk's ordered hits into the lookup outcome — the
-/// import-merge conflict rule (Dart 18.1; `front_end`
-/// `computeAmbiguousDeclarationForImport`): the first arrival
+/// import-merge conflict rule (Dart 18.1) plus the oracle's SDK preference
+/// (`PrefixScope._merge`, `element/scope.dart:811-832`): the first arrival
 /// anchors, the same target arriving again dedupes to one entry, and
 /// distinct targets make the name ambiguous with every candidate kept in
-/// arrival order.
-fn fold(hits: impl Iterator<Item = NamespaceEntry>) -> Lookup {
+/// arrival order — except across sidedness, where a non-SDK declaration
+/// hides an SDK one whichever arrived first (and the hidden one is dropped
+/// entirely, `return other` / `return existing`). The preference applies
+/// only while the anchor is a sole entry: once the walk is ambiguous, later
+/// hits join the candidate set unchanged (the oracle's merge keeps folding
+/// into the `MultiplyDefinedElement`, whose sidedness is non-SDK).
+fn fold(graph: &LibraryGraph, hits: impl Iterator<Item = NamespaceEntry>) -> Lookup {
     let mut first: Option<NamespaceEntry> = None;
     // Empty until a genuine second candidate appears — the ambiguity error
     // path; hits and misses allocate nothing.
@@ -387,7 +400,18 @@ fn fold(hits: impl Iterator<Item = NamespaceEntry>) -> Lookup {
         match first {
             None => first = Some(hit),
             Some(existing) if existing == hit => {}
-            Some(_) => {
+            Some(existing) => {
+                if rest.is_empty() {
+                    let (existing_sdk, hit_sdk) =
+                        (is_sdk(graph, &existing), is_sdk(graph, &hit));
+                    if existing_sdk && !hit_sdk {
+                        first = Some(hit);
+                        continue;
+                    }
+                    if !existing_sdk && hit_sdk {
+                        continue;
+                    }
+                }
                 if !rest.contains(&hit) {
                     rest.push(hit);
                 }
@@ -402,6 +426,21 @@ fn fold(hits: impl Iterator<Item = NamespaceEntry>) -> Lookup {
             Lookup::Ambiguous(rest.into_boxed_slice())
         }
     }
+}
+
+/// Whether `entry`'s declaration lives in an SDK library — the oracle's
+/// `_isSdkElement` predicate (scope.dart:860-866) reduced to this layer's
+/// element model: a declaration is SDK when its declaring file's library URI
+/// is `dart:`. The unindexed face cannot occur here (`probe` only returns
+/// declarations the graph's export scopes carry), and an unregistered file
+/// reads as non-SDK — the plain-ambiguity behavior.
+fn is_sdk(graph: &LibraryGraph, entry: &NamespaceEntry) -> bool {
+    let NamespaceEntry::Decl(file) = *entry else {
+        return false;
+    };
+    graph
+        .library_of_file(file)
+        .is_some_and(|lib| graph.uri(lib).starts_with("dart:"))
 }
 
 #[cfg(test)]
@@ -576,6 +615,106 @@ mod tests {
         assert_eq!(
             namespaces.lookup(&graph, consumer, strings.intern("clash")),
             ambiguous(&[NamespaceEntry::Decl(f1), NamespaceEntry::Decl(f2)]),
+        );
+    }
+
+    /// A package spelling hides the same-named SDK declaration in either
+    /// directive order, with no ambiguity — the oracle's SDK preference
+    /// (`PrefixScope._merge`, scope.dart:811-832: non-SDK hides SDK,
+    /// `return other` / `return existing`). This is the empty_unmodifiable_set
+    /// face: `import 'dart:collection'` grafts the SDK's `UnmodifiableSetView`
+    /// beside the package's, and the package spelling must keep the class the
+    /// `@override` climb walks.
+    #[test]
+    fn package_name_hides_sdk_name_in_either_directive_order() {
+        let mut rig = Rig::new();
+        let sdk = rig.builder.intern("dart:collection");
+        let pkg = rig.builder.intern("package:p/view.dart");
+        let sdk_file = rig.file("<dart:collection>");
+        let pkg_file = rig.file("view.dart");
+        rig.builder.unit(sdk, sdk_file);
+        rig.builder.unit(pkg, pkg_file);
+        rig.declare(sdk, "View", sdk_file);
+        rig.declare(pkg, "View", pkg_file);
+
+        let first_sdk = rig.builder.intern("package:c/sdk_first.dart");
+        rig.import(first_sdk, Some(sdk), None, Combinators::unfiltered());
+        rig.import(first_sdk, Some(pkg), None, Combinators::unfiltered());
+        let first_pkg = rig.builder.intern("package:c/pkg_first.dart");
+        rig.import(first_pkg, Some(pkg), None, Combinators::unfiltered());
+        rig.import(first_pkg, Some(sdk), None, Combinators::unfiltered());
+        let (strings, graph, namespaces) = rig.settle();
+        let view = strings.intern("View");
+
+        assert_eq!(
+            namespaces.lookup(&graph, first_sdk, view),
+            Lookup::Found(NamespaceEntry::Decl(pkg_file)),
+            "SDK import first: the package spelling still wins"
+        );
+        assert_eq!(
+            namespaces.lookup(&graph, first_pkg, view),
+            Lookup::Found(NamespaceEntry::Decl(pkg_file)),
+            "package import first: unchanged"
+        );
+    }
+
+    /// Two SDK declarations of one name stay ambiguous — the preference only
+    /// spans sidedness, never within the SDK (`_merge` falls through to the
+    /// `MultiplyDefinedElement` when both sides are SDK).
+    #[test]
+    fn sdk_vs_sdk_stays_ambiguous() {
+        let mut rig = Rig::new();
+        let s1 = rig.builder.intern("dart:collection");
+        let s2 = rig.builder.intern("dart:core");
+        let consumer = rig.builder.intern("package:c/c.dart");
+        let f1 = rig.file("<dart:collection>");
+        let f2 = rig.file("<dart:core>");
+        rig.builder.unit(s1, f1);
+        rig.builder.unit(s2, f2);
+        rig.declare(s1, "Clash", f1);
+        rig.declare(s2, "Clash", f2);
+        rig.import(consumer, Some(s1), None, Combinators::unfiltered());
+        rig.import(consumer, Some(s2), None, Combinators::unfiltered());
+        let (strings, graph, namespaces) = rig.settle();
+
+        assert_eq!(
+            namespaces.lookup(&graph, consumer, strings.intern("Clash")),
+            ambiguous(&[NamespaceEntry::Decl(f1), NamespaceEntry::Decl(f2)]),
+        );
+    }
+
+    /// Sidedness reads the *declaring* library, not the import edge's target:
+    /// an SDK name re-exported through a package (`export 'dart:collection';`)
+    /// still loses to a same-named package declaration (`element.library
+    /// .isInSdk` is the declaring library's flag, scope.dart:860-866).
+    #[test]
+    fn sdk_name_reexported_through_package_still_loses_to_package_name() {
+        let mut rig = Rig::new();
+        let sdk = rig.builder.intern("dart:collection");
+        let reexporter = rig.builder.intern("package:r/r.dart");
+        let pkg = rig.builder.intern("package:p/view.dart");
+        let consumer = rig.builder.intern("package:c/c.dart");
+        let sdk_file = rig.file("<dart:collection>");
+        let pkg_file = rig.file("view.dart");
+        rig.builder.unit(sdk, sdk_file);
+        rig.builder.unit(pkg, pkg_file);
+        rig.declare(sdk, "View", sdk_file);
+        rig.declare(pkg, "View", pkg_file);
+        rig.builder.export(
+            reexporter,
+            crate::library_graph::ExportEdge {
+                target: Some(sdk),
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        rig.import(consumer, Some(reexporter), None, Combinators::unfiltered());
+        rig.import(consumer, Some(pkg), None, Combinators::unfiltered());
+        let (strings, graph, namespaces) = rig.settle();
+
+        assert_eq!(
+            namespaces.lookup(&graph, consumer, strings.intern("View")),
+            Lookup::Found(NamespaceEntry::Decl(pkg_file)),
+            "the re-exported SDK name is SDK by its declaring library"
         );
     }
 

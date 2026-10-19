@@ -951,7 +951,7 @@ impl GapPass {
                     };
                 }
             }
-            Ev::NoType | Ev::FunctionType | Ev::VoidType => {
+            Ev::NoType | Ev::FunctionType { .. } | Ev::VoidType => {
                 if self.type_gated == 0 && !self.in_decl {
                     self.pending_ty = Kind::Other;
                 }

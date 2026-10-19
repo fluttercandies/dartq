@@ -30,6 +30,7 @@
 
 use std::fmt;
 use std::fs::File;
+use std::io::Read as _;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -52,6 +53,14 @@ use crate::content_id::{ContentId, content_hash};
 /// residency) enforce this before any position is derived, so a resident
 /// text never breaches it.
 pub const MAX_SOURCE_BYTES: usize = u32::MAX as usize - 1;
+
+/// The smallest file [`open_source`] maps; smaller files read into an
+/// exact-size owned buffer. A mapping rounds every file up to whole pages
+/// (16 KiB on Apple silicon) and spends one VM region per file, so at the
+/// typical few-KiB source size it costs several times the text in resident
+/// memory plus a map/unmap syscall pair; past this size the rounding is a
+/// small fraction and the evictable page-cache backing wins.
+pub const MMAP_MIN_BYTES: u64 = 128 * 1024;
 
 /// Why [`open_mapped`] refused a file.
 #[derive(Debug, thiserror::Error)]
@@ -262,6 +271,35 @@ pub fn open_mapped(path: &Path) -> Result<SourceText, OpenError> {
     MappedRange::open(path)
 }
 
+/// Loads the canonical text of the file at `path` in the cheapest resident
+/// form: files of at least [`MMAP_MIN_BYTES`] as a mapping lease (exactly
+/// [`open_mapped`]), smaller ones read into an exact-size owned buffer —
+/// the same canonical text and [`ContentId`] either way (BOM strip, lossy
+/// decode), so the choice is invisible to every consumer. The workspace
+/// walk's loader: at 10⁵ few-KiB files, per-file mappings were the
+/// dominant resident cost of the whole analysis.
+///
+/// # Errors
+///
+/// The open/metadata/read/map I/O errors, surfaced as-is, and the
+/// [`OpenError::TooLarge`] rejection when the file exceeds
+/// [`MAX_SOURCE_BYTES`].
+pub fn open_source(path: &Path) -> Result<SourceText, OpenError> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len >= MMAP_MIN_BYTES {
+        return MappedRange::open(path);
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    file.read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SOURCE_BYTES {
+        return Err(OpenError::TooLarge {
+            len: bytes.len() as u64,
+        });
+    }
+    Ok(SourceText::canonical(&bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +412,31 @@ mod tests {
             line.contains(&(MAX_SOURCE_BYTES as u64 + 1).to_string()),
             "names the file size: {line}"
         );
+    }
+
+    /// `open_source` yields the canonical text and id of `open_mapped` on
+    /// both sides of the mapping threshold, BOM and invalid UTF-8 included;
+    /// only the resident form differs.
+    #[test]
+    fn open_source_matches_open_mapped() {
+        let dir = std::env::temp_dir().join(format!("dartq-source-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let large = "x".repeat(usize::try_from(MMAP_MIN_BYTES).expect("fits") + 7);
+        let cases: [(&str, Vec<u8>); 4] = [
+            ("small", b"var x = 1;\n".to_vec()),
+            ("bom", "\u{FEFF}var y;".as_bytes().to_vec()),
+            ("lossy", b"a\xffb".to_vec()),
+            ("large", large.into_bytes()),
+        ];
+        for (name, bytes) in cases {
+            let path = dir.join(format!("{name}.dart"));
+            std::fs::write(&path, &bytes).expect("write");
+            let mapped = open_mapped(&path).expect("mapped");
+            let source = open_source(&path).expect("source");
+            assert_eq!(source.as_str(), mapped.as_str(), "{name}");
+            assert_eq!(source.content_id(), mapped.content_id(), "{name}");
+            assert_eq!(source.is_mapped(), name == "large", "{name} resident form");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

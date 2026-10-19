@@ -82,12 +82,13 @@ use dartq_semantic::{
     ElementIndex, ExportUseFace, ImportUseFace, LibraryUsages, StrictModes, UnitUseFace,
 };
 use dartq_source::{ContentId, FileId, LineIndex, SourceRange, StringId, StringTable};
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::sync::PoisonError;
 
 use crate::l1;
 use crate::pipeline::ResolvedGraph;
-use crate::state::{EngineState, ScannedFace, UnitFacts};
+use crate::state::{EngineState, FactsKey, ScannedFace, UnitFacts};
 use crate::{LibraryView, SemanticDiagnoser};
 
 // Test-only build counter for the #775 sharing pin: counting invocations
@@ -178,21 +179,45 @@ pub(crate) fn build_class_modifiers(
                 .map(|&graph_library| (graph_library, info.defining))
         })
         .collect();
+    // The per-file postures are independent reads (a cached face, else a
+    // local scan), so they fan out; the cache fills and degrade rows then
+    // land serially in the defining-file order — the exact sequence the
+    // serial walk produced, so the bounded scanned cache ends identical.
+    let resolved: Vec<Posture> = {
+        let state = &*state;
+        defining_files
+            .par_iter()
+            .map(|&(_, defining)| class_modifiers_of(state, defining))
+            .collect()
+    };
     let mut posture = LibraryClassModifiers::default();
-    for (graph_library, defining) in &defining_files {
-        posture.insert(*graph_library, class_modifiers_of(state, *defining));
+    for (&(graph_library, defining), resolved) in defining_files.iter().zip(resolved) {
+        let enabled = match resolved {
+            Posture::Cached(enabled) => enabled,
+            Posture::Scanned(key, face) => {
+                let enabled = face.features.is_enabled(Feature::ClassModifiers);
+                state.cache_scanned(key, face);
+                enabled
+            }
+            Posture::Degraded(face) => {
+                state.residency_degrades.record(&[(defining, face)]);
+                true
+            }
+        };
+        posture.insert(graph_library, enabled);
     }
     posture
 }
 
 /// `Feature::ClassModifiers` at `file`'s settled version: the persisted
-/// scan face when cached, else a local re-derivation persisted under the
-/// facts key — the same miss shape the fold's own member loop and the
-/// apply-phase recompute follow, so a warm-start or evicted face is derived
-/// exactly once per analyze and every later consumer hits.
-fn class_modifiers_of(state: &mut EngineState, file: FileId) -> bool {
+/// scan face when cached, else a local re-derivation the caller persists
+/// under the facts key — the same miss shape the fold's
+/// own member loop and the apply-phase recompute follow, so a warm-start or
+/// evicted face is derived exactly once per analyze and later consumers
+/// hit.
+fn class_modifiers_of(state: &EngineState, file: FileId) -> Posture {
     if let Some(face) = state.settled_face(file) {
-        return face.features.is_enabled(Feature::ClassModifiers);
+        return Posture::Cached(face.features.is_enabled(Feature::ClassModifiers));
     }
     let content = state.residency[&file].content;
     let key = l1::facts_key(&state.grants(), file, content);
@@ -202,24 +227,30 @@ fn class_modifiers_of(state: &mut EngineState, file: FileId) -> bool {
     // modern face (what an absent map entry means) and the next apply
     // re-captures the file.
     let Some(bytes) = state.store.get(content) else {
-        state.residency_degrades.record(&[(file, "store")]);
-        return true;
+        return Posture::Degraded("store");
     };
     let Ok(text) = std::str::from_utf8(bytes) else {
-        state.residency_degrades.record(&[(file, "utf8")]);
-        return true;
+        return Posture::Degraded("utf8");
     };
     let version = l1::language_version_for(&state.packages, &state.files, file);
     let (feature_set, settled, scanned, _) = l1::scan_unit(text, version, file, &state.grants());
-    state.cache_scanned(
+    Posture::Scanned(
         key,
         ScannedFace {
             tokens: scanned.tokens,
             features: feature_set,
             version: settled,
         },
-    );
-    feature_set.is_enabled(Feature::ClassModifiers)
+    )
+}
+
+/// One defining file's posture answer, resolved off-thread and applied in
+/// order: a cached face's flag, a fresh scan face to persist, or a pairing
+/// miss's degrade row (the modern posture).
+enum Posture {
+    Cached(bool),
+    Scanned(FactsKey, ScannedFace),
+    Degraded(&'static str),
 }
 
 /// The default semantic diagnoser over [`LibraryView`] (stateless; the

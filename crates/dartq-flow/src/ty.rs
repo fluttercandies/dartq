@@ -21,6 +21,12 @@ pub enum Base {
     Never,
     /// `Null`.
     Null,
+    /// Some function type (`int Function(E, E)`), signature unknown — the
+    /// name-level lattice spells no shape. Carries only the head's
+    /// nullability, which is the promotion-relevant bit: it subtypes only
+    /// itself and the top types, promotes to its non-null form, and every
+    /// signature question stays the semantic layer's.
+    Function,
     /// No type information (`var`/inferred, or a shape the parser did not
     /// reduce to a name). Conservative everywhere.
     Unknown,

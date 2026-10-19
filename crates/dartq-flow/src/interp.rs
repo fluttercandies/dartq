@@ -382,6 +382,14 @@ pub(crate) struct Expr {
     /// the shorts opened by the consumed expression, all the way down its
     /// chain).
     pub chain_base: Option<usize>,
+    /// The value was consumed as a selector's receiver (`a.b`'s `a`): the
+    /// selector's merged result replaces the access's value on top, and
+    /// this operand stays beneath only as a strand (the cascade's sections
+    /// still read it there). Operand pops ([`Interp::pop_value`]) skip it —
+    /// a multi-operand consumer (`x = a.b`'s assignment target,
+    /// `a + b.c`'s left operand) must never mistake the strand for the
+    /// operand beneath its own value.
+    pub consumed: bool,
 }
 
 impl Expr {
@@ -397,6 +405,7 @@ impl Expr {
             read_span: None,
             name: None,
             chain_base: None,
+            consumed: false,
         }
     }
 
@@ -412,6 +421,7 @@ impl Expr {
             read_span: None,
             name: None,
             chain_base: None,
+            consumed: false,
         }
     }
 
@@ -705,6 +715,17 @@ pub(crate) struct Interp<'o> {
     /// adopted at `InitializerEnd` when the written header left the slot
     /// unknown. Read-only for the replay.
     pub(crate) inferred_locals: &'o FxHashMap<u32, crate::ty::Ty>,
+    /// The staged assignment RHS types the semantic layer resolved for this
+    /// unit (#2174), keyed on the write target token's offset — adopted at
+    /// `Ev::Assign` when the fold's own RHS read is the unknown face.
+    /// Read-only for the replay.
+    pub(crate) staged_rhs: &'o FxHashMap<u32, crate::ty::Ty>,
+    /// The recorder's interned name lexemes, mounted at replay time: the
+    /// class-head face (`x = C()`) reads the callee's spelling — a
+    /// lowercase head is a function/getter call, not an implicit creation.
+    /// The empty slice is the direct-construction default (every head
+    /// reads as a non-class call).
+    pub(crate) names: &'o [Box<str>],
     pub(crate) reach: ReachArena,
     pub(crate) lists: Lists,
     /// The non-promotion history pool beside [`Interp::lists`] — the same
@@ -860,6 +881,16 @@ static NO_TOP_LEVEL: std::sync::LazyLock<FxHashMap<u32, crate::record::TopVar>> 
 static NO_INFERRED_LOCALS: std::sync::LazyLock<FxHashMap<u32, crate::ty::Ty>> =
     std::sync::LazyLock::new(FxHashMap::default);
 
+/// The direct-construction default for [`Interp::staged_rhs`]: no staged
+/// assignment RHS types — every plain `=` write keeps the fold's own RHS
+/// read (the pre-#2174 behavior).
+static NO_STAGED_RHS: std::sync::LazyLock<FxHashMap<u32, crate::ty::Ty>> =
+    std::sync::LazyLock::new(FxHashMap::default);
+
+/// The direct-construction default for [`Interp::names`]: no lexemes —
+/// every invocation head reads as a non-class call.
+static NO_NAMES: std::sync::LazyLock<Vec<Box<str>>> = std::sync::LazyLock::new(Vec::new);
+
 /// The direct-construction default for [`Interp::closed`]: no closed
 /// declarations — every always-exhaustive verdict answers `false` (the
 /// pre-mount behavior).
@@ -888,6 +919,8 @@ impl<'o> Interp<'o> {
             closed: &NO_CLOSED,
             top_level: &NO_TOP_LEVEL,
             inferred_locals: &NO_INFERRED_LOCALS,
+            staged_rhs: &NO_STAGED_RHS,
+            names: &NO_NAMES,
             reach: ReachArena::new(),
             lists: Lists::default(),
             reasons: Reasons::default(),
@@ -1373,6 +1406,20 @@ impl<'o> Interp<'o> {
             return a;
         }
         Ty::UNKNOWN
+    }
+
+    /// Whether the interned name spells a class head — a leading underscore
+    /// skipped, an uppercase first letter (`C`, `_Private`): the
+    /// implicit-creation face (`x = C()`) keys on it, since a lowercase
+    /// head is a function/getter call whose return this layer cannot spell.
+    pub(crate) fn is_class_head(&self, name: u32) -> bool {
+        self.names
+            .get(name as usize)
+            .is_some_and(|spelling| {
+                spelling
+                    .trim_start_matches('_')
+                    .starts_with(|c: char| c.is_ascii_uppercase())
+            })
     }
 
     /// Official `_typesAreDisjointDueToNullability`: one side is

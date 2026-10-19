@@ -364,13 +364,26 @@ impl Engine {
     /// content id is the identity residency derives on apply.
     pub(crate) fn set_source(&mut self, path: &Path, text: SourceText) -> FileId {
         let file = self.state.files.intern(path);
+        self.queue_source(file, text);
+        file
+    }
+
+    /// [`Engine::set_source`] with the path normalization computed by the
+    /// caller (`normalized == dartq_source::normalize_path(path)`): the
+    /// discovery batch derives it on the read fan-out, so the serial id pass
+    /// pays no `realpath`.
+    fn set_source_normalized(&mut self, path: &Path, normalized: PathBuf, text: SourceText) {
+        let file = self.state.files.intern_normalized(path, normalized);
+        self.queue_source(file, text);
+    }
+
+    fn queue_source(&mut self, file: FileId, text: SourceText) {
         if !self.state.pending.contains_key(&file) {
             self.state.pending_order.push(file);
         }
         self.state
             .pending
             .insert(file, state::PendingChange::Set(text));
-        file
     }
 
     /// Enqueues a removal. Unknown path — never interned and not pending —
@@ -1044,8 +1057,9 @@ impl Engine {
             // serial walk's enqueue order was never stable run-to-run;
             // sorting pins discovery to one deterministic path order.
             accepted.sort();
-            // Cold-path I/O: load every accepted file as a mapping and count
-            // its LOC in parallel — `open_mapped` is I/O-bound (page-cache
+            // Cold-path I/O: load every accepted file (small files owned,
+            // large ones mapped — `open_source`) and count its LOC in
+            // parallel — the load is I/O-bound (page-cache
             // faults) and rayon's blocking pool absorbs that (the sanctioned
             // parallel form, same as the l1 batch fan-out). The walk and its
             // acceptance predicate stay serial on purpose: the predicate is
@@ -1062,15 +1076,18 @@ impl Engine {
             // file the intern/enqueue path and the stats are identical to
             // the unbatched form.
             for batch in accepted.chunks(256) {
-                let reads: Vec<Result<(SourceText, u64), OpenError>> = batch
+                // The path normalization (one `realpath` per file) rides the
+                // read fan-out too: a pure function of the path, so the
+                // serial id pass below mints ids syscall-free.
+                let reads: Vec<Result<(SourceText, u64, PathBuf), OpenError>> = batch
                     .par_iter()
                     .map(|path| {
-                        dartq_source::open_mapped(path).map(|text| {
+                        dartq_source::open_source(path).map(|text| {
                             let loc = u64::from(
                                 u32::try_from(memchr::memchr_iter(b'\n', text.as_bytes()).count())
                                     .unwrap_or(u32::MAX),
                             );
-                            (text, loc)
+                            (text, loc, dartq_source::normalize_path(path))
                         })
                     })
                     .collect();
@@ -1088,10 +1105,10 @@ impl Engine {
                 // not the run).
                 for (path, read) in batch.iter().zip(reads) {
                     match read {
-                        Ok((text, loc)) => {
+                        Ok((text, loc, normalized)) => {
                             stats.loc_total += loc;
                             stats.file_count += 1;
-                            self.set_source(path, text);
+                            self.set_source_normalized(path, normalized, text);
                         }
                         Err(OpenError::TooLarge { .. }) => stats.oversized.push(path.clone()),
                         Err(OpenError::Io(error)) => return Err(error),

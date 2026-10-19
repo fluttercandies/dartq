@@ -99,7 +99,16 @@ pub enum Ev {
         args: u32,
     },
     NoType,
-    FunctionType,
+    /// A function type's end (`int Function(E, E)`), carrying only the
+    /// written nullability — the name-level lattice spells no signature.
+    /// The head's nullability is the promotion-relevant bit: a nullable
+    /// function-typed declaration promotes through `??=` and null tests
+    /// exactly like a named one, and every signature question stays the
+    /// semantic layer's.
+    FunctionType {
+        /// The trailing `?` was present.
+        nullable: bool,
+    },
     VoidType,
 
     // —— statements ——

@@ -44,4 +44,4 @@ pub use store::{
     PooledSourceStore, SourceStore,
 };
 pub use string_table::{StringId, StringTable};
-pub use text::{MAX_SOURCE_BYTES, OpenError, SourceText, open_mapped};
+pub use text::{MAX_SOURCE_BYTES, MMAP_MIN_BYTES, OpenError, SourceText, open_mapped, open_source};

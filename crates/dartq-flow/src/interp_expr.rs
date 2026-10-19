@@ -224,7 +224,19 @@ impl Interp<'_> {
                 };
                 self.sink_type(ty, *args);
             }
-            Ev::NoType | Ev::FunctionType => self.sink_type(Ty::UNKNOWN, crate::ty::EMPTY_ARGS),
+            Ev::NoType => self.sink_type(Ty::UNKNOWN, crate::ty::EMPTY_ARGS),
+            // The function-type head sinks its written nullability over the
+            // signature-less `Function` base: a nullable function-typed
+            // declaration promotes exactly like a named one, and the
+            // signature questions stay downstream (the staged promotion
+            // re-decides from the real declared type).
+            Ev::FunctionType { nullable } => self.sink_type(
+                Ty {
+                    base: crate::ty::Base::Function,
+                    nullable: *nullable,
+                },
+                crate::ty::EMPTY_ARGS,
+            ),
             Ev::VoidType => self.sink_type(
                 Ty {
                     base: crate::ty::Base::Void,
@@ -684,8 +696,25 @@ impl Interp<'_> {
                     // only changes flow inside `e`, which a flattened replay
                     // cannot recreate; the post-state (the write + the
                     // joined result) is the oracle-visible part.
+                    // The write's type resolution order: the semantic
+                    // layer's staged RHS type wins when present (#2174 —
+                    // the resolved send result beats this layer's
+                    // name-level guesses, whose unresolved-head faces
+                    // cannot spell a return type); otherwise the fold's
+                    // own RHS read. A compound operator's result is the
+                    // promoted read type the read-modify-write leaves
+                    // (the oracle's operator result at name level —
+                    // `int + 1` keeps the promoted `int`, and the write
+                    // therefore never demotes what the read had
+                    // promoted).
                     let written = if *plain {
-                        rhs.ty
+                        if let Some(span) = target.read_span
+                            && let Some(&staged) = self.staged_rhs.get(&span.range.offset)
+                        {
+                            staged
+                        } else {
+                            rhs.ty
+                        }
                     } else if *if_null {
                         // `LUB(NonNull(readType), rhsType)` — the boundary-
                         // aware non-null form first, then the name-level
@@ -694,13 +723,25 @@ impl Interp<'_> {
                         // An untyped RHS still leaves the lvalue non-null —
                         // `x ??= e` can never widen x back to nullable.
                         let (lhs_nn, _) = self.promote_to_non_null(target.ty, target.args);
-                        if rhs.ty == Ty::UNKNOWN {
+                        if rhs.ty == Ty::UNKNOWN || rhs.ty == Ty::UNKNOWN_NULLABLE {
+                            // An information-less RHS (an SDK static's return
+                            // this layer cannot see; a tear-off of a
+                            // top-level function the flow walk does not
+                            // resolve) still leaves the lvalue non-null —
+                            // `x ??= e` can never widen x back to nullable.
                             lhs_nn
                         } else {
                             self.name_lub(lhs_nn, rhs.ty)
                         }
                     } else {
-                        Ty::UNKNOWN
+                        // The read-modify-write face: the operator result is
+                        // the promoted read type at name level (`int + 1`
+                        // → `int`; a user operator returning a different
+                        // type is the semantic layer's re-decision). Writing
+                        // UNKNOWN here would demote what the read promoted —
+                        // `initialCapacity += 1` after a null-check early
+                        // return must stay promoted.
+                        self.promote_to_non_null(target.ty, target.args).0
                     };
                     // The write's own range: the assignment expression (the
                     // official `flow.write` node,
@@ -862,6 +903,12 @@ impl Interp<'_> {
                 } else if let Some(inner) = self.exprs.last().and_then(|e| e.chain_base) {
                     expr.chain_base = Some(inner);
                 }
+                // The receiver strands, like DotAccess's (the index operand
+                // above it was popped; the receiver stays for the cascade
+                // sections, marked consumed for the operand pops).
+                if let Some(receiver) = self.exprs.last_mut() {
+                    receiver.consumed = true;
+                }
                 self.exprs.push(expr);
             }
             Ev::DotAccess { null_aware, member } => {
@@ -997,33 +1044,52 @@ impl Interp<'_> {
                     // chain.
                     expr.chain_base = Some(inner);
                 }
+                // The receiver strands: the merged result replaces the
+                // access's value on top, and the receiver stays beneath it
+                // (the cascade's sections still read it there) — but marked
+                // consumed, so an operand pop never mistakes it for the
+                // operand beneath (`x = a.b`'s assignment target, `a + b.c`'s
+                // left operand).
+                if let Some(receiver) = self.exprs.last_mut() {
+                    receiver.consumed = true;
+                }
                 self.exprs.push(expr);
             }
-            Ev::Send | Ev::SendNoArgs => {
-                // The callee flows through as the send's result: a bare
+            Ev::Send | Ev::SendNoArgs => {                // The callee flows through as the send's result: a bare
                 // identifier keeps its variable reference and promoted type
                 // (a plain assignment's target is exactly such a reference).
                 if let Some(mut callee) = self.exprs.pop() {
-                    // An invoked bare head that resolved to nothing
-                    // (`C()`/`C<T>()` spelled without `new`/`const`): the
-                    // implicit-creation face — the call's static type is the
-                    // named class, so `x = C()` can promote `x` to `C`. The
-                    // gate: the send actually carried an argument list (the
-                    // preceding `ArgumentsEnd`; a bare leaf fires `Send`
-                    // too, and a tear-off names the callable, not the
-                    // class), and the callee is the unresolved bare-head
-                    // expression (a `prop` slot marks it — member callees
-                    // carry none, resolved callees keep their own type).
+                    // An invoked bare head that resolved to nothing: the
+                    // head's spelling decides the face. A class-head
+                    // spelling (`C()`/`C<T>()` without `new`/`const`) is
+                    // the implicit-creation face — the call's static type
+                    // is the named class, so `x = C()` can promote `x` to
+                    // `C`. A lowercase head is a function/getter call
+                    // (`foo(x)`, a tear-off's neighbor): the call's static
+                    // type is the callee's return, unknown at this layer —
+                    // typing it as the head's name (the pre-#2174 face)
+                    // wrote garbage into every `x = foo()` and demoted
+                    // what the target had promoted. The gate: the send
+                    // actually carried an argument list (the preceding
+                    // `ArgumentsEnd`; a bare leaf fires `Send` too, and a
+                    // tear-off names the callable, not the class), and
+                    // the callee is the unresolved bare-head expression
+                    // (a `prop` slot marks it — member callees carry
+                    // none, resolved callees keep their own type).
                     if matches!(ev, Ev::Send)
                         && matches!(events.get(i.wrapping_sub(1)), Some(Ev::ArgumentsEnd { .. }))
                         && callee.reference.is_none()
                         && callee.prop.is_some()
                         && let Some(name) = callee.name
                     {
-                        callee.ty = Ty {
-                            base: Base::Name(name),
-                            nullable: false,
-                        };
+                        if self.is_class_head(name) {
+                            callee.ty = Ty {
+                                base: Base::Name(name),
+                                nullable: false,
+                            };
+                        } else {
+                            callee.ty = Ty::UNKNOWN;
+                        }
                         callee.prop = None;
                     }
                     self.exprs.push(callee);
@@ -1272,10 +1338,17 @@ impl Interp<'_> {
     /// producers; the missing operand degrades to a trivial value — no
     /// reference, no branches, so it contributes no fact — and the
     /// handler's stack arithmetic stays intact.
+    ///
+    /// A selector's receiver strand ([`Expr::consumed`]) is skipped: it is
+    /// not this consumer's operand — the operand is the selector's merged
+    /// result or the value beneath the strand.
     pub(crate) fn pop_value(&mut self) -> Expr {
-        self.exprs
-            .pop()
-            .unwrap_or_else(|| Expr::trivial(Ty::UNKNOWN))
+        while let Some(expr) = self.exprs.pop() {
+            if !expr.consumed {
+                return expr;
+            }
+        }
+        Expr::trivial(Ty::UNKNOWN)
     }
 
     /// Collapses one literal's element values to a single value: each

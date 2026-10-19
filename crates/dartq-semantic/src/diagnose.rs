@@ -4030,10 +4030,19 @@ impl<'a> Engine<'a> {
                 }
                 continue;
             }
-            let from = promotions
-                .promoted(check.range)
-                .or_else(|| self.promotable_field_substitution(props, check.range, check.from))
-                .unwrap_or(check.from);
+            let staged_promotion = promotions.promoted(check.range);
+            let from = match staged_promotion {
+                // The opaque-head promotion (#2174 — a signature-less
+                // function-typed declared type, or an unknown-written
+                // slot): the flow lattice carried only the nullability
+                // decision, so the re-decision substitutes the parse-time
+                // declared type with its `?` stripped — the real promoted
+                // type that decision produces.
+                Some(Ty::Unknown) => Self::non_null_form(check.from),
+                staged => staged
+                    .or_else(|| self.promotable_field_substitution(props, check.range, check.from))
+                    .unwrap_or(check.from),
+            };
             if matches!(check.kind, StagedKind::NeverReceiver) {
                 // One row at the receiver span per `Never` receiver
                 // (`receiverOfTypeNever`). The join above replaced the type
@@ -8389,7 +8398,9 @@ impl<'a> Engine<'a> {
     /// A `?`-suffixed named type joined onto an `e!` junction is its
     /// non-null projection; every other shape is already its own
     /// `promoteToNonNull` form (`dynamic` stays, `Null` has no modeled
-    /// `Never` and keeps the under-report direction).
+    /// `Never` and keeps the under-report direction). The suffixed
+    /// function and record shapes strip the suffix the same way (#2174 —
+    /// the staged-promotion re-decision reads the same projection).
     fn non_null_form(ty: Ty) -> Ty {
         match ty {
             Ty::Named {
@@ -8400,6 +8411,14 @@ impl<'a> Engine<'a> {
                 name,
                 nullable: false,
                 args,
+            },
+            Ty::Function { shape, nullable: true } => Ty::Function {
+                shape,
+                nullable: false,
+            },
+            Ty::Record { shape, nullable: true } => Ty::Record {
+                shape,
+                nullable: false,
             },
             other => other,
         }
@@ -20183,6 +20202,29 @@ impl<'a> Engine<'a> {
             } => Some(*container),
             _ => None,
         };
+        // The receiver row beneath the member row names the class-static
+        // head when the dot merge left no receiver shape (the SDK head of
+        // `RangeError.checkValidRange(...)` resolves through the synthetic
+        // face file, which arms no `BareInfo::Container`, so the merged
+        // row keeps `Receiver::Unknown`): the push-ordered row before the
+        // member row is the receiver's own, and its spelling keys the
+        // unindexed-container dispatch below. A fully-contained receiver
+        // row (`a.b.c`'s `.b`) yields no table hit and under-reports as
+        // before.
+        let container = container.or_else(|| {
+            let index = self
+                .rows
+                .partition_point(|probe| probe.range.offset < row.range.offset);
+            let receiver = self.rows.get(index.checked_sub(1)?)?;
+            eprintln!(
+                "DBG fallback prev={:?} end={} row_off={} name={}",
+                receiver.shape,
+                receiver.range.end(),
+                row.range.offset,
+                self.strings.resolve(receiver.name)
+            );
+            (receiver.range.end() <= row.range.offset).then_some(receiver.name)
+        });
         let Some(container) = container else {
             return Ty::UNKNOWN;
         };
@@ -20207,6 +20249,11 @@ impl<'a> Engine<'a> {
                     container,
                 )
                 .is_some();
+                eprintln!(
+                    "DBG core-table container={} indexed={indexed} member={}",
+                    self.strings.resolve(container),
+                    self.strings.resolve(row.name)
+                );
                 if indexed {
                     return Ty::UNKNOWN;
                 }
@@ -24862,6 +24909,11 @@ fn staged_promotion(
         FlowBase::Name(id) => strings.intern(flow.name_lexeme(id)),
         FlowBase::Dynamic => return Some(Ty::Dynamic),
         FlowBase::Null => return Some(Ty::Null),
+        // The signature-less function head (#2174): the flow lattice spells
+        // no shape, so the promotion's re-decision substitutes the parse-time
+        // declared type with its `?` stripped (`filter_staged`) — the real
+        // promoted type the nullability decision produces.
+        FlowBase::Function => return Some(Ty::UNKNOWN),
         FlowBase::Unknown => return Some(Ty::UNKNOWN),
         // The drop rule: the official promotion only subtype-narrows
         // (`type_system.dart:1729` `tryPromoteToType`), so a `void`
@@ -24903,7 +24955,9 @@ fn intern_flow_args(
             FlowBase::Dynamic => Ty::Dynamic,
             FlowBase::Null => Ty::Null,
             FlowBase::Void | FlowBase::Never => return None,
-            FlowBase::Unknown => Ty::UNKNOWN,
+            // The signature-less function head: no modeled shape for an
+            // argument position — the unrepresentable-argument drop rule.
+            FlowBase::Function | FlowBase::Unknown => Ty::UNKNOWN,
         };
         list.push(arg);
     }
@@ -27170,6 +27224,13 @@ impl ParserListener for DiagnoseListener<'_> {
         );
 
         let engine = &mut self.engine;
+        // The operator-head probe reads the raw token kind up front, before
+        // the shadowing intern below (the operator token is not an
+        // identifier).
+        let name_is_identifier = engine
+            .tokens
+            .get(name.id as usize)
+            .is_some_and(|t| t.kind == dartq_scanner::TokenKind::Identifier);
         let is_setter = get_or_set.and_then(|t| engine.text_of(t)) == Some("set");
         engine.open_member_setter = is_setter;
         engine.open_member_static = static_kw.is_some();
@@ -27206,6 +27267,28 @@ impl ParserListener for DiagnoseListener<'_> {
         // it; the probe's verdict adjudicates at the body's end.
         engine.check_override_annotation(spelling, name_range);
         engine.probe_must_call_super(spelling, name_range);
+        // The operator head (`operator []=`): the operator token itself is
+        // the name and no `MethodDeclaration` identifier event ever follows
+        // it, so the named method's site note — which is what drains the
+        // annotation latch — never fires. The latch the checks above read
+        // would otherwise leak onto the next declaration's head (a
+        // member's `@override` reporting on the following static helper).
+        // The collector joins the operator spelling as a method member at
+        // its own `begin_method`; mirror that site note here.
+        if !name_is_identifier {
+            let is_static = engine.open_member_static;
+            let container = engine.container_context().map_or(spelling, |(c, _)| c);
+            let site = engine.note_decl_site(
+                spelling,
+                name_range,
+                DeclKind::Member {
+                    kind: MemberKind::Method,
+                    is_static,
+                    container,
+                },
+            );
+            engine.open_exec_site = Some(site);
+        }
     }
 
     fn end_method(
@@ -29076,6 +29159,81 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_assignment_expression(&mut self, operator: Token, end: Token) {
+        // #2174: a plain `=` write's resolved RHS type stages into the flow
+        // layer before the assignment folds there — the name-level flow
+        // walk reads an SDK static's return as unknown (`RangeError
+        // .checkValidRange` is invisible to it), and the write would demote
+        // what the target had promoted. Single-row window, EMPTY-args named
+        // shapes only (the flow lattice cannot spell wider shapes; the
+        // unknown-written demotion stands). The staging precedes the flow
+        // forward: the fold inside the call adopts the staged type.
+        let staged = ||
+            -> Option<(u32, String, bool)> {
+            let engine = &mut self.engine;
+            let text = engine.text_of(operator)?;
+            if text != "=" {
+                return None;
+            }
+            let limit = operator.range.offset;
+            let target = engine
+                .rows
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, row)| {
+                    row.range.end() <= limit && !matches!(row.shape, RowShape::Value)
+                })
+                .map(|(index, _)| index)?;
+            // `c[i] = e` writes through the `[]=` operator: the target's
+            // own type is not the assignment's destination (the same gate
+            // `check_assignment` applies).
+            if matches!(engine.rows[target].intent, Intent::Operator(..)) {
+                return None;
+            }
+            // The RHS's value row: the expression's own result row, not the
+            // single-row window `check_assignment` uses (a multi-row shape —
+            // an argument-bearing send — is exactly the face this staging
+            // exists for). The send face types on demand
+            // ([`Engine::callee_return_ty`]): an invocation row's stored
+            // type is the callee head's, the resolved return is the send's.
+            let after = || engine.rows[target + 1..].iter().filter(|row| row.range.offset > limit);
+            let rhs_row = after()
+                .clone()
+                .filter(|row| row.intent == Intent::Invoke)
+                .last()
+                .or_else(|| after().clone().last())?;
+            let from_ty = if rhs_row.intent == Intent::Invoke {
+                let r = engine.callee_return_ty(rhs_row);
+                eprintln!("DBG callee {} -> {r:?}", engine.strings.resolve(rhs_row.name));
+                r
+            } else {
+                rhs_row.ty
+            };
+            if let Ty::Named {
+                name,
+                nullable,
+                args: ArgListId::EMPTY,
+            } = from_ty
+            {
+                Some((
+                    engine.rows[target].range.offset,
+                    engine.strings.resolve(name).to_string(),
+                    nullable,
+                ))
+            } else {
+                None
+            }
+        }();
+        if let Some((offset, lexeme, nullable)) = staged {
+            let base = self.flow().intern_name(&lexeme);
+            self.flow().stage_assignment_rhs(
+                offset,
+                FlowTy {
+                    base: FlowBase::Name(base),
+                    nullable,
+                },
+            );
+        }
         self.flow().handle_assignment_expression(operator, end);
 
         let engine = &mut self.engine;
@@ -50333,6 +50491,67 @@ mod ticket_1351_tests {
                       if (p.$01) {} if (r.other) {} }";
         let report = unit_report(source);
         assert_eq!(count_code(&report, "unchecked_use_of_nullable_value"), 0);
+    }
+
+    // —— #2174: the staged-RHS promotion feed ————————————————————————
+
+    /// A plain `=` write whose RHS the rows resolved (`st(start)` — an
+    /// in-file static the flow walk types as unknown) promotes the target:
+    /// the semantic stages the resolved RHS type keyed on the target token,
+    /// and the fold adopts it when its own answer is unknown. The read
+    /// after the write answers the promoted type, so the argument row
+    /// suppresses (`int? end; end = st(0); g(1, 2, end);` is clean).
+    #[test]
+    fn staged_rhs_promotes_the_write_target() {
+        let source = "int st(int x) => x;\n\
+                      void g(int a, int b, int c) {}\n\
+                      void f([int start = 0, int? end]) {\n  \
+                      end = st(start);\n  \
+                      g(1, 2, end);\n\
+                      }";
+        let report = unit_report(source);
+        assert_eq!(
+            count_code(&report, "argument_type_not_assignable"),
+            0,
+            "{report:?}"
+        );
+    }
+
+    /// The compound write keeps the promoted read type (`initialCapacity
+    /// += 1` after a null-check early return): the operator result at name
+    /// level is the promoted operand, so the read-modify-write never
+    /// demotes what the read had promoted.
+    #[test]
+    fn compound_write_keeps_the_promoted_read() {
+        let source = "void g(int x) {}\n\
+                      void f(int? n) {\n  \
+                      if (n == null) return;\n  \
+                      n += 1;\n  \
+                      g(n);\n\
+                      }";
+        let report = unit_report(source);
+        assert_eq!(count_code(&report, "argument_type_not_assignable"), 0);
+    }
+
+    /// The signature-less function head promotes through `??=`: a nullable
+    /// function-typed formal's declared head carries its written
+    /// nullability, so `compare ??= defaultCompare` leaves the argument
+    /// read promoted (the argument row stages against the real declared
+    /// type with its `?` stripped and re-decides).
+    #[test]
+    fn nullable_function_typed_formal_promotes_through_if_null_assign() {
+        let source = "int defaultCompare() => 0;\n\
+                      void g(int Function() compare) {}\n\
+                      void f({int Function()? compare}) {\n  \
+                      compare ??= defaultCompare;\n  \
+                      g(compare);\n\
+                      }";
+        let report = unit_report(source);
+        assert_eq!(
+            count_code(&report, "argument_type_not_assignable"),
+            0,
+            "{report:?}"
+        );
     }
 
     // —— #2140: the core-type nullable-dereference face ——————————————————
