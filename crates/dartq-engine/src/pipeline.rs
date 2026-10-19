@@ -75,12 +75,11 @@ pub(crate) fn flush_l3(state: &mut EngineState, changed: &[FileId]) {
         return;
     };
     for file in changed {
-        let bytes = state
-            .residency
-            .get(file)
-            .and_then(|facts| state.store.get(facts.content));
-        if let Some(bytes) = bytes {
-            l3.put(bytes);
+        let Some(content) = state.residency.get(file).map(|facts| facts.content) else {
+            continue;
+        };
+        if let Some(bytes) = state.store.get(content) {
+            l3.put_known(content, bytes);
         }
     }
     l3.flush();

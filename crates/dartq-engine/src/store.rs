@@ -342,8 +342,18 @@ impl ContentStore {
         self.put_at(payload, now_secs())
     }
 
+    /// [`Self::put`] for a payload whose content id the caller already
+    /// holds (the residency's `facts.content` is the same blake3 face):
+    /// skips the re-hash.
+    pub(crate) fn put_known(&mut self, id: ContentId, payload: &[u8]) -> ContentId {
+        self.put_known_at(id, payload, now_secs())
+    }
+
     fn put_at(&mut self, payload: &[u8], now: u64) -> ContentId {
-        let id = content_hash(payload);
+        self.put_known_at(content_hash(payload), payload, now)
+    }
+
+    fn put_known_at(&mut self, id: ContentId, payload: &[u8], now: u64) -> ContentId {
         if let Some(entry) = self.entries.get_mut(&id) {
             // The dedup hit re-touches the in-memory LRU clock only — not
             // a book delta, so no manifest save rides on it (a keystroke
