@@ -2799,4 +2799,168 @@ mod tests {
             "The getter 'onMissing' isn't defined for the type 'DriftSession'."
         );
     }
+
+    /// #2190 M1a residue — the extends-walk face: `escapedNameFor` is
+    /// declared on `Column<T>` (`dsl/columns.dart:53`), the direct
+    /// superclass of `GeneratedColumn` (`column_impl.dart:9` —
+    /// `GeneratedColumn<T extends Object> extends Column<T>`; `Column`
+    /// itself extends `Expression<T>`). The member walk must climb the
+    /// generic `extends` edge and find it: both the implicit-this call
+    /// inside `GeneratedColumn` (`column_impl.dart:123,187` —
+    /// `escapedNameFor(into.dialect)`) and the declared-parameter access
+    /// (`migration.dart:532` — `column.escapedNameFor(context.dialect)`)
+    /// resolve silently in the oracle.
+    #[test]
+    fn drift_wrapper_extends_walk_member_resolves() {
+        let report = report_two(
+            "class Object {}\n\
+             class String {}\n\
+             class int {}\n\
+             abstract class Expression<D extends Object> {}\n\
+             abstract class Column<T extends Object> extends Expression<T> {\n\
+             \x20 String get name;\n\
+             \x20 String escapedNameFor(int dialect) => name;\n\
+             }\n\
+             class GenerationContext { int get dialect => 0; }",
+            "class GeneratedColumn<T extends Object> extends Column<T> {\n\
+             \x20 @override\n\
+             \x20 String get name => throw '';\n\
+             \x20 void writeColumnDefinition(GenerationContext into) {\n\
+             \x20   final escapedName = escapedNameFor(into.dialect);\n\
+             \x20   into.dialect;\n\
+             \x20   escapedName;\n\
+             \x20 }\n\
+             }\n\
+             void rename(GeneratedColumn column, GenerationContext context) {\n\
+             \x20 column.escapedNameFor(context.dialect);\n\
+             }",
+        );
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// #2190 M1a residue — the deeper generic hop: `GeneratedColumnWith
+    /// TypeConverter<D, S extends Object> extends GeneratedColumn<S>`
+    /// (`column_impl.dart:296-297`) reads `escapedNameFor` two generic
+    /// instantiations up (`GeneratedColumn<S>` → `Column<S>`), and the
+    /// `implements` face contributes members too (`Expression implements
+    /// FunctionParameter` — `expression.dart:32`).
+    #[test]
+    fn drift_wrapper_deep_generic_and_interface_walk_resolves() {
+        let report = report_two(
+            "class Object {}\n\
+             class String {}\n\
+             class int {}\n\
+             abstract class FunctionParameter { int get arity; }\n\
+             abstract class Expression<D extends Object> implements FunctionParameter {}\n\
+             abstract class Column<T extends Object> extends Expression<T> {\n\
+             \x20 String get name;\n\
+             \x20 String escapedNameFor(int dialect) => name;\n\
+             }\n\
+             class GenerationContext { int get dialect => 0; }",
+            "abstract class GeneratedColumn<T extends Object> extends Column<T> {}\n\
+             class GeneratedColumnWithTypeConverter<D, S extends Object>\n\
+             \x20   extends GeneratedColumn<S> {\n\
+             \x20 @override\n\
+             \x20 String get name => throw '';\n\
+             \x20 @override\n\
+             \x20 int get arity => 0;\n\
+             \x20 String write(GenerationContext into) => escapedNameFor(into.dialect);\n\
+             }\n\
+             void f(GeneratedColumnWithTypeConverter<int, String> c, Expression<String> e) {\n\
+             \x20 c.escapedNameFor(0);\n\
+             \x20 c.arity;\n\
+             \x20 e.arity;\n\
+             }",
+        );
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// #2190 M1a residue — the `Object`-member face: `inner.hashCode` where
+    /// `inner` is a declared `Expression` (the corpus's
+    /// `expression.dart:484/521/607` overrides read `hashCode` through the
+    /// `Object` interface — upstream `objectMembers` merge, never an
+    /// `undefined_getter`).
+    #[test]
+    fn drift_wrapper_object_member_on_expression_resolves() {
+        let report = report_two(
+            "class Object {}\n\
+             class int {}\n\
+             abstract class Expression<D extends Object> {}",
+            "class Eq extends Expression<Object> {\n\
+             \x20 final Expression<Object> inner;\n\
+             \x20 Eq(this.inner);\n\
+             \x20 @override\n\
+             \x20 int get hashCode => inner.hashCode;\n\
+             }\n\
+             void f(Expression<Object> e) { e.hashCode; }",
+        );
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// #2190 M1a residue — the ctor-reference face: `QueryRow(row, db)` is
+    /// a bare constructor call whose head resolves as the class
+    /// (`custom_select.dart:55` — `rows.map((row) => QueryRow(row, _db))`).
+    /// The wrapper receivers around it are user classes reached through the
+    /// library namespace; the bare-ctor classification must not leak an
+    /// `undefined_*` row naming the wrapper type.
+    #[test]
+    fn drift_wrapper_ctor_reference_resolves() {
+        let report = report_two(
+            "class Object {}\n\
+             class QueryRow {\n\
+             \x20 final Object data;\n\
+             \x20 final Object db;\n\
+             \x20 QueryRow(this.data, this.db);\n\
+             }\n\
+             class DatabaseConnection {}\n\
+             class List<T> {\n\
+             \x20 Iterable<R> map<R>(R Function(T) f) => throw '';\n\
+             }\n\
+             class Iterable<T> {\n\
+             \x20 List<T> toList() => throw '';\n\
+             }",
+            "void f(List<Object> rows, Object db) {\n\
+             \x20 rows.map((row) => QueryRow(row, db)).toList();\n\
+             \x20 final conn = DatabaseConnection();\n\
+             \x20 conn;\n\
+             }",
+        );
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
 }
