@@ -196,7 +196,48 @@ impl<'a> Engine<'a> {
         // push-time payload.
         let mut merged_receiver_ty = Ty::UNKNOWN;
         let recv = match popped_receiver {
-            Some(popped) => {
+            Some(mut popped) => {
+                // The parenthesized group's bool collapse: `(x as dynamic)`'s
+                // `as` fold leaves its `Value` result row at the operand's
+                // exact span (a `dynamic`/`bool` head pushes no `TypeUse`
+                // row to extend it), which the cast's own boolish-target
+                // latch then covers — the group row reads `bool` where
+                // `ParenthesizedExpression.staticType` is the operand's own
+                // type. The folded `Value` row still sits below the group
+                // row (nested group rows included) with the operand's real
+                // static type — `dynamic` among them — so the receiver
+                // classification and the never-junction read it instead of
+                // the collapsed `bool` (the oracle's
+                // `type_property_resolver` routes `dynamic` to the
+                // no-lookup dispatch).
+                if !popped.qualified
+                    && self.strings.resolve(popped.name).is_empty()
+                    && matches!(
+                        popped.shape,
+                        RowShape::Bare(BareInfo::Plain {
+                            ty: Ty::Named { name, .. }
+                        }) if name == self.members.primitive_ids[3]
+                    )
+                {
+                    let mut index = self.rows.len();
+                    while index > 0 {
+                        let row = &self.rows[index - 1];
+                        let group_row = !row.qualified
+                            && matches!(row.shape, RowShape::Bare(BareInfo::Plain { .. }))
+                            && self.strings.resolve(row.name).is_empty();
+                        if !group_row {
+                            break;
+                        }
+                        index -= 1;
+                    }
+                    if let Some(inner) = index.checked_sub(1).and_then(|i| self.rows.get(i))
+                        && matches!(inner.shape, RowShape::Value)
+                        && inner.ty != Ty::UNKNOWN
+                    {
+                        popped.ty = inner.ty;
+                        popped.shape = RowShape::Bare(BareInfo::Plain { ty: inner.ty });
+                    }
+                }
                 // The never-receiver junction (`receiverOfTypeNever`): the
                 // receiver row is in hand exactly once, here — every
                 // member face (getter read, setter target, method
@@ -4051,5 +4092,246 @@ impl<'a> Engine<'a> {
             cursor += 1;
         }
         bytes.get(cursor) == Some(&b'?')
+    }
+}
+
+/// Pins for the S2 member-dispatch faces (#2213): the frozen
+/// SDK-interface member tables the `@override` walk consults through
+/// [`Engine::face_member_frozen`] (the `implements`-face climb cannot reach
+/// an unindexed `dart:core`/`dart:async`/`dart:io` declaration, so the
+/// oracle's `getOverridden` answer comes from
+/// [`crate::member_face::CORE_INTERFACE_MEMBERS`]), and the dynamic-receiver
+/// dispatch silence — a `dynamic` static type never carries a member face
+/// the `undefined_*` trio can report against
+/// (`type_property_resolver.dart`'s `DynamicType` arm answers the access
+/// without a lookup result).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collector::collect;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_resolution::LibraryGraphBuilder;
+    use dartq_scanner::ScanConfig;
+    use dartq_source::FileTable;
+    use std::path::Path;
+
+    /// Diagnoses `source` as the sole file of a library with no imports —
+    /// the frozen faces under pin answer by spelling, so an unresolved
+    /// `implements Match` exercises the same path the corpus hits behind a
+    /// real SDK import edge.
+    fn report(source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let fold = fold_unit(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        let mut report = fold.report;
+        report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+        report
+    }
+
+    fn code_names(report: &FileReport) -> Vec<&'static str> {
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
+    }
+
+    /// The `implements` clause names an unindexed SDK interface in these
+    /// pins, so the reference reports `undefined_class` beside the member
+    /// face — the assertion reads only the override-annotation family.
+    fn override_codes(report: &FileReport) -> Vec<&'static str> {
+        report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "override_on_non_overriding_member")
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
+    }
+
+    /// The petitparser `ParserException implements FormatException` shape:
+    /// the three `@override` getters (`message`/`offset`/`source`) are all
+    /// `FormatException`'s declared face — the frozen table spares each.
+    #[test]
+    fn format_exception_interface_spares_the_override_rows() {
+        let report = report(
+            "class ParserException implements FormatException { \
+               @override String get message => ''; \
+               @override int get offset => 0; \
+               @override String get source => ''; \
+             }",
+        );
+        assert!(override_codes(&report).is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// The petitparser `ParserMatch implements Match` shape: every
+    /// `@override` member names a `Match` interface member
+    /// (`sdk/lib/core/pattern.dart:85` — `group`/`[]`/`groups`/
+    /// `groupCount` methods, the `pattern`/`input`/`start`/`end` getters).
+    #[test]
+    fn match_interface_spares_the_override_rows() {
+        let report = report(
+            "class ParserMatch implements Match { \
+               @override int get start => 0; \
+               @override int get end => 0; \
+               @override String group(int group) => ''; \
+               @override String operator [](int group) => ''; \
+               @override List<String> groups(List<int> groupIndices) => []; \
+               @override int get groupCount => 0; \
+               @override String get input => ''; \
+               @override String get pattern => ''; \
+             }",
+        );
+        assert!(override_codes(&report).is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// The dio `_DefaultIfEmptyStreamSink implements EventSink` shape:
+    /// `add`/`addError`/`close` are `EventSink`'s declared face
+    /// (`sdk/lib/async/stream.dart:2295` — `Sink`'s `add`/`close` ride the
+    /// union because the unindexed `implements Sink` edge is invisible to
+    /// the frozen climb).
+    #[test]
+    fn event_sink_interface_spares_the_override_rows() {
+        let report = report(
+            "class S implements EventSink { \
+               @override void add(Object event) {} \
+               @override void addError(Object error, [List<int>? st]) {} \
+               @override void close() {} \
+             }",
+        );
+        assert!(override_codes(&report).is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// The http `_ClientSocketException implements SocketException` shape:
+    /// `address`/`osError`/`port`/`message` are `SocketException`'s
+    /// declared fields (`sdk/lib/io/socket.dart:1398`).
+    #[test]
+    fn socket_exception_interface_spares_the_override_rows() {
+        let report = report(
+            "class ClientException implements SocketException { \
+               @override int get port => 0; \
+               @override int get osError => 0; \
+               @override int get address => 0; \
+             }",
+        );
+        assert!(override_codes(&report).is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// The spare is exact, not a blanket silence: an `@override` member no
+    /// interface declares still reports `override_on_non_overriding_member`
+    /// (the frozen face answers `false` for absent spellings).
+    #[test]
+    fn absent_interface_member_keeps_the_override_row() {
+        let report = report(
+            "class C implements Match { @override int get absent => 0; }",
+        );
+        assert_eq!(
+            override_codes(&report),
+            ["override_on_non_overriding_member"],
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A `dynamic` receiver never reports the member family: the oracle's
+    /// resolver routes the access to dynamic dispatch with no lookup
+    /// result (`type_property_resolver.dart`'s `DynamicType` arm), so a
+    /// declared `dynamic` local's reads and invocations stay silent.
+    #[test]
+    fn dynamic_receiver_reports_no_member_face() {
+        let report = report(
+            "void f(dynamic x) { x.gone; x.missing(); x.absent = 1; }",
+        );
+        let member_rows: Vec<&'static str> = code_names(&report)
+            .into_iter()
+            .filter(|name| {
+                matches!(
+                    *name,
+                    "undefined_getter" | "undefined_method" | "undefined_setter"
+                )
+            })
+            .collect();
+        assert!(member_rows.is_empty(), "{:?}", code_names(&report));
+    }
+
+    /// The `(x as dynamic).y` single-root repro (dio
+    /// `io_adapter.dart:220`): the cast's own boolish-target latch covers
+    /// the folded `Value` row's exact span, collapsing the parenthesized
+    /// group's static type to `bool` — the merge re-reads the operand's
+    /// real type off the folded row below, so the member face resolves
+    /// against `dynamic` and stays silent.
+    #[test]
+    fn cast_to_dynamic_receiver_reports_no_member_face() {
+        for source in [
+            "void f(Object x) { (x as dynamic).gone; }",
+            "void f(int x) { (x as dynamic).missing(); }",
+            "void f(Object x) { (x as dynamic).absent = 1; }",
+            "void f() { (1 as dynamic).gone; }",
+            "void f() { (null as dynamic).gone; }",
+            "void f(Object x) { ((x as dynamic)).gone; }",
+        ] {
+            let report = report(source);
+            let member_rows: Vec<&'static str> = code_names(&report)
+                .into_iter()
+                .filter(|name| {
+                    matches!(
+                        *name,
+                        "undefined_getter" | "undefined_method" | "undefined_setter"
+                    )
+                })
+                .collect();
+            assert!(member_rows.is_empty(), "{source}: {:?}", code_names(&report));
+        }
+    }
+
+    /// The re-read is exact, not a blanket silence: a cast to a concrete
+    /// declared type keeps the member face on the cast target — `(x as int)`
+    /// reports `undefined_getter` against `int` (the same `Typed` receiver
+    /// the bare-read shape resolves).
+    #[test]
+    fn cast_to_named_receiver_keeps_the_member_face() {
+        let report = report("void f(Object x) { (x as int).gone; }");
+        assert!(
+            code_names(&report).contains(&"undefined_getter"),
+            "{:?}",
+            code_names(&report)
+        );
     }
 }

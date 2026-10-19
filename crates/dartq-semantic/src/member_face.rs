@@ -557,18 +557,218 @@ pub(crate) const FINAL_PRIMITIVES: [&str; 5] = ["int", "double", "num", "bool", 
 pub(crate) const CORE_STATIC_RETURNS: [(&str, &str, &str); 1] =
     [("RangeError", "checkValidRange", "int")];
 
-/// The dart:core interface member faces the element index never carries:
-/// `dart:core` declarations resolve through the namespace but land on
-/// unindexed (external) units, so the `@override` walk's
-/// [`crate::diagnose::Engine::face_member`] answers `None` for them and a
-/// legal `class C implements Comparable<C> { @override compareTo }`
+/// The SDK interface member faces the element index never carries:
+/// `dart:core`/`dart:async`/`dart:io` declarations resolve through the
+/// namespace but land on unindexed (external) units, so the `@override`
+/// walk's [`crate::diagnose::Engine::face_member`] answers `None` for them
+/// and a legal `class C implements Comparable<C> { @override compareTo }`
 /// over-reports `override_on_non_overriding_member`. The listed members
 /// are the reference SDK's declared instance members
-/// (`sdk/lib/core/comparable.dart`, `sdk/lib/core/pattern.dart`) — the
-/// name-level set the oracle's `getOverridden` would find.
-pub(crate) const CORE_INTERFACE_MEMBERS: [(&str, &[&str]); 2] = [
+/// (`sdk/lib/core/comparable.dart`, `sdk/lib/core/pattern.dart`,
+/// `sdk/lib/core/exceptions.dart`, `sdk/lib/core/regexp.dart`,
+/// `sdk/lib/core/sink.dart`, `sdk/lib/async/stream.dart`,
+/// `sdk/lib/io/socket.dart`, `sdk/lib/io/io_sink.dart`) — the name-level
+/// set the oracle's `getOverridden` would find. Each row lists the
+/// interface's whole instance face (own declarations plus the members its
+/// unindexed super-interfaces contribute): the frozen climb cannot traverse
+/// an unindexed `implements` edge, so `EventSink` carries `Sink`'s `add`/
+/// `close` beside its own `addError` and `RegExpMatch` carries `Match`'s
+/// getters beside `namedGroup`/`groupNames`. `Object` members
+/// (`toString`, `hashCode`, `==`, `noSuchMethod`, `runtimeType`) are
+/// excluded — the `@override` gate spares them before the frozen face is
+/// consulted.
+pub(crate) const CORE_INTERFACE_MEMBERS: [(&str, &[&str]); 19] = [
     ("Comparable", &["compareTo"]),
     ("Pattern", &["allMatches", "matchAsPrefix"]),
+    // `sdk/lib/core/exceptions.dart:43` — `FormatException implements
+    // Exception` (`Exception` is a marker interface, no members).
+    ("FormatException", &["message", "source", "offset"]),
+    // `sdk/lib/core/pattern.dart:85` — `Match`'s declared face.
+    (
+        "Match",
+        &[
+            "start",
+            "end",
+            "group",
+            "[]",
+            "groups",
+            "groupCount",
+            "input",
+            "pattern",
+        ],
+    ),
+    // `sdk/lib/core/regexp.dart:479` — `RegExpMatch implements Match`:
+    // the union of `Match`'s face and its own `namedGroup`/`groupNames`.
+    (
+        "RegExpMatch",
+        &[
+            "start",
+            "end",
+            "group",
+            "[]",
+            "groups",
+            "groupCount",
+            "input",
+            "pattern",
+            "namedGroup",
+            "groupNames",
+        ],
+    ),
+    // `sdk/lib/core/regexp.dart:279` — `RegExp implements Pattern`: its
+    // own declared face plus `Pattern`'s `allMatches`/`matchAsPrefix`.
+    (
+        "RegExp",
+        &[
+            "firstMatch",
+            "allMatches",
+            "hasMatch",
+            "stringMatch",
+            "matchAsPrefix",
+            "pattern",
+            "isMultiLine",
+            "isCaseSensitive",
+            "isUnicode",
+            "isDotAll",
+        ],
+    ),
+    // `sdk/lib/core/sink.dart:13` — `Sink`'s declared face.
+    ("Sink", &["add", "close"]),
+    // `sdk/lib/core/string_sink.dart:10` — `StringSink`'s declared face.
+    (
+        "StringSink",
+        &["write", "writeAll", "writeln", "writeCharCode"],
+    ),
+    // `sdk/lib/async/stream.dart:2295` — `EventSink implements Sink`:
+    // `add`/`close` plus its own `addError`.
+    ("EventSink", &["add", "addError", "close"]),
+    // `sdk/lib/async/stream.dart:2351` — `StreamConsumer`'s declared face.
+    ("StreamConsumer", &["addStream", "close"]),
+    // `sdk/lib/async/stream.dart:2397` — `StreamSink implements EventSink,
+    // StreamConsumer`: the union of both faces plus its own `done`.
+    (
+        "StreamSink",
+        &["add", "addError", "close", "addStream", "done"],
+    ),
+    // `sdk/lib/async/stream.dart:2455`/`2688` — `StreamTransformer`'s
+    // `bind`, and `StreamTransformerBase` (which adds nothing but `cast`;
+    // `cast` is declared on both).
+    ("StreamTransformer", &["bind", "cast"]),
+    ("StreamTransformerBase", &["bind", "cast"]),
+    // `sdk/lib/async/stream.dart:2161` — `StreamSubscription`'s declared
+    // face (`onData`/`onError`/`onDone` are method-shaped assignment
+    // targets in the interface contract).
+    (
+        "StreamSubscription",
+        &[
+            "cancel",
+            "onData",
+            "onError",
+            "onDone",
+            "pause",
+            "resume",
+            "isPaused",
+            "asFuture",
+        ],
+    ),
+    // `sdk/lib/async/stream.dart:2705` — `StreamIterator`'s declared face.
+    ("StreamIterator", &["moveNext", "current", "cancel"]),
+    // `sdk/lib/async/stream.dart:137` — `Stream`'s declared face (the
+    // `Iterable`-style transformations and terminal operations the oracle
+    // merges into every `implements Stream` interface).
+    (
+        "Stream",
+        &[
+            "isBroadcast",
+            "asBroadcastStream",
+            "listen",
+            "where",
+            "map",
+            "asyncMap",
+            "asyncExpand",
+            "handleError",
+            "expand",
+            "pipe",
+            "transform",
+            "reduce",
+            "fold",
+            "join",
+            "contains",
+            "forEach",
+            "every",
+            "any",
+            "length",
+            "isEmpty",
+            "cast",
+            "toList",
+            "toSet",
+            "drain",
+            "take",
+            "takeWhile",
+            "skip",
+            "skipWhile",
+            "distinct",
+            "first",
+            "last",
+            "single",
+            "firstWhere",
+            "lastWhere",
+            "singleWhere",
+            "elementAt",
+            "timeout",
+        ],
+    ),
+    // `sdk/lib/io/socket.dart:1398` — `SocketException implements
+    // IOException` (`IOException` is a marker interface, no members).
+    ("SocketException", &["message", "osError", "address", "port"]),
+    // `sdk/lib/io/io_sink.dart:26` — `IOSink implements
+    // StreamSink<List<int>>, StringSink`: the union of both faces plus
+    // `flush` and the abstract `encoding` field (which induces the getter
+    // AND setter spellings — `late Encoding encoding`, :39).
+    (
+        "IOSink",
+        &[
+            "encoding",
+            "encoding=",
+            "add",
+            "addError",
+            "addStream",
+            "close",
+            "done",
+            "flush",
+            "write",
+            "writeAll",
+            "writeln",
+            "writeCharCode",
+        ],
+    ),
+    // `sdk/lib/async/stream_controller.dart:70` — `StreamController
+    // implements StreamSink`: the sink face plus the controller's own
+    // `stream`/`sink` getters, the assignable `onListen`/`onPause`/
+    // `onResume`/`onCancel` handler fields (inducing the setter spellings),
+    // and `isClosed`/`isPaused`/`hasListener`.
+    (
+        "StreamController",
+        &[
+            "stream",
+            "sink",
+            "isClosed",
+            "isPaused",
+            "hasListener",
+            "onListen",
+            "onListen=",
+            "onPause",
+            "onPause=",
+            "onResume",
+            "onResume=",
+            "onCancel",
+            "onCancel=",
+            "add",
+            "addError",
+            "close",
+            "addStream",
+            "done",
+        ],
+    ),
 ];
 
 /// The `dart:collection` mixin/base faces that share a `dart:core`
