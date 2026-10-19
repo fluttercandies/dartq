@@ -2126,22 +2126,14 @@ struct Engine<'a> {
     /// reference (`List<Undefined>` — the annotation itself is not an
     /// argument, its references are).
     type_arg_depth: u32,
-    /// The liveness of the type head that just pushed (B5 wave): a defined
-    /// or builtin name is live, every miss verdict is dead. Latched at
-    /// [`Engine::push_type_use`], adopted by the group open — the official
-    /// resolver bails an unresolvable NamedType before its arguments
-    /// (`named_type_resolver.dart`: the import-prefix miss returns
-    /// InvalidType with the argument walk unreached), so a dead head's
-    /// group arms no type-argument faces.
-    last_type_head_live: bool,
-    /// One liveness entry per open type-argument group, mirroring the
-    /// `group_heads` stack.
-    group_head_live: Vec<bool>,
-    /// One entry per open type-argument group: the head was dead but the
-    /// group is a function-type tail (the recovered old-style function
-    /// typedef — `typedef e = foo<F>(int x);`), whose arguments resolve
-    /// beside it like a live head's.
-    group_head_resolve_through: Vec<bool>,
+    /// The type-argument depth saved at each open function/record type
+    /// (`List<L Function()>`): the oracle's type-argument face is the
+    /// DIRECT parent (`node.parent is TypeArgumentList`,
+    /// named_type_resolver.dart:877), so a function/record type's own
+    /// return/formal/field types are plain positions — the depth resets to
+    /// zero inside and restores on close. A type-argument group nested
+    /// inside (`void Function(List<L>)`) re-enters the face.
+    type_arg_depth_saved: Vec<u32>,
     /// #1314 FAM13: the offsets of unresolved type references pushed inside
     /// a type-argument group (the `non_type_as_type_argument` face) and
     /// inside a creation head context (the `creation_with_non_type` face) —
@@ -3638,9 +3630,7 @@ impl<'a> Engine<'a> {
             open_exec_augment: false,
             pending_default_checks: Vec::new(),
             type_arg_depth: 0,
-            last_type_head_live: true,
-            group_head_live: Vec::new(),
-            group_head_resolve_through: Vec::new(),
+            type_arg_depth_saved: Vec::new(),
             type_arg_miss_rows: Vec::new(),
             non_type_anchors: Vec::new(),
             creation_miss_rows: Vec::new(),
@@ -15102,7 +15092,6 @@ impl<'a> Engine<'a> {
         match head {
             TypeHead::Bare => {
                 if self.members.builtin_types.contains(&name) {
-                    self.last_type_head_live = true;
                     return;
                 }
                 // #1595/#1596: the plain resolver path's three answers
@@ -15122,13 +15111,10 @@ impl<'a> Engine<'a> {
                             if self.is_type_pos == 0 && !self.in_own_named_scope(name) {
                                 self.used_names.insert(name);
                             }
-                            self.last_type_head_live = true;
                             // A type-argument position replaces the plain
                             // face (`non_type_as_type_argument`, the same
-                            // context chain the miss rows ride). A dead
-                            // head's group arms only through the
-                            // function-tail carve (`arg_group_resolves`).
-                            if self.type_arg_depth > 0 && self.arg_group_resolves() {
+                            // context chain the miss rows ride).
+                            if self.type_arg_depth > 0 {
                                 self.type_arg_miss_rows.push(range.offset);
                             }
                             // The plain face's declaration anchor rides the
@@ -15164,13 +15150,11 @@ impl<'a> Engine<'a> {
                             if self.is_type_pos == 0 && !self.in_own_named_scope(name) {
                                 self.used_names.insert(name);
                             }
-                            self.last_type_head_live = true;
                             return;
                         }
                         _ => {}
                     }
                 }
-                self.last_type_head_live = false;
                 // #1314 FAM13: the resolver's context chain decides the
                 // miss's code — a type-argument reference reports
                 // `non_type_as_type_argument`, a creation head
@@ -15194,14 +15178,13 @@ impl<'a> Engine<'a> {
                         ty: Ty::UNKNOWN,
                     });
                 } else {
-                    // A type-argument position under a dead head stays
-                    // silent entirely (the resolver's bail marks the whole
-                    // NamedType invalid before the arguments resolve); a
-                    // live head's misses — and a dead head's group in the
-                    // function-type tail shape — code through the context
-                    // chain (`arg_group_resolves`).
-                    let dead_arg_group = self.type_arg_depth > 0 && !self.arg_group_resolves();
-                    if self.type_arg_depth > 0 && !dead_arg_group {
+                    // A type-argument position codes through the context
+                    // chain whatever its head resolved to: the oracle walks
+                    // an unresolvable NamedType's arguments too (probed:
+                    // `W<L>` reports `undefined_class` on `W` AND
+                    // `non_type_as_type_argument` on `L`, in declarations,
+                    // creations, and typedefs alike).
+                    if self.type_arg_depth > 0 {
                         self.type_arg_miss_rows.push(range.offset);
                     } else if self.ctor_pos > 0 && self.type_arg_depth == 0 {
                         let explicit = self.implicit_creation_depth == 0;
@@ -15211,10 +15194,7 @@ impl<'a> Engine<'a> {
                         name,
                         range,
                         qualified: false,
-                        shape: RowShape::TypeUse(
-                            TypeVerdict::Missing,
-                            suppressed || dead_arg_group,
-                        ),
+                        shape: RowShape::TypeUse(TypeVerdict::Missing, suppressed),
                         intent: Intent::Read,
                         write_op: None,
                         ty: Ty::UNKNOWN,
@@ -15236,7 +15216,6 @@ impl<'a> Engine<'a> {
                     // the frame stack answering that question exists only at
                     // push time.
                     let local = self.frames.iter().rev().any(|f| f.locals.contains(&prefix));
-                    self.last_type_head_live = false;
                     self.push_row(Row {
                         name,
                         range,
@@ -15247,7 +15226,6 @@ impl<'a> Engine<'a> {
                         ty: Ty::UNKNOWN,
                     });
                 } else {
-                    self.last_type_head_live = true;
                     if self.is_type_pos == 0 && !self.in_own_named_scope(name) {
                         self.used_names.insert(name);
                     }
@@ -15256,45 +15234,6 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Whether the open type-argument group resolves its members' misses
-    /// like a live head's: either the head resolved, or the group sits in
-    /// the function-type tail shape (`dead_head_function_tail`).
-    fn arg_group_resolves(&self) -> bool {
-        *self.group_head_live.last().unwrap_or(&true)
-            || *self.group_head_resolve_through.last().unwrap_or(&false)
-    }
-
-    /// Whether this dead type head opens a function-type tail: the angle
-    /// group it starts is directly followed by a parameter list's open
-    /// paren — the recovered old-style function-typed typedef
-    /// (`typedef e = foo<F>(int x);`, the parser's missing-`Function`
-    /// recovery). The official resolver reaches the group's children
-    /// anyway (the recovery keeps the arguments real type references), so
-    /// the oracle reports the dead head AND each unresolved argument.
-    fn dead_head_function_tail(&self, head: SourceRange) -> bool {
-        let bytes = self.source.as_bytes();
-        let mut i = head.end() as usize;
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if bytes.get(i) != Some(&b'<') {
-            return false;
-        }
-        let mut depth = 1usize;
-        i += 1;
-        while i < bytes.len() && depth > 0 {
-            match bytes[i] {
-                b'<' => depth += 1,
-                b'>' => depth -= 1,
-                _ => {}
-            }
-            i += 1;
-        }
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        bytes.get(i) == Some(&b'(')
-    }
 
     /// The type-position lookup's full answer for a bare type head — the
     /// official chain (`named_type_resolver.dart:129-131` `_lookupGetter
@@ -27090,6 +27029,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_function_type(&mut self, _begin: Token) {
+        let depth = std::mem::take(&mut self.engine.type_arg_depth);
+        self.engine.type_arg_depth_saved.push(depth);
         // Function-type shapes are outside the capture's model: poison the
         // open windows (a function-type bound's leaves also fail the
         // one-root claim — this is the belt to those braces).
@@ -27110,6 +27051,8 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_record_type(&mut self, _left_paren: Token) {
+        let depth = std::mem::take(&mut self.engine.type_arg_depth);
+        self.engine.type_arg_depth_saved.push(depth);
         self.engine.bounds.poison();
         // A record RHS is outside the alias model (#1351).
         self.engine.bounds.alias_poison();
@@ -27131,6 +27074,9 @@ impl ParserListener for DiagnoseListener<'_> {
         _count: usize,
         _has_named_fields: bool,
     ) {
+        if let Some(depth) = self.engine.type_arg_depth_saved.pop() {
+            self.engine.type_arg_depth = depth;
+        }
         self.engine.var_end_record_type(question.is_some());
         self.engine.record_type_depth -= 1;
         // Fold the captured fields into the interned `Ty::Record` — the
@@ -31349,16 +31295,6 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.note_header_type_args_open();
         // #1314 FAM13: the group's member references are type arguments.
         engine.type_arg_depth += 1;
-        // The head's liveness adopts this group (the resolver's bail face).
-        engine.group_head_live.push(engine.last_type_head_live);
-        // The dead head's arguments still resolve when the group sits in
-        // the function-type tail shape (see `dead_head_function_tail`).
-        let resolve_through = !engine.last_type_head_live
-            && engine
-                .type_uses
-                .last()
-                .is_some_and(|(range, _)| engine.dead_head_function_tail(*range));
-        engine.group_head_resolve_through.push(resolve_through);
         let base = engine.rows.len();
         engine.group_heads.push((head, base));
     }
@@ -31373,8 +31309,6 @@ impl ParserListener for DiagnoseListener<'_> {
             let engine = &mut self.engine;
             // #1314 FAM13: the group closed.
             engine.type_arg_depth = engine.type_arg_depth.saturating_sub(1);
-            engine.group_head_live.pop();
-            engine.group_head_resolve_through.pop();
         }
         self.engine.end_type_arguments(count, begin, end);
     }
@@ -32812,6 +32746,9 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn end_function_type(&mut self, function: Token, question: Option<Token>) {
+        if let Some(depth) = self.engine.type_arg_depth_saved.pop() {
+            self.engine.type_arg_depth = depth;
+        }
         self.flow().end_function_type(function, question);
         self.engine.var_end_function_type(question.is_some());
         self.engine.fn_capture_end(question.is_some());
@@ -34678,7 +34615,7 @@ mod tests {
         assert_eq!(code_names(&qualified), ["undefined_identifier"]);
         let new_form = report("void f() { new prefix.C.new(); }");
         assert_eq!(code_names(&new_form), ["undefined_identifier"]);
-        let generic = report("void f() { prefix.C<int>.new(); }");
+        let generic = report("class int {} void f() { prefix.C<int>.new(); }");
         assert_eq!(
             code_names(&generic),
             ["undefined_identifier", "undefined_method"]
@@ -34702,7 +34639,7 @@ mod tests {
     /// itself: head then method, exactly the standalone shape.
     #[test]
     fn generic_creation_selector_survives_a_following_plain_chain() {
-        let source = "class C { C.new(); }\nvar a = prefix.C<int>.new();\nvar b = C.new;";
+        let source = "class int {} class C { C.new(); }\nvar a = prefix.C<int>.new();\nvar b = C.new;";
         assert_eq!(
             code_names(&report(source)),
             ["undefined_identifier", "undefined_method"]
@@ -39783,9 +39720,11 @@ mod tests {
 
     /// The rig's code list without its missing-core `undefined_class` rows.
     fn report_text_codes(source: &str) -> Vec<&'static str> {
+        // The core-face cascade: `undefined_class` on the missing core
+        // names and the type-argument face their arguments report.
         code_names(&report(source))
             .into_iter()
-            .filter(|code| *code != "undefined_class")
+            .filter(|code| *code != "undefined_class" && *code != "non_type_as_type_argument")
             .collect()
     }
 
@@ -51669,6 +51608,34 @@ mod ticket_1351_tests {
             "{:?}",
             code_names(&plain)
         );
+    }
+
+    /// The type-argument face is the DIRECT parent (`node.parent is
+    /// TypeArgumentList`): a function/record type nested in a type argument
+    /// reports its own return/formal/field misses as plain
+    /// `undefined_class`, and a type argument under an unresolvable head
+    /// still reports (oracle-probed: `W<L>` → `undefined_class` on `W` and
+    /// `non_type_as_type_argument` on `L`).
+    #[test]
+    fn type_argument_face_is_the_direct_parent_and_survives_a_dead_head() {
+        let codes = |source: &str| {
+            let report = unit_report(source);
+            report
+                .diagnostics
+                .iter()
+                .map(|d| (d.code.name, d.range.offset))
+                .filter(|(c, _)| *c == "undefined_class" || *c == "non_type_as_type_argument")
+                .collect::<Vec<_>>()
+        };
+        // `List<L Function()> c;` — `List` is a core name the rig lacks, so
+        // pin on the inner `L` (offset 5) only.
+        let nested = codes("List<L Function(L)> c;");
+        assert!(nested.contains(&("undefined_class", 5)), "{nested:?}");
+        assert!(nested.contains(&("undefined_class", 16)), "{nested:?}");
+        assert!(!nested.iter().any(|&(c, o)| c == "non_type_as_type_argument" && (o == 5 || o == 16)), "{nested:?}");
+        let dead = codes("W<L> a;");
+        assert!(dead.contains(&("undefined_class", 0)), "{dead:?}");
+        assert!(dead.contains(&("non_type_as_type_argument", 2)), "{dead:?}");
     }
 
     /// `non_type_as_type_argument` for the recovered old-style function
