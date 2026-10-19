@@ -3718,6 +3718,62 @@ mod tests {
         );
     }
 
+    /// The core-type operator face (#2235): an `int`/`double`/`num`/
+    /// `String`/`bool` receiver whose declaration resolves to an unindexed
+    /// unit chain-breaks the member walk, and the frozen member table now
+    /// carries each face's SDK-declared operator spellings — the declared
+    /// operators (`<`/`>=`/`+`/`&`/`<<`, `[]`/`+`/`*` on `String`, `&` on
+    /// `bool`) stay silent exactly as the oracle answers, while a genuinely
+    /// absent spelling (`[]` on `int`, `+` on the frozen `Match` face)
+    /// still reports `undefined_operator`.
+    #[test]
+    fn unindexed_core_type_operators_decide_through_frozen_face() {
+        let report = report_unindexed_unit(
+            "abstract class Match {\n\
+             \x20 int get start;\n\
+             }\n\
+             class int {}\n\
+             class double {}\n\
+             class num {}\n\
+             class String {}\n\
+             class bool {}\n",
+            "import 'a.dart';\n\
+             void f(int a, double d, num n, String s, bool b, Match m) {\n\
+             \x20 if (a < 2 && a >= 0) {}\n\
+             \x20 if (a + 1 - 2 * 3 % 4 / 5 > 0) {}\n\
+             \x20 if ((a & 1 | 2 ^ 3) > 0 && (a << 1 >> 2 >>> 3) > 0) {}\n\
+             \x20 if (d < 2 && n < 2) {}\n\
+             \x20 s[0];\n\
+             \x20 s * 2;\n\
+             \x20 s + s;\n\
+             \x20 if (b & true | false ^ true) {}\n\
+             \x20 a[0];\n\
+             \x20 m + 1;\n\
+             }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_operator", "undefined_operator"],
+            "{:?}",
+            code_names(&report)
+        );
+        // The two misses are `a[0]`'s `[]` on `int` and `m + 1`'s `+` on
+        // `Match` — in source order, each message carrying its spelling.
+        let messages: Vec<&str> = report
+            .diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        assert!(
+            messages[0].contains("'[]'") && messages[0].contains("'int'"),
+            "{messages:?}"
+        );
+        assert!(
+            messages[1].contains("'+'") && messages[1].contains("'Match'"),
+            "{messages:?}"
+        );
+    }
+
     /// The anchor discipline: a receiver whose type is genuinely
     /// undeclared (`Gone` resolves to nothing — the oracle's `InvalidType`)
     /// answers every member face silently; only the frozen-face spellings

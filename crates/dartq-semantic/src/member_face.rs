@@ -80,6 +80,12 @@ pub(crate) const BUILTIN_TYPES: [&str; 1] = ["dynamic"];
 /// type bounds are invisible to the name-level model, so folding them is
 /// the suppress direction (a bound violation the oracle would report stays
 /// silent); omitting one would report a genuinely present member.
+///
+/// Operator spellings are members of the face too — each row carries the
+/// operators its SDK declaration declares (`+`/`[]`/`[]=` on `List`,
+/// `[]`/`[]=` on `Map`, the `num` arithmetic/comparison set plus `int`'s
+/// bit operators, `[]`/`+`/`*` on `String`, `&`/`|`/`^` on `bool`), or
+/// `undefined_operator` mis-decides a declared operator as absent (#2235).
 pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 13] = [
     (
         "Object",
@@ -133,6 +139,27 @@ pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 13] = [
             "hashCode",
             "runtimeType",
             "noSuchMethod",
+            // `sdk/lib/core/num.dart` + `int.dart` — the operator spellings
+            // `undefined_operator` consults this face for: `num`'s
+            // arithmetic/comparison face plus `int`'s own bit operators
+            // (`==` is Object's face, spared upstream of the consult).
+            "+",
+            "-",
+            "*",
+            "%",
+            "/",
+            "~/",
+            "<",
+            "<=",
+            ">",
+            ">=",
+            "&",
+            "|",
+            "^",
+            "~",
+            "<<",
+            ">>",
+            ">>>",
         ],
     ),
     (
@@ -163,6 +190,18 @@ pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 13] = [
             "hashCode",
             "runtimeType",
             "noSuchMethod",
+            // `sdk/lib/core/double.dart` — `num`'s arithmetic/comparison
+            // operator face redeclared with `double` returns.
+            "+",
+            "-",
+            "*",
+            "%",
+            "/",
+            "~/",
+            "<",
+            "<=",
+            ">",
+            ">=",
         ],
     ),
     (
@@ -194,6 +233,18 @@ pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 13] = [
             "hashCode",
             "runtimeType",
             "noSuchMethod",
+            // `sdk/lib/core/num.dart` — the arithmetic/comparison operator
+            // face (`<`/`<=`/`>`/`>=` plus the arithmetic spellings).
+            "+",
+            "-",
+            "*",
+            "%",
+            "/",
+            "~/",
+            "<",
+            "<=",
+            ">",
+            ">=",
         ],
     ),
     (
@@ -231,11 +282,24 @@ pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 13] = [
             "hashCode",
             "runtimeType",
             "noSuchMethod",
+            // `sdk/lib/core/string.dart` — `[]` (:206), `+` (:351), `*` (:434).
+            "[]",
+            "+",
+            "*",
         ],
     ),
     (
         "bool",
-        &["toString", "hashCode", "runtimeType", "noSuchMethod"],
+        &[
+            "toString",
+            "hashCode",
+            "runtimeType",
+            "noSuchMethod",
+            // `sdk/lib/core/bool.dart` — `&`/`|`/`^` (:197/:202/:207).
+            "&",
+            "|",
+            "^",
+        ],
     ),
     (
         "Iterable",
