@@ -3210,11 +3210,15 @@ pub(crate) enum StagedKind {
     Argument,
     /// `return_of_invalid_type`: the host kind and executable name ride
     /// along (the message's third placeholder); `ctor` re-arms the
-    /// declared-subtype negative at the teardown re-decision.
+    /// declared-subtype negative at the teardown re-decision; `is_async`
+    /// re-arms the flattened async matrix (`rtv.dart:258-289`) — the
+    /// teardown re-decides through the same face the parse-time stage
+    /// asked.
     Return {
         host: ExecKind,
         name: StringId,
         ctor: bool,
+        is_async: bool,
     },
     /// `receiver_of_type_never`: the receiver row's parse-time type rides
     /// in `from`; the teardown join substitutes a promoted-read fact staged

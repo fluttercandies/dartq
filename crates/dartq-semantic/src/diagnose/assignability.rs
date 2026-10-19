@@ -1,4 +1,5 @@
 use super::*;
+use super::engine_core::flatten_ty;
 
 impl<'a> Engine<'a> {
     pub(crate) fn typed_list_literal_ty(&mut self, left: Token) -> Option<Ty> {
@@ -1189,9 +1190,10 @@ impl<'a> Engine<'a> {
         self.init_mark = None;
     }
 
-    /// The return check (`rtv.dart:209-249` sync matrix): the verdict is
-    /// [`Engine::return_verdict`]; a failing one stages — the teardown may
-    /// still clean it against the expression's promoted read.
+    /// The return check (`rtv.dart:209-249` sync matrix, `:258-289`
+    /// async): the verdict is [`Engine::return_verdict`], the frame's
+    /// latched async modifier picking the face; a failing one stages — the
+    /// teardown may still clean it against the expression's promoted read.
     pub(crate) fn check_return(&mut self, from: Ty, range: SourceRange, from_literal: bool) {
         // The innermost executable frame owns the return. A frame with no
         // latched return (`ret: None` — a function literal or closure whose
@@ -1201,14 +1203,15 @@ impl<'a> Engine<'a> {
         // method's declared return (`firstDepleted`'s `Future<InventoryEvent?>`
         // must not adjudicate `onTimeout: () => null`).
         let Some(ret) = self.frames.iter().rev().find_map(|f| match &f.kind {
-            FrameKind::Executable { ret, .. } => {
-                Some(ret.as_ref().map(|ret| (ret.ty, ret.host, ret.name, ret.ctor)))
-            }
+            FrameKind::Executable { ret, is_async, .. } => Some(
+                ret.as_ref()
+                    .map(|ret| (ret.ty, ret.host, ret.name, ret.ctor, *is_async)),
+            ),
             _ => None,
         }) else {
             return;
         };
-        let Some((to, host, name, ctor)) = ret else {
+        let Some((to, host, name, ctor, is_async)) = ret else {
             return;
         };
         // An unannotated collection literal's row carries no type of its
@@ -1238,13 +1241,18 @@ impl<'a> Engine<'a> {
         // `C`-typed factory, one class from another), so a pair the written
         // matrix suppresses re-decides through the declared-subtype
         // negative.
-        let mut verdict = self.return_verdict(from, to, from_literal);
+        let mut verdict = self.return_verdict(from, to, from_literal, is_async);
         if verdict.is_none() && ctor {
             verdict = self.declared_subtype_negative(&from, &to);
         }
         if verdict == Some(false) {
             self.stage(
-                StagedKind::Return { host, name, ctor },
+                StagedKind::Return {
+                    host,
+                    name,
+                    ctor,
+                    is_async,
+                },
                 range,
                 from,
                 to,
@@ -1368,13 +1376,25 @@ impl<'a> Engine<'a> {
     }
 
     /// The return verdict matrix, shared by the parse-time stage and the
-    /// teardown re-decision: `void` hosts accept `void`/`dynamic`/`Null`;
-    /// `void`/`dynamic` expressions only fit `void`/`dynamic` hosts;
-    /// everything else defers to the assignability decision (the return
-    /// expression is the literal's context, so `from_literal` feeds the
-    /// conversion — `double f() => 1;` is clean). Bare `return;` is a
-    /// `void` expression.
-    pub(crate) fn return_verdict(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
+    /// teardown re-decision. A synchronous body (`rtv.dart:209-249`):
+    /// `void` hosts accept `void`/`dynamic`/`Null`; `void`/`dynamic`
+    /// expressions only fit `void`/`dynamic` hosts; everything else defers
+    /// to the assignability decision (the return expression is the
+    /// literal's context, so `from_literal` feeds the conversion —
+    /// `double f() => 1;` is clean). Bare `return;` is a `void`
+    /// expression. An `async` body never reaches these branches upstream
+    /// (`isSynchronous` early-returns) — it re-decides through
+    /// [`Engine::async_return_verdict`].
+    pub(crate) fn return_verdict(
+        &self,
+        from: Ty,
+        to: Ty,
+        from_literal: bool,
+        is_async: bool,
+    ) -> Option<bool> {
+        if is_async {
+            return self.async_return_verdict(from, to, from_literal);
+        }
         match to {
             Ty::Void => match from {
                 // `Never <: void` holds (Right Bottom — `return throw e;`).
@@ -1394,6 +1414,42 @@ impl<'a> Engine<'a> {
                 _ => self.assignable(from, to, from_literal),
             },
         }
+    }
+
+    /// The `async` body's return verdict matrix (`rtv.dart:258-289`): the
+    /// declared `T` reads through [`future_value_ty`] (`T_v`), the
+    /// expression's `S` through the recursive `flatten` (type_system.dart
+    /// :425-471, [`flatten_ty`]) — the two projections are deliberately
+    /// different shapes. (a) a `void` `T_v` accepts `void`/`dynamic`/`Null`
+    /// `flatten_S` (:258-264); (b) a `void` `flatten_S` accepts
+    /// `void`/`dynamic` `T_v` (:266-272); (c) otherwise the report needs
+    /// BOTH questions to fail — `S` unassignable to `T_v` AND `flatten_S`
+    /// no subtype of `T_v` (:274-289; `Future<int> f() async => DB();` is
+    /// clean through the subtype leg even though `DB` never fits the
+    /// declared `Future<DB>` head). The recovered `Unknown` face counts as
+    /// accepted on both ok-sets (`_isVoidDynamic`/`_isVoidDynamicOrNull`,
+    /// :337-344, treat `InvalidType` the same) and stays an undecidable
+    /// `None` in the assignability question — under-report, the sync
+    /// matrix's own convention. The message placeholders keep the raw `S`
+    /// and the declared `T` (`reportTypeError`, :155-205) — the
+    /// projections are verdict-side only.
+    pub(crate) fn async_return_verdict(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
+        let t_v = future_value_ty(self.strings, &self.boundary.pool(), to);
+        let flatten_s = flatten_ty(self.strings, &self.boundary.pool(), from);
+        if t_v == Ty::Void {
+            return Some(matches!(
+                flatten_s,
+                Ty::Void | Ty::Dynamic | Ty::Null | Ty::Unknown
+            ));
+        }
+        if flatten_s == Ty::Void {
+            return Some(matches!(t_v, Ty::Void | Ty::Dynamic | Ty::Unknown));
+        }
+        let verdict = self.assignable(from, t_v, from_literal);
+        if verdict == Some(false) && self.name_subtype(flatten_s, t_v) {
+            return Some(true);
+        }
+        verdict
     }
 
     /// A single-row expression's type since `mark`, for the body/return
@@ -2263,5 +2319,281 @@ impl<'a> Engine<'a> {
             write_op: None,
             ty: Ty::named(self.members.primitive_ids[primitive]),
         });
+    }
+}
+
+/// `TypeSystem::futureValueType` (analyzer source, type_system.dart
+/// :502-529) at name level — the `async` return matrix's view of the
+/// declared return (`T_v`). NOT the recursive `flatten` shape: the `?`
+/// suffix strips first (:503-507), a `Future`/`FutureOr` head gives up
+/// exactly one argument level without recursing (:509-515 —
+/// `futureValueType(Future<Future<int>>)` is `Future<int>`), `dynamic`
+/// and `void` pass through (:517-523), and everything else — `Null`,
+/// `Never`, records, functions, any other head — maps to `Object?`
+/// (:525-526). A bare `Future`/`FutureOr` spells the
+/// instantiated-to-bounds `…<dynamic>` (the same face [`flatten_ty`]
+/// applies), a malformed argument list keeps the written type whole (the
+/// recovery guard [`flatten_ty`] shares), and an unknown declared type
+/// stays unknown — the under-report direction the verdict's own
+/// `Ty::Unknown` arm takes.
+pub(crate) fn future_value_ty(strings: &StringTable, args: &crate::model::ArgPool, ty: Ty) -> Ty {
+    let Ty::Named {
+        name,
+        nullable,
+        args: list,
+    } = ty
+    else {
+        return match ty {
+            Ty::Dynamic | Ty::Void | Ty::Unknown => ty,
+            _ => object_question(strings),
+        };
+    };
+    if nullable {
+        return future_value_ty(
+            strings,
+            args,
+            Ty::Named {
+                name,
+                nullable: false,
+                args: list,
+            },
+        );
+    }
+    if name == strings.intern("Future") || name == strings.intern("FutureOr") {
+        if list == crate::model::ArgListId::EMPTY {
+            return Ty::Dynamic;
+        }
+        let flat = args.get(list);
+        if flat.len() == 1 {
+            return flat[0];
+        }
+        return ty;
+    }
+    object_question(strings)
+}
+
+/// The `Object?` face `futureValueType` maps every non-`Future`,
+/// non-top-type head to (type_system.dart:525-526).
+fn object_question(strings: &StringTable) -> Ty {
+    Ty::Named {
+        name: strings.intern("Object"),
+        nullable: true,
+        args: crate::model::ArgListId::EMPTY,
+    }
+}
+
+/// The `async` return-matrix pins: upstream's own exemplar faces
+/// (`rtv.dart:258-289`), probed end-to-end through the single-file rig
+/// below. The sync faces keep their shared `tests`-module pins — the sync
+/// branches here are byte-identical to the pre-#2224 matrix.
+#[cfg(test)]
+mod async_return_tests {
+    use super::*;
+    use crate::collector::collect;
+    use crate::model::ArgPool;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_resolution::LibraryGraphBuilder;
+    use dartq_scanner::ScanConfig;
+    use dartq_source::FileTable;
+    use std::path::Path;
+
+    fn code_names(report: &FileReport) -> Vec<&'static str> {
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
+    }
+
+    /// The single-file rig (the shared `tests` module's
+    /// `report_full_pipeline` shape, fixed knobs): scan, collect, one
+    /// library, fold. The fixtures are parse-clean.
+    fn report(source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let fold = fold_unit(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        let mut report = fold.report;
+        report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+        report
+    }
+
+    /// `Future<DB> f() async => DB();` is silent: `T_v` is `DB` and `DB`
+    /// assigns to itself — under the sync matrix the same pair reported
+    /// (`DB` fits no `Future<DB>` head). The async modifier picks the
+    /// flattened face.
+    #[test]
+    fn async_return_of_future_value_stays_silent() {
+        let report = report(
+            "class Future<T> {}\nclass DB {}\nFuture<DB> f() async => DB();",
+        );
+        assert!(
+            code_names(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The sync control: without `async`, the same declared shape still
+    /// reports — the sync branches are untouched (bit-identical to the
+    /// pre-#2224 verdict).
+    #[test]
+    fn sync_return_of_future_typed_expression_still_reports() {
+        let report = report(
+            "class Future<T> {}\nclass DB {}\nFuture<DB> f() => DB();",
+        );
+        assert_eq!(code_names(&report), ["return_of_invalid_type"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A value of type 'DB' can't be returned from the function 'f' because it has a return type of 'Future<DB>'."
+        );
+    }
+
+    /// `Future<int> f() async { return 3 as Future<int>; }` is silent
+    /// through branch (c)'s subtype leg: `flatten_S = int` subtypes
+    /// `T_v = int` even though `S = Future<int>` never assigns to `int`
+    /// (the assignable question misses, the subtype leg answers).
+    #[test]
+    fn async_return_subtype_leg_cleans_the_future_source() {
+        let report = report(
+            "class Future<T> {}\nclass int {}\n\
+             Future<int> f() async { return 3 as Future<int>; }",
+        );
+        assert!(
+            code_names(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The `T_v`-void branch: `Future<void> f() async { return 3 as
+    /// Future<int>; }` reports — `flatten_S = int` is neither `void`,
+    /// `dynamic`, nor `Null` — and the message keeps the RAW `S` and the
+    /// declared `T` (`reportTypeError`, rtv.dart:155-205), never the
+    /// projections.
+    #[test]
+    fn async_void_future_value_reports_the_raw_types() {
+        let report = report(
+            "class Future<T> {}\nclass int {}\n\
+             Future<void> f() async { return 3 as Future<int>; }",
+        );
+        assert_eq!(code_names(&report), ["return_of_invalid_type"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "A value of type 'Future<int>' can't be returned from the function 'f' because it has a return type of 'Future<void>'."
+        );
+    }
+
+    /// `futureValueType` unwraps exactly one level:
+    /// `Future<Future<int>> f() async { return 3 as Future<int>; }` is
+    /// silent — `T_v` is the inner `Future<int>` whole, and `S` assigns to
+    /// it directly, where the sync matrix would have asked `int` against
+    /// the declared `Future<Future<int>>` head.
+    #[test]
+    fn async_nested_future_declaration_unwraps_one_level() {
+        let report = report(
+            "class Future<T> {}\nclass int {}\n\
+             Future<Future<int>> f() async { return 3 as Future<int>; }",
+        );
+        assert!(
+            code_names(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A bare `return;` in an async body reads `flatten_S = void` (branch
+    /// b): `Future<int>` demands a value (`T_v = int` fits no
+    /// void/dynamic host) and reports; the `Future<void>` host keeps it
+    /// silent (`T_v = void`, branch a's ok-set).
+    #[test]
+    fn async_bare_return_follows_the_flattened_hosts() {
+        let demands_a_value = report(
+            "class Future<T> {}\nclass int {}\nFuture<int> f() async { return; }",
+        );
+        assert_eq!(code_names(&demands_a_value), ["return_of_invalid_type"]);
+        let keeps_it_silent =
+            report("class Future<T> {}\nFuture<void> f() async { return; }");
+        assert!(
+            code_names(&keeps_it_silent).is_empty(),
+            "{:?}",
+            code_names(&keeps_it_silent)
+        );
+    }
+
+    /// The rig-free `futureValueType` shape: one unwrapping level, no
+    /// recursion (`Future<Future<int>>` reads `Future<int>`).
+    #[test]
+    fn future_value_unwraps_exactly_one_level() {
+        let (strings, mut args) = (StringTable::new(), ArgPool::default());
+        let int = Ty::named(strings.intern("int"));
+        let inner = args.named(strings.intern("Future"), false, &[int]);
+        let nested = args.named(strings.intern("Future"), false, &[inner]);
+        assert_eq!(future_value_ty(&strings, &args, nested), inner);
+        assert_eq!(future_value_ty(&strings, &args, inner), int);
+    }
+
+    /// The suffix strips first, the top faces pass through, and every
+    /// other head lands on `Object?`.
+    #[test]
+    fn future_value_strips_suffix_first_and_keeps_top_faces() {
+        let (strings, mut args) = (StringTable::new(), ArgPool::default());
+        let int = Ty::named(strings.intern("int"));
+        let future_int_q = args.named(strings.intern("Future"), true, &[int]);
+        assert_eq!(future_value_ty(&strings, &args, future_int_q), int);
+        assert_eq!(future_value_ty(&strings, &args, Ty::Dynamic), Ty::Dynamic);
+        assert_eq!(future_value_ty(&strings, &args, Ty::Void), Ty::Void);
+        let object_q = Ty::Named {
+            name: strings.intern("Object"),
+            nullable: true,
+            args: crate::model::ArgListId::EMPTY,
+        };
+        assert_eq!(future_value_ty(&strings, &args, int), object_q);
+        assert_eq!(future_value_ty(&strings, &args, Ty::Null), object_q);
+        assert_eq!(future_value_ty(&strings, &args, Ty::Never), object_q);
+        let int_q = args.named(strings.intern("int"), true, &[]);
+        assert_eq!(future_value_ty(&strings, &args, int_q), object_q);
+        let unknown = future_value_ty(&strings, &args, Ty::Unknown);
+        assert_eq!(unknown, Ty::Unknown);
     }
 }

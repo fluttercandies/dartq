@@ -633,8 +633,11 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let verdict = match check.kind {
-                StagedKind::Return { ctor, .. } => {
-                    let verdict = self.return_verdict(from, check.to, check.literal);
+                StagedKind::Return {
+                    ctor, is_async, ..
+                } => {
+                    let verdict =
+                        self.return_verdict(from, check.to, check.literal, is_async);
                     if verdict.is_none() && ctor {
                         self.declared_subtype_negative(&from, &check.to)
                     } else {
