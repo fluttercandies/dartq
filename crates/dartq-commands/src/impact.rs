@@ -817,6 +817,7 @@ mod tests {
         serde_json::from_value(json!({
             "api_signature": vec![0u8; 16],
             "directives": [],
+            "doc_imports": [],
             "elements": {
                 "strings": slice,
                 "decls": decls,
