@@ -1168,12 +1168,21 @@ impl<T> TargetRows<T> {
     pub(crate) fn edit_row(&mut self, file: FileId, f: impl FnOnce(&mut Vec<T>)) {
         let index = file.index() as usize;
         let mut row: Vec<T> = match self.slots.get_mut(index).and_then(Option::take) {
-            Some(row) => row.into_vec(),
-            None => Vec::new(),
+            Some(row) => {
+                // One slot of headroom: an insert lands without a regrow, and
+                // the boxed rebuild below is the row's only reallocation.
+                let mut row = row.into_vec();
+                row.reserve_exact(1);
+                row
+            }
+            None => Vec::with_capacity(1),
         };
         f(&mut row);
         if index >= self.slots.len() {
-            self.slots.resize_with(index + 1, || None);
+            // Grow the arena geometrically (a fresh walk interns ids in
+            // ascending order: an exact resize per edit is quadratic copying).
+            let wanted = (index + 1).max(self.slots.len() * 2);
+            self.slots.resize_with(wanted, || None);
         }
         self.slots[index] = if row.is_empty() {
             None
