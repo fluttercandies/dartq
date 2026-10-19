@@ -419,13 +419,6 @@ pub use types::{FileReport, NameRow, NameUse, RefTarget, UndefinedGuard, UnitRef
 pub(crate) use types::*;
 
 
-impl<'a> Engine<'a> {
-}
-
-// —— #279: the constant-evaluation face ——————————————————————————————————
-
-
-
 /// Parses an int literal body: decimal or `0x` hex, `_` separators
 /// stripped; `None` when the value exceeds `i64` (an unobservable edge —
 /// the literal defers to an opaque constant).

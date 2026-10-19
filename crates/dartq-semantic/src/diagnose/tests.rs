@@ -6495,18 +6495,24 @@
     /// Hand-trace: `S`/`A`/`B` have no in-file containers, so pre-fix the
     /// scrutinee read as non-sealed with rows that never must-match it —
     /// a witness over any `S` value, emitted as
-    /// `non_exhaustive_switch_expression`. The one remaining `undefined_class`
-    /// is the unresolved parameter type itself (oracle-matching, see
-    /// `type_positions_report_undefined_class`); the object patterns
-    /// `A()`/`B()` stay silent.
+    /// `non_exhaustive_switch_expression`. The `undefined_class` rows are
+    /// the unresolved parameter type and the two object-pattern heads —
+    /// the oracle resolves `ObjectPattern.type` through the ordinary
+    /// `visitNamedType` pass and reports the same misses (see
+    /// `type_positions_report_undefined_class` and #2184).
     #[test]
     fn cross_file_sealed_scrutinee_expression_emits_no_covering_gap() {
         let report = report("void f(S s) { var x = switch (s) { A() => 1, B() => 2 }; }");
-        // `x` is unread (the official read-only use rule), after the
-        // unresolved parameter type.
+        // `x` is unread (the official read-only use rule), interleaved
+        // with the three undefined heads/param.
         assert_eq!(
             code_names(&report),
-            ["undefined_class", "unused_local_variable"],
+            [
+                "undefined_class",
+                "unused_local_variable",
+                "undefined_class",
+                "undefined_class"
+            ],
             "{:?}",
             code_names(&report)
         );
@@ -6938,12 +6944,17 @@
             ["undefined_getter", "unused_local_variable", "unused_local_variable"]
         );
         let opaque = report("void f(S s) { var v = switch (s) { A() => 1, B(:var x) => 2 }; }");
-        // `v` and `x` are unread, after the unresolved parameter type.
+        // `v` and `x` are unread; `S`, `A` and `B` are all unresolvable —
+        // the parameter type and both object-pattern heads report
+        // `undefined_class` (#2184: the head rides the ordinary
+        // `visitNamedType` pass now).
         assert_eq!(
             code_names(&opaque),
             [
                 "undefined_class",
                 "unused_local_variable",
+                "undefined_class",
+                "undefined_class",
                 "unused_local_variable",
             ]
         );
@@ -11951,7 +11962,11 @@
     /// a non-nullable target reports beside the disjointness row the same
     /// pair provably fires (`pattern_never_matches_value_type` — the
     /// oracle emits both at the node). The `default` clause keeps the
-    /// exhaustiveness face out of the pin.
+    /// exhaustiveness face out of the pin. The cast target `int` is
+    /// undeclared in the bare-unit harness — a cast pattern's type reports
+    /// `undefined_class` (the `castToNonType` arm requires an
+    /// `AsExpression` parent; a CastPattern falls through to the plain
+    /// arms, #2184).
     #[test]
     fn cast_from_null_pattern_reports() {
         let r =
@@ -11961,6 +11976,7 @@
             [
                 "pattern_never_matches_value_type",
                 "cast_from_null_always_fails",
+                "undefined_class",
             ],
             "{:?}",
             code_names(&r)
@@ -15756,4 +15772,215 @@
             "{:?}",
             code_names(&r)
         );
+    }
+
+
+    // —— #2184: pattern-context type-name resolution ————————————————————————
+    // The object-pattern head reaches the diagnoser through the dedicated
+    // `handle_object_pattern` event (no `handle_identifier(TypeReference)` +
+    // `handle_type` pair), so it never entered the `push_type_use` →
+    // `RowShape::TypeUse` → `resolve_type_row` chain that reports
+    // `undefined_class` in every other type position — the oracle resolves
+    // `ObjectPattern.type` through the ordinary `visitNamedType` pass
+    // (named_type_resolver.dart's `reportNullOrNonTypeElement` fallthrough).
+    // The cast pattern's `as` type is the second face: it rode the
+    // expression-cast suppression bracket, but the oracle's `castToNonType`
+    // arm requires an `AsExpression` parent — a CastPattern's type falls
+    // through to the plain arms.
+
+    /// The diagnostic rows' `(code, offset)` pairs, in source order.
+    fn code_offsets(report: &FileReport) -> Vec<(&'static str, u32)> {
+        report
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range.offset))
+            .collect()
+    }
+
+    /// F1: a bare object-pattern head in a switch-statement case resolves
+    /// through the plain type-name pass — the miss reports `undefined_class`
+    /// at the head identifier, a defined head stays silent (`class Object {}`
+    /// stands in for the core type, the harness's no-core convention).
+    #[test]
+    fn object_pattern_head_reports_undefined_class() {
+        let source = "class Ok {}\nclass Object {}\nvoid f(Object v) {\n  switch (v) {\n    case Missing1():\n      break;\n    case Ok():\n      break;\n  }\n}";
+        let r = report(source);
+        assert_eq!(
+            code_offsets(&r),
+            [("undefined_class", offset_of(source, "Missing1"))],
+            "{:?}",
+            code_offsets(&r)
+        );
+    }
+
+    /// F2: switch-expression arm heads — both operands of a logical-or
+    /// pattern — report independently; the defined arm stays silent. The
+    /// bound variable `x` keeps its ordinary `unused_local_variable` row,
+    /// and the open switch keeps its `non_exhaustive_switch_expression`
+    /// verdict (a wildcard arm would close it).
+    #[test]
+    fn switch_expression_arm_heads_report() {
+        let source = "class Ok {}\nclass Object {}\nvoid f(Object v) {\n  var r = switch (v) {\n    Missing2(:var x) || Missing3() => 1,\n    Ok() => 2,\n  };\n  return r;\n}";
+        let r = report(source);
+        assert_eq!(
+            code_offsets(&r),
+            [
+                (
+                    "non_exhaustive_switch_expression",
+                    offset_of(source, "switch (v)"),
+                ),
+                ("undefined_class", offset_of(source, "Missing2")),
+                ("unused_local_variable", offset_of(source, "x)")),
+                ("undefined_class", offset_of(source, "Missing3")),
+            ],
+            "{:?}",
+            code_offsets(&r)
+        );
+    }
+
+    /// F3: an if-case head reports; a defined typed field sub-pattern and
+    /// a defined head stay silent. The bound variables keep their ordinary
+    /// `unused_local_variable` rows (`class String {}` stands in for the
+    /// core type).
+    #[test]
+    fn if_case_head_reports_typed_field_silent() {
+        let source = "class Ok {\n  var y;\n}\nclass String {}\nclass Object {}\nvoid f(Object v) {\n  if (v case Missing4(:String s)) {}\n  if (v case Ok(:var y)) {}\n}";
+        let r = report(source);
+        assert_eq!(
+            code_offsets(&r),
+            [
+                ("undefined_class", offset_of(source, "Missing4")),
+                ("unused_local_variable", offset_of(source, " s") + 1),
+                ("unused_local_variable", offset_of(source, " y)") + 1),
+            ],
+            "{:?}",
+            code_offsets(&r)
+        );
+    }
+
+    /// F4: the head's own type-argument group keeps the type-arg face —
+    /// the head reports `undefined_class`, a missing argument reports
+    /// `non_type_as_type_argument` (the oracle's
+    /// `_isTypeInTypeArgumentList` arm outranks the fallthrough).
+    #[test]
+    fn object_pattern_head_with_type_args_reports_both_faces() {
+        let source = "class int {}\nclass Object {}\nvoid f(Object v) {\n  switch (v) {\n    case Missing5<int, Missing6>():\n      break;\n  }\n}";
+        let r = report(source);
+        assert_eq!(
+            code_offsets(&r),
+            [
+                ("non_type_as_type_argument", offset_of(source, "Missing6")),
+                ("undefined_class", offset_of(source, "Missing5")),
+            ],
+            "{:?}",
+            code_offsets(&r)
+        );
+    }
+
+    /// F5: the cast pattern's `as` type never reaches the `cast_to_non_type`
+    /// arm (its parent is a CastPattern, not an AsExpression) — a miss
+    /// reports `undefined_class`, a resolved non-type `not_a_type`. The
+    /// expression cast keeps its dedicated face. The bound `x`/`y` keep
+    /// their `unused_local_variable` rows.
+    #[test]
+    fn cast_pattern_type_reports_plain_faces() {
+        let source = "class Object {}\nvoid f(Object v) {\n  switch (v) {\n    case var x as Missing7:\n      break;\n  }\n}";
+        let r = report(source);
+        assert_eq!(
+            code_offsets(&r),
+            [
+                ("unused_local_variable", offset_of(source, " x as") + 1),
+                ("undefined_class", offset_of(source, "Missing7")),
+            ],
+            "{:?}",
+            code_offsets(&r)
+        );
+
+        // A parameter head is a resolved non-type: `not_a_type` with the
+        // declaration context (the oracle's `element != null` arm).
+        let source = "class int {}\nclass Object {}\nvoid f(int notAType, Object v) {\n  switch (v) {\n    case var y as notAType:\n      break;\n  }\n}";
+        let r = report(source);
+        let rows: Vec<_> = r
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                d.code.name == "not_a_type"
+                    && d.range.offset == offset_of(source, "as notAType") + 3
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "{:?}", code_offsets(&r));
+        let context = rows[0].context.as_deref().unwrap_or_default();
+        assert_eq!(
+            context.len(),
+            1,
+            "the parameter declaration anchor rides: {:?}",
+            code_offsets(&r)
+        );
+
+        // The expression-cast control: `v as Missing` keeps
+        // `cast_to_non_type` — the bracket change must not flip it.
+        let source = "class Object {}\nvoid f(Object v) { var w = v as Missing8; }";
+        let r = report(source);
+        assert_eq!(
+            code_offsets(&r),
+            [
+                ("unused_local_variable", offset_of(source, " w =") + 1),
+                ("cast_to_non_type", offset_of(source, "Missing8")),
+            ],
+            "{:?}",
+            code_offsets(&r)
+        );
+    }
+
+    /// F6: declared-variable patterns and typed wildcards already ride the
+    /// normal type events — regression pin, both heads report. `n` keeps
+    /// its `unused_local_variable` row.
+    #[test]
+    fn declared_variable_and_typed_wildcard_heads_report() {
+        let source = "class Object {}\nvoid f(Object v) {\n  switch (v) {\n    case Missing8 n:\n      break;\n    case Missing9 _:\n      break;\n  }\n}";
+        let r = report(source);
+        assert_eq!(
+            code_offsets(&r),
+            [
+                ("undefined_class", offset_of(source, "Missing8")),
+                ("unused_local_variable", offset_of(source, " n:") + 1),
+                ("undefined_class", offset_of(source, "Missing9")),
+            ],
+            "{:?}",
+            code_offsets(&r)
+        );
+    }
+
+    /// F7: a head resolving to a non-type element (a top-level function)
+    /// reports `not_a_type` — the plain path's `element != null` arm — with
+    /// the same-file declaration context.
+    #[test]
+    fn object_pattern_non_type_head_reports_not_a_type() {
+        let source = "class int {}\nclass Object {}\nint topFn() => 0;\nvoid f(Object v) {\n  if (v case topFn()) {}\n}";
+        let r = report(source);
+        let rows: Vec<_> = r
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                d.code.name == "not_a_type"
+                    && d.range.offset == offset_of(source, "case topFn") + 5
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "{:?}", code_offsets(&r));
+        let context = rows[0].context.as_deref().unwrap_or_default();
+        assert_eq!(
+            context.len(),
+            1,
+            "the declaration anchor rides: {:?}",
+            code_offsets(&r)
+        );
+    }
+
+    /// F8: silence pin — defined heads across all three pattern homes push
+    /// no diagnostic row.
+    #[test]
+    fn defined_object_pattern_heads_stay_silent() {
+        let source = "class Ok {\n  var field;\n}\nclass Object {}\nvoid f(Object v) {\n  if (v case Ok()) {}\n  if (v case Ok(field: _)) {}\n  var r = switch (v) { Ok() => 1, _ => 2 };\n  return r;\n}";
+        let r = report(source);
+        assert!(r.diagnostics.is_empty(), "{:?}", code_offsets(&r));
     }

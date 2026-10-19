@@ -3482,14 +3482,31 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_as_operator_type(&mut self, operator: Token) {
         self.flow().begin_as_operator_type(operator);
 
-        self.engine.enter_non_type_pos();
+        // The non-type-pos suppression is the expression cast's face — its
+        // `cast_to_non_type` verdict rides `emit_as_type_miss` at
+        // `handle_as_operator`. A cast pattern (`case p as T:`) fires this
+        // same bracket but never fires `handle_as_operator`; upstream its
+        // NamedType's parent is a CastPattern, not the AsExpression the
+        // `castToNonType` arm requires, so the type falls through to the
+        // plain `undefined_class`/`not_a_type` arms
+        // (named_type_resolver.dart's `reportNullOrNonTypeElement`).
+        // Inside a pattern the bracket stays open — symmetric in
+        // `end_as_operator_type` — letting the type's TypeUse row resolve
+        // through pass 2 like every other position. An expression `as`
+        // cannot reach this shape: constant pattern operands admit no
+        // `as` grammar.
+        if self.engine.switch.pattern_depth == 0 {
+            self.engine.enter_non_type_pos();
+        }
         self.engine.as_type_mark = Some(self.engine.rows.len());
     }
 
     fn end_as_operator_type(&mut self, operator: Token) {
         self.flow().end_as_operator_type(operator);
 
-        self.engine.leave_non_type_pos();
+        if self.engine.switch.pattern_depth == 0 {
+            self.engine.leave_non_type_pos();
+        }
     }
 
     fn begin_new_expression(&mut self, token: Token) {
@@ -4439,6 +4456,20 @@ impl ParserListener for DiagnoseListener<'_> {
         } else {
             None
         };
+        // The head is a NamedType the parser reports through this event
+        // instead of the `handle_identifier(TypeReference)` + `handle_type`
+        // pair — feed the plain type-use pipeline so its miss resolves
+        // through `resolve_type_row`'s `undefined_class` arm
+        // (named_type_resolver.dart `reportNullOrNonTypeElement`'s
+        // fallthrough; upstream Dart SDK source, pkg/analyzer/lib/src/dart/
+        // resolver/named_type_resolver.dart). No `arm_type_head`: the
+        // head's type-argument group already closed inside the pattern's
+        // own parse. The `Some(head)` check doubles as the oracle's
+        // synthetic-name gate — `first_identifier` is a real stream token
+        // (`is_identifier` peek), never a recovery insert.
+        if let Some(head) = head {
+            engine.push_type_use(head, first_identifier.range, TypeHead::Bare);
+        }
         // The pattern head is a `NamedType` reference (the oracle resolves
         // `ObjectPattern.type` through `visitNamedType` →
         // `_useIdentifierElement`): a resolved head counts as a name use —
