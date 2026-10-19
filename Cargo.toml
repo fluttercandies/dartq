@@ -42,6 +42,10 @@ repository = "https://github.com/fluttercandies/dartq"
 # One version decision per external dependency, made once here; member
 # crates consume them via `name = { workspace = true }`.
 blake3 = "1"
+# The CLI binary's global allocator: segment-based, returns freed pages
+# promptly (the 100k cold peak is fragmentation-bound under the system
+# allocator).
+mimalloc = { version = "=0.1.52", default-features = false }
 clap = { version = "4.6.6", features = ["derive"] }
 crossbeam-channel = "0.5"
 filetime = "0.2"

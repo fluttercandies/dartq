@@ -100,6 +100,9 @@ mod impact;
 mod index;
 mod rename;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     // Lossy argv decode: `env::args` panics (exit 101) on a non-UTF-8
     // argument, ahead of any parse; the lossy spelling keeps the process in

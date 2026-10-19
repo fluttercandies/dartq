@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
+mimalloc = { workspace = true }
 dartq-commands = { workspace = true }
 dartq-daemon = { workspace = true }
 dartq-diagnostics = { workspace = true }
