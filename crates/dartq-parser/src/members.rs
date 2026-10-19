@@ -245,12 +245,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     }
 
     /// Top-level modifier walk (official head of `parseTopLevelMemberImpl`).
+    /// Every arm is gated on the official `isModifier` (modifier_context.dart):
+    /// built-in modifier keywords only count when their follower continues a
+    /// declaration, so `late;` leaves the keyword in the name slot and the
+    /// declaration recovers as a field NAMED `late` (the official
+    /// `!next.isIdentifier` fall-through, parser_impl.dart:4356) instead of a
+    /// synthetic-named field — the observable difference is resolution of
+    /// later bare `late` reads (use_late_in_non_nnbd.dart 19:3).
     fn walk_top_level_member_modifiers(&mut self) -> MemberModifiers {
         let mut mods = MemberModifiers::default();
         let mut vfc_done = false;
         loop {
             match self.peek_kind() {
-                TokenKind::Keyword(Keyword::External) if mods.external.is_none() => {
+                TokenKind::Keyword(Keyword::External)
+                    if mods.external.is_none() && self.is_modifier_at(0) =>
+                {
                     let t = self.peek_span();
                     self.cursor.advance();
                     if mods.augment.is_some() {
@@ -261,12 +270,16 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     }
                     mods.external = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Augment) if mods.augment.is_none() => {
+                TokenKind::Keyword(Keyword::Augment)
+                    if mods.augment.is_none() && self.is_modifier_at(0) =>
+                {
                     let t = self.peek_span();
                     self.cursor.advance();
                     mods.augment = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Abstract) if mods.abstract_kw.is_none() => {
+                TokenKind::Keyword(Keyword::Abstract)
+                    if mods.abstract_kw.is_none() && self.is_modifier_at(0) =>
+                {
                     let t = self.peek_span();
                     self.cursor.advance();
                     // Official `_parseAbstract` order chain (top-level member
@@ -283,19 +296,21 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     self.report(msg::extraneous_modifier("abstract"), t);
                     mods.abstract_kw = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Static) => {
+                TokenKind::Keyword(Keyword::Static) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
                     self.cursor.advance();
                     self.report(msg::extraneous_modifier("static"), t);
                     mods.static_kw = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Covariant) => {
+                TokenKind::Keyword(Keyword::Covariant) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
                     self.cursor.advance();
                     self.report(msg::extraneous_modifier("covariant"), t);
                     mods.covariant = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Late) if mods.late_kw.is_none() => {
+                TokenKind::Keyword(Keyword::Late)
+                    if mods.late_kw.is_none() && self.is_modifier_at(0) =>
+                {
                     let t = self.peek_span();
                     self.cursor.advance();
                     if let Some(vfc) = mods.var_final_or_const {
@@ -780,14 +795,20 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// Class-member modifier walk (official `ModifierContext._parseModifiers`
     /// handlers + `parseClassMemberModifiers`). Every arm mirrors its
     /// official `_parse<Key>` handler: order checks against already-seen
-    /// modifiers, then the duplicate/recovery reports.
+    /// modifiers, then the duplicate/recovery reports. Built-in modifier
+    /// arms are gated on the official `isModifier` follower rule
+    /// (modifier_context.dart:13-53), so `late;` inside a class recovers as
+    /// a field NAMED `late` (official `!next.isIdentifier` fall-through)
+    /// instead of a synthetic-named field.
     fn walk_class_member_modifiers(&mut self) -> MemberModifiers {
         let mut mods = MemberModifiers::default();
         let mut static_seen = false;
         let mut covariant_seen = false;
         loop {
             match self.peek_kind() {
-                TokenKind::Keyword(Keyword::External) if mods.external.is_none() => {
+                TokenKind::Keyword(Keyword::External)
+                    if mods.external.is_none() && self.is_modifier_at(0) =>
+                {
                     let t = self.peek_span();
                     self.cursor.advance();
                     // Official `_parseExternal` order chain (no augment arm).
@@ -806,7 +827,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     }
                     mods.external = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Augment) if mods.augment.is_none() => {
+                TokenKind::Keyword(Keyword::Augment)
+                    if mods.augment.is_none() && self.is_modifier_at(0) =>
+                {
                     let t = self.peek_span();
                     self.cursor.advance();
                     // Official `_parseAugment` order chain.
@@ -833,7 +856,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     }
                     mods.augment = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Abstract) if mods.abstract_kw.is_none() => {
+                TokenKind::Keyword(Keyword::Abstract)
+                    if mods.abstract_kw.is_none() && self.is_modifier_at(0) =>
+                {
                     let t = self.peek_span();
                     self.cursor.advance();
                     // Official `_parseAbstract` order chain.
@@ -848,7 +873,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                     }
                     mods.abstract_kw = Some(t);
                 }
-                TokenKind::Keyword(Keyword::Static) => {
+                TokenKind::Keyword(Keyword::Static) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
                     self.cursor.advance();
                     if !covariant_seen && !static_seen {
@@ -873,7 +898,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         self.report(msg::duplicated_modifier("static"), t);
                     }
                 }
-                TokenKind::Keyword(Keyword::Covariant) => {
+                TokenKind::Keyword(Keyword::Covariant) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
                     self.cursor.advance();
                     if !covariant_seen && !static_seen && mods.const_kw.is_none() {
@@ -899,7 +924,9 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         self.report(msg::conflicting_modifiers("covariant", "const"), t);
                     }
                 }
-                TokenKind::Keyword(Keyword::Late) if mods.late_kw.is_none() => {
+                TokenKind::Keyword(Keyword::Late)
+                    if mods.late_kw.is_none() && self.is_modifier_at(0) =>
+                {
                     let t = self.peek_span();
                     self.cursor.advance();
                     // Official `_parseLate` order chain.
@@ -963,7 +990,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                         self.report(msg::conflicting_modifiers("const", "var"), t);
                     }
                 }
-                TokenKind::Keyword(Keyword::Required) => {
+                TokenKind::Keyword(Keyword::Required) if self.is_modifier_at(0) => {
                     let t = self.peek_span();
                     self.cursor.advance();
                     // Official `_parseRequired` order chain (the member-level

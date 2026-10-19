@@ -134,7 +134,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             TokenKind::Keyword(Keyword::Return) => self.parse_return_statement(),
             TokenKind::Keyword(Keyword::Var | Keyword::Final) => {
                 let var_or_final = self.peek_span();
-                if self.is_statement_modifier_at(1) {
+                if self.is_modifier_at(1) {
                     self.parse_expression_statement_or_declaration(false);
                 } else {
                     self.cursor.advance();
@@ -364,7 +364,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// Official `parseExpressionStatementOrConstDeclaration`: `const`
     /// disambiguation in statement position.
     fn parse_expression_statement_or_const_declaration(&mut self) {
-        if self.is_statement_modifier_at(1) {
+        if self.is_modifier_at(1) {
             // `const` leads a modifier run: the wrapper walk consumes it.
             self.parse_expression_statement_or_declaration(false);
             return;
@@ -422,7 +422,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
 
         let mut late_kw: Option<TokenSpan> = None;
         let mut var_final_or_const: Option<TokenSpan> = None;
-        if self.is_statement_modifier_at(0) {
+        if self.is_modifier_at(0) {
             if self.peek_kind() == TokenKind::Keyword(Keyword::Augment)
                 && self.cursor.look_kind(1) == TokenKind::Keyword(Keyword::Super)
             {
@@ -441,7 +441,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 TokenKind::Keyword(Keyword::Late) => {
                     late_kw = Some(self.peek_span());
                     self.cursor.advance();
-                    if self.is_statement_modifier_at(0)
+                    if self.is_modifier_at(0)
                         && matches!(
                             self.peek_kind(),
                             TokenKind::Keyword(Keyword::Var | Keyword::Final)
@@ -453,13 +453,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                 }
                 _ => {}
             }
-            if self.is_statement_modifier_at(0) {
+            if self.is_modifier_at(0) {
                 // Official `parseVariableDeclarationModifiers` recovery:
                 // consume the modifier run, then report the declaration-only
                 // modifiers as extraneous.
                 let mut extraneous: Vec<TokenSpan> = Vec::new();
                 let mut seen = [false; 6];
-                while self.is_statement_modifier_at(0) {
+                while self.is_modifier_at(0) {
                     let token = self.peek_span();
                     let extraneous_index = match self.peek_kind() {
                         TokenKind::Keyword(Keyword::Abstract) => Some(0),
@@ -2033,7 +2033,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     /// Official `isModifier` (`modifier_context.dart:13`) at cursor-relative
     /// offset `n`, including the built-in follower and record-type
     /// refinements.
-    fn is_statement_modifier_at(&self, n: usize) -> bool {
+    /// Official `isModifier` (modifier_context.dart:13-53): the raw
+    /// modifier-keyword set, with the built-in half additionally gated on
+    /// the follower — a built-in keyword is only a modifier when followed
+    /// by another keyword or an identifier (record-shape aware), otherwise
+    /// it IS the identifier (`late;` names the field, `external()` is a
+    /// call). Shared by the statement and member modifier walks.
+    pub(crate) fn is_modifier_at(&self, n: usize) -> bool {
         let TokenKind::Keyword(keyword) = self.cursor.look_kind(n) else {
             return false;
         };

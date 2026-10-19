@@ -22,7 +22,9 @@ use super::collector::setup;
 
 /// Exact stream for a member head missing its name before a `;`. Oracle
 /// 3.13.1 (`dart analyze --format=machine`, `late;\nint x;\n`): the `late`
-/// head recovers silently — the inserted-name face only fires with a
+/// head carries no diagnostics of its own — built-in `late` before `;` is
+/// not a modifier (official `isModifier`), so it IS the field name and no
+/// name is inserted; the inserted-name face only fires with a
 /// `var`/`final`/`const` modifier (`var ;` probe) — and `parseFields`'s
 /// type-less rider anchors on the member head `late` (offset 0..4), not the
 /// follower `;`. The earlier two-row pin predated the live probe.
@@ -36,9 +38,10 @@ fn late_semicolon_top_level_single_missing_identifier() {
 }
 
 /// The class-member flavor (`late;` inside a class): same oracle split —
-/// the silent head insert and ONE type-less rider anchored on the `late`
-/// keyword (probed 3.13.1: line 2 col 3, len 4), never
-/// `expectedClassMember` and never a name-slot `missing_identifier`.
+/// built-in `late` before `;` is the member NAME (no insert) and ONE
+/// type-less rider anchors on the `late` keyword (probed 3.13.1: line 2
+/// col 3, len 4), never `expectedClassMember` and never a name-slot
+/// `missing_identifier`.
 #[test]
 fn late_semicolon_class_member_official_stream() {
     let mut p = setup("class C {\n  late;\n}\n");

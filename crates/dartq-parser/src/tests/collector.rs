@@ -57,6 +57,11 @@ pub(crate) struct Collector {
     pub texts: Vec<String>,
     pub corrections: Vec<Option<String>>,
     pub log: Vec<Logged>,
+    /// Identifier events: (context Debug label, UTF-16 start, UTF-16 end,
+    /// log index at fire time). Offsets pin WHICH token a declaration or
+    /// reference names; the log index interleaves identifier events with
+    /// the structural log for nesting assertions.
+    pub idents: Vec<(String, u32, u32, usize)>,
 }
 
 impl Collector {
@@ -80,6 +85,15 @@ impl Collector {
 }
 
 impl ParserListener for Collector {
+    fn handle_identifier(&mut self, token: Token, context: crate::listener::IdentifierContext) {
+        self.idents.push((
+            format!("{context:?}"),
+            token.range.offset,
+            token.range.offset + token.range.length,
+            self.log.len(),
+        ));
+    }
+
     fn handle_recoverable_error(&mut self, message: Message, start: TokenSpan, end: TokenSpan) {
         self.texts.push(message.text);
         self.corrections.push(message.correction);
