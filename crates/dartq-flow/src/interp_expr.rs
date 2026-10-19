@@ -1433,11 +1433,21 @@ impl Interp<'_> {
         match tested.base {
             Base::Unknown | Base::Dynamic | Base::Void => None,
             _ => {
-                let declared_args = self
-                    .vars
-                    .get(var as usize)
-                    .map_or(crate::ty::EMPTY_ARGS, |meta| meta.args);
-                if !self.args_admit(tested, tested_args, declared_args) {
+                // The argument gate applies to same-base spellings only
+                // (`x is List` on `List<int> x`): a cross-base raw test
+                // (`option is Some` on `Option<T> option`) spells its own
+                // instantiation, and whether that stands below the declared
+                // one is the hierarchy question this seam cannot decide —
+                // the pattern face's gate
+                // ([`Self::pattern_promotion_candidate`]) already skips the
+                // argument check cross-base for the same reason, and the
+                // undecided case promotes optimistically for the resolved
+                // back-end to re-tighten.
+                let meta = self.vars.get(var as usize);
+                let declared_args = meta.map_or(crate::ty::EMPTY_ARGS, |meta| meta.args);
+                if meta.is_some_and(|meta| meta.ty.base == tested.base)
+                    && !self.args_admit(tested, tested_args, declared_args)
+                {
                     return None;
                 }
                 self.factored_candidate(var, tested)

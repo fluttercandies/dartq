@@ -6537,3 +6537,46 @@ fn constructor_initialized_final_receiver_never_promotes() {
     );
 }
 
+
+/// `Option<T> option; option is Some` — a raw tested type against a
+/// written generic declaration of a DIFFERENT base — promotes
+/// optimistically: whether `Some<dynamic>` stands below `Option<T>` is the
+/// class-hierarchy question the name-level seam cannot decide (the
+/// `args_admit` gate decides only the same-base spelling `x is List` on
+/// `List<int> x`, where `List<dynamic>` provably is no subtype). The
+/// pattern face (`case Some():`) gates identically — same-base only — so
+/// the two faces agree on `Option<T>`'s scrutinee. The resolved back-end
+/// re-tightens the undecided arm through `TypeOps::try_promote_to`.
+#[test]
+fn cross_base_raw_tested_against_written_declaration_promotes() {
+    let source = "void f<T>(List<int> x, Option<T> option) {\n\
+                      x is List;\n\
+                      if (option is Some) { option; }\n\
+                  }";
+    let facts = facts_of(source);
+    let promoted_offsets: Vec<u32> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::PromotedRead { span, .. } => Some(span.range.offset),
+            _ => None,
+        })
+        .collect();
+    // The if-body `option` read carries the `Some` promotion.
+    let if_body_read = source.rfind("option").unwrap() as u32;
+    assert!(
+        promoted_offsets.contains(&if_body_read),
+        "the cross-base raw test promotes the scrutinee: {facts:?}"
+    );
+    // The same-base raw test still refuses (`List<dynamic>` is no subtype
+    // of `List<int>`): `x` carries no promotion at all.
+    let list_reads: Vec<u32> = source
+        .match_indices("x")
+        .map(|(offset, _)| offset as u32)
+        .collect();
+    assert!(
+        list_reads
+            .iter()
+            .all(|offset| !promoted_offsets.contains(offset)),
+        "the same-base raw test must not promote: {facts:?}"
+    );
+}
