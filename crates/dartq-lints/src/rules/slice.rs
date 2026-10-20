@@ -75,7 +75,7 @@ pub(crate) fn statement_run(c: &Check<'_>, run: &[u32]) -> Vec<u32> {
 /// open at the header. The cut restarts the run after the last flow-header
 /// row; block, initializer, and argument parents hold none and keep the run
 /// intact.
-fn flow_body_run<'a>(c: &Check<'_>, run: &'a [u32]) -> &'a [u32] {
+pub(crate) fn flow_body_run<'a>(c: &Check<'_>, run: &'a [u32]) -> &'a [u32] {
     let cut = run.iter().rposition(|&row| {
         matches!(
             c.kind(row),

@@ -1328,6 +1328,51 @@ fn foreach_chaining_and_receiver_face_pass() {
     );
 }
 
+/// The async-arrow face: the oracle-of-record (3.13.1) reports
+/// `[].forEach((e) async => …)` at the method name — the `async` modifier
+/// is parser-diet (an `ExpressionBody` payload word, no AST node), so the
+/// shape dispatches identically. The corpus face pairs it with earlier
+/// statements in the same block: their rows must not leak into the
+/// receiver run (an earlier `x.f()` is not method chaining on this
+/// invocation, an earlier `?.` is not its null-aware chain).
+#[test]
+fn foreach_async_arrow_reports_after_earlier_statements() {
+    let f =
+        Fixture::parse("void f() { [].where((e) => true); [].forEach((e) async => print(e)); }");
+    assert_eq!(
+        f.run(&one_rule("avoid_function_literals_in_foreach_calls"))
+            .len(),
+        1
+    );
+
+    let f = Fixture::parse(
+        "void f() { [].forEach((e) => print(e)); [].forEach((e) async => print(e)); }",
+    );
+    assert_eq!(
+        f.run(&one_rule("avoid_function_literals_in_foreach_calls"))
+            .len(),
+        2
+    );
+
+    let f = Fixture::parse(
+        "void f() { final h = (e) => print(e); h(1); [].forEach((e) async => print(e)); }",
+    );
+    assert_eq!(
+        f.run(&one_rule("avoid_function_literals_in_foreach_calls"))
+            .len(),
+        1
+    );
+
+    // An earlier statement's null-aware access does not suppress the
+    // invocation's own face.
+    let f = Fixture::parse("void f(List<int>? xs) { xs?.length; [].forEach((e) => print(e)); }");
+    assert_eq!(
+        f.run(&one_rule("avoid_function_literals_in_foreach_calls"))
+            .len(),
+        1
+    );
+}
+
 // —— prefer_interpolation_to_compose_strings ———————————————————————————
 
 /// `name + ' (id)'` reports over the pair span. Production-bridge

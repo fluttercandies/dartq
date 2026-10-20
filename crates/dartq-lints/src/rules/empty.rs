@@ -1077,12 +1077,17 @@ pub(crate) mod one_member_abstracts {
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/one_member_abstracts.dart`
     /// — an abstract class with no `extends`/`with`/`implements` clauses,
-    /// no fields, and exactly one abstract *method* (accessors excluded,
-    /// `element.methods`) reports at the class name with the method name as
-    /// the argument. Every queried fact is syntactic here: the clause words
-    /// are the declaration payload, the fields are the [`NodeKind::Fields`]
-    /// members, a plain method is a [`NodeKind::Method`] with the
-    /// get/set word absent, and an abstract method's body is an
+    /// no fields, and exactly one abstract *method* reports at the class
+    /// name with the method name as the argument. The member tally is
+    /// version-bound: the oracle-of-record (Dart 3.13.x) counts accessor
+    /// members toward it — a getter beside the lone method lifts the
+    /// count to two and the class stays silent — while the 3.15-main
+    /// element model's `element.methods` excludes accessors. The tally
+    /// follows the 3.13.x oracle; revisit on oracle upgrade. Every
+    /// queried fact is syntactic here: the clause words are the
+    /// declaration payload, the fields are the [`NodeKind::Fields`]
+    /// members, a member is a [`NodeKind::Method`] row (the get/set word
+    /// marks accessors), and an abstract method's body is an
     /// [`NodeKind::EmptyBody`]. The official `isAugmentation`/null-element
     /// gates are wave-inert: `augment` is gated off at the scanner. The
     /// rule is `deprecated` upstream since 3.13 but stays registered and
@@ -1114,18 +1119,24 @@ pub(crate) mod one_member_abstracts {
         {
             return;
         }
-        // `element.methods`: plain methods only — accessors carry the
-        // get/set word, constructors/factories are separate kinds.
-        let methods: Vec<u32> = members
+        // Version-bound tally: the oracle-of-record (Dart 3.13.x, the
+        // pre-element-model visitor) counts accessor members in the member
+        // tally — a getter beside the lone abstract method lifts the count
+        // to two and the class stays silent. The 3.15-main element model
+        // reads `element.methods` (accessors excluded); revisit this count
+        // when the oracle-of-record upgrades. The reported member must
+        // still be a plain abstract method: an accessor-only class holds
+        // one member yet has no method to promote.
+        let tally: Vec<u32> = members
             .into_iter()
-            .filter(|&member| {
-                c.kind(member) == NodeKind::Method
-                    && c.payload(member).get(1).copied() == Some(NONE_TOKEN)
-            })
+            .filter(|&member| c.kind(member) == NodeKind::Method)
             .collect();
-        let [method] = methods[..] else {
+        let [method] = tally[..] else {
             return;
         };
+        if c.payload(method).get(1).copied() != Some(NONE_TOKEN) {
+            return;
+        }
         // `method.isAbstract`: the body is the empty `;` form.
         let Some(body) = super::last_child(c, method) else {
             return;
@@ -1180,21 +1191,24 @@ pub(crate) mod one_member_abstracts {
             assert!(f.run(&one_rule("one_member_abstracts")).is_empty());
         }
 
-        /// Accessors are not `element.methods`: an accessor-only class has
-        /// zero methods and stays silent.
+        /// Accessors count toward the member tally but are not the
+        /// reported method: an accessor-only class has one member yet no
+        /// plain method, so it stays silent.
         #[test]
         fn ignores_an_accessor_only_abstract_class() {
             let f = Fixture::parse("abstract class A { int get x; }");
             assert!(f.run(&one_member_abstracts_set()).is_empty());
         }
 
-        /// A getter beside a lone method leaves the method count at one —
-        /// the class reports.
+        /// Version-bound face: the oracle-of-record (Dart 3.13.x) counts
+        /// the getter in the member tally — a getter beside the lone
+        /// abstract method lifts the count to two and the class stays
+        /// silent. (3.15-main's `element.methods` excludes accessors and
+        /// would report; revisit on oracle upgrade.)
         #[test]
-        fn accessor_does_not_count_as_a_method() {
+        fn accessor_counts_in_the_member_tally() {
             let f = Fixture::parse("abstract class A { int get x; void m(); }");
-            let lints = f.run(&one_member_abstracts_set());
-            assert_eq!(lints.len(), 1);
+            assert!(f.run(&one_member_abstracts_set()).is_empty());
         }
 
         fn one_member_abstracts_set() -> crate::registry::EnableSet {

@@ -482,11 +482,16 @@ pub(crate) mod unnecessary_string_interpolations {
                     .collect();
                 let ty = faces::expr_type(c, analysis, &run)
                     .or_else(|| member_invoke_type(c, analysis, &run));
+                // The inferred-local fallback answers the `'${a}'` face —
+                // the brace form of the `'$a'` read — so it applies only
+                // when the whole expression is that lone identifier. A
+                // multi-row run (a member access like `d.length`, an
+                // invocation) reads the full expression's static type, and
+                // an unanswered face stays silent — the receiver's own
+                // type never stands in for the expression's.
                 if is_string(analysis, ty)
                     || (matches!(ty, Some(Ty::Unknown) | None)
-                        && run
-                            .first()
-                            .is_some_and(|&head_row| c.kind(head_row) == NodeKind::Identifier)
+                        && matches!(run.as_slice(), [ident] if c.kind(*ident) == NodeKind::Identifier)
                         && inferred_string_local(c, run[0]))
                 {
                     report_literal(c, head, close + 1);
@@ -2965,6 +2970,20 @@ mod tests {
         assert_eq!(lints.len(), 1, "{lints:?}");
         let start = f.source.find("'${a}'").unwrap() as u32;
         assert_eq!(lints[0].range, start..start + 6);
+    }
+
+    /// The member-access face reads the full expression's static type —
+    /// `'${d.length}'` over `var d = 'x'` interpolates an `int` and stays
+    /// silent (the oracle's row): the inferred-local fallback answers only
+    /// a lone-identifier run, never the receiver row of a longer run.
+    #[test]
+    fn interp_brace_member_access_passes() {
+        let f = Fixture::parse("void f() {\n  var d = 'x';\n  var h = '${d.length}';\n}");
+        assert!(
+            f.run_semantic(&one_rule("unnecessary_string_interpolations"))
+                .is_empty(),
+            "member access interpolates an int, not the String receiver"
+        );
     }
 
     /// A written nullable type answers at the read row (`String?`) — the

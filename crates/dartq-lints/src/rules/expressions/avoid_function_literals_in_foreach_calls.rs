@@ -66,18 +66,24 @@ fn check(c: &mut Check<'_>) {
     else {
         return;
     };
+    // The receiver run bounds at the statement body: the owner window of
+    // a block-level invocation carries every earlier statement's rows, and
+    // a flow arm carries its header rows — both poison the chain guards
+    // (an earlier `x.f()` reads as method chaining, an earlier `?.` reads
+    // as a null-aware chain) and the receiver face alike.
+    let receiver = slice::statement_run(c, slice::flow_body_run(c, &kids[..head]));
     // The chain guards: no method chaining in the target (:31-43 — the
     // official bails unconditionally, so it runs before the receiver
     // face whose opaque presumption would over-fire the chained shape),
     // no null-aware access below (:87), not inside a cascade (:45-48).
-    if has_method_chaining(c, &kids, head) {
+    if has_method_chaining(c, &receiver) {
         return;
     }
-    if chain_has_null_aware(c, &kids, head, Some(marker)) {
+    if chain_has_null_aware(c, &receiver, Some(marker)) {
         return;
     }
     // The receiver type check (:40-45 `_isIterable`).
-    if !receiver_is_iterable(c, &kids, head) {
+    if !receiver_is_iterable(c, &receiver) {
         return;
     }
     // The closure-arity stand-in for the opaque `Map.forEach` face: a
@@ -111,18 +117,24 @@ fn check(c: &mut Check<'_>) {
 /// written bare-name types — a user class is provably outside the
 /// family; a member receiver through the bridge when mounted), and an
 /// unresolvable receiver keeps the documented presumption.
-fn receiver_is_iterable(c: &Check<'_>, kids: &[u32], head: usize) -> bool {
-    super::static_type_faces::receiver_family(c, c.semantics(), kids, head, slice::ITERABLE)
-        .unwrap_or(true)
+fn receiver_is_iterable(c: &Check<'_>, receiver: &[u32]) -> bool {
+    super::static_type_faces::receiver_family(
+        c,
+        c.semantics(),
+        receiver,
+        receiver.len(),
+        slice::ITERABLE,
+    )
+    .unwrap_or(true)
 }
 
 /// `containsNullAwareInvocationInChain` (:87): the invocation's own
 /// marker word, or any null-aware access over the receiver run.
-fn chain_has_null_aware(c: &Check<'_>, kids: &[u32], head: usize, marker: Option<u32>) -> bool {
+fn chain_has_null_aware(c: &Check<'_>, receiver: &[u32], marker: Option<u32>) -> bool {
     if marker.is_some_and(|marker| c.payload(marker).get(1).copied().unwrap_or(0) != 0) {
         return true;
     }
-    kids[..head].iter().any(|&piece| {
+    receiver.iter().any(|&piece| {
         matches!(c.kind(piece), NodeKind::DotAccess | NodeKind::CascadeAccess)
             && c.payload(piece).get(1).copied().unwrap_or(0) != 0
     })
@@ -131,9 +143,9 @@ fn chain_has_null_aware(c: &Check<'_>, kids: &[u32], head: usize, marker: Option
 /// `_hasMethodChaining` (:31-43): the target carries an invocation — a
 /// `Send` piece in the receiver run preceded by an argument group (a
 /// chained call; the bare-name reads trail a `NoArguments`).
-fn has_method_chaining(c: &Check<'_>, kids: &[u32], head: usize) -> bool {
-    kids[..head].iter().enumerate().any(|(i, &piece)| {
-        c.kind(piece) == NodeKind::Send && i > 0 && c.kind(kids[i - 1]) == NodeKind::Arguments
+fn has_method_chaining(c: &Check<'_>, receiver: &[u32]) -> bool {
+    receiver.iter().enumerate().any(|(i, &piece)| {
+        c.kind(piece) == NodeKind::Send && i > 0 && c.kind(receiver[i - 1]) == NodeKind::Arguments
     })
 }
 
