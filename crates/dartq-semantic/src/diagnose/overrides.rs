@@ -1,5 +1,107 @@
 use super::*;
 
+/// The frozen `dart:collection` list-base face (upstream Dart SDK source,
+/// `sdk/lib/collection/list.dart` — `abstract mixin class ListBase<E>
+/// implements List<E>`, `typedef ListMixin<E> = ListBase<E>`): every
+/// member the SDK projection's names-only stubs cannot carry, split by
+/// the declaration's abstractness and kind. The base implements all of
+/// `List`'s interface except the four forwarding points its doc names
+/// ("Forwarding just the four `length` and `[]` read/write operations")
+/// — those stay abstract, so a `with ListMixin` class missing the `length`
+/// setter reports `setter List.length` missing exactly like the oracle
+/// (`DriftResultSet with ListMixin<DriftRow>`); everything else joins the
+/// concrete-implementation set. Kinds matter only to the getter/method
+/// conflict face — they mirror the SDK declarations. `(member, abstract,
+/// kind)` with kind 0 = method, 1 = setter, 2 = getter.
+const LIST_BASE_FACE: &[(&str, bool, u8)] = &[
+    ("length", true, 2),
+    ("length=", true, 1),
+    ("[]", true, 0),
+    ("[]=", true, 0),
+    ("iterator", false, 2),
+    ("isEmpty", false, 2),
+    ("isNotEmpty", false, 2),
+    ("first", false, 2),
+    ("first=", false, 1),
+    ("last", false, 2),
+    ("last=", false, 1),
+    ("single", false, 2),
+    ("reversed", false, 2),
+    ("elementAt", false, 0),
+    ("followedBy", false, 0),
+    ("forEach", false, 0),
+    ("contains", false, 0),
+    ("every", false, 0),
+    ("any", false, 0),
+    ("firstWhere", false, 0),
+    ("lastWhere", false, 0),
+    ("singleWhere", false, 0),
+    ("join", false, 0),
+    ("where", false, 0),
+    ("whereType", false, 0),
+    ("map", false, 0),
+    ("expand", false, 0),
+    ("reduce", false, 0),
+    ("fold", false, 0),
+    ("skip", false, 0),
+    ("skipWhile", false, 0),
+    ("take", false, 0),
+    ("takeWhile", false, 0),
+    ("toList", false, 0),
+    ("toSet", false, 0),
+    ("add", false, 0),
+    ("addAll", false, 0),
+    ("remove", false, 0),
+    ("removeWhere", false, 0),
+    ("retainWhere", false, 0),
+    ("clear", false, 0),
+    ("cast", false, 0),
+    ("removeLast", false, 0),
+    ("sort", false, 0),
+    ("shuffle", false, 0),
+    ("asMap", false, 0),
+    ("+", false, 0),
+    ("sublist", false, 0),
+    ("getRange", false, 0),
+    ("removeRange", false, 0),
+    ("fillRange", false, 0),
+    ("setRange", false, 0),
+    ("replaceRange", false, 0),
+    ("indexOf", false, 0),
+    ("indexWhere", false, 0),
+    ("lastIndexOf", false, 0),
+    ("lastIndexWhere", false, 0),
+    ("insert", false, 0),
+    ("removeAt", false, 0),
+    ("insertAll", false, 0),
+    ("setAll", false, 0),
+];
+
+/// The outcome of the inherited-signature instantiation face: the
+/// signature carried no super-face type parameters (compare as read), the
+/// edge arguments resolved to a substitution environment (compare
+/// substituted), or the environment is unknowable at the M1 name level
+/// (the face comparison suppresses — the under-report direction, never a
+/// false positive).
+enum Instantiated {
+    Unchanged,
+    Applied(FxHashMap<StringId, Ty>),
+    Undecidable,
+}
+
+/// The written supertype clause of one current-file container header: its
+/// own type-parameter spellings in declaration order, and each
+/// `extends`/`with`/`implements` face as (head, written argument types —
+/// one per parameter). Built by a single bounded token walk
+/// ([`Engine::scan_header_clauses`]); a header whose clauses parse
+/// unfaithfully (a function- or record-typed argument, recovery residue)
+/// contributes no entry — its edges instantiate to unknown, the
+/// suppression direction.
+struct HeaderClause {
+    params: Vec<StringId>,
+    supers: Vec<(StringId, Vec<Ty>)>,
+}
+
 impl<'a> Engine<'a> {
     /// Walks `container`'s member face through the linearized supertype
     /// chain: the container's own members, then its `with` mixins in reverse
@@ -336,8 +438,14 @@ impl<'a> Engine<'a> {
         faces.extend(decl.implements_clause.iter().copied());
         faces.extend(decl.on_clause.iter().copied());
         let mut broken_seen: Vec<Projected<'a, MemberEntry>> = Vec::new();
+        // The written clause facts, built on first need — an inherited
+        // signature carrying free type parameters — and shared across the
+        // face loop (one token walk per check).
+        let mut facts: Option<FxHashMap<StringId, HeaderClause>> = None;
         for face in faces {
-            let Some((inherited, face_name, origin)) = self.face_member(face, spelling) else {
+            let Some((inherited, face_name, origin, chain)) =
+                self.face_member_tracked(face, spelling)
+            else {
                 // Unresolvable or cyclic face chain: suppression territory
                 // (recovery residue in a clause lands here too).
                 continue;
@@ -356,10 +464,34 @@ impl<'a> Engine<'a> {
             {
                 continue;
             }
+            // The super-face type-argument substitution
+            // (`Substitution.fromInterfaceType`): the inherited signature
+            // read through a generic super face carries that face's own
+            // type parameters — the oracle compares the signature
+            // instantiated by the edge's written arguments. Free
+            // parameters in the inherited signature are the M1 model's
+            // unsubstituted reads; the substitution face resolves them
+            // from the written clause arguments (exact where the chain's
+            // edges live in this file), suppresses the face where they do
+            // not (the under-report direction).
+            let substituted;
+            let inherited_ref: &MemberEntry = match self.instantiate_inherited(
+                &chain,
+                &inherited,
+                container,
+                &mut facts,
+            ) {
+                Instantiated::Unchanged => &inherited,
+                Instantiated::Applied(env) => {
+                    substituted = self.substitute_entry(&inherited, &env);
+                    &substituted
+                }
+                Instantiated::Undecidable => continue,
+            };
             if self.override_broken(
                 entry,
                 (self.file, container),
-                &inherited,
+                inherited_ref,
                 (origin, face_name),
             ) {
                 broken_seen.push(inherited.clone());
@@ -368,7 +500,7 @@ impl<'a> Engine<'a> {
                 let container_text = self.strings.resolve(container);
                 let declared_text = self.override_signature_text(entry);
                 let face_text = self.strings.resolve(face_name);
-                let inherited_text = self.override_signature_text(&inherited);
+                let inherited_text = self.override_signature_text(inherited_ref);
                 let setter = entry.kind == MemberKind::Setter;
                 let code = if setter {
                     SemanticCode::InvalidOverrideSetter
@@ -383,7 +515,7 @@ impl<'a> Engine<'a> {
                     &declared_text,
                     face_text,
                     &inherited_text,
-                    overridden_member_context(&inherited, origin, setter),
+                    overridden_member_context(inherited_ref, origin, setter),
                 );
             }
         }
@@ -842,6 +974,16 @@ impl<'a> Engine<'a> {
             if !(body_present || top_level) {
                 continue;
             }
+            // The empty-`>`-body top-level arm still excludes an `external`
+            // header (`defaultValuesAreExpected`'s augment/external/native
+            // exclusions, error_verifier.dart:8327-8372) —
+            // `@JS('fetch') external JSPromise<Response> _fetch(...)` in the
+            // http corpus takes defaults in its JS embedding, never from
+            // Dart. The listener's own external bit is owned elsewhere
+            // (#2286), so this face reads the header tokens directly.
+            if top_level && self.header_is_external(check.name_range) {
+                continue;
+            }
             let code = if check.named {
                 SemanticCode::MissingDefaultValueForParameter
             } else {
@@ -850,6 +992,32 @@ impl<'a> Engine<'a> {
             let name = self.strings.resolve(check.name).to_string();
             self.stage_usage(code, check.name_range, &name);
         }
+    }
+
+    /// Whether the executable header holding the formal at `name_range` was
+    /// written `external`: walk back from the formal's name token to the
+    /// header's `;`/`{`/`}` boundary (the previous member's terminator) and
+    /// look for the `external` modifier. Comments never intervene (the
+    /// scanner drops them), and the boundary stops the walk inside the
+    /// previous member, so the scan cannot misread one. A 512-token cap
+    /// bounds a pathological unclosed header; the first declaration in a
+    /// file walks to index 0.
+    fn header_is_external(&self, name_range: SourceRange) -> bool {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < name_range.offset);
+        let mut index = match at.checked_sub(1) { Some(i) => i, None => return false };
+        for _ in 0..512 {
+            match self.tokens.lexeme(self.source, index) {
+                ";" | "{" | "}" => return false,
+                "external" => return true,
+                _ => {}
+            }
+            if index == 0 {
+                return false;
+            }
+            index -= 1;
+        }
+        false
     }
 
     /// Drops the staged rows (the native/skipped-body arms of
@@ -1807,7 +1975,7 @@ impl<'a> Engine<'a> {
                 kind == ContainerKind::Enum || (!decl.is_abstract && !decl.sealed);
             if concrete_target && let Some(view) = self.collect_interface(decl) {
                 self.abstract_completeness(kind, decl, &conflicted, &view, name_range);
-                self.implementation_overrides(decl, &view, name_range);
+                self.implementation_overrides(container, decl, &view, name_range);
                 self.must_be_overridden(decl, &view, name_range);
             }
         }
@@ -1834,14 +2002,32 @@ impl<'a> Engine<'a> {
             if !seen.insert(name) {
                 return None;
             }
-            let (found, found_owner) = resolve_container(
+            // An unresolvable hop degrades to the oracle's `supertype`
+            // fallback, not a broken chain: `extends Missing` lands the
+            // member-less `Object` face and the walk ends there, so the
+            // accumulated hits stand (the abstract-completeness face still
+            // reports a resolvable `implements` member — `SecurityLintCode
+            // extends DiagnosticCodeImpl implements LintCode`, where the
+            // `_fe_analyzer_shared` edge is dead but `LintCode`'s interface
+            // names report). A top-level miss returns the empty face; a
+            // nested miss ends the climb like a `None` superclass.
+            let Some((found, found_owner)) = resolve_container(
                 self.graph,
                 self.namespaces,
                 self.index,
                 scope_lib,
                 owner,
                 name,
-            )?;
+            ) else {
+                // A dead hop whose spelling names the frozen list face
+                // (`with ListMixin` over a names-only SDK projection the
+                // index cannot model) still contributes its members.
+                self.frozen_list_face_hits(name, owner, top_concrete, &mut hits);
+                return Some(hits);
+            };
+            if found.members.is_empty() {
+                self.frozen_list_face_hits(name, found_owner, top_concrete, &mut hits);
+            }
             for (member, entry) in &found.members {
                 if !entry.is_static {
                     hits.push(FaceEntry {
@@ -1870,6 +2056,9 @@ impl<'a> Engine<'a> {
                     found_owner,
                     *mixin,
                 ) {
+                    if mixin_container.members.is_empty() {
+                        self.frozen_list_face_hits(*mixin, mixin_owner, true, &mut hits);
+                    }
                     for (member, entry) in &mixin_container.members {
                         if !entry.is_static {
                             hits.push(FaceEntry {
@@ -1881,6 +2070,8 @@ impl<'a> Engine<'a> {
                             });
                         }
                     }
+                } else {
+                    self.frozen_list_face_hits(*mixin, found_owner, true, &mut hits);
                 }
             }
             for interface in &found.implements_clause {
@@ -1892,6 +2083,9 @@ impl<'a> Engine<'a> {
                     found_owner,
                     *interface,
                 ) {
+                    if interface_container.members.is_empty() {
+                        self.frozen_list_face_hits(*interface, interface_owner, false, &mut hits);
+                    }
                     for (member, entry) in &interface_container.members {
                         if !entry.is_static {
                             hits.push(FaceEntry {
@@ -1908,6 +2102,8 @@ impl<'a> Engine<'a> {
                             });
                         }
                     }
+                } else {
+                    self.frozen_list_face_hits(*interface, found_owner, false, &mut hits);
                 }
             }
             // The chain ends here (Object is unindexed) — enumeration
@@ -1918,6 +2114,64 @@ impl<'a> Engine<'a> {
             scope_lib = owner_lib;
             name = superclass;
             owner = found_owner;
+        }
+    }
+
+    /// The frozen list face a names-only SDK stub cannot carry, appended to
+    /// `hits` when `face`'s spelling names `dart:collection`'s list family
+    /// ([`LIST_BASE_FACE`]; upstream Dart SDK source,
+    /// `sdk/lib/collection/list.dart` — `ListBase`/`ListMixin` and the
+    /// `List` interface they carry). The SDK projection is names-only: a
+    /// hop whose container the index cannot model — or models member-less —
+    /// contributes nothing, so a `with ListMixin<RawRow>` class looked
+    /// complete while the oracle still demanded the base's abstract
+    /// forwarding points (`setter List.length` on a class declaring the
+    /// `length` getter, `[]`, `[]=`). Every entry carries [`Ty::Unknown`]
+    /// types, so override/comparison faces over it suppress — only the
+    /// completeness enumeration reads the rows. Not a list-family spelling:
+    /// a no-op (the common case; one string compare).
+    fn frozen_list_face_hits(
+        &self,
+        face: StringId,
+        owner_file: FileId,
+        top_concrete: bool,
+        hits: &mut Vec<FaceEntry<'a>>,
+    ) {
+        let text = self.strings.resolve(face);
+        let applies = text == "List"
+            || COLLECTION_INTERFACE_ALIASES
+                .iter()
+                .any(|(alias, targets)| text == *alias && targets.contains(&"List"));
+        if !applies {
+            return;
+        }
+        let list_name = self.intern("List");
+        for (member, r#abstract, kind) in LIST_BASE_FACE {
+            let entry = MemberEntry {
+                kind: match kind {
+                    1 => MemberKind::Setter,
+                    2 => MemberKind::Getter,
+                    _ => MemberKind::Method,
+                },
+                is_static: false,
+                is_abstract: *r#abstract,
+                is_external: false,
+                is_final: false,
+                type_params: 0,
+                type_param_names: Box::default(),
+                var_ty: Ty::Unknown,
+                return_ty: Ty::Unknown,
+                formals: None,
+                annotations: Box::default(),
+                name_range: MemberEntry::MISSING_NAME_RANGE,
+            };
+            hits.push(FaceEntry {
+                name: self.intern(member),
+                entry: Projected::Foreign(std::rc::Rc::new(entry)),
+                owner_name: list_name,
+                owner_file,
+                concrete_source: top_concrete,
+            });
         }
     }
 
@@ -2127,28 +2381,37 @@ impl<'a> Engine<'a> {
         // broken chain suppresses the whole check.
         let concrete_super_names: Option<FxHashSet<StringId>> = match decl.superclass {
             Some(superclass) => {
-                let Some((super_container, _)) = resolve_container(
+                match resolve_container(
                     self.graph,
                     self.namespaces,
                     self.index,
                     self.lib,
                     self.file,
                     superclass,
-                ) else {
-                    return;
-                };
-                // A sealed superclass is abstract at the element level
-                // (element.dart:150): its interface names stay the concrete
-                // subclass's to implement — no exemption.
-                if super_container.kind == ContainerKind::Class
-                    && (super_container.is_abstract || super_container.sealed)
-                {
-                    None
-                } else {
-                    let Some(hits) = self.face_entries(superclass, true) else {
-                        return;
-                    };
-                    Some(hits.into_iter().map(|h| h.name).collect())
+                ) {
+                    // A dead superclass edge is the oracle's `Object`
+                    // fallback — no names to exempt, no suppression: the
+                    // `implements`/`with` faces' abstract names still
+                    // report (the `extends Missing` arm, diagnostic.g.dart's
+                    // `non_abstract_class_inherits_abstract_member` over an
+                    // unresolvable super).
+                    None => None,
+                    Some((super_container, _)) => {
+                        // A sealed superclass is abstract at the element
+                        // level (element.dart:150): its interface names
+                        // stay the concrete subclass's to implement — no
+                        // exemption.
+                        if super_container.kind == ContainerKind::Class
+                            && (super_container.is_abstract || super_container.sealed)
+                        {
+                            None
+                        } else {
+                            let Some(hits) = self.face_entries(superclass, true) else {
+                                return;
+                            };
+                            Some(hits.into_iter().map(|h| h.name).collect())
+                        }
+                    }
                 }
             }
             None => None,
@@ -2287,25 +2550,30 @@ impl<'a> Engine<'a> {
     }
 
     /// The interface loop's concrete-implementation face
-    /// (`inheritance_override.dart:412-481`): for every interface name with
-    /// an *inherited* concrete implementation — the first concrete hit over
-    /// the superclass and `with` faces — that member must be a valid
-    /// override of the interface map's most-specific member of the same
-    /// name. This is the residue the per-member `invalid_override` pass
-    /// cannot reach (no own declaration exists); the class's own concrete
-    /// members stay that pass's exclusive business — the oracle's interface
-    /// loop also re-reports own-member shapes, a duplication its TODO
-    /// (`inheritance_override.dart:463-469`) calls out as an artifact this
-    /// port does not replicate. When no candidate validly overrides all the
-    /// others (the conflict shapes) the pass skips — the conflict
-    /// diagnostics own those. Emissions anchor at the container's name (the
-    /// oracle's `classNameToken`, whose placement its own TODO calls out).
-    /// Kind mismatches skip (the oracle routes them to the member-kind
-    /// verifier), and a field entry never carries the setter face (its
-    /// getter-shaped type would compare with the wrong variance).
+    /// (`inheritance_override.dart:412-481`): for every interface name the
+    /// `implemented` map resolves — the class's own concrete member first,
+    /// then the first concrete hit over the `with` mixins and the
+    /// superclass — that member must be a valid override of the interface
+    /// map's most-specific member of the same name. The own-member source
+    /// is not optional: it *shadows* the inherited concrete member in the
+    /// official `implemented` map (`_addImplemented`), so a class declaring
+    /// its own `substitute` is compared by its own signature — the
+    /// inherited walk alone fabricates comparisons the oracle never runs
+    /// (`GetterElementImpl`'s own valid substitute read as
+    /// `ExecutableElementImpl`'s). Own-member shapes the oracle
+    /// double-reports (its TODO,
+    /// `inheritance_override.dart:463-469`) stay double-reported here —
+    /// the duplication is upstream behavior. When no candidate validly
+    /// overrides all the others (the conflict shapes) the pass skips — the
+    /// conflict diagnostics own those. Emissions anchor at the container's
+    /// name (the oracle's `classNameToken`, whose placement its own TODO
+    /// calls out). Kind mismatches skip (the oracle routes them to the
+    /// member-kind verifier), and a field entry never carries the setter
+    /// face (its getter-shaped type would compare with the wrong variance).
     pub(crate) fn implementation_overrides(
         &mut self,
-        decl: &Container,
+        container: StringId,
+        decl: &'a Container,
         view: &InterfaceView<'a>,
         name_range: SourceRange,
     ) {
@@ -2328,7 +2596,10 @@ impl<'a> Engine<'a> {
             let Some(specific) = self.most_specific(&hits) else {
                 continue;
             };
-            let Some(concrete) = Self::inherited_concrete_implementation(decl, view, *name) else {
+            let Some(concrete) = self
+                .own_concrete_implementation(container, decl, *name, setter_face)
+                .or_else(|| Self::inherited_concrete_implementation(decl, view, *name))
+            else {
                 continue;
             };
             if concrete.entry.kind != specific.entry.kind {
@@ -2386,6 +2657,54 @@ impl<'a> Engine<'a> {
                         (other.owner_file, other.owner_name),
                     )
             })
+        })
+    }
+
+    /// The class's own concrete member of `name` — `_addImplemented`'s first
+    /// source (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/element/inheritance_manager3.dart:318-338`
+    /// — own methods/getters/setters, non-abstract and non-static, enter the
+    /// `implemented` map before any mixin or super face, each level
+    /// replacing the last). A non-final field carries the setter half (the
+    /// implicit synthetic setter the element model lists under `setters`)
+    /// and the getter face accepts a field's implicit getter. `None` = no
+    /// own concrete member; the inherited walk decides.
+    fn own_concrete_implementation(
+        &self,
+        container: StringId,
+        decl: &'a Container,
+        name: StringId,
+        setter_face: bool,
+    ) -> Option<FaceEntry<'a>> {
+        let matches = |e: &MemberEntry| {
+            !e.is_static
+                && !e.is_abstract
+                && if setter_face {
+                    e.kind == MemberKind::Setter
+                        || (e.kind == MemberKind::Field && !e.is_final)
+                } else {
+                    e.kind == MemberKind::Getter || e.kind == MemberKind::Field
+                }
+        };
+        let entry = decl
+            .members
+            .get(&name)
+            .filter(|e| matches(*e))
+            .or_else(|| {
+                if !setter_face {
+                    return None;
+                }
+                let bare = self
+                    .strings
+                    .intern(self.strings.resolve(name).strip_suffix('=')?);
+                decl.members.get(&bare).filter(|e| matches(*e))
+            })?;
+        Some(FaceEntry {
+            name,
+            entry: self.boundary.member(self.file, container, name, entry),
+            owner_name: container,
+            owner_file: self.file,
+            concrete_source: true,
         })
     }
 
@@ -2673,10 +2992,30 @@ impl<'a> Engine<'a> {
         face: StringId,
         spelling: StringId,
     ) -> Option<(Projected<'a, MemberEntry>, StringId, FileId)> {
+        self.face_member_tracked(face, spelling)
+            .map(|(entry, name, owner, _)| (entry, name, owner))
+    }
+
+    /// [`Self::face_member`] with the climb's hop chain (visited order, the
+    /// found hop last): the `check_override` substitution composes the
+    /// super-face type-argument environment along it (each edge's written
+    /// `extends`/`with`/`implements` arguments instantiate the next hop's
+    /// parameters, `Substitution.fromInterfaceType`'s walk).
+    pub(crate) fn face_member_tracked(
+        &self,
+        face: StringId,
+        spelling: StringId,
+    ) -> Option<(
+        Projected<'a, MemberEntry>,
+        StringId,
+        FileId,
+        Vec<(StringId, FileId)>,
+    )> {
         let mut name = face;
         let mut owner = self.file;
         let mut scope_lib = self.lib;
         let mut seen = FxHashSet::default();
+        let mut chain: Vec<(StringId, FileId)> = Vec::new();
         // The `implements`/`on` faces a resolved hop leaves unclimbed — the
         // linear superclass chain handles `extends`+`with`; when it dead-ends
         // (no superclass), the interface faces keep the climb alive in
@@ -2706,6 +3045,7 @@ impl<'a> Engine<'a> {
                     continue;
                 }
             };
+            chain.push((name, found_owner));
             if let Some(entry) = found.members.get(&spelling)
                 && !entry.is_static
             {
@@ -2715,6 +3055,7 @@ impl<'a> Engine<'a> {
                     self.boundary.member(found_owner, name, spelling, entry),
                     name,
                     found_owner,
+                    chain,
                 ));
             }
             // The mixin/superclass names are written in `found_owner` and
@@ -2735,14 +3076,18 @@ impl<'a> Engine<'a> {
                     mixin_lib,
                     owner,
                     *mixin,
-                ) && let Some(entry) = mixin_container.members.get(&spelling)
-                    && !entry.is_static
-                {
-                    return Some((
-                        self.boundary.member(mixin_owner, *mixin, spelling, entry),
-                        *mixin,
-                        mixin_owner,
-                    ));
+                ) {
+                    chain.push((*mixin, mixin_owner));
+                    if let Some(entry) = mixin_container.members.get(&spelling)
+                        && !entry.is_static
+                    {
+                        return Some((
+                            self.boundary.member(mixin_owner, *mixin, spelling, entry),
+                            *mixin,
+                            mixin_owner,
+                            chain,
+                        ));
+                    }
                 }
             }
             // The interface faces this hop does not climb inline: `implements`
@@ -2771,6 +3116,533 @@ impl<'a> Engine<'a> {
                     scope_lib = owner_lib;
                 }
             }
+        }
+    }
+
+    /// The super-face type-argument substitution
+    /// (`inheritance_manager3.dart`'s instantiated member map — the
+    /// inherited signature the oracle's `isCorrectOverrideOf` reads is the
+    /// member's declaration with the super face's written arguments
+    /// substituted for its type parameters). The M1 model strips clauses
+    /// to names, so the environment composes from the written clause
+    /// facts: exact where every edge from the diagnosing container to the
+    /// declaring hop lives in this file (the header token walk supplies
+    /// both the arguments and the declaring hop's parameter names),
+    /// name-forced where the declaring hop is foreign but its parameter
+    /// count is one (the single free spelling maps to the single written
+    /// argument), and undecidable elsewhere. Free parameters in the
+    /// inherited signature with an undecidable environment suppress the
+    /// face comparison — comparing them unsubstituted is how
+    /// `D? fromSql(S?)` over `TypeConverter<D?, S?>`'s `D fromSql(S)`
+    /// false-broke.
+    fn instantiate_inherited(
+        &self,
+        chain: &[(StringId, FileId)],
+        inherited: &MemberEntry,
+        container: StringId,
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> Instantiated {
+        let Some((hop_name, hop_owner)) = chain.last().copied() else {
+            return Instantiated::Unchanged;
+        };
+        let free = self.super_free_params(inherited, hop_owner);
+        if free.is_empty() {
+            return Instantiated::Unchanged;
+        }
+        // The environment at the declaring hop, composed along the chain.
+        // `None` = an unknowable environment (a foreign edge's arguments
+        // never enter the walk).
+        fn clause<'a>(
+            self_: &Engine<'_>,
+            facts: &'a mut Option<FxHashMap<StringId, HeaderClause>>,
+        ) -> &'a mut FxHashMap<StringId, HeaderClause> {
+            facts.get_or_insert_with(|| self_.scan_header_clauses())
+        }
+        let mut env: Option<FxHashMap<StringId, Ty>> = Some(FxHashMap::default());
+        for (index, &(hop, hop_file)) in chain.iter().enumerate() {
+            // The edge written for this hop: the direct face's edge lives
+            // in the diagnosing container's header; a deeper hop's edge
+            // lives in the previous hop's header — same-file headers only.
+            let incoming: Option<Vec<Ty>> = if index == 0 {
+                clause(self, facts)
+                    .get(&container)
+                    .and_then(|c| c.supers.iter().find(|(head, _)| *head == hop))
+                    .map(|(_, args)| args.clone())
+            } else {
+                let (prev, prev_file) = chain[index - 1];
+                if prev_file != self.file {
+                    None
+                } else {
+                    clause(self, facts)
+                        .get(&prev)
+                        .and_then(|c| c.supers.iter().find(|(head, _)| *head == hop))
+                        .map(|(_, args)| args.clone())
+                }
+            };
+            let Some(args) = incoming else {
+                return Instantiated::Undecidable;
+            };
+            let prev = env.take();
+            // The hop's parameter names: same-file headers spell them;
+            // foreign hops expose only the count.
+            let hop_params: Option<Vec<StringId>> = if hop_file == self.file {
+                clause(self, facts).get(&hop).map(|c| c.params.clone())
+            } else {
+                None
+            };
+            env = match (hop_params, prev) {
+                (Some(params), prev) if params.len() == args.len() => {
+                    let substituted: Vec<crate::model::Ty> = match prev {
+                        Some(map) => args
+                            .iter()
+                            .map(|arg| self.substitute_ty(*arg, &map))
+                            .collect(),
+                        None => return Instantiated::Undecidable,
+                    };
+                    Some(params.into_iter().zip(substituted).collect())
+                }
+                _ => None,
+            };
+        }
+        // The found hop's environment decides. Exact names substitute
+        // directly; a foreign single-parameter hop maps its one free
+        // spelling to the single written argument (the name-forced rule).
+        if let Some(map) = env {
+            return Instantiated::Applied(map);
+        }
+        let foreign_single = hop_owner != self.file
+            && self
+                .index
+                .get(hop_owner)
+                .and_then(|f| f.container(hop_name))
+                .is_some_and(|c| c.type_params == 1);
+        if foreign_single && chain.len() == 1 && free.len() == 1 {
+            let incoming = clause(self, facts)
+                .get(&container)
+                .and_then(|c| c.supers.iter().find(|(head, _)| *head == hop_name))
+                .map(|(_, args)| args.clone());
+            if let Some([arg]) = incoming.as_deref() {
+                let mut map = FxHashMap::default();
+                map.insert(free[0], *arg);
+                return Instantiated::Applied(map);
+            }
+        }
+        Instantiated::Undecidable
+    }
+
+    /// The dead-superclass-edge subtype verdict — the oracle's `extends
+    /// Missing` fallback as a subtype question: an unresolvable, non-type-
+    /// parameter hop declares no supertype (the element lands on
+    /// `Object`), so the declared closure of `sub` is COMPLETE once every
+    /// visited head is either a resolved container (its written clauses),
+    /// a dead hop, or a core-chain member. A closed walk that folded at
+    /// least one dead edge and never reached `sup` answers `Some(false)` —
+    /// provably incomparable, the direction the name lattice's cut cannot
+    /// take (`XmlNodeList extends DelegatingList` over a dead
+    /// `package:collection` edge still not being a `List`). A walk with no
+    /// dead edge stays undecided — resolved hierarchies the M1 model
+    /// cannot see (SDK mixin chains) keep the under-report posture, and a
+    /// type-parameter hop cuts immediately (its bound is invisible).
+    fn dead_edge_subtype(
+        &self,
+        sub: StringId,
+        sub_scope: (FileId, StringId),
+        sup: StringId,
+    ) -> Option<bool> {
+        let Some(start) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.owner_library_of(sub_scope.0, sub_scope.1).unwrap_or(self.lib),
+            sub_scope.0,
+            sub,
+        ) else {
+            return None;
+        };
+        let mut queue: VecDeque<(FileId, StringId)> = VecDeque::new();
+        let mut seen: FxHashSet<StringId> = FxHashSet::default();
+        seen.insert(sub);
+        queue.push_back((start.1, sub));
+        let mut dead = false;
+        while let Some((file, container)) = queue.pop_front() {
+            let Some(decl) = self.index.get(file).and_then(|f| f.container(container)) else {
+                continue;
+            };
+            let lib = self.owner_library_of(file, container).unwrap_or(self.lib);
+            let edges = decl
+                .superclass
+                .into_iter()
+                .chain(decl.with_clause.iter().copied())
+                .chain(decl.implements_clause.iter().copied())
+                .chain(decl.on_clause.iter().copied());
+            for edge in edges {
+                if edge == sup {
+                    return Some(true);
+                }
+                if !seen.insert(edge) {
+                    continue;
+                }
+                match resolve_container(self.graph, self.namespaces, self.index, lib, file, edge) {
+                    Some((_, edge_owner)) => queue.push_back((edge_owner, edge)),
+                    None => {
+                        // A type parameter's supertypes ride its invisible
+                        // bound — the walk cannot close over one.
+                        if self
+                            .index
+                            .get(file)
+                            .and_then(|f| f.decl(edge))
+                            .is_some_and(|d| d.kind == crate::model::MicroKind::TypeParam)
+                        {
+                            return None;
+                        }
+                        // The oracle's dead hop: the face collapses to
+                        // `Object`, contributing nothing.
+                        dead = true;
+                    }
+                }
+            }
+            for (base, parent) in crate::switch_tracker::CORE_SUPERTYPES {
+                if self.strings.resolve(container) == base
+                    && self.strings.resolve(sup) == parent
+                {
+                    return Some(true);
+                }
+                if self.strings.resolve(container) == base {
+                    seen.insert(self.intern(parent));
+                }
+            }
+        }
+        dead.then_some(false)
+    }
+
+    /// The inherited entry's bare type-parameter spellings that are free in
+    /// the diagnosing scope: not the entry's own generics (a generic
+    /// method's parameters shadow its container's), but declared as a type
+    /// parameter in the declaring file's declaration set — the
+    /// unsubstituted container parameters the oracle never compares raw.
+    fn super_free_params(&self, entry: &MemberEntry, scope_file: FileId) -> Vec<StringId> {
+        let mut free: Vec<StringId> = Vec::new();
+        let push = |ty: Ty, free: &mut Vec<StringId>| {
+            if let Ty::Named {
+                name,
+                args: crate::model::ArgListId::EMPTY,
+                ..
+            } = ty
+                && !entry.type_param_names.contains(&name)
+                && !free.contains(&name)
+                && self
+                    .index
+                    .get(scope_file)
+                    .and_then(|f| f.decl(name))
+                    .is_some_and(|decl| decl.kind == crate::model::MicroKind::TypeParam)
+            {
+                free.push(name);
+            }
+        };
+        push(entry.var_ty, &mut free);
+        push(entry.return_ty, &mut free);
+        if let Some(formals) = entry.formals.as_deref() {
+            for formal in formals.positional.iter().chain(formals.named.iter()) {
+                push(formal.ty, &mut free);
+            }
+        }
+        free
+    }
+
+    /// Applies the substitution environment to the projected entry: a
+    /// mutable copy with every environment key replaced (the declaring
+    /// container's parameters instantiated by the super face's written
+    /// arguments — the entry's own generics never collide with the keys).
+    /// Argument lists re-intern bottom-up into the diagnosing pool, the
+    /// same single universe every comparison resolves through.
+    fn substitute_entry(&self, entry: &MemberEntry, keys: &FxHashMap<StringId, Ty>) -> MemberEntry {
+        let mut copy = entry.clone();
+        copy.var_ty = self.substitute_ty(copy.var_ty, keys);
+        copy.return_ty = self.substitute_ty(copy.return_ty, keys);
+        if let Some(formals) = &mut copy.formals {
+            for formal in formals
+                .positional
+                .iter_mut()
+                .chain(formals.named.iter_mut())
+            {
+                formal.ty = self.substitute_ty(formal.ty, keys);
+            }
+        }
+        copy
+    }
+
+    /// One `Ty` under the substitution: a bare parameter spelling in the
+    /// key set becomes its written argument (the `?` projections
+    /// union — `D?` over the argument `S?` stays `S?`), a named type with
+    /// arguments recurses into them (re-interned when any argument
+    /// changed), every other shape passes through.
+    fn substitute_ty(&self, ty: Ty, keys: &FxHashMap<StringId, Ty>) -> Ty {
+        match ty {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } if args != crate::model::ArgListId::EMPTY => {
+                let old: Vec<Ty> = self.boundary.pool().get(args).to_vec();
+                let substituted: Vec<Ty> =
+                    old.iter().map(|arg| self.substitute_ty(*arg, keys)).collect();
+                if substituted == old {
+                    return ty;
+                }
+                self.boundary.args.borrow_mut().named(name, nullable, &substituted)
+            }
+            Ty::Named {
+                name,
+                nullable,
+                args: _,
+            } => match keys.get(&name) {
+                Some(replacement) => {
+                    let mut replaced = *replacement;
+                    if nullable && !Self::is_nullable_ty(replaced) {
+                        replaced = Self::nullable_form(replaced);
+                    }
+                    replaced
+                }
+                None => ty,
+            },
+            _ => ty,
+        }
+    }
+
+    /// The current file's written supertype clauses, one token walk. The
+    /// walk is the substitution face's only fact source (the element model
+    /// strips clauses to names); it runs on first need — an inherited
+    /// signature carrying free type parameters — and stays off the plain
+    /// override path.
+    fn scan_header_clauses(&self) -> FxHashMap<StringId, HeaderClause> {
+        let mut map: FxHashMap<StringId, HeaderClause> = FxHashMap::default();
+        let toks = self.tokens.as_slice();
+        let mut i = 0;
+        while i < toks.len() {
+            match self.tokens.lexeme(self.source, i) {
+                "class" | "mixin" | "enum" => i = self.scan_one_header(i + 1, &mut map),
+                _ => i += 1,
+            }
+        }
+        map
+    }
+
+    /// Parses one class-family header's parameter window and supertype
+    /// clauses starting after the family keyword; returns the scan position
+    /// past the header (`{` body skipped whole, `;` mixin application
+    /// consumed). A header that does not parse faithfully records nothing.
+    fn scan_one_header(&self, start: usize, map: &mut FxHashMap<StringId, HeaderClause>) -> usize {
+        let toks = self.tokens.as_slice();
+        let lex_at = |i: usize| toks.get(i).map(|_| self.tokens.lexeme(self.source, i));
+        let mut i = start;
+        // The declaring name is the identifier right after the keyword.
+        if i >= toks.len() {
+            return i;
+        }
+        let Some(name) = self.intern_checked(i) else {
+            return i;
+        };
+        i += 1;
+        // The type-parameter window: `<...>` with top-level identifiers the
+        // parameters (a bound after `extends` is skipped until the next `,`).
+        let mut params: Vec<StringId> = Vec::new();
+        if lex_at(i) == Some("<") {
+            let mut depth = 1usize;
+            let mut after_extends = false;
+            i += 1;
+            while i < toks.len() && depth > 0 {
+                match lex_at(i) {
+                    Some("<") => depth += 1,
+                    Some(">") => depth -= 1,
+                    Some(",") if depth == 1 => after_extends = false,
+                    Some("extends") if depth == 1 => after_extends = true,
+                    _ if depth == 1 && !after_extends => {
+                        if matches!(lex_at(i + 1), Some(",") | Some(">") | Some("extends"))
+                            && let Some(id) = self.intern_checked(i)
+                        {
+                            params.push(id);
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        // The clause window: supertype faces until the body opens.
+        let mut supers: Vec<(StringId, Vec<Ty>)> = Vec::new();
+        let mut faithful = true;
+        let mut end = i;
+        while let Some(lex) = lex_at(end) {
+            match lex {
+                "{" | ";" => break,
+                "extends" | "with" | "implements" | "on" | "=" => {
+                    end += 1;
+                    loop {
+                        match self.scan_clause_type(end, &mut supers) {
+                            Some(next) => end = next,
+                            None => {
+                                faithful = false;
+                                break;
+                            }
+                        }
+                        match lex_at(end) {
+                            Some(",") => end += 1,
+                            _ => break,
+                        }
+                    }
+                    if !faithful {
+                        break;
+                    }
+                }
+                _ => {
+                    faithful = false;
+                    break;
+                }
+            }
+        }
+        if !faithful {
+            // Recovery residue: skip to the next header boundary so the
+            // scan resynchronizes without parsing member bodies.
+            while let Some(lex) = lex_at(end) {
+                if lex == "{" {
+                    return self.tokens.matching_end(end).map_or(toks.len(), |c| c + 1);
+                }
+                if lex == ";" {
+                    return end + 1;
+                }
+                end += 1;
+            }
+            return end;
+        }
+        map.insert(name, HeaderClause { params, supers });
+        if lex_at(end) == Some("{") {
+            self.tokens.matching_end(end).map_or(toks.len(), |c| c + 1)
+        } else {
+            end + 1
+        }
+    }
+
+    /// Parses one clause type at `i` — `Head`, `Head<...args...>`, `Head?`,
+    /// `dynamic`/`void` — appending `(head, [value])` to `supers` (the
+    /// value list zips 1:1 with the face's parameter list) and returns the
+    /// position past it. `None` marks the clause unfaithful (a
+    /// non-identifier head, an unbalanced group, a function- or
+    /// record-typed argument): the header contributes no facts.
+    fn scan_clause_type(
+        &self,
+        start: usize,
+        supers: &mut Vec<(StringId, Vec<Ty>)>,
+    ) -> Option<usize> {
+        let toks = self.tokens.as_slice();
+        let lex_at = |i: usize| toks.get(i).map(|_| self.tokens.lexeme(self.source, i));
+        let mut i = start;
+        let head_ty = match lex_at(i)? {
+            "dynamic" => {
+                supers.push((StringId::NONE, vec![Ty::Dynamic]));
+                return Some(i + 1);
+            }
+            "void" => {
+                supers.push((StringId::NONE, vec![Ty::Void]));
+                return Some(i + 1);
+            }
+            _ => {
+                let head = self.intern_checked(i)?;
+                i += 1;
+                let mut args: Vec<Ty> = Vec::new();
+                if lex_at(i) == Some("<") {
+                    i = self.scan_type_args(i, &mut args)?;
+                }
+                let nullable = lex_at(i) == Some("?");
+                if nullable {
+                    i += 1;
+                }
+                if args.is_empty() {
+                    Ty::Named {
+                        name: head,
+                        nullable,
+                        args: crate::model::ArgListId::EMPTY,
+                    }
+                } else {
+                    Ty::Named {
+                        name: head,
+                        nullable,
+                        args: self.boundary.intern_list(&args),
+                    }
+                }
+            }
+        };
+        supers.push((self.intern_checked(start)?, vec![head_ty]));
+        Some(i)
+    }
+
+    /// Parses a balanced `<...>` type-argument group into `args`, returning
+    /// the position past the closing `>`. Nested groups recurse; an
+    /// argument that is not a plain named type (a `Function` tail, a record
+    /// group, a bare `Function` head) bails `None` — the unmodelable-shape
+    /// posture the bounds capture keeps.
+    fn scan_type_args(&self, start: usize, args: &mut Vec<Ty>) -> Option<usize> {
+        let toks = self.tokens.as_slice();
+        let lex_at = |i: usize| toks.get(i).map(|_| self.tokens.lexeme(self.source, i));
+        let mut i = start;
+        if lex_at(i) != Some("<") {
+            return None;
+        }
+        i += 1;
+        loop {
+            let ty = match lex_at(i)? {
+                "dynamic" => {
+                    i += 1;
+                    Ty::Dynamic
+                }
+                "void" => {
+                    i += 1;
+                    Ty::Void
+                }
+                _ => {
+                    let id = self.intern_checked(i)?;
+                    i += 1;
+                    let mut nested: Vec<Ty> = Vec::new();
+                    if lex_at(i) == Some("<") {
+                        i = self.scan_type_args(i, &mut nested)?;
+                    }
+                    let nullable = lex_at(i) == Some("?");
+                    if nullable {
+                        i += 1;
+                    }
+                    if nested.is_empty() {
+                        Ty::Named {
+                            name: id,
+                            nullable,
+                            args: crate::model::ArgListId::EMPTY,
+                        }
+                    } else {
+                        Ty::Named {
+                            name: id,
+                            nullable,
+                            args: self.boundary.intern_list(&nested),
+                        }
+                    }
+                }
+            };
+            args.push(ty);
+            match lex_at(i)? {
+                "," => i += 1,
+                ">" => return Some(i + 1),
+                _ => return None,
+            }
+        }
+    }
+
+    /// The token at `i` interned as an identifier spelling (`None` for
+    /// anything the clause grammar cannot treat as a type head or a
+    /// parameter name — operators, group punctuation, literals).
+    fn intern_checked(&self, i: usize) -> Option<StringId> {
+        let lexeme = self.tokens.lexeme(self.source, i);
+        let first = lexeme.as_bytes().first()?;
+        if first.is_ascii_alphabetic() || *first == b'_' || *first == b'$' {
+            Some(self.intern(lexeme))
+        } else {
+            None
         }
     }
 
@@ -2869,7 +3741,9 @@ impl<'a> Engine<'a> {
                     // rule; the lattice decides distinct heads only.
                     return None;
                 }
-                world.decide_subtype(from_name, to_name)
+                world
+                    .decide_subtype(from_name, to_name)
+                    .or_else(|| self.dead_edge_subtype(from_name, from_scope, to_name))
             })
         };
         let declared_at = |ty: Ty| (ty, declared_owner, declared);
@@ -3275,6 +4149,171 @@ mod sealed_abstract_fold_tests {
         assert!(
             names.iter().all(|n| *n == "abstract_sealed_class"),
             "only the combination violation may report: {names:?}"
+        );
+    }
+
+    // —— #2301: super-face type-argument substitution ————————————————
+
+    /// The drift `TypeConverter` shape: `W extends NATC<D?, S?>` inherits
+    /// `TC.fromSql` two hops down with the intermediate hop's parameters in
+    /// the signature — the composed environment instantiates them to the
+    /// override's own arguments, so the valid override stays silent while a
+    /// genuinely broken return still reports.
+    #[test]
+    fn substitution_composes_through_intermediate_hop() {
+        let source = "class TC<D, S> {\n\
+                      \x20 D fromSql(S dbValue) => throw '';\n\
+                      }\n\
+                      class NATC<D, S> extends TC<D?, S?> {}\n\
+                      class W<D, S> extends NATC<D?, S?> {\n\
+                      \x20 @override\n\
+                      \x20 D fromSql(S dbValue) => throw '';\n\
+                      }\n\
+                      class Bad extends TC<int, String> {\n\
+                      \x20 @override\n\
+                      \x20 String fromSql(int dbValue) => throw '';\n\
+                      }\n";
+        let names = code_names(&report(source));
+        let overrides: Vec<_> = names
+            .iter()
+            .filter(|n| **n == "invalid_override")
+            .collect();
+        assert_eq!(
+            overrides.len(),
+            1,
+            "only the broken return may report: {names:?}"
+        );
+    }
+
+    /// A raw generic `implements A` gives the hop an unknowable environment
+    /// — the comparison suppresses instead of comparing bare parameter
+    /// spellings (the oracle resolves the face to `A<dynamic>`, where the
+    /// same shape is valid, so silence matches).
+    #[test]
+    fn undecidable_face_suppresses_override_comparison() {
+        let report = report(
+            "class A<T> {\n\
+             \x20 T m() => throw '';\n\
+             }\n\
+             class C implements A {\n\
+             \x20 @override\n\
+             \x20 dynamic m() => throw '';\n\
+             }\n",
+        );
+        let names = code_names(&report);
+        assert!(
+            !names.contains(&"invalid_override"),
+            "the undecidable face must not report: {names:?}"
+        );
+    }
+
+    // —— #2301: the frozen list face over names-only SDK stubs —————————
+
+    /// `with ListMixin` over an unmodeled hop contributes the SDK list
+    /// face: a bare class misses the base's four abstract forwarding
+    /// points (`setter List.length` among them — the drift
+    /// `DriftResultSet` row), and a class declaring all four stays silent.
+    #[test]
+    fn frozen_list_face_reports_missing_forwarding_points() {
+        let bare = report("class C with ListMixin<int> {}\n");
+        let names = code_names(&bare);
+        assert!(
+            names.contains(&"non_abstract_class_inherits_abstract_member"),
+            "the bare with-face must report: {names:?}"
+        );
+        assert!(
+            bare.diagnostics
+                .iter()
+                .any(|d| d.message.contains("setter List.length")),
+            "the length setter must be among the missing: {:?}",
+            bare.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let full = report(
+            "class D with ListMixin<int> {\n\
+             \x20 int get length => 0;\n\
+             \x20 set length(int v) {}\n\
+             \x20 int operator [](int i) => 0;\n\
+             \x20 void operator []=(int i, int v) {}\n\
+             }\n",
+        );
+        let names = code_names(&full);
+        assert!(
+            !names.contains(&"non_abstract_class_inherits_abstract_member"),
+            "declaring the four forwarding points must be silent: {names:?}"
+        );
+    }
+
+    /// A user `ListMixin` that resolves with members contributes its own
+    /// face — the frozen table must never shadow a real container.
+    #[test]
+    fn resolved_list_mixin_keeps_its_own_members() {
+        let report = report(
+            "class ListMixin<T> {\n\
+             \x20 void add(T v) {}\n\
+             }\n\
+             class E with ListMixin<int> {}\n",
+        );
+        let names = code_names(&report);
+        assert!(
+            !names.contains(&"non_abstract_class_inherits_abstract_member"),
+            "a resolved mixin face must not gain the frozen rows: {names:?}"
+        );
+    }
+
+    // —— #2301: own-member shadowing in the concrete-implementation face —
+
+    /// The class's own concrete member shadows the inherited one in the
+    /// official `implemented` map: `Good`'s own `M substitute()` compares
+    /// validly against the interface member, and the inherited `Base`
+    /// signature must never be compared instead (the analyzer element.dart
+    /// false-positive shape).
+    #[test]
+    fn own_member_shadows_inherited_concrete_implementation() {
+        let source = "abstract class B {}\n\
+                      abstract class M implements B {\n\
+                      \x20 M substitute();\n\
+                      }\n\
+                      class Base {\n\
+                      \x20 B substitute() => throw '';\n\
+                      }\n\
+                      class Good extends Base implements M {\n\
+                      \x20 @override\n\
+                      \x20 M substitute() => throw '';\n\
+                      }\n\
+                      class Bad extends Base implements M {\n\
+                      \x20 @override\n\
+                      \x20 B substitute() => throw '';\n\
+                      }\n";
+        let names = code_names(&report(source));
+        let implementations: Vec<_> = names
+            .iter()
+            .filter(|n| **n == "invalid_implementation_override")
+            .collect();
+        assert_eq!(
+            implementations.len(),
+            1,
+            "only the broken own member may report: {names:?}"
+        );
+    }
+
+    // —— #2301: the `external` exclusion in the top-level default arm ——
+
+    /// An `external` top-level header never expects optional-parameter
+    /// defaults (the http `_fetch` row); a sibling without the modifier
+    /// still reports.
+    #[test]
+    fn external_top_level_header_takes_no_defaults() {
+        let report = report("external int f(int a, [int b]);\nint g(int a, [int b]);\n");
+        let names = code_names(&report);
+        let defaults: Vec<_> = names
+            .iter()
+            .filter(|n| n.starts_with("missing_default_value_for_parameter"))
+            .copied()
+            .collect();
+        assert_eq!(
+            defaults,
+            ["missing_default_value_for_parameter_positional"],
+            "only the non-external header may report: {names:?}"
         );
     }
 }
