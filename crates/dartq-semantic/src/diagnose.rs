@@ -3502,3 +3502,6 @@ mod suppression_tests {
 
 #[cfg(test)]
 mod ticket_2231_tests;
+
+#[cfg(test)]
+mod ticket_2297_tests;

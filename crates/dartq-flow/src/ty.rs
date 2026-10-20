@@ -137,6 +137,16 @@ pub(crate) struct Boundary {
     /// a top-type or `FutureOr`-of-top bound promotes to nothing, its
     /// non-null form being itself). `None` → a null check promotes nothing.
     pub(crate) target: Option<(Ty, u32)>,
+    /// The bound type as written, beside its written-argument tree — the
+    /// `TypeParameterTypeImpl` arm of the official `isAlwaysExhaustive`
+    /// (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/type_system.dart:868-877): the
+    /// verdict recurses into the parameter's bound, so `T extends St` over
+    /// the enum `St` splits completely. Unlike [`Self::target`] this keeps
+    /// every derivable shape, not only the ones whose non-null face
+    /// differs — a `?`-less named bound collapses `target` to `None` and
+    /// still decides here.
+    pub(crate) bound: (Ty, u32),
 }
 
 /// The closed-declaration facts a switch scrutinee's always-exhaustive

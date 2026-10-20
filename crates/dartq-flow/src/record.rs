@@ -364,7 +364,11 @@ impl<'t> Flow<'t> {
         let Some((class, target)) = self.bound_face(base, nullable, args) else {
             return;
         };
-        self.tv_bound = Some(crate::ty::Boundary { class, target });
+        self.tv_bound = Some(crate::ty::Boundary {
+            class,
+            target,
+            bound: (crate::ty::Ty { base, nullable }, args),
+        });
     }
 
     /// The nullability face of one type spelling beside its promotion
@@ -1359,6 +1363,17 @@ impl ParserListener for Flow<'_> {
                     crate::ty::Classification::NonNullable
                 },
                 target: None,
+                // The signature-less function head is all this level
+                // spells; the official `isAlwaysExhaustive` answers `false`
+                // for every function type, so the head is the whole
+                // answer the verdict needs.
+                bound: (
+                    crate::ty::Ty {
+                        base: crate::ty::Base::Function,
+                        nullable: question.is_some(),
+                    },
+                    crate::ty::EMPTY_ARGS,
+                ),
             });
         }
     }
@@ -1376,6 +1391,13 @@ impl ParserListener for Flow<'_> {
             self.tv_bound = Some(crate::ty::Boundary {
                 class: crate::ty::Classification::PotentiallyNullable,
                 target: None,
+                bound: (
+                    crate::ty::Ty {
+                        base: crate::ty::Base::Void,
+                        nullable: false,
+                    },
+                    crate::ty::EMPTY_ARGS,
+                ),
             });
         }
     }
@@ -1429,6 +1451,16 @@ impl ParserListener for Flow<'_> {
                     },
                     crate::ty::EMPTY_ARGS,
                 )),
+                // The implicit bound as written: `Object?`
+                // (type_system.dart:868-877 reads the element's bound, and
+                // the analyzer's default is the nullable top).
+                bound: (
+                    crate::ty::Ty {
+                        base: crate::ty::Base::Name(object),
+                        nullable: true,
+                    },
+                    crate::ty::EMPTY_ARGS,
+                ),
             })
         };
         if let Some(boundary) = boundary {
@@ -2589,5 +2621,107 @@ mod tests {
         assert_eq!(bases.get(1), Some(&crate::ty::Base::Void));
         assert_eq!(bases.get(2), Some(&crate::ty::Base::Dynamic));
         assert_eq!(bases.get(3), Some(&crate::ty::Base::Never));
+    }
+
+    /// Drives the real parser over `source` with `self` as the listener
+    /// and returns the collected flow facts — the `Flow`-as-listener
+    /// wiring every type-variable event reaches (the semantic pipeline's
+    /// `DiagnoseListener` forwards only a subset, so these cells live at
+    /// the level where the recorder's own boundary table is populated).
+    fn run_facts(source: &'static str) -> Vec<FlowFact> {
+        let result = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            dartq_source::FileTable::new().intern(std::path::Path::new("test.dart")),
+        );
+        assert!(result.diagnostics.is_empty());
+        let tokens: &'static TokenTable = Box::leak(Box::new(result.tokens));
+        let mut flow = Flow::new(tokens, source);
+        {
+            let feats = dartq_language::FeatureSet::for_language_version(
+                dartq_language::LanguageVersion::new(3, 15),
+            );
+            let mut parser = dartq_parser::Parser::new(
+                source,
+                tokens,
+                dartq_parser::ParserFeatures::from_feature_set(feats),
+                &mut flow,
+            );
+            parser.parse_unit();
+        }
+        flow.facts
+    }
+
+    /// #2297 `T extends St` (enum bound): the `TypeParameterTypeImpl` arm
+    /// of `isAlwaysExhaustive` recurses into the declared bound — a fully
+    /// covered switch leaves the body end unreachable, so no
+    /// `BodyMayCompleteNormally` and the trailing statement stays live
+    /// (there is none here). Oracle tp1: silent.
+    #[test]
+    fn type_param_enum_bound_fully_covered_reaches_no_body_end() {
+        let facts = run_facts(
+            "enum St { a, b }\nint f<T extends St>(T v) {\n  switch (v) {\n    case St.a: return 1;\n    case St.b: return 2;\n  }\n}\n",
+        );
+        assert!(
+            !facts
+                .iter()
+                .any(|f| matches!(f, FlowFact::BodyMayCompleteNormally { .. })),
+            "{facts:?}"
+        );
+        // Coverage is complete: no dead row either.
+        assert!(
+            !facts.iter().any(|f| matches!(f, FlowFact::DeadCode { .. })),
+            "{facts:?}"
+        );
+    }
+
+    /// The same bound, an all-returning switch, and a trailing
+    /// statement: the exhaustive verdict deads what follows it (oracle
+    /// tp4: `dead_code` at the trailing statement).
+    #[test]
+    fn type_param_enum_bound_deads_the_trailing_statement() {
+        let facts = run_facts(
+            "enum St { a, b }\nint f<T extends St>(T v) {\n  switch (v) {\n    case St.a: return 1;\n    case St.b: return 2;\n  }\n  return 3;\n}\n",
+        );
+        assert!(
+            facts.iter().any(|f| matches!(f, FlowFact::DeadCode { .. })),
+            "{facts:?}"
+        );
+    }
+
+    /// A chained bound `T extends S, S extends St` recurses through the
+    /// boundary table to the enum — same silent outcome (oracle
+    /// nested_bound).
+    #[test]
+    fn type_param_chained_bound_reaches_no_body_end() {
+        let facts = run_facts(
+            "enum St { a, b }\nint f<T extends S, S extends St>(T v) {\n  switch (v) {\n    case St.a: return 1;\n    case St.b: return 2;\n  }\n}\n",
+        );
+        assert!(
+            !facts
+                .iter()
+                .any(|f| matches!(f, FlowFact::BodyMayCompleteNormally { .. })),
+            "{facts:?}"
+        );
+    }
+
+    /// The conservative arm: an unbounded `T` carries the implicit
+    /// `Object?` bound (subtype.dart:313), never always-exhaustive — a
+    /// fully covered switch still leaves the end reachable (oracle
+    /// implicit_bound keeps the unmatched path live).
+    #[test]
+    fn unbounded_type_param_keeps_the_body_end_reachable() {
+        let facts = run_facts(
+            "int f<T>(T v) {\n  switch (v) {\n    case 1: return 1;\n  }\n}\n",
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|f| matches!(f, FlowFact::BodyMayCompleteNormally { .. })),
+            "{facts:?}"
+        );
     }
 }

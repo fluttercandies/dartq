@@ -243,7 +243,13 @@ pub(crate) fn restriction_is_constant(space: &Restriction) -> bool {
 /// (recursed into the type argument), and promoted type parameters
 /// (recursed into the promoted bound, then the declared bound). All
 /// three fall to the `false` arm here — under-report, never a false
-/// positive.
+/// positive. The declared-bound half of the type-parameter arm is
+/// modelled on the flow side instead (`dartq_flow::Interp`'s
+/// `is_always_exhaustive`, which reads the recorder's bound table): this
+/// level's [`NameWorld`] is built without any bound source (its
+/// constructor takes a resolution snapshot that carries names and
+/// supertypes only), so the parameter is indistinguishable from any other
+/// unresolved named head here.
 pub(crate) fn is_always_exhaustive(world: &NameWorld<'_>, ty: NameTy) -> bool {
     match ty {
         NameTy::Null => true,
@@ -523,11 +529,6 @@ impl NameTy {
             // The S0 side channel keeps its name-level shape; the argument
             // slot stays in the semantic lattice (`Ty`), not here.
             Ty::Named { name, nullable, .. } => NameTy::Named(name, nullable),
-            // Record and function types have no name-level decomposition
-            // (the columns live in the `Ty` shape, not here): one fixed
-            // unknown keeps the pair self-equal (`(int, int)` covers
-            // `(int, int)`, `void Function()` covers itself) while staying
-            // unmodelable — the under-report direction.
             Ty::Record { .. } | Ty::Function { .. } => NameTy::Unknown(u64::MAX),
         }
     }
@@ -1017,8 +1018,26 @@ impl<'a> NameWorld<'a> {
 
     /// Whether `sub`'s supertype chain reaches `sup`: the unit's declared
     /// superclass and `with`/`implements` edges plus the fixed core chain.
+    /// The implicit `Object` edge sits beside the walk (the same arm
+    /// [`Self::decide_subtype`] carries): the model records only written
+    /// clauses, so a declaration-less `class C {}` and the core primitives
+    /// (`bool`, `String`) carry no `Object` row, yet every interface type
+    /// subtypes the non-nullable top (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/element/subtype.dart:304-340`). Without it
+    /// the sealed-right arm of [`Self::can_be_subtype_of`] answers a false
+    /// mutual exclusion (`Object` vs `bool` reports
+    /// `pattern_never_matches_value_type` — oracle probes keep it silent).
+    /// An unresolvable name still answers `false` here: whether its denoted
+    /// type subtypes `Object` is undecidable at name level, and
+    /// `can_be_subtype_of`'s undecided shapes take the `true` default on
+    /// their own (type_system.dart:324).
     pub(crate) fn named_sub(&self, sub: StringId, sup: StringId) -> bool {
         if sub == sup {
+            return true;
+        }
+        if sup == self.object_id
+            && (self.is_interface_container(sub) || self.primitive_ids.contains(&sub))
+        {
             return true;
         }
         let mut queue = std::collections::VecDeque::new();
