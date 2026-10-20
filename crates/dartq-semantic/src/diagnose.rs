@@ -460,6 +460,13 @@ mod ticket_2243_tests;
 #[cfg(test)]
 mod ticket_2245_tests;
 
+/// The #2241 unchecked-use pins: the member walk's receiver verdict
+/// re-decides against the flow's staged variable promotions (the opaque
+/// promoted head of a `var`-inferred nullable local), and the `== null`,
+/// else-branch, and unguarded cells keep the report.
+#[cfg(test)]
+mod ticket_2241_tests;
+
 /// The const NON_CONSTANT-family differential pins (#2242): unresolved
 /// callees inside const literals report the element faces at the
 /// invocation and anchor the declaration row at the first failure, and a
@@ -1368,7 +1375,7 @@ pub fn fold_unit_with_ops<'t>(
     engine.prop_promotion_rows = PropPromotionStaging {
         rows: prop_promotions.rows.clone(),
     };
-    engine.resolve_rows();
+    engine.resolve_rows(&promotions);
     // The discarded-value folds (`checkConstructorInvocation`) and the
     // `unless` parameter co-row (`_findUndefinedUseResultParameter`) run
     // after the resolve arms: the folds read the final used set, the co-row

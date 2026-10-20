@@ -441,3 +441,113 @@
         assert!(!names.contains(&"unused_element"), "{names:?}");
         assert!(!names.contains(&"unchecked_use_of_nullable_value"), "{names:?}");
     }
+
+    // —— #2260: receiver-model faces — named-selector creations ————————
+
+    /// A named-selector implicit creation folds to its class: `final c =
+    /// Ctr.broadcast(sync: true)` types `c` as `Ctr` (the oracle's
+    /// InstanceCreationExpression static type), so `c.ping()` resolves —
+    /// the constructor-reference posture pushes no callee row (the
+    /// resolving head is a type use, the selector none) and the argument
+    /// rows used to stand as the initializer's window, binding the LAST
+    /// ARGUMENT's type (`bool` — probed against the oracle, bloc bloc.dart
+    /// 353/363 `controller.close()` for `bool`).
+    #[test]
+    fn named_selector_creation_types_the_var() {
+        let source = "class Ctr {\n  Ctr.broadcast({bool? sync});\n  void ping() {}\n}\n\
+                      void f() {\n  final c = Ctr.broadcast(sync: true);\n  print(c.ping());\n}\n\
+                      void print(Object x) {}\n";
+        let names = code_names(&report(source));
+        assert!(!names.contains(&"undefined_method"), "{names:?}");
+        assert!(!names.contains(&"undefined_getter"), "{names:?}");
+        assert!(!names.contains(&"undefined_setter"), "{names:?}");
+    }
+
+    /// The typed head (`Ctr<int>.broadcast(...)`) binds the same way — the
+    /// type-argument group sits between the class and the selector.
+    #[test]
+    fn typed_named_selector_creation_types_the_var() {
+        let source = "class Ctr<T> {\n  Ctr.broadcast({bool? sync});\n  void ping() {}\n}\n\
+                      void f() {\n  final c = Ctr<int>.broadcast(sync: true);\n  print(c.ping());\n}\n\
+                      void print(Object x) {}\n";
+        let names = code_names(&report(source));
+        assert!(!names.contains(&"undefined_method"), "{names:?}");
+    }
+
+    /// The named-selector creation's declarator feed (the oracle's
+    /// `int bad = Ctr.broadcast(...)` answers `invalid_assignment` at the
+    /// creation — the pre-fix model read the last argument's `bool`). The
+    /// declarator-assignment face's consumption of the folded creation row
+    /// is a recorded #2260 residual (the face needs the SDK-spelled `int`,
+    /// unavailable in this rig world) — this pin holds the fold's
+    /// wrong-code contract: the creation neither mis-types the declarator
+    /// (no `bool`-carried face) nor reports a member miss.
+    #[test]
+    fn named_selector_creation_feeds_assignment_check() {
+        let source = "class Ctr {\n  Ctr.broadcast({bool? sync});\n}\n\
+                      void f() {\n  var bad = Ctr.broadcast(sync: true);\n  print(bad);\n}\n\
+                      void print(Object x) {}\n";
+        let names = code_names(&report(source));
+        assert!(!names.contains(&"undefined_method"), "{names:?}");
+        assert!(!names.contains(&"invalid_assignment"), "{names:?}");
+    }
+
+    /// A cascade section over the folded creation resolves on the class
+    /// face (`Ctr.broadcast(..)..ping()` — the section's receiver is the
+    /// created value).
+    #[test]
+    fn named_selector_creation_cascade_resolves() {
+        let source = "class Ctr {\n  Ctr.broadcast({bool? sync});\n  void ping() {}\n}\n\
+                      void f() {\n  Ctr.broadcast(sync: true)..ping();\n}\n";
+        let names = code_names(&report(source));
+        assert!(!names.contains(&"undefined_method"), "{names:?}");
+    }
+
+    /// An unresolved head keeps its own posture: the miss row reports and
+    /// no creation fold fires (the oracle's error-recovery creation type is
+    /// invalid — member reads stay silent beside the undefined name).
+    #[test]
+    fn undefined_named_selector_head_stays_miss_only() {
+        let source = "void f() {\n  final c = Missing.named(3);\n  print(c.ping());\n}\n\
+                      void print(Object x) {}\n";
+        let report = report(source);
+        let names = code_names(&report);
+        assert!(names.contains(&"undefined_identifier"), "{names:?}");
+        assert!(!names.contains(&"undefined_method"), "{names:?}");
+        assert!(!names.contains(&"undefined_getter"), "{names:?}");
+    }
+
+    /// A non-type head (a local variable) is a member send, not a creation:
+    /// the fold must not fire (`n.named(3)` reports the invocation miss
+    /// against the local's type, exactly the oracle's face).
+    #[test]
+    fn local_head_named_send_stays_member_miss() {
+        let source = "void f() {\n  var n = 1;\n  final d = n.named(3);\n  print(d);\n}\n";
+        let report = report(source);
+        let spans = rows(&report);
+        let named = source.find("named").unwrap() as u32;
+        assert!(
+            spans.contains(&("undefined_method", named)),
+            "{spans:?}"
+        );
+    }
+
+    // —— #2260: the keyword-spelled prefix head (dio dio_mixin.dart:419) —
+
+    /// Value-position built-in reads never report an
+    /// `undefined_identifier`: `T != dynamic` resolves both sides (the
+    /// oracle resolves the TypeLiteral/`dynamic` top type — dio
+    /// dio_mixin.dart:419/644). The value-position row rides the keyword
+    /// gate; the same skip guards the recovery-routed PrefixHead face
+    /// whose `UndefinedIdentifier` emit lacked it. The SDK-spelled type
+    /// positions in this rig world report `undefined_class` beside the
+    /// gate's scope (the rig has no dart:core faces) — the CLI/oracle
+    /// pair on the corpus source is 1:1 clean.
+    #[test]
+    fn type_param_vs_dynamic_comparison_is_clean() {
+        let source = "class Dio {\n  void fetch<T>(Object o) async {\n    \
+                      if (T != dynamic) {\n      print(1);\n    }\n  }\n}\n\
+                      void print(Object x) {}\n";
+        let names = code_names(&report(source));
+        assert!(!names.contains(&"undefined_identifier"), "{names:?}");
+    }

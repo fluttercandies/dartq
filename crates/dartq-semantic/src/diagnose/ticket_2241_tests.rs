@@ -292,3 +292,98 @@ void sink(int x) {}
         code_names(&report)
     );
 }
+
+// —— initializer-closure cells (the #2241 rider): a closure nested in a
+// —— top-level variable initializer analyzes its own locals like any
+// —— function body — the flow world's framing must survive the closure
+// —— body's nested local-initializer brackets. The oracle is silent on
+// —— every guarded read below (probed: `dart analyze` 3.13.1).
+
+/// Guarded member read inside the initializer closure: the oracle is
+/// silent. Before the flow fix the closure's promotion never formed and
+/// the read false-reported.
+#[test]
+fn pin_initializer_closure_guarded_read_silent() {
+    let source = "\
+class int {}
+class Box {
+  int length = 0;
+}
+Box? mk() => null;
+final f = () {
+  final files = mk();
+  if (files == null) return 0;
+  return files.length;
+};
+";
+    let report = unit_report(source);
+    assert!(
+        unchecked(&report).is_empty(),
+        "initializer closure: {:#?}",
+        code_names(&report)
+    );
+}
+
+/// Guarded argument read inside the initializer closure: the staged
+/// assignability face sees the promotion — the oracle reports no
+/// argument-type error (`take(files)` passes a promoted-non-null value).
+#[test]
+fn pin_initializer_closure_guarded_argument_silent() {
+    let source = "\
+class int {}
+class Box {
+  int length = 0;
+}
+Box? mk() => null;
+void take(Box b) {}
+final f = () {
+  final files = mk();
+  if (files == null) return 0;
+  take(files);
+  return 1;
+};
+";
+    let report = unit_report(source);
+    let assignability: Vec<String> = code_names(&report)
+        .into_iter()
+        .filter(|name| name.starts_with("argument_type_not_assignable"))
+        .collect();
+    assert!(
+        assignability.is_empty(),
+        "initializer closure argument: {:#?}",
+        code_names(&report)
+    );
+}
+
+/// The promotion also kills the branch inside the initializer closure:
+/// after the early-return guard the second `== null` test is known-false,
+/// so its then-branch is dead — the oracle reports `dead_code` there,
+/// same as in a plain function body.
+#[test]
+fn pin_initializer_closure_promotion_deads_branch() {
+    let source = "\
+class int {}
+class Box {
+  int length = 0;
+}
+Box? mk() => null;
+final f = () {
+  final files = mk();
+  if (files == null) return 0;
+  if (files == null) {
+    mk();
+  }
+  return 1;
+};
+";
+    let report = unit_report(source);
+    let dead: Vec<String> = code_names(&report)
+        .into_iter()
+        .filter(|name| name.starts_with("dead_code"))
+        .collect();
+    assert!(
+        !dead.is_empty(),
+        "initializer closure lost the dead row: {:#?}",
+        code_names(&report)
+    );
+}

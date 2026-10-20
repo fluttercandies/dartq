@@ -191,8 +191,11 @@ impl<'a> Engine<'a> {
 
     // —— pass 2 ———————————————————————————————————————————————————————
 
-    /// Resolves the recorded rows in source order and emits.
-    pub(crate) fn resolve_rows(&mut self) {
+    /// Resolves the recorded rows in source order and emits. The flow
+    /// promotions (#2241) ride beside the read types: the member walk's
+    /// receiver verdict re-decides against them, exactly like the staged
+    /// families' teardown join.
+    pub(crate) fn resolve_rows(&mut self, promotions: &PromotionStaging) {
         self.build_ur_sites();
         let rows = std::mem::take(&mut self.rows);
         let mut deferred = std::mem::take(&mut self.deferred_miss_rows);
@@ -215,30 +218,30 @@ impl<'a> Engine<'a> {
                     .conditional_uri_rows
                     .contains(&deferred[index].range.offset)
                 {
-                    self.resolve_row(&deferred[index]);
+                    self.resolve_row(promotions, &deferred[index]);
                 }
                 index += 1;
             }
-            self.resolve_row(row);
+            self.resolve_row(promotions, row);
         }
         for deferred_row in &deferred[index..] {
             if !self
                 .conditional_uri_rows
                 .contains(&deferred_row.range.offset)
             {
-                self.resolve_row(deferred_row);
+                self.resolve_row(promotions, deferred_row);
             }
         }
     }
 
     /// One row's pass-2 dispatch (shared by the main stack and the
     /// fold-deferred rows).
-    pub(crate) fn resolve_row(&mut self, row: &Row) {
+    pub(crate) fn resolve_row(&mut self, promotions: &PromotionStaging, row: &Row) {
         match &row.shape {
             RowShape::Bare(info) => self.resolve_bare_row(row, *info),
             RowShape::Member { recv } => {
                 let recv = self.promoted_receiver(row.range.offset, *recv);
-                self.resolve_member_row(row, recv);
+                self.resolve_member_row(promotions, row, recv);
             }
             RowShape::Receiver(recv) => self.resolve_receiver_row(row, *recv),
             RowShape::TypeUse(..) => self.resolve_type_row(row),
@@ -621,7 +624,20 @@ impl<'a> Engine<'a> {
         let name_text = self.strings.resolve(row.name);
         match verdict {
             TypeVerdict::PrefixHead => {
-                if !self.guard.ignore(None, row.name) {
+                // The declaration-head keyword skip rides this face too: a
+                // prefix head can never spell `dynamic`/`var`/`final`/`const`/
+                // `void` (no legal parse writes one — `dynamic` answers the
+                // top type before any prefix question upstream), so a row
+                // carrying that spelling is parser-recovery noise and the
+                // oracle reports nothing (probe: dio dio_mixin.dart:419
+                // `if (T != dynamic &&` — the recovered `dynamic` reported
+                // `undefined_identifier` here while `dart analyze` stays
+                // silent; the value-position gate does not reach a TypeUse
+                // row).
+                if !Self::synthetic_reference(row.range)
+                    && !self.keyword_bare_reference(row.range)
+                    && !self.guard.ignore(None, row.name)
+                {
                     self.emit(SemanticCode::UndefinedIdentifier, row.range, name_text, "");
                 }
                 self.record_miss(row.name, row.range, false, NameUse::Read);
@@ -919,9 +935,10 @@ impl<'a> Engine<'a> {
     /// Member faces keep this check off: a built-in identifier is a legal
     /// member name (`obj.late`).
     pub(crate) fn keyword_bare_reference(&self, range: SourceRange) -> bool {
-        let start = range.offset as usize;
+        let start = self.byte_of(range.offset);
+        let end = self.byte_of(range.offset + range.length);
         self.source
-            .get(start..start + range.length as usize)
+            .get(start..end)
             .is_some_and(|text| matches!(text, "var" | "final" | "const" | "dynamic" | "void"))
     }
 
@@ -992,7 +1009,12 @@ impl<'a> Engine<'a> {
         }
     }
 
-    pub(crate) fn resolve_member_row(&mut self, row: &Row, recv: Receiver) {
+    pub(crate) fn resolve_member_row(
+        &mut self,
+        promotions: &PromotionStaging,
+        row: &Row,
+        recv: Receiver,
+    ) {
         // Any member access uses the accessed name (the official `members`
         // set; unresolved reads land in `unresolvedReadMembers`, which the
         // field rule credits the same). Read-shaped accesses also join the
@@ -1141,6 +1163,7 @@ impl<'a> Engine<'a> {
                     self.check_container_member(row, name, kind);
                 } else {
                     self.check_instance_member(
+                        promotions,
                         row,
                         Receiver::Typed {
                             type_name: name,
@@ -1150,7 +1173,7 @@ impl<'a> Engine<'a> {
                 }
             }
             Receiver::This { .. } | Receiver::Typed { .. } => {
-                self.check_instance_member(row, recv);
+                self.check_instance_member(promotions, row, recv);
             }
             Receiver::Super { container, .. } => {
                 self.check_super_member(row, container);
@@ -1313,7 +1336,12 @@ impl<'a> Engine<'a> {
     /// miss reports the getter read (the operator's invalid type never
     /// cascades). Mixin `on` constraints and extension `on` types are
     /// invisible to the model, so bodies of those containers record only.
-    pub(crate) fn check_instance_member(&mut self, row: &Row, recv: Receiver) {
+    pub(crate) fn check_instance_member(
+        &mut self,
+        promotions: &PromotionStaging,
+        row: &Row,
+        recv: Receiver,
+    ) {
         let (container, this_kind) = match recv {
             Receiver::This { container, kind } => (container, Some(kind)),
             Receiver::Typed { type_name, .. } => (type_name, None),
@@ -1351,6 +1379,27 @@ impl<'a> Engine<'a> {
             && self
                 .promotable_field_substitution(&self.prop_promotion_rows, read_span, ty)
                 .is_some()
+        {
+            receiver_nullable = false;
+        }
+        // The promoted-variable face (#2241): a bare-read receiver whose
+        // flow promotion stands — `if (files != null) files.length` on the
+        // `var`-inferred local whose promoted head is the flow lattice's
+        // opaque marker (a signature-less function head shares the shape,
+        // #2174). `filter_staged`'s general arm rewrites the staged
+        // `Ty::Unknown` to the parse-time type's non-null form; the
+        // receiver verdict reads the same staging: an opaque head, or a
+        // promotion to a strictly non-null face, reads a non-null receiver
+        // — a `Null` or nullable promoted head (the `== null` branch)
+        // keeps the verdict.
+        if receiver_nullable
+            && let Some(read_span) = self
+                .promoted_recv_reads
+                .binary_search_by(|(member, _)| member.cmp(&row.range.offset))
+                .ok()
+                .map(|index| self.promoted_recv_reads[index].1)
+            && let Some(promoted) = promotions.promoted(read_span)
+            && (promoted == Ty::Unknown || promoted.is_strictly_non_nullable())
         {
             receiver_nullable = false;
         }
