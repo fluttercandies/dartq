@@ -897,3 +897,134 @@ fn bare_call_miss_still_reports_when_no_extension_carries() {
         let theirs = source.find("theirs").unwrap() as u32;
         assert_eq!(spans, vec![("undefined_identifier", theirs)], "{spans:?}");
     }
+
+// —— #2351: the Map ctor-arity family (creation selector faces) ——————————
+//
+// Every fixture below mirrors a face probed against oracle `dart analyze`
+// (fvm default) this round; the code/message pair is the oracle's
+// verbatim. The rig carries no dart:core, so the fixtures declare the
+// container locally (`class Map<K, V>`) — the arms account against the
+// resolved container's declared count either way (the corpus run answers
+// `Map` through the graph, the rig through the declaration).
+//
+// The class-segment faces account against the CLASS's declared count
+// (`_buildTypeArguments` takes the count from the type element's type
+// parameters) and report the base code; the selector-segment faces of an
+// explicit `new`/const creation report `_constructor` for ANY written
+// count — the constructor's own name never declares type parameters, and
+// the oracle keeps that verdict even when the count equals the class's
+// arity (`new Map.fromIterables<int, int>` reports).
+
+/// The analyzer-corpus twin (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/dart/element/type_algebra.dart:217 —
+/// `Map<TypeParameterElement, DartType>.fromIterables(parameters,
+/// types)`): the class-segment group accounts against the class's
+/// declared count — `Map` declares 2, the group writes 2 → silent. The
+/// selector name never enters the count question.
+#[test]
+fn map_class_segment_matching_arity_is_silent() {
+    let report = report(
+        "class Map<K, V> { Map.fromIterables(a, b); }\
+         class A {} class B {} void f() { Map<A, B>.fromIterables([], []); }",
+    );
+    assert!(
+        report.diagnostics.is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
+}
+
+/// The class-segment mismatch keeps the base code and the class message —
+/// `Map` written with 3 arguments reports `wrong_number_of_type_arguments`
+/// ("The type 'Map' is declared with 2 …"), never the constructor variant
+/// (the NamedType resolution face owns the group).
+#[test]
+fn map_class_segment_mismatch_reports_base_code() {
+    let report = report(
+        "class Map<K, V> { Map.fromIterables(a, b); }\
+         class A {} class B {} class C {} void f() { Map<A, B, C>.fromIterables([], []); }",
+    );
+    assert_eq!(
+        code_names(&report),
+        ["wrong_number_of_type_arguments"],
+        "{:?}",
+        code_names(&report)
+    );
+    assert_eq!(
+        report.diagnostics[0].message,
+        "The type 'Map' is declared with 2 type parameters, but 3 type arguments were given."
+    );
+}
+
+/// The explicit-creation selector face reports `_constructor` for ANY
+/// written count — including a count EQUAL to the class's arity
+/// (`new Map.fromIterables<int, int>` reports; oracle-probed). This is
+/// the arm the class-arity gate must NOT reach: the selector segment of
+/// an explicit creation never class-accounts.
+#[test]
+fn new_selector_group_reports_constructor_code_at_matching_count() {
+    let report = report(
+        "class Map<K, V> { Map.fromIterables(a, b); }\
+         class A {} class B {} void f() { new Map.fromIterables<A, B>([], []); }",
+    );
+    assert_eq!(
+        code_names(&report),
+        ["wrong_number_of_type_arguments_constructor"],
+        "{:?}",
+        code_names(&report)
+    );
+    assert_eq!(
+        report.diagnostics[0].message,
+        "The constructor 'Map.fromIterables' doesn't have type parameters."
+    );
+}
+
+/// The explicit-creation class-segment faces mirror the implicit ones:
+/// `new Map<A, B>.fromIterables` is silent at the class's arity, the
+/// 3-argument spelling reports the base code with the class message.
+#[test]
+fn new_class_segment_faces_match_class_arity() {
+    let matched = report(
+        "class Map<K, V> { Map.fromIterables(a, b); }\
+         class A {} class B {} void f() { new Map<A, B>.fromIterables([], []); }",
+    );
+    assert!(
+        matched.diagnostics.is_empty(),
+        "{:?}",
+        code_names(&matched)
+    );
+    let mismatched = report(
+        "class Map<K, V> { Map.fromIterables(a, b); }\
+         class A {} class B {} class C {} void f() { new Map<A, B, C>.fromIterables([], []); }",
+    );
+    assert_eq!(
+        code_names(&mismatched),
+        ["wrong_number_of_type_arguments"],
+        "{:?}",
+        code_names(&mismatched)
+    );
+    assert_eq!(
+        mismatched.diagnostics[0].message,
+        "The type 'Map' is declared with 2 type parameters, but 3 type arguments were given."
+    );
+}
+
+/// The unnamed creation (`new Map<A, B, C>()` — no selector segment)
+/// keeps the class face: the base code through `check_annotation_arity`
+/// (the `creation_ref` `None` arm), the pre-existing posture.
+#[test]
+fn unnamed_creation_mismatch_keeps_base_code() {
+    let report = report(
+        "class Map<K, V> {} class A {} class B {} class C {} void f() { new Map<A, B, C>(); }",
+    );
+    assert_eq!(
+        code_names(&report),
+        ["wrong_number_of_type_arguments"],
+        "{:?}",
+        code_names(&report)
+    );
+    assert_eq!(
+        report.diagnostics[0].message,
+        "The type 'Map' is declared with 2 type parameters, but 3 type arguments were given."
+    );
+}
