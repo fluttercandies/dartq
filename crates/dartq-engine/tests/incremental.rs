@@ -603,3 +603,70 @@ fn interpolated_part_of_is_an_orphan_singleton() {
         "p is its own orphan singleton"
     );
 }
+
+/// A part URI included twice by one library reports `duplicate_part` on
+/// the second include's URI span (the part-graph's attached-set check).
+/// Oracle probed 3.13.1: error `duplicate_part` on the second directive,
+/// "The library already contains a part with the URI '<uri>'."
+#[test]
+fn duplicate_part_include_reports_on_the_second_uri() {
+    const N: &str = "library n;\npart 'p.dart';\npart 'p.dart';\nint f() => 1;\n";
+    const P: &str = "part of n;\nint g() => 1;\n";
+
+    let fixture = Fixture::new(&[("lib/n.dart", N), ("lib/p.dart", P)]);
+    let n_path = fixture.path("lib/n.dart");
+    let p_path = fixture.path("lib/p.dart");
+    let mut engine = fixture.engine();
+    engine.set_content(&n_path, N.as_bytes());
+    engine.set_content(&p_path, P.as_bytes());
+    let n = engine.file_table().try_file_id(&n_path).expect("interned");
+
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
+        .expect("cold");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].code.name, "duplicate_part");
+    assert_eq!(diagnostics[0].file, n, "the row anchors on the include");
+    // The first include still claims the part: one library, two members.
+    assert_eq!(engine.libraries().len(), 1, "the part stays a member");
+    let lib = engine.library_of(n).expect("n defines a library");
+    let members = engine
+        .libraries()
+        .iter()
+        .find(|(id, _)| *id == lib)
+        .map(|(_, members)| members.len());
+    assert_eq!(members, Some(2));
+}
+
+/// A name-form `part of foo;` under an UNNAMED includer, below the
+/// enhanced-parts horizon, reports `part_of_unnamed_library` on the
+/// include's URI (pipeline.rs's unnamed-library arm; upstream
+/// library_analyzer.dart `_resolvePartDirective`, the
+/// `!Feature.enhanced_parts` branch). Oracle probed 3.13.1: error
+/// `part_of_unnamed_library` on the directive, "The library is unnamed.
+/// A URI is expected, not a library name 'foo', in the part-of
+/// directive."
+#[test]
+fn name_form_part_of_under_unnamed_includer_reports_part_of_unnamed_library() {
+    const M: &str = "part 'p.dart';\nint f() => 1;\n";
+    const P: &str = "part of foo;\nint g() => 1;\n";
+
+    let fixture = Fixture::new(&[("lib/m.dart", M), ("lib/p.dart", P)]);
+    let m_path = fixture.path("lib/m.dart");
+    let p_path = fixture.path("lib/p.dart");
+    let mut engine = fixture.engine();
+    engine.set_content(&m_path, M.as_bytes());
+    engine.set_content(&p_path, P.as_bytes());
+    let m = engine.file_table().try_file_id(&m_path).expect("interned");
+    let p = engine.file_table().try_file_id(&p_path).expect("interned");
+
+    let diagnostics = engine
+        .analyze(&[], &mut |_| {}, &CancellationToken::default())
+        .expect("cold");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].code.name, "part_of_unnamed_library");
+    assert_eq!(diagnostics[0].file, m, "the row anchors on the include");
+    // The name mismatch claims nothing: p stays an orphan singleton.
+    assert_eq!(engine.libraries().len(), 2, "m plus the p orphan singleton");
+    assert_ne!(engine.library_of(m), engine.library_of(p));
+}

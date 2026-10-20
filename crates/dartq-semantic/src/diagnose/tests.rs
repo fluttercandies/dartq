@@ -16594,3 +16594,80 @@ fn typedef_after_use_still_types_tear_off_argument() {
     .expect("offset fits u32");
     assert_eq!(rows, [("argument_type_not_assignable", at)], "{rows:?}");
 }
+
+// —— single-zero code pins (#2388): presence + severity per live emitter
+// that no other gate exercises. Oracle posture (pinned 3.13.1
+// `dart analyze`, probed 2026-10-20) is recorded per test; the pins nail
+// dartq's own emission, message alignment is a separate lane. ————————
+
+/// `await x` in a sync body (`return await x;` — the official
+/// await_in_wrong_context_test.dart `test_sync` shape) converts the
+/// parser's `endInvalidAwaitExpression` recovery at the `await` keyword.
+/// Oracle probed: error `await_in_wrong_context` at the `await` token,
+/// "The await expression can only be used in an async function."
+#[test]
+fn await_in_sync_body_reports_await_in_wrong_context() {
+    let rep = report("f(x) {\n  return await x;\n}\n");
+    let rows: Vec<_> = rep
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "await_in_wrong_context")
+        .collect();
+    assert_eq!(rows.len(), 1, "{:?}", code_names(&rep));
+    assert_eq!(rows[0].severity, Severity::Error);
+}
+
+/// `==` between two constant collection instances faults: collections
+/// lack primitive equality (`const_eval.rs`'s bin Eq catch-all; the
+/// official `hasPrimitiveEquality` gate, constant_verifier.dart:140-165).
+/// Oracle diff, probed: `const c = [1] == [1];` is SILENT on the pinned
+/// 3.13.1 oracle (its `constEvalPrimitiveEquality` face fires on
+/// user-class operands with a declared `==`/`hashCode`, where dartq's
+/// const-creation arm answers false silently — both faces recorded as
+/// known divergences; this pin owns dartq's current emission).
+#[test]
+fn const_collection_equality_reports_const_eval_primitive_equality() {
+    let rep = report("const c = [1] == [1];\n");
+    let rows: Vec<_> = rep
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "const_eval_primitive_equality")
+        .collect();
+    assert_eq!(rows.len(), 1, "{:?}", code_names(&rep));
+    assert_eq!(rows[0].severity, Severity::Error);
+}
+
+/// Bare creation over a type alias whose RHS names nothing this unit can
+/// build on: the head is a type, not a value (`invocation.rs`'s
+/// `report_alias_invocation_of_non_function`, element_resolver.dart's
+/// function-invocation face). Oracle probed: error
+/// `invocation_of_non_function` at the head, "'T' isn't a function."
+#[test]
+fn alias_bare_creation_reports_invocation_of_non_function() {
+    let rep = report("typedef T = Missing;\nvoid f() {\n  T();\n}\n");
+    let rows: Vec<_> = rep
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "invocation_of_non_function")
+        .collect();
+    assert_eq!(rows.len(), 1, "{:?}", code_names(&rep));
+    assert_eq!(rows[0].severity, Severity::Error);
+}
+
+/// A map-pattern key that is not a constant reports at the key's own
+/// span (`visitMapPattern`'s per-entry constant check,
+/// constant_verifier.dart:342-358; the row fires beside a resolution
+/// miss too, so a plain parameter key keeps the probe minimal). Oracle
+/// probed: error `non_constant_map_pattern_key` at the key, "Key
+/// expressions in map patterns must be constants."
+#[test]
+fn non_constant_map_pattern_key_reports_at_the_key() {
+    let rep = report("void f(x) {\n  var {x: _} = x;\n}\n");
+    let rows: Vec<_> = rep
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "non_constant_map_pattern_key")
+        .collect();
+    assert_eq!(rows.len(), 1, "{:?}", code_names(&rep));
+    assert_eq!(rows[0].severity, Severity::Error);
+}

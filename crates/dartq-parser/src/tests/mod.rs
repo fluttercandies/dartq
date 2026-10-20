@@ -18,6 +18,7 @@ mod gate_acceptance;
 mod gate_dark_pins;
 mod gate_fam11_restricted_patterns;
 mod gate_fp_pins;
+mod gate_local_pins;
 mod gate_m0;
 mod gate_m0_wave1;
 mod gate_m0_wave10;

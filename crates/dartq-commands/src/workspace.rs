@@ -1764,6 +1764,10 @@ mod tests {
             WorkspaceAdvisory::MissingConfig(root.join(".dart_tool/package_config.json"))
         );
         assert_eq!(advisory.code().machine, "DARTQ/PACKAGE_CONFIG_MISSING");
+        // The lowercase registry row, pinned against drift (#2388) — the
+        // machine form above does not catch a `name` rename.
+        assert_eq!(advisory.code().name, "dartq/package_config_missing");
+        assert_eq!(advisory.code().dtype, dartq_diagnostics::DiagnosticType::Tool);
         assert!(advisory.message().contains("run `dart pub get`"));
 
         fs::remove_dir_all(&root).ok();
@@ -1975,6 +1979,11 @@ mod tests {
 
         let advisory = advisory.expect("one advisory");
         assert_eq!(advisory.code(), DARTQ_PACKAGE_CONFIG_INVALID);
+        // The literal registry string breaks the constant-to-constant
+        // comparison above: a rename inside `DARTQ_PACKAGE_CONFIG_INVALID`
+        // would otherwise pass unnoticed (#2388).
+        assert_eq!(advisory.code().name, "dartq/package_config_invalid");
+        assert_eq!(advisory.code().dtype, dartq_diagnostics::DiagnosticType::Tool);
         assert_eq!(advisory.config_path(), config_path);
         let WorkspaceAdvisory::InvalidConfig(invalid) = &advisory else {
             panic!("invalid-config advisory, got {advisory:?}")
