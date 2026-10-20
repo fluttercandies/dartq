@@ -8,7 +8,11 @@ impl<'a> Engine<'a> {
         while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
             cursor -= 1;
         }
-        if cursor == 0 || bytes[cursor - 1] != b'>' {
+        // A `=>` arrow before the bracket ends in the same `>` byte a
+        // written `<...>` group closes with (`seq(Parser other) => [this,
+        // other]`) — the pair is an expression arrow, not a group, and the
+        // nearest earlier type-use is a pattern head, not an element type.
+        if cursor < 2 || bytes[cursor - 1] != b'>' || bytes[cursor - 2] == b'=' {
             return None;
         }
         let (name_range, name) = self
@@ -158,7 +162,10 @@ impl<'a> Engine<'a> {
         while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
             cursor -= 1;
         }
-        if cursor == 0 || bytes[cursor - 1] != b'>' {
+        // The same arrow face [`Self::typed_list_literal_ty`] rejects: a
+        // `=> [` opens an untyped switch-arm/arrow-body literal, and the
+        // byte before its bracket is the arrow's `>`, never a group close.
+        if cursor < 2 || bytes[cursor - 1] != b'>' || bytes[cursor - 2] == b'=' {
             return;
         }
         // The nearest type reference ending before the bracket is the
@@ -2400,6 +2407,32 @@ impl<'a> Engine<'a> {
         }
         let mut unknown = false;
         for (&f, &t) in from.iter().zip(to.iter()) {
+            // The generic-method inference face: a `dynamic` argument into
+            // an unsolved formal's own type-variable slot never reaches the
+            // subtype question — the call-site inference binds the variable
+            // from the argument's static type first
+            // (`node.accept(visitor)` over `accept<E>(AstVisitor<E>)` with
+            // an `AstVisitor<dynamic>` argument solves `E = dynamic`, and
+            // the written pair `AstVisitor<dynamic>`/`AstVisitor<E>` the
+            // matrix sees is inference residue, not a mismatch;
+            // type_analyzer.dart's `InferenceContext` grounds the formal
+            // before any assignability ask). Only the exact unsolved
+            // residue qualifies: a non-primitive, non-collection head that
+            // resolves to no container.
+            if f == Ty::Dynamic
+                && matches!(
+                    t,
+                    Ty::Named {
+                        nullable: false,
+                        args: ArgListId::EMPTY,
+                        ..
+                    }
+                )
+                && let Ty::Named { name, .. } = t
+                && self.unbound_formal_head(name)
+            {
+                continue;
+            }
             // The covariant-interface element rule is the subtype question
             // (`Ctrl<dynamic>` does not fit `Ctrl<int>`: `dynamic <: int`
             // is false — the expression-position downcast leniency never
@@ -2411,6 +2444,25 @@ impl<'a> Engine<'a> {
             }
         }
         (!unknown).then_some(true)
+    }
+
+    /// The unsolved-formal head test: a named head that is neither a final
+    /// primitive nor a collection head and resolves to no container names
+    /// a type parameter of some declaration — the residue an unsubstituted
+    /// generic formal carries to the verdict (the same predicate the
+    /// raw-generic face applies at the send walk).
+    fn unbound_formal_head(&self, name: StringId) -> bool {
+        !self.members.primitive_ids.contains(&name)
+            && !self.collection_heads.contains(&name)
+            && resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                name,
+            )
+            .is_none()
     }
 
     /// A primitive-literal row: [`Engine::push_primitive_row`] is the only
@@ -2672,8 +2724,9 @@ mod async_return_tests {
 
     /// The single-file rig (the shared `tests` module's
     /// `report_full_pipeline` shape, fixed knobs): scan, collect, one
-    /// library, fold. The fixtures are parse-clean.
-    fn report(source: &str) -> FileReport {
+    /// library, fold. The fixtures are parse-clean. Shared with this
+    /// file's verdict-pin module below.
+    pub(super) fn report(source: &str) -> FileReport {
         let strings = StringTable::new();
         let mut files = FileTable::new();
         let file = files.intern(Path::new("main.dart"));
@@ -2860,5 +2913,106 @@ mod async_return_tests {
         assert_eq!(future_value_ty(&strings, &args, int_q), object_q);
         let unknown = future_value_ty(&strings, &args, Ty::Unknown);
         assert_eq!(unknown, Ty::Unknown);
+    }
+}
+
+/// The element/argument verdict pins for this file's census shapes. The
+/// rig is the async-return module's single-file pipeline, verbatim.
+#[cfg(test)]
+mod assignability_face_tests {
+    use super::async_return_tests::report;
+
+    /// The arrow-adjacent list literal (`seq(Parser other) => [this,
+    /// other]`, petitparser's choice/sequence combinators): the switch
+    /// arm's `>` is the arrow's, not a written `<...>` group close, so the
+    /// element face never arms and the nearest earlier type-use (the
+    /// pattern's head) never becomes the element type.
+    #[test]
+    fn arrow_adjacent_list_literal_has_no_element_face() {
+        let report = report(
+            "class Seq {}\n\
+             class A {\n\
+               A({required this.children});\n\
+               final List<Seq> children;\n\
+             }\n\
+             List<Seq> f(Seq other) => switch (other) {\n\
+               A(children: final children) => [\n\
+                 ...children,\n\
+                 other,\n\
+               ],\n\
+               _ => [other, other],\n\
+             };",
+        );
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.code.name == "list_element_type_not_assignable"),
+            "{:?}",
+            report.diagnostics.iter().map(|d| (&d.code.name, &d.message)).collect::<Vec<_>>()
+        );
+    }
+
+    /// The written-group control: a real `<String>[...]` literal still
+    /// checks its elements against the declared type.
+    #[test]
+    fn written_group_literal_still_checks_elements() {
+        let report = report("List<int> g() => <String>['x'];");
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code.name == "list_element_type_not_assignable"),
+            "{:?}",
+            report.diagnostics.iter().map(|d| (&d.code.name, &d.message)).collect::<Vec<_>>()
+        );
+    }
+
+    /// A `dynamic` argument into an unsolved generic formal's
+    /// type-variable slot is the call-site inference's own ground
+    /// (`accept<E>(V<E>)` over a `V<dynamic>` argument binds `E`), so the
+    /// written residue never reports.
+    #[test]
+    fn dynamic_argument_into_unsolved_generic_formal_stays_silent() {
+        let report = report(
+            "class V<T> {\n\
+               int visit() => 1;\n\
+             }\n\
+             class Node {\n\
+               int accept<E>(V<E> visitor) => visitor.visit();\n\
+             }\n\
+             void m(Node node, V<dynamic> visitor) {\n\
+               node.accept(visitor);\n\
+             }",
+        );
+        assert!(
+            !report
+                .diagnostics
+                .iter()
+                .any(|d| d.code.name == "argument_type_not_assignable"),
+            "{:?}",
+            report.diagnostics.iter().map(|d| (&d.code.name, &d.message)).collect::<Vec<_>>()
+        );
+    }
+
+    /// The ground-truth control: a `dynamic` slot against a concrete
+    /// written argument still refuses (`List<dynamic>` into
+    /// `List<int>` — the slot pair is real, no inference stands).
+    #[test]
+    fn dynamic_slot_against_concrete_argument_still_reports() {
+        let report = report(
+            "void takeList(List<int> xs) {}\n\
+             void m(List<dynamic> y) {\n\
+               takeList(y);\n\
+             }",
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|d| d.code.name == "argument_type_not_assignable"),
+            "{:?}",
+            report.diagnostics.iter().map(|d| (&d.code.name, &d.message)).collect::<Vec<_>>()
+        );
     }
 }
