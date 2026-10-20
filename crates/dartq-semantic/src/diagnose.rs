@@ -420,6 +420,55 @@ mod ticket_2216_tests;
 #[cfg(test)]
 mod ticket_1351_tests;
 
+/// The undefined-name/resolution differential pins: constructor-reference
+/// prefix heads (`fb.RuleState.stable()`), record `on`-type field getters,
+/// and extension invoke-miss naming (the `on` type's `this`, an
+/// `InvalidType` `this` stays silent). Kept as a standalone module so the
+/// shared `tests` rig stays untouched while its lane is in flight.
+#[cfg(test)]
+mod ticket_undefined_family_tests;
+
+/// The dead/unused-family differential pins: the `InvalidType` checked
+/// type's `factor` remainder (the losing `is`/`is!` arm's `dead_code`),
+/// `unused_field`'s `unresolvedReadMembers` spelling fallback and the
+/// enum `values` credit, and the extension `on` resolvability gate on
+/// `unused_element` member credits.
+#[cfg(test)]
+mod ticket_dead_family_tests;
+
+/// The assignability-family differential pins (W3 real-corpus burn): the
+/// `FutureOr<T>` union rule, the async matrix's Right Bottom leg, the
+/// strict function-shape and covariant-argument slots, and the record
+/// poison. Kept as a standalone module so the shared `tests` rig stays
+/// untouched while its lane is in flight.
+#[cfg(test)]
+mod ticket_assignability_family_tests;
+
+/// The #2243 promotion differential pins: an args-carrying promoted local
+/// read on the return path, and the if-null assignment's constructor-RHS
+/// promotion. Kept as a standalone module so the shared `tests` rig stays
+/// untouched while its lane is in flight.
+#[cfg(test)]
+mod ticket_2243_tests;
+
+/// The #2245 composite-argument pins: a comparison (`==`/`!=`/`&&`/`||`)
+/// argument folds no single row, so the argument windows recover the
+/// statically-`bool` composite face at its own extent instead of dropping
+/// the window (the dropped window shifted every later argument onto the
+/// wrong formal — the multiline `_checkAndThrow` misalignment). Kept as a
+/// standalone module so the shared `tests` rig stays untouched.
+#[cfg(test)]
+mod ticket_2245_tests;
+
+/// The const NON_CONSTANT-family differential pins (#2242): unresolved
+/// callees inside const literals report the element faces at the
+/// invocation and anchor the declaration row at the first failure, and a
+/// qualified const creation (`C.named(...)`) validates its arguments
+/// against the in-file const constructor. Kept as a standalone module so
+/// the shared `tests` rig stays untouched.
+#[cfg(test)]
+mod ticket_const_family_tests;
+
 pub use types::{FileReport, NameRow, NameUse, RefTarget, UndefinedGuard, UnitRef};
 pub(crate) use types::*;
 
@@ -2541,3 +2590,6 @@ mod suppression_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod ticket_2231_tests;
