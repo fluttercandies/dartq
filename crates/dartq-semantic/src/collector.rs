@@ -1753,7 +1753,10 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             builder.type_arg_depth > 0,
             "unbalanced type-argument events",
         );
-        builder.type_arg_depth -= 1;
+        // The parser pairs begin/end events; saturate so a drifted close
+        // degrades to "no open group" (keeping the sink seal below) instead
+        // of underflowing.
+        builder.type_arg_depth = builder.type_arg_depth.saturating_sub(1);
         if let Some(site) = builder.capture.as_mut() {
             site.end_group(SourceRange {
                 offset: begin.range.offset,

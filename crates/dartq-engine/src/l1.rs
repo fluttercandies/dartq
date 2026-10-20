@@ -1033,9 +1033,12 @@ pub(crate) fn scan_unit(
             // at this emit site (the generated row keeps the AT_SIGN
             // template — dartq-diagnostics code.rs preamble).
             let code = dartq_diagnostics::INVALID_LANGUAGE_VERSION_OVERRIDE;
+            // Contract-drift defense, not a reachable path: the scanner
+            // always records the comment span with an override — degrade
+            // to the (0,0) anchor rather than crash the scan face.
             let span = scanned
                 .language_version_override_span
-                .expect("scanner records the comment span with every override");
+                .unwrap_or(SourceRange { offset: 0, length: 0 });
             warnings.push(Diagnostic::new(
                 code.dtype.severity(),
                 code,
@@ -1055,9 +1058,12 @@ pub(crate) fn scan_unit(
             // beside it.
             if over.is_below_floor() {
                 let code = dartq_diagnostics::ILLEGAL_LANGUAGE_VERSION_OVERRIDE;
+                // Contract-drift defense, not a reachable path: the scanner
+                // always records the comment span with an override — degrade
+                // to the (0,0) anchor rather than crash the scan face.
                 let span = scanned
                     .language_version_override_span
-                    .expect("scanner records the comment span with every override");
+                    .unwrap_or(SourceRange { offset: 0, length: 0 });
                 warnings.push(Diagnostic::new(
                     code.dtype.severity(),
                     code,
@@ -4640,6 +4646,42 @@ pub(crate) mod tests {
         );
         assert_eq!(settled, LanguageVersion::new(2, 12));
         assert!(warnings.is_empty(), "the floor itself is allowed");
+    }
+
+    /// The official above-latest rejection (official scanner
+    /// `_languageVersionChanged`): an override above
+    /// [`DEFAULT_LANGUAGE_VERSION`] warns at the comment lexeme and is
+    /// dropped — the settled version and the feature grants stay at the
+    /// incoming baseline and no rescan runs. Pins the override-warning
+    /// span plumbing end to end (the settle arms' only observable face).
+    #[test]
+    fn above_latest_override_rejects_and_reports() {
+        let text = "// @dart = 99.9\nint a = 0;\n";
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let file = state.files.intern(Path::new("/ceiling.dart"));
+        let grants = state.grants();
+        let (features, settled, _, warnings) =
+            scan_unit(text, DEFAULT_LANGUAGE_VERSION, file, &grants);
+        assert_eq!(settled, DEFAULT_LANGUAGE_VERSION, "the override is dropped");
+        assert_eq!(
+            features.fingerprint(),
+            FeatureSet::for_language_version(DEFAULT_LANGUAGE_VERSION).fingerprint(),
+            "the feature set stays the incoming baseline"
+        );
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code.name, "invalid_language_version_override");
+        assert_eq!(warnings[0].severity, Severity::Warning);
+        assert_eq!(warnings[0].range.offset, 0);
+        assert_eq!(warnings[0].range.length, 15);
+        assert_eq!(
+            warnings[0].message,
+            format!(
+                "The language version override can't specify a version greater \
+                 than the latest known language version: {DEFAULT_LANGUAGE_VERSION}."
+            )
+            .as_str()
+        );
     }
 
     /// One library's structural row: id, defining file, parts, deps, and
