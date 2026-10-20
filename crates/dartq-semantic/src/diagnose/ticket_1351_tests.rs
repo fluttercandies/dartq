@@ -1032,8 +1032,12 @@
     /// `int? f()` is legal and emits nothing.
     #[test]
     fn function_typed_formal_type_binds() {
+        // The `int` stub declares `isEven` so the member face resolves on
+        // the call's return — the pin isolates the `?.` verdict (the
+        // oracle's int carries isEven; a memberless stub would add the
+        // collateral `undefined_getter` rows).
         let source =
-            "class int {}\nvoid m(int f()) { f()?.isEven; }\nvoid n(int? f()) { f()?.isEven; }";
+            "class bool {} class int { bool get isEven => throw 0; }\nvoid m(int f()) { f()?.isEven; }\nvoid n(int? f()) { f()?.isEven; }";
         let report = unit_report(source);
         let names = report
             .diagnostics

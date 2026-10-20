@@ -410,14 +410,23 @@ impl ParserListener for DiagnoseListener<'_> {
         // primary, which is not a member site — secondaries never spare it
         // except through a `this.i` formal or an initializer assignment).
         if let Some(container) = engine.container_context().map(|(c, _)| c) {
-            // Only DECLARED constructors join the verifier (the implicit
-            // constructor binds the representation from the primary formal
-            // itself — a constructor-less extension type stays silent).
+            // Only declared SECONDARY constructors join the verifier — the
+            // primary formal always binds the representation, so counting it
+            // would push the rep into the pending set with no generative
+            // ctor site to answer it (the declaration face then fires
+            // `final_not_initialized` on `extension type A._(int i) {}`).
+            // `constructors` holds the named selectors only: an unnamed
+            // primary contributes nothing, a named primary contributes
+            // exactly one — the threshold splits at one named row beyond
+            // that.
             let declares_ctors = engine
                 .index
                 .get(engine.file)
                 .and_then(|f| f.container(container))
-                .is_some_and(|decl| !decl.constructors.is_empty());
+                .is_some_and(|decl| {
+                    decl.constructors.len()
+                        > usize::from(!decl.has_unnamed_constructor)
+                });
             if declares_ctors {
                 let reps: Vec<(StringId, SourceRange)> = engine
                     .index

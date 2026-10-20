@@ -7274,21 +7274,31 @@
         assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
     }
 
-    /// The silent faces: a const literal's duplicate face is the
-    /// ERROR-tier const twins (explicitly `const` or implicitly const in
-    /// a const context — never this wave's row); evaluation failure is
-    /// silence (`computeConstantValue` fails); ints and doubles never
-    /// unify.
+    /// The silent faces: evaluation failure is silence
+    /// (`computeConstantValue` fails) and ints and doubles never unify.
+    /// Explicitly-`const` literals report the ERROR-tier
+    /// `equal_elements_in_const_set` row themselves.
     #[test]
     fn const_and_non_constant_duplicates_stay_silent() {
-        let rep = report("const s = {1, 1};");
-        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
-        let rep = report("const c = [{1, 1}];");
-        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
         let rep = report("var x = 0; var s = {x, x};");
         assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
         let rep = report("var s = {1, 1.0};");
         assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        // Const literals carry the ERROR-tier row for their own duplicate.
+        let rep = report("const s = {1, 1};");
+        assert_eq!(
+            code_names(&rep),
+            ["equal_elements_in_const_set"],
+            "{:?}",
+            code_names(&rep)
+        );
+        let rep = report("const c = [{1, 1}];");
+        assert_eq!(
+            code_names(&rep),
+            ["equal_elements_in_const_set"],
+            "{:?}",
+            code_names(&rep)
+        );
     }
 
     /// Spread/if/for elements skip the whole literal's duplicate check —
@@ -7823,20 +7833,30 @@
         assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
     }
 
-    /// The silent faces: const literals early-return in the oracle (their
-    /// duplicate face is the ERROR-tier const twins), and an element
-    /// whose constant evaluation fails never reports.
+    /// The silent faces: an element whose constant evaluation fails never
+    /// reports. Const literals early-return here — their duplicate face is
+    /// the ERROR-tier `equal_elements_in_const_set` row.
     #[test]
     fn non_const_duplicate_silences() {
-        // `const` literal — the ERROR twins' business, silent here.
-        let rep = report("const s = {1, 1};");
-        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
-        // An implicitly const literal inside a const context.
-        let rep = report("const c = [{1, 1}];");
-        assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
         // A non-constant variable's evaluation fails — silent.
         let rep = report("var x = 0; var s = {x, x};");
         assert!(code_names(&rep).is_empty(), "{:?}", code_names(&rep));
+        // `const` literal — carries the ERROR-tier row for its duplicate.
+        let rep = report("const s = {1, 1};");
+        assert_eq!(
+            code_names(&rep),
+            ["equal_elements_in_const_set"],
+            "{:?}",
+            code_names(&rep)
+        );
+        // An implicitly const literal inside a const context.
+        let rep = report("const c = [{1, 1}];");
+        assert_eq!(
+            code_names(&rep),
+            ["equal_elements_in_const_set"],
+            "{:?}",
+            code_names(&rep)
+        );
     }
 
     /// Constant-evaluation equality, not syntactic identity: distinct
