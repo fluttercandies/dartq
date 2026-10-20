@@ -8018,6 +8018,73 @@ fn unknowable_operand_never_guaranteed_fail() {
     assert!(dead_snippets(source).is_empty());
 }
 
+/// #2357 pin ① (guaranteed-fail over a reference operand): the official
+/// fail arm decides before the reference branch, so a local variable's
+/// `is Never` folds to `booleanLiteral(false)` and deads the then arm —
+/// no promotion split rides the fold (the then body reports the
+/// whole-block dead row, the probe-g5 shape). Swap-back-proven: HEAD
+/// (fold absent in the reference arm) keeps the then arm live.
+#[test]
+fn local_reference_is_never_deads_the_then_arm() {
+    let source = "void f() { int x = 0; if (x is Never) { x; } else {} }";
+    assert_eq!(dead_snippets(source), ["{ x; }"]);
+}
+
+/// #2357 pin ② (promoted-satisfying reference): after `x is String`
+/// promotes `x`, the inner `x is String` keeps the reference path (the
+/// official fail arm does not fire — `String` and `String` are not
+/// disjoint) and the promotion split itself deads the else arm: a bottom
+/// `factor(previous, tested)` marks the unmatched arm unreachable
+/// (official `tryPromoteForTypeCheck`'s `ifFalseIsUnreachable` —
+/// upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/
+/// flow_analysis/flow_analysis.dart:4156-4160). Honest swap-back note:
+/// HEAD-green — this deadness is [`Interp::branch_type_test`]'s
+/// pre-existing factor face; the pin constrains the fail fold from
+/// displacing it.
+#[test]
+fn promoted_reference_meeting_the_test_deads_the_else() {
+    let source =
+        "void f(Object x) { if (x is String) { if (x is String) {} else { x; } } }";
+    assert_eq!(dead_snippets(source), ["{ x; }"]);
+}
+
+/// #2357 pin ③ (guaranteed-fail flipped over a reference operand):
+/// `is! Never` folds to `booleanLiteral(true)` — the then arm stays live
+/// and the else arm reports the dead row. Swap-back-proven: HEAD keeps
+/// the else arm live.
+#[test]
+fn local_reference_is_bang_never_flips_the_dead_arm() {
+    let source = "void f() { int x = 0; if (x is! Never) {} else { x; } }";
+    assert_eq!(dead_snippets(source), ["{ x; }"]);
+}
+
+/// #2357 pin ④ (control): a promotable reference whose test guarantees
+/// nothing keeps both arms live — no fold fires and the promotion split
+/// leaves both faces reachable. Honest swap-back note: HEAD-green by
+/// construction (the control face); its force is against the fold
+/// over-firing on a plain promotable operand.
+#[test]
+fn promotable_reference_keeps_both_is_test_arms_live() {
+    let source = "void f(Object x) { if (x is String) { x; } else { x; } }";
+    assert!(dead_snippets(source).is_empty());
+}
+
+/// #2357 pin ⑤ (no guaranteed-succeed fold on references): the official
+/// succeed arm sits behind the reference check (upstream Dart SDK source,
+/// pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:
+/// 7190-7205 — reached only when `_getExpressionReference` returned
+/// null), so a reference test never folds to `true` on a mere subtype
+/// fact: `int x; x is num` keeps the else arm live (the promotion split's
+/// else-deadness needs a bottom factor, and `factor(int, num)` is `int`).
+/// Honest swap-back note: HEAD-green — the pin binds this lane's skip
+/// decision, its force is against a succeed fold over-reaching into the
+/// reference arm.
+#[test]
+fn reference_is_test_never_folds_to_guaranteed_succeed() {
+    let source = "void f(int x) { if (x is num) { x; } else { x; } }";
+    assert!(dead_snippets(source).is_empty());
+}
+
 /// #2346③: a switch expression's value carries the LUB join of its case
 /// values (upstream Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart
 /// `SwitchExpressionImpl.staticType`'s arm fold; the name-level join is

@@ -681,25 +681,63 @@ impl Interp<'_> {
                 if let Some(var) = operand.reference
                     && !self.current.model(var).captured()
                 {
-                    let promoted = self.promotion_candidate(var, tested, tested_args);
-                    let (matched, unmatched) =
-                        self.branch_type_test(var, tested, tested_args, promoted);
-                    let (if_true, if_false) = if is_not {
-                        (unmatched, matched)
+                    // The official fail arm decides before the reference
+                    // branch and covers promotable references too — a
+                    // reference operand never short-circuits it (upstream
+                    // Dart SDK source, pkg/_fe_analyzer_shared/lib/src/
+                    // flow_analysis/flow_analysis.dart:7184-7189). It reads
+                    // the operand's *declared* static type:
+                    // `isExpression_end`'s `subExpressionType` is the
+                    // sub-expression's AST static type
+                    // (flow_analysis_visitor.dart:362-369,
+                    // `expression.typeOrThrow`), promotion-free — a
+                    // promoted face would over-fire (`Object? x` promoted
+                    // to `String` then `x is Null` stays live officially,
+                    // while `String` is disjoint from `Null`). The fold is
+                    // `booleanLiteral(isNot)` (:6544-6559): no promotion
+                    // split rides it, so `branch_type_test` is skipped and
+                    // `test_split` stays off; `current` keeps the pre-test
+                    // state like the non-reference folds — the deadness
+                    // rides the branch pair.
+                    //
+                    // The guaranteed-succeed arm has no reference face
+                    // here: upstream reaches it only when
+                    // `_getExpressionReference` returned null
+                    // (:7190-7205), so a reference test never folds to
+                    // `true` on a mere subtype fact (`int x; x is num`
+                    // keeps the else live). The reference else-deadness
+                    // comes from the promotion split itself — a bottom
+                    // `factor(previous, tested)` marks the unmatched arm
+                    // unreachable (`tryPromoteForTypeCheck`'s
+                    // `ifFalseIsUnreachable`, :4156-4160), already
+                    // [`Interp::branch_type_test`]'s face.
+                    let declared =
+                        self.vars.get(var as usize).map_or(Ty::UNKNOWN, |meta| meta.ty);
+                    if self.is_test_guaranteed_fail(declared, tested) {
+                        let cur = self.current.clone();
+                        let dead = cur.clone().set_unreachable(&mut self.reach);
+                        expr.branches = Some(if is_not { (cur, dead) } else { (dead, cur) });
                     } else {
-                        (matched, unmatched)
-                    };
-                    // The split rides `Expr::branches` for the condition
-                    // consumers (`cond_split`) and `current` narrows to the
-                    // true arm for the guard machinery's contract
-                    // (`GuardBegin` snapshots the pre-guard state and the
-                    // guard-true arm IS this drift). A value consumer that
-                    // drops the expression rejoins both arms
-                    // ([`Interp::rejoin_value_split`]) — an `is` result
-                    // read as a plain value narrows nothing officially.
-                    self.current = if_true.clone();
-                    expr.branches = Some((if_true, if_false));
-                    expr.test_split = true;
+                        let promoted = self.promotion_candidate(var, tested, tested_args);
+                        let (matched, unmatched) =
+                            self.branch_type_test(var, tested, tested_args, promoted);
+                        let (if_true, if_false) = if is_not {
+                            (unmatched, matched)
+                        } else {
+                            (matched, unmatched)
+                        };
+                        // The split rides `Expr::branches` for the condition
+                        // consumers (`cond_split`) and `current` narrows to the
+                        // true arm for the guard machinery's contract
+                        // (`GuardBegin` snapshots the pre-guard state and the
+                        // guard-true arm IS this drift). A value consumer that
+                        // drops the expression rejoins both arms
+                        // ([`Interp::rejoin_value_split`]) — an `is` result
+                        // read as a plain value narrows nothing officially.
+                        self.current = if_true.clone();
+                        expr.branches = Some((if_true, if_false));
+                        expr.test_split = true;
+                    }
                 } else {
                     let cur = self.current.clone();
                     // The non-reference guaranteed-fail face (official
@@ -1736,17 +1774,19 @@ impl Interp<'_> {
         }
     }
 
-    /// Whether a non-reference operand's type test is guaranteed to
+    /// Whether an operand's type test is guaranteed to
     /// fail (official `isExpression_end`'s first arm — upstream Dart
     /// SDK source, pkg/_fe_analyzer_shared/lib/src/flow_analysis/
     /// flow_analysis.dart:7184-7189 — `isBottomType(checkedType)` or
     /// `_isTypeCheckGuaranteedToFailWithSoundNullSafety`
     /// (:9133-9140) over `_typesAreDisjointDueToNullability`
     /// (:9496-9501), folded to `booleanLiteral(isNot)`, decided before
-    /// the guaranteed-succeed arm): a bottom tested type (`Never`) or
-    /// a nullability-disjoint pair — one side `Null`-or-equivalent
-    /// (`Null`, `Never?`), the other non-nullable — makes the test a
-    /// constant `false`. The same refusal trio as
+    /// the reference branch and the guaranteed-succeed arm — it covers
+    /// promotable references too, fed the declared static type): a
+    /// bottom tested type (`Never`) or a nullability-disjoint pair
+    /// — one side `Null`-or-equivalent (`Null`, `Never?`), the other
+    /// non-nullable — makes the test a constant `false`. The same
+    /// refusal trio as
     /// [`Interp::is_test_guaranteed`] applies: an unknown/dynamic/void
     /// face on either side is never a dead-branch producer (the
     /// name-level lattice's optimism must not certify the mark).
