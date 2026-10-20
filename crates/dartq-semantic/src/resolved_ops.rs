@@ -54,7 +54,9 @@
 
 use std::cell::RefCell;
 
-use dartq_flow::ty::{ArgTy, Base, Classification, NameTypeOps, TypeOps, Ty as FlowTy};
+use dartq_flow::ty::{
+    ArgTy, Base, Classification, EMPTY_ARGS, NameTypeOps, TypeOps, Ty as FlowTy,
+};
 use dartq_resolution::{LibraryGraph, LibraryId, Lookup, NamespaceEntry, Namespaces};
 use dartq_source::{FileId, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -915,15 +917,19 @@ pub struct ResolvedTypeOps<'a> {
     /// `is_always_exhaustive` per-decl verdict, stable across the
     /// corpus's switch-end probes.
     closed: RefCell<FxHashMap<TypeDeclId, bool>>,
-    /// Resolved-but-unmodeled name → its opaque declaration. The import
+    /// `(name, written arity)` → its opaque declaration. The import
     /// scopes resolve the spelling (it landed in `non_containers`), but
     /// no element model carries its class — a `dart:` SDK class outside
     /// the builtin table (`Uint8List`, `File`), an unanalyzed dependency.
-    /// One synthetic declaration per name, disjoint from every registered
-    /// one, so the type questions answer "unrelated" (the oracle's
-    /// resolved-class posture) instead of collapsing through `Invalid`'s
-    /// vacuous arms.
-    opaque: RefCell<FxHashMap<StringId, TypeDeclId>>,
+    /// One synthetic declaration per spelling and written arity, disjoint
+    /// from every registered one, so the type questions answer "unrelated"
+    /// (the oracle's resolved-class posture) instead of collapsing through
+    /// `Invalid`'s vacuous arms; the written arguments ride along on the
+    /// `Interface`, so `Stream<List<int>>` and `Stream<Uint8List>` read as
+    /// two instantiations of one opaque `Stream` (covariance decides)
+    /// rather than one shared argument-less declaration (#2288's spurious
+    /// `is`-check dead rows).
+    opaque: RefCell<FxHashMap<(StringId, usize), TypeDeclId>>,
     dynamic: TypeId,
     null: TypeId,
     void: TypeId,
@@ -950,19 +956,33 @@ impl<'a> ResolvedTypeOps<'a> {
         }
     }
 
-    /// The opaque declaration of one resolved-but-unmodeled name, minted
-    /// once per name in a raw range no registered declaration can reach
-    /// (the registry's counter starts at [`FIRST_CONTAINER_RAW`] and
-    /// grows by declaration count; an analyze would need 2^30 containers
-    /// to collide).
-    fn opaque_decl(&self, name: StringId) -> TypeDeclId {
+    /// The opaque declaration of one resolved-but-unmodeled name at one
+    /// written arity, minted once per key in a raw range no registered
+    /// declaration can reach (the registry's counter starts at
+    /// [`FIRST_CONTAINER_RAW`] and grows by declaration count; an analyze
+    /// would need 2^30 containers to collide). The arity is part of the
+    /// key because a declaration's type-parameter count is part of its
+    /// identity: two spellings of one name with different written arities
+    /// are not instantiations of the same class.
+    fn opaque_decl(&self, name: StringId, arity: usize) -> TypeDeclId {
         let mut cache = self.opaque.borrow_mut();
-        if let Some(&decl) = cache.get(&name) {
+        if let Some(&decl) = cache.get(&(name, arity)) {
             return decl;
         }
         let decl = TypeDeclId::from_raw(FIRST_OPAQUE_RAW + cache.len() as u32);
-        cache.insert(name, decl);
+        cache.insert((name, arity), decl);
         decl
+    }
+
+    /// The opaque `Interface` for `name` with its written `args` and
+    /// nullability face — the single mint every map arm shares, so a name
+    /// reads as the same declaration at the base, scrutinee and nested
+    /// argument faces.
+    fn opaque_ty(&self, name: StringId, args: Vec<TypeId>, nullable: bool) -> TypeId {
+        let decl = self.opaque_decl(name, args.len());
+        self.snapshot
+            .table
+            .intern(UninternedType::Interface { decl, args }, nullable)
     }
 
     /// Extends the `name_id → (non-null, nullable)` binding through
@@ -971,9 +991,11 @@ impl<'a> ResolvedTypeOps<'a> {
     /// to-bounds interface (interned once per nullability face); a
     /// type-parameter spelling maps to its synthetic [`TypeParameter`]
     /// id; `FutureOr` maps to `FutureOr<dynamic>` (the raw-type face
-    /// `map_future_or`'s argument-less arm produces); everything else
-    /// (a typedef, a local function, a synthetic `#<handle>` token, an
-    /// unindexed import) caches the `Invalid` pair.
+    /// `map_future_or`'s argument-less arm produces); a
+    /// resolved-but-unmodeled spelling (`non_containers`) caches its
+    /// argument-less opaque pair; everything else (a typedef, a local
+    /// function, a synthetic `#<handle>` token, an unindexed import)
+    /// caches the `Invalid` pair.
     fn observe_names(&self, names: &[Box<str>]) {
         let mut cache = self.name_ty.borrow_mut();
         let start = cache.len();
@@ -1029,8 +1051,8 @@ impl<'a> ResolvedTypeOps<'a> {
                     })
                     .map_or_else(
                         || {
-                            self.builtin_spelling(lexeme, false).map_or(
-                                (self.invalid, self.invalid),
+                            self.builtin_spelling(lexeme, false).map_or_else(
+                                || self.observed_opaque_pair(name),
                                 |non_null| {
                                     (
                                         non_null,
@@ -1058,6 +1080,99 @@ impl<'a> ResolvedTypeOps<'a> {
             };
             cache.push(pair);
         }
+    }
+
+    /// The observed `(non-null, nullable)` pair of a name the registry
+    /// and the builtin table both miss: a resolved-but-unmodeled spelling
+    /// (`non_containers`) mints its argument-less opaque face, so the base
+    /// ops answer "unrelated" exactly like `map_scrutinee`'s arm, and
+    /// every other miss is the oracle's `InvalidType`.
+    fn observed_opaque_pair(&self, name: StringId) -> (TypeId, TypeId) {
+        if !self.snapshot.non_containers.contains(&name) {
+            return (self.invalid, self.invalid);
+        }
+        (
+            self.opaque_ty(name, Vec::new(), false),
+            self.opaque_ty(name, Vec::new(), true),
+        )
+    }
+
+    /// One written name's resolved mapping — the shared core of
+    /// [`ResolvedTypeOps::map_scrutinee`] (a probe/typed-op `Base::Name`
+    /// with its own written argument list) and
+    /// [`ResolvedTypeOps::map_node`] (a nested argument tree). Precedence
+    /// mirrors the official scope chain: a type parameter, the
+    /// `FutureOr` pseudo type, a registered container, the
+    /// `Null`/`Never` kind spellings, the resolved-but-unmodeled opaque
+    /// declaration, and finally `Invalid`.
+    fn map_name(
+        &self,
+        lexeme: &str,
+        args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+        nullable: bool,
+    ) -> TypeId {
+        let name = self.strings.intern(lexeme);
+        if let Some(&param) = self.snapshot.type_params.get(&name) {
+            return self
+                .snapshot
+                .table
+                .intern(UninternedType::TypeParameter { parameter: param }, nullable);
+        }
+        if lexeme == "FutureOr" {
+            return self.map_future_or(args, arena, names, nullable);
+        }
+        let registered = self
+            .snapshot
+            .registry
+            .get(&name)
+            .filter(|_| !self.snapshot.non_containers.contains(&name));
+        if let Some(&decl) = registered {
+            let Some(mapped_args) = self.map_args(args, arena, names, decl) else {
+                return self.invalid;
+            };
+            return self
+                .snapshot
+                .table
+                .intern(UninternedType::Interface { decl, args: mapped_args }, nullable);
+        }
+        if let Some(builtin) = self.builtin_spelling(lexeme, nullable) {
+            return builtin;
+        }
+        if self.snapshot.non_containers.contains(&name) {
+            let written = arena.get(args as usize).map_or(&[][..], Vec::as_slice);
+            let mapped = self.opaque_args(written, arena, names);
+            return self.opaque_ty(name, mapped, nullable);
+        }
+        self.invalid
+    }
+
+    /// The written argument list of an opaque instantiation: each node
+    /// maps through [`ResolvedTypeOps::map_node`], and an `Invalid`
+    /// argument reads `dynamic` — the top instantiation the official
+    /// `instantiateToBounds` substitutes for an unconstrained parameter —
+    /// so an unresolved nested name keeps the enclosing opaque
+    /// `Interface` comparable instead of suppressing it through
+    /// `map_args`'s arity/`Invalid` veto. Without that substitution the
+    /// residual `Stream<List<int>>` vs `Stream<Uint8List>` comparison
+    /// would read both arguments as `Invalid` and answer "same type".
+    fn opaque_args(
+        &self,
+        written: &[ArgTy],
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> Vec<TypeId> {
+        written
+            .iter()
+            .map(|arg| {
+                let ty = self.map_node(arg, arena, names);
+                match self.snapshot.table.get(ty).kind() {
+                    TypeKind::Invalid => self.dynamic,
+                    _ => ty,
+                }
+            })
+            .collect()
     }
 
     /// `Null` and `Never` spelled as types: kind-level spellings the
@@ -1155,34 +1270,9 @@ impl<'a> ResolvedTypeOps<'a> {
                 let Some(lexeme) = names.get(id as usize) else {
                     return self.invalid;
                 };
-                let name = self.strings.intern(lexeme);
                 // A parameter named `FutureOr` shadows the core type — the
-                // same precedence `observe_names` uses.
-                if let Some(&param) = self.snapshot.type_params.get(&name) {
-                    return self
-                        .snapshot
-                        .table
-                        .intern(UninternedType::TypeParameter { parameter: param }, node.nullable);
-                }
-                if lexeme.as_ref() == "FutureOr" {
-                    return self.map_future_or(node.args, arena, names, node.nullable);
-                }
-                let Some(&decl) = self
-                    .snapshot
-                    .registry
-                    .get(&name)
-                    .filter(|_| !self.snapshot.non_containers.contains(&name))
-                else {
-                    return self
-                        .builtin_spelling(lexeme, node.nullable)
-                        .unwrap_or(self.invalid);
-                };
-                let Some(args) = self.map_args(node.args, arena, names, decl) else {
-                    return self.invalid;
-                };
-                self.snapshot
-                    .table
-                    .intern(UninternedType::Interface { decl, args }, node.nullable)
+                // same precedence `observe_names` uses (inside `map_name`).
+                self.map_name(lexeme, node.args, arena, names, node.nullable)
             }
         }
     }
@@ -1267,59 +1357,10 @@ impl<'a> ResolvedTypeOps<'a> {
                 let Some(lexeme) = names.get(id as usize) else {
                     return self.invalid;
                 };
-                let name = self.strings.intern(lexeme);
-                if let Some(&param) = self.snapshot.type_params.get(&name) {
-                    return self
-                        .snapshot
-                        .table
-                        .intern(UninternedType::TypeParameter { parameter: param }, ty.nullable);
-                }
-                if lexeme.as_ref() == "FutureOr" {
-                    return self.map_future_or(args, arena, names, ty.nullable);
-                }
-                let Some(&decl) = self
-                    .snapshot
-                    .registry
-                    .get(&name)
-                    .filter(|_| !self.snapshot.non_containers.contains(&name))
-                else {
-                    if let Some(non_null) = self.builtin_spelling(lexeme, ty.nullable) {
-                        return non_null;
-                    }
-                    // A name the import scopes resolve but no model
-                    // carries (`non_containers` — a `dart:` SDK class
-                    // outside the builtin table, an unanalyzed
-                    // dependency): the oracle resolves it, so the
-                    // subtype questions stay live — an unrelated opaque
-                    // declaration keeps `factor` at `from` and the
-                    // promotions refused, where an `Invalid` read would
-                    // vacuously dead the else branch of every
-                    // `x is Uint8List`-shaped test (subtype.dart's 0c
-                    // arm answers `InvalidType` both ways). A name
-                    // outside `non_containers` too resolves nowhere —
-                    // that IS the oracle's `InvalidType`.
-                    if self.snapshot.non_containers.contains(&name) {
-                        let decl = self.opaque_decl(name);
-                        return self.snapshot.table.intern(
-                            UninternedType::Interface {
-                                decl,
-                                args: Vec::new(),
-                            },
-                            ty.nullable,
-                        );
-                    }
-                    return self.invalid;
-                };
-                let Some(mapped_args) = self.map_args(args, arena, names, decl) else {
-                    return self.invalid;
-                };
-                self.snapshot.table.intern(
-                    UninternedType::Interface {
-                        decl,
-                        args: mapped_args,
-                    },
-                    ty.nullable,
-                )
+                // The full chain — including the resolved-but-unmodeled
+                // opaque face — is shared with `map_node`, so a name reads
+                // as the same declaration at every depth.
+                self.map_name(lexeme, args, arena, names, ty.nullable)
             }
             _ => self.map_base(ty).unwrap_or(self.invalid),
         }
@@ -1466,6 +1507,32 @@ impl TypeOps for ResolvedTypeOps<'_> {
         }
     }
 
+    /// Whether a pattern's written type resolves to `Invalid` (official
+    /// `promoteForPattern`'s invalid arm, `flow_analysis.dart:7720-7723`):
+    /// the spelling maps through [`ResolvedTypeOps::map_scrutinee`], the
+    /// same resolution the typed subtype ops use, so an unresolvable head
+    /// and a registered container with a wrong written arity both answer
+    /// `true` — the analyzer's `InvalidType` for the pattern's required
+    /// type. The flow layer then skips the type test and joins the live
+    /// state into the unmatched chain instead of letting
+    /// `factor(any, Invalid)` dead the body.
+    fn is_invalid_typed(
+        &self,
+        ty: FlowTy,
+        args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> bool {
+        self.observe_names(names);
+        matches!(
+            self.snapshot
+                .table
+                .get(self.map_scrutinee(ty, args, arena, names))
+                .kind(),
+            TypeKind::Invalid
+        )
+    }
+
     /// The name-observation hook `Interp::run` calls once per replay: a
     /// forward scan extends the `name_ty` bindings to every name the unit
     /// has interned so far, so the base ops resolve through the hierarchy
@@ -1585,6 +1652,110 @@ impl TypeOps for ResolvedTypeOps<'_> {
             None
         }
     }
+
+    /// The downward-inferred object-pattern required type: a RAW pattern
+    /// spelling solves its own parameters along its superclass chain (the
+    /// official `analyzeObjectPattern` inference — shared
+    /// type_analyzer.dart:1749-1772 — with the matched value's static type
+    /// as the context). `case AL():` over `AV<int>` finds the hop
+    /// `AL<T> extends AV<T>` spelling the matched declaration; the hop's
+    /// arguments are the tested declaration's own parameter positions,
+    /// and the matched spelling's written arguments substitute them
+    /// positionally — so the inferred spelling is `AL<int>`, carried
+    /// as `(tested, from_args)`: the hop's parameter positions line up
+    /// with the matched arity exactly when the inferred tree IS the
+    /// matched tree, and any other hop shape (a partial or compound
+    /// parameter mapping) is undecidable here and refuses. An `Invalid`
+    /// arm (either head unresolved) refuses the same way — the raw face's
+    /// posture stands.
+    ///
+    /// Dormant under the name-level edge set: the erased hop cannot
+    /// decide the inferred spelling a strict-subtype step (the promotion
+    /// gate's `is_subtype` walk refuses the dynamic-erased argument), so
+    /// the answer changes nothing until the written clause trees land
+    /// (the TypedModel migration) — this body is that migration's
+    /// consumer, final-form on both faces.
+    fn downcast_infer(
+        &self,
+        tested: FlowTy,
+        tested_args: u32,
+        from: FlowTy,
+        from_args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> Option<(FlowTy, u32)> {
+        self.observe_names(names);
+        // Inference is the raw-pattern face only: a written argument list
+        // already spells the required type.
+        if tested_args != EMPTY_ARGS || from_args == EMPTY_ARGS {
+            return None;
+        }
+        let (Base::Name(tested_id), Base::Name(from_id)) = (tested.base, from.base) else {
+            return None;
+        };
+        let tested_name = self.strings.intern(names.get(tested_id as usize)?);
+        let from_name = self.strings.intern(names.get(from_id as usize)?);
+        let tested_decl = *self
+            .snapshot
+            .registry
+            .get(&tested_name)
+            .filter(|_| !self.snapshot.non_containers.contains(&tested_name))?;
+        let from_decl = *self
+            .snapshot
+            .registry
+            .get(&from_name)
+            .filter(|_| !self.snapshot.non_containers.contains(&from_name))?;
+        // The superclass hop spelling the matched declaration. The
+        // declared-ness gate keeps `supertypes`'s panic contract.
+        if self.snapshot.hierarchy.decl(tested_decl).is_none() {
+            return None;
+        }
+        let hop = self
+            .snapshot
+            .hierarchy
+            .supertypes(tested_decl)
+            .iter()
+            .copied()
+            .find(|ty| {
+                matches!(
+                    self.snapshot.table.get(*ty).kind(),
+                    TypeKind::Interface { decl, .. } if decl == from_decl
+                )
+            })?;
+        let TypeKind::Interface { args: hop_range, .. } = self.snapshot.table.get(hop).kind()
+        else {
+            return None;
+        };
+        let hop_args = self.snapshot.table.args(hop_range);
+        // Every hop argument is the tested declaration's own parameter
+        // position, in declaration order, and the matched spelling writes
+        // exactly that many — the inferred tree is then the matched tree
+        // verbatim. The name-level edge set erases every clause argument
+        // to `dynamic` today (the written clause trees are the TypedModel
+        // migration's transport), so the placeholder face accepts the
+        // erased `dynamic` beside the sharpened parameter reference; a
+        // sharpened CONCRETE argument (`class AL<T> extends AV<int>`)
+        // refuses — that hop constrains nothing and the inference must
+        // not read the matched arguments into the pattern's parameters.
+        let params = self.snapshot.decl_params.get(&tested_decl)?;
+        if params.len() != hop_args.len() {
+            return None;
+        }
+        if !hop_args.iter().zip(params.iter()).all(|(arg, param)| {
+            match self.snapshot.table.get(*arg).kind() {
+                TypeKind::Dynamic => true,
+                TypeKind::TypeParameter { parameter } => parameter == *param,
+                _ => false,
+            }
+        }) {
+            return None;
+        }
+        let written_len = arena.get(from_args as usize).map_or(0, Vec::len);
+        if written_len != hop_args.len() {
+            return None;
+        }
+        Some((tested, from_args))
+    }
 }
 
 #[cfg(test)]
@@ -1689,7 +1860,147 @@ mod tests {
             .collect()
     }
 
+    /// `diagnose_codes` with `names` declared in an imported library whose
+    /// file carries no element model: the names resolve through the
+    /// import scope but no declaration backs them, so the adapter files
+    /// them under `non_containers` and maps their spellings to opaque
+    /// declarations — the exact face a `dart:` SDK class outside the
+    /// builtin table presents in the real pipeline.
+    fn diagnose_codes_unmodeled(source: &str, names: &[&str]) -> Vec<&'static str> {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let main_file = files.intern(Path::new("main.dart"));
+        let other_file = files.intern(Path::new("other.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            main_file,
+        );
+        assert!(scanned.diagnostics.is_empty(), "{source:?}");
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib_other = builder.intern("package:t/other.dart");
+        let lib_main = builder.intern("package:t/main.dart");
+        builder.unit(lib_other, other_file);
+        builder.unit(lib_main, main_file);
+        let mut index = ElementIndex::default();
+        index.insert(main_file, elements.clone());
+        for name in names {
+            builder.declare(lib_other, strings.intern(name), other_file);
+        }
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_main, name, main_file);
+        }
+        builder.import(
+            lib_main,
+            ImportEdge {
+                target: Some(lib_other),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib_main);
+        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let fold = fold_unit_with_ops(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            main_file,
+            lib_main,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+            Some(&ops),
+        );
+        fold.report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect()
+    }
+
     /// A sealed-scrutinee switch closes: no `body_might_complete_normally`
+    /// The raw object pattern's downward-inferred promotion (#2293 rider):
+    /// `case AL():` over an `AV<Num>` scrutinee solves `AL`'s own parameter
+    /// along the superclass hop `AL<T> extends AV<T>` — the matched arm
+    /// promotes to `AL<Num>` (official `analyzeObjectPattern` inference +
+    /// `promoteForPattern`) and the clause body's call accepts the promoted
+    /// read. The oracle reports nothing.
+    ///
+    /// Ignored pending the hierarchy sharpening: the inference seam
+    /// ([`TypeOps::downcast_infer`] + the `matched_object_pattern`
+    /// consumption) is wired, but the name-level edge set erases every
+    /// clause argument to `dynamic`, so the promotion gate's subtype walk
+    /// refuses the inferred spelling (`AL<Num> <: AV<Num>` walks the
+    /// dynamic-erased hop and refuses). The written clause trees are the
+    /// TypedModel migration's transport; revive this pin when they land.
+    #[ignore = "dormant: erased hierarchy edges refuse the inferred subtype (TypedModel clause-tree transport pending)"]
+    #[test]
+    fn raw_object_pattern_downcast_promotes() {
+        let codes = diagnose_codes(
+            "sealed class AV<T> {}\n\
+             class AL<T> extends AV<T> {}\n\
+             class Num {}\n\
+             void h(AL<Num> v) {}\n\
+             void f(AV<Num> value) {\n\
+             \x20 switch (value) {\n\
+             \x20   case AL():\n\
+             \x20     h(value);\n\
+             \x20 }\n\
+             }",
+            |_| None,
+        );
+        assert!(
+            codes.is_empty(),
+            "raw pattern should downcast-promote: {codes:?}"
+        );
+    }
+
+    /// The declared-arity control: a pattern that WRITES its arguments
+    /// (`case AL<Num>():`) needs no inference — the written spelling is
+    /// the required type and the promotion stands as before.
+    ///
+    /// Same dormancy as [`Self::raw_object_pattern_downcast_promotes`]:
+    /// the promotion gate's subtype walk refuses over the dynamic-erased
+    /// hop even for the written spelling.
+    #[ignore = "dormant: erased hierarchy edges refuse the inferred subtype (TypedModel clause-tree transport pending)"]
+    #[test]
+    fn written_object_pattern_args_promote() {
+        let codes = diagnose_codes(
+            "sealed class AV<T> {}\n\
+             class AL<T> extends AV<T> {}\n\
+             class Num {}\n\
+             void h(AL<Num> v) {}\n\
+             void f(AV<Num> value) {\n\
+             \x20 switch (value) {\n\
+             \x20   case AL<Num>():\n\
+             \x20     h(value);\n\
+             \x20 }\n\
+             }",
+            |_| None,
+        );
+        assert!(
+            codes.is_empty(),
+            "written pattern args should promote: {codes:?}"
+        );
+    }
+
+    /// The sealed-scrutinee switch stays silent
     /// on the non-void function — the exhaustive arms keep the
     /// post-switch state unreachable, so the missing tail `return` never
     /// reports. The resolved `is_always_exhaustive` answers `true`
@@ -1919,6 +2230,64 @@ mod tests {
         assert!(
             !codes.contains(&"dead_code"),
             "the else-if chain stays live over unmodeled tests: {codes:?}"
+        );
+    }
+
+    /// #2288: an unmodeled `is`-test compares the written instantiations,
+    /// not just the heads. `Stream<List<int>>` and `Stream<Uint8List>` are
+    /// two instantiations of one opaque `Stream` (covariance decides), so
+    /// the test can fail and the else branch stays live — the dio
+    /// `progress_stream/io_progress_stream.dart:13` face. With the written
+    /// arguments dropped, both sides shared one argument-less declaration,
+    /// the test read as guaranteed true, and the else body deaded.
+    #[test]
+    fn unmodeled_generic_is_test_distinguishes_written_arguments() {
+        let codes = diagnose_codes_unmodeled(
+            "int f(Stream<List<int>> stream) { \
+               if (stream is Stream<Uint8List>) { return 1; } else { return 2; } \
+             }",
+            &["Stream", "Uint8List"],
+        );
+        assert!(
+            !codes.contains(&"dead_code"),
+            "distinct instantiations keep the else live: {codes:?}"
+        );
+    }
+
+    /// The positive face of the same rule: identical written arguments are
+    /// the same instantiation, so the `is`-test is guaranteed true and the
+    /// else branch is genuinely dead. The arity split must not turn a
+    /// decidable test into a vacuous one.
+    #[test]
+    fn unmodeled_generic_same_instantiation_deads_the_else() {
+        let codes = diagnose_codes_unmodeled(
+            "int f(Stream<Uint8List> stream) { \
+               if (stream is Stream<Uint8List>) { return 1; } else { return 2; } \
+             }",
+            &["Stream", "Uint8List"],
+        );
+        assert!(
+            codes.contains(&"dead_code"),
+            "the same instantiation deads the else: {codes:?}"
+        );
+    }
+
+    /// #2288: a pattern whose written type resolves to `Invalid` is not a
+    /// guaranteed mismatch. Official `promoteForPattern`'s invalid arm
+    /// (`flow_analysis.dart:7720-7723`) joins the live state into the
+    /// unmatched chain and skips the type test; without it
+    /// `factor(any, Invalid)` answered `Never` and deaded the body.
+    #[test]
+    fn invalid_pattern_type_keeps_the_body_live() {
+        let codes = diagnose_codes(
+            "void f(Object o) { \
+               if (o case Missing()) { print(1); } else { print(2); } \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"dead_code"),
+            "an unresolvable pattern type keeps both branches live: {codes:?}"
         );
     }
 

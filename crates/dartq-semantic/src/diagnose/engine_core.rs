@@ -1324,7 +1324,12 @@ impl<'a> Engine<'a> {
     /// push-time type, or an invoked callee's declared return type (a
     /// completed send's row type is `Unknown` — its static type IS the
     /// callee's return type, the same face [`Self::receiver_static_ty`]
-    /// reads at the junctions).
+    /// reads at the junctions). A VALUE callee whose declared type is a
+    /// callable class answers its `call` method's return instead — the
+    /// invocation runs the implicit `call` dispatch (upstream's
+    /// `InstanceCall` target resolution, `resolver_visitor.dart`: when the
+    /// callee's static type declares a `call` method, the send's static
+    /// type is that method's return type).
     pub(crate) fn operand_static_ty(&self, row: &Row) -> Ty {
         if !matches!(row.intent, Intent::Invoke) {
             return row.ty;
@@ -1373,9 +1378,70 @@ impl<'a> Engine<'a> {
                     return self.callee_return_ty(row);
                 }
             }
-            return row.ty;
+            return self
+                .callable_call_ret(row, row.ty)
+                .unwrap_or(row.ty);
         }
         self.callee_return_ty(row)
+    }
+
+    /// The implicit-`call` result of a VALUE send whose captured declared
+    /// type is `callee_ty`: a class declaring (or inheriting) an instance
+    /// `call` method makes the invocation run that method, so the send's
+    /// static type is the method's return type. `None` keeps the captured
+    /// declared face — the send is not a callable dispatch.
+    ///
+    /// The callee must be a VALUE: a creation send (`C()`, `p.C()`,
+    /// `C.named()`) also carries the class head as its declared type, but
+    /// its result is the created instance. Constructors are not walkable
+    /// members (they live in the container's separate constructor table),
+    /// so the callee-shape gate below excludes the creation forms outright.
+    ///
+    /// Generic containers answer `None`: the model cannot name a
+    /// container's type parameters here (only the member's own names ride
+    /// [`MemberEntry::type_param_names`]), so a return type mentioning the
+    /// class's `T` would substitute to nothing — the declared face stays
+    /// (under-report, never a wrong head).
+    fn callable_call_ret(&self, row: &Row, callee_ty: Ty) -> Option<Ty> {
+        let Ty::Named {
+            name,
+            nullable: false,
+            ..
+        } = callee_ty
+        else {
+            return None;
+        };
+        let value = match &row.shape {
+            RowShape::Bare(BareInfo::Plain { .. }) => true,
+            RowShape::Member { recv } => match recv {
+                Receiver::Typed { type_name, .. }
+                | Receiver::This {
+                    container: type_name,
+                    ..
+                }
+                | Receiver::Super {
+                    container: type_name,
+                    ..
+                } => matches!(
+                    self.walk_members(*type_name, row.name),
+                    Walk::Found(entry)
+                        if matches!(
+                            entry.kind,
+                            MemberKind::Field | MemberKind::Getter | MemberKind::Method
+                        )
+                ),
+                _ => false,
+            },
+            _ => false,
+        };
+        if !value {
+            return None;
+        }
+        let entry = self.resolved_member(name, self.intern("call"))?;
+        if entry.kind != MemberKind::Method || entry.is_static || entry.type_params != 0 {
+            return None;
+        }
+        (self.declared_type_params_of_container(name) == Some(0)).then_some(entry.return_ty)
     }
 
     /// `TypeSystem::flatten` at name level — see [`flatten_ty`].
@@ -1473,7 +1539,15 @@ impl<'a> Engine<'a> {
         if matches!(row.intent, Intent::Invoke) {
             let ty = self.operand_static_ty(row);
             if ty != Ty::UNKNOWN {
-                return Some(ty);
+                // A `?.`-merged invocation's result carries the nullable
+                // face when the merge could not join (`var a = c?.m()`
+                // keeps `a` nullable) — the same member-offset latch the
+                // read arm below re-arms.
+                return Some(if self.null_aware_members.contains(&row.range.offset) {
+                    Self::nullable_form(ty)
+                } else {
+                    ty
+                });
             }
         } else if row.ty != Ty::UNKNOWN {
             // A `?.`-merged member read keeps the field's written type —
@@ -1573,7 +1647,26 @@ impl<'a> Engine<'a> {
     /// member merges read the promoted receiver through it.
     pub(crate) fn check_null_assert(&mut self, at: SourceRange) {
         let (ty, read_span) = match self.rows.last() {
-            Some(row) => (self.operand_static_ty(row), row.range),
+            Some(row) => {
+                // The implicit-this getter read's row type is the unknown
+                // face — `non_null_form(Unknown)` is a no-op and the
+                // downstream member merge then falls back to the declared
+                // nullable getter type (`receiver_static_ty`'s
+                // `Bare(Plain{ty})` arm), over-reporting
+                // `unchecked_use_of_nullable_value` and suppressing the
+                // `unnecessary_null_comparison` twin beside it. Resolve the
+                // merged equivalent static type first; the assertion's
+                // non-null face then rewrites the row over it.
+                let ty = self.operand_static_ty(row);
+                (
+                    if ty == Ty::UNKNOWN {
+                        self.receiver_static_ty(row)
+                    } else {
+                        ty
+                    },
+                    row.range,
+                )
+            }
             None => return,
         };
         if ty == Ty::Null {
@@ -3341,6 +3434,97 @@ mod tests {
              class Dir implements FSE {}\n\
              void g(FSE e) {\n\
              \x20 if (e is Dir) {}\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// A send on an implicit-`this` field whose declared type declares
+    /// `call` runs the implicit dispatch: the inferred local binds the
+    /// `call` method's return (`Out`), not the field's class, so the
+    /// receiver's own member resolves. Upstream's `InstanceCall` target
+    /// resolution (`resolver_visitor.dart`) types the send by `call`.
+    #[test]
+    fn callable_this_field_send_takes_call_return() {
+        let report = report(
+            "class Ctx {}\n\
+             class Out { void run() {} }\n\
+             class Expr { Out call(Ctx c) => throw 0; }\n\
+             class Visitor {\n\
+             \x20 Visitor(this.expr);\n\
+             \x20 final Expr expr;\n\
+             \x20 void visit(Ctx ctx) {\n\
+             \x20\x20 final out = expr(ctx);\n\
+             \x20\x20 out.run();\n\
+             \x20 }\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// The same dispatch through an explicit receiver (`box.expr(ctx)`):
+    /// the merged member row carries the field's declared `Expr` face and
+    /// the send answers `call`'s return.
+    #[test]
+    fn callable_member_send_takes_call_return() {
+        let report = report(
+            "class Ctx {}\n\
+             class Out { void run() {} }\n\
+             class Expr { Out call(Ctx c) => throw 0; }\n\
+             class Box { Box(this.expr); final Expr expr; }\n\
+             class Visitor {\n\
+             \x20 void visit(Ctx ctx, Box box) {\n\
+             \x20\x20 final out = box.expr(ctx);\n\
+             \x20\x20 out.run();\n\
+             \x20 }\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// The value's declared type is the interface declaring `call` (the
+    /// concrete implementation lives on the value's own class): the send
+    /// answers the interface member's return — the interface closure is
+    /// part of the member walk, and its `call` is not the concrete
+    /// override's untyped identity.
+    #[test]
+    fn callable_interface_typed_send_takes_call_return() {
+        let report = report(
+            "class Ctx {}\n\
+             class Out { void run() {} }\n\
+             abstract class Callable { Out call(Ctx c); }\n\
+             class Expr implements Callable {\n\
+             \x20 @override Out call(Ctx c) => throw 0;\n\
+             }\n\
+             class Visitor {\n\
+             \x20 Visitor(this.fn);\n\
+             \x20 final Callable fn;\n\
+             \x20 void visit(Ctx ctx) {\n\
+             \x20\x20 final out = fn(ctx);\n\
+             \x20\x20 out.run();\n\
+             \x20 }\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// `call` inherited from a superclass of the value's static type: the
+    /// member walk's superclass closure answers the send, so the inherited
+    /// return types the local.
+    #[test]
+    fn callable_inherited_send_takes_call_return() {
+        let report = report(
+            "class Ctx {}\n\
+             class Out { void run() {} }\n\
+             class Base { Out call(Ctx c) => throw 0; }\n\
+             class Expr extends Base {}\n\
+             class Visitor {\n\
+             \x20 Visitor(this.expr);\n\
+             \x20 final Expr expr;\n\
+             \x20 void visit(Ctx ctx) {\n\
+             \x20\x20 final out = expr(ctx);\n\
+             \x20\x20 out.run();\n\
+             \x20 }\n\
              }",
         );
         assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));

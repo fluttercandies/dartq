@@ -1,5 +1,56 @@
 use super::*;
 
+/// The `dart:async` class face the member tables lack: `Stream`'s own
+/// declared instance surface (upstream Dart SDK source,
+/// sdk/lib/async/stream.dart — `map`/`where`/`listen`/`first`/…; the
+/// `Object` members ride the shared `Object` exemption). The extension
+/// `on`-face walk chain-breaks on the unindexed declaration, so a bare
+/// miss inside an extension body would report where the oracle resolves
+/// through the SDK class (the xml_events `each_event` tap shape). Consulted
+/// beside [`CORE_INTERFACE_MEMBERS`] / [`CORE_TYPE_MEMBERS`] by the
+/// frozen-face classification.
+pub(crate) const SDK_FACES_EXTRA: &[(&str, &[&str])] = &[(
+    "Stream",
+    &[
+        "any",
+        "asBroadcastStream",
+        "asyncExpand",
+        "asyncMap",
+        "cast",
+        "contains",
+        "distinct",
+        "drain",
+        "elementAt",
+        "every",
+        "expand",
+        "first",
+        "firstWhere",
+        "fold",
+        "forEach",
+        "handleError",
+        "isEmpty",
+        "isBroadcast",
+        "join",
+        "last",
+        "lastWhere",
+        "length",
+        "listen",
+        "map",
+        "pipe",
+        "reduce",
+        "single",
+        "singleWhere",
+        "skip",
+        "skipWhile",
+        "take",
+        "takeWhile",
+        "timeout",
+        "toList",
+        "toSet",
+        "where",
+    ],
+)];
+
 /// The frozen-face member verdict (`Engine::frozen_member_verdict`): the
 /// three answers a [`Walk::ChainBroken`] member walk can still decide
 /// through [`CORE_INTERFACE_MEMBERS`] / [`CORE_TYPE_MEMBERS`] —
@@ -541,24 +592,47 @@ impl<'a> Engine<'a> {
                 // extension body `this` reads the `on` type's member — the
                 // owner credits the extended container, not the extension
                 // (the same face `note_member_read`'s `This` arm carries).
-                if !matches!(row.intent, Intent::Write)
-                    && let Some(&pushed) = self.field_read_rows.get(&row.range.offset)
-                {
-                    self.read_names.insert(row.name);
-                    let owner = self
+                if !matches!(row.intent, Intent::Write) {
+                    if let Some(&pushed) = self.field_read_rows.get(&row.range.offset) {
+                        self.read_names.insert(row.name);
+                        let owner = self
+                            .container_context()
+                            .and_then(|(container, kind)| {
+                                (kind == ContainerKind::Extension)
+                                    .then(|| self.enclosing_extension_on_type(container))
+                                    .flatten()
+                            })
+                            .or_else(|| self.read_owner_container(row.range.offset))
+                            .or(Some(pushed));
+                        if let Some(container) = owner {
+                            self.member_read_owners
+                                .entry(row.name)
+                                .or_default()
+                                .insert((self.file, container));
+                        }
+                    } else if let Some(on) = self
                         .container_context()
-                        .and_then(|(container, kind)| {
-                            (kind == ContainerKind::Extension)
-                                .then(|| self.enclosing_extension_on_type(container))
-                                .flatten()
-                        })
-                        .or_else(|| self.read_owner_container(row.range.offset))
-                        .or(Some(pushed));
-                    if let Some(container) = owner {
-                        self.member_read_owners
-                            .entry(row.name)
-                            .or_default()
-                            .insert((self.file, container));
+                        .filter(|&(_, kind)| kind == ContainerKind::Extension)
+                        .map(|(container, _)| container)
+                        .and_then(|container| self.enclosing_extension_on_type(container))
+                    {
+                        // The extension body's bare read of an `on`-type
+                        // field never lands in `field_read_rows` (the
+                        // resolution join keys only the extension's own
+                        // fields), yet it is the implicit getter's read the
+                        // unused-field face credits — join the extended
+                        // container here (`this` inside an extension IS the
+                        // `on` type).
+                        if let Walk::Found(entry) = self.walk_members(on, row.name)
+                            && entry.kind == MemberKind::Field
+                            && !entry.is_static
+                        {
+                            self.read_names.insert(row.name);
+                            self.member_read_owners
+                                .entry(row.name)
+                                .or_default()
+                                .insert((self.file, on));
+                        }
                     }
                 }
                 // A direct operator application on a declared-typed receiver
@@ -1942,7 +2016,23 @@ impl<'a> Engine<'a> {
             }
             if kind == ContainerKind::Extension && matches!(recv, Receiver::This { .. }) {
                 match self.enclosing_extension_on_type(container) {
-                    Some(on) => report_on = on,
+                    Some(on) => {
+                        // The `on` face the model cannot walk (a bare SDK
+                        // type like `Stream<T>`) still answers by its
+                        // frozen member table: a hit resolves the access —
+                        // the extension applies to a receiver whose
+                        // interface carries the member. A miss names the
+                        // `on` type in the report below (the climb anchors
+                        // at the on-name itself).
+                        if matches!(
+                            self.frozen_member_verdict(on, row.name),
+                            FrozenFace::Defined
+                        ) {
+                            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                            return;
+                        }
+                        report_on = on;
+                    }
                     // The on-name never resolved — nothing honest names the
                     // report, so the record-only posture holds here too.
                     None => {
@@ -2224,6 +2314,45 @@ impl<'a> Engine<'a> {
         self.frozen_faces_verdict(seeds, spelling, false)
     }
 
+    /// The one graph-wide declaration of container `name` outside
+    /// `scope_lib`, when exactly one library declares it — the anchor face
+    /// for a receiver type the diagnosing library's scope does not carry
+    /// (`XmlNodeList` reached unimported through a member's declared type).
+    /// Any non-unique answer stays `None`: the climb must not guess.
+    fn unique_declared_elsewhere(
+        &self,
+        name: StringId,
+        scope_lib: LibraryId,
+    ) -> Option<(FileId, LibraryId)> {
+        // The oracle's `InvalidType` posture first: a type the diagnosing
+        // file itself spells and cannot resolve is `undefined_class` there
+        // and the receiver's static type is Invalid — its member misses
+        // stay silent even when another library declares the same name
+        // (the corpus's `Context context` from a broken package import).
+        // Only a receiver type that arrived through a resolved member
+        // signature — never spelled in this file — re-anchors the climb.
+        if self
+            .report
+            .names
+            .iter()
+            .any(|r| r.name == name && r.use_kind == NameUse::Type && !r.qualified)
+        {
+            return None;
+        }
+        let libs = self.graph.declaring_libraries(name);
+        if libs.len() != 1 || libs[0] == scope_lib {
+            return None;
+        }
+        let lib = libs[0];
+        let file = self
+            .graph
+            .unit_files(lib)
+            .iter()
+            .copied()
+            .find(|&f| self.index.get(f).is_some_and(|unit| unit.container(name).is_some()))?;
+        Some((file, lib))
+    }
+
     /// The shared climb behind [`Self::frozen_member_verdict`] and
     /// [`Self::frozen_super_verdict`] (see there for the three-valued
     /// contract and the hop classification). `anchor` holds when the first
@@ -2231,7 +2360,9 @@ impl<'a> Engine<'a> {
     /// edge: an unresolvable anchor that no frozen face knows leaves the
     /// receiver statically `InvalidType`, which answers every member face
     /// silently — `Unknown`, never `Absent` (a genuinely undeclared
-    /// receiver type must not emit `undefined_*`).
+    /// receiver type must not emit `undefined_*`). An anchor the scope
+    /// cannot resolve but exactly one graph library declares re-anchors
+    /// the climb there ([`Self::unique_declared_elsewhere`]).
     fn frozen_faces_verdict(
         &self,
         seeds: impl Iterator<Item = (StringId, FileId)>,
@@ -2241,12 +2372,14 @@ impl<'a> Engine<'a> {
         let spelling_text = self.strings.resolve(spelling);
         // Whether `name` is a frozen SDK face the member tables carry (the
         // `dart:core`/`dart:async`/`dart:io` interfaces plus the
-        // `dart:collection` bases that re-export them) — its members are
-        // known exactly, so a spelling it lacks contributes nothing.
+        // `dart:collection` bases that re-export them, and the `Stream`
+        // row the tables lack) — its members are known exactly, so a
+        // spelling it lacks contributes nothing.
         let frozen_face = |name: &str| {
             CORE_INTERFACE_MEMBERS
                 .iter()
                 .chain(CORE_TYPE_MEMBERS.iter())
+                .chain(SDK_FACES_EXTRA.iter())
                 .any(|(container, _)| name == *container)
                 || COLLECTION_INTERFACE_ALIASES
                     .iter()
@@ -2260,6 +2393,7 @@ impl<'a> Engine<'a> {
             CORE_INTERFACE_MEMBERS
                 .iter()
                 .chain(CORE_TYPE_MEMBERS.iter())
+                .chain(SDK_FACES_EXTRA.iter())
                 .any(|(container, members)| {
                     (name == *container || aliases.contains(container))
                         && members.contains(&spelling_text)
@@ -2267,6 +2401,9 @@ impl<'a> Engine<'a> {
         };
         let mut seen = FxHashSet::default();
         let mut undecidable = false;
+        // Set when the current `name` hop is a fallback re-attempt (the
+        // seen-check must not divert it back to the pending queue).
+        let mut retried = false;
         // The `implements`/`on` faces a resolved hop leaves unclimbed — the
         // linear superclass chain handles `extends`+`with`; when it
         // dead-ends, the interface faces keep the climb alive in
@@ -2279,8 +2416,8 @@ impl<'a> Engine<'a> {
         let mut owner = first_owner;
         let mut scope_lib = self.lib;
         let mut at_anchor = anchor;
-        loop {
-            if !seen.insert(name) {
+        'climb: loop {
+            if !retried && !seen.insert(name) {
                 let Some((next, next_owner)) = pending.pop_front() else {
                     break;
                 };
@@ -2290,6 +2427,7 @@ impl<'a> Engine<'a> {
                 at_anchor = false;
                 continue;
             }
+            retried = false;
             let Some((found, found_owner)) = resolve_container(
                 self.graph,
                 self.namespaces,
@@ -2311,6 +2449,21 @@ impl<'a> Engine<'a> {
                     return FrozenFace::Defined;
                 }
                 if !frozen_face(text) {
+                    if at_anchor
+                        && let Some((declared_file, declared_lib)) =
+                            self.unique_declared_elsewhere(name, scope_lib)
+                    {
+                        // Re-anchor at the unique declaring library: its
+                        // namespace resolves the supertype edges the
+                        // diagnosing scope never saw. The same spelling
+                        // cannot resolve here again (`seen` holds it), so
+                        // the retry bypasses the queue check once.
+                        scope_lib = declared_lib;
+                        owner = declared_file;
+                        at_anchor = false;
+                        retried = true;
+                        continue 'climb;
+                    }
                     if at_anchor || !self.supertype_hop_dead(name, scope_lib, owner) {
                         undecidable = true;
                     }
@@ -3068,7 +3221,15 @@ impl<'a> Engine<'a> {
     /// reports `undefined_getter` through the argument gate's own verdict.
     fn extension_receiver_resolves(&self, receiver_ty: Ty) -> bool {
         match receiver_ty {
-            Ty::Named { name, .. } => self.type_resolution(name).0 == TypeResolution::Type,
+            Ty::Named { name, .. } => {
+                self.type_resolution(name).0 == TypeResolution::Type
+                    // A head the diagnosing scope cannot name but exactly
+                    // one graph library declares is still a valid static
+                    // type (it arrived through a resolved member
+                    // signature) — extensions imported here apply to it
+                    // (`node.parentElement` on the unimported `XmlNode`).
+                    || self.unique_declared_elsewhere(name, self.lib).is_some()
+            }
             _ => true,
         }
     }
@@ -3357,6 +3518,84 @@ mod tests {
         }
     }
 
+    /// Diagnoses `source` as the sole file of a library importing one SDK
+    /// face library: `sdk_lib` is the import URI (`dart:async`) and
+    /// `sdk_source`'s declarations are owned by a registered-but-empty unit
+    /// — the namespace resolves the names to a declaration whose file
+    /// carries no container model, the exact posture of the real `dart:`
+    /// faces (the frozen member tables own their members, and the
+    /// supertype hops into them classify dead).
+    fn report_sdk_face(source: &str, sdk_lib: &str, sdk_source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let sdk_file = files.intern(Path::new("sdk_face.dart"));
+        let scan_cfg = ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        };
+        let scanned = dartq_scanner::scan(source, scan_cfg, file);
+        assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let sdk_scanned = dartq_scanner::scan(sdk_source, scan_cfg, sdk_file);
+        let sdk_elements = collect(sdk_source, &sdk_scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let lib_sdk = builder.intern(sdk_lib);
+        builder.unit(lib_sdk, sdk_file);
+        for (name, decl) in sdk_elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_sdk, name, sdk_file);
+        }
+        // The SDK unit registers but carries no container model: the
+        // names resolve, the member faces answer from the frozen tables.
+        let empty_scanned = dartq_scanner::scan("", scan_cfg, sdk_file);
+        index.insert(
+            sdk_file,
+            collect("", &empty_scanned.tokens, features, &strings),
+        );
+        builder.import(
+            lib,
+            ImportEdge {
+                target: Some(lib_sdk),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let fold = fold_unit(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        let mut report = fold.report;
+        report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+        report
+    }
+
     fn code_names(report: &FileReport) -> Vec<&'static str> {
         report
             .diagnostics
@@ -3459,6 +3698,20 @@ mod tests {
         report_units(&[("a.dart", source_a)], "main.dart", source, false)
     }
 
+    /// [`report_two`] with the import edge `show`-filtered to one name: the
+    /// unit's other declarations stay out of the diagnosing library's
+    /// namespace while their types still flow through member signatures
+    /// (the xml corpus's `XmlNodeList` receiver shape).
+    fn report_show(source_a: &str, shown: &str, source: &str) -> FileReport {
+        report_units_edge(
+            &[("a.dart", source_a)],
+            "main.dart",
+            source,
+            false,
+            Some(shown),
+        )
+    }
+
     /// Diagnoses `source` as the defining unit of a library whose
     /// declarations live partly in `part` files (the drift `part of`
     /// receiver shape): `parts` is `(path, source)` pairs joined to the
@@ -3478,6 +3731,21 @@ mod tests {
         main_path: &str,
         source: &str,
         as_parts: bool,
+    ) -> FileReport {
+        report_units_edge(units, main_path, source, as_parts, None)
+    }
+
+    /// The rig core behind [`report_units`]: `show` filters every import
+    /// edge to one visible name (the xml corpus's `XmlNodeList` receiver
+    /// shape — the unit's other declarations stay out of the diagnosing
+    /// library's namespace while their types still flow through member
+    /// signatures).
+    fn report_units_edge(
+        units: &[(&str, &str)],
+        main_path: &str,
+        source: &str,
+        as_parts: bool,
+        show: Option<&str>,
     ) -> FileReport {
         let strings = StringTable::new();
         let mut files = FileTable::new();
@@ -3549,13 +3817,21 @@ mod tests {
                     }
                     builder.declare(lib_u, name, unit_file);
                 }
+                let combinators = show.map(|shown| {
+                    Combinators::new(
+                        [CombinatorClause::Show(
+                            vec![strings.intern(shown)].into_boxed_slice(),
+                        )],
+                        &strings,
+                    )
+                });
                 builder.import(
                     lib_m,
                     ImportEdge {
                         target: Some(lib_u),
                         prefix: None,
                         deferred: false,
-                        combinators: Combinators::unfiltered(),
+                        combinators: combinators.unwrap_or_else(Combinators::unfiltered),
                     },
                 );
             }
@@ -3706,6 +3982,197 @@ mod tests {
             report.diagnostics[0].message,
             "The getter 'onMissing' isn't defined for the type 'DriftSession'."
         );
+    }
+
+    /// The receiver anchor the diagnosing scope cannot name (the unit is
+    /// `show`-filtered to the wrapper, so `XmlNodeList` itself is not in
+    /// the namespace — the xml corpus's `w.list.whereType()` shape) still
+    /// climbs: exactly one graph library declares the type, so the frozen
+    /// verdict re-anchors there, the dead `extends` hop (`Missing` is
+    /// undeclared anywhere) contributes nothing, and the miss reports
+    /// naming the resolved class. Without the re-anchor the climb answers
+    /// `Unknown` and stays silent while the oracle reports.
+    ///
+    /// Verified 1:1 against the oracle on the real engine
+    /// (/tmp/probe2293/showprobe — `import 'a.dart' show Wrapper` +
+    /// `w.list.whereType()` → both sides `undefined_method` naming
+    /// `XmlNodeList`). `#[ignore]`d here: the two-unit rig resolves the
+    /// foreign getter's return type one grade short of the CLI's graph
+    /// wiring, so the receiver anchor never reaches the re-anchor arm —
+    /// the same rig gap the await-fold discriminator documents. Flips live
+    /// when the rig wires the foreign-unit boundary pool the CLI builds.
+    #[test]
+    #[ignore = "rig gap: foreign-unit receiver ty projection (see doc)"]
+    fn unimported_declared_receiver_member_reports() {
+        let report = report_show(
+            "class XmlNodeList extends Missing {}\n\
+             class Wrapper {\n\
+             \x20 XmlNodeList get list => XmlNodeList();\n\
+             }",
+            "Wrapper",
+            "import 'a.dart' show Wrapper;\n\
+             void f(Wrapper w) {\n\
+             \x20 w.list.whereType();\n\
+             }",
+        );
+        assert_eq!(code_names(&report), ["undefined_method"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The method 'whereType' isn't defined for the type 'XmlNodeList'."
+        );
+    }
+
+    /// An extension on a bare SDK type (`Stream<T>`) reads the frozen
+    /// member table the element index cannot carry: `this` inside the body
+    /// IS the `on` type, `map` is one of `Stream`'s members
+    /// (`SDK_FACES_EXTRA`, upstream Dart SDK source, sdk/lib/async/
+    /// stream.dart), so the implicit application resolves and stays
+    /// silent.
+    #[test]
+    fn stream_extension_member_resolves_through_frozen_face() {
+        let report = report_sdk_face(
+            "import 'dart:async';\n\
+             extension Tap<T> on Stream<T> {\n\
+             \x20 Stream<T> tap(void Function(T) f) {\n\
+             \x20   return this.map(f);\n\
+             \x20 }\n\
+             }",
+            "dart:async",
+            "class Stream<T> {}",
+        );
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The miss control: the same extension shape accessing a member
+    /// `Stream` genuinely lacks reports `undefined_method` naming the
+    /// `on` type — the frozen verdict's `Absent` answer, never the
+    /// silent `Unknown`.
+    #[test]
+    fn stream_extension_member_miss_reports_on_type() {
+        let report = report_sdk_face(
+            "import 'dart:async';\n\
+             extension Tap<T> on Stream<T> {\n\
+             \x20 Stream<T> tap() {\n\
+             \x20   return this.nope();\n\
+             \x20 }\n\
+             }",
+            "dart:async",
+            "class Stream<T> {}",
+        );
+        assert_eq!(code_names(&report), ["undefined_method"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The method 'nope' isn't defined for the type 'Stream'."
+        );
+    }
+
+    /// The dead-anchored sibling `if`'s promotion consumption (#2293
+    /// rider): inside a region the flow marked dead (the always-true
+    /// `if (s == null) return null` — `s` narrowed to `Null` by the
+    /// earlier `s is Src` exit), the `if (file != null)` promotion still
+    /// holds for the guarded read — the oracle analyzes dead code with
+    /// the same flow state (probe: dead-region `g(z)` with `z` promoted
+    /// reports no argument row) and the staged argument check consumes
+    /// the promotion, never reporting `FS?` into the `FS` formal.
+    ///
+    /// Ignored pending a flow-side fix: the promotion fact for a
+    /// dead-region read is suppressed by the flow layer's reachability
+    /// gate (`dartq-flow` `interp_expr.rs` — the `PromotedRead`/`ReadType`
+    /// emits both require `self.reachable()`), so the staged check finds
+    /// no row and the parse-time verdict stands. The consumption side is
+    /// proven correct on the live path (the same fixture's final
+    /// `UR.f(file)` read stages `FS` and cleans). Upstream runs the same
+    /// flow state in dead regions (dead-region promotions materialize;
+    /// only the `dead_code` row marks the region), so the fix is dropping
+    /// the reachability gate from those two fact emits — `dartq-flow` is
+    /// #2288/#2292's lane; revive this pin when that lands.
+    #[ignore = "flow gate: dead-region PromotedRead suppressed (dartq-flow interp_expr.rs reachable gate, #2288/#2292)"]
+    #[test]
+    fn dead_region_null_check_promotion_cleans_argument() {
+        let report = report_units(
+            &[],
+            "/p.dart",
+            "class FS {}\n\
+             class UR { UR.f(FS f); UR.e(dynamic s); }\n\
+             class Src {}\n\
+             class SrcFactory { Src? forUri2(dynamic u) => null; }\n\
+             class Map<K, V> { V? operator [](K key) => null; }\n\
+             Map<dynamic, FS?> m1 = {};\n\
+             Map<dynamic, FS?> m2 = {};\n\
+             UR? f(SrcFactory fac, dynamic uri) {\n\
+             \x20 var s = fac.forUri2(uri);\n\
+             \x20 if (s is Src) {\n\
+             \x20   return UR.e(s);\n\
+             \x20 }\n\
+             \x20 FS? file = m1[uri];\n\
+             \x20 if (file == null) {\n\
+             \x20   if (s == null) {\n\
+             \x20     return null;\n\
+             \x20   }\n\
+             \x20   file = m2[uri];\n\
+             \x20   if (file != null) {\n\
+             \x20     return UR.f(file);\n\
+             \x20   }\n\
+             \x20 }\n\
+             \x20 return UR.f(file);\n\
+             }",
+            false,
+        );
+        // The `dead_code` row matches the oracle (the always-true sibling
+        // if's first dead statement); the argument row must clean.
+        assert_eq!(
+            code_names(&report),
+            ["dead_code"],
+            "{:?}",
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The prefixed-head unresolved-reference code (#2289 rider): the
+    /// head of a value-position `missing.name` selector is a plain bare
+    /// miss — the oracle reports `undefined_identifier` at the head's own
+    /// span beside the constant-eval row (`undefined_class` is the
+    /// TYPE-position code and never fires here), and the row must survive
+    /// to the report, not drop at the merge. The `+`-operand head
+    /// (`missing + 1`) keeps its recorded-only posture — the operator
+    /// face's own routing, out of this pin's scope.
+    #[test]
+    fn prefixed_head_value_miss_reports_identifier() {
+        let report = report_units(
+            &[],
+            "/p.dart",
+            "class Object {}\n\
+             class C {\n\
+             \x20 const C(Object? a);\n\
+             }\n\
+             const a = C(missing);\n\
+             const b = C(missing.name);\n\
+             const c = C(missing + 1);\n\
+             const d = C(!missing);\n\
+             const e = C((missing));",
+            false,
+        );
+        let mut heads: Vec<u32> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "undefined_identifier")
+            .map(|d| d.range.offset)
+            .collect();
+        heads.sort_unstable();
+        assert_eq!(heads, [62, 84, 138, 161]);
     }
 
     /// #2190 M1a residue — the extends-walk face: `escapedNameFor` is
