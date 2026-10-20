@@ -457,3 +457,238 @@ fn unresolvable_dart_uri_reports_no_deprecation() {
         assert!(deprecations.is_empty(), "{source:?}");
     }
 }
+
+// —— The #2304/#2317② listener-hook pack: the map-entry, brace-ambiguity,
+// generator-yield, and typed-literal-collapse faces. Each fixture was
+// probed against oracle `dart analyze` (fvm default); the harness stubs
+// the collection heads the faces' written annotations name (the
+// ticket_1351 harness convention).
+
+const LITERAL_HARNESS: &str = "class int {}\nclass String {}\nclass List<T> {}\n\
+                              class Set<T> {}\nclass Map<K, V> {}\nclass Iterable<T> {}\n\
+                              class Stream<T> {}\nclass Object {}\n";
+
+fn literal_face_report(source: &str) -> FileReport {
+    report(&(String::from(LITERAL_HARNESS) + source))
+}
+
+/// (a) The declared-context entry face: a `Map<String, int>` initializer
+/// whose second entry's value (`'b'`) is not assignable to `int` reports
+/// `map_value_type_not_assignable` at the failing value, the matching
+/// entry silent (the probed oracle row).
+#[test]
+fn declared_map_context_checks_entry_values() {
+    let src = "final Map<String, int> m0 = {'a': 'b', 'c': 2};\n";
+    let rep = literal_face_report(src);
+    assert_eq!(
+        code_names(&rep),
+        ["map_value_type_not_assignable"],
+        "{:?}",
+        code_names(&rep)
+    );
+    let d = &rep.diagnostics[0];
+    assert_eq!(
+        d.message,
+        "The element type 'String' can't be assigned to the map value type 'int'."
+    );
+    let full = String::from(LITERAL_HARNESS) + src;
+    let at = full.find("'b'").expect("value span");
+    assert_eq!(d.range.offset as usize, at);
+    assert_eq!(d.range.length, 3);
+}
+
+/// (b) Matching entries stay silent, on the initializer, arrow-body, and
+/// `return` channels alike.
+#[test]
+fn matching_map_entries_stay_silent_on_every_context_channel() {
+    for src in [
+        "final Map<String, int> m0 = {'a': 1, 'c': 2};\n",
+        "Map<String, int> f0() => {'a': 1};\n",
+        "Map<String, int> f1() { return {'a': 1}; }\n",
+    ] {
+        let rep = literal_face_report(src);
+        assert!(
+            rep.diagnostics.is_empty(),
+            "{src:?}: {:?}",
+            code_names(&rep)
+        );
+    }
+}
+
+/// (c) The written `<K, V>` head's own entry face: the failing value
+/// reports against the WRITTEN type argument (the probed oracle row).
+#[test]
+fn typed_map_literal_checks_entry_values() {
+    let src = "final t0 = <String, int>{'a': 'b'};\n";
+    let rep = literal_face_report(src);
+    assert_eq!(
+        code_names(&rep),
+        ["map_value_type_not_assignable"],
+        "{:?}",
+        code_names(&rep)
+    );
+    assert_eq!(
+        rep.diagnostics[0].message,
+        "The element type 'String' can't be assigned to the map value type 'int'."
+    );
+}
+
+/// (d) The #2317② collapse: the written group's nested value argument
+/// keeps its own type argument (`List<String>`, not `String`) — the
+/// nested literal passes to a `Map<String, List<String>>` formal, and the
+/// failing entry names `List<String>` as the expected type. Both pins
+/// fail under the flat segment scan's one-level collapse.
+#[test]
+fn typed_map_nested_value_argument_stays_intact() {
+    let ok = "void take(Map<String, List<String>> m) {}\n\
+              void u0() { take(<String, List<String>>{'k': ['v']}); }\n";
+    let rep = literal_face_report(ok);
+    assert!(rep.diagnostics.is_empty(), "{ok:?}: {:?}", code_names(&rep));
+
+    let bad = "void take2(Map<String, List<String>> m) {}\n\
+               void u1() { take2(<String, List<String>>{'k': 'oops'}); }\n";
+    let rep = literal_face_report(bad);
+    assert_eq!(
+        code_names(&rep),
+        ["map_value_type_not_assignable"],
+        "{:?}",
+        code_names(&rep)
+    );
+    assert_eq!(
+        rep.diagnostics[0].message,
+        "The element type 'String' can't be assigned to the map value type 'List<String>'."
+    );
+}
+
+/// (e) The ambiguity faces: the spread-of-dynamic literal reports
+/// `_either` at the braces; the entry-plus-expression mix reports `_both`
+/// (both probed oracle rows); the all-entry shape and the map-decided
+/// context stay silent.
+#[test]
+fn ambiguous_brace_literals_report_either_or_both() {
+    let either = "Object f0(dynamic d) { var e0 = {...d}; return e0; }\n";
+    let rep = literal_face_report(either);
+    assert_eq!(
+        code_names(&rep),
+        ["ambiguous_set_or_map_literal_either"],
+        "{:?}",
+        code_names(&rep)
+    );
+    let d = &rep.diagnostics[0];
+    assert_eq!(
+        d.message,
+        "This literal must be either a map or a set, but the elements don't have enough information for type inference to work."
+    );
+    assert_eq!(
+        d.correction.as_deref(),
+        Some("Try adding type arguments to the literal (one for sets, two for maps).")
+    );
+
+    let both = "Object f1() { var m0 = {1: 2, 3}; return m0; }\n";
+    let rep = literal_face_report(both);
+    assert_eq!(
+        code_names(&rep),
+        ["ambiguous_set_or_map_literal_both"],
+        "{:?}",
+        code_names(&rep)
+    );
+    assert_eq!(
+        rep.diagnostics[0].message,
+        "The literal can't be either a map or a set because it contains at least one literal map entry or a spread operator spreading a 'Map', and at least one element which is neither of these."
+    );
+
+    for src in [
+        // The all-entry shape decides map silently.
+        "Object f2() { var m1 = {1: 2}; return m1; }\n",
+        // The written Map context decides the shape silently.
+        "Object f3(dynamic d) { Map<String, int> m2 = {...d}; return m2; }\n",
+        // The elementless form defaults to a map silently.
+        "Object f4() { var m3 = {}; return m3; }\n",
+        // A resolved collection spread decides set silently
+        // (`mustBeASet`; probed: dart analyze 3.13.1, zero rows).
+        "Object f5() { List<int> l = []; var e1 = {...l}; return e1; }\n",
+        // A blind spread beside an undecided one: the hidden real side
+        // may have decided, so the `_either` tail stays silent (probed:
+        // zero rows).
+        "Object f6(dynamic d) { List<int> l = []; var e2 = {...l, ...d}; return e2; }\n",
+    ] {
+        let rep = literal_face_report(src);
+        assert!(
+            rep.diagnostics.is_empty(),
+            "{src:?}: {:?}",
+            code_names(&rep)
+        );
+    }
+
+    // An unresolvable spread operand is the oracle's error-dynamic
+    // shape: `_either` beside the operand's own `undefined_identifier`
+    // (the `return` reads `e3`, so no unused row; probed row set, source
+    // order).
+    let rep = literal_face_report("Object f7() { var e3 = {...nope}; return e3; }\n");
+    assert_eq!(
+        code_names(&rep),
+        [
+            "ambiguous_set_or_map_literal_either",
+            "undefined_identifier",
+        ],
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// (f) The generator yield face: a non-assignable `yield` expression
+/// reports at the expression with the declared sequence's element type
+/// (the probed oracle row); `yield*` shares the code with the implied-
+/// sequence message; matching yields and non-sequence declared returns
+/// stay silent; the out-of-generator form never reaches this face.
+#[test]
+fn generator_yield_checks_against_the_sequence_element() {
+    let bad = "Iterable<int> g0() sync* { yield 's'; }\n";
+    let rep = literal_face_report(bad);
+    assert_eq!(
+        code_names(&rep),
+        ["yield_of_invalid_type"],
+        "{:?}",
+        code_names(&rep)
+    );
+    let d = &rep.diagnostics[0];
+    assert_eq!(
+        d.message,
+        "A yielded value of type 'String' must be assignable to 'int'."
+    );
+    let full = String::from(LITERAL_HARNESS) + bad;
+    let at = full.find("'s'").expect("expression span");
+    assert_eq!(d.range.offset as usize, at);
+    assert_eq!(d.range.length, 3);
+
+    let star = "Stream<int> g1() async* { yield* 'nope'; }\n";
+    let rep = literal_face_report(star);
+    assert_eq!(
+        code_names(&rep),
+        ["yield_of_invalid_type"],
+        "{:?}",
+        code_names(&rep)
+    );
+    assert_eq!(
+        rep.diagnostics[0].message,
+        "The type 'Stream<String>' implied by the 'yield*' expression must be assignable to 'Stream<int>'."
+    );
+
+    for src in [
+        // The matching yield stays silent.
+        "Iterable<int> g2() sync* { yield 1; }\n",
+        // The `yield*` implied sequence matching the declared return.
+        "Stream<int> g3() async* { yield* other(); }\nStream<int> other() async* {}\n",
+        // A declared return outside the sequence family answers nothing.
+        "int g4() sync* { yield 1; }\n",
+        // The out-of-generator form routes to the invalid-yield face.
+        "void g5() { yield 1; }\n",
+    ] {
+        let rep = literal_face_report(src);
+        assert!(
+            !code_names(&rep).contains(&"yield_of_invalid_type"),
+            "{src:?}: {:?}",
+            code_names(&rep)
+        );
+    }
+}

@@ -428,8 +428,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 .get(engine.file)
                 .and_then(|f| f.container(container))
                 .is_some_and(|decl| {
-                    decl.constructors.len()
-                        > usize::from(!decl.has_unnamed_constructor)
+                    decl.constructors.len() > usize::from(!decl.has_unnamed_constructor)
                 });
             if declares_ctors {
                 let reps: Vec<(StringId, SourceRange)> = engine
@@ -1233,7 +1232,10 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some((head, false)) = engine.factory_head.take()
             && let Some((container, _)) = engine.container_context()
         {
-            let text = engine.source.get(head.offset as usize..head.end() as usize).unwrap_or("");
+            let text = engine
+                .source
+                .get(head.offset as usize..head.end() as usize)
+                .unwrap_or("");
             let key = if text == "new" || text == engine.strings.resolve(container) {
                 engine.intern("new")
             } else {
@@ -1260,8 +1262,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // `late` instance field's initializer, whose `withThisAccessibility`
         // span covers nested closures (the local fn has no executable of its
         // own below it to inherit from).
-        let instance =
-            self.engine.instance_context() || self.engine.field_initializer_binds_this();
+        let instance = self.engine.instance_context() || self.engine.field_initializer_binds_this();
         let engine = &mut self.engine;
         engine.open_exec_site = None;
         engine.pending_local_fn = None;
@@ -1329,8 +1330,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // A closure inside a `late` instance field's initializer binds
         // `this` too — the `bindsThis` accessibility region covers the
         // whole initializer.
-        let instance =
-            self.engine.instance_context() || self.engine.field_initializer_binds_this();
+        let instance = self.engine.instance_context() || self.engine.field_initializer_binds_this();
         let engine = &mut self.engine;
         engine.open_exec_site = None;
         engine.pending_local_fn = None;
@@ -1361,8 +1361,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
         self.engine.nsm_poison();
         // Same `this`-accessibility inheritance as the anonymous form.
-        let instance =
-            self.engine.instance_context() || self.engine.field_initializer_binds_this();
+        let instance = self.engine.instance_context() || self.engine.field_initializer_binds_this();
         let engine = &mut self.engine;
         engine.open_exec_site = None;
         engine.pending_local_fn = None;
@@ -1810,8 +1809,25 @@ impl ParserListener for DiagnoseListener<'_> {
                     };
                     engine.push_type_use(name, token.range, head);
                     // The head awaits its type-argument group (or its
-                    // completing `handle_type`).
-                    engine.arm_type_head(name, token.range);
+                    // completing `handle_type`) — unless a DEAD prefix
+                    // owns the continuation: the NamedType's element is
+                    // null upstream (the prefix bail returned
+                    // `InvalidType`), so the continuation's group has no
+                    // head to count against and the annotation-arity face
+                    // must not arm. A starving miss would let a
+                    // resolution-elsewhere homonym own the group — the
+                    // analyzer corpus's
+                    // `typedef GeneratedTypeConstraint =
+                    // shared.GeneratedTypeConstraint<…>` counted its
+                    // argument against the typedef being declared
+                    // (`wrong_number_of_type_arguments` beside the
+                    // prefix's `undefined_identifier`; the oracle counts
+                    // against nothing).
+                    let dead_prefix = matches!(head, TypeHead::Continuation)
+                        && engine.type_prefix.as_ref().is_some_and(|tp| !tp.live);
+                    if !dead_prefix {
+                        engine.arm_type_head(name, token.range);
+                    }
                 }
             }
             C::PrefixedTypeReference => {
@@ -2778,11 +2794,8 @@ impl ParserListener for DiagnoseListener<'_> {
         if !matches!(kind, ContainerKind::Class | ContainerKind::Enum) {
             return;
         }
-        let site = engine.note_decl_site(
-            container,
-            begin.range,
-            DeclKind::Constructor { container },
-        );
+        let site =
+            engine.note_decl_site(container, begin.range, DeclKind::Constructor { container });
         engine.ctor_head_anchors.insert(site, begin.range);
         engine.open_ctor_site = Some(site);
         engine.primary_ctor_site = Some(site);
@@ -2938,8 +2951,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // shapes only (the flow lattice cannot spell wider shapes; the
         // unknown-written demotion stands). The staging precedes the flow
         // forward: the fold inside the call adopts the staged type.
-        let staged = ||
-            -> Option<(u32, String, bool)> {
+        let staged = || -> Option<(u32, String, bool)> {
             let engine = &mut self.engine;
             let text = engine.text_of(operator)?;
             if text != "=" {
@@ -2951,9 +2963,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 .iter()
                 .enumerate()
                 .rev()
-                .find(|(_, row)| {
-                    row.range.end() <= limit && !matches!(row.shape, RowShape::Value)
-                })
+                .find(|(_, row)| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))
                 .map(|(index, _)| index)?;
             // `c[i] = e` writes through the `[]=` operator: the target's
             // own type is not the assignment's destination (the same gate
@@ -2967,7 +2977,11 @@ impl ParserListener for DiagnoseListener<'_> {
             // exists for). The send face types on demand
             // ([`Engine::callee_return_ty`]): an invocation row's stored
             // type is the callee head's, the resolved return is the send's.
-            let after = || engine.rows[target + 1..].iter().filter(|row| row.range.offset > limit);
+            let after = || {
+                engine.rows[target + 1..]
+                    .iter()
+                    .filter(|row| row.range.offset > limit)
+            };
             let rhs_row = after()
                 .clone()
                 .filter(|row| row.intent == Intent::Invoke)
@@ -2990,7 +3004,11 @@ impl ParserListener for DiagnoseListener<'_> {
                 // oracle's flow-aware inference).
                 engine.staged_write_tys.insert(
                     engine.rows[target].name,
-                    (engine.rows[target].range.offset, engine.frames.len(), from_ty),
+                    (
+                        engine.rows[target].range.offset,
+                        engine.frames.len(),
+                        from_ty,
+                    ),
                 );
                 Some((
                     engine.rows[target].range.offset,
@@ -3233,8 +3251,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 let ty = engine.operand_static_ty(&row);
                 let covered = engine.bool_decided_covers(&row);
                 let operand_start = engine.skip_whitespace(operator.range.end());
-                let list_shaped = engine.byte_at(operand_start)
-                    == Some(b'[')
+                let list_shaped = engine.byte_at(operand_start) == Some(b'[')
                     && matches!(row.shape, RowShape::Value);
                 // The constant-context gate: a const expression's operand
                 // faults belong to the const evaluator (`const c = !1;`
@@ -3429,7 +3446,9 @@ impl ParserListener for DiagnoseListener<'_> {
         // anchor, `bool_expression_verifier.dart:47`).
         let cast_boolish = match cast_ty {
             Some(Ty::Named {
-                name, nullable: false, ..
+                name,
+                nullable: false,
+                ..
             }) => name == engine.members.primitive_ids[3],
             Some(Ty::Unknown) => true,
             _ => false,
@@ -3682,8 +3701,8 @@ impl ParserListener for DiagnoseListener<'_> {
         // the arg nodes and folds the invocation to a non-constant leaf for
         // the enclosing initializer window — the generic `ClosedArgs`
         // dispatch never sees a super-arglist (it folds the args away).
-        let init_super = self.engine.initializer_depth > 0
-            && self.engine.init_super_callee().is_some();
+        let init_super =
+            self.engine.initializer_depth > 0 && self.engine.init_super_callee().is_some();
         let closed = if init_super {
             let closed = self
                 .engine
@@ -3792,10 +3811,7 @@ impl ParserListener for DiagnoseListener<'_> {
                             .last()
                             .and_then(|slot| *slot)
                             .filter(|&callee| {
-                                engine
-                                    .rows
-                                    .get(callee)
-                                    .is_some_and(|row| row.qualified)
+                                engine.rows.get(callee).is_some_and(|row| row.qualified)
                             })
                             .and_then(|callee| {
                                 let receiver =
@@ -3839,7 +3855,9 @@ impl ParserListener for DiagnoseListener<'_> {
                             // `C.named(` is the implicit `const
                             // C.named(...)` — a valid creation folds to its
                             // container's value; no failure row stages.
-                            engine.const_capture.push_named_creation(container, closed.span);
+                            engine
+                                .const_capture
+                                .push_named_creation(container, closed.span);
                         } else if core_const {
                             engine
                                 .const_capture
@@ -3920,7 +3938,11 @@ impl ParserListener for DiagnoseListener<'_> {
                     engine.named_given.insert((key, *given));
                 }
             }
-            let named = level.args.iter().filter(|(name, ..)| name.is_some()).count();
+            let named = level
+                .args
+                .iter()
+                .filter(|(name, ..)| name.is_some())
+                .count();
             if let Ok(positional) = u16::try_from(count.saturating_sub(named)) {
                 let given = engine.positional_given.entry(key).or_default();
                 *given = (*given).max(positional);
@@ -4034,9 +4056,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 _ => None,
             })
             .unwrap_or(false);
-        if !void_return
-            && let Some((ty, literal, range)) = engine.single_row_since(mark)
-        {
+        if !void_return && let Some((ty, literal, range)) = engine.single_row_since(mark) {
             engine.check_return(ty, range, literal);
         }
     }
@@ -4400,11 +4420,8 @@ impl ParserListener for DiagnoseListener<'_> {
                 | Verdict::Unresolved(span)
                 | Verdict::Fault(_, span) => {
                     let span = if span.length > 0 { span } else { colon.range };
-                    self.engine.emit_corrected(
-                        SemanticCode::NonConstantMapPatternKey,
-                        span,
-                        "",
-                    );
+                    self.engine
+                        .emit_corrected(SemanticCode::NonConstantMapPatternKey, span, "");
                 }
             }
         }
@@ -4422,8 +4439,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // One close per record pattern in the declaration window — the
         // flat `final (a, b) = pair()` binds read exactly one; nested
         // records close more and gate the destructure bind off.
-        self.engine.pattern_bind_records =
-            self.engine.pattern_bind_records.saturating_add(1);
+        self.engine.pattern_bind_records = self.engine.pattern_bind_records.saturating_add(1);
     }
 
     fn begin_constant_pattern(&mut self, const_keyword: Option<Token>) {
@@ -4507,8 +4523,7 @@ impl ParserListener for DiagnoseListener<'_> {
                         inside(row.range)
                             && matches!(
                                 row.shape,
-                                RowShape::Bare(BareInfo::Missing { .. })
-                                    | RowShape::TypeUse(..)
+                                RowShape::Bare(BareInfo::Missing { .. }) | RowShape::TypeUse(..)
                             )
                     };
                     let already_answered = engine
@@ -4825,25 +4840,25 @@ impl ParserListener for DiagnoseListener<'_> {
         if engine.const_capture.top_is_constant_pattern()
             && let Some(node) = engine.const_capture.close_constant_pattern()
         {
-                match eval(&node, engine) {
-                    Verdict::Value(_) | Verdict::Constant => {}
-                    Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
-                        // The same `InvalidType` early-return shape as the
-                        // constant-pattern face: a resolution verdict already
-                        // anchored inside the expression's span suppresses the
-                        // generic row (constant_verifier.dart:134-136).
-                        let already_answered = engine.report.diagnostics.iter().any(|d| {
-                            d.range.offset >= span.offset
-                                && d.range.end() <= span.end()
-                                && d.range.length > 0
-                                && d.range != span
-                        });
-                        if !already_answered {
-                            engine.emit(SemanticCode::NonConstantCaseExpression, span, "", "");
-                        }
+            match eval(&node, engine) {
+                Verdict::Value(_) | Verdict::Constant => {}
+                Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
+                    // The same `InvalidType` early-return shape as the
+                    // constant-pattern face: a resolution verdict already
+                    // anchored inside the expression's span suppresses the
+                    // generic row (constant_verifier.dart:134-136).
+                    let already_answered = engine.report.diagnostics.iter().any(|d| {
+                        d.range.offset >= span.offset
+                            && d.range.end() <= span.end()
+                            && d.range.length > 0
+                            && d.range != span
+                    });
+                    if !already_answered {
+                        engine.emit(SemanticCode::NonConstantCaseExpression, span, "", "");
                     }
-                    Verdict::Fault(fault, span) => engine.emit_const_fault(fault, span),
                 }
+                Verdict::Fault(fault, span) => engine.emit_const_fault(fault, span),
+            }
         }
         let root = engine.close_case_sink();
         let space = engine.substitute_root(root);
@@ -5159,9 +5174,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // A(0)` argument list types the evaluated creation's type, never
         // the operand's (`ur_arg_base` holds the open argument lists; a
         // literal nested in one sits below the pattern's expression).
-        if engine.const_capture.top_is_constant_pattern()
-            && engine.ur_arg_base.is_empty()
-        {
+        if engine.const_capture.top_is_constant_pattern() && engine.ur_arg_base.is_empty() {
             let ty = Ty::named(engine.members.primitive_ids[0]);
             engine.const_fold.arm(ty, token.range);
         }
@@ -5173,9 +5186,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.push_primitive_row(token, 0);
         engine.const_int_literal(token);
-        if engine.const_capture.top_is_constant_pattern()
-            && engine.ur_arg_base.is_empty()
-        {
+        if engine.const_capture.top_is_constant_pattern() && engine.ur_arg_base.is_empty() {
             let ty = Ty::named(engine.members.primitive_ids[0]);
             engine.const_fold.arm(ty, token.range);
         }
@@ -5187,9 +5198,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.push_primitive_row(token, 1);
         engine.const_double_literal(token);
-        if engine.const_capture.top_is_constant_pattern()
-            && engine.ur_arg_base.is_empty()
-        {
+        if engine.const_capture.top_is_constant_pattern() && engine.ur_arg_base.is_empty() {
             let ty = Ty::named(engine.members.primitive_ids[1]);
             engine.const_fold.arm(ty, token.range);
         }
@@ -5201,9 +5210,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.push_primitive_row(token, 1);
         engine.const_double_literal(token);
-        if engine.const_capture.top_is_constant_pattern()
-            && engine.ur_arg_base.is_empty()
-        {
+        if engine.const_capture.top_is_constant_pattern() && engine.ur_arg_base.is_empty() {
             let ty = Ty::named(engine.members.primitive_ids[1]);
             engine.const_fold.arm(ty, token.range);
         }
@@ -5213,9 +5220,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().handle_literal_bool(token);
 
         let engine = &mut self.engine;
-        if engine.const_capture.top_is_constant_pattern()
-            && engine.ur_arg_base.is_empty()
-        {
+        if engine.const_capture.top_is_constant_pattern() && engine.ur_arg_base.is_empty() {
             let is_true = engine.text_of(token) == Some("true");
             engine.switch.pending_const = Some(Restriction::BoolValue(is_true));
             let ty = Ty::named(engine.members.primitive_ids[3]);
@@ -5229,9 +5234,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().handle_literal_null(token);
 
         let engine = &mut self.engine;
-        if engine.const_capture.top_is_constant_pattern()
-            && engine.ur_arg_base.is_empty()
-        {
+        if engine.const_capture.top_is_constant_pattern() && engine.ur_arg_base.is_empty() {
             engine.switch.pending_const = Some(Restriction::Null);
             engine.const_fold.arm(Ty::Null, token.range);
         }
@@ -5408,13 +5411,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // exactly like a typed expression. The row spans the whole literal
         // — `const`/`>`-start through the `]` — matching the oracle's
         // listLiteral anchor.
-        if let Some(ty) = engine.typed_list_literal_ty(left) {
+        if engine.typed_list_literal_ty(left).is_some() {
             let span_start = const_keyword.map_or_else(
                 || {
                     // Locate the `<` group's head byte for the anchor's
                     // start: walk back from `[` past the `>` and the group.
                     let bytes = engine.source.as_bytes();
-                    let mut cursor = left.range.offset as usize;
+                    let mut cursor = engine.byte_of(left.range.offset);
                     while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
                         cursor -= 1;
                     }
@@ -5433,7 +5436,7 @@ impl ParserListener for DiagnoseListener<'_> {
                             _ => {}
                         }
                     }
-                    cursor as u32
+                    engine.utf16_of(cursor)
                 },
                 |token| token.range.offset,
             );
@@ -5441,16 +5444,37 @@ impl ParserListener for DiagnoseListener<'_> {
                 offset: span_start,
                 length: right.range.end() - span_start,
             };
-            engine.push_typed_value_row(range, ty);
-        } else {
-            // The unannotated literal's completed row stays opaque; the
-            // return check re-types it against the host's declared return
-            // (the context-driven resolution the oracle runs).
-            engine
-                .untyped_literals
-                .insert(right.range.offset, UntypedLiteral::List);
-            engine.push_value_row(right);
+            // The written group's nested arguments collapse under the
+            // helper's flat segment scan (the segment's LAST type-use
+            // wins — `<List<int>>` reads its element as `int`): a nested
+            // group rebuilds through the recursive parse (#2317②), an
+            // unspellable shape keeps the row opaque.
+            let ty = if engine.group_has_nested_args(left) {
+                engine
+                    .literal_group_args(left)
+                    .and_then(|args| match args.as_slice() {
+                        [elem] => Some(engine.boundary.args.borrow_mut().named(
+                            engine.collection_heads[0],
+                            false,
+                            std::slice::from_ref(elem),
+                        )),
+                        _ => None,
+                    })
+            } else {
+                engine.typed_list_literal_ty(left)
+            };
+            if let Some(ty) = ty {
+                engine.push_typed_value_row(range, ty);
+                return;
+            }
         }
+        // The unannotated literal's completed row stays opaque; the
+        // return check re-types it against the host's declared return
+        // (the context-driven resolution the oracle runs).
+        engine
+            .untyped_literals
+            .insert(right.range.offset, UntypedLiteral::List);
+        engine.push_value_row(right);
     }
 
     fn begin_literal_set_or_map(&mut self, _left: Token, const_keyword: Option<Token>) {
@@ -5521,26 +5545,83 @@ impl ParserListener for DiagnoseListener<'_> {
         // `const`/`<`-start through the `}`. An unannotated literal's
         // completed row stays opaque; the return check re-types it against
         // the host's declared return.
-        if let Some((span_start, ty)) = engine.typed_set_or_map_literal_ty(left) {
-            let span_start = const_keyword
-                .map(|token| token.range.offset)
-                .unwrap_or(span_start);
+        //
+        // The flat group's type comes from the engine helper; a NESTED
+        // group rebuilds through the recursive parse — the helper's flat
+        // segment scan takes each segment's LAST type-use, so
+        // `<String, List<String>>` reads its value as `String`, and its
+        // comma split cannot even attribute a nested group (three
+        // segments → `None`) (#2317②). A nested shape the name-level
+        // parse cannot spell (a function-typed argument) keeps the row
+        // opaque and silent — the written group decided the shape
+        // upstream either way.
+        let nested = engine.group_has_nested_args(left);
+        let helper_typed = engine.typed_set_or_map_literal_ty(left);
+        let typed_args = if nested {
+            engine.literal_group_args(left)
+        } else if let Some((_, Ty::Named { args, .. })) = &helper_typed {
+            Some(engine.boundary.args.borrow().get(*args).to_vec())
+        } else {
+            None
+        };
+        // The ambiguity face (`_inferSetOrMapLiteralType`'s tail): an
+        // untyped, non-empty literal whose context decides nothing and
+        // whose elements cannot agree on a side reports
+        // `ambiguous_set_or_map_literal_either`/`_both` at the literal.
+        if helper_typed.is_none() && !nested && engine.literal_context_side(left).is_none() {
+            engine.check_set_or_map_ambiguity(left, const_keyword, right, count);
+        }
+        if let Some(args) = typed_args {
+            let head = match args.len() {
+                1 => engine.collection_heads[1],
+                2 => engine.collection_heads[2],
+                _ => {
+                    // The written group is not a set/map arity: the
+                    // shape stays opaque (a recovery shape the oracle
+                    // itself types `dynamic`).
+                    engine.push_value_row(right);
+                    return;
+                }
+            };
+            let span_start = const_keyword.map_or_else(
+                || {
+                    engine
+                        .typed_group_head_u16(left)
+                        .unwrap_or(left.range.offset)
+                },
+                |token| token.range.offset,
+            );
             let range = SourceRange {
                 offset: span_start,
                 length: right.range.end() - span_start,
             };
+            let ty = engine.boundary.args.borrow_mut().named(head, false, &args);
+            // The typed map's own entry face
+            // (`_verifyMapLiteralEntry`): each key/value against the
+            // written type arguments.
+            if let [k, v] = args.as_slice() {
+                engine.check_map_literal_entries(left, right, *k, *v);
+            }
             engine.push_typed_value_row(range, ty);
-        } else {
-            let kind = if count == 0 {
-                UntypedLiteral::EmptyBraces
-            } else if has_set_entry {
-                UntypedLiteral::SetElements
-            } else {
-                UntypedLiteral::MapEntries
-            };
-            engine.untyped_literals.insert(right.range.offset, kind);
-            engine.push_value_row(right);
+            return;
         }
+        let kind = if count == 0 {
+            UntypedLiteral::EmptyBraces
+        } else if has_set_entry {
+            UntypedLiteral::SetElements
+        } else {
+            UntypedLiteral::MapEntries
+        };
+        engine.untyped_literals.insert(right.range.offset, kind);
+        // The untyped literal's map-context entry face: a written
+        // `Map<K, V>` in the direct initializer / arrow-body / `return`
+        // position donates its type arguments to the entry checks
+        // (`typed_literal_resolver.dart` `_fromContextType` →
+        // literal_element_verifier.dart).
+        if let Some((k, v)) = engine.map_entry_context(left) {
+            engine.check_map_literal_entries(left, right, k, v);
+        }
+        engine.push_value_row(right);
     }
 
     fn handle_literal_map_entry(
@@ -5582,10 +5663,9 @@ impl ParserListener for DiagnoseListener<'_> {
         });
         let inner_ty = match inner_row {
             Some(row)
-                if engine
-                    .bool_decided
-                    .iter()
-                    .any(|span| span.offset <= row.range.offset && row.range.end() <= span.end()) =>
+                if engine.bool_decided.iter().any(|span| {
+                    span.offset <= row.range.offset && row.range.end() <= span.end()
+                }) =>
             {
                 Ty::named(engine.members.primitive_ids[3])
             }
@@ -5630,13 +5710,8 @@ impl ParserListener for DiagnoseListener<'_> {
         // `RecordLiteral` is in the official used set.
         engine.ur_seal_used();
         if let Some(fields) = engine.const_capture.record_literal(count, token.range) {
-            let failed =
-                engine.check_const_elements(SemanticCode::NonConstantRecordField, &fields);
-            engine.push_literal_value(
-                failed,
-                token.range,
-                crate::const_eval::InstanceKind::Record,
-            );
+            let failed = engine.check_const_elements(SemanticCode::NonConstantRecordField, &fields);
+            engine.push_literal_value(failed, token.range, crate::const_eval::InstanceKind::Record);
         }
         // The literal's row: a single positional field whose type the field
         // window decides carries the record shape (`const(x-1)`'s `(int,)`),
@@ -5659,9 +5734,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 // resolves as an expression upstream), exactly like the
                 // plain-send and creation folds' deferred drain; the pass-2
                 // arms keep non-reporting shapes silent.
-                engine
-                    .deferred_miss_rows
-                    .extend(engine.rows.drain(mark..));
+                engine.deferred_miss_rows.extend(engine.rows.drain(mark..));
                 engine.push_record_row(token, positional, named);
             }
             None => engine.push_value_row(token),
@@ -5877,6 +5950,39 @@ impl ParserListener for DiagnoseListener<'_> {
             && engine.redirect_target_depth == 0
         {
             engine.requalify_creation_head(start, period);
+        }
+        // The two-segment qualified reference whose head resolves to
+        // NOTHING (`fb.C<int>()`, `const fb.C()` — no period before the
+        // name, `fb` absent from every scope): the head is the NamedType's
+        // import prefix and its element is null, so upstream's
+        // `resolveConstructorTypeReference` tail reports
+        // `undefined_identifier` over the written `prefix.C` span and
+        // returns with `InvalidType` — the creation face and the
+        // type-argument face never ask their question. The invocation-parse
+        // shape (`fb.C()` keyword-less, which upstream resolves as a target
+        // identifier first) reports the same face at the prefix token alone
+        // (probed: `fb.C()` → 1:11 length 2, `const fb.C<int>()` → 1:17
+        // length 4). The head row converts to the prefix face and its
+        // recorded creation miss is consumed — a prefix that RESOLVES keeps
+        // the class-segment verdict below (`creation_with_non_type` at the
+        // class token), and a resolved non-prefix head (a class spelled as
+        // a prefix) keeps the creation-miss arm's faces.
+        if _period_before_name.is_none()
+            && engine.redirect_target_depth == 0
+            && let Some((head, Some((_, selector_range)))) = engine.creation_ref
+            && matches!(engine.resolve_bare(head).0, BareInfo::Missing { .. })
+            && engine
+                .creation_miss_rows
+                .binary_search_by_key(&start.range.offset, |entry| entry.0)
+                .is_ok()
+        {
+            let end = match context {
+                ConstructorReferenceContext::Const | ConstructorReferenceContext::New => {
+                    selector_range.end()
+                }
+                _ => start.range.end(),
+            };
+            engine.requalify_creation_head_to(start, end);
         }
         // The two-segment qualified reference (`const Missing.new()`): the
         // `.new` rode the qualified rest, so the reference's type is the
@@ -6726,11 +6832,8 @@ impl ParserListener for DiagnoseListener<'_> {
         // recoverable error converts to `await_in_wrong_context` at the
         // `await` keyword (error_converter.dart). There is no suppression
         // face: the oracle reports it unconditionally.
-        self.engine.emit_corrected(
-            SemanticCode::AwaitInWrongContext,
-            begin.range,
-            "",
-        );
+        self.engine
+            .emit_corrected(SemanticCode::AwaitInWrongContext, begin.range, "");
     }
 
     fn end_invalid_yield_statement(&mut self, begin: Token, star: Option<Token>, end: Token) {
@@ -6779,6 +6882,14 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().end_yield_statement(begin, star, end);
         // `YieldStatement` is in the official used set.
         self.engine.ur_seal_used();
+        // The generator face (`yield_statement_resolver.dart`
+        // `_resolve_generator` → `_checkForYieldOfInvalidType`): the
+        // yielded expression (or the `yield*` implied sequence) against
+        // the declared sequence's element type. The parser routes the
+        // out-of-generator form to `end_invalid_yield_statement` — the
+        // `yield_in_non_generator` family owns it, this face never runs
+        // there.
+        self.engine.check_yield(begin, star, end);
     }
 
     fn handle_assigned_variable_pattern(&mut self, variable: Token) {
@@ -6912,7 +7023,9 @@ impl ParserListener for DiagnoseListener<'_> {
             // The redirect names its target class: a reference for the
             // `unused_element` face (`factory F.a() = _F;` keeps `_F` used).
             engine.used_names.insert(target_container);
-            engine.factory_redirect_targets.insert((target_container, target));
+            engine
+                .factory_redirect_targets
+                .insert((target_container, target));
             let ctor = engine.decl_sites[site].name;
             // The redirect-target faces
             // (`_checkForRedirectToInvalidReturnType`,
@@ -6936,12 +7049,7 @@ impl ParserListener for DiagnoseListener<'_> {
             match target_resolved {
                 None => {
                     let name_text = engine.strings.resolve(target_container).to_string();
-                    engine.emit(
-                        SemanticCode::RedirectToNonClass,
-                        span,
-                        &name_text,
-                        "",
-                    );
+                    engine.emit(SemanticCode::RedirectToNonClass, span, &name_text, "");
                 }
                 Some((target_decl, _)) => {
                     // The faces key on a resolved CONSTRUCTOR element
@@ -7137,7 +7245,8 @@ impl ParserListener for DiagnoseListener<'_> {
         // The flat record destructure bind: `final (a, b) = pair()` — the
         // pattern bound no types of its own, but the scrutinee's record
         // carries them; the name-level locals take the positional slots.
-        self.engine.destructure_record(equals.range.end(), semicolon.range.offset);
+        self.engine
+            .destructure_record(equals.range.end(), semicolon.range.offset);
     }
 
     fn handle_recoverable_error(&mut self, p0: Message, p1: Token, p2: Token) {
@@ -7212,4 +7321,823 @@ impl ParserListener for DiagnoseListener<'_> {
         // last value row — the unchecked-use face (#1351).
         self.engine.check_condition_operand();
     }
+}
+
+// —— listener-domain literal & yield faces —————————————————————————————
+//
+// The typed-literal group parse, the map-entry checks, the brace-literal
+// ambiguity decision, and the generator yield check run at the listener
+// layer: their decisions read the written source shape (the `<...>` group,
+// the entry colons, the direct `=`/`=>`/`return` position) alongside the
+// row stack, leaving the engine-side assignability/invocation domains
+// untouched.
+
+fn ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn trim_ws(bytes: &[u8], mut start: usize, end: usize) -> usize {
+    while start < end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    start
+}
+
+/// The source position one past the last significant byte before `cursor`:
+/// whitespace and both comment forms walk back over. The direct-position
+/// gate's scanner.
+fn preceding_position(bytes: &[u8], mut cursor: usize) -> Option<usize> {
+    loop {
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor >= 2 && bytes[cursor - 1] == b'*' && bytes[cursor - 2] == b'/' {
+            let mut i = cursor - 2;
+            while i > 0 && !(bytes[i - 1] == b'/' && bytes[i] == b'*') {
+                i -= 1;
+            }
+            if i == 0 {
+                return None;
+            }
+            cursor = i - 1;
+            continue;
+        }
+        if cursor >= 2 && bytes[cursor - 1] == b'/' && bytes[cursor - 2] == b'/' {
+            let mut i = cursor - 2;
+            while i > 0 && bytes[i - 1] != b'\n' {
+                i -= 1;
+            }
+            cursor = i;
+            continue;
+        }
+        return if cursor == 0 { None } else { Some(cursor) };
+    }
+}
+
+/// Top-level comma segments between `start` and `end`: bracket depth over
+/// `()[]{}`, string contents skipped; `angles` folds `<`/`>` into the
+/// depth (type-argument groups carry no comparison operators, element
+/// lists do).
+fn top_level_comma_segments(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    angles: bool,
+) -> Vec<(usize, usize)> {
+    let mut segments = Vec::new();
+    let mut seg_start = start;
+    let mut i = start;
+    let mut depth = 0usize;
+    while i < end {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'<' if angles => depth += 1,
+            b'>' if angles => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => {
+                segments.push((seg_start, i));
+                seg_start = i + 1;
+            }
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < end && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    segments.push((seg_start, end));
+    segments
+}
+
+/// The first top-level `:` in `[start, end)`, or `None`.
+fn top_level_colon(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    let mut i = start;
+    let mut depth = 0usize;
+    while i < end {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b':' if depth == 0 => return Some(i),
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < end && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The first top-level `?` in `[start, end)`, or `None`.
+fn top_level_question(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    let mut i = start;
+    let mut depth = 0usize;
+    while i < end {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'?' if depth == 0 => return Some(i),
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < end && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The byte extent of the balanced `(`...`)` group opening at `open`.
+fn balanced_paren(bytes: &[u8], open: usize, end: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < end {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < end && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A word-bounded needle at the top of `[start, end)`.
+fn find_word(bytes: &[u8], start: usize, end: usize, needle: &[u8]) -> Option<usize> {
+    let mut search = start;
+    while let Some(at) = bytes[search..end]
+        .windows(needle.len())
+        .position(|w| w == needle)
+    {
+        let at = search + at;
+        let before_ok = at == start || !ident_byte(bytes[at - 1]);
+        let after = at + needle.len();
+        let after_ok = after == end || !ident_byte(bytes[after]);
+        if before_ok && after_ok {
+            return Some(at);
+        }
+        search = at + 1;
+        if search >= end {
+            return None;
+        }
+    }
+    None
+}
+
+/// Whether the byte before position `eq` makes the `=` a compound
+/// (`==`, `??=`, `+=`, `<=`, ...) rather than the plain assignment.
+fn compound_assignment(bytes: &[u8], eq: usize) -> bool {
+    eq >= 2
+        && matches!(
+            bytes[eq - 2],
+            b'=' | b'!'
+                | b'<'
+                | b'>'
+                | b'+'
+                | b'-'
+                | b'*'
+                | b'/'
+                | b'%'
+                | b'&'
+                | b'|'
+                | b'^'
+                | b'?'
+        )
+}
+
+/// The spread operand's leading bare identifier: its name when the span
+/// opens with an identifier token (`l`, `a.b`, `a(1)` — the resolution
+/// channels answer the head name), `None` for operands opening with any
+/// other token (literals, parens).
+fn leading_ident_name(engine: &Engine<'_>, start: usize, end: usize) -> Option<StringId> {
+    let bytes = engine.source.as_bytes();
+    let mut cursor = start;
+    if cursor < end
+        && (bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_' || bytes[cursor] == b'$')
+    {
+        cursor += 1;
+    } else {
+        return None;
+    }
+    while cursor < end && (ident_byte(bytes[cursor]) || bytes[cursor] == b'$') {
+        cursor += 1;
+    }
+    let text = std::str::from_utf8(&bytes[start..cursor]).ok()?;
+    Some(engine.strings.intern(text))
+}
+
+/// The written group's span for the typed literal opening at `left`: the
+/// gate (the byte before the bracket closes a written `<>` group, never an
+/// expression arrow) plus the balanced walk to the group's `<` head.
+fn typed_group_head(engine: &Engine<'_>, left: Token) -> Option<usize> {
+    let bytes = engine.source.as_bytes();
+    let mut cursor = engine.byte_of(left.range.offset);
+    while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+        cursor -= 1;
+    }
+    if cursor < 2 || bytes[cursor - 1] != b'>' || bytes[cursor - 2] == b'=' {
+        return None;
+    }
+    let mut depth = 0usize;
+    loop {
+        if cursor == 0 {
+            return None;
+        }
+        cursor -= 1;
+        match bytes[cursor] {
+            b'>' => depth += 1,
+            b'<' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(cursor);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Engine<'_> {
+    /// Whether the typed literal's written `<...>` group carries nested
+    /// type arguments — the collapse repair's trigger (the flat segment
+    /// scan attributes nested groups' type-uses to the wrong segment).
+    pub(crate) fn group_has_nested_args(&self, left: Token) -> bool {
+        let Some(head) = typed_group_head(self, left) else {
+            return false;
+        };
+        let bytes = self.source.as_bytes();
+        let end = self.byte_of(left.range.offset);
+        let mut depth = 0usize;
+        for &b in &bytes[head + 1..end] {
+            match b {
+                b'<' => {
+                    if depth == 0 {
+                        return true;
+                    }
+                    depth += 1;
+                }
+                b'>' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// The written `<...>` group's parsed argument types: each top-level
+    /// segment's head type-use plus its own nested group, recursing per
+    /// argument level. A shape the name-level model cannot spell (a
+    /// function-typed or record argument) bails — the literal's row stays
+    /// opaque (the under-report posture).
+    pub(crate) fn literal_group_args(&self, left: Token) -> Option<Vec<Ty>> {
+        let head = typed_group_head(self, left)?;
+        // The group's own closing `>` (gate-guaranteed the byte before the
+        // literal bracket) stays outside the segment scan.
+        let close = self.byte_of(left.range.offset) - 1;
+        self.parse_group_args(head + 1, close)
+    }
+
+    /// The written group's `<` head as a UTF-16 offset — the typed
+    /// literal's row anchor start.
+    pub(crate) fn typed_group_head_u16(&self, left: Token) -> Option<u32> {
+        typed_group_head(self, left).map(|head| self.utf16_of(head))
+    }
+
+    fn parse_group_args(&self, start: usize, end: usize) -> Option<Vec<Ty>> {
+        let segments = top_level_comma_segments(self.source.as_bytes(), start, end, true);
+        let mut args = Vec::with_capacity(segments.len());
+        for (s, e) in segments {
+            args.push(self.parse_type_arg(s, e)?);
+        }
+        Some(args)
+    }
+
+    fn parse_type_arg(&self, start: usize, end: usize) -> Option<Ty> {
+        let bytes = self.source.as_bytes();
+        let start = trim_ws(bytes, start, end);
+        // The head is the segment's FIRST type-use (textual order — the
+        // head precedes its arguments; the prefix form `p.C` ships one use
+        // at `C`).
+        let s16 = self.utf16_of(start);
+        let e16 = self.utf16_of(end);
+        let &(range, name) = self
+            .type_uses
+            .iter()
+            .find(|(r, _)| r.offset >= s16 && r.end() <= e16)?;
+        if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
+            return None;
+        }
+        let nullable = self.written_nullable_suffix(range.end());
+        let mut cursor = self.byte_of(range.end());
+        if nullable {
+            let mut c = cursor;
+            while c < end && bytes[c].is_ascii_whitespace() {
+                c += 1;
+            }
+            if c < end && bytes[c] == b'?' {
+                cursor = c + 1;
+            }
+        }
+        let mut c = cursor;
+        while c < end && bytes[c].is_ascii_whitespace() {
+            c += 1;
+        }
+        let args = if c < end && bytes[c] == b'<' {
+            // The head's own nested group: balanced to its `>`, and
+            // nothing may follow it inside the segment.
+            let (close, after) = {
+                let mut depth = 0usize;
+                let mut i = c;
+                loop {
+                    if i >= end {
+                        return None;
+                    }
+                    match bytes[i] {
+                        b'<' => depth += 1,
+                        b'>' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break (i, i + 1);
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            };
+            if bytes[after..end].iter().any(|b| !b.is_ascii_whitespace()) {
+                return None;
+            }
+            let args = self.parse_group_args(c + 1, close)?;
+            self.boundary.args.borrow_mut().intern(&args)
+        } else {
+            if c != end {
+                return None;
+            }
+            crate::model::ArgListId::EMPTY
+        };
+        Some(Ty::Named {
+            name,
+            nullable,
+            args,
+        })
+    }
+
+    /// The map literal's entry face
+    /// (`literal_element_verifier.dart` `_verifyMapLiteralEntry`): each
+    /// entry's key and value rows ask their assignability question of the
+    /// literal's resolved type arguments, reporting
+    /// `map_key_type_not_assignable` / `map_value_type_not_assignable` at
+    /// the failing side. Leaves without a top-level colon (spreads,
+    /// expression elements), the conditional shape, and the null-aware
+    /// entry (its promotion asks a different question) stay silent.
+    pub(crate) fn check_map_literal_entries(&mut self, left: Token, right: Token, k: Ty, v: Ty) {
+        for (key, value) in self.entry_spans(left, right) {
+            for ((start, end), expected, code) in [
+                (key, k, SemanticCode::MapKeyTypeNotAssignable),
+                (value, v, SemanticCode::MapValueTypeNotAssignable),
+            ] {
+                let Some((ty, range)) = self.leaf_completion_row(start, end) else {
+                    continue;
+                };
+                // A `void` key/value short-circuits to the use-of-void
+                // face upstream (`_verifyMapLiteralEntryKey`) — no entry
+                // row; an unspellable completion row suppresses.
+                if ty == Ty::Void || ty == Ty::UNKNOWN {
+                    continue;
+                }
+                if self.assignable(ty, expected, false) == Some(false) {
+                    let (a0, a1) = (self.ty_display(ty), self.ty_display(expected));
+                    self.emit(code, range, &a0, &a1);
+                }
+            }
+        }
+    }
+
+    /// The entry key/value spans (UTF-16) of a map-shaped literal's
+    /// leaves.
+    fn entry_spans(&self, left: Token, right: Token) -> Vec<((u32, u32), (u32, u32))> {
+        let bytes = self.source.as_bytes();
+        let mut out = Vec::new();
+        for (s, e) in self.literal_leaves(left, right) {
+            let s = trim_ws(bytes, s, e);
+            let Some(colon) = top_level_colon(bytes, s, e) else {
+                continue;
+            };
+            // The null-aware entry's key promotes to non-null (a
+            // different question); a conditional's `?` makes the leaf an
+            // expression — both stay silent here.
+            if top_level_question(bytes, s, colon).is_some() {
+                continue;
+            }
+            let key = (self.utf16_of(s), self.utf16_of(colon));
+            let value = (self.utf16_of(colon + 1), self.utf16_of(e));
+            out.push((key, value));
+        }
+        out
+    }
+
+    /// The brace literal's ambiguity decision
+    /// (`typed_literal_resolver.dart` `_inferSetOrMapLiteralType`'s tail):
+    /// elements that must be map sides (entries, resolved map spreads) and
+    /// elements that must be set sides (expressions, resolved iterable
+    /// spreads) mixed together report
+    /// `ambiguous_set_or_map_literal_both`; no element forcing either side
+    /// while some element is positively undecided — a spread whose
+    /// expression row reads `dynamic`/non-collection, or an unresolvable
+    /// spread operand (the oracle's error-dynamic shape) — reports
+    /// `_either` (`_InferredCollectionElementTypeInformation`: a dynamic
+    /// spread fills all three slots, forcing neither must-be bit). One
+    /// side only decides silently, and the elementless form defaults to a
+    /// map. An operand with NO row resolves to a type the row model
+    /// cannot spell — its hidden side may already have decided the whole
+    /// literal in the oracle, so it suppresses the nothing-forces `_either`
+    /// tail (the under-report posture; a resolved collection spread is
+    /// this shape's common occupant).
+    pub(crate) fn check_set_or_map_ambiguity(
+        &mut self,
+        left: Token,
+        const_keyword: Option<Token>,
+        right: Token,
+        count: usize,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let mut has_map = false;
+        let mut has_set = false;
+        let mut either_evidence = false;
+        let mut hidden_side = false;
+        for (start, end) in self.literal_leaves(left, right) {
+            match self.leaf_side(start, end) {
+                LeafSide::Map => has_map = true,
+                LeafSide::Set => has_set = true,
+                LeafSide::Either => either_evidence = true,
+                LeafSide::Blind => hidden_side = true,
+            }
+        }
+        let code = match (has_map, has_set) {
+            (true, true) => SemanticCode::AmbiguousSetOrMapLiteralBoth,
+            (false, false) if either_evidence && !hidden_side => {
+                SemanticCode::AmbiguousSetOrMapLiteralEither
+            }
+            _ => return,
+        };
+        let span_start = const_keyword
+            .map(|token| token.range.offset)
+            .unwrap_or(left.range.offset);
+        let range = SourceRange {
+            offset: span_start,
+            length: right.range.end() - span_start,
+        };
+        let message = code.message("", "");
+        self.emit_message_with_correction(code, range, message);
+    }
+
+    /// One leaf's must-be side (`_inferCollectionElementType`'s
+    /// `mustBeMap`/`mustBeSet` bits).
+    fn leaf_side(&self, start: usize, end: usize) -> LeafSide {
+        let bytes = self.source.as_bytes();
+        let s = trim_ws(bytes, start, end);
+        if bytes[s..].starts_with(b"...") {
+            // The spread expression's row decides (`SpreadElementImpl`'s
+            // arm): a resolved `Map` spread must be a map side, a resolved
+            // iterable-family spread a set side; a `dynamic`/non-collection
+            // row fills the can-be slots without forcing either must-be
+            // bit — positive `_either` evidence.
+            let s16 = self.utf16_of(s);
+            let e16 = self.utf16_of(end);
+            let after = trim_ws(
+                bytes,
+                s + 3 + usize::from(bytes.get(s + 3) == Some(&b'?')),
+                end,
+            );
+            if let Some((ty, _)) = self.row_in_span(s16, e16) {
+                let Ty::Named { name, .. } = ty else {
+                    return LeafSide::Either;
+                };
+                if name == self.collection_heads[2] {
+                    return LeafSide::Map;
+                }
+                if name == self.collection_heads[0]
+                    || name == self.collection_heads[1]
+                    || name == self.collection_heads[3]
+                {
+                    return LeafSide::Set;
+                }
+                return LeafSide::Either;
+            }
+            // No row: the operand's type is invisible. An unresolvable
+            // operand is the oracle's error-dynamic shape (positive
+            // `_either` evidence); a resolved one hides a real type whose
+            // side may already have decided the literal — blind.
+            if let Some(name) = leading_ident_name(self, after, end) {
+                if self.resolve_local(name).is_none()
+                    && matches!(self.resolve_bare(name).0, BareInfo::Missing { .. })
+                {
+                    return LeafSide::Either;
+                }
+            }
+            return LeafSide::Blind;
+        }
+        match top_level_colon(bytes, s, end) {
+            Some(colon) => {
+                // A conditional's mid-leaf `?` ahead of the colon makes
+                // the leaf an expression; the plain colon is an entry.
+                if top_level_question(bytes, s, colon).is_some() {
+                    LeafSide::Set
+                } else {
+                    LeafSide::Map
+                }
+            }
+            None => LeafSide::Set,
+        }
+    }
+
+    /// The literal's leaf elements (byte spans): top-level comma segments
+    /// with `for`/`if` wrappers unwrapped to their bodies.
+    fn literal_leaves(&self, left: Token, right: Token) -> Vec<(usize, usize)> {
+        let bytes = self.source.as_bytes();
+        let start = self.byte_of(left.range.end());
+        let end = self.byte_of(right.range.offset);
+        let mut leaves = Vec::new();
+        let mut work: Vec<(usize, usize)> = top_level_comma_segments(bytes, start, end, false);
+        while let Some((s, e)) = work.pop() {
+            let s = trim_ws(bytes, s, e);
+            if s >= e {
+                continue;
+            }
+            // `for (...) body`: the body follows the clause's balanced `)`.
+            if bytes[s..].starts_with(b"for") {
+                let after_for = trim_ws(bytes, s + 3, e);
+                if after_for < e && bytes[after_for] == b'(' {
+                    let close = balanced_paren(bytes, after_for, e);
+                    if let Some(close) = close {
+                        work.push((close + 1, e));
+                        continue;
+                    }
+                }
+            }
+            // `if (c) then [else else-part]`: both branches unwrap.
+            if bytes[s..].starts_with(b"if") {
+                let after_if = trim_ws(bytes, s + 2, e);
+                if after_if < e && bytes[after_if] == b'(' {
+                    let close = balanced_paren(bytes, after_if, e);
+                    if let Some(close) = close {
+                        let else_at = find_word(bytes, close + 1, e, b"else");
+                        match else_at {
+                            Some(at) => {
+                                work.push((close + 1, at));
+                                work.push((at + 4, e));
+                            }
+                            None => work.push((close + 1, e)),
+                        }
+                        continue;
+                    }
+                }
+            }
+            leaves.push((s, e));
+        }
+        leaves
+    }
+
+    /// The last typed row inside `[start, end)` (UTF-16) — the spread
+    /// leaf's expression-row selection.
+    fn row_in_span(&self, start: u32, end: u32) -> Option<(Ty, SourceRange)> {
+        let row = self.rows.iter().rev().find(|row| {
+            row.ty != Ty::UNKNOWN && row.range.offset >= start && row.range.end() <= end
+        })?;
+        Some((row.ty, row.range))
+    }
+
+    /// The leaf's completion row: the LAST row inside the span, whatever
+    /// its type — the value expression's own node row. A nested
+    /// collection's opaque completion row outlives its inner typed rows,
+    /// so the completion pick answers nothing exactly where the oracle
+    /// checks the nested literal's own type and the row cannot spell it
+    /// (the under-report posture); a nested TYPED completion row reads as
+    /// the value's static type.
+    fn leaf_completion_row(&self, start: u32, end: u32) -> Option<(Ty, SourceRange)> {
+        let row = self.rows.iter().rev().find(|row| {
+            row.range.offset >= start
+                && row.range.end() <= end
+                && !matches!(row.shape, RowShape::TypeUse(..))
+                && !self.interpolation_child_rows.contains(&row.range.offset)
+        })?;
+        Some((row.ty, row.range))
+    }
+
+    /// The context side the literal's direct position donates (`Some(true)`
+    /// = map, `Some(false)` = set): the declaration group's armed
+    /// annotation at the direct `=` position, or the host's declared
+    /// return at the direct `=>`-body / `return` position — the two
+    /// channels the name-level model carries
+    /// (`typed_literal_resolver.dart` `_fromContextType`).
+    pub(crate) fn literal_context_side(&self, left: Token) -> Option<bool> {
+        let Ty::Named { name, .. } = self.literal_context_ty(left)? else {
+            return None;
+        };
+        if name == self.collection_heads[2] {
+            return Some(true);
+        }
+        if name == self.collection_heads[0]
+            || name == self.collection_heads[1]
+            || name == self.collection_heads[3]
+        {
+            return Some(false);
+        }
+        None
+    }
+
+    /// The written 2-argument `Map<K, V>` context at the literal's
+    /// direct position, split into its type arguments — the entry face's
+    /// expected key/value pair.
+    pub(crate) fn map_entry_context(&self, left: Token) -> Option<(Ty, Ty)> {
+        let Ty::Named { name, args, .. } = self.literal_context_ty(left)? else {
+            return None;
+        };
+        if name != self.collection_heads[2] {
+            return None;
+        }
+        let args = self.boundary.args.borrow().get(args).to_vec();
+        match args.as_slice() {
+            [k, v] => Some((*k, *v)),
+            _ => None,
+        }
+    }
+
+    fn literal_context_ty(&self, left: Token) -> Option<Ty> {
+        let bytes = self.source.as_bytes();
+        let cursor = preceding_position(bytes, self.byte_of(left.range.offset))?;
+        match bytes[cursor - 1] {
+            // The declaration's own initializer: the group is open and no
+            // nested executable sits between (`init_frame_depth` latched
+            // the initializer world's frame count — a closure body's
+            // `=` inside is its own business).
+            b'=' if !compound_assignment(bytes, cursor) => {
+                if self.in_initializer && self.frames.len() == self.init_frame_depth {
+                    self.pending_decl_ty
+                } else {
+                    None
+                }
+            }
+            // The arrow-body expression.
+            b'>' if cursor >= 2 && bytes[cursor - 2] == b'=' => self.host_return_ty(),
+            // The bare `return e;` expression.
+            b'n' if cursor >= 6
+                && bytes[cursor - 6..cursor] == *b"return"
+                && (cursor == 6 || !ident_byte(bytes[cursor - 7])) =>
+            {
+                self.host_return_ty()
+            }
+            _ => None,
+        }
+    }
+
+    /// The innermost executable's declared return — a closure frame's
+    /// uninferred return never delegates outward (`check_return`'s
+    /// `firstDepleted` posture).
+    fn host_return_ty(&self) -> Option<Ty> {
+        let frame = self
+            .frames
+            .iter()
+            .rev()
+            .find(|f| matches!(f.kind, FrameKind::Executable { .. }))?;
+        let FrameKind::Executable { ret, .. } = &frame.kind else {
+            return None;
+        };
+        ret.as_ref().map(|r| r.ty)
+    }
+
+    /// The generator yield face
+    /// (`yield_statement_resolver.dart` `_checkForYieldOfInvalidType`):
+    /// `yield e` asks e's type of the declared sequence's element type;
+    /// `yield* e` asks the implied `Iterable<E>`/`Stream<E>` of the full
+    /// declared return. A declared return outside the body's own sequence
+    /// family answers nothing (upstream `asInstanceOf` miss), and the
+    /// closure generator's uninferred return under-reports.
+    pub(crate) fn check_yield(&mut self, begin: Token, star: Option<Token>, end: Token) {
+        let Some(frame) = self
+            .frames
+            .iter()
+            .rev()
+            .find(|f| matches!(f.kind, FrameKind::Executable { .. }))
+        else {
+            return;
+        };
+        let FrameKind::Executable {
+            ret,
+            is_async,
+            generator,
+            ..
+        } = &frame.kind
+        else {
+            return;
+        };
+        if !*generator {
+            return;
+        }
+        let Some(ret) = ret else { return };
+        let is_sync = !*is_async;
+        let Some((expr_ty, range)) =
+            self.single_value_row_between(begin.range.end(), end.range.offset)
+        else {
+            return;
+        };
+        let iterable = self.collection_heads[3];
+        let stream = self.intern("Stream");
+        let seq_head = if is_sync { iterable } else { stream };
+        if star.is_some() {
+            let implied = self
+                .boundary
+                .args
+                .borrow_mut()
+                .named(seq_head, false, &[expr_ty]);
+            if self.assignable(implied, ret.ty, false) == Some(false) {
+                let (a0, a1) = (self.ty_display(implied), self.ty_display(ret.ty));
+                self.emit(SemanticCode::YieldEachOfInvalidType, range, &a0, &a1);
+            }
+            return;
+        }
+        let Ty::Named { name, args, .. } = ret.ty else {
+            return;
+        };
+        if name != seq_head {
+            return;
+        }
+        let Some(&e) = self.boundary.args.borrow().get(args).first() else {
+            return;
+        };
+        if self.assignable(expr_ty, e, false) == Some(false) {
+            let (a0, a1) = (self.ty_display(expr_ty), self.ty_display(e));
+            self.emit(SemanticCode::YieldOfInvalidType, range, &a0, &a1);
+        }
+    }
+
+    /// The statement window's single value row — the exact-one-row posture
+    /// [`Engine::single_row_since`] shares, bounded by token spans instead
+    /// of a mark.
+    fn single_value_row_between(&self, after: u32, until: u32) -> Option<(Ty, SourceRange)> {
+        let rows: Vec<&Row> = self
+            .rows
+            .iter()
+            .filter(|row| row.range.offset >= after && row.range.end() <= until)
+            .filter(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+            .filter(|row| !self.interpolation_child_rows.contains(&row.range.offset))
+            .collect();
+        match rows.as_slice() {
+            [row] => Some((row.ty, row.range)),
+            _ => None,
+        }
+    }
+}
+
+/// A leaf element's must-be side for the ambiguity decision.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeafSide {
+    Map,
+    Set,
+    /// No side forced, but the leaf is positively undecided in the
+    /// oracle too (a `dynamic`/non-collection spread row, an
+    /// unresolvable operand's error-dynamic): `_either` evidence.
+    Either,
+    /// The leaf's type is invisible to the row model (no row at the
+    /// operand): its hidden real side may already have decided the
+    /// literal, so it forces nothing and vetoes the `_either` tail.
+    Blind,
 }

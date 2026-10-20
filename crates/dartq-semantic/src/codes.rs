@@ -1212,6 +1212,51 @@ pub enum SemanticCode {
     /// (`const_constructor_param_type_mismatch`, diagnostic.g.dart:2619;
     /// `evaluation.dart` `_checkArgumentType` / the field-formal arm).
     ConstConstructorParamTypeMismatch,
+    /// `The element type '{0}' can't be assigned to the map key type
+    /// '{1}'.` — a map literal entry's key whose static type is not
+    /// assignable to the literal's resolved key type
+    /// (`map_key_type_not_assignable`, diagnostic.g.dart:10480;
+    /// literal_element_verifier.dart `_verifyMapLiteralEntryKey`). The
+    /// nullability twin shares the name and the message (the
+    /// `uniqueName` split) — one variant covers both faces.
+    MapKeyTypeNotAssignable,
+    /// `The element type '{0}' can't be assigned to the map value type
+    /// '{1}'.` — a map literal entry's value whose static type is not
+    /// assignable to the literal's resolved value type
+    /// (`map_value_type_not_assignable`, diagnostic.g.dart:10520;
+    /// literal_element_verifier.dart `_verifyMapLiteralEntryValue`). The
+    /// nullability twin shares the name and the message (the
+    /// `uniqueName` split) — one variant covers both faces.
+    MapValueTypeNotAssignable,
+    /// `A yielded value of type '{0}' must be assignable to '{1}'.` — a
+    /// generator's `yield` expression whose static type is not assignable
+    /// to the declared sequence's element type (`yield_of_invalid_type`,
+    /// diagnostic.g.dart:18890; yield_statement_resolver.dart
+    /// `_checkForYieldOfInvalidType`).
+    YieldOfInvalidType,
+    /// `The type '{0}' implied by the 'yield*' expression must be
+    /// assignable to '{1}'.` — a generator's `yield*` expression whose
+    /// implied sequence type is not assignable to the declared return
+    /// type. The registry keeps one `analyzerCode` for the pair (the
+    /// `yieldEachOfInvalidType` row's `name` is `yield_of_invalid_type`,
+    /// diagnostic.g.dart:18851 — the `uniqueName` split), so this variant
+    /// shares the name/machine face with
+    /// [`SemanticCode::YieldOfInvalidType`] and differs only in message.
+    YieldEachOfInvalidType,
+    /// `This literal must be either a map or a set, but the elements
+    /// don't have enough information for type inference to work.` — a
+    /// brace literal whose elements cannot decide the shape (the
+    /// spread-of-dynamic form)
+    /// (`ambiguous_set_or_map_literal_either`, diagnostic.g.dart:431;
+    /// typed_literal_resolver.dart `_inferSetOrMapLiteralType`).
+    AmbiguousSetOrMapLiteralEither,
+    /// `The literal can't be either a map or a set because it contains at
+    /// least one literal map entry or a spread operator spreading a
+    /// 'Map', and at least one element which is neither of these.` — a
+    /// brace literal mixing entries (or map spreads) with plain elements
+    /// (`ambiguous_set_or_map_literal_both`, diagnostic.g.dart:414; the
+    /// same `_inferSetOrMapLiteralType` decision).
+    AmbiguousSetOrMapLiteralBoth,
 }
 
 /// The message face of [`SemanticCode::NotEnoughPositionalArguments`]: the
@@ -1894,6 +1939,32 @@ impl SemanticCode {
             Self::ConstConstructorParamTypeMismatch => (
                 "const_constructor_param_type_mismatch",
                 "CONST_CONSTRUCTOR_PARAM_TYPE_MISMATCH",
+            ),
+            // The registry's nullability twins share the name and the
+            // machine form (the `uniqueName` split) — the base variant
+            // covers both report faces.
+            Self::MapKeyTypeNotAssignable => (
+                "map_key_type_not_assignable",
+                "MAP_KEY_TYPE_NOT_ASSIGNABLE",
+            ),
+            Self::MapValueTypeNotAssignable => (
+                "map_value_type_not_assignable",
+                "MAP_VALUE_TYPE_NOT_ASSIGNABLE",
+            ),
+            // The `yield*` row's registry `name` is `yield_of_invalid_type`
+            // (diagnostic.g.dart:18854 — the `uniqueName` split); both
+            // generator faces print the shared code.
+            Self::YieldOfInvalidType | Self::YieldEachOfInvalidType => (
+                "yield_of_invalid_type",
+                "YIELD_OF_INVALID_TYPE",
+            ),
+            Self::AmbiguousSetOrMapLiteralEither => (
+                "ambiguous_set_or_map_literal_either",
+                "AMBIGUOUS_SET_OR_MAP_LITERAL_EITHER",
+            ),
+            Self::AmbiguousSetOrMapLiteralBoth => (
+                "ambiguous_set_or_map_literal_both",
+                "AMBIGUOUS_SET_OR_MAP_LITERAL_BOTH",
             ),
         };
         let dtype = self.dtype();
@@ -2707,6 +2778,27 @@ impl SemanticCode {
             Self::ConstConstructorParamTypeMismatch => format!(
                 "A value of type '{a0}' can't be assigned to a parameter of type '{a1}' in a const constructor."
             ),
+            Self::MapKeyTypeNotAssignable => {
+                format!("The element type '{a0}' can't be assigned to the map key type '{a1}'.")
+            }
+            Self::MapValueTypeNotAssignable => {
+                format!("The element type '{a0}' can't be assigned to the map value type '{a1}'.")
+            }
+            Self::YieldOfInvalidType => {
+                format!("A yielded value of type '{a0}' must be assignable to '{a1}'.")
+            }
+            // The `yield*` face shares the registry `name` with the plain
+            // yield row; only the problem text differs (the uniqueName
+            // split).
+            Self::YieldEachOfInvalidType => format!(
+                "The type '{a0}' implied by the 'yield*' expression must be assignable to '{a1}'."
+            ),
+            Self::AmbiguousSetOrMapLiteralEither => {
+                "This literal must be either a map or a set, but the elements don't have enough information for type inference to work.".to_string()
+            }
+            Self::AmbiguousSetOrMapLiteralBoth => {
+                "The literal can't be either a map or a set because it contains at least one literal map entry or a spread operator spreading a 'Map', and at least one element which is neither of these.".to_string()
+            }
         }
     }
 
@@ -3326,6 +3418,16 @@ impl SemanticCode {
             // correctionMessage (diagnostic.g.dart :2625).
             Self::ConstConstructorParamTypeMismatch => Some(
                 "Try using a subtype, or removing the keyword 'const'.".to_string(),
+            ),
+            // The ambiguity pair's verbatim oracle correctionMessages
+            // (diagnostic.g.dart:419-422 and :436-439).
+            Self::AmbiguousSetOrMapLiteralEither => Some(
+                "Try adding type arguments to the literal (one for sets, two for maps)."
+                    .to_string(),
+            ),
+            Self::AmbiguousSetOrMapLiteralBoth => Some(
+                "Try removing or changing some of the elements so that all of the elements are consistent."
+                    .to_string(),
             ),
             _ => None,
         }
@@ -4423,7 +4525,13 @@ mod tests {
             | SemanticCode::DefinitelyUnassignedLateLocalVariable
             | SemanticCode::TypeTestWithUndefinedName
             | SemanticCode::CastToNonType
-            | SemanticCode::ClassUsedAsMixin => code.code_info(),
+            | SemanticCode::ClassUsedAsMixin
+            | SemanticCode::MapKeyTypeNotAssignable
+            | SemanticCode::MapValueTypeNotAssignable
+            | SemanticCode::YieldOfInvalidType
+            | SemanticCode::YieldEachOfInvalidType
+            | SemanticCode::AmbiguousSetOrMapLiteralEither
+            | SemanticCode::AmbiguousSetOrMapLiteralBoth => code.code_info(),
         }
     }
 
@@ -4613,6 +4721,12 @@ mod tests {
             SemanticCode::WrongNumberOfTypeArgumentsFunction,
             SemanticCode::WrongTypeParameterVarianceInSuperinterface,
             SemanticCode::WrongTypeParameterVariancePosition,
+            SemanticCode::MapKeyTypeNotAssignable,
+            SemanticCode::MapValueTypeNotAssignable,
+            SemanticCode::YieldOfInvalidType,
+            SemanticCode::YieldEachOfInvalidType,
+            SemanticCode::AmbiguousSetOrMapLiteralEither,
+            SemanticCode::AmbiguousSetOrMapLiteralBoth,
         ]
     }
 
