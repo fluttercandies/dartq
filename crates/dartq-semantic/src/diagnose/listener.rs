@@ -5823,7 +5823,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // keyword_named_class_methods_2.dart:49). Every other shape keeps
         // the opaque value row (the oracle's own field types are inference
         // faces M1 does not model).
-        let fields = engine.record_field_tys(count);
+        let fields = engine.record_field_tys(count, names);
         match fields {
             Some((mark, positional, named)) => {
                 // The literal's row replaces its field residue: the fields
