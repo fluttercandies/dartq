@@ -2699,14 +2699,25 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         {
             site.function_formals_begin();
         }
-        // A depth-0 generalized-function-type group is a type shape, never
-        // the executable's own formals: `int Function() topFn(int x)` parses
-        // the return annotation's `()` before the name, and letting it run
-        // the depth-0 prep would attach its EMPTY formals first-wins and
-        // discard the real group that follows.
-        if builder.formal_depth == 0 && kind != ParserMemberKind::GeneralizedFunctionType {
+        // Every depth-0 group opens a fresh formal list. Sibling top-level
+        // `Function({…})` type literals — a generated table of `const …
+        // Function({required String name})` entries, or typedef RHSes —
+        // reuse the same named-formal spellings in independent lists, and
+        // keeping the previous list would flag every reuse across siblings
+        // as `duplicate_definition`.
+        if builder.formal_depth == 0 {
             builder.positional_formals.clear();
             builder.named_formals.clear();
+        }
+        // A depth-0 generalized-function-type group is a type shape, never
+        // the executable's own formals: `int Function() topFn(int x)` parses
+        // the return annotation's `()` before the name, and attaching at its
+        // close would fill the formals slot first-wins and discard the real
+        // group that follows (the end guard mirrors this). The header latch
+        // waits with it: `T Function() topFn<T>()` parses `<T>` after the
+        // annotation, and `attach_type_param_count` only lands while the
+        // header is open.
+        if builder.formal_depth == 0 && kind != ParserMemberKind::GeneralizedFunctionType {
             // An operator declaration's name token is the operator spelling
             // itself, not an identifier — no `MethodDeclaration` context
             // ever fires for it, so the armed return type (`bool` in

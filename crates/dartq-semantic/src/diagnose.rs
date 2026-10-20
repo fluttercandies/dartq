@@ -3646,3 +3646,22 @@ mod ticket_2413_tests;
 /// reports `unchecked_use_of_nullable_value`, on `B` stays silent).
 #[cfg(test)]
 mod ticket_2414_tests;
+
+/// The #2416 pins: the record literal's named labels ride the record
+/// type — `return (entryIndex: 1, header: null);` against a declared
+/// `({int entryIndex, String? header})` stays silent (the record row's
+/// `named` split feeds the assignability face, never a positional-only
+/// `(int, String?)` shadow), and `_loading = (progress: progress);`
+/// against `({num? progress})` field-initializer faces the named shape.
+#[cfg(test)]
+mod ticket_2416_tests;
+
+/// The #2419 pins: every depth-0 formal-parameter group opens a fresh
+/// pool — sibling top-level `Function({…})` type literals (the
+/// `diagnostic.g.dart` const table, typedef RHSes) each clear the
+/// accumulated formals at their own begin, so named-formal reuse across
+/// independent GFT lists no longer reports `duplicate_definition`, while
+/// the within-list check, the executable-vs-annotation split, and the
+/// header latch for `<T>` after a GFT return annotation all hold.
+#[cfg(test)]
+mod ticket_2419_tests;
