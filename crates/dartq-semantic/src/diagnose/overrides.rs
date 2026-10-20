@@ -77,6 +77,66 @@ const LIST_BASE_FACE: &[(&str, bool, u8)] = &[
     ("setAll", false, 0),
 ];
 
+/// The frozen `dart:collection` set-base face (upstream Dart SDK source,
+/// `sdk/lib/collection/set.dart` — `abstract mixin class SetBase<E>
+/// implements Set<E>`, `typedef SetMixin<E> = SetBase<E>`): the same
+/// names-only-stub complement as [`LIST_BASE_FACE`]. `SetBase` implements
+/// all of `Set`'s interface except the seven forwarding points its doc
+/// names ("depends only on the abstract members: add, contains, lookup,
+/// remove, iterator, length and toSet") — those stay abstract, so a
+/// concrete `extends SetBase` class missing one reports it exactly like
+/// the oracle; everything else joins the concrete-implementation set
+/// (html's `_CssClassSetImpl extends SetBase<String> implements
+/// CssClassSet` — `SetBase.addAll`/`removeAll` implement the
+/// `CssClassSet` interface names). Kinds mirror the SDK declarations;
+/// `SetBase` declares no setter. `(member, abstract, kind)` with kind
+/// 0 = method, 1 = setter, 2 = getter.
+const SET_BASE_FACE: &[(&str, bool, u8)] = &[
+    ("add", true, 0),
+    ("contains", true, 0),
+    ("lookup", true, 0),
+    ("remove", true, 0),
+    ("iterator", true, 2),
+    ("toSet", true, 0),
+    ("length", true, 2),
+    ("isEmpty", false, 2),
+    ("isNotEmpty", false, 2),
+    ("single", false, 2),
+    ("first", false, 2),
+    ("last", false, 2),
+    ("cast", false, 0),
+    ("followedBy", false, 0),
+    ("whereType", false, 0),
+    ("clear", false, 0),
+    ("addAll", false, 0),
+    ("removeAll", false, 0),
+    ("retainAll", false, 0),
+    ("removeWhere", false, 0),
+    ("retainWhere", false, 0),
+    ("containsAll", false, 0),
+    ("union", false, 0),
+    ("intersection", false, 0),
+    ("difference", false, 0),
+    ("toList", false, 0),
+    ("map", false, 0),
+    ("where", false, 0),
+    ("expand", false, 0),
+    ("forEach", false, 0),
+    ("reduce", false, 0),
+    ("fold", false, 0),
+    ("every", false, 0),
+    ("join", false, 0),
+    ("any", false, 0),
+    ("take", false, 0),
+    ("takeWhile", false, 0),
+    ("skip", false, 0),
+    ("skipWhile", false, 0),
+    ("firstWhere", false, 0),
+    ("lastWhere", false, 0),
+    ("singleWhere", false, 0),
+    ("elementAt", false, 0),
+];
+
 /// The outcome of the inherited-signature instantiation face: the
 /// signature carried no super-face type parameters (compare as read), the
 /// edge arguments resolved to a substitution environment (compare
@@ -376,12 +436,17 @@ impl<'a> Engine<'a> {
     /// Checks one instance-member declaration against the container's direct
     /// super-faces (upstream Dart SDK source,
     /// `pkg/analyzer/lib/src/error/inheritance_override.dart:498-546`
-    /// `_checkDeclaredMember`): for each face, the nearest same-named
-    /// non-static member; kind mismatches skip (other checks own them), and
-    /// a decidable name-level signature conflict emits `invalid_override` at
-    /// the member's name span. Every unresolvable hop, cycle, or
-    /// incomparable type suppresses — the under-report direction, never a
-    /// false positive.
+    /// `_checkDeclaredMember` / `_checkDeclaredField`): for each face, the
+    /// nearest same-named non-static member; kind mismatches skip (other
+    /// checks own them), and a decidable name-level signature conflict
+    /// emits `invalid_override` at the member's name span. A field checks
+    /// through its implicit getter and — non-final only — implicit setter
+    /// faces, so a field overriding a getter of an unfit declared type
+    /// reports exactly like the oracle (`mixin XmlHasAttributes
+    /// implements XmlAttributesBase` with a `XmlNodeList<XmlAttribute>`
+    /// field over `List<XmlAttribute> get attributes`). Every
+    /// unresolvable hop, cycle, or incomparable type suppresses — the
+    /// under-report direction, never a false positive.
     ///
     /// Runs from the parse listener, so the element model (built by the
     /// earlier `collect`) is complete and the declaration's name token
@@ -437,86 +502,137 @@ impl<'a> Engine<'a> {
         faces.extend(decl.with_clause.iter().copied());
         faces.extend(decl.implements_clause.iter().copied());
         faces.extend(decl.on_clause.iter().copied());
-        let mut broken_seen: Vec<Projected<'a, MemberEntry>> = Vec::new();
+        // The declared faces the oracle checks (upstream Dart SDK source,
+        // `pkg/analyzer/lib/src/error/inheritance_override.dart`
+        // `_checkDeclaredField` → `_checkDeclaredMember(name, field.getter)`
+        // / `(name, field.setter)`): a field rides its implicit getter and —
+        // a non-final field only — its implicit setter, each a separate
+        // executable element; every other member shape rides itself. A
+        // field's getter face compares through the `Field` entry itself
+        // (the override faces read a field's declared type exactly like a
+        // getter's return type, and the signature text renders
+        // `{ty} Function()`); its setter face is a synthesized setter entry
+        // (one required positional of the declared type) so the parameter
+        // arm compares it like any written setter.
+        let mut declared_faces: Vec<(MemberKind, Option<MemberEntry>)> = Vec::with_capacity(2);
+        if entry.kind == MemberKind::Field {
+            declared_faces.push((MemberKind::Getter, None));
+            if !entry.is_final {
+                let setter_face = MemberEntry {
+                    kind: MemberKind::Setter,
+                    formals: Some(Box::new(Formals {
+                        positional: Box::new([Formal {
+                            name: spelling,
+                            ty: entry.var_ty,
+                            required: true,
+                            covariant: false,
+                            default_value: None,
+                        }]),
+                        named: Box::new([]),
+                    })),
+                    ..entry.clone()
+                };
+                declared_faces.push((MemberKind::Setter, Some(setter_face)));
+            }
+        } else {
+            declared_faces.push((entry.kind, None));
+        }
+        // Per declared face (getter / setter): the inherited members already
+        // judged broken, keyed by pointer — one diagnostic per inherited
+        // member.
+        let mut broken_seen: Vec<(bool, *const MemberEntry)> = Vec::new();
         // The written clause facts, built on first need — an inherited
         // signature carrying free type parameters — and shared across the
         // face loop (one token walk per check).
         let mut facts: Option<FxHashMap<StringId, HeaderClause>> = None;
         for face in faces {
-            let Some((inherited, face_name, origin, chain)) =
-                self.face_member_tracked(face, spelling)
-            else {
-                // Unresolvable or cyclic face chain: suppression territory
-                // (recovery residue in a clause lands here too).
-                continue;
-            };
-            if inherited.kind != entry.kind {
-                continue;
-            }
-            // The stacked climb can surface one inherited member through
-            // several direct faces (the applied `S&M2` superclass face and
-            // the `M2` face both answer M2's member); the oracle's verdict
-            // per inherited member is one diagnostic. The boundary's memo
-            // keeps a projected entry's identity stable across faces.
-            if broken_seen
-                .iter()
-                .any(|prior| prior.ptr() == inherited.ptr())
-            {
-                continue;
-            }
-            // The super-face type-argument substitution
-            // (`Substitution.fromInterfaceType`): the inherited signature
-            // read through a generic super face carries that face's own
-            // type parameters — the oracle compares the signature
-            // instantiated by the edge's written arguments. Free
-            // parameters in the inherited signature are the M1 model's
-            // unsubstituted reads; the substitution face resolves them
-            // from the written clause arguments (exact where the chain's
-            // edges live in this file), suppresses the face where they do
-            // not (the under-report direction).
-            let substituted;
-            let inherited_ref: &MemberEntry = match self.instantiate_inherited(
-                &chain,
-                &inherited,
-                container,
-                &mut facts,
-            ) {
-                Instantiated::Unchanged => &inherited,
-                Instantiated::Applied(env) => {
-                    substituted = self.substitute_entry(&inherited, &env);
-                    &substituted
-                }
-                Instantiated::Undecidable => continue,
-            };
-            if self.override_broken(
-                entry,
-                (self.file, container),
-                inherited_ref,
-                (origin, face_name),
-            ) {
-                broken_seen.push(inherited.clone());
-                let display = self.strings.resolve(spelling);
-                let display = display.strip_suffix('=').unwrap_or(display);
-                let container_text = self.strings.resolve(container);
-                let declared_text = self.override_signature_text(entry);
-                let face_text = self.strings.resolve(face_name);
-                let inherited_text = self.override_signature_text(inherited_ref);
-                let setter = entry.kind == MemberKind::Setter;
-                let code = if setter {
-                    SemanticCode::InvalidOverrideSetter
+            for (face_kind, face_entry) in &declared_faces {
+                let setter_face = *face_kind == MemberKind::Setter;
+                // A field's setter face resolves under the setter spelling;
+                // every other face keeps the written name (a real setter
+                // declaration arrives spelled `name=` already).
+                let lookup = if face_entry.is_some() {
+                    self.setter_spelling(spelling)
                 } else {
-                    SemanticCode::InvalidOverride
+                    spelling
                 };
-                self.emit5_with_context(
-                    code,
-                    range,
-                    display,
-                    container_text,
-                    &declared_text,
-                    face_text,
-                    &inherited_text,
-                    overridden_member_context(inherited_ref, origin, setter),
-                );
+                let Some((inherited, face_name, origin, chain)) =
+                    self.face_member_tracked(face, lookup)
+                else {
+                    // Unresolvable or cyclic face chain: suppression
+                    // territory (recovery residue in a clause lands here
+                    // too).
+                    continue;
+                };
+                if inherited.kind != *face_kind {
+                    continue;
+                }
+                // The stacked climb can surface one inherited member through
+                // several direct faces (the applied `S&M2` superclass face
+                // and the `M2` face both answer M2's member); the oracle's
+                // verdict per inherited member is one diagnostic. The
+                // boundary's memo keeps a projected entry's identity stable
+                // across faces.
+                if broken_seen
+                    .iter()
+                    .any(|(tag, ptr)| *tag == setter_face && *ptr == inherited.ptr())
+                {
+                    continue;
+                }
+                // The super-face type-argument substitution
+                // (`Substitution.fromInterfaceType`): the inherited signature
+                // read through a generic super face carries that face's own
+                // type parameters — the oracle compares the signature
+                // instantiated by the edge's written arguments. Free
+                // parameters in the inherited signature are the M1 model's
+                // unsubstituted reads; the substitution face resolves them
+                // from the written clause arguments (exact where the chain's
+                // edges live in this file), suppresses the face where they do
+                // not (the under-report direction).
+                let substituted;
+                let inherited_ref: &MemberEntry = match self.instantiate_inherited(
+                    &chain,
+                    &inherited,
+                    container,
+                    &mut facts,
+                ) {
+                    Instantiated::Unchanged => &inherited,
+                    Instantiated::Applied(env) => {
+                        substituted = self.substitute_entry(&inherited, &env);
+                        &substituted
+                    }
+                    Instantiated::Undecidable => continue,
+                };
+                let declared_cmp = face_entry.as_ref().unwrap_or(entry);
+                if self.override_broken(
+                    declared_cmp,
+                    (self.file, container),
+                    inherited_ref,
+                    (origin, face_name),
+                ) {
+                    broken_seen.push((setter_face, inherited.ptr()));
+                    let display = self.strings.resolve(spelling);
+                    let display = display.strip_suffix('=').unwrap_or(display);
+                    let container_text = self.strings.resolve(container);
+                    let declared_text = self.override_signature_text(declared_cmp);
+                    let face_text = self.strings.resolve(face_name);
+                    let inherited_text = self.override_signature_text(inherited_ref);
+                    let code = if setter_face {
+                        SemanticCode::InvalidOverrideSetter
+                    } else {
+                        SemanticCode::InvalidOverride
+                    };
+                    self.emit5_with_context(
+                        code,
+                        range,
+                        display,
+                        container_text,
+                        &declared_text,
+                        face_text,
+                        &inherited_text,
+                        overridden_member_context(inherited_ref, origin, setter_face),
+                    );
+                }
             }
         }
     }
@@ -2117,19 +2233,26 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The frozen list face a names-only SDK stub cannot carry, appended to
-    /// `hits` when `face`'s spelling names `dart:collection`'s list family
-    /// ([`LIST_BASE_FACE`]; upstream Dart SDK source,
-    /// `sdk/lib/collection/list.dart` — `ListBase`/`ListMixin` and the
-    /// `List` interface they carry). The SDK projection is names-only: a
-    /// hop whose container the index cannot model — or models member-less —
-    /// contributes nothing, so a `with ListMixin<RawRow>` class looked
-    /// complete while the oracle still demanded the base's abstract
-    /// forwarding points (`setter List.length` on a class declaring the
-    /// `length` getter, `[]`, `[]=`). Every entry carries [`Ty::Unknown`]
-    /// types, so override/comparison faces over it suppress — only the
-    /// completeness enumeration reads the rows. Not a list-family spelling:
-    /// a no-op (the common case; one string compare).
+    /// The frozen collection-base faces a names-only SDK stub cannot
+    /// carry, appended to `hits` when `face`'s spelling names
+    /// `dart:collection`'s list or set family ([`LIST_BASE_FACE`] /
+    /// [`SET_BASE_FACE`]; upstream Dart SDK source,
+    /// `sdk/lib/collection/list.dart` — `ListBase`/`ListMixin` — and
+    /// `sdk/lib/collection/set.dart` — `SetBase`/`SetMixin`). The SDK
+    /// projection is names-only: a hop whose container the index cannot
+    /// model — or models member-less — contributes nothing, so a
+    /// `with ListMixin<RawRow>` class looked complete while the oracle
+    /// still demanded the base's abstract forwarding points (`setter
+    /// List.length` on a class declaring the `length` getter, `[]`,
+    /// `[]=`). Every entry carries [`Ty::Unknown`] types, so
+    /// override/comparison faces over it suppress — only the
+    /// completeness enumeration reads the rows. Not a family spelling:
+    /// a no-op (the common case; a couple string compares). The concrete
+    /// classes of the set family (`HashSet`/`LinkedHashSet`/
+    /// `SplayTreeSet`/`UnmodifiableSetView`) carry no frozen face: they
+    /// implement every member, so the only faithful rows would be
+    /// all-concrete — pure suppression the walk already models by
+    /// contributing nothing.
     fn frozen_list_face_hits(
         &self,
         face: StringId,
@@ -2138,40 +2261,74 @@ impl<'a> Engine<'a> {
         hits: &mut Vec<FaceEntry<'a>>,
     ) {
         let text = self.strings.resolve(face);
-        let applies = text == "List"
+        if text == "List"
             || COLLECTION_INTERFACE_ALIASES
                 .iter()
-                .any(|(alias, targets)| text == *alias && targets.contains(&"List"));
-        if !applies {
+                .any(|(alias, targets)| text == *alias && targets.contains(&"List"))
+        {
+            let list_name = self.intern("List");
+            for (member, r#abstract, kind) in LIST_BASE_FACE {
+                let entry = MemberEntry {
+                    kind: match kind {
+                        1 => MemberKind::Setter,
+                        2 => MemberKind::Getter,
+                        _ => MemberKind::Method,
+                    },
+                    is_static: false,
+                    is_abstract: *r#abstract,
+                    is_external: false,
+                    is_final: false,
+                    type_params: 0,
+                    type_param_names: Box::default(),
+                    var_ty: Ty::Unknown,
+                    return_ty: Ty::Unknown,
+                    formals: None,
+                    annotations: Box::default(),
+                    name_range: MemberEntry::MISSING_NAME_RANGE,
+                };
+                hits.push(FaceEntry {
+                    name: self.intern(member),
+                    entry: Projected::Foreign(std::rc::Rc::new(entry)),
+                    owner_name: list_name,
+                    owner_file,
+                    concrete_source: top_concrete,
+                });
+            }
             return;
         }
-        let list_name = self.intern("List");
-        for (member, r#abstract, kind) in LIST_BASE_FACE {
-            let entry = MemberEntry {
-                kind: match kind {
-                    1 => MemberKind::Setter,
-                    2 => MemberKind::Getter,
-                    _ => MemberKind::Method,
-                },
-                is_static: false,
-                is_abstract: *r#abstract,
-                is_external: false,
-                is_final: false,
-                type_params: 0,
-                type_param_names: Box::default(),
-                var_ty: Ty::Unknown,
-                return_ty: Ty::Unknown,
-                formals: None,
-                annotations: Box::default(),
-                name_range: MemberEntry::MISSING_NAME_RANGE,
-            };
-            hits.push(FaceEntry {
-                name: self.intern(member),
-                entry: Projected::Foreign(std::rc::Rc::new(entry)),
-                owner_name: list_name,
-                owner_file,
-                concrete_source: top_concrete,
-            });
+        // `SetMixin` is the SDK's own `typedef SetMixin<E> = SetBase<E>`
+        // (set.dart:343) — one face, and the abstract rows' owner renders
+        // as `SetBase` (the declaration home the oracle's interface map
+        // names).
+        if text == "SetBase" || text == "SetMixin" {
+            let base_name = self.intern("SetBase");
+            for (member, r#abstract, kind) in SET_BASE_FACE {
+                let entry = MemberEntry {
+                    kind: match kind {
+                        1 => MemberKind::Setter,
+                        2 => MemberKind::Getter,
+                        _ => MemberKind::Method,
+                    },
+                    is_static: false,
+                    is_abstract: *r#abstract,
+                    is_external: false,
+                    is_final: false,
+                    type_params: 0,
+                    type_param_names: Box::default(),
+                    var_ty: Ty::Unknown,
+                    return_ty: Ty::Unknown,
+                    formals: None,
+                    annotations: Box::default(),
+                    name_range: MemberEntry::MISSING_NAME_RANGE,
+                };
+                hits.push(FaceEntry {
+                    name: self.intern(member),
+                    entry: Projected::Foreign(std::rc::Rc::new(entry)),
+                    owner_name: base_name,
+                    owner_file,
+                    concrete_source: top_concrete,
+                });
+            }
         }
     }
 
@@ -4709,3 +4866,266 @@ mod function_subtype_override_tests {
         );
     }
 }
+
+/// The #2299 pins: the set-base frozen face (the html
+/// `_CssClassSetImpl extends SetBase<String> implements CssClassSet`
+/// shape — `SetBase.addAll`/`removeAll` implement the interface names)
+/// and the field-declaration override faces (a field checks through its
+/// implicit getter and — non-final only — implicit setter, the oracle's
+/// `_checkDeclaredField`).
+#[cfg(test)]
+mod field_face_and_set_base_tests {
+    use crate::collector::collect;
+    use crate::diagnose::{FileReport, StrictModes, fold_unit, merge_source_ordered};
+    use crate::library::ElementIndex;
+    use crate::model::MicroKind;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{LibraryClassModifiers, LibraryGraphBuilder, Namespaces};
+    use dartq_scanner::ScanConfig;
+    use dartq_source::{FileTable, StringTable};
+    use std::path::Path;
+
+    /// Diagnoses `source` as the sole file of a library with no imports —
+    /// the single-file rig, local to this module.
+    fn report(source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let fold = fold_unit(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        let mut report = fold.report;
+        report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+        report
+    }
+
+    fn code_names(report: &FileReport) -> Vec<&'static str> {
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
+    }
+
+    /// The html shape minus the SDK: an abstract middle class
+    /// `extends SetBase` (a dead hop whose spelling names the frozen
+    /// set face) `implements` an abstract interface and implements the
+    /// seven forwarding points itself (the `_CssClassSetImpl` posture).
+    /// The frozen face's concrete rows implement the interface's own
+    /// demands — the concrete subclass reports nothing, exactly like the
+    /// oracle against the real `dart:collection`.
+    #[test]
+    fn set_base_concrete_rows_implement_interface_names() {
+        let report = report(
+            "class V {}\n\
+             abstract class CssClassSet {\n\
+             \x20 void addAll(V v);\n\
+             \x20 void removeAll(V v);\n\
+             }\n\
+             abstract class Impl extends SetBase implements CssClassSet {\n\
+             \x20 void add(v) {}\n\
+             \x20 void contains(v) {}\n\
+             \x20 void lookup(v) {}\n\
+             \x20 void remove(v) {}\n\
+             \x20 void toSet() {}\n\
+             \x20 get iterator => 0;\n\
+             \x20 get length => 0;\n\
+             }\n\
+             class C extends Impl {}\n",
+        );
+        let names = code_names(&report);
+        assert!(
+            !names.contains(&"non_abstract_class_inherits_abstract_member"),
+            "the frozen concrete rows and Impl's own members cover the interface: {names:?}"
+        );
+    }
+
+    /// The set face's abstract forwarding points still demand: a concrete
+    /// subclass of the frozen `SetBase` face missing the seven reports
+    /// them (the face's `SetBase`-owned rows), never the concrete ones.
+    #[test]
+    fn set_base_abstract_points_still_demand() {
+        let report = report("class C extends SetBase {}\n");
+        let missing = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "non_abstract_class_inherits_abstract_member")
+            .expect("the seven forwarding points demand implementations");
+        for name in ["SetBase.add", "SetBase.contains", "SetBase.lookup", "SetBase.remove"] {
+            assert!(
+                missing.message.contains(name),
+                "the demand names {name}: {}",
+                missing.message
+            );
+        }
+        assert!(
+            missing.message.contains("and 3 more"),
+            "the seven points render at the three-plus tier: {}",
+            missing.message
+        );
+        assert!(
+            !missing.message.contains("addAll"),
+            "the concrete rows never demand: {}",
+            missing.message
+        );
+    }
+
+    /// The xml `mixin XmlHasAttributes implements XmlAttributesBase`
+    /// shape: a field whose declared type is not a subtype of the
+    /// interface getter's return type reports `invalid_override` at the
+    /// field's name, message rendered on the field's implicit getter.
+    #[test]
+    fn field_getter_face_over_interface_getter_reports() {
+        let report = report(
+            "class NodeList {}\n\
+             class TList {}\n\
+             abstract class XmlAttributesBase {\n\
+             \x20 TList get attributes => TList();\n\
+             }\n\
+             mixin XmlHasAttributes implements XmlAttributesBase {\n\
+             \x20 final NodeList attributes = NodeList();\n\
+             }\n",
+        );
+        let row = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "invalid_override")
+            .expect("the field's getter face must report");
+        assert_eq!(
+            row.message,
+            "'XmlHasAttributes.attributes' ('NodeList Function()') isn't a valid \
+             override of 'XmlAttributesBase.attributes' ('TList Function()')."
+        );
+    }
+
+    /// A field of the interface's own type stays silent — the getter face
+    /// override is valid.
+    #[test]
+    fn field_getter_face_valid_stays_silent() {
+        let report = report(
+            "class TList {}\n\
+             abstract class Base {\n\
+             \x20 TList get attributes => TList();\n\
+             }\n\
+             class C extends Base {\n\
+             \x20 final TList attributes = TList();\n\
+             }\n",
+        );
+        let names = code_names(&report);
+        assert!(
+            !names.contains(&"invalid_override"),
+            "a valid field getter face never reports: {names:?}"
+        );
+    }
+
+    /// A non-final field's implicit setter face compares like a written
+    /// setter: the declared type rides the parameter position, so an
+    /// unfit type reports the setter variant with the setter message
+    /// template.
+    #[test]
+    fn field_setter_face_over_written_setter_reports() {
+        let report = report(
+            "class TStr {}\n\
+             class Zero {}\n\
+             class A {\n\
+             \x20 set x(TStr v) {}\n\
+             }\n\
+             class C extends A {\n\
+             \x20 Zero x = Zero();\n\
+             }\n",
+        );
+        let row = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "invalid_override")
+            .expect("the field's setter face must report");
+        assert_eq!(
+            row.message,
+            "The setter 'C.x' ('void Function(Zero)') isn't a valid override of \
+             'A.x' ('void Function(TStr)')."
+        );
+    }
+
+    /// A final field has no implicit setter: the setter face never
+    /// compares, so a written super setter of an unfit type stays silent
+    /// (the oracle's `field.setter == null` early return).
+    #[test]
+    fn final_field_has_no_setter_face() {
+        let report = report(
+            "class TStr {}\n\
+             class Zero {}\n\
+             class A {\n\
+             \x20 set x(TStr v) {}\n\
+             }\n\
+             class C extends A {\n\
+             \x20 final Zero x = Zero();\n\
+             }\n",
+        );
+        let names = code_names(&report);
+        assert!(
+            names.iter().all(|n| *n != "invalid_override"),
+            "a final field carries no setter face: {names:?}"
+        );
+    }
+
+    /// The getter face against an inherited METHOD stays a kind-mismatch
+    /// skip — the member-kind verifier owns that report, this face never
+    /// manufactures it.
+    #[test]
+    fn field_getter_face_kind_mismatch_stays_silent() {
+        let report = report(
+            "class Zero {}\n\
+             class A {\n\
+             \x20 Zero x() => Zero();\n\
+             }\n\
+             class C extends A {\n\
+             \x20 final Zero x = Zero();\n\
+             }\n",
+        );
+        let names = code_names(&report);
+        assert!(
+            !names.contains(&"invalid_override"),
+            "getter-vs-method is the kind verifier's business: {names:?}"
+        );
+    }
+}
+
