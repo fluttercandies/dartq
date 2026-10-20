@@ -76,6 +76,10 @@ const FUTURE_RAW: u32 = 2;
 const FUNCTION_RAW: u32 = 3;
 const FIRST_BUILTIN_RAW: u32 = 4;
 const FIRST_CONTAINER_RAW: u32 = 100;
+/// The opaque-declaration band for resolved-but-unmodeled names
+/// ([`ResolvedTypeOps::opaque_decl`]) — disjoint from the registry's
+/// allocation range (builtins + containers grow upward from 100).
+const FIRST_OPAQUE_RAW: u32 = 0x4000_0000;
 
 /// The curated `dart:core` face — the same fixed public-declaration table
 /// [`crate::bounds`]'s snapshot carries (`int`/`double` subtype `num`,
@@ -911,6 +915,15 @@ pub struct ResolvedTypeOps<'a> {
     /// `is_always_exhaustive` per-decl verdict, stable across the
     /// corpus's switch-end probes.
     closed: RefCell<FxHashMap<TypeDeclId, bool>>,
+    /// Resolved-but-unmodeled name → its opaque declaration. The import
+    /// scopes resolve the spelling (it landed in `non_containers`), but
+    /// no element model carries its class — a `dart:` SDK class outside
+    /// the builtin table (`Uint8List`, `File`), an unanalyzed dependency.
+    /// One synthetic declaration per name, disjoint from every registered
+    /// one, so the type questions answer "unrelated" (the oracle's
+    /// resolved-class posture) instead of collapsing through `Invalid`'s
+    /// vacuous arms.
+    opaque: RefCell<FxHashMap<StringId, TypeDeclId>>,
     dynamic: TypeId,
     null: TypeId,
     void: TypeId,
@@ -929,11 +942,27 @@ impl<'a> ResolvedTypeOps<'a> {
             system: TypeSystem::new(&snapshot.table, &snapshot.hierarchy),
             name_ty: RefCell::new(Vec::new()),
             closed: RefCell::new(FxHashMap::default()),
+            opaque: RefCell::new(FxHashMap::default()),
             dynamic: table.intern(UninternedType::Dynamic, false),
             null: table.intern(UninternedType::Null, false),
             void: table.intern(UninternedType::Void, false),
             invalid: table.intern(UninternedType::Invalid, false),
         }
+    }
+
+    /// The opaque declaration of one resolved-but-unmodeled name, minted
+    /// once per name in a raw range no registered declaration can reach
+    /// (the registry's counter starts at [`FIRST_CONTAINER_RAW`] and
+    /// grows by declaration count; an analyze would need 2^30 containers
+    /// to collide).
+    fn opaque_decl(&self, name: StringId) -> TypeDeclId {
+        let mut cache = self.opaque.borrow_mut();
+        if let Some(&decl) = cache.get(&name) {
+            return decl;
+        }
+        let decl = TypeDeclId::from_raw(FIRST_OPAQUE_RAW + cache.len() as u32);
+        cache.insert(name, decl);
+        decl
     }
 
     /// Extends the `name_id → (non-null, nullable)` binding through
@@ -1254,9 +1283,32 @@ impl<'a> ResolvedTypeOps<'a> {
                     .get(&name)
                     .filter(|_| !self.snapshot.non_containers.contains(&name))
                 else {
-                    return self
-                        .builtin_spelling(lexeme, ty.nullable)
-                        .unwrap_or(self.invalid);
+                    if let Some(non_null) = self.builtin_spelling(lexeme, ty.nullable) {
+                        return non_null;
+                    }
+                    // A name the import scopes resolve but no model
+                    // carries (`non_containers` — a `dart:` SDK class
+                    // outside the builtin table, an unanalyzed
+                    // dependency): the oracle resolves it, so the
+                    // subtype questions stay live — an unrelated opaque
+                    // declaration keeps `factor` at `from` and the
+                    // promotions refused, where an `Invalid` read would
+                    // vacuously dead the else branch of every
+                    // `x is Uint8List`-shaped test (subtype.dart's 0c
+                    // arm answers `InvalidType` both ways). A name
+                    // outside `non_containers` too resolves nowhere —
+                    // that IS the oracle's `InvalidType`.
+                    if self.snapshot.non_containers.contains(&name) {
+                        let decl = self.opaque_decl(name);
+                        return self.snapshot.table.intern(
+                            UninternedType::Interface {
+                                decl,
+                                args: Vec::new(),
+                            },
+                            ty.nullable,
+                        );
+                    }
+                    return self.invalid;
                 };
                 let Some(mapped_args) = self.map_args(args, arena, names, decl) else {
                     return self.invalid;
@@ -1436,8 +1488,11 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// `InvalidType <: X` vacuously true, so `factor(T, InvalidType)` is
     /// `Never` and the `x is Missing` else branch deads exactly as the
     /// analyzer reports it (the broken-import corpus's dominant
-    /// dead_code root); a name the registry misses IS the oracle's
-    /// `InvalidType`, not an unanswerable question.
+    /// dead_code root); a name the registry misses AND the import scopes
+    /// cannot resolve IS the oracle's `InvalidType` — a name the scopes
+    /// do resolve (`non_containers`) maps opaque instead
+    /// ([`ResolvedTypeOps::opaque_decl`]), keeping the remainder live
+    /// like the oracle's resolved class.
     fn factor_typed(
         &self,
         from: FlowTy,
@@ -1693,6 +1748,206 @@ mod tests {
         assert!(
             codes.contains(&"body_might_complete_normally"),
             "open switch should keep reporting: {codes:?}"
+        );
+    }
+
+    /// The archive-corpus DEAD_CODE cascade pins (2026-10-19). A name the
+    /// import scopes resolve but no element model carries (a `dart:` SDK
+    /// class outside the builtin table) maps to an unrelated opaque
+    /// declaration, so an `is`-test against it keeps both branches live —
+    /// where the registry-miss `Invalid` read answered every subtype
+    /// question vacuously (subtype.dart's 0c arm) and deaded the else.
+    ///
+    /// The harness names the class in an imported library whose file
+    /// carries no element model — the exact `non_containers` face the
+    /// synthetic `dart:` nodes produce in the real pipeline.
+    #[test]
+    fn resolved_but_unmodeled_is_test_keeps_both_branches_live() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let main_file = files.intern(Path::new("main.dart"));
+        let other_file = files.intern(Path::new("other.dart"));
+        let main_source = "int f(int x) => x is Widget ? 1 : 2;";
+        let scanned = dartq_scanner::scan(
+            main_source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            main_file,
+        );
+        assert!(scanned.diagnostics.is_empty());
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let main_elements = collect(main_source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib_other = builder.intern("package:t/other.dart");
+        let lib_main = builder.intern("package:t/main.dart");
+        builder.unit(lib_other, other_file);
+        builder.unit(lib_main, main_file);
+        let mut index = ElementIndex::default();
+        index.insert(main_file, main_elements.clone());
+        // `Widget` resolves through the import scope, but `other_file`
+        // carries no element model — the sweep files the name under
+        // `non_containers`.
+        builder.declare(lib_other, strings.intern("Widget"), other_file);
+        for (name, decl) in main_elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_main, name, main_file);
+        }
+        builder.import(
+            lib_main,
+            ImportEdge {
+                target: Some(lib_other),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib_main);
+        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let fold = fold_unit_with_ops(
+            main_source,
+            &scanned.tokens,
+            features,
+            &strings,
+            main_file,
+            lib_main,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+            Some(&ops),
+        );
+        let codes: Vec<&'static str> = fold
+            .report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect();
+        assert!(
+            !codes.contains(&"dead_code"),
+            "an unmodeled-but-resolved is-test keeps the else live: {codes:?}"
+        );
+    }
+
+    /// The cascade's `else if` face: after a negative `is Shape`
+    /// refinement, `is Circle` over the same receiver kept deading the
+    /// whole else-if clause. Both tests map opaque now, so neither branch
+    /// collapses — the same model-less-import rig as the pin above, with
+    /// both names declared in it.
+    #[test]
+    fn resolved_but_unmodeled_else_if_chain_keeps_the_second_clause() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let main_file = files.intern(Path::new("main.dart"));
+        let other_file = files.intern(Path::new("other.dart"));
+        let main_source = "int g(e) { \
+               if (e is Shape) { return 1; } else if (e is Circle) { return 2; } \
+               return 0; \
+             }";
+        let scanned = dartq_scanner::scan(
+            main_source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            main_file,
+        );
+        assert!(scanned.diagnostics.is_empty());
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let main_elements = collect(main_source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib_other = builder.intern("package:t/other.dart");
+        let lib_main = builder.intern("package:t/main.dart");
+        builder.unit(lib_other, other_file);
+        builder.unit(lib_main, main_file);
+        let mut index = ElementIndex::default();
+        index.insert(main_file, main_elements.clone());
+        // `Shape`/`Circle` resolve through the import scope, but
+        // `other_file` carries no element model — the sweep files both
+        // names under `non_containers`.
+        builder.declare(lib_other, strings.intern("Shape"), other_file);
+        builder.declare(lib_other, strings.intern("Circle"), other_file);
+        for (name, decl) in main_elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_main, name, main_file);
+        }
+        builder.import(
+            lib_main,
+            ImportEdge {
+                target: Some(lib_other),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib_main);
+        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let fold = fold_unit_with_ops(
+            main_source,
+            &scanned.tokens,
+            features,
+            &strings,
+            main_file,
+            lib_main,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+            Some(&ops),
+        );
+        let codes: Vec<&'static str> = fold
+            .report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect();
+        assert!(
+            !codes.contains(&"dead_code"),
+            "the else-if chain stays live over unmodeled tests: {codes:?}"
+        );
+    }
+
+    /// The cascade's `??`-chain face: `a ?? b` with a nullable right side
+    /// types nullable, so the next arm stays live (`int? ?? int?` is
+    /// `int?`, and `6` runs whenever both operands are null).
+    #[test]
+    fn ifnull_chain_with_nullable_right_keeps_the_next_arm() {
+        let codes = diagnose_codes("int h(int? a, int? b) => a ?? b ?? 6;", |_| None);
+        assert!(
+            !codes.contains(&"dead_code"),
+            "a nullable ??-chain keeps its last arm: {codes:?}"
+        );
+    }
+
+    /// The cascade's dead-null-chain face: a variable written inside an
+    /// if's then branch is possibly-assigned after the join, so the
+    /// definite-unassignment gate (the fact's `definitely_unassigned` bit)
+    /// keeps the `?.` chain's dead row silent.
+    #[test]
+    fn if_then_write_keeps_the_null_aware_chain_live() {
+        let codes = diagnose_codes(
+            "class L {} L? mk() => null; \
+             int f(bool c) { L? v; if (c) { v = mk(); } return v?.hashCode ?? 0; }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"dead_code"),
+            "a possibly-assigned local's ?. chain stays live: {codes:?}"
         );
     }
 

@@ -1102,8 +1102,18 @@ impl<'a> TypeSystem<'a> {
 
     /// Pushes the instantiated supertypes of `d0` — the walk's starting
     /// frontier, in declaration order (subtype.dart:211-214).
+    ///
+    /// A declaration outside the snapshot's hierarchy (the semantic
+    /// layer's resolved-but-unmodeled face: an opaque stand-in for a name
+    /// the import scopes resolve but no element model carries) carries no
+    /// known supertype edges, so it seeds nothing: every concrete `d1`
+    /// then answers `false` (unrelated), while the rule-1/4 top faces and
+    /// `interface_subtype`'s `d0 == d1` reflexivity still answer ahead of
+    /// the walk.
     fn seed_frontier(&self, d0: TypeDeclId, a0: PoolRange, frontier: &mut Vec<TypeId>) {
-        let info = self.hierarchy.decl(d0).expect("declared owner");
+        let Some(info) = self.hierarchy.decl(d0) else {
+            return;
+        };
         for &edge in &info.supertypes {
             frontier.push(self.instantiate(edge, info, a0));
         }
@@ -1346,6 +1356,22 @@ mod tests {
             )
         };
         assert_eq!(forced, (true, false));
+    }
+
+    /// The unregistered-declaration face: a declaration the hierarchy
+    /// snapshot does not carry (the semantic layer's resolved-but-unmodeled
+    /// opaque stand-in) subtypes as unrelated instead of panicking on the
+    /// walk's seed — neither direction holds against a registered class,
+    /// while the top face still answers ahead of the walk.
+    #[test]
+    fn unregistered_declaration_subtypes_as_unrelated() {
+        let (table, hierarchy) = fixture();
+        let sys = TypeSystem::new(&table, &hierarchy);
+        let opaque = itf(&table, TypeDeclId::from_raw(0x4000_0000), &[]);
+        let int = itf(&table, INT, &[]);
+        assert!(!sys.is_subtype(opaque, int));
+        assert!(!sys.is_subtype(int, opaque));
+        assert!(sys.is_subtype(opaque, itf(&table, OBJECT, &[])));
     }
 
     /// Deep rule-12 re-entry: `List<List<int>> <: Iterable<Iterable<num>>`

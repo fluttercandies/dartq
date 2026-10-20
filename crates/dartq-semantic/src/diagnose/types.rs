@@ -3320,28 +3320,45 @@ pub(crate) struct StagedNonPromotion {
     pub(crate) reasons: Vec<NonPromotionReason>,
 }
 
-/// The `UnassignedRead` fact spans (#746), kept offset-sorted: the
-/// definite-unassignment face the `cast_from_nullable_always_fails` join
-/// consumes.
+/// The `UnassignedRead` fact rows (#746), kept offset-sorted: the
+/// definite-unassignment faces (`cast_from_nullable_always_fails`, the
+/// dead-null-chain face) consume them. The flow fact unions two official
+/// gates under one row —
+/// `isDefinitelyUnassigned` (the `unassigned` bit) and the non-late
+/// reads' `!isAssigned` (the potentially-unassigned join face) — so each
+/// row carries its `definitely_unassigned` bit and the consumers split
+/// by it: a variable assigned on one branch of an `if` is *possibly*
+/// unassigned (the wide row fires) but not *definitely* unassigned, and
+/// the official definite-unassignment faces (`cast_from_nullable_always_fails`,
+/// `_verifyUnassignedVariable`'s dead chain) must not fire on it.
 #[derive(Default)]
 pub(crate) struct UnassignedStaging {
-    pub(crate) rows: Vec<SourceRange>,
+    /// `(span, definitely_unassigned)`, offset-sorted.
+    pub(crate) rows: Vec<(SourceRange, bool)>,
 }
 
 impl UnassignedStaging {
-    /// Stages one unassigned-read span. One read event fires one fact, so
-    /// the repeat insert is a no-op.
-    pub(crate) fn stage(&mut self, range: SourceRange) {
-        if let Err(index) = self.rows.binary_search_by(|r| r.offset.cmp(&range.offset)) {
-            self.rows.insert(index, range);
+    /// Stages one unassigned-read span with its definite-unassignment
+    /// bit. One read event fires one fact, so the repeat insert is a
+    /// no-op; a diverging repeat (a loop body walked under two states)
+    /// keeps the first row.
+    pub(crate) fn stage(&mut self, range: SourceRange, definitely_unassigned: bool) {
+        if let Err(index) = self
+            .rows
+            .binary_search_by(|r| r.0.offset.cmp(&range.offset))
+        {
+            self.rows.insert(index, (range, definitely_unassigned));
         }
     }
 
-    /// Whether the read at exactly `range` is definitely unassigned.
+    /// Whether the read at exactly `range` stood definitely unassigned —
+    /// the official `isDefinitelyUnassigned` gate both consumer faces
+    /// pin. A merely possibly-unassigned read (the wide row) answers
+    /// `false`.
     pub(crate) fn staged(&self, range: SourceRange) -> bool {
         self.rows
-            .binary_search_by(|r| r.offset.cmp(&range.offset))
-            .is_ok_and(|index| self.rows[index] == range)
+            .binary_search_by(|r| r.0.offset.cmp(&range.offset))
+            .is_ok_and(|index| self.rows[index].0 == range && self.rows[index].1)
     }
 }
 

@@ -371,6 +371,45 @@ impl<'a> Engine<'a> {
                             .insert(index, (member_offset, recv_span));
                     }
                 }
+                // The chained-read candidate (#2283): a member folded over a
+                // promotion-latched member receiver freezes its receiver
+                // classification from the UNPROMOTED result face (`a.value`
+                // over an `a is Sub` promotion types `.isNaN` on the
+                // declared getter's `Object`, never the promoted field's
+                // `double` — pass 1 cannot see the flow promotion), so this
+                // row's pass-2 verdict owes the same re-derivation its
+                // receiver got. Cascade sections take no latch: their
+                // receiver re-classifies to the latched cascade target
+                // (S4-B), a face no chain link describes. The zero-length
+                // span marks the chained form — read-type lookups compare
+                // the full range and never hit it, so pass 2 keeps the
+                // frozen row byte for byte — while its offset keys the
+                // receiver read's own entry for the teardown settlement
+                // (`finalize_redirects`' tail).
+                if matches!(popped_shape, RowShape::Member { .. })
+                    && !self.in_cascade
+                    && self
+                        .promoted_recv_reads
+                        .binary_search_by(|(row, _)| row.cmp(&popped.range.offset))
+                        .is_ok()
+                {
+                    let member_offset = member.range.offset;
+                    if let Err(index) = self
+                        .promoted_recv_reads
+                        .binary_search_by(|(row, _)| row.cmp(&member_offset))
+                    {
+                        self.promoted_recv_reads.insert(
+                            index,
+                            (
+                                member_offset,
+                                SourceRange {
+                                    offset: popped.range.offset,
+                                    length: 0,
+                                },
+                            ),
+                        );
+                    }
+                }
                 let deferred_receiver = match &popped_shape {
                     RowShape::Bare(BareInfo::Missing { .. }) => {
                         !self.members.primitive_ids.contains(&popped.name)
@@ -877,6 +916,141 @@ impl<'a> Engine<'a> {
         open + 1 // unterminated: keep the open paren covered
     }
 
+    /// The chained-read settlement (#2283): re-derives each latched member
+    /// read's result face from its receiver's promoted face and re-decides
+    /// the row's pass-2 member trio on it. A chain head's face is the flow
+    /// read type at the receiver's span (the #1465 promoted receiver); a
+    /// chained link's face is the link below it's settled result — the
+    /// oracle's member re-binding (`a is Sub` promotes `a`, so `a.value`
+    /// resolves on `Sub` and its RESULT type is `Sub`'s own `value` member,
+    /// whose face every later chain node reads). Reads walk in source
+    /// order, so each link consumes only earlier entries' faces and
+    /// arbitrary depth settles in one pass.
+    fn settle_promoted_chains(&mut self) {
+        if self.promoted_recv_reads.is_empty() {
+            return;
+        }
+        let latches = self.promoted_recv_reads.clone();
+        let reads = self.member_reads.clone();
+        let mut derived: FxHashMap<u32, Ty> = FxHashMap::default();
+        for read in &reads {
+            let Ok(index) = latches
+                .binary_search_by(|(member, _)| member.cmp(&read.offset))
+            else {
+                continue;
+            };
+            let span = latches[index].1;
+            // The head-linked latch (#1465) carries the receiver read's own
+            // span; the chained latch's zero-length span keys the receiver
+            // read's entry instead (its face is the chain's settled
+            // result). A face the walk cannot name (`dynamic`, unknown)
+            // keeps the frozen row — the under-report posture.
+            let face = if span.length == 0 {
+                derived.get(&span.offset).copied()
+            } else {
+                self.read_type_at(span)
+            };
+            let Some(face @ Ty::Named { name, .. }) = face else {
+                continue;
+            };
+            // The chained link re-decides whether or not the settled face
+            // declares the member — a miss is exactly the re-render face
+            // (the row keeps reporting, now naming the settled face). Only
+            // the result-type derivation below needs the `Found` arm.
+            if span.length == 0 {
+                self.settle_chain_row(read, name, face);
+            }
+            let Walk::Found(entry) = self.walk_members(name, read.name) else {
+                continue;
+            };
+            let result = match entry.kind {
+                MemberKind::Field => self.fold_alias_ty(entry.var_ty),
+                _ => self.fold_alias_ty(entry.return_ty),
+            };
+            derived.insert(read.offset, result);
+        }
+    }
+
+    /// One chained row's verdict re-decision: pass 2 judged the row on the
+    /// frozen unpromoted result face, so its member-trio emission re-decides
+    /// against the settled face — a member the face declares retracts (the
+    /// oracle resolves it there and stays silent), a still-missing member
+    /// reports against the settled face's display (the oracle's re-bound
+    /// receiver names `double`, never the frozen `Object`). The verdict
+    /// mirrors the pass-2 member trio's own shape: the indexed walk decides,
+    /// Object's universal face spares, and a root chain-break (the
+    /// primitive/external head — `double`, `List`) falls to the frozen
+    /// member tables ([`Engine::frozen_member_verdict`], the trio's
+    /// `ChainBroken` consult) — `double.isNaN` retracts through the frozen
+    /// `double` row, `double.missing` re-renders through its `Absent`.
+    fn settle_chain_row(&mut self, read: &MemberRead, face_head: StringId, face: Ty) {
+        let plain_walk = self.walk_members(face_head, read.name);
+        let setter_name = self.setter_spelling(read.name);
+        let setter_walk = self.walk_members(face_head, setter_name);
+        // The frozen-table verdict behind a root chain-break (`Walk::
+        // ChainBroken` — an unindexed head the element model cannot carry):
+        // `Defined` retracts, `Absent`/`Unknown` keep the row. An indexed
+        // head's walk (`Found`/`Missing`) decided already.
+        let frozen_defined = |engine: &Self, name: StringId| {
+            matches!(engine.walk_members(face_head, name), Walk::ChainBroken)
+                && matches!(
+                    engine.frozen_member_verdict(face_head, name),
+                    super::row_resolution::FrozenFace::Defined
+                )
+        };
+        let object_face =
+            read.name == self.intern("==") || self.members.object_members.contains(&read.name);
+        let mut index = 0;
+        while index < self.report.diagnostics.len() {
+            let diagnostic = &self.report.diagnostics[index];
+            if diagnostic.range.offset != read.offset {
+                index += 1;
+                continue;
+            }
+            let (code, exists) = match diagnostic.code.name {
+                "undefined_getter" => (
+                    SemanticCode::UndefinedGetter,
+                    matches!(&plain_walk, Walk::Found(entry) if matches!(entry.kind, MemberKind::Field | MemberKind::Getter))
+                        || object_face
+                        || frozen_defined(self, read.name),
+                ),
+                "undefined_method" => (
+                    SemanticCode::UndefinedMethod,
+                    matches!(&plain_walk, Walk::Found(entry) if entry.kind == MemberKind::Method)
+                        || object_face
+                        || frozen_defined(self, read.name),
+                ),
+                "undefined_setter" => (
+                    SemanticCode::UndefinedSetter,
+                    matches!(&setter_walk, Walk::Found(entry) if entry.kind == MemberKind::Setter)
+                        || matches!(&plain_walk, Walk::Found(entry) if entry.kind == MemberKind::Field && !entry.is_final)
+                        || object_face
+                        || frozen_defined(self, read.name)
+                        || frozen_defined(self, setter_name),
+                ),
+                _ => {
+                    index += 1;
+                    continue;
+                }
+            };
+            if exists {
+                self.report.diagnostics.remove(index);
+            } else {
+                let name_text = self.strings.resolve(read.name).to_string();
+                let face_text = self.render_ty(face);
+                self.report.diagnostics[index] = Diagnostic::new(
+                    code.severity(),
+                    code.code_info(),
+                    code.message(&name_text, &face_text),
+                    self.file,
+                    diagnostic.range,
+                    None,
+                );
+                index += 1;
+            }
+        }
+    }
+
     /// F-C: the `recursive_constructor_redirect` walk — a redirecting
     /// constructor whose invocation chain returns to itself reports at the
     /// invocation (`_checkForRecursiveConstructorRedirect`'s
@@ -892,7 +1066,13 @@ impl<'a> Engine<'a> {
     /// (`factory W.n()` declared after its `W() : this.n()` user) judges
     /// exactly (`_checkForConflictingInitializerErrorCodes` /
     /// `_checkForRedirectingConstructorErrorCodes` run on settled elements).
+    ///
+    /// This teardown hook also settles the promotion-refined chained reads
+    /// (#2283) — the module's only post-resolve seam: pass 2 has already
+    /// emitted the chained rows against their frozen unpromoted receiver
+    /// faces, and the settlement re-decides them below.
     pub(crate) fn finalize_redirects(&mut self) {
+        self.settle_promoted_chains();
         let edges = std::mem::take(&mut self.redirect_edges);
         for edge in &edges {
             // The generative target's face
@@ -5443,6 +5623,116 @@ mod tests {
             code_names(&report).contains(&"invalid_reference_to_this"),
             "{:?}",
             code_names(&report)
+        );
+    }
+
+    // —— #2283: promotion-refined chained reads ——————————————————————————
+
+    /// The shared fixture, in same-file types (the no-import rig resolves
+    /// no external names, so the oracle's `double`/`Object` pair maps to
+    /// `Refined`/`Frozen`): the declared face's accessor answers `Frozen`,
+    /// the promoted face's field narrows it to `Refined` (a subtype, so
+    /// the override is sound).
+    const PROMOTED_CHAIN: &str = "class Frozen {} \
+       class Refined extends Frozen { Flag get isNaN => Flag(); } \
+       class Flag {} \
+       class Base { Frozen get value => Frozen(); } \
+       class Sub extends Base { \
+         Sub(this.value); \
+         @override final Refined value; \
+       } \
+       void chain(Base a) { \
+         if (a is Sub) {";
+
+    /// The xml `general.dart` family: `a.value.isNaN` over an `a is Sub`
+    /// promotion resolves `value` on the promoted face, whose field type
+    /// declares `isNaN` — the oracle stays silent, and the settlement
+    /// retracts the frozen `Frozen`-faced trio.
+    #[test]
+    fn promoted_chain_read_resolves_on_the_promoted_result_face() {
+        let report = report(&format!(
+            "{} \
+             a.value.isNaN; \
+             }}",
+            PROMOTED_CHAIN
+        ));
+        let undefined: Vec<_> = code_names(&report)
+            .into_iter()
+            .filter(|name| name.starts_with("undefined_"))
+            .collect();
+        assert!(undefined.is_empty(), "{undefined:?}");
+    }
+
+    /// The getter-face variant (`value` stays a getter on the promoted
+    /// subclass, returning the narrowed type): the settlement walks the
+    /// promoted face's accessor the same way.
+    #[test]
+    fn promoted_chain_getter_override_resolves_on_the_promoted_face() {
+        let report = report(
+            "class Frozen {} \
+             class Refined extends Frozen { Flag get isNaN => Flag(); } \
+             class Flag {} \
+             class Base { Frozen get value => Frozen(); } \
+             class Sub extends Base { \
+               @override Refined get value => Refined(); \
+             } \
+             void chain(Base a) { \
+               if (a is Sub) { a.value.isNaN; } \
+             }",
+        );
+        let undefined: Vec<_> = code_names(&report)
+            .into_iter()
+            .filter(|name| name.starts_with("undefined_"))
+            .collect();
+        assert!(undefined.is_empty(), "{undefined:?}");
+    }
+
+    /// The settlement re-binds, not silences: a member the promoted result
+    /// face also lacks still reports — naming the promoted face's display
+    /// (`Refined`), never the frozen `Frozen`.
+    #[test]
+    fn promoted_chain_miss_names_the_settled_face() {
+        let report = report(&format!(
+            "{} \
+             a.value.missing; \
+             }}",
+            PROMOTED_CHAIN
+        ));
+        let rows: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "undefined_getter")
+            .map(|d| d.message.to_string())
+            .collect();
+        assert_eq!(rows.len(), 1, "{:?}", code_names(&report));
+        assert!(
+            rows[0].contains("for the type 'Refined'"),
+            "{rows:?}"
+        );
+    }
+
+    /// Without a promotion the frozen face stands: the chain miss names
+    /// the declared accessor's `Frozen` exactly as before — the settlement
+    /// is the promotion's consequence, not a blanket re-render.
+    #[test]
+    fn unpromoted_chain_miss_keeps_the_declared_face() {
+        let report = report(
+            "class Frozen {} \
+             class Base { Frozen get value => Frozen(); } \
+             void chain(Base a) { \
+               a.value.missing; \
+             }",
+        );
+        let rows: Vec<_> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "undefined_getter")
+            .map(|d| d.message.to_string())
+            .collect();
+        assert_eq!(rows.len(), 1, "{:?}", code_names(&report));
+        assert!(
+            rows[0].contains("for the type 'Frozen'"),
+            "{rows:?}"
         );
     }
 }
