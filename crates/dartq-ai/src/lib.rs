@@ -8,6 +8,9 @@
 //! * [`explain`] — the explain query: the one-stop symbol
 //!   report (declaration, supertypes, members, references, the declaring
 //!   library's importers, and its tests) over borrowed index faces.
+//! * [`diagnostic_explain`] — the `explain --diagnostic` report: a single
+//!   diagnostic's echo, registry facts, fix rows, same-code neighbours,
+//!   and docs URL over borrowed faces.
 //! * [`impact`] — the impact query: the changed symbols with
 //!   their signature verdicts, the reverse-dependency closure tagged
 //!   content-only vs semantic, the test-graph join, and the environment
@@ -17,6 +20,7 @@
 //!   and the T8 explain stage).
 
 pub mod compatibility;
+pub mod diagnostic_explain;
 pub mod explain;
 pub mod impact;
 pub mod rev_import_graph;

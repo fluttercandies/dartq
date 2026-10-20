@@ -31,10 +31,12 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use dartq_ai::diagnostic_explain::{self as diquery};
 use dartq_ai::explain::{self as query, ConstructorFact, SymbolDeclHit};
 use dartq_ai::rev_import_graph::RevImportGraph;
+use dartq_diagnostics::{Diagnostic, FileLayoutProvider};
 use dartq_engine::Engine;
 use dartq_index::{RefRow, SuperClause, TargetRef};
 use dartq_source::{FileId, StringId};
@@ -42,7 +44,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::Verbosity;
-use crate::analyze::{AnalyzeError, prelude};
+use crate::analyze::{AnalyzeError, prelude, run_overlaid};
+use crate::fix_table::{FixAction, spec_for};
 use crate::impact::impact_substrate;
 use crate::workspace::{WorkspaceError, engine_config};
 
@@ -61,6 +64,11 @@ pub enum ExplainError {
     /// (a producer bug — internal tier, never a usage error).
     #[error("{0}")]
     Analyze(#[from] AnalyzeError),
+    /// The `code`/`file`/`line:col` selection matched no emitted row — the
+    /// usage-tier refusal (`dartq explain --diagnostic` explains a hit the
+    /// run actually carries).
+    #[error("no diagnostic '{0}' in this run")]
+    NoSuchDiagnostic(String),
 }
 
 /// Runs the explain face over the workspace at `dir`: assemble the engine,
@@ -258,6 +266,272 @@ fn explain_answer(
     Ok(value)
 }
 
+/// The `--file` argument's position clause: `PATH[:LINE[:COL]]` — the
+/// 1-based line and UTF-16 column of the diagnostic convention. A bare
+/// `PATH` selects the file's first row of the code. `path` resolves
+/// against the working directory and canonicalizes inside
+/// [`explain_diagnostic`] before it meets the interned paths.
+#[derive(Debug, Clone)]
+pub struct FileSelector {
+    /// The hit file (canonicalized by the caller before resolution).
+    pub path: PathBuf,
+    /// The 1-based line, when spelled.
+    pub line: Option<u32>,
+    /// The 1-based column, when spelled.
+    pub column: Option<u32>,
+}
+
+/// Runs the `explain --diagnostic` face over the workspace at `dir`: the
+/// full analyze pipeline (engine rows + the lint stage + the options and
+/// provenance rows — the same `dart analyze` set the face echoes), then
+/// the one diagnostic selected by `code`/`file` assembled into the
+/// schema-valid report.
+///
+/// `file` narrows the selection to a row in that file; its `:line[:col]`
+/// narrows to the row covering that position. Absent `file` the run's
+/// first `code` row answers (the oracle-order head).
+///
+/// # Errors
+///
+/// [`ExplainError::Workspace`]/[`ExplainError::Engine`]/[`ExplainError::Analyze`]
+/// on assembly, engine-bind, discovery, or cancellation failure — the same
+/// tiers as the symbol face. A `code`/`file`/`line:col` the run carries no
+/// row for answers [`ExplainError::NoSuchDiagnostic`] (the CLI's usage
+/// tier).
+pub fn explain_diagnostic(
+    dir: &Path,
+    sdk: Option<&Path>,
+    code: &str,
+    file: Option<FileSelector>,
+    verbosity: Verbosity,
+) -> Result<Value, ExplainError> {
+    let (config, dir) = engine_config(dir, sdk)?;
+    let mut engine =
+        Engine::new(config).map_err(|error| ExplainError::Engine(error.to_string()))?;
+    // The diagnostics face runs the full pipeline — the lint stage and the
+    // options/provenance rows included (prelude alone would emit no rows).
+    let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&dir))?;
+    // The selector's path resolves against the workspace dir and
+    // canonicalizes into the engine's spelling universe before the row
+    // comparison — the file table's interned paths are canonical.
+    let file = file
+        .map(|selector| {
+            let base = if selector.path.is_absolute() {
+                selector.path.clone()
+            } else {
+                dir.join(&selector.path)
+            };
+            base.canonicalize().map(|path| FileSelector {
+                path,
+                line: selector.line,
+                column: selector.column,
+            })
+        })
+        .transpose()
+        .map_err(|error| {
+            ExplainError::Analyze(AnalyzeError::Discovery(io::Error::other(format!(
+                "--file path is unusable: {error}"
+            ))))
+        })?;
+    explain_diagnostic_answer(&run, code, file.as_ref(), verbosity)
+}
+
+/// The report over an already-run analyze pass — the assembly the
+/// engine-carrying callers (the daemon session) hit the same way.
+fn explain_diagnostic_answer(
+    run: &crate::analyze::AnalyzeRun<'_>,
+    code: &str,
+    file: Option<&FileSelector>,
+    verbosity: Verbosity,
+) -> Result<Value, ExplainError> {
+    // The selection scans once: the first row matching the file filter is
+    // the candidate, narrowed to the position-filtered row when a line/col
+    // selector rides along.
+    let selected: Option<&Diagnostic> = match file {
+        None => run.diagnostics.iter().find(|d| d.code.name == code),
+        Some(sel) => {
+            let layout = &run.layout;
+            let file_hit = |d: &Diagnostic| {
+                layout
+                    .engine()
+                    .file_table()
+                    .path(d.file)
+                    .is_some_and(|path| path == sel.path)
+            };
+            match (sel.line, sel.column) {
+                (Some(line), Some(column)) => run.diagnostics.iter().find(|d| {
+                    d.code.name == code
+                        && file_hit(d)
+                        && covers(layout, d, line, column)
+                }),
+                (Some(line), None) => run
+                    .diagnostics
+                    .iter()
+                    .find(|d| d.code.name == code && file_hit(d) && {
+                        let (hit_line, _) = layout.line_col(d.file, d.range.offset);
+                        hit_line == line
+                    }),
+                _ => run
+                    .diagnostics
+                    .iter()
+                    .find(|d| d.code.name == code && file_hit(d)),
+            }
+        }
+    };
+    let Some(hit) = selected else {
+        return Err(ExplainError::NoSuchDiagnostic(code.to_owned()));
+    };
+    let layout = &run.layout;
+    let code_info = hit.code;
+    let file_path = layout.file_path(hit.file).display().to_string();
+    let related_lines: Vec<u32> = run
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            d.code.name == code && d.file == hit.file && !std::ptr::eq(*d, hit)
+        })
+        .map(|d| layout.line_col(d.file, d.range.offset).0)
+        .collect();
+    let total: u32 = run
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == code)
+        .count() as u32;
+
+    // The registry faces: the type column is the code family; a lint code
+    // resolves to its rule-registry line (the `package:lints` group plus
+    // the removed/deprecated markers); the fix registry rows render under
+    // their action-kind id and provenance tag.
+    let rule = lint_rule_fact(code_info.name);
+    let why = diquery::WhyFace {
+        code_family: code_info.dtype.as_str().to_owned(),
+        rule,
+    };
+    let fixes: Vec<diquery::FixRow> = spec_for(code_info.name)
+        .map(|spec| {
+            vec![diquery::FixRow {
+                id: fix_action_id(&spec.action).to_owned(),
+                source: match spec.source {
+                    crate::fix_table::FixSource::Lint => "builtin-lint",
+                    crate::fix_table::FixSource::Semantic => "builtin-semantic",
+                    crate::fix_table::FixSource::Parser => "builtin-parser",
+                }
+                .to_owned(),
+                summary: fix_action_summary(&spec.action).to_owned(),
+            }]
+        })
+        .unwrap_or_default();
+    let documentation = code_info
+        .has_published_docs
+        .then(|| format!("https://dart.dev/diagnostics/{}", code_info.name));
+    let report = diquery::explain_diagnostic(
+        diquery::DiagnosticEcho {
+            code: code_info.name.to_owned(),
+            severity: hit.severity.as_machine_str().to_owned(),
+            message: hit.message.to_string(),
+            file: file_path,
+            range: [hit.range.offset, hit.range.offset + hit.range.length],
+        },
+        why,
+        fixes,
+        total,
+        related_lines,
+        documentation,
+        verbosity.into(),
+    );
+    let value = serde_json::to_value(&report).expect("explain report serializes");
+    let json = serde_json::to_string(&value).expect("explain report serializes");
+    let tier = match verbosity {
+        Verbosity::Minimal => dartq_schema::Verbosity::Minimal,
+        Verbosity::Compact => dartq_schema::Verbosity::Compact,
+        Verbosity::Full => dartq_schema::Verbosity::Full,
+    };
+    dartq_schema::validate_at_tier(&json, dartq_schema::Domain::DiagnosticExplain, tier)
+        .map_err(|violation| {
+            ExplainError::Analyze(AnalyzeError::Discovery(io::Error::other(format!(
+                "explain report violates the published schema: {violation}"
+            ))))
+        })?;
+    Ok(value)
+}
+
+/// Whether the row's span covers the 1-based `(line, column)` position —
+/// the position sits inside `[offset, offset + length)` in the row's file.
+fn covers(
+    layout: &crate::layout::EngineLayout<'_>,
+    d: &Diagnostic,
+    line: u32,
+    column: u32,
+) -> bool {
+    let (start_line, start_col) = layout.line_col(d.file, d.range.offset);
+    let (end_line, end_col) = layout.line_col(d.file, d.range.offset + d.range.length);
+    (line, column) >= (start_line, start_col) && (line, column) <= (end_line, end_col)
+}
+
+/// The lint-registry line a `LINT` code resolves to: `name`/`group` always,
+/// the removed/deprecated markers when the pinned tables record them.
+/// Returns `None` for non-lint codes.
+fn lint_rule_fact(code: &str) -> Option<diquery::RuleFact> {
+    let id = dartq_lints::rule_by_name(code)?;
+    let spec = dartq_lints::rules()[id.0 as usize];
+    Some(diquery::RuleFact {
+        name: spec.name.to_owned(),
+        group: match spec.group {
+            dartq_lints::Group::Core => "core",
+            dartq_lints::Group::Recommended => "recommended",
+            dartq_lints::Group::Diagnostic => "diagnostic",
+            dartq_lints::Group::Removed => "removed",
+            dartq_lints::Group::Standalone => "standalone",
+        }
+        .to_owned(),
+        removed_since: crate::rule_states::removed_since(code)
+            .flatten()
+            .map(str::to_owned),
+        deprecated_since: crate::rule_states::deprecated_since(code).map(str::to_owned),
+    })
+}
+
+/// The fix family's stable id — the action-kind spelling.
+fn fix_action_id(action: &FixAction) -> &'static str {
+    match action {
+        FixAction::DropLexeme(_) => "drop-lexeme",
+        FixAction::RemoveLexeme(_) => "remove-lexeme",
+        FixAction::RemoveKeyword(_) => "remove-keyword",
+        FixAction::RemoveKeywordAcrossComments(_) => "remove-keyword-across-comments",
+        FixAction::ReplaceExact { .. } => "replace-exact",
+        FixAction::InsertAfter(_) => "insert-after",
+        FixAction::Rewrite(_) => "rewrite",
+        FixAction::MultiRewrite(_) => "multi-rewrite",
+        FixAction::CreateFile(_) => "create-file",
+    }
+}
+
+/// The one-sentence description of the action kind — the fix face's own
+/// render of the family a row belongs to.
+fn fix_action_summary(action: &FixAction) -> &'static str {
+    match action {
+        FixAction::DropLexeme(_) => {
+            "Remove the lexeme at the hit start (trailing whitespace follows)."
+        }
+        FixAction::RemoveLexeme(_) => {
+            "Remove the lexeme at the hit start and one following character."
+        }
+        FixAction::RemoveKeyword(_) => {
+            "Remove the keyword at the hit start through the next token's trivia."
+        }
+        FixAction::RemoveKeywordAcrossComments(_) => {
+            "Remove the keyword at the hit start through the next token, comments included."
+        }
+        FixAction::ReplaceExact { .. } => {
+            "Replace the hit span with its verified replacement text."
+        }
+        FixAction::InsertAfter(_) => "Insert the fix text at the hit span's end.",
+        FixAction::Rewrite(_) => "Apply the family's verified span rewrite.",
+        FixAction::MultiRewrite(_) => "Apply the family's verified multi-span rewrite.",
+        FixAction::CreateFile(_) => "Create the file the fix names.",
+    }
+}
+
 /// The commands [`Verbosity`] onto the assembler's: same three tiers, same
 /// default — the spelling mapping is the whole job.
 impl From<Verbosity> for query::Verbosity {
@@ -266,6 +540,18 @@ impl From<Verbosity> for query::Verbosity {
             Verbosity::Minimal => query::Verbosity::Minimal,
             Verbosity::Compact => query::Verbosity::Compact,
             Verbosity::Full => query::Verbosity::Full,
+        }
+    }
+}
+
+/// The commands [`Verbosity`] onto the diagnostic assembler's — the same
+/// three-tier mapping `query::Verbosity` rides.
+impl From<Verbosity> for diquery::Verbosity {
+    fn from(verbosity: Verbosity) -> Self {
+        match verbosity {
+            Verbosity::Minimal => diquery::Verbosity::Minimal,
+            Verbosity::Compact => diquery::Verbosity::Compact,
+            Verbosity::Full => diquery::Verbosity::Full,
         }
     }
 }
@@ -636,6 +922,141 @@ mod tests {
             ]),
             "the unnamed face's captured formals, the redirect's empty list"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -- the diagnostic face (`explain --diagnostic`) -------------------------
+
+    /// Two unused imports in one file — `related` can count the same-code
+    /// rows, and a `line`/`file` selector can discriminate them.
+    const TWO_UNUSED: &str = "import 'dart:async';\nimport 'dart:io';\nvoid main() {}\n";
+
+    /// The diagnostic explain report end to end: born schema-valid at the
+    /// producing tier, the echoed row carries the canonical file and the
+    /// `[start, end)` range, `why` names the registry facts, `related`
+    /// counts every same-code row in the run, and `documentation` carries
+    /// the published page (`unused_import` publishes one).
+    #[test]
+    fn diagnostic_explain_pins_the_sections_and_validates() {
+        let root = workspace("explain_diag", &[("lib/unused.dart", TWO_UNUSED)]);
+        let canonical = root.canonicalize().expect("root");
+        let file = canonical.join("lib/unused.dart").display().to_string();
+
+        let json = explain_diagnostic(
+            &root,
+            Some(&root.join("sdk")),
+            "unused_import",
+            None,
+            Verbosity::Compact,
+        )
+        .expect("explain_diagnostic run");
+        assert_eq!(json["diagnostic"]["code"], "unused_import");
+        assert_eq!(json["diagnostic"]["severity"], "WARNING");
+        assert_eq!(json["diagnostic"]["file"], file);
+        assert_eq!(
+            json["diagnostic"]["range"],
+            json!([7, 19]),
+            "the unused import's URI-string span (`'dart:async'`)"
+        );
+        assert_eq!(json["why"]["code_family"], "STATIC_WARNING");
+        assert_eq!(json["why"]["trigger_kind"], "unused-family");
+        assert_eq!(
+            json["documentation"],
+            "https://dart.dev/diagnostics/unused_import"
+        );
+        assert_eq!(json["related"]["total"], 2, "two unused imports in the run");
+        assert!(
+            json["related"].get("lines").is_none(),
+            "lines join at full only"
+        );
+        assert!(json.get("fixes").is_none(), "fixes join at full only");
+
+        // Full tier: fixes and related.lines join.
+        let json = explain_diagnostic(
+            &root,
+            Some(&root.join("sdk")),
+            "unused_import",
+            None,
+            Verbosity::Full,
+        )
+        .expect("full run");
+        assert!(json.get("fixes").is_some());
+        assert_eq!(
+            json["related"]["lines"],
+            json!([2]),
+            "the other same-code row's line"
+        );
+
+        // Minimal: the echo alone.
+        let json = explain_diagnostic(
+            &root,
+            Some(&root.join("sdk")),
+            "unused_import",
+            None,
+            Verbosity::Minimal,
+        )
+        .expect("minimal run");
+        assert!(json.get("why").is_none());
+        assert!(json.get("related").is_none());
+        assert_eq!(json["diagnostic"]["code"], "unused_import");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `--file` selector narrows the row set to that file; the
+    /// `:line[:col]` suffix picks the covering row; a code the run carries
+    /// no row for (or a file/position with no hit) answers
+    /// `NoSuchDiagnostic` — the CLI's usage tier.
+    #[test]
+    fn diagnostic_explain_file_and_position_selectors() {
+        let root = workspace("explain_diag_sel", &[("lib/unused.dart", TWO_UNUSED)]);
+        let canonical = root.canonicalize().expect("root");
+        let file = canonical.join("lib/unused.dart");
+
+        // The file selector alone picks the file's first same-code row.
+        let selector = FileSelector {
+            path: file.clone(),
+            line: None,
+            column: None,
+        };
+        let json = explain_diagnostic(
+            &root,
+            Some(&root.join("sdk")),
+            "unused_import",
+            Some(selector),
+            Verbosity::Compact,
+        )
+        .expect("file selector run");
+        assert_eq!(json["diagnostic"]["range"], json!([7, 19]));
+
+        // The line suffix picks the covering row (line 2 = the
+        // `'dart:io'` URI literal).
+        let selector = FileSelector {
+            path: file.clone(),
+            line: Some(2),
+            column: None,
+        };
+        let json = explain_diagnostic(
+            &root,
+            Some(&root.join("sdk")),
+            "unused_import",
+            Some(selector),
+            Verbosity::Compact,
+        )
+        .expect("line selector run");
+        assert_eq!(json["diagnostic"]["range"], json!([28, 37]));
+
+        // A code with no row in the run → NoSuchDiagnostic.
+        let error = explain_diagnostic(
+            &root,
+            Some(&root.join("sdk")),
+            "no_such_code",
+            None,
+            Verbosity::Compact,
+        )
+        .expect_err("no such code");
+        assert!(matches!(error, ExplainError::NoSuchDiagnostic(_)));
 
         std::fs::remove_dir_all(&root).ok();
     }

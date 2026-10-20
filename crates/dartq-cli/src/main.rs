@@ -544,8 +544,19 @@ struct DaemonArgs {
 
 #[derive(Args)]
 struct ExplainArgs {
-    /// The symbol name to explain.
-    symbol: String,
+    /// The symbol name to explain — the symbol face's selector. On the
+    /// `--diagnostic` face the one positional slot is the workspace `dir`
+    /// (the selector syntax `explain --diagnostic CODE [dir]`): a
+    /// positional is a dir, never a symbol, when `--diagnostic` is set.
+    symbol: Option<String>,
+    /// The diagnostic code to explain — selects the diagnostic face. The
+    /// run's first hit of the code answers when `--file` is absent.
+    #[arg(long, value_name = "CODE")]
+    diagnostic: Option<String>,
+    /// The file[:line[:col]] the diagnostic hit sits on — narrows the
+    /// diagnostic face's selection.
+    #[arg(long, value_name = "PATH[:LINE[:COL]]", requires = "diagnostic")]
+    file: Option<String>,
     /// Package directory holding pubspec.yaml and
     /// `.dart_tool/package_config.json`; defaults to the current directory.
     #[arg(default_value = ".")]
@@ -2094,20 +2105,71 @@ fn explain_entry(args: &ExplainArgs) -> u8 {
 /// error — printed as-is, exit 0. Exit tiers: workspace/engine assembly is
 /// the usage tier, discovery/cancellation the internal tier.
 fn explain_run(args: &ExplainArgs, out: &mut impl Write) -> u8 {
-    let report = match dartq_commands::explain::explain(
-        &args.dir,
-        args.sdk.as_deref(),
-        &args.symbol,
-        args.verbosity.into_commands(),
-    ) {
-        Ok(report) => report,
-        Err(error @ (ExplainError::Workspace(_) | ExplainError::Engine(_))) => {
-            eprintln!("error: {error}");
-            return exit::USAGE;
+    // The diagnostic face's positional slot carries the workspace `dir`
+    // (`explain --diagnostic CODE [dir]`): a positional is a dir, never a
+    // symbol, when `--diagnostic` is set. The explicit second positional
+    // still binds `dir`; both slots filled at once is ambiguous — usage.
+    let report = match (&args.symbol, &args.diagnostic) {
+        (dir_pos @ (None | Some(_)), Some(code)) => {
+            let dir = match dir_pos {
+                None => args.dir.clone(),
+                Some(positional) if args.dir == PathBuf::from(".") => {
+                    PathBuf::from(positional)
+                }
+                Some(_) => {
+                    eprintln!("error: two positionals on --diagnostic; give CODE [dir]");
+                    return exit::USAGE;
+                }
+            };
+            let selector = match args.file.as_deref().map(parse_file_selector) {
+                Some(Ok(selector)) => Some(selector),
+                Some(Err(message)) => {
+                    eprintln!("error: --file: {message}");
+                    return exit::USAGE;
+                }
+                None => None,
+            };
+            match dartq_commands::explain::explain_diagnostic(
+                &dir,
+                args.sdk.as_deref(),
+                code,
+                selector,
+                args.verbosity.into_commands(),
+            ) {
+                Ok(report) => report,
+                Err(
+                    error @ (ExplainError::Workspace(_)
+                    | ExplainError::Engine(_)
+                    | ExplainError::NoSuchDiagnostic(_)),
+                ) => {
+                    eprintln!("error: {error}");
+                    return exit::USAGE;
+                }
+                Err(error) => {
+                    eprintln!("dartq: internal error: {error}");
+                    return exit::INTERNAL_ERROR;
+                }
+            }
         }
-        Err(error) => {
-            eprintln!("dartq: internal error: {error}");
-            return exit::INTERNAL_ERROR;
+        (Some(symbol), None) => match dartq_commands::explain::explain(
+            &args.dir,
+            args.sdk.as_deref(),
+            symbol,
+            args.verbosity.into_commands(),
+        ) {
+            Ok(report) => report,
+            Err(error @ (ExplainError::Workspace(_) | ExplainError::Engine(_))) => {
+                eprintln!("error: {error}");
+                return exit::USAGE;
+            }
+            Err(error) => {
+                eprintln!("dartq: internal error: {error}");
+                return exit::INTERNAL_ERROR;
+            }
+        },
+        _ => {
+            eprintln!("error: give a symbol name or --diagnostic CODE");
+            return exit::USAGE;
         }
     };
 
@@ -2124,6 +2186,54 @@ fn explain_run(args: &ExplainArgs, out: &mut impl Write) -> u8 {
         return exit::INTERNAL_ERROR;
     }
     exit::CLEAN
+}
+
+/// Parses the `--file` argument's `PATH[:LINE[:COL]]` spelling. The path
+/// is canonicalized at the call site (the engine's interned spelling).
+fn parse_file_selector(text: &str) -> Result<dartq_commands::explain::FileSelector, String> {
+    // Split at most twice from the right: `path:line:col`, `path:line`,
+    // `path` — a path with a drive letter or containing `:` still parses
+    // because the numeric suffixes only count when they follow a `:`.
+    let (path, line, column) = match text.rfind(':') {
+        None => (text, None, None),
+        Some(right) => {
+            let tail = &text[right + 1..];
+            if tail.chars().all(|c| c.is_ascii_digit()) && !tail.is_empty() {
+                // One trailing number could be line or column; a second
+                // `:` before it decides.
+                let before = &text[..right];
+                match before.rfind(':') {
+                    Some(left)
+                        if before[left + 1..]
+                            .chars()
+                            .all(|c| c.is_ascii_digit())
+                            && !before[left + 1..].is_empty() =>
+                    {
+                        (
+                            &before[..left],
+                            Some(&before[left + 1..]),
+                            Some(tail),
+                        )
+                    }
+                    _ => (before, Some(tail), None),
+                }
+            } else {
+                (text, None, None)
+            }
+        }
+    };
+    if path.is_empty() {
+        return Err("the file path is empty".to_owned());
+    }
+    let parse_u32 = |text: &str, what: &str| {
+        text.parse::<u32>()
+            .map_err(|_| format!("the {what} must be a 1-based integer (got '{text}')"))
+    };
+    Ok(dartq_commands::explain::FileSelector {
+        path: PathBuf::from(path),
+        line: line.map(|s| parse_u32(s, "line")).transpose()?,
+        column: column.map(|s| parse_u32(s, "column")).transpose()?,
+    })
 }
 
 /// One JSON object at exit.
@@ -4337,7 +4447,9 @@ mod tests {
         let Command::Explain(args) = parsed else {
             panic!("expected explain command")
         };
-        assert_eq!(args.symbol, "Dog");
+        assert_eq!(args.symbol.as_deref(), Some("Dog"));
+        assert!(args.diagnostic.is_none(), "the symbol face selects");
+        assert!(args.file.is_none());
         assert_eq!(args.dir, PathBuf::from("."), "default target cwd");
         assert!(args.sdk.is_none());
         assert!(matches!(args.format, ExplainFormat::Json), "json default");
@@ -4361,7 +4473,7 @@ mod tests {
         let Command::Explain(args) = parsed else {
             panic!("expected explain command")
         };
-        assert_eq!(args.symbol, "Dog");
+        assert_eq!(args.symbol.as_deref(), Some("Dog"));
         assert_eq!(args.dir, PathBuf::from("/pkg"));
         assert_eq!(args.sdk, Some(PathBuf::from("/sdk")));
         assert!(matches!(args.verbosity, Verbosity::Full), "-v full parses");
@@ -4374,6 +4486,85 @@ mod tests {
             panic!("expected explain command")
         };
         assert!(matches!(args.verbosity, Verbosity::Minimal));
+    }
+
+    /// The diagnostic face's flag contract: `--diagnostic CODE` selects it,
+    /// `--file PATH[:LINE[:COL]]` narrows the row, and the one positional
+    /// slot carries the workspace `dir` on this face (a positional is a
+    /// dir, never a symbol, once `--diagnostic` is set).
+    #[test]
+    fn explain_diagnostic_args_parse() {
+        let parsed = parse_args_of(&["explain", "--diagnostic", "unused_import"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Explain(args) = parsed else {
+            panic!("expected explain command")
+        };
+        assert!(args.symbol.is_none(), "no positional given");
+        assert_eq!(args.diagnostic.as_deref(), Some("unused_import"));
+        assert!(args.file.is_none());
+        assert_eq!(args.dir, PathBuf::from("."), "default target cwd");
+
+        // The positional slot is the `[dir]` on the diagnostic face —
+        // `explain --diagnostic CODE /pkg` parses with /pkg in the slot.
+        let parsed = parse_args_of(&["explain", "--diagnostic", "unused_import", "/pkg"])
+            .expect("parse")
+            .expect("subcommand");
+        let Command::Explain(args) = parsed else {
+            panic!("expected explain command")
+        };
+        assert_eq!(args.symbol.as_deref(), Some("/pkg"), "the [dir] slot");
+
+        let parsed = parse_args_of(&[
+            "explain",
+            "--diagnostic",
+            "unused_import",
+            "--file",
+            "lib/a.dart:3:9",
+        ])
+        .expect("parse")
+        .expect("subcommand");
+        let Command::Explain(args) = parsed else {
+            panic!("expected explain command")
+        };
+        assert_eq!(args.file.as_deref(), Some("lib/a.dart:3:9"));
+
+        // `--file` without `--diagnostic` is a usage error (clap's
+        // `requires` gate).
+        assert!(parse_args_of(&["explain", "Dog", "--file", "a.dart"]).is_err());
+        assert!(parse_args_of(&["explain", "--file", "a.dart"]).is_err());
+    }
+
+    /// `PATH[:LINE[:COL]]` splits right-to-left on numeric tails; a
+    /// non-numeric tail stays in the path (drive letters, `:`-bearing
+    /// paths), an empty path is the usage error.
+    #[test]
+    fn parse_file_selector_shapes() {
+        let parse = |text: &str| parse_file_selector(text).expect("selector");
+
+        let sel = parse("lib/a.dart");
+        assert_eq!(sel.path, PathBuf::from("lib/a.dart"));
+        assert_eq!((sel.line, sel.column), (None, None));
+
+        let sel = parse("lib/a.dart:3");
+        assert_eq!(sel.path, PathBuf::from("lib/a.dart"));
+        assert_eq!((sel.line, sel.column), (Some(3), None));
+
+        let sel = parse("lib/a.dart:3:9");
+        assert_eq!(sel.path, PathBuf::from("lib/a.dart"));
+        assert_eq!((sel.line, sel.column), (Some(3), Some(9)));
+
+        // A non-numeric tail is not a position — it is part of the path.
+        let sel = parse("weird:name.dart");
+        assert_eq!(sel.path, PathBuf::from("weird:name.dart"));
+        assert_eq!((sel.line, sel.column), (None, None));
+
+        assert!(parse_file_selector(":3").is_err(), "empty path");
+        // A trailing non-numeric tail folds into the path — only digits
+        // count as the position suffix.
+        let sel = parse("lib/a.dart:3:x");
+        assert_eq!(sel.path, PathBuf::from("lib/a.dart:3:x"));
+        assert_eq!((sel.line, sel.column), (None, None));
     }
 
     /// The explain fixture: one import chain plus its test — the same shape
@@ -4398,7 +4589,9 @@ mod tests {
 
     fn explain_args(root: &Path, verbosity: Verbosity, symbol: &str) -> ExplainArgs {
         ExplainArgs {
-            symbol: symbol.to_owned(),
+            symbol: Some(symbol.to_owned()),
+            diagnostic: None,
+            file: None,
             dir: root.to_path_buf(),
             format: ExplainFormat::Json,
             sdk: Some(root.join("sdk")),
@@ -4518,6 +4711,67 @@ mod tests {
         // Usage tier: a missing directory.
         let missing = explain_args(&root.join("nope"), Verbosity::Compact, "Dog");
         assert_eq!(explain_run(&missing, &mut Vec::new()), exit::USAGE);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The diagnostic face end to end: `--diagnostic` selects the row, the
+    /// report is schema-valid at its producing tier, `related` counts the
+    /// run's same-code rows, and a code the run carries no row for is the
+    /// usage tier (`NoSuchDiagnostic`).
+    #[test]
+    fn explain_diagnostic_end_to_end() {
+        // One file with two unused imports — the `related` face can count
+        // the same-code rows.
+        const UNUSED: &str = "import 'dart:async';\nimport 'dart:io';\nvoid main() {}\n";
+        let root = analyze_fixture("explain_diag", &[("lib/unused.dart", UNUSED)]);
+        let canonical = root.canonicalize().expect("root");
+        let file = canonical.join("lib/unused.dart").display().to_string();
+
+        let args = ExplainArgs {
+            symbol: None,
+            diagnostic: Some("unused_import".to_owned()),
+            file: None,
+            dir: root.to_path_buf(),
+            format: ExplainFormat::Json,
+            sdk: Some(root.join("sdk")),
+            verbosity: Verbosity::Compact,
+        };
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(explain_run(&args, &mut out), exit::CLEAN);
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
+        // The report is born schema-valid inside `explain_diagnostic`
+        // (the producing tier rides the gate); the assertions pin the
+        // sections the tier promises.
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["diagnostic"]["code"], "unused_import");
+        assert_eq!(json["diagnostic"]["file"], file);
+        assert_eq!(json["why"]["trigger_kind"], "unused-family");
+        assert_eq!(json["related"]["total"], 2, "two unused imports in the run");
+        assert!(
+            json["related"].get("lines").is_none(),
+            "lines join at full only"
+        );
+
+        // Full: `fixes` and `related.lines` join.
+        let args = ExplainArgs {
+            verbosity: Verbosity::Full,
+            ..args
+        };
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(explain_run(&args, &mut out), exit::CLEAN);
+        let json: serde_json::Value =
+            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
+        assert!(json.get("fixes").is_some(), "fixes join at full");
+        assert!(json["related"].get("lines").is_some(), "lines join at full");
+
+        // No row for the code → usage tier.
+        let args = ExplainArgs {
+            diagnostic: Some("no_such_code".to_owned()),
+            ..args
+        };
+        assert_eq!(explain_run(&args, &mut Vec::new()), exit::USAGE);
 
         fs::remove_dir_all(&root).ok();
     }

@@ -265,6 +265,21 @@
 //! keys, so consumers read "zero exported" apart from "not exported".
 //! Full row-shape detail lives in `index_export`'s module docs.
 //!
+//! Diagnostic explain report (`dartq explain --diagnostic`; the echoed
+//! diagnostic is the red line — `compact` adds the registry facts and the
+//! related count, `full` adds the fix rows and the per-file line list):
+//!
+//! | field                 | minimal | compact | full |
+//! |-----------------------|---------|---------|------|
+//! | `diagnostic`          | ●       | ●       | ●    |
+//! | `why`                 |         | ●       | ●    |
+//! | `documentation`       |         | opt     | opt  |
+//! | `related`             |         | ●       | ●    |
+//! | `related.lines`       |         |         | ●    |
+//! | `fixes`               |         |         | ●    |
+//!
+//! Full row-shape detail lives in `diagnostic_explain`'s module docs.
+//!
 //! Assists documents (`dartq assists` / `dartq/assists`; per assist row —
 //! the row's provenance tag and title ride every tier, unlike the fix
 //! patch's human-name rows: the writer drops only the priority and the
@@ -326,6 +341,9 @@
 //! * [`Domain::Explain`] — the explain report
 //!   ([`explain_schema`]; `SCHEMA_VERSION_EXPLAIN` mirrors `dartq-ai`'s
 //!   authoritative constant).
+//! * [`Domain::DiagnosticExplain`] — the `dartq explain --diagnostic`
+//!   report ([`diagnostic_explain_schema`];
+//!   `SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN` mirrors `dartq-ai`'s constant).
 //! * [`Domain::Compat`] — the compatibility report
 //!   ([`compat_schema`]; `SCHEMA_VERSION_COMPAT` mirrors `dartq-ai`'s
 //!   authoritative constant).
@@ -377,6 +395,7 @@ mod assists;
 mod check;
 mod compat;
 mod config;
+mod diagnostic_explain;
 mod diagnostics;
 mod explain;
 mod fix_patch;
@@ -392,6 +411,10 @@ pub use assists::{SCHEMA_VERSION_ASSISTS, assists_schema};
 pub use check::{SCHEMA_VERSION_CHECK, check_schema};
 pub use compat::{ERROR_KINDS, SCHEMA_VERSION_COMPAT, compat_schema};
 pub use config::{SCHEMA_VERSION_CONFIG, TARGET_KINDS, config_schema};
+pub use diagnostic_explain::{
+    FIX_SOURCES, RULE_GROUPS, SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN, TRIGGER_KINDS,
+    diagnostic_explain_schema,
+};
 pub use diagnostics::{SCHEMA_VERSION_DIAGNOSTICS, diagnostics_schema};
 pub use explain::{SCHEMA_VERSION_EXPLAIN, explain_schema};
 pub use fix_patch::{SCHEMA_VERSION_FIX_PATCH, fix_patch_schema};
@@ -416,6 +439,8 @@ pub enum Domain {
     Query,
     /// The explain report (`dartq-ai`'s `explain` query output).
     Explain,
+    /// The diagnostic explain report (`dartq explain --diagnostic`).
+    DiagnosticExplain,
     /// The compatibility report (`dartq compat`).
     Compat,
     /// The `--metrics-json` run summary (`dartq check` / `dartq analyze`).
@@ -509,6 +534,7 @@ pub fn validate(payload: &str, domain: Domain) -> Result<(), SchemaViolation> {
         Domain::FixPatch => fix_patch::validate_fix_patch(&value),
         Domain::Query => query::validate_query(&value),
         Domain::Explain => explain::validate_explain(&value),
+        Domain::DiagnosticExplain => diagnostic_explain::validate_diagnostic_explain(&value),
         Domain::Compat => compat::validate_compat(&value),
         Domain::RunMetrics => run_metrics::validate_run_metrics(&value),
         Domain::Index => index::validate_index(&value),
@@ -556,6 +582,9 @@ pub fn validate_at_tier(
         (Domain::Query, tier) => query::validate_query_at_tier(&value, tier),
         (Domain::Compat, tier) => compat::validate_compat_at_tier(&value, tier),
         (Domain::Explain, tier) => explain::validate_explain_at_tier(&value, tier),
+        (Domain::DiagnosticExplain, tier) => {
+            diagnostic_explain::validate_diagnostic_explain_at_tier(&value, tier)
+        }
         (Domain::Check, tier) => check::validate_check_at_tier(&value, tier),
         (Domain::Analyze, tier) => analyze::validate_analyze_at_tier(&value, tier),
         (Domain::Assists, tier) => assists::validate_assists_at_tier(&value, tier),

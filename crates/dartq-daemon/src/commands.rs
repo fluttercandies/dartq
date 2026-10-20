@@ -1669,9 +1669,9 @@ fn explain_answer(
     let sdk = sdk.or(Some(drain.sdk_root));
     let mut report =
         explain_core(drain.root, sdk, symbol, verbosity).map_err(|error| match error {
-            ExplainError::Workspace(_) | ExplainError::Engine(_) => {
-                SessionError::InvalidParams(error.to_string())
-            }
+            ExplainError::Workspace(_)
+            | ExplainError::Engine(_)
+            | ExplainError::NoSuchDiagnostic(_) => SessionError::InvalidParams(error.to_string()),
             ExplainError::Analyze(_) => SessionError::Internal(error.to_string()),
         })?;
     if let Some(since) = since {
