@@ -481,6 +481,16 @@ mod ticket_2245_tests;
 #[cfg(test)]
 mod ticket_2241_tests;
 
+/// The #2324 pins: the dead-coalesce operand faces (the `?.`-merged
+/// read/send keeps the null union, an invoked operand reads its send's
+/// declared result, a generic key send never anchors) and the extension
+/// on-type field-read owner face (#2282's spare, unnamed-extension
+/// spelling). Kept as a standalone module so the shared `tests` rig stays
+/// untouched.
+#[cfg(test)]
+mod ticket_2324_tests;
+
+
 /// The const NON_CONSTANT-family differential pins (#2242): unresolved
 /// callees inside const literals report the element faces at the
 /// invocation and anchor the declaration row at the first failure, and a

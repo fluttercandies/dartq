@@ -1090,17 +1090,31 @@ impl<'a> Engine<'a> {
             if matches!(kind, ContainerKind::Mixin | ContainerKind::Extension) {
                 match self.on_face_walk(container, kind, name) {
                     // The hit belongs to a constraint's face, not the
-                    // enclosing container's own map — `RefTarget::Opaque`
+                    // enclosing container's own map. A mixin's constraint
+                    // owns no concrete declaration — `RefTarget::Opaque`
                     // (the "resolved, cannot name the owner" answer) keeps
                     // the read from being credited to the enclosing
                     // container's member set, which would leave the owning
-                    // face's field looking unread downstream.
+                    // face's field looking unread downstream. An
+                    // extension's `on` type DOES own one: `this` inside the
+                    // extension IS the extended type, so the read's owner
+                    // is the `on` container (the same face
+                    // `note_member_read`'s `This` arm credits) — pass 2's
+                    // unused-field join can then spare the declaring field
+                    // (#2282). An unresolved `on` name has no honest owner
+                    // and stays opaque.
                     Walk::Found(entry) => {
                         let ty = match entry.kind {
                             MemberKind::Field => self.fold_alias_ty(entry.var_ty),
                             _ => Ty::UNKNOWN,
                         };
-                        return (BareInfo::Plain { ty }, RefTarget::Opaque);
+                        let target = if kind == ContainerKind::Extension {
+                            self.enclosing_extension_on_type(container)
+                                .map_or(RefTarget::Opaque, |on| RefTarget::Member { container: on })
+                        } else {
+                            RefTarget::Opaque
+                        };
+                        return (BareInfo::Plain { ty }, target);
                     }
                     Walk::ChainBroken => {
                         return (
@@ -1728,9 +1742,14 @@ impl<'a> Engine<'a> {
         // container (superclass, mixin application, or interface face —
         // `member_lookup_defining`'s climb) records the read so
         // `member_was_read` spares `unused_field` on the declaring member.
-        // Statics ride no receiver and never mark.
-        if let Some((container, _)) = self.container_context()
-            && let Some((declaring, entry)) = member_lookup_defining(
+        // Statics ride no receiver and never mark. An extension body's
+        // bare read of an `on`-type field defines on the extended
+        // container the same way (#2282 — `this` inside an extension IS
+        // the `on` type; the climb above keys on the extension's own map
+        // only).
+        let mut field_declaring = None;
+        if let Some((container, kind)) = self.container_context() {
+            if let Some((found, entry)) = member_lookup_defining(
                 self.graph,
                 self.namespaces,
                 self.index,
@@ -1739,10 +1758,20 @@ impl<'a> Engine<'a> {
                 container,
                 name,
                 false,
-            )
-            && entry.kind == MemberKind::Field
-            && !entry.is_static
-        {
+            ) {
+                if entry.kind == MemberKind::Field && !entry.is_static {
+                    field_declaring = Some(found);
+                }
+            } else if kind == ContainerKind::Extension
+                && let Some(on) = self.enclosing_extension_on_type(container)
+                && let Walk::Found(entry) = self.walk_members(on, name)
+                && entry.kind == MemberKind::Field
+                && !entry.is_static
+            {
+                field_declaring = Some(on);
+            }
+        }
+        if let Some(declaring) = field_declaring {
             self.field_read_rows.insert(range.offset, declaring);
         }
         // The implicit-this face's push-time snapshots: the field-group

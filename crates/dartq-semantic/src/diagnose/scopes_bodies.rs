@@ -387,6 +387,42 @@ impl<'a> Engine<'a> {
         self.if_null_groups.push((self.rows.len(), op_range));
     }
 
+    /// The dead-coalesce operand's never-null verdict
+    /// (`_checkForDeadNullCoalesce`'s operand face): the row's own type,
+    /// widened to the nullable face when a `?.` merge stands at the row's
+    /// offset (`x?.f ?? d` keeps the null union the merge could not join —
+    /// the same member-offset latch `null_comparison`'s operand face
+    /// re-arms), and the send's RESULT for an invoked operand (`a.b() ?? c`
+    /// reads `b`'s declared return — the row keeps the callee's declared
+    /// type, never the send's; the same shape `initializer_static_ty`'s
+    /// Invoke arm answers). A type-parameter send result suppresses the
+    /// verdict — the written name carries no bound (`null_comparison`'s
+    /// posture), so `m[key(e)] ?? d`'s generic key send never anchors the
+    /// dead face.
+    fn coalesce_operand_never_null(&self, row: &Row) -> bool {
+        if self.null_aware_members.contains(&row.range.offset) {
+            return Self::nullable_form(row.ty).is_strictly_non_nullable();
+        }
+        if matches!(row.intent, Intent::Invoke) {
+            let ty = self.operand_static_ty(row);
+            if ty != Ty::UNKNOWN {
+                return match ty {
+                    Ty::Named {
+                        name,
+                        nullable: false,
+                        ..
+                    } if self.type_params.contains(&name)
+                        || self.pending_type_params.contains(&name) =>
+                    {
+                        false
+                    }
+                    _ => ty.is_strictly_non_nullable(),
+                };
+            }
+        }
+        row.ty.is_strictly_non_nullable()
+    }
+
     /// `end_binary_expression` for `??`: the right operand's row anchors
     /// the report when the left operand's type is strictly non-nullable —
     /// the right operand is never executed (the official
@@ -422,13 +458,14 @@ impl<'a> Engine<'a> {
             || mark
                 .checked_sub(1)
                 .and_then(|index| self.rows.get(index))
-                // An operator-marked or invoked row is the index/`+`/call
-                // geometry, never the read's own type (`m[k] ?? d` reads
-                // `Map.[]`'s `V?`; `m[k(e)] ?? d`'s nearest row is the key
-                // send — the receiver row's non-nullability is not the
-                // read's, #2172's `groupSetsBy`/`groupBy`/`groupBy` rows).
-                .filter(|lhs| !matches!(lhs.intent, Intent::Operator(..) | Intent::Invoke))
-                .is_some_and(|lhs| lhs.ty.is_strictly_non_nullable());
+                // An operator-marked row is the index/`+` geometry, never
+                // the read's own type (`m[k] ?? d` reads `Map.[]`'s `V?` —
+                // #2172's `groupSetsBy`/`groupBy` rows). An invoked row
+                // reads its send result through the shared verdict, whose
+                // type-parameter posture keeps a generic key send
+                // (`m[keyOf(e)] ?? d`) from anchoring.
+                .filter(|lhs| !matches!(lhs.intent, Intent::Operator(..)))
+                .is_some_and(|lhs| self.coalesce_operand_never_null(lhs));
         if !non_null {
             return;
         }
@@ -472,9 +509,9 @@ impl<'a> Engine<'a> {
             .find(|row| {
                 row.range.end() <= limit
                     && !matches!(row.shape, RowShape::Value)
-                    && !matches!(row.intent, Intent::Operator(..) | Intent::Invoke)
+                    && !matches!(row.intent, Intent::Operator(..))
             })
-            .is_some_and(|target| target.ty.is_strictly_non_nullable());
+            .is_some_and(|target| self.coalesce_operand_never_null(target));
         if non_null && let Some(value) = self.rows.last() {
             let range = value.range;
             self.stage_usage(SemanticCode::DeadNullAwareExpression, range, "");
