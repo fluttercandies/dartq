@@ -15,10 +15,14 @@
     //!   invalid-typed receiver) still spares the field by spelling.
     //! - `_recordEnumValuesUse` (:442-455): reading an enum's `values`
     //!   getter credits every constant's getter at once.
-    //! - The extension `on` resolvability gate: `extension _E on Missing`
-    //!   can never apply (`applicableTo` short-circuits on the InvalidType
-    //!   before the member probe), so no access credits its members in the
-    //!   oracle — a name-level application row must not spare them.
+//! - The extension credit's receiver-validity gate: an access through an
+//!   unresolvable receiver type (the broken-import corpus's dominant
+//!   shape — `m.g` on an undefined `Missing`) binds nothing and credits
+//!   nothing, so the accessed member reports; an access through a VALID
+//!   receiver applies an invalid-`on` extension vacuously (the subtype
+//!   check against the InvalidType extended type passes) and spares it.
+//!   The credit is judged at the resolution side and the declaration
+//!   walk trusts it as recorded.
 
     use super::*;
     use crate::collector::collect;
@@ -280,21 +284,60 @@
         );
     }
 
-    // —— unused_element: the extension `on` resolvability gate ——————————
+    // —— unused_element: the extension credit's receiver-validity gate ————
+    //
+    // The oracle truth table (probed against `dart analyze` 3.13.1, a
+    // self-package `package_config.json` mapping the probing directory —
+    // the corpus's broken-import world):
+    //
+    // - an access through a VALID receiver spares a member of an
+    //   extension whose `on` type is itself invalid — the subtype check
+    //   against the InvalidType extended type passes vacuously, the member
+    //   lookup inside the extension succeeds, and `usedElements.members`
+    //   gains it (`c.g` on a valid `C` with `extension _E on Missing`
+    //   emits neither `undefined_getter` nor `unused_element`; dropping
+    //   the extension brings the getter miss back);
+    // - an access through an INVALID receiver (or no access at all)
+    //   credits nothing — the lookup dies on the unresolvable receiver
+    //   before the extension probe — so the member reports;
+    // - a bare identifier read inside a SIBLING extension is an
+    //   implicit-`this` read on the sibling's `on` type: no extension
+    //   override is created and the member stays uncredited.
+    //
+    // The credit set is therefore judged at the resolution side (receiver
+    // validity), and the declaration-site walk trusts it as recorded.
 
-    /// `extension _E on Missing` can never apply: the oracle's
-    /// `applicableTo` short-circuits on the InvalidType, so a same-name
-    /// member read resolves nothing and `usedElements.members` stays
-    /// empty — the member reports `unused_element` despite the name-level
-    /// application the access performed.
+    /// The corpus's dominant `unused_element` family: an invalid receiver
+    /// (`m` typed by an undefined class) credits nothing, so an accessed
+    /// member of an extension whose `on` type also fails to resolve still
+    /// reports.
     #[test]
-    fn extension_on_unresolved_type_never_credits_members() {
+    fn extension_member_on_invalid_receiver_still_reports() {
+        let source = "extension _E on Missing {\n\
+                      \x20 int get g => 0;\n\
+                      }\n\
+                      void f(Missing m) {\n\
+                      \x20 m.g;\n\
+                      }";
+        let report = report_ops(source);
+        assert!(
+            rows(&report, "unused_element")
+                .iter()
+                .any(|&(offset, _)| {
+                    offset == source.find("get g").unwrap() as u32 + 4
+                }),
+            "the member accessed through an invalid receiver reports: {:?}",
+            report.diagnostics
+        );
+    }
+
+    /// Without any access the member reports regardless of the `on`
+    /// clause — the unaccessed half of the corpus family.
+    #[test]
+    fn extension_member_reports_without_access() {
         let source = "class C {}\n\
                       extension _E on Missing {\n\
                       \x20 int get g => 0;\n\
-                      }\n\
-                      void f(C c) {\n\
-                      \x20 c.g;\n\
                       }";
         let report = report(source);
         assert!(
@@ -303,7 +346,124 @@
                 .any(|&(offset, _)| {
                     offset == source.find("get g").unwrap() as u32 + 4
                 }),
-            "the member of `extension _E on Missing` reports: {:?}",
+            "the unaccessed member of `extension _E on Missing` reports: {:?}",
+            report.diagnostics
+        );
+    }
+
+    /// A public member of an UNNAMED extension is checked like a private
+    /// declaration (the extension itself has no name to be exported by),
+    /// so the corpus's `extension on Element?` getter family reports when
+    /// nothing applies to it.
+    #[test]
+    fn unnamed_extension_member_reports_when_never_applied() {
+        let source = "extension on Missing {\n\
+                      \x20 bool get isFoo => true;\n\
+                      }";
+        let report = report(source);
+        assert!(
+            rows(&report, "unused_element")
+                .iter()
+                .any(|&(offset, _)| {
+                    offset == source.find("get isFoo").unwrap() as u32 + 4
+                }),
+            "the unnamed extension's member reports: {:?}",
+            report.diagnostics
+        );
+    }
+
+    /// The ffi_verifier shape end to end: the extension's `on` type and
+    /// the accessing receiver's declared type are BOTH undefined, so the
+    /// access binds nothing and the member reports.
+    #[test]
+    fn unnamed_extension_member_reports_for_invalid_receiver_access() {
+        let source = "void f(Missing m) {\n\
+                      \x20 m.isFoo;\n\
+                      }\n\
+                      extension on Missing {\n\
+                      \x20 bool get isFoo => true;\n\
+                      }";
+        let report = report_ops(source);
+        assert!(
+            rows(&report, "unused_element")
+                .iter()
+                .any(|&(offset, _)| {
+                    offset == source.find("get isFoo").unwrap() as u32 + 4
+                }),
+            "the member accessed through the invalid receiver reports: {:?}",
+            report.diagnostics
+        );
+    }
+
+    /// `assert(isArray)` inside a sibling extension is an implicit-`this`
+    /// read on the SIBLING's `on` type: no extension override engages, the
+    /// read credits nothing, and both the read member and the reading
+    /// method report.
+    #[test]
+    fn unnamed_extension_bare_sibling_read_credits_nothing() {
+        let source = "extension on A {\n\
+                      \x20 bool get isArray => true;\n\
+                      }\n\
+                      extension on B {\n\
+                      \x20 void m() {\n\
+                      \x20\x20 assert(isArray);\n\
+                      \x20 }\n\
+                      }\n\
+                      class A {}\n\
+                      class B {}";
+        let report = report(source);
+        let getter_at = source.find("get isArray").unwrap() as u32 + 4;
+        let method_at = source.find("void m").unwrap() as u32 + 5;
+        let unused = rows(&report, "unused_element");
+        assert!(
+            unused.iter().any(|&(offset, _)| offset == getter_at),
+            "the cross-extension bare read spares nothing: {:?}",
+            report.diagnostics
+        );
+        assert!(
+            unused.iter().any(|&(offset, _)| offset == method_at),
+            "the never-applied sibling method reports: {:?}",
+            report.diagnostics
+        );
+    }
+
+    /// The `visitWithOverride` corpus shape: a generic unnamed extension
+    /// (`extension<T extends C> on T`) whose parameter-headed `on` type
+    /// can never resolve — its method reports when never applied.
+    #[test]
+    fn unnamed_generic_extension_method_reports() {
+        let source = "class C {}\n\
+                      extension<T extends C> on T {\n\
+                      \x20 void visitWithOverride() {}\n\
+                      }";
+        let report = report(source);
+        assert!(
+            rows(&report, "unused_element").iter().any(|&(offset, _)| {
+                offset == source.find("visitWithOverride").unwrap() as u32
+            }),
+            "the generic unnamed extension's method reports: {:?}",
+            report.diagnostics
+        );
+    }
+
+    /// A named-private extension over a resolving generic `on` head
+    /// (`Map<K, V>` with local arguments) that is never applied: the
+    /// member reports despite the resolvable head.
+    #[test]
+    fn named_private_extension_generic_on_reports_when_never_applied() {
+        let source = "class K {}\n\
+                      class V {}\n\
+                      extension _M on Map<K, V> {\n\
+                      \x20 int get entry => 1;\n\
+                      }";
+        let report = report(source);
+        assert!(
+            rows(&report, "unused_element")
+                .iter()
+                .any(|&(offset, _)| {
+                    offset == source.find("get entry").unwrap() as u32 + 4
+                }),
+            "the never-applied member of the generic-`on` extension reports: {:?}",
             report.diagnostics
         );
     }

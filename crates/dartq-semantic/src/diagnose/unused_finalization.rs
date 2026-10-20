@@ -320,7 +320,15 @@ impl<'a> Engine<'a> {
                     // the member all the same in the `used_names` arm, so
                     // the extension arm drops it; statics keep the
                     // spelling arms — they resolve through the
-                    // container-static path `_E._x`).
+                    // container-static path `_E._x`). The credit set is
+                    // receiver-validity-gated at the resolution side: an
+                    // access through an unresolvable receiver type (the
+                    // broken-import corpus) credits nothing, while an
+                    // extension whose `on` type is itself invalid still
+                    // applies vacuously to a valid receiver — probed:
+                    // `c.g` on a valid `C` with `extension _E on Missing`
+                    // neither reports `undefined_getter` nor leaves `g`
+                    // unused, so the credit alone decides.
                     let is_extension_instance = !is_static
                         && self
                             .index
@@ -328,25 +336,8 @@ impl<'a> Engine<'a> {
                             .and_then(|f| f.container(container))
                             .is_some_and(|c| c.kind == ContainerKind::Extension);
                     let member_used = if is_extension_instance {
-                        // The credit is oracle-faithful only when the
-                        // extension can apply at all: an `on` type that
-                        // resolves to no container (`extension _E on
-                        // Missing`) leaves every access unbound in the
-                        // oracle (`applicableTo` never reaches the member
-                        // probe), so `usedElements.members` gains nothing
-                        // — the name-level `extension_application` credit
-                        // counts only when the declaring `on` head
-                        // resolves in this unit's scope.
-                        let on_resolves = self
-                            .index
-                            .get(self.file)
-                            .into_iter()
-                            .flat_map(|f| f.extension_faces())
-                            .filter(|face| face.name == Some(container))
-                            .all(|face| self.extension_on_resolves(face));
-                        on_resolves
-                            && (self.extension_member_used.contains(&site.name)
-                                || self.extension_member_used.contains(&bare))
+                        self.extension_member_used.contains(&site.name)
+                            || self.extension_member_used.contains(&bare)
                     } else {
                         self.used_names.contains(&bare)
                     };
@@ -517,14 +508,17 @@ impl<'a> Engine<'a> {
         // gains the member only when the access's `read.element` resolved —
         // `element_usage_detector.dart`'s `extensionOverride`/named-read
         // arms): a same-spelling access that never resolved to the member
-        // (the broken-import corpus — an invalid `on` type or receiver
-        // keeps the application probe from applying) credits nothing, so
-        // the bare `used_names`/`read_names` spelling arms do NOT spare
-        // instance members here. Static members keep the spelling arms —
-        // they resolve through the container-static path (`_E._x`), not
-        // the implicit application probe. A write-only field still needs
-        // a READ (the `unused_field` rule). The candidates clone out
-        // first — the staging below mutates the engine.
+        // credits nothing, so the bare `used_names`/`read_names` spelling
+        // arms do NOT spare instance members here. The credit set is
+        // receiver-validity-gated at the resolution side — an access
+        // through an unresolvable receiver (the broken-import corpus)
+        // credits nothing, while an invalid `on` type applies vacuously to
+        // a valid receiver — so the credit alone decides. Static members
+        // keep the spelling arms — they resolve through the
+        // container-static path (`_E._x`), not the implicit application
+        // probe. A write-only field still needs a READ (the `unused_field`
+        // rule). The candidates clone out first — the staging below
+        // mutates the engine.
         //
         // Membership split with `decl_sites`: an unnamed extension
         // declares no sites at all, so its whole member set checks here; a
@@ -534,7 +528,7 @@ impl<'a> Engine<'a> {
         // spelling arm there), and its STATIC fields the `DeclKind::
         // Member` field arm — leaving this face the named-private
         // instance fields the site arms are ineligible for.
-        let mut extension_members: Vec<(StringId, SourceRange, MemberKind, bool, bool, bool)> =
+        let mut extension_members: Vec<(StringId, SourceRange, MemberKind, bool, bool)> =
             Vec::new();
         if let Some(elements) = self.index.get(self.file) {
             for face in elements.extension_faces() {
@@ -544,13 +538,6 @@ impl<'a> Engine<'a> {
                 if !named_private && face.name.is_some() {
                     continue;
                 }
-                // The `extension_member_used` credit below is oracle-bound:
-                // an `on` type that resolves to no container can never
-                // apply (`applicableTo` short-circuits on the InvalidType
-                // before the member probe), so no access credits the face's
-                // members in the oracle — the name-level application row's
-                // insert must not spare them.
-                let on_resolves = self.extension_on_resolves(face);
                 for (spelling, entry) in &face.members {
                     // A named extension's members are declaration sites —
                     // this face keeps only its public-named instance fields
@@ -569,18 +556,17 @@ impl<'a> Engine<'a> {
                         entry.kind,
                         entry.is_static,
                         !entry.annotations.is_empty(),
-                        on_resolves,
                     ));
                 }
             }
         }
-        for (spelling, range, kind, is_static, annotated, on_resolves) in extension_members {
+        for (spelling, range, kind, is_static, annotated) in extension_members {
             if range == MemberEntry::MISSING_NAME_RANGE {
                 continue;
             }
             let bare = self.bare_name(spelling);
             let spared = annotated
-                || (on_resolves && self.extension_member_used.contains(&spelling))
+                || self.extension_member_used.contains(&spelling)
                 || (is_static
                     && (self.used_names.contains(&bare)
                         || (matches!(kind, MemberKind::Field)
@@ -597,64 +583,6 @@ impl<'a> Engine<'a> {
         }
         self.suppress_same_line_ignored_locals();
         self.report_unused_imports();
-    }
-
-    /// Whether an extension face can apply at all — the oracle-bound gate
-    /// on the `extension_member_used` credit (the broken-import corpus's
-    /// `unused_element` family): `applicableTo` short-circuits on an
-    /// `InvalidType` `extendedType` before the member probe, so an `on`
-    /// type that never resolves credits nothing — `usedElements.members`
-    /// gains the member only through a resolved application. A bare `on`
-    /// head resolves through `resolve_container`; a generic `on` spells
-    /// its validity through the argument list too (`on List<Missing>` is
-    /// an `InvalidType` whole — the head alone does not rescue it), and
-    /// the extension's own type parameters skip the check (they bind at
-    /// the application, never the scope). A non-named `on` shape — a
-    /// record or function type — needs no name resolution at all; a
-    /// missing/`Unknown` shape never applies (the model's `on_type`
-    /// comment: "the face can never apply").
-    fn extension_on_resolves(&self, face: &ExtensionFace) -> bool {
-        let resolves = |name| {
-            resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                self.lib,
-                self.file,
-                name,
-            )
-            .is_some()
-        };
-        match face.on_ty {
-            Ty::Named { args, .. } => {
-                let Some(on) = face.on_type else {
-                    // A named head with no honest name: recovery-shaped —
-                    // never applies.
-                    return false;
-                };
-                if !resolves(on) {
-                    return false;
-                }
-                let Some(elements) = self.index.get(self.file) else {
-                    return true;
-                };
-                elements
-                    .type_args()
-                    .get(args)
-                    .iter()
-                    .all(|arg| match arg {
-                        Ty::Named { name, .. } => {
-                            face.type_param_names.contains(name) || resolves(*name)
-                        }
-                        _ => true,
-                    })
-            }
-            // Record and function shapes resolve by construction — a
-            // `Missing` leaf inside them is invisible to this model's
-            // flat arg read (the under-report direction).
-            Ty::Record { .. } | Ty::Function { .. } => true,
-            _ => face.on_type.is_some_and(resolves),
-        }
     }
 
     /// The trailing same-line `// ignore:` face over the local-variable
