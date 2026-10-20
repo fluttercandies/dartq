@@ -20,8 +20,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use dartq_lints::{
-    EnableSet, Group, SEMANTIC_RULES, emittable_rule_names, mounts_semantics, rule_by_name,
-    rules,
+    EnableSet, Group, SEMANTIC_RULES, emittable_rule_names, mounts_semantics, rule_by_name, rules,
 };
 
 /// The pinned `package:lints` snapshot's `core.yaml` — the critical set,
@@ -455,9 +454,18 @@ fn rule_names_are_unique() {
 }
 
 /// The completeness pin: a registry entry that leaves the official sets (or
-/// carries the wrong `Group`) breaks the crate's contract.
+/// carries the wrong `Group`) breaks the crate's contract. Membership is
+/// case-insensitive like [`rule_by_name`]: the pinned `package:lints` yaml
+/// keeps two mixed-case spellings (`prefer_iterable_whereType`,
+/// `prefer_for_elements_to_map_fromIterable`) while the registered names —
+/// the emitted code strings — are their all-lowercase machine forms.
 #[test]
 fn every_rule_is_in_its_official_set() {
+    fn contains(official: &[&str], name: &str) -> bool {
+        official
+            .iter()
+            .any(|entry| entry.eq_ignore_ascii_case(name))
+    }
     for spec in rules() {
         let official = match spec.group {
             Group::Core => OFFICIAL_CORE,
@@ -466,7 +474,7 @@ fn every_rule_is_in_its_official_set() {
             Group::Removed => OFFICIAL_REMOVED,
             Group::Standalone => {
                 assert!(
-                    official_standalone().contains(&spec.name),
+                    contains(&official_standalone(), spec.name),
                     "{} claims the standalone group but is absent from the wave lists",
                     spec.name
                 );
@@ -474,7 +482,7 @@ fn every_rule_is_in_its_official_set() {
             }
         };
         assert!(
-            official.contains(&spec.name),
+            contains(official, spec.name),
             "{} claims group {:?} but is absent from the official list",
             spec.name,
             spec.group
@@ -490,7 +498,9 @@ fn recommended_rules_are_not_core_rules() {
     for spec in rules() {
         if spec.group == Group::Recommended {
             assert!(
-                !OFFICIAL_CORE.contains(&spec.name),
+                !OFFICIAL_CORE
+                    .iter()
+                    .any(|entry| entry.eq_ignore_ascii_case(spec.name)),
                 "{} is a core-set rule but registered as Recommended",
                 spec.name
             );
@@ -551,11 +561,14 @@ fn registry_holds_the_pinned_count() {
 /// section exactly its pinned official set. The wave sections pin exact
 /// order (each new wave appends its section here); the legacy
 /// core/recommended blocks keep their historical registration order, each
-/// entry's identity pinned by `rule_by_name_round_trips`.
+/// entry's identity pinned by `rule_by_name_round_trips`. Comparisons run
+/// on lowercased forms: the pinned `package:lints` yaml keeps two
+/// mixed-case spellings while the registered names are the all-lowercase
+/// machine code strings.
 #[test]
 fn registry_sections_hold_the_official_order() {
-    fn official<'a>(names: &[&'a str]) -> BTreeSet<&'a str> {
-        names.iter().copied().collect()
+    fn official(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| name.to_ascii_lowercase()).collect()
     }
     let ranks: Vec<u8> = rules()
         .iter()
@@ -572,11 +585,11 @@ fn registry_sections_hold_the_official_order() {
         "registry sections must be contiguous, in wave order"
     );
 
-    let section = |group: Group| -> BTreeSet<&'static str> {
+    let section = |group: Group| -> BTreeSet<String> {
         rules()
             .iter()
             .filter(|spec| spec.group == group)
-            .map(|spec| spec.name)
+            .map(|spec| spec.name.to_ascii_lowercase())
             .collect()
     };
     assert_eq!(section(Group::Core), official(OFFICIAL_CORE));
@@ -586,36 +599,60 @@ fn registry_sections_hold_the_official_order() {
         official(OFFICIAL_DIAGNOSTIC_MIRRORS)
     );
 
-    let ordered_section = |group: Group| -> Vec<&'static str> {
+    let ordered_section = |group: Group| -> Vec<String> {
         rules()
             .iter()
             .filter(|spec| spec.group == group)
-            .map(|spec| spec.name)
+            .map(|spec| spec.name.to_ascii_lowercase())
             .collect()
     };
-    assert_eq!(ordered_section(Group::Removed), OFFICIAL_REMOVED);
-    assert_eq!(ordered_section(Group::Standalone), official_standalone());
+    let ordered_official = |names: &[&str]| -> Vec<String> {
+        names.iter().map(|name| name.to_ascii_lowercase()).collect()
+    };
+    assert_eq!(
+        ordered_section(Group::Removed),
+        ordered_official(OFFICIAL_REMOVED)
+    );
+    assert_eq!(
+        ordered_section(Group::Standalone),
+        ordered_official(&official_standalone())
+    );
 }
 
-/// The two camelCase registry spellings are the yaml/LintNames forms
-/// byte-for-byte (`prefer_iterable_whereType` /
-/// `prefer_for_elements_to_map_fromIterable`), and their machine-form
-/// rendering is the oracle's `emitMachineFormat` convention
-/// (`pkg/dartdev/lib/src/commands/analyze.dart:605`,
-/// `error.code?.toUpperCase()`) — the JSON writer emits `code.name`
-/// verbatim, the machine writer the uppercased form.
+/// The diagnostic-code-string invariant: every registered name IS the
+/// official machine code string — all-lowercase, matching the upstream
+/// `LintNames` constants (`pkg/linter/lib/src/lint_names.g.dart`, every
+/// constant lowercase) and `tool/machine/rules.json` (all 264 entries
+/// lowercase) byte-for-byte. The JSON writer emits `code.name` verbatim and
+/// the machine writer its uppercase, so `spec.name` is the single source of
+/// the emitted code on both faces. The two `package:lints` yaml spellings
+/// (`prefer_iterable_whereType`,
+/// `prefer_for_elements_to_map_fromIterable` — yaml conventions, not
+/// machine names) resolve through the case-insensitive [`rule_by_name`]
+/// like every other casing; they are not the registered form.
 #[test]
-fn camel_case_rule_names_pin_their_code_strings() {
-    for (name, machine) in [
-        ("prefer_iterable_whereType", "PREFER_ITERABLE_WHERETYPE"),
+fn registered_names_are_official_code_strings() {
+    for spec in rules() {
+        assert_eq!(
+            spec.name,
+            spec.name.to_ascii_lowercase(),
+            "{} must be the all-lowercase official diagnostic code string",
+            spec.name
+        );
+    }
+    // The two former yaml spellings stay resolvable — analysis_options
+    // files authored against `package:lints` naming keep working — but the
+    // registered (emitted) names are the machine forms.
+    for (yaml, code) in [
+        ("prefer_iterable_whereType", "prefer_iterable_wheretype"),
         (
             "prefer_for_elements_to_map_fromIterable",
-            "PREFER_FOR_ELEMENTS_TO_MAP_FROMITERABLE",
+            "prefer_for_elements_to_map_fromiterable",
         ),
     ] {
-        let id = rule_by_name(name).unwrap_or_else(|| panic!("{name} must stay registered"));
-        assert_eq!(rules()[id.0 as usize].name, name);
-        assert_eq!(name.to_uppercase(), machine);
+        let id = rule_by_name(code).unwrap_or_else(|| panic!("{code} must stay registered"));
+        assert_eq!(rules()[id.0 as usize].name, code);
+        assert_eq!(rule_by_name(yaml), Some(id), "{yaml} must still resolve");
     }
 }
 
@@ -634,9 +671,9 @@ fn rule_by_name_round_trips() {
 /// and only truly unknown names error (the `undefined_lint` face).
 #[test]
 fn rule_by_name_is_case_insensitive() {
-    let canonical = rule_by_name("prefer_iterable_whereType").expect("registered name");
+    let canonical = rule_by_name("prefer_iterable_wheretype").expect("registered name");
     for spelling in [
-        "prefer_iterable_wheretype",
+        "prefer_iterable_whereType",
         "PREFER_ITERABLE_WHERETYPE",
         "Prefer_Iterable_WhereType",
     ] {

@@ -28,6 +28,44 @@ use dartq_source::ContentId;
 /// pre-reads it to desugar const sets, which is not a scope injection.
 pub const IMPLICITLY_IMPORTED_LIBRARIES: [&str; 1] = ["core"];
 
+/// `dart:` libraries whose `library` declaration carries a `@Deprecated` /
+/// `@deprecated` annotation: library name → the annotation's message text
+/// verbatim (`""` for the bare `@deprecated`, which upstream treats as no
+/// message).
+///
+/// Source of truth: the SDK library files of the pinned oracle SDK (3.13.1)
+/// — each row mirrors the annotation on the `library` directive:
+/// `cli/cli.dart` ("The functionality of this library is incomplete and may
+/// be removed in a later version"), `html`, `indexed_db`, `svg`,
+/// `web_audio`, `web_gl` (`*/dart2js/*_dart2js.dart`, all "Use package:web
+/// and dart:js_interop instead."), `js`/`js_util` ("Use dart:js_interop
+/// instead."), and `web_sql` (`web_sql/dart2js/web_sql_dart2js.dart`, bare
+/// `@deprecated`). `io` and the `_internal` helpers carry member-level
+/// deprecations only — no library annotation — and stay out. `web_sql` is
+/// included even though no `libraries.json` segment tabulates it: the table
+/// mirrors the SDK source annotations, and the consumer's reachability gate
+/// (an unresolvable `dart:` URI never produces a usage check upstream —
+/// `pkg/analyzer/lib/src/error/element_usage_detector.dart`,
+/// `importDirective`) decides whether the row can fire.
+///
+/// Sorted by name for binary search; consumed by
+/// [`crate::deprecated_library_message`].
+pub static DEPRECATED_SDK_LIBRARIES: &[(&str, &str)] = &[
+    (
+        "cli",
+        "The functionality of this library is incomplete and may be removed \
+         in a later version",
+    ),
+    ("html", "Use package:web and dart:js_interop instead."),
+    ("indexed_db", "Use package:web and dart:js_interop instead."),
+    ("js", "Use dart:js_interop instead."),
+    ("js_util", "Use dart:js_interop instead."),
+    ("svg", "Use package:web and dart:js_interop instead."),
+    ("web_audio", "Use package:web and dart:js_interop instead."),
+    ("web_gl", "Use package:web and dart:js_interop instead."),
+    ("web_sql", ""),
+];
+
 /// A loaded SDK: parsed metadata, its canonical identity, and the dart-sdk
 /// root it was loaded from.
 ///

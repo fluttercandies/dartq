@@ -163,6 +163,31 @@ impl SdkSnapshot {
     }
 }
 
+/// The deprecation annotation message of the `dart:` library `library`
+/// (name without the `dart:` prefix), or `None` when its `library`
+/// directive carries none — the SDK-side half of upstream's
+/// `deprecated_member_use` on import directives
+/// (`pkg/analyzer/lib/src/error/element_usage_detector.dart:769`,
+/// `importDirective` → `checkUsage(node.libraryImport?.importedLibrary)`).
+///
+/// The raw annotation text is returned verbatim: `""` for a bare
+/// `@deprecated` (upstream treats it as no message). Message normalization
+/// — trim, `.`-terminated punctuation check, empty-means-none — is the
+/// reporter's own policy upstream
+/// (`pkg/analyzer/lib/src/error/deprecated_member_use_verifier.dart`,
+/// `normalizeDeprecationMessage`) and stays the consumer's call.
+///
+/// The table is snapshot-independent SDK-source metadata — every SDK ships
+/// the same library files — so this face takes no `self`; it is a free
+/// function sibling of the [`FLAT_LIBRARIES`] table.
+#[must_use]
+pub fn deprecated_library_message(library: &str) -> Option<&'static str> {
+    crate::metadata::DEPRECATED_SDK_LIBRARIES
+        .binary_search_by_key(&library, |entry| entry.0)
+        .ok()
+        .map(|index| crate::metadata::DEPRECATED_SDK_LIBRARIES[index].1)
+}
+
 /// Failure of [`SdkSnapshot::uri_to_path`]: every unresolvable `dart:` URI
 /// is an explicit error, never a silent no-op.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

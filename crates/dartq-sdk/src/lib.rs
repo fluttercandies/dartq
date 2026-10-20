@@ -48,7 +48,7 @@ mod query;
 pub use flat_libraries::FLAT_LIBRARIES;
 pub use loader::SdkError;
 pub use metadata::{
-    AllowedExperiments, IMPLICITLY_IMPORTED_LIBRARIES, Importability, SdkIdentity, SdkLibraries,
-    SdkLibrary, SdkSnapshot, TargetLibraries, UnknownExperiments,
+    AllowedExperiments, DEPRECATED_SDK_LIBRARIES, IMPLICITLY_IMPORTED_LIBRARIES, Importability,
+    SdkIdentity, SdkLibraries, SdkLibrary, SdkSnapshot, TargetLibraries, UnknownExperiments,
 };
-pub use query::SdkUriError;
+pub use query::{SdkUriError, deprecated_library_message};

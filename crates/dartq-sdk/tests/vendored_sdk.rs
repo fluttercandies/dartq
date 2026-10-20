@@ -280,3 +280,42 @@ fn allowed_experiments_map_to_feature_sets() {
     assert!(current.is_enabled(Feature::Macros));
     assert!(current.is_enabled(Feature::EnhancedParts));
 }
+
+/// The deprecated-`dart:`-library face: the frozen table mirrors every
+/// library-level `@Deprecated`/`@deprecated` annotation in the oracle SDK's
+/// `lib/` tree (3.13.1), name → raw annotation message (`""` for the bare
+/// `@deprecated`). The lookup ignores snapshot state — every SDK ships the
+/// same library files — so the pin asserts the table itself plus the
+/// query's hit/miss arms.
+#[test]
+fn deprecated_library_table_matches_the_sdk_annotations() {
+    let expected: &[(&str, &str)] = &[
+        (
+            "cli",
+            "The functionality of this library is incomplete and may be removed \
+             in a later version",
+        ),
+        ("html", "Use package:web and dart:js_interop instead."),
+        ("indexed_db", "Use package:web and dart:js_interop instead."),
+        ("js", "Use dart:js_interop instead."),
+        ("js_util", "Use dart:js_interop instead."),
+        ("svg", "Use package:web and dart:js_interop instead."),
+        ("web_audio", "Use package:web and dart:js_interop instead."),
+        ("web_gl", "Use package:web and dart:js_interop instead."),
+        ("web_sql", ""),
+    ];
+    assert_eq!(dartq_sdk::DEPRECATED_SDK_LIBRARIES, expected);
+
+    for &(name, message) in expected {
+        assert_eq!(
+            dartq_sdk::deprecated_library_message(name),
+            Some(message),
+            "{name}"
+        );
+    }
+    // Member-level deprecation only (`io`), an ordinary library (`core`),
+    // an `_internal` helper, and an unknown name all miss.
+    for name in ["io", "core", "_internal", "no_such_library"] {
+        assert_eq!(dartq_sdk::deprecated_library_message(name), None, "{name}");
+    }
+}

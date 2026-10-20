@@ -928,7 +928,7 @@ pub(crate) mod prefer_iterable_where_type {
     /// parameter as the tested expression. Message: `diagnostic.g.dart`
     /// `preferIterableWheretype`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_iterable_whereType",
+        name: "prefer_iterable_wheretype",
         group: Group::Core,
         problem: "Use 'whereType' to filter elements by type.",
         correction: "Try using 'whereType' rather than 'where'.",
@@ -1155,7 +1155,7 @@ pub(crate) mod prefer_for_elements_to_map_from_iterable {
     /// `required` keyword — and a single expression body (or one return).
     /// Message: `diagnostic.g.dart` `preferForElementsToMapFromiterable`.
     pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_for_elements_to_map_fromIterable",
+        name: "prefer_for_elements_to_map_fromiterable",
         group: Group::Recommended,
         problem: "Use 'for' elements when building maps from iterables.",
         correction: "Try using a collection literal with a 'for' element.",
@@ -2713,7 +2713,7 @@ mod tests {
     #[test]
     fn where_type_reports_a_type_test_closure() {
         let f = Fixture::parse("void f(List<int> xs) { xs.where((e) => e is int); }");
-        let lints = f.run(&one_rule("prefer_iterable_whereType"));
+        let lints = f.run(&one_rule("prefer_iterable_wheretype"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
             lints[0].message,
@@ -2728,10 +2728,10 @@ mod tests {
     #[test]
     fn where_type_not_is_and_foreign_param_pass() {
         let f = Fixture::parse("void f(List<int> xs) { xs.where((e) => e is! int); }");
-        assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+        assert!(f.run(&one_rule("prefer_iterable_wheretype")).is_empty());
 
         let f = Fixture::parse("void f(List<int> xs) { xs.where((e) => f(e) is int); }");
-        assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+        assert!(f.run(&one_rule("prefer_iterable_wheretype")).is_empty());
     }
 
     /// Two arguments and a bare untargeted `where` pass (:47-51), and the
@@ -2740,11 +2740,11 @@ mod tests {
     #[test]
     fn where_type_argument_and_receiver_faces_pass() {
         let f = Fixture::parse("void f(List<int> xs) { xs.where((e) => e is int, 1); }");
-        assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+        assert!(f.run(&one_rule("prefer_iterable_wheretype")).is_empty());
 
         let f = Fixture::parse("void f() { var x = ({'k': 1}).where((e) => e is int); }");
         assert!(
-            f.run(&one_rule("prefer_iterable_whereType")).is_empty(),
+            f.run(&one_rule("prefer_iterable_wheretype")).is_empty(),
             "a map literal is outside Iterable"
         );
     }
@@ -2763,7 +2763,7 @@ mod tests {
             "void f(List<int> xs, bool flag) { xs.where((e) => e is int && flag); }",
         );
         assert!(
-            f.run(&one_rule("prefer_iterable_whereType")).is_empty(),
+            f.run(&one_rule("prefer_iterable_wheretype")).is_empty(),
             "a binary body is no is-test"
         );
 
@@ -2771,25 +2771,25 @@ mod tests {
         let f = Fixture::parse(
             "void f(List<int> xs, bool flag) { xs.where((e) => flag ? e is int : false); }",
         );
-        assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+        assert!(f.run(&one_rule("prefer_iterable_wheretype")).is_empty());
 
         // An is-test inside a nested closure's body stays silent.
         let f = Fixture::parse(
             "void f(List<int> xs) { xs.where((e) { return xs.map((x) => x is int).length == 1; }); }",
         );
-        assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+        assert!(f.run(&one_rule("prefer_iterable_wheretype")).is_empty());
 
         // A second statement bails (`statements.length != 1`).
         let f = Fixture::parse("void f(List<int> xs) { xs.where((e) { g(); return e is int; }); }");
-        assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+        assert!(f.run(&one_rule("prefer_iterable_wheretype")).is_empty());
 
         // The parenthesized expression body and the single-return block
         // body are the is-test themselves.
         let f = Fixture::parse("void f(List<int> xs) { xs.where((e) => (e is int)); }");
-        assert_eq!(f.run(&one_rule("prefer_iterable_whereType")).len(), 1);
+        assert_eq!(f.run(&one_rule("prefer_iterable_wheretype")).len(), 1);
 
         let f = Fixture::parse("void f(List<int> xs) { xs.where((e) { return e is int; }); }");
-        assert_eq!(f.run(&one_rule("prefer_iterable_whereType")).len(), 1);
+        assert_eq!(f.run(&one_rule("prefer_iterable_wheretype")).len(), 1);
     }
 
     // —— collection_methods_unrelated_type: the A6 burn faces ——————————————
@@ -2900,7 +2900,7 @@ mod tests {
             "void f(Iterable<int> i) { Map<int, int>.fromIterable(i, key: (e) => e, value: (e) => e); }",
         );
         assert_eq!(
-            f.run(&one_rule("prefer_for_elements_to_map_fromIterable"))
+            f.run(&one_rule("prefer_for_elements_to_map_fromiterable"))
                 .len(),
             1
         );
@@ -2975,7 +2975,7 @@ mod tests {
                 b.end(NodeKind::ExpressionStatement, 23);
             }),
         );
-        let lints = f.run(&one_rule("prefer_for_elements_to_map_fromIterable"));
+        let lints = f.run(&one_rule("prefer_for_elements_to_map_fromiterable"));
         assert_eq!(lints.len(), 1);
         assert_eq!(
             lints[0].message,
@@ -3029,7 +3029,7 @@ mod tests {
             }),
         );
         assert!(
-            f.run(&one_rule("prefer_for_elements_to_map_fromIterable"))
+            f.run(&one_rule("prefer_for_elements_to_map_fromiterable"))
                 .is_empty()
         );
     }
@@ -3312,7 +3312,7 @@ class D {
     #[test]
     fn where_type_unresolved_receivers_pass() {
         let f = Fixture::parse("void f(xs) { xs.where((e) => e is int); }");
-        assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+        assert!(f.run(&one_rule("prefer_iterable_wheretype")).is_empty());
 
         let f = Fixture::parse(
             r"
@@ -3325,10 +3325,10 @@ void f(User u) {
 }
 ",
         );
-        assert!(f.run(&one_rule("prefer_iterable_whereType")).is_empty());
+        assert!(f.run(&one_rule("prefer_iterable_wheretype")).is_empty());
 
         let f = Fixture::parse("void f(List<int> xs) { xs.where((e) => e is int); }");
-        assert_eq!(f.run(&one_rule("prefer_iterable_whereType")).len(), 1);
+        assert_eq!(f.run(&one_rule("prefer_iterable_wheretype")).len(), 1);
     }
 
     /// The closure requiredness gate (:77-80): an optional positional or
@@ -3339,14 +3339,14 @@ void f(User u) {
         let f =
             Fixture::parse("void f(x) { Map.fromIterable(x, key: ([e]) => e, value: (e) => e); }");
         assert!(
-            f.run(&one_rule("prefer_for_elements_to_map_fromIterable"))
+            f.run(&one_rule("prefer_for_elements_to_map_fromiterable"))
                 .is_empty()
         );
 
         let f =
             Fixture::parse("void f(x) { Map.fromIterable(x, key: ({e}) => e, value: (e) => e); }");
         assert!(
-            f.run(&one_rule("prefer_for_elements_to_map_fromIterable"))
+            f.run(&one_rule("prefer_for_elements_to_map_fromiterable"))
                 .is_empty()
         );
 
@@ -3354,7 +3354,7 @@ void f(User u) {
             "void f(x) { Map.fromIterable(x, key: ({required e}) => e, value: (e) => e); }",
         );
         assert_eq!(
-            f.run(&one_rule("prefer_for_elements_to_map_fromIterable"))
+            f.run(&one_rule("prefer_for_elements_to_map_fromiterable"))
                 .len(),
             1
         );
@@ -3369,7 +3369,7 @@ void f(x) {
 ",
         );
         assert!(
-            f.run(&one_rule("prefer_for_elements_to_map_fromIterable"))
+            f.run(&one_rule("prefer_for_elements_to_map_fromiterable"))
                 .is_empty()
         );
     }
