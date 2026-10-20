@@ -1742,11 +1742,18 @@ impl<'a> Engine<'a> {
         // container (superclass, mixin application, or interface face —
         // `member_lookup_defining`'s climb) records the read so
         // `member_was_read` spares `unused_field` on the declaring member.
-        // Statics ride no receiver and never mark. An extension body's
-        // bare read of an `on`-type field defines on the extended
-        // container the same way (#2282 — `this` inside an extension IS
-        // the `on` type; the climb above keys on the extension's own map
-        // only).
+        // Statics mark the same: a static member of the enclosing (or
+        // inherited) container is in bare-name scope inside its body, and
+        // the official read credit (`_isReadMember`'s readMembers join)
+        // precedes its static early-return — that return only gates the
+        // override face (#2335). An extension body's bare read of an
+        // `on`-type INSTANCE field defines on the extended container the
+        // same way (#2282 — `this` inside an extension IS the `on` type;
+        // the climb above keys on the extension's own map only): the
+        // `on` type's statics stay out — no implicit receiver carries
+        // them (bare static access needs qualification, the extension's
+        // lexical scope is the library), so a static hit there is not an
+        // honest read.
         let mut field_declaring = None;
         if let Some((container, kind)) = self.container_context() {
             if let Some((found, entry)) = member_lookup_defining(
@@ -1759,7 +1766,7 @@ impl<'a> Engine<'a> {
                 name,
                 false,
             ) {
-                if entry.kind == MemberKind::Field && !entry.is_static {
+                if entry.kind == MemberKind::Field {
                     field_declaring = Some(found);
                 }
             } else if kind == ContainerKind::Extension

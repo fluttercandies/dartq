@@ -4,8 +4,9 @@
 //! `unresolvedReadMembers` credits the member scope's climb, not only the
 //! enclosing container's own map). The oracle (fvm default, probed on the
 //! `riderrepro` tree) reports nothing on `Base._f` when `Sub` reads it,
-//! still reports `unused_field` on an unread sibling field, and never
-//! credits a static field's bare-name read.
+//! still reports `unused_field` on an unread sibling field, and spares a
+//! static field's bare-name read the same way (#2335 — the official read
+//! credit precedes its static early-return).
 
 use super::*;
 use crate::collector::collect;
@@ -97,17 +98,19 @@ fn own_field_read_still_spares() {
     );
 }
 
-/// A static field's bare-name read inside the subclass rides no
-/// receiver — it must not mark the field read (upstream's
-/// `_useIdentifierElement` only credits instance members through `this`).
+/// A static field's bare-name read inside the subclass marks the field
+/// read exactly like an instance read — a static member of the inherited
+/// container is in bare-name scope, and the official read credit
+/// (`_isReadMember`'s readMembers join) precedes the static
+/// early-return, which only gates the override face (#2335).
 #[test]
-fn static_field_bare_read_does_not_spare() {
+fn static_field_bare_read_spares() {
     let rep = report(
         "class Base { static int _s = 0; }\n\
          class Sub extends Base { int m() => _s; }",
     );
     assert!(
-        !rows_for(&rep, "unused_field").is_empty(),
+        rows_for(&rep, "unused_field").is_empty(),
         "{:?}",
         rep.diagnostics
     );
@@ -124,4 +127,68 @@ fn inherited_getter_read_does_not_spare_a_field() {
     );
     let rows = rows_for(&rep, "unused_field");
     assert_eq!(rows.len(), 1, "{:?}", rep.diagnostics);
+}
+
+/// The #2335 recipe pins: static-field read credit.
+///
+/// The oracle (dart analyze, analyzer-residual triage 2026-10-20 R1) is
+/// silent whenever a private static field is READ anywhere in the
+/// library — bare same-class, qualified cross-class, or compound
+/// read-write. A write-only access never spares.
+/// #2335 shape 1: a bare read inside the declaring class spares the
+/// static (the member scope's climb now admits statics).
+#[test]
+fn static_bare_read_spares() {
+    let rep = report(
+        "class C { static const int _k = 1; int f() => _k; }",
+    );
+    assert!(
+        rows_for(&rep, "unused_field").is_empty(),
+        "{:?}",
+        rep.diagnostics
+    );
+}
+
+/// #2335 shape 2: a qualified read through the declaring container's own
+/// name (`A._k` in another class of the same library) spares the static —
+/// the `Receiver::Container` arm credits the owning container directly.
+#[test]
+fn static_qualified_cross_class_read_spares() {
+    let rep = report(
+        "class A { static const int _k = 1; }\n\
+         class B { int f() => A._k; }",
+    );
+    assert!(
+        rows_for(&rep, "unused_field").is_empty(),
+        "{:?}",
+        rep.diagnostics
+    );
+}
+
+/// #2335 shape 3: a compound read-write (`++_n`) is a read before the
+/// write — the pass-2 arm credits any non-write intent.
+#[test]
+fn static_read_write_spares() {
+    let rep = report(
+        "class C { static int _n = 0; int f() => ++_n; }",
+    );
+    assert!(
+        rows_for(&rep, "unused_field").is_empty(),
+        "{:?}",
+        rep.diagnostics
+    );
+}
+
+/// #2335 negative: a write-only access (`_k = 1`) never reads the
+/// implicit getter — the static still reports.
+#[test]
+fn static_write_only_still_reports() {
+    let rep = report(
+        "class C { static int _k = 0; void f() { _k = 1; } }",
+    );
+    assert!(
+        !rows_for(&rep, "unused_field").is_empty(),
+        "{:?}",
+        rep.diagnostics
+    );
 }
