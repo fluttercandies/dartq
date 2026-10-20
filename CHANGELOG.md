@@ -63,6 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the flow model's four base sites consume the typed seam and
   `try_promote` keeps the strict `is_subtype(t, f) && !is_subtype(f, t)`
   gate (#2204).
+- Clause-tree producer in the engine pipeline: a focused parser-listener
+  pass builds the per-clause capture trees for every generic header
+  (gated by `clauses_a_generic_head` with recovery-aware bail-outs) and
+  the pipeline swaps them in through `build_with_clauses` (#2229).
 
 ### Changed
 
@@ -294,6 +298,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the type faults); literals inside redirecting/super constructor
   argument lists stop reporting non_constant_*_element; leading-dot
   shorthands stay silent (#2215).
+- Invalid-type faces: names whose type verdict is missing intern
+  `Ty::UNKNOWN` into flow arguments (the oracle's InvalidType) instead
+  of materializing usable promotions, type-argument positions report
+  `non_type_as_type_argument`, extension instance members spare only on
+  element-attributed application credit, `for_in_of_invalid_type`
+  follows the analyzer's `_checkForEachParts` decision order, and an
+  unnamed extension's `this` binds through the frame-latched extension
+  face rank (`extension on X?` keeps `this` nullable)
+  (#2193, #2188, #2216, #2217).
+- Core-type member faces carry their operator spellings (`+ - * % ~/`
+  `<< >> >>>` over int/double/num/String/bool per the SDK declarations),
+  so comparison and arithmetic invocations on core-typed receivers stop
+  reporting `undefined_operator` (#2235).
+- Unconstrained inference yields the lattice's unknown sentinel (the
+  upstream `type_constraint.dart` posture) instead of the first
+  candidate, and GLB merges join upper bounds by GLB rather than
+  overwriting (#2234).
+- Assignability: `S <: FutureOr<T>` holds when `S <: Future<T>` or
+  `S <: T`, function signatures compare through strict slot subtyping,
+  covariant argument legs compare element-wise, unknown/invalid record
+  fields pre-scan as poison, and `Never` short-circuits async return
+  verdicts (#2240).
+- Composite boolean arguments keep their slot in the positional
+  pairing: a comparison or lazy-boolean operand window answers `bool`
+  at the composite's own extent instead of vanishing, which had shifted
+  every later argument onto the wrong formal (#2245).
+- Flow promotion for `var`-inferred locals whose initializer type
+  carries type arguments: the initializer's nullable spelled face adopts
+  whole (written argument tree included), the unresolved-nullable marker
+  takes the marker promotion, and `??=` against a constructed RHS
+  promotes through the invocation's written type-argument tree — no
+  longer leaked into the next construct's type row (#2243).
 
 ### Performance
 
@@ -312,6 +348,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The lint fan-out reuses the semantic context's token table for its
   parse instead of re-lexing every semantic-lint file — one full scan
   less per file, posture-pinned by a const assert (#2233).
+- Library surfaces store their columns as exact-sized boxed slices —
+  residency bills the slice length, not the builder's capacity slack —
+  and the engine reports ten more memory families (element models,
+  index captures, postings, warm-start, session scratch) for a full
+  residency census at 100k-file scale (#2236).
 
 ## [1.0.0] - 2026-10-12
 
