@@ -88,20 +88,39 @@ pub enum ConstantValue {
     /// const variable's declared type folds to (`const x = C();` has
     /// static type `C`).
     Created(StringId),
+    /// A symbol literal by its name (`#foo`) — equality is name equality
+    /// (the upstream `SymbolState`).
+    Symbol(StringId),
+    /// A const list by its element values — structural equality, the
+    /// upstream `ListState`.
+    List(Box<[ConstantValue]>),
+    /// A const set by its element values in source order (the upstream
+    /// `SetState` equality is order-insensitive; source order is the
+    /// written order every observed duplicate shares).
+    Set(Box<[ConstantValue]>),
+    /// A const map by its key/value pairs in source order (the upstream
+    /// `MapState` equality is order-insensitive).
+    Map(Box<[(ConstantValue, ConstantValue)]>),
+    /// A const record by its fields — positional first, named pairs
+    /// sorted by label so label order does not decide equality (the
+    /// upstream `RecordState`: shape then per-field equality).
+    Record {
+        positional: Box<[ConstantValue]>,
+        named: Box<[(StringId, ConstantValue)]>,
+    },
     /// An opaque constant instance whose identity no M2 diagnostic
     /// observes.
     Instance(InstanceKind),
 }
 
-/// The opaque-instance kinds: const collections, symbols, function
-/// tear-offs, const-constructor instances, records.
+/// The opaque-instance kinds: function tear-offs, const-constructor
+/// instances.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstanceKind {
     List,
     Set,
     Map,
     Record,
-    Symbol,
     Function,
     Object,
 }
@@ -677,16 +696,26 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
         Expr::List(parts) => eval_each(parts, lookup, InstanceKind::List, depth),
         Expr::Set(parts) => eval_each(parts, lookup, InstanceKind::Set, depth),
         Expr::Map(entries) => {
+            let mut pairs = Vec::with_capacity(entries.len());
             for (k, v) in entries {
-                for part in [k, v] {
-                    if let other @ (Verdict::Fault(..) | Verdict::NotConstant(_)
-                    | Verdict::Unresolved(_)) = fold(part, lookup, depth)
-                    {
-                        return other;
-                    }
+                match (fold(k, lookup, depth), fold(v, lookup, depth)) {
+                    (Verdict::Value(key), Verdict::Value(value)) => pairs.push((key, value)),
+                    (
+                        other @ (Verdict::Fault(..) | Verdict::NotConstant(_)
+                        | Verdict::Unresolved(_)),
+                        _,
+                    )
+                    | (
+                        _,
+                        other @ (Verdict::Fault(..) | Verdict::NotConstant(_)
+                        | Verdict::Unresolved(_)),
+                    ) => return other,
+                    // One unknown-value side leaves the whole map's value
+                    // unknown (the opaque-kind fallback).
+                    _ => return Verdict::Value(ConstantValue::Instance(InstanceKind::Map)),
                 }
             }
-            Verdict::Value(ConstantValue::Instance(InstanceKind::Map))
+            Verdict::Value(ConstantValue::Map(pairs.into()))
         }
         Expr::Record(fields) => eval_each(fields, lookup, InstanceKind::Record, depth),
         Expr::Entry(..) | Expr::Opaque => Verdict::Constant,
@@ -753,15 +782,32 @@ fn primarily_identical(a: &ConstantValue, b: &ConstantValue) -> bool {
 /// failing element's verdict propagates with its own anchor (the
 /// variable-initializer site reports at the deepest non-const construct,
 /// `constant_verifier.dart` `_evaluateAndReportError`).
+/// Folds a literal's parts in order: every part must value — one fault
+/// grades the whole literal by its own verdict, and one unknown-value
+/// part leaves the whole value unknown (the opaque-kind fallback).
 fn eval_each(parts: &[Node], lookup: &dyn ConstLookup, kind: InstanceKind, depth: u32) -> Verdict {
+    let mut values = Vec::with_capacity(parts.len());
     for part in parts {
-        if let other @ (Verdict::Fault(..) | Verdict::NotConstant(_) | Verdict::Unresolved(_)) =
-            fold(part, lookup, depth)
-        {
-            return other;
+        match fold(part, lookup, depth) {
+            Verdict::Value(value) => values.push(value),
+            Verdict::Constant => return Verdict::Value(ConstantValue::Instance(kind)),
+            other @ (Verdict::Fault(..) | Verdict::NotConstant(_) | Verdict::Unresolved(_)) => {
+                return other;
+            }
         }
     }
-    Verdict::Value(ConstantValue::Instance(kind))
+    Verdict::Value(match kind {
+        InstanceKind::List => ConstantValue::List(values.into()),
+        InstanceKind::Set => ConstantValue::Set(values.into()),
+        // Records reach eval label-less (the Expr tree keeps no labels —
+        // only the capture's value push sees them): every field rides
+        // positional.
+        InstanceKind::Record => ConstantValue::Record {
+            positional: values.into(),
+            named: Box::default(),
+        },
+        _ => ConstantValue::Instance(kind),
+    })
 }
 
 fn eval_binary(
@@ -2217,12 +2263,13 @@ impl ConstCapture {
         );
     }
 
-    /// `#foo` — a valid constant of opaque value.
-    pub fn symbol(&mut self, span: SourceRange) {
+    /// `#foo` — a valid constant, by its name (the upstream
+    /// `SymbolState` equality: same name equal, different names not).
+    pub fn symbol(&mut self, name: StringId, span: SourceRange) {
         if self.open() {
             self.push(
                 Node {
-                    expr: Expr::Value(ConstantValue::Instance(InstanceKind::Symbol)),
+                    expr: Expr::Value(ConstantValue::Symbol(name)),
                     span,
                 },
                 true,
@@ -4246,8 +4293,8 @@ mod tests {
         assert_eq!(args.len(), 1);
         assert_eq!(
             eval(&args[0], &world),
-            Verdict::Value(ConstantValue::Instance(InstanceKind::Set)),
-            "a constant set stays const-feasible for the probe"
+            Verdict::Value(ConstantValue::Set([ConstantValue::Int(1), ConstantValue::Int(2)].into())),
+            "a constant set stays const-feasible for the probe, by its element values"
         );
     }
 

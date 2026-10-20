@@ -5387,7 +5387,7 @@ impl ParserListener for DiagnoseListener<'_> {
         }
     }
 
-    fn end_literal_symbol(&mut self, hash: Token, _identifier_count: usize) {
+    fn end_literal_symbol(&mut self, hash: Token, identifier_count: usize) {
         let engine = &mut self.engine;
         // A symbol literal's static type is `Symbol`, so a following selector
         // (`#void.foo;`) resolves against it — the oracle reports the
@@ -5408,7 +5408,21 @@ impl ParserListener for DiagnoseListener<'_> {
             write_op: None,
             ty,
         });
-        engine.const_capture.symbol(hash.range);
+        // The symbol's own name (`parse_symbol_rest`): one
+        // operator/`void`/identifier token, or the dotted parts joined —
+        // the name decides the duplicate twins' equality (the upstream
+        // `SymbolState`).
+        let mut name = String::new();
+        for index in 0..identifier_count {
+            if index > 0 {
+                name.push('.');
+            }
+            if let Some(part) = engine.tokens.get((hash.id + 1 + 2 * index as u32) as usize) {
+                name.push_str(&engine.source[part.byte_range()]);
+            }
+        }
+        let name = engine.strings.intern(&name);
+        engine.const_capture.symbol(name, hash.range);
     }
 
     fn handle_adjacent_string_literals(&mut self, start: Token, literal_count: usize) {
@@ -5439,7 +5453,15 @@ impl ParserListener for DiagnoseListener<'_> {
             // at the enclosing site).
             let failed =
                 engine.check_const_elements(SemanticCode::NonConstantListElement, &elements);
-            engine.push_literal_value(failed, right.range, crate::const_eval::InstanceKind::List);
+            let payload = engine
+                .literal_payload(&elements)
+                .map(|values| ConstantValue::List(values.into()));
+            engine.push_literal_value(
+                failed,
+                right.range,
+                crate::const_eval::InstanceKind::List,
+                payload,
+            );
         }
         engine.check_list_literal_elements(left, right);
         // The literal folds to one expression node upstream: its element
@@ -5576,21 +5598,25 @@ impl ParserListener for DiagnoseListener<'_> {
                     // (`_validateMapLiteralEntry`): `non_constant_map_key` /
                     // `non_constant_map_value` at each entry's key and value.
                     let mut failed = None;
-                    for (key, value) in entries {
+                    for (key, value) in &entries {
                         for (code, part) in [
                             (SemanticCode::NonConstantMapKey, key),
                             (SemanticCode::NonConstantMapValue, value),
                         ] {
-                            let at = engine.check_const_elements(code, std::slice::from_ref(&part));
+                            let at = engine.check_const_elements(code, std::slice::from_ref(part));
                             failed = failed.or(at);
                         }
                     }
-                    engine.push_literal_value(failed, right.range, InstanceKind::Map);
+                    let payload = engine.map_payload(&entries);
+                    engine.push_literal_value(failed, right.range, InstanceKind::Map, payload);
                 }
                 SetOrMap::Set(elements) => {
                     let failed =
                         engine.check_const_elements(SemanticCode::NonConstantSetElement, &elements);
-                    engine.push_literal_value(failed, right.range, InstanceKind::Set);
+                    let payload = engine
+                        .literal_payload(&elements)
+                        .map(|values| ConstantValue::Set(values.into()));
+                    engine.push_literal_value(failed, right.range, InstanceKind::Set, payload);
                 }
             }
         }
@@ -5764,9 +5790,20 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         // `RecordLiteral` is in the official used set.
         engine.ur_seal_used();
+        // This close owns the begin-pushed names entry (the parser emits
+        // exactly one of `end_record_literal`/`end_parenthesized_expression`
+        // per `(`); leaving it would misattribute a nested literal's labels
+        // to its parent.
+        let names: Vec<StringId> = engine.record_literal_names.pop().unwrap_or_default();
         if let Some(fields) = engine.const_capture.record_literal(count, token.range) {
             let failed = engine.check_const_elements(SemanticCode::NonConstantRecordField, &fields);
-            engine.push_literal_value(failed, token.range, crate::const_eval::InstanceKind::Record);
+            let payload = engine.record_payload(&fields, &names);
+            engine.push_literal_value(
+                failed,
+                token.range,
+                crate::const_eval::InstanceKind::Record,
+                payload,
+            );
         }
         // The literal's row: a single positional field whose type the field
         // window decides carries the record shape (`const(x-1)`'s `(int,)`),
@@ -7471,6 +7508,127 @@ fn top_level_comma_segments(
     segments
 }
 
+/// The byte just past the matching `>` of the type-argument group opening
+/// at `lt`, when the `<` opens a genuine `<...>` type group rather than a
+/// comparison. The scan folds nested `<>` and accepts only type-permissible
+/// bytes between the angles; the closing `>` must be followed by a token a
+/// typed literal or type-use admits — `{` (typed literal body),
+/// `(`/`,`/`)`/`]`/`}`/`:`/`;`/`=`/`>` or end-of-span. Any operator byte,
+/// or a `>` followed by an operand (a comparison's right side), returns
+/// `None`, leaving the `<`/`>` a plain comparison.
+fn angle_group_end(bytes: &[u8], lt: usize, end: usize) -> Option<usize> {
+    debug_assert_eq!(bytes[lt], b'<');
+    let mut depth = 0usize;
+    let mut i = lt;
+    while i < end {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    let mut j = i + 1;
+                    while j < end && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    return match bytes.get(j) {
+                        None | Some(b',') | Some(b'}') | Some(b')') | Some(b']')
+                        | Some(b'{') | Some(b'(') | Some(b':') | Some(b';')
+                        | Some(b'=') | Some(b'>') => Some(i + 1),
+                        _ => None,
+                    };
+                }
+            }
+            // Anything outside a type-use's byte set disqualifies the group:
+            // strings, arithmetic/comparison/logical operators, brackets.
+            b'\'' | b'"' | b'!' | b'&' | b'|' | b'+' | b'-' | b'*' | b'/'
+            | b'%' | b'^' | b'=' | b'~' | b'(' | b')' | b'[' | b']' | b'{'
+            | b'}' | b':' | b';' => return None,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Top-level comma segments between `start` and `end` for a literal's
+/// element list: bracket depth over `()[]{}`, string contents skipped, and
+/// a genuine `<...>` type-argument group folded into the depth so a typed
+/// literal's value (`key: <int, dynamic>{}`) stays a single leaf. A
+/// comparison's `<`/`>` (no valid group per [`angle_group_end`]) does NOT
+/// fold — `a < b, c > d` still splits on its element commas.
+fn literal_comma_segments(bytes: &[u8], start: usize, end: usize) -> Vec<(usize, usize)> {
+    let mut segments = Vec::new();
+    let mut seg_start = start;
+    let mut i = start;
+    let mut depth = 0usize;
+    while i < end {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'<' => {
+                if let Some(close) = angle_group_end(bytes, i, end) {
+                    i = close;
+                    continue;
+                }
+            }
+            b',' if depth == 0 => {
+                segments.push((seg_start, i));
+                seg_start = i + 1;
+            }
+            b'/' => {
+                if let Some(after) = comment_end(bytes, i, end) {
+                    i = after;
+                    continue;
+                }
+            }
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < end && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    segments.push((seg_start, end));
+    segments
+}
+
+/// The byte just past the comment opening at `i` (`//` runs to the end of
+/// the line, `/*` to its `*/`), or `None` when `i` is no comment head.
+/// Upstream reads elements from the AST, where comments do not exist; a
+/// comment's `:`/`,`/`<` bytes must not steer the byte scans.
+fn comment_end(bytes: &[u8], i: usize, end: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&b'/') {
+        return None;
+    }
+    match bytes.get(i + 1) {
+        Some(b'/') => {
+            let mut j = i + 2;
+            while j < end && bytes[j] != b'\n' {
+                j += 1;
+            }
+            Some(j)
+        }
+        Some(b'*') => {
+            let mut j = i + 2;
+            while j + 1 < end {
+                if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+                    return Some(j + 2);
+                }
+                j += 1;
+            }
+            Some(end)
+        }
+        _ => None,
+    }
+}
+
 /// The first top-level `:` in `[start, end)`, or `None`.
 fn top_level_colon(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
     let mut i = start;
@@ -7480,6 +7638,12 @@ fn top_level_colon(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth = depth.saturating_sub(1),
             b':' if depth == 0 => return Some(i),
+            b'/' => {
+                if let Some(after) = comment_end(bytes, i, end) {
+                    i = after;
+                    continue;
+                }
+            }
             b'\'' | b'"' => {
                 let quote = bytes[i];
                 i += 1;
@@ -7506,6 +7670,12 @@ fn top_level_question(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth = depth.saturating_sub(1),
             b'?' if depth == 0 => return Some(i),
+            b'/' => {
+                if let Some(after) = comment_end(bytes, i, end) {
+                    i = after;
+                    continue;
+                }
+            }
             b'\'' | b'"' => {
                 let quote = bytes[i];
                 i += 1;
@@ -7982,7 +8152,7 @@ impl Engine<'_> {
         let start = self.byte_of(left.range.end());
         let end = self.byte_of(right.range.offset);
         let mut leaves = Vec::new();
-        let mut work: Vec<(usize, usize)> = top_level_comma_segments(bytes, start, end, false);
+        let mut work: Vec<(usize, usize)> = literal_comma_segments(bytes, start, end);
         while let Some((s, e)) = work.pop() {
             let s = trim_ws(bytes, s, e);
             if s >= e {

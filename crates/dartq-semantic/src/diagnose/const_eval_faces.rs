@@ -448,7 +448,13 @@ impl<'a> Engine<'a> {
             ConstantValue::Enum { container, .. } | ConstantValue::Created(container) => {
                 Ty::named(*container)
             }
-            ConstantValue::Type(_) | ConstantValue::Instance(_) => Ty::UNKNOWN,
+            ConstantValue::Type(_)
+            | ConstantValue::Symbol(_)
+            | ConstantValue::List(_)
+            | ConstantValue::Set(_)
+            | ConstantValue::Map(_)
+            | ConstantValue::Record { .. }
+            | ConstantValue::Instance(_) => Ty::UNKNOWN,
         }
     }
 
@@ -1992,16 +1998,20 @@ impl<'a> Engine<'a> {
     }
 
     /// Pushes a closed const literal's value onto the capture: its
-    /// instance when every element was constant, else a non-constant leaf
-    /// anchored at the first failing element (so the enclosing
-    /// initializer's verdict reports there). Inside a creation's argument
-    /// list the failure stays local — the oracle's argument faces there
-    /// are `invalid_constant`, which this face does not model.
+    /// structural value when every element was constant and known
+    /// (`payload` — the duplicate twins compare by value), the
+    /// opaque-kind instance when any element's value is unknown, else a
+    /// non-constant leaf anchored at the first failing element (so the
+    /// enclosing initializer's verdict reports there). Inside a
+    /// creation's argument list the failure stays local — the oracle's
+    /// argument faces there are `invalid_constant`, which this face does
+    /// not model.
     pub(crate) fn push_literal_value(
         &mut self,
         failed: Option<SourceRange>,
         end: SourceRange,
         kind: crate::const_eval::InstanceKind,
+        payload: Option<ConstantValue>,
     ) {
         // The ERROR-tier duplicate twins of a const literal (#2261): the
         // capture staged this literal's parts at its close; the oracle's
@@ -2016,8 +2026,69 @@ impl<'a> Engine<'a> {
             }
             _ => self
                 .const_capture
-                .push_value(end, ConstantValue::Instance(kind)),
+                .push_value(end, payload.unwrap_or(ConstantValue::Instance(kind))),
         }
+    }
+
+    /// The closed literal's structural value: every element's folded
+    /// value in order, `None` when any element is of unknown value (the
+    /// opaque-kind fallback — the duplicate twins must not decide on a
+    /// partial value).
+    pub(crate) fn literal_payload(
+        &mut self,
+        parts: &[crate::const_eval::Node],
+    ) -> Option<Vec<ConstantValue>> {
+        parts
+            .iter()
+            .map(|part| match eval(part, self) {
+                Verdict::Value(value) => Some(value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The map literal's structural value: every entry's key/value pair
+    /// in order, `None` when any side is of unknown value (the
+    /// opaque-kind fallback).
+    pub(crate) fn map_payload(
+        &mut self,
+        entries: &[(crate::const_eval::Node, crate::const_eval::Node)],
+    ) -> Option<ConstantValue> {
+        entries
+            .iter()
+            .map(|(key, value)| match (eval(key, self), eval(value, self)) {
+                (Verdict::Value(key), Verdict::Value(value)) => Some((key, value)),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|pairs| ConstantValue::Map(pairs.into()))
+    }
+
+    /// The record literal's structural value from its staged fields and
+    /// the literal's named labels (the trailing `names.len()` fields are
+    /// the named pairs, in source order — the same split
+    /// `record_field_tys` reads): positional fields first, named pairs
+    /// sorted by label so written order never decides equality (the
+    /// upstream `RecordState` compares the named map). `None` when any
+    /// field is of unknown value.
+    pub(crate) fn record_payload(
+        &mut self,
+        fields: &[crate::const_eval::Node],
+        names: &[StringId],
+    ) -> Option<ConstantValue> {
+        let named = names.len();
+        if named > fields.len() {
+            return None;
+        }
+        let mut values = self.literal_payload(fields)?;
+        let tail = values.split_off(values.len() - named);
+        let mut pairs: Vec<(StringId, ConstantValue)> =
+            names.iter().copied().zip(tail).collect();
+        pairs.sort_by_key(|(name, _)| *name);
+        Some(ConstantValue::Record {
+            positional: values.into(),
+            named: pairs.into(),
+        })
     }
 
     /// The const-literal twin of [`Self::check_equal_duplicates`] (the
