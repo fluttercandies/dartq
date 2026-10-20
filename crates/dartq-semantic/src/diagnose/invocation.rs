@@ -1910,17 +1910,31 @@ impl<'a> Engine<'a> {
         let mark = level.mark;
         let hi = self.rows.len();
         let name = level.pending_name;
-        let hi = self.rows.len();
         let arg = if hi == mark {
             None
         } else {
             match self.rows.get(mark).filter(|_| hi == mark + 1) {
-                Some(row) => Some((
-                    row.ty,
-                    Self::primitive_literal(row, &self.members.primitive_ids),
-                    row.range,
-                    self.tear_off_sig(row),
-                )),
+                Some(row) => {
+                    // A const creation's inner literal is the creation's
+                    // own argument, never the enclosing call's value: the
+                    // oracle types `f(const Constant(null))`'s argument
+                    // with the creation's downward-instantiated container
+                    // (its own faces own the `null`), so the fallback
+                    // literal type must not leak into the outer check
+                    // (`Expression<D>`'s `null` vs `Expression<D>` row the
+                    // oracle never writes). The unknown posture stays
+                    // silent exactly where the oracle's creation-typed
+                    // argument is.
+                    let covered =
+                        row.ty == Ty::Null && self.const_capture.creation_covers(row.range.offset);
+                    let ty = if covered { Ty::UNKNOWN } else { row.ty };
+                    Some((
+                        ty,
+                        Self::primitive_literal(row, &self.members.primitive_ids),
+                        row.range,
+                        self.tear_off_sig(row),
+                    ))
+                }
                 None => match self.composite_bool_arg(mark, hi) {
                     Some((ty, range)) => Some((ty, false, range, None)),
                     None => Some((
@@ -1944,6 +1958,35 @@ impl<'a> Engine<'a> {
                 self.arg_sigs.insert(range.offset, sig);
             }
             level.args.push((name, ty, literal, range));
+        }
+    }
+
+    /// The implicit-`call` invocation face: a value invocation `v(args)`
+    /// whose static type names a container declaring a `call` method
+    /// resolves to `v.call` — the interface member answers even when
+    /// abstract (the xml corpus's `XPathExpression.call`). The member must
+    /// be an instance method; a generic container instantiation and every
+    /// function-typed alias keep their own faces (`None`). Returns the
+    /// call method's formals and declared return type.
+    fn implicit_call_face(&self, ty: Ty) -> Option<(Formals, Ty)> {
+        let Ty::Named {
+            name: container,
+            args: ArgListId::EMPTY,
+            ..
+        } = self.fold_alias_ty(ty)
+        else {
+            return None;
+        };
+        let call = self.intern("call");
+        match self.walk_members(container, call) {
+            Walk::Found(entry) if entry.kind == MemberKind::Method && !entry.is_static => {
+                let (formals, return_ty) = match &entry {
+                    Projected::Own(e) => (e.formals.as_deref()?.clone(), e.return_ty),
+                    Projected::Foreign(e) => (e.formals.as_deref()?.to_owned(), e.return_ty),
+                };
+                Some((formals, return_ty))
+            }
+            _ => None,
         }
     }
 
@@ -3513,6 +3556,19 @@ impl<'a> Engine<'a> {
                 .map(std::borrow::Cow::into_owned),
             _ => None,
         };
+        // The implicit-`call` face (the member placeholder's type names a
+        // container whose `call` method answers): the invocation checks
+        // against the call method's formals — `body(inner)` over
+        // `XPathExpression body` checks `inner` against
+        // `XPathContext` (`XPathExpression.call`'s formal), the oracle's
+        // FunctionExpressionInvocation `.call` resolution.
+        let formals = formals.or_else(|| {
+            let row = self.rows.get(callee)?;
+            row.qualified
+                .then(|| self.implicit_call_face(row.ty))
+                .flatten()
+                .map(|(formals, _)| formals)
+        });
         let Some(formals) = formals else {
             return;
         };
@@ -4436,6 +4492,20 @@ impl<'a> Engine<'a> {
             && row.intent == Intent::Read
         {
             row.intent = Intent::Invoke;
+        }
+        // The implicit-`call` result type: a member value invocation whose
+        // type names a container with a `call` method yields the method's
+        // return type — `return body(inner)` reads `XPathSequence`
+        // (`XPathExpression.call`'s), never the receiver's own
+        // `XPathExpression` (the oracle's `.call` resolution types the
+        // invocation node with the called member's return). A `Never`-typed
+        // member keeps its own face (the dead-flow arm above reads it).
+        if let Some(row) = self.rows.get(callee)
+            && row.qualified
+            && !self.is_never_ty(row.ty)
+            && let Some((_, call_ret)) = self.implicit_call_face(row.ty)
+        {
+            self.rows[callee].ty = call_ret;
         }
         // The function-position face (`function_expression_invocation_
         // resolver.dart:131`): the invoked expression's own static type —

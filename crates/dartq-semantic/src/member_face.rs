@@ -961,9 +961,9 @@ pub(crate) const COLLECTION_INTERFACE_ALIASES: [(&str, &[&str]); 36] = [
 /// is the unnamed-face entry (`pragma(` calls the const factory `pragma`,
 /// which redirects to `pragma._`), and the named spellings cover the
 /// factory/generative selectors (`Deprecated.implement`, `bool.fromEnvironment`).
-/// Asserted against upstream `pkg:core` — a container absent here falls
-/// through to the indexed-container walk unchanged.
-pub(crate) const CORE_CONST_CTOR: [(&str, &[&str]); 15] = [
+/// Asserted against upstream `pkg:core` and `pkg:async` — a container
+/// absent here falls through to the indexed-container walk unchanged.
+pub(crate) const CORE_CONST_CTOR: [(&str, &[&str]); 16] = [
     ("bool", &["fromEnvironment", "hasEnvironment"]),
     ("Deprecated", &["", "extend", "implement", "instantiate", "mixin", "optional", "subclass"]),
     ("Duration", &[""]),
@@ -976,6 +976,7 @@ pub(crate) const CORE_CONST_CTOR: [(&str, &[&str]); 15] = [
     ("OutOfMemoryError", &[""]),
     ("pragma", &[""]),
     ("StackOverflowError", &[""]),
+    ("Stream", &["empty"]),
     ("String", &["fromEnvironment"]),
     ("Symbol", &[""]),
     ("_Enum", &[""]),

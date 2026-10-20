@@ -1652,6 +1652,14 @@ struct ArgLevel {
     /// `windows.len()` at open — an argument list is its window's own
     /// when no level of the same window remains below it.
     window_seq: usize,
+    /// The callee identifier arrived through a dot selector
+    /// (`ExpressionContinuation`): only a selector has a receiver, so
+    /// only its close may extend the call span back over the stack's
+    /// top node (`x.f(`). A bare-expression callee (`f(`, `C(` — and a
+    /// call element following a sibling list element, `[
+    /// missing, Missing() ]`) has no receiver: the neighboring node is
+    /// an unrelated operand, never part of the call.
+    selector_callee: bool,
 }
 
 /// The listener-facing capture half: folds expression events into a tree
@@ -1691,6 +1699,16 @@ pub struct ConstCapture {
     /// that a type-declaration host retracts there (the probed host
     /// split — the element check has no host view, the drain does).
     annotation_leaves: Vec<(SourceRange, bool)>,
+    /// The selector flag the next `begin_arguments` latches onto its
+    /// level (the just-pushed callee ident was a dot selector).
+    selector_callee: bool,
+    /// The explicit `const C(...)` creation spans (`const` keyword
+    /// through the closing token): an argument value folded inside one
+    /// belongs to the creation, not to the enclosing call — the
+    /// resolution-side argument faces read the creation's container
+    /// type, never an inner literal's (`isExp(const Constant(null))`
+    /// checks `Constant`, not `null`).
+    creation_spans: Vec<SourceRange>,
 }
 
 /// The closed argument list of a call whose const-ness the engine
@@ -1753,6 +1771,8 @@ impl ConstCapture {
             opaque_marks: Vec::new(),
             staged_dups: Vec::new(),
             annotation_leaves: Vec::new(),
+            selector_callee: false,
+            creation_spans: Vec::new(),
         }
     }
 
@@ -2169,6 +2189,25 @@ impl ConstCapture {
         if !self.open() {
             return;
         }
+        self.selector_callee = false;
+        self.push(
+            Node {
+                expr: Expr::Ident(name),
+                span,
+            },
+            false,
+        );
+    }
+
+    /// A dot-selector identifier (`x.f(`'s `f`): the same operand push as
+    /// [`Self::identifier`], plus the selector flag the call's
+    /// `begin_arguments` latches — a selector's close may extend the call
+    /// span over the stack's receiver node, a bare callee's may not.
+    pub fn selector_identifier(&mut self, name: StringId, span: SourceRange) {
+        if !self.open() {
+            return;
+        }
+        self.selector_callee = true;
         self.push(
             Node {
                 expr: Expr::Ident(name),
@@ -2619,6 +2658,24 @@ impl ConstCapture {
         taken
     }
 
+    /// Records one explicit `const C(...)` creation's written span (the
+    /// `const` keyword through the creation's closing token). File-bounded
+    /// like the operand stack: one entry per written creation, consumed
+    /// only through the read-only [`Self::creation_covers`].
+    pub fn note_creation_span(&mut self, span: SourceRange) {
+        self.creation_spans.push(span);
+    }
+
+    /// Whether `offset` sits inside a recorded const creation: an
+    /// argument row folding there belongs to the creation's own
+    /// evaluation — the resolution-side faces read the creation's
+    /// container type, never the inner literal's.
+    pub fn creation_covers(&self, offset: u32) -> bool {
+        self.creation_spans
+            .iter()
+            .any(|span| span.offset <= offset && offset < span.end())
+    }
+
     /// Pops the staged const-literal parts whose shape matches `want`
     /// (the engine calls it at the literal's value push — LIFO pairs the
     /// staging with its own literal; a mismatched top stays for recovery
@@ -2768,6 +2825,7 @@ impl ConstCapture {
             args: Vec::new(),
             named: Vec::new(),
             window_seq: self.windows.len(),
+            selector_callee: std::mem::take(&mut self.selector_callee),
         });
     }
 
@@ -2936,18 +2994,26 @@ impl ConstCapture {
                 // two) extends the span back to it. A binary/conditional
                 // operand at the same position (`x + f()`, `c ? f() : y`)
                 // is latched, not a receiver — the latches discriminate
-                // where the byte-gap cannot.
-                let offset = self
-                    .stack
-                    .last()
-                    .filter(|prev| {
-                        let mark = self.stack.len() - 1;
-                        let gap = node.span.offset.saturating_sub(prev.span.end());
-                        (1..=3).contains(&gap)
-                            && !self.bin_latches.iter().any(|&(_, m, _)| m == mark)
-                            && !self.cond_latches.iter().any(|&(m, _)| m == mark)
-                    })
-                    .map_or(node.span.offset, |prev| prev.span.offset);
+                // where the byte-gap cannot. Only a selector callee may
+                // take the extension: a bare `f(` has no receiver, so a
+                // small gap to the stack's top node is a sibling operand
+                // (`[missing, Missing()]`'s preceding element, `C.n(`'s
+                // receiver above an inner argument) whose span must not
+                // widen the call.
+                let offset = if level.selector_callee {
+                    self.stack
+                        .last()
+                        .filter(|prev| {
+                            let mark = self.stack.len() - 1;
+                            let gap = node.span.offset.saturating_sub(prev.span.end());
+                            (1..=3).contains(&gap)
+                                && !self.bin_latches.iter().any(|&(_, m, _)| m == mark)
+                                && !self.cond_latches.iter().any(|&(m, _)| m == mark)
+                        })
+                        .map_or(node.span.offset, |prev| prev.span.offset)
+                } else {
+                    node.span.offset
+                };
                 let span = SourceRange {
                     offset,
                     length: end.end().saturating_sub(offset),

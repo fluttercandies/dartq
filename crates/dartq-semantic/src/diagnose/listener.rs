@@ -1771,7 +1771,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     // token is the send's end).
                     engine.nsm_member_name(token);
                     engine.push_member(name, token.range);
-                    engine.const_capture.identifier(name, token.range);
+                    engine.const_capture.selector_identifier(name, token.range);
                 }
             }
             C::TypeReference | C::TypeReferenceContinuation => {
@@ -3577,8 +3577,20 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.const_kw_spans.push(const_keyword.range);
     }
 
-    fn end_const_expression(&mut self, _token: Token) {
+    fn end_const_expression(&mut self, token: Token) {
         let engine = &mut self.engine;
+        // The creation's written span (`const` keyword through the closing
+        // token): an argument row folding inside belongs to the creation's
+        // own evaluation — the resolution-side argument faces read the
+        // creation's container type, never an inner literal's (`isExp(const
+        // Constant(null))` checks `Constant`, not `null`).
+        if let Some(kw) = engine.const_kw_spans.last().copied() {
+            let span = SourceRange {
+                offset: kw.offset,
+                length: token.range.end().saturating_sub(kw.offset),
+            };
+            engine.const_capture.note_creation_span(span);
+        }
         engine.const_kw_spans.pop();
         // The `const_with_non_const` face: a const creation whose target
         // resolves to a container without a const constructor reports at
