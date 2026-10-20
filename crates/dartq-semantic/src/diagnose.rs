@@ -3521,3 +3521,14 @@ mod ticket_2359_tests;
 /// receivers keep reporting.
 #[cfg(test)]
 mod ticket_2328_tests;
+
+/// The #2348 differential pins: the RETURN_OF_INVALID_TYPE over-fire
+/// census classified per line — every d-only line's actual side carried a
+/// recovery artifact (the collapsed nested literal argument, the
+/// unpromoted record field or callable field/local, the implicit-`call`
+/// callee type) whose pair an oracle-reported twin shares, so the pins
+/// lock the resolved silence beside the earned twins — plus the P0
+/// pool-guard panic fix (`covariant_args`' narrow borrow) driving the
+/// full instantiated-alias recursion to its verdict.
+#[cfg(test)]
+mod ticket_2348_tests;

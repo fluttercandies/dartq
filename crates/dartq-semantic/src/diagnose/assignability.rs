@@ -2550,8 +2550,15 @@ impl<'a> Engine<'a> {
     /// mismatch is the `wrong_number` family's written residue; the
     /// assignability face stays silent on it.
     pub(crate) fn covariant_args(&self, from: ArgListId, to: ArgListId) -> Option<bool> {
-        let pool = self.boundary.pool();
-        let (from, to) = (pool.get(from), pool.get(to));
+        // The narrow borrow ([`Engine::function_shape_sig`]'s pattern): the
+        // slots copy out and the pool guard drops before the element
+        // verdicts — each re-enters [`Engine::assignable`] and the chain
+        // below it interns into the same pool (`intern_list`'s
+        // `borrow_mut`), which a live `Ref` here would panic against.
+        let (from, to) = {
+            let pool = self.boundary.pool();
+            (pool.get(from).to_vec(), pool.get(to).to_vec())
+        };
         if from.len() != to.len() {
             return None;
         }
