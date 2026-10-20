@@ -228,6 +228,16 @@ pub(crate) enum Frame {
         /// chain state updates at the pattern close, so the row cannot be
         /// recomputed there).
         pending_matched: Option<(Ty, u32)>,
+        /// A switch expression's latched case-value types: one per
+        /// alternative's body value, taken at its `SwitchExprCaseEnd` and
+        /// joined at `SwitchExprBlockEnd` into the expression's type
+        /// (upstream Dart SDK source, pkg/analyzer/lib/src/dart/ast/
+        /// ast.dart `SwitchExpressionImpl.staticType`'s arm fold — the
+        /// name-level join here is [`Interp::name_lub`], the same join
+        /// `??` carries; the real hierarchy's LUB stays the resolved
+        /// back-end's question). Empty for statement switches and
+        /// recovered case-less blocks.
+        expr_case_tys: Vec<Ty>,
         /// A `CaseExprEnd` was seen: the group awaits its first body event
         /// (one-event lookahead closes the alternatives there).
         case_open: bool,
@@ -448,6 +458,12 @@ impl Expr {
 /// eligibility per upstream `ThisPropertyTarget`,
 /// `flow_analysis.dart:5977-5990`).
 pub(crate) const THIS_RECEIVER: u32 = u32::MAX - 1;
+
+/// Recursion budget for the always-exhaustive bound walk
+/// ([`Interp::is_always_exhaustive`]). A well-formed `extends` chain is
+/// far shorter than this; the budget only bounds the spelling-level cycle
+/// an ill-formed `T extends U, U extends T` would otherwise spin on.
+const BOUND_RECURSION_LIMIT: u8 = 16;
 
 /// One open null-shorting context (official `_NullAwareAccessContext`,
 /// flow_analysis.dart:9664): the skip path captured at the `?.`/`?[`/`?..`
@@ -1740,15 +1756,36 @@ impl<'o> Interp<'o> {
     /// mirrors the official decision order over the recorder's
     /// declaration capture ([`ClosedNames`]): `Null` and `bool` split
     /// completely, enums and sealed classes are closed by their element
-    /// faces, and `FutureOr<T>` recurses into its argument. Extension types
-    /// (erasure recursion), type parameters (bound recursion), records, and
-    /// function types are undecidable at this level — `false`, the
-    /// conservative arm: a missed verdict keeps the post-switch state live
-    /// (the pre-mount behavior), never a false dead report. Nullability is
-    /// agnostic exactly like the official's `InterfaceType` arm — `S?` of
-    /// a sealed `S` is still always-exhaustive (the null half is the
-    /// space model's split, not this gate's).
+    /// faces, `FutureOr<T>` recurses into its argument, and a type
+    /// parameter recurses into its bound (the official
+    /// `TypeParameterTypeImpl` arm, :868-877) — `T extends St` over the
+    /// enum `St` splits completely, so a full-coverage switch over `T`
+    /// leaves the post-switch state dead. The bound is the *declared* one
+    /// ([`crate::ty::Boundary::bound`]): the promoted-bound half of that
+    /// arm is not modelled, which keeps the verdict a conservative subset
+    /// (a promotion the level cannot see answers `false`). Extension types
+    /// (erasure recursion), records, and function types stay undecidable
+    /// at this level — `false`, the conservative arm: a missed verdict
+    /// keeps the post-switch state live (the pre-mount behavior), never a
+    /// false dead report. Nullability is agnostic exactly like the
+    /// official's `InterfaceType` arm — `S?` of a sealed `S` is still
+    /// always-exhaustive (the null half is the space model's split, not
+    /// this gate's).
     pub(crate) fn is_always_exhaustive(&self, ty: Ty, args: u32) -> bool {
+        self.exhaustive_within(ty, args, BOUND_RECURSION_LIMIT)
+    }
+
+    /// [`Interp::is_always_exhaustive`] with a recursion budget. The
+    /// official recurses unguarded over resolved elements, whose bounds
+    /// the type system keeps well-founded; the recorder's table is
+    /// spelling-level, so an ill-formed `T extends U, U extends T` (which
+    /// the oracle rejects as `type_parameter_supertype_of_its_bound`)
+    /// would cycle. The budget makes the walk structurally terminating —
+    /// an exhausted chain answers `false`, the conservative arm.
+    fn exhaustive_within(&self, ty: Ty, args: u32, budget: u8) -> bool {
+        if budget == 0 {
+            return false;
+        }
         if self
             .ops
             .is_always_exhaustive(ty, args, self.args, self.names)
@@ -1765,15 +1802,26 @@ impl<'o> Interp<'o> {
             && let Some(row) = self.args.get(args as usize)
             && let [arg] = row.as_slice()
         {
-            return self.is_always_exhaustive(
+            return self.exhaustive_within(
                 Ty {
                     base: arg.base,
                     nullable: arg.nullable,
                 },
                 arg.args,
+                budget - 1,
             );
         }
-        false
+        // The `TypeParameterTypeImpl` arm (:868-877): a name that captured
+        // a declared bound at parse time is a type parameter, and the
+        // verdict is its bound's.
+        self.boundaries
+            .get(id as usize)
+            .copied()
+            .flatten()
+            .is_some_and(|boundary| {
+                let (bound, bound_args) = boundary.bound;
+                self.exhaustive_within(bound, bound_args, budget - 1)
+            })
     }
 
     // —— collect runs ——————————————————————————————————————————————————

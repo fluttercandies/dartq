@@ -7776,3 +7776,245 @@ fn assert_message_reads_the_condition_false_state() {
     });
     assert!(promoted, "{source:?}");
 }
+
+
+// -- #2311 face pins ------------------------------------------------------------
+
+/// ② `x = x ?? const []` writes the LHS's non-null face *with its written
+/// argument tree*, so the read after the self-assign reports a real
+/// promotion (the `argument_type_not_assignable` verdict at
+/// `intl/lib/message_lookup_by_library.dart:134` hinged on it).
+///
+/// Mechanism: `Expr::trivial` left the `??` result argument-less
+/// (`EMPTY_ARGS` = the raw-type face), so `List<Object>? x`'s write
+/// recorded `List<dynamic>` — not a subtype of the declared `List<Object>`
+/// — and the type-of-interest re-promotion dropped. The `??` fold now
+/// recovers the LHS read's argument tree when the result lands on the
+/// promoted left side (its `promote_to_non_null` head matches the joined
+/// result type), falling back to the empty tree for a composite LHS
+/// (`f() ?? d`, `a.b ?? d`) the head cannot attribute.
+#[test]
+fn if_null_self_assign_promotes_with_the_written_arguments() {
+    // `x` reads its promoted non-null `List` carrying the written `<Object>`
+    // — the pairing a resolved back-end stages as `List<Object>`.
+    let source = "void f(List<Object>? x) { x = x ?? const []; x; }";
+    let (flow, facts) = analyze(source);
+    let flow = flow.0.borrow();
+    let promoted: Vec<(crate::ty::Ty, Vec<String>)> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::PromotedRead { ty, args, .. } => Some((
+                *ty,
+                flow.type_args_at(*args)
+                    .iter()
+                    .map(|a| match a.base {
+                        crate::ty::Base::Name(id) => flow.name_lexeme(id).to_string(),
+                        other => panic!("named spelling expected, got {other:?}"),
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(promoted.len(), 1, "{facts:?}");
+    assert!(!promoted[0].0.nullable, "{promoted:?}");
+    assert_eq!(promoted[0].1, vec!["Object".to_string()], "{promoted:?}");
+}
+
+#[test]
+fn if_null_non_literal_rhs_keeps_the_nullable_join() {
+    // `x ?? y` where `y`'s nullability is undecided: the LUB join widens
+    // back to nullable, so the write records no promotion.
+    let source = "void f(List<Object>? x, List<Object>? y) { x = x ?? y; x; }";
+    assert!(
+        promoted_tys(source).is_empty(),
+        "{:?}",
+        promoted_tys(source)
+    );
+}
+
+#[test]
+fn if_null_inside_other_assign_touches_no_var() {
+    // `y = x ?? const []` writes `y`, never `x`: the RHS's own head is the
+    // written face, and `x` keeps its declared nullable read.
+    let source = "void f(List<Object>? x, List<Object>? y) { y = x ?? const []; x; }";
+    assert!(
+        promoted_tys(source).is_empty(),
+        "{:?}",
+        promoted_tys(source)
+    );
+}
+
+/// ③ `case final v?:` on a possibly-null matched value promotes the matched
+/// arm non-null and joins the pre-pattern `current` into the unmatched
+/// chain (official `_handleNullTestPattern(matchesIfNull: false)`:
+/// `_unmatched = _join(_unmatched!, _current)` — the state *before* the
+/// promotion, still nullable on the null path). Joining the promoted state
+/// instead carried the non-null face into the next clause's entry and
+/// killed a later `case null:` arm (the riverpod `notifier_provider.dart`
+/// shape). At the flow layer this reads as: the `case null` arm stays
+/// reachable, so its body emits no dead-code row.
+#[test]
+fn null_check_pattern_joins_the_pre_pattern_state() {
+    let source = "\
+void f(Object? x) {
+  switch (x) {
+    case final y?:
+      1;
+    case null:
+      2;
+  }
+}";
+    assert!(dead_snippets(source).is_empty(), "{source:?}");
+}
+
+/// ③ boundary arm: a matched value already non-null makes `sub?` a
+/// guaranteed match — the official touches neither `_current` nor
+/// `_unmatched`, so a later arm's entry state is unchanged and no
+/// promotion is recorded.
+#[test]
+fn null_check_pattern_on_a_non_null_matched_value_is_a_no_op() {
+    let source = "\
+void f(Object x) {
+  switch (x) {
+    case final y?:
+      1;
+    case _:
+      2;
+  }
+}";
+    assert!(dead_snippets(source).is_empty(), "{source:?}");
+    assert!(promoted_tys(source).is_empty(), "{source:?}");
+}
+
+/// ④ A `Function`-typed operand's `is` test against a function type: the
+/// true-arm read promotes to the non-null tested type, the else-arm read
+/// sees the declared nullable face. This is the name-level pin of the
+/// drift `async.dart:15` face; the semantic layer's over-report in a
+/// resolved-`FutureOr` world (a `FutureOr<F>` operand whose resolved face
+/// vacuously subtypes `Function`) is a documented residual — the fix sites
+/// sit outside this lane's scope (signature-aware `is_subtype_typed` in
+/// the resolved ops back-end).
+#[test]
+fn function_is_test_splits_the_arms() {
+    let source = "void f(void Function(int)? g) { if (g is void Function(int)) { g; } else { g; } }";
+    let promoted = promoted_tys(source);
+    // True arm: the non-null `void Function(int)` face. Else arm: the
+    // subtracted `Null` remainder reads as the nullable `Never` face
+    // (`promote_to_non_null(Null)`), never back to the declared operand.
+    assert_eq!(promoted.len(), 2, "{promoted:?}");
+    assert_eq!(promoted[0].base, crate::ty::Base::Function, "{promoted:?}");
+    assert!(!promoted[0].nullable, "{promoted:?}");
+    assert_eq!(promoted[1].base, crate::ty::Base::Never, "{promoted:?}");
+}
+
+/// #2346③: a switch expression's value carries the LUB join of its case
+/// values (upstream Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart
+/// `SwitchExpressionImpl.staticType`'s arm fold; the name-level join is
+/// `??`'s `name_lub`). The bound local adopts the joined nullable face, so
+/// the receiver read of `r.m()` lifts it — the flow-read face the semantic
+/// Unknown arm (#2346①) re-enters the member verdict with, whose
+/// nullability emits the oracle's `unchecked_use_of_nullable_value`.
+/// Before the join the block pushed the plain UNKNOWN face and every
+/// consumer stayed untyped.
+#[test]
+fn switch_expr_case_value_lub_types_the_bound_local() {
+    let source = "class C { void m() {} }\n\
+                  void f(bool x, C? a, C? b) {\n\
+                  \x20 var r = switch (x) { true => a, false => b };\n\
+                  \x20 r.m();\n\
+                  }";
+    let (flow, facts) = analyze(source);
+    let c = flow.0.borrow_mut().intern_name("C");
+    let read_offset = source.find("r.m()").unwrap() as u32;
+    let rows: Vec<(u32, crate::ty::Ty)> = facts
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::ReadType { span, ty, .. } => Some((span.range.offset, ty)),
+            _ => None,
+        })
+        .collect();
+    let receiver = rows
+        .iter()
+        .find(|(offset, _)| *offset == read_offset)
+        .unwrap_or_else(|| panic!("no read row at {read_offset}: {rows:?}"));
+    assert_eq!(
+        receiver.1,
+        crate::ty::Ty {
+            base: crate::ty::Base::Name(c),
+            nullable: true,
+        },
+        "{rows:?}"
+    );
+}
+
+/// #2346③: the latch takes the alternative's BODY value, not the guard's —
+/// a guarded alternative's guard value is the stack's second entry at the
+/// case end, and latching it would join `bool` into the fold (the mixed
+/// join loses the face).
+#[test]
+fn switch_expr_guard_case_latches_the_body_value() {
+    let source = "class C { void m() {} }\n\
+                  void f(bool x, bool y, C? a, C b) {\n\
+                  \x20 var r = switch (x) { true when y => a, _ => b };\n\
+                  \x20 r.m();\n\
+                  }";
+    let (flow, facts) = analyze(source);
+    let c = flow.0.borrow_mut().intern_name("C");
+    let read_offset = source.find("r.m()").unwrap() as u32;
+    let rows: Vec<(u32, crate::ty::Ty)> = facts
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::ReadType { span, ty, .. } => Some((span.range.offset, ty)),
+            _ => None,
+        })
+        .collect();
+    let receiver = rows
+        .iter()
+        .find(|(offset, _)| *offset == read_offset)
+        .unwrap_or_else(|| panic!("no read row at {read_offset}: {rows:?}"));
+    assert_eq!(
+        receiver.1,
+        crate::ty::Ty {
+            base: crate::ty::Base::Name(c),
+            nullable: true,
+        },
+        "{rows:?}"
+    );
+}
+
+/// #2346③ negative (the oracle's silent face, probed at
+/// `unchecked_use_of_nullable_value`'s family): all-non-null case values
+/// join to the non-null face, and the bound local adopts nothing (a
+/// non-nullable spelled initializer never widens the unknown slot — the
+/// #2243 posture), so the receiver read carries no nullable face to lift.
+#[test]
+fn switch_expr_non_null_case_values_bind_no_nullable_face() {
+    let source = "class C { void m() {} }\n\
+                  void f(bool x, C a, C b) {\n\
+                  \x20 var r = switch (x) { true => a, false => b };\n\
+                  \x20 r.m();\n\
+                  }";
+    let read_offset = source.find("r.m()").unwrap() as u32;
+    let rows: Vec<(u32, crate::ty::Ty)> = read_types_of(source);
+    let receiver = rows
+        .iter()
+        .find(|(offset, _)| *offset == read_offset)
+        .unwrap_or_else(|| panic!("no read row at {read_offset}: {rows:?}"));
+    assert!(
+        !receiver.1.nullable,
+        "non-null join must not carry a nullable face: {rows:?}"
+    );
+}
+
+#[test]
+fn tmp_probe_three_shapes() {
+    for source in [
+        "class A {}\nvoid f(A? a) {\n  switch (a) {\n    case final x?:\n      print(x);\n    case null:\n      print(0);\n  }\n}",
+        "typedef Build<T> = T Function(int x);\nvoid f(Build<int>? b) {\n  switch (b) {\n    case final override?:\n      print(override);\n    case null:\n      print(0);\n  }\n}",
+        "void f(Object? x) {\n  switch (x) {\n    case final y?:\n      print(y);\n    case null:\n      print(0);\n  }\n}",
+    ] {
+        println!("SRC {source:?}");
+        println!("  DEAD {:?}", dead_snippets(source));
+    }
+}

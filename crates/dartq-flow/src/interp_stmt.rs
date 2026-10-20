@@ -614,6 +614,7 @@ impl Interp<'_> {
                     scrutinee_ty,
                     scrutinee_args,
                     pending_matched: None,
+                    expr_case_tys: Vec::new(),
                     case_open: false,
                     group_labels: false,
                     group_default: false,
@@ -801,6 +802,7 @@ impl Interp<'_> {
                     scrutinee_ty: Ty::UNKNOWN,
                     scrutinee_args: crate::ty::EMPTY_ARGS,
                     pending_matched: None,
+                    expr_case_tys: Vec::new(),
                     case_open: false,
                     group_labels: false,
                     group_default: false,
@@ -884,8 +886,11 @@ impl Interp<'_> {
                 // open.
                 self.flush_null_shorts_above(self.consumer_base(usize::from(*has_guard) + 1));
                 let mut guard_false = None;
+                // The body value is the stack's top (the guard's value sits
+                // below it): its type feeds the block-end arm fold.
+                let mut case_value_ty = None;
                 if *has_guard {
-                    let _value = self.exprs.pop();
+                    case_value_ty = self.exprs.pop().map(|e| e.ty);
                     let guard = self.exprs.pop();
                     if let Some(guard) = guard {
                         let (if_true, if_false) = self.cond_split(&guard);
@@ -893,9 +898,14 @@ impl Interp<'_> {
                         guard_false = Some(if_false);
                     }
                 } else {
-                    let _value = self.exprs.pop();
+                    case_value_ty = self.exprs.pop().map(|e| e.ty);
                 }
                 if let Some(frame_index) = self.switch_frame() {
+                    if let Some(ty) = case_value_ty
+                        && let Frame::Switch { expr_case_tys, .. } = &mut self.stack[frame_index]
+                    {
+                        expr_case_tys.push(ty);
+                    }
                     let chained = match (&guard_false, &self.stack[frame_index]) {
                         (Some(if_false), Frame::Switch { unmatched, .. }) => {
                             Some(self.join(Some(unmatched.clone()), Some(if_false.clone())))
@@ -929,12 +939,17 @@ impl Interp<'_> {
                 let Some(frame_index) = self.switch_frame() else {
                     return true;
                 };
-                let (combined, previous) = match &self.stack[frame_index] {
+                let (combined, previous, case_tys) = match &self.stack[frame_index] {
                     Frame::Switch {
                         group_combined,
                         previous,
+                        expr_case_tys,
                         ..
-                    } => (group_combined.clone(), previous.clone()),
+                    } => (
+                        group_combined.clone(),
+                        previous.clone(),
+                        expr_case_tys.clone(),
+                    ),
                     _ => return true,
                 };
                 self.stack.remove(frame_index);
@@ -945,11 +960,22 @@ impl Interp<'_> {
                 self.current = self
                     .join(combined.or(Some(previous.clone())), None)
                     .inherit_tested(&previous, &mut self.lists);
+                // The expression's type: the case-value LUB fold (upstream
+                // Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart
+                // `SwitchExpressionImpl.staticType`'s arm fold; the
+                // name-level join is `??`'s). The plain UNKNOWN this push
+                // used to carry left every value consumer untyped — an
+                // initializer's inferred local adopted no face and a
+                // receiver's flow read lifted nothing.
+                let ty = case_tys
+                    .into_iter()
+                    .reduce(|joined, ty| self.name_lub(joined, ty))
+                    .unwrap_or(Ty::UNKNOWN);
                 // Net one value for the consumer (crate contract, see
                 // `ListLitEnd`/`ExprBody`): without it `var y = switch
                 // (x) {...}` finds no rhs at `InitializerEnd` and `x =
                 // switch (x) {...}` pops the assignment target as rhs.
-                self.exprs.push(Expr::trivial(Ty::UNKNOWN));
+                self.exprs.push(Expr::trivial(ty));
             }
             Ev::AssertBegin { span } => {
                 self.dead_code(*span);
