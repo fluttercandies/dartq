@@ -2371,4 +2371,30 @@ mod face_tests {
             code_names(&rep)
         );
     }
+
+    /// Consecutive named arguments of a const creation flush per argument
+    /// (the capture's named event owns its value's flush): the values
+    /// never pool into the compound-recovery node the argument faces
+    /// would read as non-constant. `P(a: 1, b: 2)` folds for the oracle —
+    /// silent here too — while the single-named and positional-only
+    /// spellings keep their established faces.
+    #[test]
+    fn consecutive_named_args_of_const_creation_stay_const() {
+        let rep = unit_report(
+            "class V { const V(); }\n\
+             class P {\n\
+             final V? a, b;\n\
+             const P({this.a, this.b});\n\
+             }\n\
+             const p1 = P(a: V(), b: V());\n\
+             const p2 = P(a: V());\n\
+             const p3 = P(b: V());",
+        );
+        assert_eq!(
+            code_names(&rep),
+            Vec::<&str>::new(),
+            "{:?}",
+            code_names(&rep)
+        );
+    }
 }

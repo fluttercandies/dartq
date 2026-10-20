@@ -1599,13 +1599,31 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                         },
                     );
                 }
-                DirectiveKind::Export => builder.export(
-                    node,
-                    ExportEdge {
-                        target: graph_target(state, &graph_ids, &dep_nodes, target),
-                        combinators: directive.combinators.clone(),
-                    },
-                ),
+                DirectiveKind::Export => {
+                    // The `directive_graph_target` arm: a `dart:` export
+                    // (`export 'dart:typed_data' show Uint8List;` — the
+                    // drift barrel's face) resolves to its synthetic SDK
+                    // face node exactly like an import, or its names never
+                    // join the export flow and every re-exported SDK type
+                    // reads undefined at the importing library.
+                    let sdk_target = (target == ResolvedTarget::External)
+                        .then(|| {
+                            directive
+                                .uri
+                                .as_ref()
+                                .and_then(|uri| uri.strip_prefix("dart:"))
+                                .and_then(|name| sdk_faces.get(name).copied())
+                        })
+                        .flatten();
+                    builder.export(
+                        node,
+                        ExportEdge {
+                            target: sdk_target
+                                .or_else(|| graph_target(state, &graph_ids, &dep_nodes, target)),
+                            combinators: directive.combinators.clone(),
+                        },
+                    );
+                }
                 _ => {}
             }
         }
@@ -1615,8 +1633,8 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
     // facts — declaration names arrive pre-interned, edge payloads are owned
     // clones, and target resolution reads the completed `graph_ids` /
     // `sdk_faces` maps — so the lanes mutate nothing. `sdk_faces` must be
-    // complete first (an External import's face lookup reads it), which the
-    // serial section above guarantees.
+    // complete first (an External import/export's face lookup reads it),
+    // which the serial section above guarantees.
     let rows: Vec<LibraryRows> = live
         .par_iter()
         .map(|&library| {
@@ -1659,10 +1677,28 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                                 combinators: directive.combinators.clone(),
                             });
                         }
-                        DirectiveKind::Export => row.exports.push(ExportEdge {
-                            target: graph_target(state, &graph_ids, &dep_nodes, directive.target),
-                            combinators: directive.combinators.clone(),
-                        }),
+                        DirectiveKind::Export => {
+                            // The import arm's `dart:` resolution on the
+                            // export side: an SDK face target joins the
+                            // export flow (`directive_graph_target`'s
+                            // External arm); every other target resolves
+                            // through the graph as before.
+                            let sdk_target = (directive.target == ResolvedTarget::External)
+                                .then(|| {
+                                    directive
+                                        .uri
+                                        .as_ref()
+                                        .and_then(|uri| uri.strip_prefix("dart:"))
+                                        .and_then(|name| sdk_faces.get(name).copied())
+                                })
+                                .flatten();
+                            row.exports.push(ExportEdge {
+                                target: sdk_target.or_else(|| {
+                                    graph_target(state, &graph_ids, &dep_nodes, directive.target)
+                                }),
+                                combinators: directive.combinators.clone(),
+                            });
+                        }
                         _ => {}
                     }
                 }
@@ -3944,13 +3980,26 @@ mod tests {
                                 },
                             );
                         }
-                        DirectiveKind::Export => builder.export(
-                            graph_id,
-                            ExportEdge {
-                                target: graph_target(state, &graph_ids, &dep_nodes, directive.target),
-                                combinators: directive.combinators.clone(),
-                            },
-                        ),
+                        DirectiveKind::Export => {
+                            let sdk_target = (directive.target == ResolvedTarget::External)
+                                .then(|| {
+                                    directive
+                                        .uri
+                                        .as_ref()
+                                        .and_then(|uri| uri.strip_prefix("dart:"))
+                                        .and_then(|name| sdk_faces.get(name).copied())
+                                })
+                                .flatten();
+                            builder.export(
+                                graph_id,
+                                ExportEdge {
+                                    target: sdk_target.or_else(|| {
+                                        graph_target(state, &graph_ids, &dep_nodes, directive.target)
+                                    }),
+                                    combinators: directive.combinators.clone(),
+                                },
+                            );
+                        }
                         _ => {}
                     }
                 }
@@ -4032,8 +4081,10 @@ mod tests {
     /// pushed through the parallel pass and through the serial oracle
     /// produces identical graphs. The fixture: five libraries with
     /// cross-imports, a shared target imported twice, an explicit `dart:math`
-    /// import, unknown `dart:` faces, a part file (multi-file membership), a
-    /// modifier-carrying class family, and a declaration-free library.
+    /// import, unknown `dart:` faces, a `dart:` export with a show
+    /// combinator (the SDK-face export edge), a part file (multi-file
+    /// membership), a modifier-carrying class family, and a
+    /// declaration-free library.
     #[test]
     fn parallel_graph_build_matches_the_serial_walk() {
         let fixture = crate::l1::tests::Fixture::new();
@@ -4064,7 +4115,11 @@ mod tests {
             &lib.join("d.dart"),
             "import 'dart:async';\nimport 'dart:nope';\nint d() => 4;\n",
         );
-        crate::l1::tests::set(&mut state, &lib.join("e.dart"), "import 'a.dart';\n");
+        crate::l1::tests::set(
+            &mut state,
+            &lib.join("e.dart"),
+            "export 'dart:typed_data' show Uint8List;\nimport 'a.dart';\n",
+        );
         crate::l1::apply(&mut state, &mut |_| {});
 
         let built = build_library_graph(&mut state);

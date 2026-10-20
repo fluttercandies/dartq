@@ -2762,12 +2762,21 @@ impl ConstCapture {
 
     /// A named-argument label. The listener's event lands after the
     /// value's operands are staged (`NamedArgumentExpression` event
-    /// order), so only the namedness flag sets here — advancing the
-    /// operand floor would strand the value below it and drop it from
-    /// the level's arguments (the annotation-argument faces read it).
+    /// order), so the flag sets first and the value flushes here — the
+    /// same one-node flush a positional argument gets. Without the flush,
+    /// consecutive named values pool on the stack and the next flush
+    /// coalesces them into one compound-recovery `Other` node under a
+    /// single namedness flag — the creation-argument faces then read a
+    /// non-constant where the oracle folds a constant (`P(a: 1, b: 2)`),
+    /// and the annotation faces' flag count drifts from the argument
+    /// count.
     pub fn named_argument(&mut self) {
         if let Some(level) = self.args.last_mut() {
             level.named_pending = true;
+        }
+        if self.open() {
+            self.apply_unaries_at(self.depth);
+            self.flush_argument();
         }
     }
 
@@ -2783,6 +2792,13 @@ impl ConstCapture {
         let Some(level) = self.args.last_mut() else {
             return;
         };
+        // Nothing staged and no flag pending: a bare flush — an empty
+        // argument list's close, or the close after a named event already
+        // flushed its own value — must not grow `named` past `args` (the
+        // annotation faces pair the two vectors).
+        if level.mark.min(self.stack.len()) == self.stack.len() {
+            return;
+        }
         // One namedness flag per argument, in flush order — the
         // annotation-argument faces read it (the official's
         // `genericError` distinguishes the named value's leaf by the
