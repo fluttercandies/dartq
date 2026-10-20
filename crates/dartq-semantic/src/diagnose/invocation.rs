@@ -229,13 +229,53 @@ impl<'a> Engine<'a> {
         // belongs to this cascade (its selector offset was already pushed
         // into `cascade_sections` by `handle_cascade_access`) — carries the
         // latched target `Receiver`, substituted in below.
-        let cascade_recv = (self.in_cascade
-            && popped_receiver
-                .as_ref()
-                .is_some_and(|row| matches!(row.shape, RowShape::Value | RowShape::Record(..))))
-        .then(|| self.member_reads.last())
+        // The latch fires only when the last read belongs to THIS cascade
+        // (same `cascadeExpression` node): two sections of one cascade are
+        // chained by `..` with no `;` between them — a statement separator
+        // can never appear inside a single expression, so any `;` in the
+        // span proves a fresh cascade (`C()..p = 1; D()..q = true;` keeps
+        // its own real receiver `D`), while a bare-identifier RHS
+        // (`..version = version`, a `Bare` leftover) collapses exactly like
+        // a literal `Value` one.
+        let cascade_recv = (self.in_cascade)
+        .then(|| {
+            // The latched target read is the LAST CASCADE-SECTION read, not
+            // `member_reads`' plain tail: a member-read RHS (`..p =
+            // original.p`) records its own read AFTER the section's, so the
+            // tail answers the RHS's face and the next section resolves
+            // against the RHS type (`..followRedirects =
+            // original.followRedirects` then reports `..maxRedirects`
+            // against `bool`). Scanning back to the newest read whose
+            // selector offset is in `cascade_sections` answers the section's
+            // own record; the walk is short in practice (the entries past a
+            // section's selector are just its RHS's own reads).
+            self.member_reads
+                .iter()
+                .rev()
+                .find(|read| self.cascade_sections.contains(&read.offset))
+        })
         .flatten()
-        .filter(|last| self.cascade_sections.contains(&last.offset))
+        .filter(|_| {
+            // A chained access ON a section (`..headers.addAll(x)`) pops the
+            // section's own selector row — that send must resolve against
+            // the section's member type, never the latched target. An RHS
+            // leftover never sits at a section offset, so the popped row's
+            // own offset answers which shape this merge is.
+            popped_receiver.as_ref().is_none_or(|row| {
+                !self.cascade_sections.contains(&row.range.offset)
+            })
+        })
+        .filter(|last| {
+            // A `;` inside the popped RHS's own span (a `"a;b"` literal) is
+            // part of the expression, not a boundary — the separator probe
+            // ends where the leftover row begins.
+            let start = self.byte_of(last.offset);
+            let end = popped_receiver
+                .as_ref()
+                .map(|row| self.byte_of(row.range.offset))
+                .unwrap_or_else(|| self.byte_of(member.range.offset));
+            !self.source.as_bytes()[start.min(end)..end].contains(&b';')
+        })
         .map(|last| last.recv);
         let receiver_offset = popped_receiver
             .as_ref()
@@ -360,8 +400,16 @@ impl<'a> Engine<'a> {
                 // The promoted-receiver candidate (#1465): a bare
                 // declared-type read's member re-decides in pass 2 against
                 // the flow read type at this span — the merged row keeps the
-                // push-time classification until then.
-                if matches!(popped_shape, RowShape::Bare(BareInfo::Plain { .. })) {
+                // push-time classification until then. Cascade sections take
+                // no latch (the chained-read branch below documents the same
+                // rule): their "receiver" row is the previous section's RHS
+                // leftover, and pass 2's promoted re-decision would re-type
+                // the member against the RHS's declared face
+                // (`..version = version` → `String`) where upstream resolves
+                // the latched cascade target (type_analyzer.dart:611-618).
+                if matches!(popped_shape, RowShape::Bare(BareInfo::Plain { .. }))
+                    && !self.in_cascade
+                {
                     let member_offset = member.range.offset;
                     if let Err(index) = self
                         .promoted_recv_reads
@@ -3134,6 +3182,13 @@ impl<'a> Engine<'a> {
         // upstream resolves the variable's declared function type and
         // counts against it (`resolveArgumentsToParameters`).
         let mut sig_from_row: Option<Box<FnVarSig>> = None;
+        // A same-named member claims the unqualified callee ahead of the
+        // namespace (the oracle resolves `this.x` before any top-level
+        // spelling): the return face below reads the flag — a member-owned
+        // call must not inherit the same-spelled top-level function's
+        // return type (`predicate(result)` reads the field's callable
+        // return, never `Parser<String>`).
+        let mut member_owns_callee = false;
         let formals: Option<Formals> = match &row.shape {
             // A top-level function's declared formals — or the enclosing
             // container's own method under the implicit-this face (#1351):
@@ -3171,6 +3226,57 @@ impl<'a> Engine<'a> {
                             self.member_formals_full(&Receiver::This { container, kind }, row.name)
                         }),
                 };
+                // A same-named member that is NOT a method still owns the
+                // callee: `predicate(result)` inside `PredicateParser`
+                // resolves the function-typed field (implicit this), never
+                // the same-spelled top-level function — the oracle's scope
+                // rules put `this.predicate` ahead of the namespace. The
+                // member's callable signature comes from its declared
+                // type's alias chain (`alias_fn_sig`); a foreign alias or
+                // an unmodeled shape yields no formals — the under-report
+                // — but the top-level fallback must never lend its formals
+                // to a call the member already claimed.
+                let member_found = !shadowed
+                    && self
+                        .container_context()
+                        .is_some_and(|(container, _)| {
+                            matches!(
+                                self.walk_members(container, row.name),
+                                Walk::Found(_)
+                            )
+                        });
+                member_owns_callee = member_found;
+                let member_sig: Option<Box<FnVarSig>> = match member {
+                    Some(_) => None,
+                    None if member_found => (!shadowed)
+                        .then(|| self.container_context())
+                        .flatten()
+                        .and_then(|(container, _)| {
+                            match self.walk_members(container, row.name) {
+                                Walk::Found(entry) if entry.kind == MemberKind::Field => {
+                                    match self.fold_alias_ty(entry.var_ty) {
+                                        Ty::Named { name, .. } => Some(name),
+                                        _ => None,
+                                    }
+                                }
+                                Walk::Found(entry) if entry.kind == MemberKind::Getter => {
+                                    match self.fold_alias_ty(entry.return_ty) {
+                                        Ty::Named { name, .. } => Some(name),
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            }
+                        })
+                        .and_then(|name| self.alias_fn_sig(name)),
+                    None => None,
+                };
+                let member: Option<std::borrow::Cow<'_, Formals>> = match member {
+                    Some(formals) => Some(formals),
+                    None => member_sig
+                        .as_ref()
+                        .map(|sig| std::borrow::Cow::Owned(sig.formals(self.intern("")))),
+                };
                 // A function-typed variable's written signature (the
                 // captured `T Function<T>(T)` face) precedes the element
                 // model's — the model poisons such annotations and carries
@@ -3203,7 +3309,11 @@ impl<'a> Engine<'a> {
                 });
                 match (member, sig_formals) {
                     (Some(formals), _) => {
-                        sig_from_row = None;
+                        // The member's alias signature doubles as the
+                        // return face (`predicate(result)` reads `bool`,
+                        // the alias RHS's return), like a variable's
+                        // written signature does.
+                        sig_from_row = member_sig;
                         Some(formals.into_owned())
                     }
                     (None, Some(Some((formals, sig)))) => {
@@ -3212,8 +3322,17 @@ impl<'a> Engine<'a> {
                     }
                     (None, _) => {
                         sig_from_row = None;
-                        self.top_level_decl(row.name)
-                            .and_then(|d| d.formals.as_deref().cloned())
+                        // A member already claimed the callee (field or
+                        // getter of any shape): the namespace fallback
+                        // belongs to a spelling no member carries, so a
+                        // same-named top-level function must not lend its
+                        // formals to the member's call.
+                        if member_found {
+                            None
+                        } else {
+                            self.top_level_decl(row.name)
+                                .and_then(|d| d.formals.as_deref().cloned())
+                        }
                     }
                 }
             }
@@ -3362,11 +3481,18 @@ impl<'a> Engine<'a> {
                 None,
                 // The written signature's return precedes the element
                 // model's (a function-typed variable's annotation is
-                // poisoned in the declared-type slot).
+                // poisoned in the declared-type slot). A member-owned
+                // callee never reads the namespace: the same-spelled
+                // top-level function's return is not the member's
+                // callable's return.
                 sig_from_row
                     .as_ref()
                     .map(|sig| sig.return_ty)
-                    .or_else(|| self.top_level_decl(row.name).map(|decl| decl.return_ty)),
+                    .or_else(|| {
+                        (!member_owns_callee)
+                            .then(|| self.top_level_decl(row.name).map(|decl| decl.return_ty))
+                            .flatten()
+                    }),
             ),
             // The member's declared return rides the element walk (the
             // instantiation write below grounds `T` returns).
@@ -4027,6 +4153,36 @@ impl<'a> Engine<'a> {
                     self.resolved_member(*name, self.intern("call")),
                     Some(entry) if entry.kind == MemberKind::Method
                 ) {
+                    return;
+                }
+                // A cross-file function-type alias is callable like the
+                // local capture: the alias declaration is library-visible
+                // (`top_level_decl`), only its RHS shape is this-file
+                // (`alias_fn_sig`'s documented capture boundary) — a
+                // same-file non-function RHS was already answered `None`
+                // above and still reports, while a foreign one keeps the
+                // under-report posture (`Predicate<T> predicate` over
+                // petitparser's shared `typedef Predicate<T> =
+                // Callback<T, bool>`).
+                if self.bounds.alias_fn_shape(*name).is_none()
+                    && self.bounds.alias_named_shape(*name).is_none()
+                    && matches!(
+                        self.top_level_decl(*name).as_deref(),
+                        Some(decl) if decl.kind == MicroKind::TypeAlias
+                    )
+                {
+                    return;
+                }
+                // An out-of-scope head is a foreign projection this unit
+                // cannot resolve (an unexported function-type alias rides
+                // inference without an import — the oracle resolves the
+                // callable truth structurally): call-ability is undecidable
+                // here, so the face keeps silent. The dart:core primitives
+                // have no declaring stub, yet their non-callable verdicts
+                // are known.
+                if self.top_level_decl(*name).is_none()
+                    && !self.members.primitive_ids.contains(name)
+                {
                     return;
                 }
                 let range = row.range;
@@ -5541,6 +5697,213 @@ mod tests {
             !code_names(&report).contains(&"undefined_setter"),
             "{:?}",
             code_names(&report)
+        );
+    }
+
+    /// A bare-identifier RHS leaves a `Bare` row, not a `Value` one —
+    /// `Decl()..version = version..encoding = encoding` must still resolve
+    /// `encoding` against the latched cascade target `Decl`, never against
+    /// the parameter's `String` (upstream `cascadeReceiver`,
+    /// type_analyzer.dart:611-618). xml `builder.dart`'s `declaration`
+    /// shape.
+    #[test]
+    fn cascade_section_with_bare_rhs_keeps_the_latched_target() {
+        let report = report(
+            "class Decl { \
+               String? get version => null; \
+               set version(String? value) {} \
+               String? get encoding => null; \
+               set encoding(String? value) {} \
+             } \
+             void build({String? version, String? encoding}) { \
+               final d = Decl()..version = version..encoding = encoding; \
+             }",
+        );
+        assert!(
+            !code_names(&report).contains(&"undefined_setter"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The real-file shape (xml `builder.dart`'s `declaration`): getter +
+    /// setter pairs and three chained sections — every section resolves
+    /// against `Decl`, never against the previous section's RHS type.
+    #[test]
+    fn cascade_getter_setter_chain_keeps_the_latched_target() {
+        let report = report(
+            "class Decl { \
+               String? get version => null; \
+               set version(String? value) {} \
+               String? get encoding => null; \
+               set encoding(String? value) {} \
+               bool get standalone => false; \
+               set standalone(bool? value) {} \
+             } \
+             void build({String? version, String? encoding, bool? standalone}) { \
+               final d = Decl() \
+                 ..version = version \
+                 ..encoding = encoding \
+                 ..standalone = standalone; \
+             }",
+        );
+        assert!(
+            !code_names(&report).contains(&"undefined_setter"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The collapse stays receiver-correct for the bare-RHS shape too:
+    /// `Decl()..version = version..missing = encoding` resolves `missing`
+    /// on `Decl` and reports the target miss.
+    #[test]
+    fn cascade_section_after_bare_rhs_still_reports_a_target_miss() {
+        let report = report(
+            "class Decl { \
+               String? get version => null; \
+               set version(String? value) {} \
+             } \
+             void build({String? version, String? encoding}) { \
+               final d = Decl()..version = version..missing = encoding; \
+             }",
+        );
+        assert!(
+            code_names(&report).contains(&"undefined_setter"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A member-read RHS records its own read AFTER the section's selector,
+    /// so the latch must answer the newest CASCADE-SECTION read, not
+    /// `member_reads`' plain tail: `request..contentLength =
+    /// original.contentLength..followRedirects = original.followRedirects`
+    /// still resolves every section against `request` (http `retry.dart`'s
+    /// build — the tail answered the RHS face and the next section reported
+    /// `undefined_setter` against `int`).
+    #[test]
+    fn cascade_section_after_member_read_rhs_keeps_the_latched_target() {
+        let report = report(
+            "class Req { \
+               int? get contentLength => null; \
+               set contentLength(int? value) {} \
+               bool get followRedirects => false; \
+               set followRedirects(bool value) {} \
+               bool get maxRedirects => false; \
+               set maxRedirects(bool value) {} \
+             } \
+             class Orig { \
+               int? get contentLength => null; \
+               bool get followRedirects => true; \
+               bool get maxRedirects => true; \
+             } \
+             void build(Req request, Orig original) { \
+               request \
+                 ..contentLength = original.contentLength \
+                 ..followRedirects = original.followRedirects \
+                 ..maxRedirects = original.maxRedirects; \
+             }",
+        );
+        assert!(
+            !code_names(&report).contains(&"undefined_setter"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The member-read-RHS latch stays receiver-correct for a target miss:
+    /// `req..contentLength = orig.contentLength..missing = 1` resolves
+    /// `missing` on `Req` and reports the setter miss against it.
+    #[test]
+    fn cascade_section_after_member_read_rhs_still_reports_a_target_miss() {
+        let report = report(
+            "class Req { \
+               int? get contentLength => null; \
+               set contentLength(int? value) {} \
+             } \
+             class Orig { \
+               int? get contentLength => null; \
+             } \
+             void build(Req req, Orig orig) { \
+               req..contentLength = orig.contentLength..missing = 1; \
+             }",
+        );
+        assert!(
+            code_names(&report).contains(&"undefined_setter"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A chained access ON a section (`..headers.addAll(x)`) pops the
+    /// section's own selector row — that send resolves against the
+    /// section's member type (`headers`' map), never the latched cascade
+    /// target (`..headers.addAll` must not report `undefined_method`
+    /// against `Req`; the http `mock_client.dart` shape).
+    #[test]
+    fn cascade_chained_send_on_a_section_resolves_against_the_section_type() {
+        let report = report(
+            "class Req { \
+               final Map<String, String> headers = {}; \
+               int? get contentLength => null; \
+               set contentLength(int? value) {} \
+             } \
+             void build(Req request, Map<String, String> other) { \
+               request \
+                 ..contentLength = 1 \
+                 ..headers.addAll(other); \
+             }",
+        );
+        assert!(
+            !code_names(&report).contains(&"undefined_method"),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A function-typed field claims the unqualified callee before the
+    /// namespace: `predicate(result)` inside `PredicateParser` resolves
+    /// `this.predicate`, never the same-spelled top-level function — the
+    /// oracle's scope order. The field's alias signature answers arity
+    /// (1 == 1), and no top-level formals may leak in.
+    #[test]
+    fn function_typed_field_claims_the_bare_callee() {
+        let report = report(
+            "typedef Pred = bool Function(String); \
+             Pred predicate(String s, int n) => true; \
+             class P { \
+               final Pred predicate; \
+               const P(this.predicate); \
+               bool test(String r) => predicate(r); \
+             }",
+        );
+        let names = code_names(&report);
+        assert!(
+            !names.contains(&"not_enough_positional_arguments")
+                && !names.contains(&"invocation_of_non_function_expression"),
+            "{names:?}"
+        );
+    }
+
+    /// A non-callable member still claims the callee: `count(1)` inside a
+    /// class declaring `int count` reports the non-function face against
+    /// the field — a same-spelled top-level function must not silently
+    /// supply the signature either (the member wins the scope race).
+    #[test]
+    fn non_function_field_blocks_the_top_level_fallback() {
+        let report = report(
+            "int count(int a, int b) => a; \
+             class P { \
+               final int count; \
+               const P(this.count); \
+               int test() => count(1); \
+             }",
+        );
+        let names = code_names(&report);
+        assert!(
+            !names.contains(&"not_enough_positional_arguments"),
+            "{names:?}"
         );
     }
 
