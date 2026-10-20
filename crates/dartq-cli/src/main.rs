@@ -3520,6 +3520,44 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// A bare `.dart` file target — no `pubspec.yaml`, no
+    /// `package_config.json`, the workspace walk's `NoRoot` floor at the
+    /// file's own directory — still analyzes in the no-package context: the
+    /// oracle's `dart analyze <file>` face emits the file's own semantic
+    /// rows (SDK types resolve, `package:` URIs would degrade to
+    /// `URI_DOES_NOT_EXIST`) rather than an empty stream. Pin the machine
+    /// stdout's non-empty row set against regression to a zero-row run.
+    #[test]
+    fn analyze_bare_file_target_emits_its_own_rows() {
+        let root = analyze_fixture("bare-file", &[("bad.dart", "int x = \"s\";\n")]);
+        // Strip every package marker: the target's directory is the bare
+        // floor, not a malformed package.
+        fs::remove_file(root.join("pubspec.yaml")).ok();
+        fs::remove_file(root.join("pubspec.lock")).ok();
+        fs::remove_dir_all(root.join(".dart_tool")).ok();
+        let file = root.canonicalize().expect("root").join("bad.dart");
+
+        let args = AnalyzeArgs {
+            targets: vec![file.clone()],
+            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let code = analyze_run(&args, &mut out);
+        assert_eq!(code, exit::ERRORS, "the file's own ERROR rows → 3");
+        let text = String::from_utf8(out).expect("UTF-8");
+        assert!(
+            text.lines().any(|row| row.contains("INVALID_ASSIGNMENT")
+                && row.contains(&file.display().to_string())),
+            "the bare file's own diagnostic emits, never a zero-row run: {text}"
+        );
+        assert!(
+            text.lines().all(|row| row.contains("bad.dart")),
+            "no sibling or workspace noise joins the file target's set: {text}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// The analyze face's crash tier: a panic anywhere in the engine pass
     /// maps to exit 4 — the exit half of the harness's Panic signature
     /// (exit 4 + empty stdout; stdout stays empty structurally because the
