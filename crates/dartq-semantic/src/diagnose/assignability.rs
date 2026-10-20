@@ -2938,19 +2938,112 @@ impl<'a> Engine<'a> {
         );
     }
 
-    /// A simple annotation name (`@foo`): the oracle's annotation resolution
-    /// needs a class (or a `foo.name` constant face); a fully missing name is
-    /// `undefined_annotation` anchored over the `@` (3.13.1 caliber — the
-    /// diagnostic was removed upstream in 3.14, `m1_codes.txt` freezes the
-    /// measured form). A [`CORE_TOP_LEVEL_ANNOTATIONS`] name is defined by
-    /// the implicit dart:core import, never missing. Defined names stay
-    /// silent: the class/constructor second-part checks sit outside the M1
-    /// model (under-report). The metadata path skips the broken-import
-    /// shown-name guard — the oracle's scope lookup reports the missing
-    /// annotation regardless of `show` clauses (element.dart:8217-8250
-    /// suppresses the identifier face only; probe-verified both ways).
+    /// The annotation name's resolution order (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/summary2/metadata_resolver.dart — member
+    /// metadata resolves inside the container's body scope while head
+    /// metadata resolves before that scope opens;
+    /// pkg/analyzer/lib/src/dart/element/scope.dart — `InstanceScope` holds
+    /// only the container's own members and `ExtensionScope` every own
+    /// extension member, neither climbs the supertype chain;
+    /// pkg/analyzer/lib/src/dart/resolver/annotation_resolver.dart — the
+    /// annotation expression resolves like any constant-context expression
+    /// and the lookup failure is that resolution's report): locals, the
+    /// container's type parameters, the own-container member face (own
+    /// statics for class/mixin/enum/extension-type bodies, every own member
+    /// inside an extension body — the enum constants are static fields —
+    /// plus the synthesized `values` face for enums), then the scoped
+    /// top-level/import lookup. The climbed faces never answer an
+    /// annotation name — a superclass `static const`, the own instance
+    /// members of a class body, the mixin/extension `on`-type walks, the
+    /// object members, the extension pool and the implicit-`this`
+    /// extension application all stay missing (probe-verified against the
+    /// 3.13.1 oracle), so `@internal` over a superclass
+    /// `static const internal` reports `undefined_annotation`.
+    fn annotation_name_missing(&self, name: StringId) -> bool {
+        if self.frames.iter().rev().any(|f| f.locals.contains(&name))
+            || self.initializer_locals.contains(&name)
+            || self.type_params.contains(&name)
+            || self.pending_type_params.contains(&name)
+        {
+            return false;
+        }
+        if let Some((container, kind)) = self.container_context() {
+            if kind == ContainerKind::Enum && self.members.enum_synth_members.contains(&name) {
+                return false;
+            }
+            // The unnamed extension's own members live in the frame's
+            // face-rank map (`resolve_container` cannot serve the
+            // placeholder name, #1701).
+            let own = if kind == ContainerKind::Extension {
+                self.unnamed_extension_members().or_else(|| {
+                    resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        container,
+                    )
+                    .map(|(resolved, _)| &resolved.members)
+                })
+            } else {
+                resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    container,
+                )
+                .map(|(resolved, _)| &resolved.members)
+            };
+            let answered = own.is_some_and(|members| {
+                members.get(&name).is_some_and(|entry| {
+                    // A class/mixin/enum/extension-type body sees only the
+                    // own static members; an extension body sees every own
+                    // member (scope.dart `InstanceScope` / `ExtensionScope`).
+                    kind == ContainerKind::Extension || entry.is_static
+                })
+            });
+            if answered {
+                return false;
+            }
+        }
+        // A top-level/import hit answers; an ambiguous import face keeps
+        // the resolve direction (the same verdict `resolve_bare` takes). A
+        // file-local `TypeParam` decl does not: the metadata scope carries
+        // only the container's own type parameters (the layer above) — a
+        // method's own `<T>` parses after its metadata and the oracle
+        // reports the miss (probe-verified against the 3.13.1 oracle).
+        let scoped = match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::Local(decl) => decl.kind != MicroKind::TypeParam,
+            ScopedHit::Found(_) | ScopedHit::Ambiguous(_) => true,
+            ScopedHit::NotFound => false,
+        };
+        !scoped
+    }
+
+    /// A simple annotation name (`@foo`): the name resolves through the
+    /// annotation scope order ([`Engine::annotation_name_missing`]); a fully
+    /// missing name is `undefined_annotation` anchored over the `@` (3.13.1
+    /// caliber — the diagnostic was removed upstream in 3.14, `m1_codes.txt`
+    /// freezes the measured form). A [`CORE_TOP_LEVEL_ANNOTATIONS`] name is
+    /// defined by the implicit dart:core import, never missing. Defined
+    /// names stay silent: the class/constructor second-part checks sit
+    /// outside the M1 model (under-report). The metadata path skips the
+    /// broken-import shown-name guard — the oracle's scope lookup reports
+    /// the missing annotation regardless of `show` clauses
+    /// (element.dart:8217-8250 suppresses the identifier face only;
+    /// probe-verified both ways).
     pub(crate) fn check_annotation(&mut self, name: StringId, range: SourceRange) {
-        let missing = matches!(self.resolve_bare(name).0, BareInfo::Missing { .. })
+        let missing = self.annotation_name_missing(name)
             && !CORE_TOP_LEVEL_ANNOTATIONS.contains(&self.strings.resolve(name));
         let at = self.annotation_at.take();
         if missing {

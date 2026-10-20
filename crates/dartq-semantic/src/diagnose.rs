@@ -540,6 +540,40 @@ mod ticket_2340_tests;
 #[cfg(test)]
 mod ticket_2337_tests;
 
+/// The #2348 differential pins: the RETURN_OF_INVALID_TYPE over-fire
+/// census classified per line — every d-only line's actual side carried a
+/// recovery artifact whose pair an oracle-reported twin shares, so the
+/// pins lock the earned twins the return gate must keep judging (no
+/// pair-level suppression is sound) beside the P0 pool-guard panic fix
+/// (`covariant_args`' narrow borrow) driving the full instantiated-alias
+/// recursion to its verdict; the recovery faces themselves are the flow
+/// promotion interpreter's, the resolution read rows', and the
+/// implicit-`call` face's to fix.
+#[cfg(test)]
+mod ticket_2348_tests;
+
+/// The #2328 differential pins: the chain-broken member/on-face climb and
+/// the bare-name faces it must not own — the bare creation send resolves
+/// through the scoped lookup instead of masquerading as an implicit-`this`
+/// member, and an annotation name resolves through the scope alone, so its
+/// miss reports `undefined_annotation` instead of the broken climb's
+/// blanket suppression, while real member calls over chain-broken
+/// receivers keep reporting.
+#[cfg(test)]
+mod ticket_2328_tests;
+
+/// The #2362 differential pins: the generic-supertype instantiation's
+/// whole-`Ty::Named` unwrap — `instantiate_inherited` binds each declaring
+/// hop's parameter to the stored super face's own argument list, never to
+/// the one-element wrapping, so a same-file `Sub<X> extends Box<X>` face
+/// substitutes the written argument, a nested `Outer<Inner<E>>` argument
+/// substitutes into the member, and the foreign name-forced hop
+/// (`XmlNodeList<E> extends DelegatingList<E>`) stops false-firing on
+/// every inherited member while a genuine mismatch across the edge keeps
+/// reporting.
+#[cfg(test)]
+mod ticket_2362_tests;
+
 pub(crate) use types::*;
 pub use types::{FileReport, NameRow, NameUse, RefTarget, UndefinedGuard, UnitRef};
 
@@ -3512,53 +3546,30 @@ mod ticket_2297_tests;
 #[cfg(test)]
 mod ticket_2359_tests;
 
-/// The #2328 differential pins: the chain-broken member/on-face climb and
-/// the bare-name faces it must not own — the bare creation send resolves
-/// through the scoped lookup instead of masquerading as an implicit-`this`
-/// member, and an annotation name resolves through the scope alone, so its
-/// miss reports `undefined_annotation` instead of the broken climb's
-/// blanket suppression, while real member calls over chain-broken
-/// receivers keep reporting.
-#[cfg(test)]
-mod ticket_2328_tests;
 
-/// The #2348 differential pins: the RETURN_OF_INVALID_TYPE over-fire
-/// census classified per line — every d-only line's actual side carried a
-/// recovery artifact (the collapsed nested literal argument, the
-/// unpromoted record field or callable field/local, the implicit-`call`
-/// callee type) whose pair an oracle-reported twin shares, so the pins
-/// lock the resolved silence beside the earned twins — plus the P0
-/// pool-guard panic fix (`covariant_args`' narrow borrow) driving the
-/// full instantiated-alias recursion to its verdict.
-#[cfg(test)]
-mod ticket_2348_tests;
-
-/// The #2362 differential pins: the generic-supertype instantiation's
-/// whole-`Ty::Named` unwrap — `instantiate_inherited` binds each declaring
-/// hop's parameter to the stored super face's own argument list, never to
-/// the one-element wrapping, so a same-file `Sub<X> extends Box<X>` face
-/// substitutes the written argument, a nested `Outer<Inner<E>>` argument
-/// substitutes into the member, and the foreign name-forced hop
-/// (`XmlNodeList<E> extends DelegatingList<E>`) stops false-firing on
-/// every inherited member while a genuine mismatch across the edge keeps
-/// reporting.
-#[cfg(test)]
-mod ticket_2362_tests;
-
-/// The #2344 pins: the member-condition shadow gate — a staged
-/// nullable condition anchored on a member read skips the local
-/// conditions/promotions tables (the official verifier reads the
-/// expression's own element, so a same-named local never enters the
-/// member's condition face), while local and member faces without the
-/// collision keep their existing verdicts.
+/// The #2344 pins: the member-read gate on the nullable-condition join —
+/// a staged condition at a member token decides on the property face
+/// alone, so a same-named promoted local never hides the member's
+/// `unchecked_use_of_nullable_value`, while shadow-free members, the
+/// bare local face, and promotable-field promotions keep their verdicts.
 #[cfg(test)]
 mod ticket_2344_tests;
 
-/// The #2365 pins: the bare implicit-call invocation — a callable
-/// instance called without an explicit .call resolves the call member's
-/// formals (counts and argument checks included) and writes its declared
-/// return type, with the method's own type parameters feeding the
-/// substitution, while non-callable callees keep the non-function face
-/// and explicit .call tear-offs stay untouched.
+/// The #2365 pins: the bare-identifier implicit-`call` invocation's
+/// result type — a callable class instance invoked bare types the send
+/// with the `call` method's return (substituted when the method is
+/// generic), so `return body(inner)` stops over-firing
+/// `return_of_invalid_type` on the callee's own class, while
+/// non-callable callees and the dot-spelled control keep their faces.
 #[cfg(test)]
 mod ticket_2365_tests;
+
+/// The #2329 pins: the annotation name's resolution order — locals, the
+/// container's type parameters, the own-container member face (own statics
+/// for class bodies, every own member inside an extension body), then the
+/// scoped top-level/import lookup. The climbed faces — the superclass
+/// `static const`, the own instance members, the method's own type
+/// parameters, the object members — never answer, so their names miss into
+/// `undefined_annotation` exactly where the 3.13.1 oracle reports.
+#[cfg(test)]
+mod ticket_2329_tests;
