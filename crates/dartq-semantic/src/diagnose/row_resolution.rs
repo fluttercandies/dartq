@@ -87,8 +87,7 @@ impl<'a> Engine<'a> {
                 // carries the miss only when the callee resolved (the main
                 // path's `!defined` shape: an unresolved callee's label is
                 // not a miss).
-                let (resolved, defined) = match self.super_ctor_named_formals(container, selector)
-                {
+                let (resolved, defined) = match self.super_ctor_named_formals(container, selector) {
                     // The membership test is the call-site face's own
                     // (`named_formal_for`): a `super(x: v)` label binds a
                     // `this._x` formal's public name like every other
@@ -143,8 +142,7 @@ impl<'a> Engine<'a> {
                     let formals = self.member_formals_full(&recv, callee_name);
                     (
                         formals.is_some(),
-                        formals
-                            .is_some_and(|f| self.named_formal_for(&f, name).is_some()),
+                        formals.is_some_and(|f| self.named_formal_for(&f, name).is_some()),
                     )
                 } else {
                     let decl = self
@@ -291,7 +289,11 @@ impl<'a> Engine<'a> {
         match &row.shape {
             RowShape::Bare(info) => self.resolve_bare_row(promotions, row, *info),
             RowShape::Member { recv } => {
-                let recv = self.tolerant_receiver(promotions, row, self.promoted_receiver(row.range.offset, *recv));
+                let recv = self.tolerant_receiver(
+                    promotions,
+                    row,
+                    self.promoted_receiver(row.range.offset, *recv),
+                );
                 self.resolve_member_row(promotions, row, recv);
             }
             RowShape::Receiver(recv) => self.resolve_receiver_row(row, *recv),
@@ -437,9 +439,7 @@ impl<'a> Engine<'a> {
                 offset: read_span.offset - 1,
                 length: read_span.length,
             };
-            if let Some(redecided) =
-                self.redecided_face(static_ty, self.read_type_at(shifted))
-            {
+            if let Some(redecided) = self.redecided_face(static_ty, self.read_type_at(shifted)) {
                 return redecided;
             }
         }
@@ -573,7 +573,12 @@ impl<'a> Engine<'a> {
                 if !matches!(row.intent, Intent::Write | Intent::ReadWrite)
                     && self.field_init_this_rows.contains(&row.range.offset)
                 {
-                    self.emit(SemanticCode::ImplicitThisReferenceInInitializer, row.range, name_text, "");
+                    self.emit(
+                        SemanticCode::ImplicitThisReferenceInInitializer,
+                        row.range,
+                        name_text,
+                        "",
+                    );
                 }
                 // The discarded-value face (`_check` + `checkNameExpression`,
                 // use_result_verifier.dart): an invocation or bare read of a
@@ -670,12 +675,7 @@ impl<'a> Engine<'a> {
                                 continue;
                             }
                             let op_text = self.strings.resolve(spelling).to_string();
-                            self.emit(
-                                SemanticCode::UndefinedOperator,
-                                op_range,
-                                &op_text,
-                                "Type",
-                            );
+                            self.emit(SemanticCode::UndefinedOperator, op_range, &op_text, "Type");
                         }
                     } else {
                         self.check_operator_expr(ty, row);
@@ -707,8 +707,7 @@ impl<'a> Engine<'a> {
                         // the invalid extended type).
                         if let Some(host) = ext_invoke {
                             if let Some(container) = host {
-                                let type_text =
-                                    self.strings.resolve(container).to_string();
+                                let type_text = self.strings.resolve(container).to_string();
                                 if !Self::synthetic_reference(row.range)
                                     && !self.keyword_bare_reference(row.range)
                                 {
@@ -1074,7 +1073,10 @@ impl<'a> Engine<'a> {
 
     /// Consumes one recorded clause-entry offset (#1314 FAM14): the same
     /// ascending binary hit, returning the clause face.
-    pub(crate) fn take_clause_miss(rows: &mut Vec<(u32, ClauseTag)>, offset: u32) -> Option<ClauseTag> {
+    pub(crate) fn take_clause_miss(
+        rows: &mut Vec<(u32, ClauseTag)>,
+        offset: u32,
+    ) -> Option<ClauseTag> {
         match rows.binary_search_by_key(&offset, |entry| entry.0) {
             Ok(index) => Some(rows.remove(index).1),
             Err(_) => None,
@@ -1186,9 +1188,7 @@ impl<'a> Engine<'a> {
             // member, not the extension's. A `super` access is a plain
             // container (extensions declare no `super` member face). A
             // named-container `this` keeps its own container.
-            Receiver::This { container, kind }
-                if kind == ContainerKind::Extension =>
-            {
+            Receiver::This { container, kind } if kind == ContainerKind::Extension => {
                 match self.enclosing_extension_on_type(container) {
                     Some(on) => (self.file, on),
                     // The on-name never resolved — no honest owner.
@@ -1201,7 +1201,9 @@ impl<'a> Engine<'a> {
             // `C.f` — a static-member read through the container's own name
             // (a `static const` field of a private class rides this face):
             // the receiver IS the owning container, no instance to type.
-            Receiver::Container { name: container, .. } => (self.file, container),
+            Receiver::Container {
+                name: container, ..
+            } => (self.file, container),
             Receiver::Typed { type_name, .. } => {
                 match resolve_container(
                     self.graph,
@@ -1217,7 +1219,10 @@ impl<'a> Engine<'a> {
             }
             _ => return,
         };
-        self.member_read_owners.entry(name).or_default().insert(handle);
+        self.member_read_owners
+            .entry(name)
+            .or_default()
+            .insert(handle);
     }
 
     /// The read's owning container: the published push-time bare
@@ -1337,6 +1342,45 @@ impl<'a> Engine<'a> {
                 {
                     self.check_top_level_unused_result(row);
                 }
+                // The inferred-slot receiver face (#2346①): a receiver
+                // whose declared slot the name-level model never bound —
+                // the for-in loop variable (`for (var e in xs)`'s `e`
+                // carries the iterable's element type, upstream's
+                // `_inferForEachVariable`), a pattern destructure the
+                // flat-record bind declined — still owns a static type:
+                // the flow layer's read-type row at the receiver's own
+                // span (the same face the promoted-receiver re-decision
+                // #1465 reads). A named flow face runs the member verdict
+                // on its container's instance face, the flow type's own
+                // nullability riding the receiver verdict — a nullable
+                // face emits the shared unchecked-access code at the
+                // found/miss gates (`type_property_resolver`'s
+                // `isNullable` tail precedes every member resolution), a
+                // non-null face the `undefined_*` trio. Every other face
+                // — a dynamic dispatch, an unresolvable receiver, a
+                // diverging repeat read — keeps the under-report.
+                if !self_named
+                    && let Some(read_span) = self
+                        .member_reads
+                        .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+                        .ok()
+                        .map(|index| self.member_reads[index].recv_span)
+                    && let Some(
+                        face @ Ty::Named {
+                            name: flow_head, ..
+                        },
+                    ) = self.read_type_at(read_span)
+                {
+                    self.check_instance_member(
+                        promotions,
+                        row,
+                        Receiver::Typed {
+                            type_name: flow_head,
+                            ty: face,
+                        },
+                    );
+                    return;
+                }
             }
             Receiver::Prefix { name: prefix } => {
                 // `lazy.loadLibrary()` is the deferred-load runtime face
@@ -1394,11 +1438,7 @@ impl<'a> Engine<'a> {
             // the bare-scope `resolve_container` cannot reach it (the name
             // sits behind the prefix table), so the check re-resolves
             // through [`prefixed_container`] directly.
-            Receiver::PrefixedContainer {
-                prefix,
-                name,
-                kind,
-            } => {
+            Receiver::PrefixedContainer { prefix, name, kind } => {
                 if let Some((resolved, _)) = prefixed_container(
                     self.graph,
                     self.namespaces,
@@ -1458,7 +1498,12 @@ impl<'a> Engine<'a> {
     /// reads, and `undefined_setter` on writes; the extension face reports
     /// its dedicated trio. Operator intents have no static-face shape the
     /// M1 model can name — record only. External containers suppress.
-    pub(crate) fn check_container_member(&mut self, row: &Row, container: StringId, kind: ContainerKind) {
+    pub(crate) fn check_container_member(
+        &mut self,
+        row: &Row,
+        container: StringId,
+        kind: ContainerKind,
+    ) {
         let Some((resolved, _)) = resolve_container(
             self.graph,
             self.namespaces,
@@ -1494,9 +1539,10 @@ impl<'a> Engine<'a> {
             resolved
                 .members
                 .contains_key(&self.setter_spelling(row.name))
-                || resolved.members.get(&row.name).is_some_and(|entry| {
-                    matches!(entry.kind, MemberKind::Field) && !entry.is_final
-                })
+                || resolved
+                    .members
+                    .get(&row.name)
+                    .is_some_and(|entry| matches!(entry.kind, MemberKind::Field) && !entry.is_final)
         } else {
             resolved.members.contains_key(&row.name)
         };
@@ -1803,14 +1849,23 @@ impl<'a> Engine<'a> {
                 && self
                     .record_field_ty(receiver_ty, row.name, receiver_nullable)
                     .is_some();
-            let function_hit = matches!(receiver_ty, Ty::Function { nullable: false, .. })
-                && row.name == self.intern("call");
+            let function_hit = matches!(
+                receiver_ty,
+                Ty::Function {
+                    nullable: false,
+                    ..
+                }
+            ) && row.name == self.intern("call");
             if record_hit || function_hit {
                 return;
             }
             let (decidable, display) = match receiver_ty {
-                Ty::Record { nullable: false, .. } => (true, "<unknown>"),
-                Ty::Function { nullable: false, .. } => (true, "Function"),
+                Ty::Record {
+                    nullable: false, ..
+                } => (true, "<unknown>"),
+                Ty::Function {
+                    nullable: false, ..
+                } => (true, "Function"),
                 _ => (false, ""),
             };
             if decidable {
@@ -2051,10 +2106,7 @@ impl<'a> Engine<'a> {
         // the shared emission).
         let mut report_on = container;
         if matches!(kind, ContainerKind::Mixin | ContainerKind::Extension) {
-            if !matches!(
-                self.on_face_walk(container, kind, row.name),
-                Walk::Missing
-            ) {
+            if !matches!(self.on_face_walk(container, kind, row.name), Walk::Missing) {
                 self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
                 return;
             }
@@ -2355,7 +2407,11 @@ impl<'a> Engine<'a> {
     /// `with` mixins, `implements` faces and `on` constraints (the same
     /// seed [`Engine::face_member_any`] reads). An unindexed container
     /// itself breaks the chain: `Unknown`.
-    pub(crate) fn frozen_super_verdict(&self, container: StringId, spelling: StringId) -> FrozenFace {
+    pub(crate) fn frozen_super_verdict(
+        &self,
+        container: StringId,
+        spelling: StringId,
+    ) -> FrozenFace {
         let Some(decl) = self
             .index
             .get(self.file)
@@ -2403,12 +2459,11 @@ impl<'a> Engine<'a> {
             return None;
         }
         let lib = libs[0];
-        let file = self
-            .graph
-            .unit_files(lib)
-            .iter()
-            .copied()
-            .find(|&f| self.index.get(f).is_some_and(|unit| unit.container(name).is_some()))?;
+        let file = self.graph.unit_files(lib).iter().copied().find(|&f| {
+            self.index
+                .get(f)
+                .is_some_and(|unit| unit.container(name).is_some())
+        })?;
         Some((file, lib))
     }
 
@@ -2577,11 +2632,7 @@ impl<'a> Engine<'a> {
                     _ => {}
                 }
             }
-            for super_face in found
-                .implements_clause
-                .iter()
-                .chain(found.on_clause.iter())
-            {
+            for super_face in found.implements_clause.iter().chain(found.on_clause.iter()) {
                 pending.push_back((*super_face, found_owner));
             }
             match found.superclass {
@@ -2612,7 +2663,12 @@ impl<'a> Engine<'a> {
     /// [`CORE_TYPE_MEMBERS`] keys and resolves to no indexed container.
     /// Extension members still apply implicitly, so the pool gates first; a
     /// table hit is defined, a miss reports the access-intent trio.
-    pub(crate) fn check_core_type_member(&mut self, container: StringId, row: &Row, receiver_nullable: bool) {
+    pub(crate) fn check_core_type_member(
+        &mut self,
+        container: StringId,
+        row: &Row,
+        receiver_nullable: bool,
+    ) {
         let container_text = self.strings.resolve(container);
         // `Symbol` rides the same face: every symbol literal is
         // `Symbol`-typed (`#void.foo;` resolves `.foo` against it —
@@ -2837,7 +2893,10 @@ impl<'a> Engine<'a> {
             let walk_missing = if indexed {
                 matches!(self.walk_members(name, spelling), Walk::Missing)
             } else {
-                matches!(self.frozen_member_verdict(name, spelling), FrozenFace::Absent)
+                matches!(
+                    self.frozen_member_verdict(name, spelling),
+                    FrozenFace::Absent
+                )
             };
             if walk_missing {
                 match self.extension_application(name, ty, spelling, false, false) {
@@ -2949,7 +3008,8 @@ impl<'a> Engine<'a> {
                 .get(self.file)
                 .is_some_and(|f| f.has_extension_member(row.name));
         }
-        match self.extension_application(container, receiver_ty, row.name, write, receiver_nullable) {
+        match self.extension_application(container, receiver_ty, row.name, write, receiver_nullable)
+        {
             ExtensionApp::None => false,
             ExtensionApp::Single => true,
             // The member resolved through a non-nullable `on` face against a
@@ -3054,12 +3114,11 @@ impl<'a> Engine<'a> {
                 || sup == object
                 || world.named_sub(sub, sup)
                 || (sup == iterable && matches!(strings.resolve(sub), "List" | "Set"))
-                || crate::member_face::COLLECTION_INTERFACE_ALIASES.iter().any(
-                    |(alias, roots)| {
-                        *alias == strings.resolve(sub)
-                            && roots.contains(&strings.resolve(sup))
-                    },
-                )
+                || crate::member_face::COLLECTION_INTERFACE_ALIASES
+                    .iter()
+                    .any(|(alias, roots)| {
+                        *alias == strings.resolve(sub) && roots.contains(&strings.resolve(sup))
+                    })
         };
         // The `on` clause's argument list gates beside the head
         // (`applicable_extensions.dart:205-281` `applicableTo`: the oracle
@@ -3381,9 +3440,7 @@ impl<'a> Engine<'a> {
     /// the exported spelling). An own-library face contributes nothing —
     /// its name resolved locally, never through an import.
     pub(crate) fn credit_extension_import(&mut self, face: &ExtensionFace, face_file: FileId) {
-        if face_file == self.file
-            || self.graph.library_of_file(face_file) == Some(self.lib)
-        {
+        if face_file == self.file || self.graph.library_of_file(face_file) == Some(self.lib) {
             return;
         }
         if let Some(name) = face.name {
@@ -3461,7 +3518,12 @@ impl<'a> Engine<'a> {
     }
 
     /// Whether the plain member walk finds `member` on `container`.
-    pub(crate) fn member_found(&self, container: StringId, member: StringId, super_walk: bool) -> bool {
+    pub(crate) fn member_found(
+        &self,
+        container: StringId,
+        member: StringId,
+        super_walk: bool,
+    ) -> bool {
         let walk = if super_walk {
             self.walk_super(container, member)
         } else {
@@ -3523,7 +3585,10 @@ mod tests {
             },
             file,
         );
-        assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
         let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
         let features = ParserFeatures::from_feature_set(set);
         let elements = collect(source, &scanned.tokens, features, &strings);
@@ -3602,7 +3667,10 @@ mod tests {
             enable_augmentations: true,
         };
         let scanned = dartq_scanner::scan(source, scan_cfg, file);
-        assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
         let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
         let features = ParserFeatures::from_feature_set(set);
         let elements = collect(source, &scanned.tokens, features, &strings);
@@ -3677,10 +3745,7 @@ mod tests {
     /// must not silence it (the ~430 oracle-only rows' root cause).
     #[test]
     fn shown_name_invoked_in_class_reports_undefined_method() {
-        let report = report_with_edge(
-            "class C { void m() { Foo(); } }",
-            broken_show("Foo"),
-        );
+        let report = report_with_edge("class C { void m() { Foo(); } }", broken_show("Foo"));
         assert_eq!(code_names(&report), ["undefined_method"]);
         let row = &report.diagnostics[0];
         assert_eq!(
@@ -3717,10 +3782,7 @@ mod tests {
     /// same verdict the show-listed shape now reaches.
     #[test]
     fn unfiltered_broken_import_invoke_in_class_reports() {
-        let report = report_with_edge(
-            "class C { void m() { Foo(); } }",
-            broken_bare(),
-        );
+        let report = report_with_edge("class C { void m() { Foo(); } }", broken_bare());
         assert_eq!(code_names(&report), ["undefined_method"]);
     }
 
@@ -3730,10 +3792,7 @@ mod tests {
     /// still applies, so this stays silent.
     #[test]
     fn shown_name_prefixed_ctor_head_stays_suppressed() {
-        let report = report_with_edge(
-            "const x = Foo.bar();",
-            broken_show("Foo"),
-        );
+        let report = report_with_edge("const x = Foo.bar();", broken_show("Foo"));
         assert!(
             !code_names(&report).contains(&"undefined_method"),
             "{:?}",
@@ -3938,7 +3997,12 @@ mod tests {
              class Future<T> {}",
             "void f(DriftSession s) { s.transactionParent; s.exec(1); }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// #2190 shape 2 — the `_CollectByDialect` record-type field whose
@@ -3956,7 +4020,12 @@ mod tests {
              class List<T> {}",
             "void f(C c) { c.collectedStatements; }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// #2190 shape 3 — the `part of` plain-class field
@@ -3984,7 +4053,12 @@ mod tests {
             )],
             "void f(DatabaseConnection db) { db.executor; }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// #2190 discriminator — every corpus receiver is bound from
@@ -4628,11 +4702,7 @@ mod tests {
         );
         assert_eq!(
             code_names(&report),
-            [
-                "undefined_getter",
-                "undefined_method",
-                "undefined_setter"
-            ],
+            ["undefined_getter", "undefined_method", "undefined_setter"],
             "{:?}",
             code_names(&report)
         );

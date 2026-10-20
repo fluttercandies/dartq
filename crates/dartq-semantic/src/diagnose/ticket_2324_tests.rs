@@ -15,7 +15,12 @@
 //! closure formal under an unresolvable context schema binds `Object?` and
 //! reports the unchecked code at member use, while a decidable member miss
 //! through a merely-nullable receiver emits the same code where the
-//! `undefined_*` trio used to fire.
+//! `undefined_*` trio used to fire. The #2346① companion: the non-closure
+//! receiver faces — a for-in loop variable, a pattern destructure, a
+//! nullable-scrutinee pattern binding — resolve their member verdicts
+//! through the flow read-type face (the inferred-slot upgrade) and report
+//! the shared unchecked code where the `undefined_*` family or silence
+//! used to stand.
 
 use super::*;
 use crate::collector::collect;
@@ -39,7 +44,10 @@ fn report(source: &str) -> FileReport {
         },
         file,
     );
-    assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+    assert!(
+        scanned.diagnostics.is_empty(),
+        "scanner diagnostics: {source:?}"
+    );
     let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
     let features = ParserFeatures::from_feature_set(set);
     let elements = collect(source, &scanned.tokens, features, &strings);
@@ -75,10 +83,7 @@ fn report(source: &str) -> FileReport {
 }
 
 fn has_code(report: &FileReport, code: &str) -> bool {
-    report
-        .diagnostics
-        .iter()
-        .any(|d| d.code.name == code)
+    report.diagnostics.iter().any(|d| d.code.name == code)
 }
 
 fn code_names(report: &FileReport) -> Vec<&'static str> {
@@ -182,11 +187,7 @@ fn unnamed_extension_this_read_spares_the_on_type_field() {
                   } \
                   void f(C c) { print(c.doubled); }";
     let rep = report(source);
-    assert!(
-        !has_code(&rep, "unused_field"),
-        "{:?}",
-        rep.diagnostics
-    );
+    assert!(!has_code(&rep, "unused_field"), "{:?}", rep.diagnostics);
 }
 
 /// An extension body's bare read never spares the extension's OWN
@@ -210,11 +211,7 @@ fn extension_own_field_read_still_marks_the_extension() {
     // C._n is read through the extension (spared); D._n is read directly
     // (spared). The pin: neither spelling leaks a false negative —
     // specifically C._n's credit must land on C, not D.
-    assert!(
-        !has_code(&rep, "unused_field"),
-        "{:?}",
-        rep.diagnostics
-    );
+    assert!(!has_code(&rep, "unused_field"), "{:?}", rep.diagnostics);
 }
 
 // —— #2338: a member selector never adopts a shadowed local's promotion ——
@@ -236,11 +233,7 @@ fn member_selector_shadow_of_promoted_local_stays_silent() {
                     dep.dependencies!; \
                   }";
     let rep = report(source);
-    assert!(
-        rep.diagnostics.is_empty(),
-        "{:?}",
-        rep.diagnostics
-    );
+    assert!(rep.diagnostics.is_empty(), "{:?}", rep.diagnostics);
 }
 
 /// The closure-captured variant: the shadowed local is captured by a
@@ -296,11 +289,7 @@ fn member_nullability_without_shadow_unchanged() {
     let asserted = "class POF { POF? dependencies; POF? first; } \
                     void f(POF dep) { dep.dependencies!; }";
     let rep = report(asserted);
-    assert!(
-        rep.diagnostics.is_empty(),
-        "{:?}",
-        rep.diagnostics
-    );
+    assert!(rep.diagnostics.is_empty(), "{:?}", rep.diagnostics);
     let bare = "class POF { POF? dependencies; POF? first; } \
                 void f(POF dep) { dep.dependencies.first; }";
     let rep = report(bare);
@@ -406,8 +395,16 @@ fn annotated_invalid_formal_stays_silent() {
         "{:?}",
         code_names(&rep)
     );
-    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
-    assert!(!has_code(&rep, "undefined_getter"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_method"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(
+        !has_code(&rep, "undefined_getter"),
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// A for-in variable over an invalid container binds `InvalidType` — the
@@ -463,8 +460,16 @@ fn nullable_receiver_miss_reports_unchecked_not_undefined() {
         "{:?}",
         code_names(&rep)
     );
-    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
-    assert!(!has_code(&rep, "undefined_getter"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_method"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(
+        !has_code(&rep, "undefined_getter"),
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// The property face of the same tail (`y.length` on `Object?`) — the
@@ -478,7 +483,11 @@ fn nullable_receiver_property_miss_reports_unchecked() {
         "{:?}",
         code_names(&rep)
     );
-    assert!(!has_code(&rep, "undefined_getter"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_getter"),
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// A member miss on a declared nullable class (`C? c; c.undef()`) — the
@@ -493,8 +502,16 @@ fn nullable_class_miss_reports_unchecked() {
         "{:?}",
         code_names(&rep)
     );
-    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
-    assert!(!has_code(&rep, "undefined_getter"), "{:?}", code_names(&rep));
+    assert!(
+        !has_code(&rep, "undefined_method"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(
+        !has_code(&rep, "undefined_getter"),
+        "{:?}",
+        code_names(&rep)
+    );
 }
 
 /// The invoke intent joins the found-arm gate: `C? c; c.m()` where `m`
@@ -524,4 +541,163 @@ fn non_nullable_miss_keeps_the_undefined_family() {
         code_names(&rep)
     );
     assert!(has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+}
+
+// —— #2346① companion: the non-closure UNCHECKED receiver faces — a
+// receiver whose declared slot the name-level model never bound (the
+// for-in loop variable, a pattern destructure) reads its static type from
+// the flow layer's read-type row; a nullable face reports the shared
+// unchecked-access code at the member verdict, never the `undefined_*`
+// family.
+
+/// The for-loop element receiver (`for (var e in l) e.m()` over
+/// `List<C?>`): the loop variable's inferred slot resolves through the
+/// flow read-type face — the nullable element type reports the unchecked
+/// code at the send, never `undefined_method` (upstream's
+/// `_inferForEachVariable` element type).
+#[test]
+fn for_in_element_nullable_receiver_reports_unchecked() {
+    let source = "class C { void m() {} } \
+                  class List<T> {} \
+                  void f(List<C?> l) { for (var e in l) { e.m(); } }";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+}
+
+/// The read face of the same inferred-slot receiver (`e.length` on the
+/// nullable element): the miss reports the unchecked code, never
+/// `undefined_getter`.
+#[test]
+fn for_in_element_read_reports_unchecked() {
+    let source = "class C { void m() {} } \
+                  class List<T> {} \
+                  void f(List<C?> l) { for (var e in l) { e.length; } }";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(!has_code(&rep, "undefined_getter"), "{:?}", code_names(&rep));
+}
+
+/// The write face (`e.x = 1` through the nullable element): the unchecked
+/// code again — the `isNullable` tail precedes the write trio.
+#[test]
+fn for_in_element_write_reports_unchecked() {
+    let source = "class C { void m() {} } \
+                  class List<T> {} \
+                  void f(List<C?> l) { for (var e in l) { e.x = 1; } }";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(!has_code(&rep, "undefined_setter"), "{:?}", code_names(&rep));
+}
+
+/// The non-nullable boundary of the inferred-slot face: an element of
+/// `List<C>` resolves the member on `C` — no unchecked row, no
+/// `undefined_*` family.
+#[test]
+fn for_in_element_non_null_stays_silent() {
+    let source = "class C { void m() {} } \
+                  class List<T> {} \
+                  void f(List<C> l) { for (var e in l) { e.m(); } }";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(
+        !has_code(&rep, "undefined_method") && !has_code(&rep, "undefined_getter"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// The record-destructure receiver (`var (c, n) = r` on a `(C?, int)`
+/// parameter): the flat-record bind's positional slot type is nullable —
+/// the member verdict reports the unchecked code.
+#[test]
+fn record_destructure_nullable_slot_reports_unchecked() {
+    let source = "class C { void m() {} } \
+                  void f((C?, int) r) { var (c, n) = r; c.m(); }";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+}
+
+/// The non-nullable record slot: `(C, int)`'s `c` is `C` — the member
+/// resolves and nothing reports.
+#[test]
+fn record_destructure_non_null_stays_silent() {
+    let source = "class C { void m() {} } \
+                  void f((C, int) r) { var (c, n) = r; c.m(); }";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+}
+
+/// The if-case pattern variable under a nullable scrutinee (`Object? o`
+/// case `C? p`): the null branch is reachable, the bound variable keeps
+/// the written nullable type, and the member access reports the unchecked
+/// code.
+#[test]
+fn if_case_pattern_nullable_scrutinee_reports_unchecked() {
+    let source = "class C { void m() {} } \
+                  void f(Object? o) { if (o case C? p) { p.m(); } }";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+}
+
+/// The switch-case pattern binding under a nullable scrutinee: the bound
+/// variable's written `C?` rides the same predicate path.
+#[test]
+fn switch_case_pattern_nullable_scrutinee_reports_unchecked() {
+    let source = "class C { void m() {} } \
+                  void f(Object? o) { switch (o) { case C? c: c.m(); } }";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+}
+
+/// The dynamic-dispatch boundary of the inferred-slot face: an untyped
+/// formal's flow face is `dynamic` — never a named container — so the
+/// member access keeps the silent dispatch (`unk.m()` reports nothing).
+#[test]
+fn inferred_slot_dynamic_face_keeps_the_silent_dispatch() {
+    let source = "class C { void m() {} } \
+                  void f(unk) { unk.m(); }";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
 }
