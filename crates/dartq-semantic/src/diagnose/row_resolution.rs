@@ -824,8 +824,23 @@ impl<'a> Engine<'a> {
                         self.record_miss(row.name, row.range, false, use_kind);
                     }
                     Intent::Operator(..) => {
-                        // The undefined receiver itself reports above all; the
-                        // operator on an invalid type never cascades.
+                        // The undefined operand reports itself (`missing + 1`'s
+                        // undefined_identifier at the head — the
+                        // simple-identifier face the operator's own resolution
+                        // rides): the same guarded emission the Read arm
+                        // carries (the write-initializer clause is a
+                        // write-only posture no operator head takes). The
+                        // operator face never cascades a second row — the
+                        // invalid operand's dynamic face swallows the
+                        // operator lookup (probed: `missing + 1` reports the
+                        // identifier alone, `missing[0]` likewise).
+                        if !Self::synthetic_reference(row.range)
+                            && !self.keyword_bare_reference(row.range)
+                            && !self.guard.ignore(None, row.name)
+                            && !self.bare_write_target_exists(row.name, this_type)
+                        {
+                            self.emit(SemanticCode::UndefinedIdentifier, row.range, name_text, "");
+                        }
                         self.record_miss(row.name, row.range, false, NameUse::Read);
                     }
                 }
@@ -4147,8 +4162,9 @@ mod tests {
     /// span beside the constant-eval row (`undefined_class` is the
     /// TYPE-position code and never fires here), and the row must survive
     /// to the report, not drop at the merge. The `+`-operand head
-    /// (`missing + 1`) keeps its recorded-only posture — the operator
-    /// face's own routing, out of this pin's scope.
+    /// (`missing + 1`) rides the same face (#2306): the operator's
+    /// operand reports the identifier alone, the operator lookup itself
+    /// never cascades over the invalid operand.
     #[test]
     fn prefixed_head_value_miss_reports_identifier() {
         let report = report_units(
@@ -4172,7 +4188,59 @@ mod tests {
             .map(|d| d.range.offset)
             .collect();
         heads.sort_unstable();
-        assert_eq!(heads, [62, 84, 138, 161]);
+        assert_eq!(heads, [62, 84, 111, 138, 161]);
+    }
+
+    /// #2306: the operator's undefined operand reports itself at the head
+    /// — `missing + 1` and `missing[0]` carry the same
+    /// `undefined_identifier` face a bare read carries (upstream Dart SDK
+    /// source, `pkg/analyzer/lib/src/dart/resolver/simple_identifier_resolver.dart`,
+    /// the operand's own `simpleIdentifier` visit), and the operator
+    /// lookup never cascades a second row over the invalid operand (the
+    /// operand's dynamic face swallows it — probed against the oracle,
+    /// both shapes report the identifier alone). `final` heads keep the
+    /// const-initializer face out of the pin's scope.
+    #[test]
+    fn operator_head_miss_reports_identifier_without_cascade() {
+        let report = report_units(
+            &[],
+            "/p.dart",
+            "class Object {}\n\
+             final a = missing + 1;\n\
+             final b = missing[0];",
+            false,
+        );
+        assert_eq!(
+            code_names(&report),
+            ["undefined_identifier", "undefined_identifier"],
+            "{:?}",
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.message.to_string())
+                .collect::<Vec<_>>()
+        );
+        let mut heads: Vec<u32> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "undefined_identifier")
+            .map(|d| d.range.offset)
+            .collect();
+        heads.sort_unstable();
+        assert_eq!(heads, [26, 49]);
+    }
+
+    /// The guarded read face keeps its suppression in operator position: a
+    /// `show`-listed name of a broken import as an operator operand stays
+    /// silent — the operator head takes the Read arm's guard verbatim
+    /// (`undefined_identifier` consults `shouldIgnoreUndefined`), and the
+    /// miss still lands in the names table.
+    #[test]
+    fn shown_name_operator_head_stays_suppressed() {
+        let report = report_with_edge("void f() { Missing + 1; }", broken_show("Missing"));
+        assert!(report.diagnostics.is_empty(), "{:?}", code_names(&report));
+        assert_eq!(report.names.len(), 1);
+        assert_eq!(report.names[0].use_kind, NameUse::Read);
     }
 
     /// #2190 M1a residue — the extends-walk face: `escapedNameFor` is
