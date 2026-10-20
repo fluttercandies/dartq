@@ -630,6 +630,111 @@ fn unnecessary_statements_span_faces() {
     assert_eq!(lints[0].range.end, utf16_at(&f, tok(source, &f.tokens, "s", 1)) + 1);
 }
 
+/// The oracle span families (#2411): comma-delimited classic-`for`
+/// updaters walk per segment (a clear segment stays silent), a plain
+/// prefix reports operator-through-operand once (`--`/`++` stay clear,
+/// a nested prefix reports at the whole outer expression), a const
+/// literal reports at the whole `const …` node (an empty inner list
+/// included), and the conditional arms walk (a property-access
+/// statement reports at its own span).
+#[test]
+fn unnecessary_statements_oracle_span_families() {
+    // Comma updaters: `i = i` has a clear effect; `a == s` reports at
+    // its own span (oracle 4:20 len 6).
+    let source =
+        "void f(int i, int a, String s, bool b) {\n  for (; b; i = i, a == s) {\n    i = 1;\n  }\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    let a = tok(source, &f.tokens, "a", 1);
+    let s = tok(source, &f.tokens, "s", 1);
+    assert_eq!(lints[0].range.start, utf16_at(&f, a));
+    assert_eq!(lints[0].range.end, utf16_at(&f, s) + 1);
+
+    // Every updater segment clear stays silent.
+    assert_eq!(
+        run_semantic(
+            "void f(int c, int a, bool b) {\n  for (; b; c++, a++) {\n    c = 1;\n  }\n}\n",
+            "unnecessary_statements"
+        )
+        .len(),
+        0
+    );
+
+    // Plain prefixes report operator-through-operand (`!c`, `-a`, `~a`);
+    // the `--`/`++` statements stay clear.
+    let source = "void f(bool c, int a) {\n  !c;\n  -a;\n  ~a;\n  --a;\n  ++a;\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 3, "{lints:?}");
+    let f = Fixture::parse(source);
+    for (lint, op) in lints.iter().zip(["!", "-", "~"]) {
+        let start = tok(source, &f.tokens, op, 0);
+        assert_eq!(lint.range.start, utf16_at(&f, start), "{op}");
+        assert_eq!(lint.range.end, utf16_at(&f, start) + 2, "{op}");
+    }
+
+    // A nested prefix reports once, at the whole outer expression.
+    let source = "void f(int a) {\n  -(-a);\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    let dash = tok(source, &f.tokens, "-", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, dash));
+    assert_eq!(lints[0].range.end, utf16_at(&f, dash) + 5);
+
+    // A prefix over a parenthesized binary reports whole (no descent).
+    let source = "void f(int a, bool b) {\n  !(a == b);\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    let bang = tok(source, &f.tokens, "!", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, bang));
+    assert_eq!(lints[0].range.end, utf16_at(&f, bang) + 9);
+
+    // Const literal statements report at the whole `const …` node — an
+    // empty inner list included (oracle lengths 8, 9, 13).
+    let source = "void f() {\n  const [];\n  const [1];\n  const [1 + 2];\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 3, "{lints:?}");
+    let f = Fixture::parse(source);
+    for (lint, (nth, len)) in lints.iter().zip([(0, 8), (1, 9), (2, 13)]) {
+        let kw = tok(source, &f.tokens, "const", nth);
+        assert_eq!(lint.range.start, utf16_at(&f, kw), "const {nth}");
+        assert_eq!(lint.range.end, utf16_at(&f, kw) + len, "const {nth}");
+    }
+
+    // The conditional arms walk: local reads report per arm.
+    let source = "void f(bool t, int x, int y) {\n  t ? x : y;\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 2, "{lints:?}");
+    let f = Fixture::parse(source);
+    for (lint, name) in lints.iter().zip(["x", "y"]) {
+        let start = tok(source, &f.tokens, name, 1);
+        assert_eq!(lint.range.start, utf16_at(&f, start), "{name}");
+        assert_eq!(lint.range.end, utf16_at(&f, start) + 1, "{name}");
+    }
+
+    // Member-access arms report at their own `a.b` spans.
+    let source = "class C {\n  int b = 1;\n}\nvoid f(C a, bool t) {\n  t ? a.b : a.b;\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 2, "{lints:?}");
+    let f = Fixture::parse(source);
+    for (lint, nth) in lints.iter().zip([0, 1]) {
+        let a = tok(source, &f.tokens, "a", 1 + nth);
+        assert_eq!(lint.range.start, utf16_at(&f, a), "arm {nth}");
+        assert_eq!(lint.range.end, utf16_at(&f, a) + 3, "arm {nth}");
+    }
+
+    // A property-access statement reports at its own span.
+    let source = "class C {\n  int b = 1;\n}\nvoid f(C a) {\n  a.b;\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    let a = tok(source, &f.tokens, "a", 1);
+    assert_eq!(lints[0].range.start, utf16_at(&f, a));
+    assert_eq!(lints[0].range.end, utf16_at(&f, a) + 3);
+}
+
 /// The cascade face: a bare method section is a tear-off and reports;
 /// an invocation section and a getter section stay silent.
 #[test]

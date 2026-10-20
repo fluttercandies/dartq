@@ -133,13 +133,33 @@ fn walk(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32])
         | NodeKind::UnaryPostfix
         | NodeKind::NonNullAssert => {}
         // `--`/`++` are clear (:141-147); every other prefix reports.
+        // The bridge stamps the prefix as one childless token leaf over
+        // the operator after the operand completes (no payload), so the
+        // leaf's head token reads the operator and the report spans the
+        // operator through the operand rows' content end (`!c` reports
+        // len 2, `-(-a)` reports once at the whole expression — the
+        // upstream visitNode face does not descend). The operand tiles
+        // seal past their follower (the send-group markers stamp the
+        // `;`), so the content end reads the non-marker rows only.
         NodeKind::UnaryPrefix => {
-            let clear = c
-                .payload(root)
-                .first()
-                .is_some_and(|&op| matches!(c.lexeme(op), "--" | "++"));
-            if !clear {
-                report(c, root, run);
+            if !matches!(c.lexeme(c.head_token(root)), "--" | "++") {
+                let end = run
+                    .iter()
+                    .copied()
+                    .filter(|&row| {
+                        !matches!(
+                            c.kind(row),
+                            NodeKind::NoTypeArguments
+                                | NodeKind::NoArguments
+                                | NodeKind::Send
+                                | NodeKind::DotAccess
+                        )
+                    })
+                    .map(|row| c.utf16_span(row).end)
+                    .max()
+                    .unwrap_or_else(|| c.utf16_span(root).end);
+                let range = c.utf16_span(root).start..end;
+                c.report(range, &[]);
             }
         }
         // `??`/`||`/`&&` walk the right operand for control flow
@@ -162,11 +182,38 @@ fn walk(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>, run: &[u32])
                 walk(c, analysis, &arm);
             }
         }
-        // `const []` is a literal face upstream (visitNode); the const
-        // literal's own content decides.
+        // The const literal is a `visitNode` face upstream — the whole
+        // `const …` node reports with no descent (an empty inner list
+        // included: `const [];`, `const [1]`, `const [1 + 2]` all report
+        // at the keyword-to-close span). The row anchors at the literal
+        // head — the `const` keyword is a width-0 begin anchor carried
+        // by no row — so the keyword face reads the preceding token.
         NodeKind::ConstLiteral => {
-            let inner = inner_run(c, run, root);
-            walk(c, analysis, &inner);
+            let head = c.head_token(root);
+            let kw = if head > 0 && c.lexeme(head - 1) == "const" {
+                head - 1
+            } else {
+                head
+            };
+            let start = crate::rules::utf16_token_span(c, kw).start;
+            // The row's own span is unreliable at the empty shape (the
+            // seal degenerates), so the statement dispatch bounds the
+            // close: the trailing `;` token's start is the expression
+            // content end (the tiling wobbles on whether the statement
+            // row's token range carries the `;`).
+            let end = match c.kind(c.node()) {
+                NodeKind::ExpressionStatement => {
+                    let range = c.unit.ast.token_range(c.node());
+                    match range.end.checked_sub(1) {
+                        Some(last) if c.lexeme(last) == ";" => {
+                            crate::rules::utf16_token_span(c, last).start
+                        }
+                        _ => c.utf16_span(c.node()).end,
+                    }
+                }
+                _ => c.utf16_span(root).end,
+            };
+            c.report(start..end, &[]);
         }
         // The report-at-node set: literals, lambdas, type tests, index
         // accesses, parens, constructor tear-offs (:114-116).
@@ -217,14 +264,15 @@ fn statement_run(c: &Check<'_>, stmt: u32) -> Vec<u32> {
         .collect()
 }
 
-/// The run's root row: the unique row whose span contains every other
-/// row's span (sibling pieces never nest), falling back to the last row
-/// (postfix completion order puts the root last).
+/// The run's root row: the outermost row whose span contains every
+/// other row's span (sibling pieces never nest; wrapper rows may tie —
+/// the outermost completion is the last in run order), falling back to
+/// the last row (postfix completion order puts the root last).
 fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
     let root = *run.last()?;
     run.iter()
         .copied()
-        .find(|&row| {
+        .rfind(|&row| {
             let span = c.byte_span(row);
             run.iter().all(|&other| {
                 let other = c.byte_span(other);
@@ -240,20 +288,21 @@ fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
 /// at the operand head.
 fn report(c: &mut Check<'_>, root: u32, run: &[u32]) {
     let start = slice::run_utf16_start(c, run).unwrap_or(c.utf16_span(root).start);
-    let tail = content_end_row(c, root);
+    let tail = content_end_row(c, root, run);
     let range = start..c.utf16_span(tail).end;
     c.report(range, &[]);
 }
 
 /// The row whose end bounds the expression's true content: the
-/// binary/assignment containers seal past their last operand (the
-/// parser's expression return carries the follower `;`/`,`/`)`), so the
-/// content ends at the children's tiled tail; every other row seals at
-/// its own content exactly. The `No*` sentinel leaves anchor at the
-/// follower token and the bare-send `Send` leaf and the member-selector
-/// `DotAccess` handle tile through it (the #585 send/selector span
-/// posture), so none of them bound the content.
-fn content_end_row(c: &Check<'_>, root: u32) -> u32 {
+/// binary/assignment containers and the member-selector roots seal past
+/// their last operand (the parser's expression return carries the
+/// follower `;`/`,`/`)`/`:`), so the content ends at the children's
+/// tiled tail; every other row seals at its own content exactly. The
+/// `No*` sentinel leaves anchor at the follower token and the bare-send
+/// `Send` leaf and the member-selector `DotAccess` handle tile through
+/// it (the #585 send/selector span posture), so none of them bound the
+/// content.
+fn content_end_row(c: &Check<'_>, root: u32, run: &[u32]) -> u32 {
     match c.kind(root) {
         NodeKind::BinaryExpression | NodeKind::Assignment => {
             let window = c.children(root);
@@ -270,6 +319,22 @@ fn content_end_row(c: &Check<'_>, root: u32) -> u32 {
                 .max_by_key(|&row| c.byte_span(row).end)
                 .unwrap_or(root)
         }
+        // The member-selector tiles are owner siblings (no child
+        // window), so the tail reads off the run's non-marker rows.
+        NodeKind::DotAccess | NodeKind::Qualified => run
+            .iter()
+            .copied()
+            .filter(|&row| {
+                !matches!(
+                    c.kind(row),
+                    NodeKind::NoTypeArguments
+                        | NodeKind::NoArguments
+                        | NodeKind::Send
+                        | NodeKind::DotAccess
+                )
+            })
+            .max_by_key(|&row| c.byte_span(row).end)
+            .unwrap_or(root),
         _ => root,
     }
 }
@@ -541,7 +606,7 @@ fn check_for(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     let init: Vec<u32> = fragments
         .iter()
         .copied()
-        .filter(|&row| c.byte_span(content_end_row(c, row)).end <= left_start)
+        .filter(|&row| c.byte_span(content_end_row(c, row, &[row])).end <= left_start)
         .collect();
     walk(c, analysis, &init);
     // Each comma-delimited updater walks separately (:212-215).
@@ -588,8 +653,8 @@ fn for_header_condition(c: &Check<'_>, stmt: u32) -> bool {
     c.byte_span(stmt).end <= (token.byte_offset + token.byte_len) as usize
 }
 
-/// The maximal row groups whose spans stay within a comma-delimited
-/// token range (an updater list tiling).
+/// The maximal row groups split at the comma token indices (an updater
+/// list tiling).
 fn comma_groups(c: &Check<'_>, rows: &[u32]) -> Vec<Vec<u32>> {
     let Some((&first, rest)) = rows.split_first() else {
         return Vec::new();
@@ -598,26 +663,34 @@ fn comma_groups(c: &Check<'_>, rows: &[u32]) -> Vec<Vec<u32>> {
     let end = rest
         .last()
         .map_or_else(|| c.byte_span(first).end, |&row| c.byte_span(row).end);
-    let mut commas: Vec<usize> = c
-        .unit
-        .ast
-        .token_range(rows[0])
-        .filter_map(|token| {
+    // The separator scan spans the whole window's token range: the
+    // updater list tiles as sibling subtrees, so the first row's own
+    // token range misses the commas between later segments.
+    let first_range = c.unit.ast.token_range(first);
+    let window = first_range.start
+        ..rest
+            .last()
+            .map_or(first_range.end, |&row| c.unit.ast.token_range(row).end);
+    let commas: Vec<u32> = window
+        .filter(|&token| {
             let span = crate::rules::byte_span_of_token(c, token);
-            (c.lexeme(token) == "," && span.start >= start && span.end <= end)
-                .then_some(span.start)
+            c.lexeme(token) == "," && span.start >= start && span.end <= end
         })
         .collect();
-    commas.sort_unstable();
-    let mut groups: Vec<Vec<u32>> = vec![Vec::new()];
-    let mut comma = 0;
+    let mut groups: Vec<Vec<u32>> = Vec::new();
     for &row in rows {
-        let span = c.byte_span(row);
-        while comma < commas.len() && span.start >= commas[comma] {
-            comma += 1;
+        // The group key is the row's head token against the comma token
+        // indices: operand tiles and container roots seal past their
+        // follower (an assignment's span carries the trailing comma, a
+        // send-group marker stamps over it) and completion order is not
+        // monotonic in head tokens, so each row resolves its own segment
+        // — the commas strictly before its head.
+        let head = c.head_token(row);
+        let index = commas.partition_point(|&token| token < head);
+        while groups.len() <= index {
             groups.push(Vec::new());
         }
-        groups.last_mut().expect("seeded above").push(row);
+        groups[index].push(row);
     }
     groups.retain(|group| !group.is_empty());
     groups
@@ -808,33 +881,50 @@ fn binary_right_run(c: &Check<'_>, run: &[u32], root: u32) -> Vec<u32> {
     right
 }
 
-/// The then/else arm runs of the conditional at `root`: the arm rows
-/// plus the owner-sibling pieces inside each arm's span.
+/// The then/else arm runs of the conditional at `root`: every row —
+/// owner-sibling piece or child-window row — inside the arm's own byte
+/// window. The arms tile as whole expression groups (a bare name is a
+/// multi-row send group), so the windows split on the payload's `?`/`:`
+/// tokens; the condition sits left of the `?` and enters neither window.
 fn arm_runs(c: &Check<'_>, run: &[u32], root: u32) -> Vec<Vec<u32>> {
-    c.collect_direct(root)
-        .into_iter()
-        .skip(1)
-        .take(2)
-        .map(|arm| inner_run(c, run, arm))
-        .collect()
-}
-
-/// The rows of one expression: the owner-sibling pieces inside `root`'s
-/// span plus its own completion window.
-fn inner_run(c: &Check<'_>, run: &[u32], root: u32) -> Vec<u32> {
-    let span = c.byte_span(root);
-    let mut rows: Vec<u32> = run
-        .iter()
-        .copied()
-        .filter(|&row| {
-            row != root && {
-                let other = c.byte_span(row);
-                other.start >= span.start && other.end <= span.end
-            }
-        })
-        .collect();
+    let Some(&question) = c.payload(root).first() else {
+        return Vec::new();
+    };
+    let Some(&colon) = c.payload(root).get(1) else {
+        return Vec::new();
+    };
+    let (Some(question_end), Some(colon_span)) = (
+        c.unit
+            .tokens
+            .get(question as usize)
+            .map(|t| (t.byte_offset + t.byte_len) as usize),
+        c.unit
+            .tokens
+            .get(colon as usize)
+            .map(|t| (t.byte_offset as usize, (t.byte_offset + t.byte_len) as usize)),
+    ) else {
+        return Vec::new();
+    };
+    // Membership is start-anchored: the chain tiles seal past their
+    // follower (a member-selector row stamps over the colon), so an
+    // end-bound would drop the row that owns the arm's verdict.
+    let inside = |row: u32, lo: usize, hi: usize| {
+        let span = c.byte_span(row);
+        span.start >= lo && span.start < hi
+    };
     let window = c.children(root);
-    rows.extend(window.start..window.end);
-    rows.sort_unstable();
-    rows
+    let root_end = c.byte_span(root).end;
+    [(question_end, colon_span.0), (colon_span.1, root_end)]
+        .into_iter()
+        .map(|(lo, hi)| {
+            let mut rows: Vec<u32> = run
+                .iter()
+                .copied()
+                .filter(|&row| row != root && inside(row, lo, hi))
+                .collect();
+            rows.extend((window.start..window.end).filter(|&row| inside(row, lo, hi)));
+            rows.sort_unstable();
+            rows
+        })
+        .collect()
 }
