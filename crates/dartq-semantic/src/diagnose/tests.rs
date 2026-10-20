@@ -10662,6 +10662,120 @@
         assert!(code_names(&r3).is_empty(), "{:?}", code_names(&r3));
     }
 
+    // —— #2307: constructor-selector element credit ———————————————————————
+
+    /// A private named constructor created through an explicit `const` or
+    /// `new` keyword is referenced: the selector rides the creation's
+    /// head events (no member row), so the element credit spares it, and
+    /// the genuinely unreferenced sibling still reports. Pre-fix both
+    /// spurious rows fired (the const/new forms never credited the
+    /// selector).
+    #[test]
+    fn unused_private_constructor_const_and_new_uses_spare() {
+        let r = report(
+            "class int {} class A { const A._ca(); const A._da(); } \
+             class B { B._nb(); B._db(); } \
+             const a = A._ca(); final b = new B._nb(); void main() {}",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unused_element", "unused_element"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The declaration 'A._da' isn't referenced."
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "The declaration 'B._db' isn't referenced."
+        );
+    }
+
+    /// An annotation's `@A._x` selector names the class's constructor
+    /// (the metadata continuation carries no member row): the annotated
+    /// constructor stays silent while its unreferenced sibling reports.
+    #[test]
+    fn unused_private_constructor_annotation_use_spares() {
+        let r = report(
+            "class int {} class A { const A._ann(); const A._dead(); } \
+             @A._ann class B {} void main() { B(); }",
+        );
+        assert_eq!(code_names(&r), ["unused_element"], "{:?}", code_names(&r));
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The declaration 'A._dead' isn't referenced."
+        );
+        // The negative twin: without the annotation both report.
+        let r2 = report(
+            "class int {} class A { const A._ann2(); const A._dead2(); } \
+             class B {} void main() { B(); }",
+        );
+        assert_eq!(
+            code_names(&r2),
+            ["unused_element", "unused_element"],
+            "{:?}",
+            code_names(&r2)
+        );
+    }
+
+    /// A parameterized creation (`C<int>._x()`, `const C<int>._y()`) hands
+    /// its selector to the after-type-arguments continuation instead of
+    /// the plain one: the head must still credit the constructor element.
+    /// Same-spelling rescue would mask the miss, so each class carries its
+    /// own selector spelling.
+    #[test]
+    fn unused_private_constructor_parameterized_creation_spares() {
+        let r = report(
+            "class int {} class A<T> { A._pa(); A._deadA(); } \
+             class B<T> { const B._pb(); const B._deadB(); } \
+             final a = A<int>._pa(); const b = B<int>._pb(); void main() {}",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["unused_element", "unused_element"],
+            "{:?}",
+            code_names(&r)
+        );
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The declaration 'A._deadA' isn't referenced."
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "The declaration 'B._deadB' isn't referenced."
+        );
+    }
+
+    /// A record literal's fields drain into the literal's own row, but each
+    /// field still owes its reference credit: a bare call inside the
+    /// literal marks its callee used, a read marks the field read, and an
+    /// unreferenced sibling still reports. Pre-fix the drain kept only the
+    /// unresolved shapes, so every resolved field reference was lost.
+    #[test]
+    fn unused_record_literal_field_reference_spares() {
+        let r = report(
+            "class int {} int _live(int x) => x; int _gone(int x) => x; \
+             void f() { var r = (a: _live(1), b: 2); r; } void main() { f(); }",
+        );
+        assert_eq!(code_names(&r), ["unused_element"], "{:?}", code_names(&r));
+        assert_eq!(
+            r.diagnostics[0].message,
+            "The declaration '_gone' isn't referenced."
+        );
+        let r2 = report(
+            "class int {} class C { int _read = 1; int _written = 2; \
+             void g() { var r = (a: _read); r; } void w() { _written = 3; } } \
+             void main() { C().g(); C().w(); }",
+        );
+        assert_eq!(code_names(&r2), ["unused_field"], "{:?}", code_names(&r2));
+        assert_eq!(
+            r2.diagnostics[0].message,
+            "The value of the field '_written' isn't used."
+        );
+    }
+
     // —— #505: the import/flow cluster ———————————————————————————————————
 
     /// An import that contributed nothing reports at its URI; the same

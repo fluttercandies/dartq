@@ -2000,6 +2000,19 @@ impl ParserListener for DiagnoseListener<'_> {
                 }
             }
             C::ConstructorReferenceContinuationAfterTypeArguments => {
+                // The parameterized creation's selector (`C<int>._x(...)`):
+                // the written type-argument group splits the reference, so
+                // this event — not `ConstructorReferenceContinuation` —
+                // carries the selector, and no member row ever names it.
+                // Credit the constructor element against the latched head
+                // (the same gate as the end-of-reference credit: the head
+                // must resolve to a class declaring the selector; a prefix
+                // head resolves to nothing — under-report).
+                if let Some(name) = name
+                    && let Some((head, _)) = engine.creation_ref
+                {
+                    engine.credit_constructor_selector(head, name);
+                }
                 // The `.new` selector of the parameterized creation
                 // (`prefix.C<int>.new()`): the head row already reported
                 // (the requalified prefix face), and the oracle's property
@@ -2048,6 +2061,15 @@ impl ParserListener for DiagnoseListener<'_> {
                 // latch (`head.selector`), the shape
                 // `use_result_unless` matches.
                 if let Some(name) = name {
+                    // An annotation's `@C._x` selector names the class's
+                    // constructor (the oracle resolves it as the metadata
+                    // creation's element); the metadata events carry no
+                    // member row, so credit it here against the open
+                    // head. The join below rewrites the head spelling, so
+                    // the credit reads it first.
+                    if let Some(head) = engine.pending_annotations.last().map(|open| open.name) {
+                        engine.credit_constructor_selector(head, name);
+                    }
                     let selector = engine.strings.resolve(name);
                     let head = engine
                         .pending_annotations
@@ -5601,22 +5623,19 @@ impl ParserListener for DiagnoseListener<'_> {
         match fields {
             Some((mark, positional, named)) => {
                 // The literal's row replaces its field residue: the fields
-                // already emitted their own diagnostics during the walk, so
-                // the window drains into one typed record row — the same
-                // fold the argument rows use. A field's unresolved row still
-                // owes its report (`(1, _)`'s `_` — the record literal's
-                // field resolves as an expression upstream, so its
-                // `undefined_identifier` survives the fold into pass 2).
-                for row in engine.rows.drain(mark..) {
-                    if matches!(
-                        row.shape,
-                        RowShape::Bare(BareInfo::Missing { .. })
-                            | RowShape::TypeUse(..)
-                            | RowShape::Member { .. }
-                    ) {
-                        engine.deferred_miss_rows.push(row);
-                    }
-                }
+                // already emitted their own walk-time diagnostics, so the
+                // window drains into one typed record row — the same fold
+                // the argument rows use. The drain is unfiltered: a dropped
+                // row still owes its pass-2 obligations. A resolved bare
+                // field marks its usage (`(a: _live())` spares `_live`,
+                // `(a: _read)` reads the field) and an unresolved one its
+                // report (`(1, _)`'s `_` — the record literal's field
+                // resolves as an expression upstream), exactly like the
+                // plain-send and creation folds' deferred drain; the pass-2
+                // arms keep non-reporting shapes silent.
+                engine
+                    .deferred_miss_rows
+                    .extend(engine.rows.drain(mark..));
                 engine.push_record_row(token, positional, named);
             }
             None => engine.push_value_row(token),
@@ -5867,6 +5886,18 @@ impl ParserListener for DiagnoseListener<'_> {
         // The reference closed — its segments stop matching type-argument
         // groups (a plain invocation's group inside `new C(...)`'s
         // arguments must not).
+        //
+        // The selector's element credit: this event family carries the
+        // creation's `C._x` selector without a member-access row, so the
+        // element-use pool needs the explicit credit (the oracle resolves
+        // the constructor element of every creation form). Element-accurate
+        // through [`Engine::credit_constructor_selector`]'s container
+        // check; a prefixed head's segments dead-end there (the
+        // under-report direction — a private selector is never reachable
+        // through a prefix).
+        if let Some((head, Some((selector, _)))) = engine.creation_ref {
+            engine.credit_constructor_selector(head, selector);
+        }
         engine.creation_ref = None;
     }
 

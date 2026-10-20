@@ -254,6 +254,34 @@ impl<'a> Engine<'a> {
         resolved
     }
 
+    /// The creation/metadata selector credit (`const C._x()`,
+    /// `new C._x()`, `@C._x`): the parser routes a constructor
+    /// reference's selector through the creation-head events instead of a
+    /// member-access row (`listener.rs`'s `C::ConstructorReference`
+    /// family), so `used_names` never learns the spelling and the
+    /// element-use pool reports the constructor as unused. The oracle
+    /// resolves the creation's constructor element, so the credit is
+    /// element-accurate: the head must resolve to a container that
+    /// declares the selector as a constructor. An implicit-const or plain
+    /// `C._x()` invocation rides the member path and needs no credit; an
+    /// unresolvable head (a prefix segment, a dead name) credits nothing —
+    /// the under-report direction every unmodelable corner keeps.
+    pub(crate) fn credit_constructor_selector(&mut self, head: StringId, selector: StringId) {
+        let Some((container, _)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            head,
+        ) else {
+            return;
+        };
+        if container.constructors.contains(&selector) {
+            self.used_names.insert(selector);
+        }
+    }
+
     /// The constructor half of a resolved `C.sel` access (`_E._`,
     /// `C.named`): the member walk keys on `members`, while constructors
     /// live in the container's own `constructors` list (the official
