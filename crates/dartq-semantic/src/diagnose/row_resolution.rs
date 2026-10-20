@@ -3471,7 +3471,19 @@ impl<'a> Engine<'a> {
             }
             for edge in self.graph.import_edges(self.lib) {
                 let Some(target) = edge.target else { continue };
-                for (name, entry) in self.graph.export_scope(target) {
+                // The pool's face order reaches the ambiguity message's
+                // candidate enumeration (`emit_extension_ambiguity` lists
+                // the members in pool order), so an import target's
+                // export-scope iteration must not leak container order
+                // into the output. The sort key is the name's BYTES, not
+                // its intern id: ids are allocation-ordered and a parallel
+                // intern race can drift them across runs, while the byte
+                // order is content-addressed and run-stable (the pool is a
+                // set — order carries no resolution semantics).
+                let strings = self.strings;
+                let mut scope: Vec<_> = self.graph.export_scope(target).collect();
+                scope.sort_by_key(|&(name, _)| strings.resolve(name));
+                for (name, entry) in scope {
                     if !edge.combinators.allows(name) {
                         continue;
                     }
