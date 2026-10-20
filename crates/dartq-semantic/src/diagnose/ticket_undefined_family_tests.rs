@@ -588,3 +588,139 @@
         assert!(!names.contains(&"undefined_method"), "{names:?}");
         assert!(!names.contains(&"undefined_getter"), "{names:?}");
     }
+
+    /// Diagnoses `source_m` importing `source_a` unprefixed: `a.dart`'s
+    /// public face joins `main.dart`'s unit scope (the plain-import twin
+    /// of [`report_prefixed`]).
+    fn report_imported(source_m: &str, source_a: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file_a = files.intern(Path::new("a.dart"));
+        let file_m = files.intern(Path::new("main.dart"));
+        let (scanned_a, features, _) = scan(source_a, file_a);
+        let (scanned_m, _, set) = scan(source_m, file_m);
+        let elements_a = collect(source_a, &scanned_a.tokens, features, &strings);
+        let elements_m = collect(source_m, &scanned_m.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib_a = builder.intern("package:t/a.dart");
+        let lib_m = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file_a, elements_a.clone());
+        index.insert(file_m, elements_m.clone());
+        for (name, _) in elements_a.declarations() {
+            builder.declare(lib_a, name, file_a);
+        }
+        for (name, decl) in elements_m.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib_m, name, file_m);
+        }
+        builder.import(
+            lib_m,
+            ImportEdge {
+                target: Some(lib_a),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let fold = fold_unit(
+            source_m,
+            &scanned_m.tokens,
+            features,
+            &strings,
+            file_m,
+            lib_m,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        let mut report = fold.report;
+        report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+        report
+    }
+
+    // —— #2284: the implicit-`this` extension application on a bare miss ——
+
+    /// `variable(other)` inside `class Expression` and inside
+    /// `extension ComparableExpr on Expression<DT>` resolves through the
+    /// imported `WithTypes on Expression<T>` face — the oracle's
+    /// `findExtension` applies the extension's member to `this` after the
+    /// member face and the scope both miss (drift's
+    /// `WithTypes<T> on Expression<T>` in `helpers.dart`). Before the fix
+    /// the bare call reported `undefined_method` naming `Expression`.
+    #[test]
+    fn bare_call_applies_imported_extension_member() {
+        let report = report_imported(
+            "import 'a.dart';\n\
+             class Expression<D extends Object> {\n  \
+               const Expression();\n  \
+               Expression<bool> equals(D compare) => isE(variable(compare));\n  \
+               Expression<bool> isE(Expression<D> other) => E<bool>();\n}\n\
+             class E<D extends Object> extends Expression<D> {\n  \
+               const E();\n}\n\
+             extension ComparableExpr<DT extends Comparable<dynamic>>\n    \
+                 on Expression<DT> {\n  \
+               Expression<bool> bigger(DT other) => isE(variable(other));\n}\n",
+            "import 'main.dart';\n\
+             extension WithTypes<T extends Object> on Expression<T> {\n  \
+               Variable<T> variable(T? value) => Variable<T>();\n}\n\
+             class Variable<T> {}\n",
+        );
+        let names = code_names(&report);
+        for code in [
+            "undefined_method",
+            "undefined_getter",
+            "undefined_identifier",
+        ] {
+            assert!(!names.contains(&code), "{code} -> {names:?}");
+        }
+    }
+
+    /// The same face inside a `mixin`'s `on` constraint — `this` carries
+    /// the constraint's member face (riverpod's
+    /// `$AsyncClassModifier on AnyNotifier` calling the imported
+    /// `ClassBaseX.requireElement`).
+    #[test]
+    fn bare_call_applies_extension_through_mixin_constraint() {
+        let report = report_imported(
+            "import 'a.dart';\n\
+             class AnyNotifier<S, V> {}\n\
+             mixin M<V> on AnyNotifier<V, V> {\n  \
+               V get future => requireElement().state;\n}\n",
+            "import 'main.dart';\n\
+             extension X<S, V> on AnyNotifier<S, V> {\n  \
+               AnyNotifier<S, V> requireElement() => this;\n  \
+               V get state => throw '';\n}\n",
+        );
+        let names = code_names(&report);
+        for code in [
+            "undefined_method",
+            "undefined_getter",
+            "undefined_identifier",
+        ] {
+            assert!(!names.contains(&code), "{code} -> {names:?}");
+        }
+    }
+
+    /// The miss still reports when no in-scope face carries the member:
+    /// the bare `absent()` inside the same class body keeps the oracle's
+    /// `undefined_method` for 'Expression'.
+    #[test]
+    fn bare_call_miss_still_reports_when_no_extension_carries() {
+        let report = report_imported(
+            "import 'a.dart';\n\
+             class Expression<D extends Object> {\n  \
+               Expression<bool> f(D compare) => absent(compare);\n}\n",
+            "extension WithTypes<T extends Object> on Expression<T> {\n  \
+               void variable(T? value) {}\n}\n",
+        );
+        let names = code_names(&report);
+        assert!(names.contains(&"undefined_method"), "{names:?}");
+    }

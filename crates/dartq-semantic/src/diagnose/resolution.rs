@@ -1074,8 +1074,208 @@ impl<'a> Engine<'a> {
             ),
             ScopedHit::Found(entry) => self.bare_info_of_entry(name, entry),
             ScopedHit::Ambiguous(_) => (BareInfo::Plain { ty: Ty::UNKNOWN }, RefTarget::Opaque),
-            ScopedHit::NotFound => (self.missing_info(name), RefTarget::Missing),
+            ScopedHit::NotFound => {
+                // The implicit-`this` extension application: a bare name
+                // missing every scope still resolves as `this.name` when an
+                // in-scope extension face declares `name` on `this`'s
+                // static type (`extension_member_resolver.dart`
+                // `findExtension` runs after the scope miss — the same
+                // verdict `member_defined` reaches for the explicit
+                // `x.name` form). An applied face suppresses the miss
+                // exactly like an `Opaque` member hit; an ambiguous or
+                // inapplicable pool changes nothing — the oracle's
+                // `undefined_*` face stands.
+                if let Some((container, kind)) = self.container_context()
+                    && self.instance_context()
+                    && self.this_extension_member_applies(container, kind, name)
+                {
+                    return (BareInfo::Plain { ty: Ty::UNKNOWN }, RefTarget::Opaque);
+                }
+                (self.missing_info(name), RefTarget::Missing)
+            }
         }
+    }
+
+    /// Whether `name` is an applicable extension member for the implicit
+    /// `this` inside `container` (`extension_member_resolver.dart`'s
+    /// `_getApplicable` over the `accessibleExtensions` scope face): the
+    /// unit's own faces plus the named faces every import edge's target
+    /// exports under its combinators — the same pool
+    /// [`Engine::accessible_extension_faces`] materializes for the
+    /// explicit-receiver face, recomputed here because the bare-name path
+    /// holds `&self` (a bare miss is a cold path — the per-call fill costs
+    /// a small scan, not a state). Applicability is the receiver's subtype
+    /// relation to the face's `on` type, argument-gated exactly like
+    /// [`Engine::extension_application`]; the receiver is `this`'s static
+    /// type — the `on` type inside an extension body, the enclosing
+    /// container's head everywhere else.
+    fn this_extension_member_applies(
+        &self,
+        container: StringId,
+        kind: ContainerKind,
+        name: StringId,
+    ) -> bool {
+        let receiver_ty = self.this_static_ty(container, kind);
+        let Ty::Named {
+            name: receiver,
+            nullable: receiver_nullable,
+            ..
+        } = receiver_ty
+        else {
+            return false;
+        };
+        // A nullable `this` (`on C?`, an unbounded `on T`) reads a
+        // possibly-null receiver — the `unchecked_use_of_nullable_value`
+        // family owns that face; a bare miss stays reportable there.
+        if receiver_nullable {
+            return false;
+        }
+        // The oracle gates application on the receiver resolving at its
+        // head — an `InvalidType` `this` applies no extension. The bare
+        // head resolved to the enclosing container by construction, so
+        // only the `on`-clause head needs the check.
+        if kind == ContainerKind::Extension
+            && self.type_resolution(receiver).0 != TypeResolution::Type
+        {
+            return false;
+        }
+        let world = self.name_world();
+        let object = self.intern("Object");
+        let iterable = self.intern("Iterable");
+        let strings = self.strings;
+        let reaches = |sub: StringId, sup: StringId| {
+            sub == sup
+                || sup == object
+                || world.named_sub(sub, sup)
+                || (sup == iterable && {
+                    let text = strings.resolve(sub);
+                    matches!(text, "List" | "Set")
+                        || crate::member_face::COLLECTION_INTERFACE_ALIASES
+                            .iter()
+                            .any(|(alias, roots)| *alias == text && roots.contains(&"Iterable"))
+                })
+        };
+        let arg_applicable = |face: &ExtensionFace, face_file: FileId| {
+            let on_ty = self.boundary.ty(face_file, face.on_ty);
+            let (
+                Ty::Named {
+                    name: receiver_head,
+                    args: receiver_args,
+                    ..
+                },
+                Ty::Named {
+                    name: on_head,
+                    args: on_args,
+                    ..
+                },
+            ) = (receiver_ty, on_ty)
+            else {
+                return true;
+            };
+            if receiver_head != on_head {
+                return true;
+            }
+            let receiver_args = self.boundary.pool().get(receiver_args).to_vec();
+            let on_args = self.boundary.pool().get(on_args).to_vec();
+            let receiver_args = if receiver_args.is_empty() && !on_args.is_empty() {
+                vec![Ty::Dynamic; on_args.len()]
+            } else {
+                receiver_args
+            };
+            if receiver_args.len() != on_args.len() {
+                return true;
+            }
+            receiver_args
+                .iter()
+                .zip(on_args.iter())
+                .all(|(&receiver_arg, &on_arg)| {
+                    if let Ty::Named {
+                        name: arg_name,
+                        args,
+                        ..
+                    } = on_arg
+                        && args == ArgListId::EMPTY
+                        && face.type_param_names.contains(&arg_name)
+                    {
+                        return true;
+                    }
+                    let (
+                        Ty::Named {
+                            name: arg_head,
+                            args: arg_args,
+                            ..
+                        },
+                        Ty::Named {
+                            name: receiver_head,
+                            args: receiver_args,
+                            ..
+                        },
+                    ) = (on_arg, receiver_arg)
+                    else {
+                        return !matches!(receiver_arg, Ty::Dynamic)
+                            || matches!(on_arg, Ty::Dynamic);
+                    };
+                    if arg_args != ArgListId::EMPTY || receiver_args != ArgListId::EMPTY {
+                        return true;
+                    }
+                    reaches(receiver_head, arg_head)
+                })
+        };
+        // The `accessibleExtensions` enumeration (`scope.dart:473-488`):
+        // own unit files first, then the named faces each import edge's
+        // target exports — combinator filtered; an unnamed face never
+        // reaches the import scope but an own-library unnamed face
+        // applies all the same.
+        let probe = |face: &ExtensionFace, file: FileId| -> bool {
+            let Some(on) = face.on_type else {
+                return false;
+            };
+            if !face.members.contains_key(&name) {
+                return false;
+            }
+            // Receiver nullability already returned above; against a
+            // non-nullable `this` both `on` nullability faces apply.
+            reaches(receiver, on) && arg_applicable(face, file)
+        };
+        let unit_has = |file: FileId| -> bool {
+            self.index
+                .get(file)
+                .is_some_and(|elements| {
+                    elements
+                        .extension_faces()
+                        .iter()
+                        .any(|face| probe(face, file))
+                })
+        };
+        if unit_has(self.file) {
+            return true;
+        }
+        for &unit in self.graph.unit_files(self.lib) {
+            if unit != self.file && unit_has(unit) {
+                return true;
+            }
+        }
+        for edge in self.graph.import_edges(self.lib) {
+            let Some(target) = edge.target else {
+                continue;
+            };
+            for (exported, entry) in self.graph.export_scope(target) {
+                if !edge.combinators.allows(exported) {
+                    continue;
+                }
+                let Some(elements) = self.index.get(entry.file) else {
+                    continue;
+                };
+                if elements
+                    .extension_faces()
+                    .iter()
+                    .any(|face| face.name == Some(exported) && probe(face, entry.file))
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The `on`-face member walk for a bare name inside a mixin or an
