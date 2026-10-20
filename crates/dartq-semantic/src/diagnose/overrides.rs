@@ -639,6 +639,370 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The with-clause mixin-application anchor face (upstream Dart SDK
+    /// source, `pkg/analyzer/lib/src/error/inheritance_override.dart`
+    /// `InheritanceOverrideVerifier.verify` lines 338-364): as each mixin
+    /// application point completes, the oracle runs `_checkDeclaredMembers`
+    /// for the mixin's own members against the super-interfaces accumulated
+    /// so far — the superclass plus the mixins already applied, in with
+    /// order — and only after the mixin loop adds `implements`/`on`. The
+    /// diagnostic anchors at the written mixin name INCLUDING its type
+    /// arguments (`XmlHasChildren<XmlNode>` = the whole `NamedType` span),
+    /// and the message carries the mixin's declared signature instantiated
+    /// at the application point. Fires once per container header at the
+    /// with-clause event, while `container_context` is still the open
+    /// container and `deferred_modifier.spans.buffered` still holds the
+    /// with entries (the tail `with_clause.len()` entries — an `extends`
+    /// overflow residue lands before them, never inside the tail window).
+    ///
+    /// The `element.interfaces`/`on` faces are deliberately absent from the
+    /// per-mixin check set: upstream adds them only AFTER the mixin loop,
+    /// so a mixin member that conflicts with an `implements` interface is
+    /// `check_override`'s business at the member site, never an extra
+    /// `INVALID_OVERRIDE` at the mixin span. Every unresolvable hop, cycle,
+    /// or incomparable type suppresses — the under-report direction.
+    ///
+    /// `container` is the open container frame's name (the class / named
+    /// mixin application / enum being declared). Wired from the
+    /// with-clause listener events before `drain_with_clause_spans` moves
+    /// the buffered spans into `pending_mixin_uses` — the listener hook
+    /// ships with its owning lane, so the check sits uncalled until then.
+    #[expect(dead_code, reason = "the with-clause listener hook lands with its lane (#2314)")]
+    pub(crate) fn check_mixin_application_overrides(&mut self, container: StringId) {
+        let Some(elements) = self.index.get(self.file) else {
+            return;
+        };
+        let Some(decl) = elements.container(container) else {
+            return;
+        };
+        if decl.with_clause.is_empty() {
+            return;
+        }
+        // The written mixin spans, in application order — the tail window
+        // of the clause buffer at the with-clause event. A claim/count
+        // disagreement (recovery shape, unmodelable entry) leaves no spans
+        // to pair: bail rather than anchor at a wrong offset.
+        let with_count = decl.with_clause.len();
+        let spans: Vec<SourceRange> = match self.deferred_modifier.as_ref() {
+            Some(deferred) if deferred.spans.buffered.len() >= with_count => deferred
+                .spans
+                .buffered[deferred.spans.buffered.len() - with_count..]
+                .to_vec(),
+            _ => return,
+        };
+        // The oracle's accumulation set: the direct super-interfaces already
+        // applied before each mixin — `[supertype]` then each prior mixin.
+        // `element.interfaces`/`on` join only after the mixin loop, so they
+        // never enter this face set.
+        let mut accumulated: Vec<StringId> = Vec::with_capacity(with_count + 1);
+        if let Some(superclass) = decl.superclass {
+            accumulated.push(superclass);
+        }
+        // The written clause facts, built on first need — a mixin's own
+        // signature carrying free type parameters — and shared across the
+        // mixin loop (one token walk per check).
+        let mut facts: Option<FxHashMap<StringId, HeaderClause>> = None;
+        for (index, &mixin) in decl.with_clause.iter().enumerate() {
+            // Resolve the mixin through the diagnosing file's library: the
+            // with-entry spellings are written in this file and resolve
+            // through its scope, whatever file declares the container. A
+            // with-entry that is not a class-or-mixin element is not a
+            // valid superinterface upstream (`mixinType.isValidSuperinterface`)
+            // — the element never enters `directSuperInterfaces`, so neither
+            // its members nor its own accumulation slot contribute.
+            let Some((mixin_container, mixin_owner)) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                mixin,
+            ) else {
+                continue;
+            };
+            if !matches!(
+                mixin_container.kind,
+                ContainerKind::Class | ContainerKind::Mixin
+            ) {
+                continue;
+            }
+            // The declared side: the mixin's own members, methods then
+            // getters then setters (upstream `_checkDeclaredMembers`
+            // iterates `type.methods`, then `type.getters`, then
+            // `type.setters`), statics skipped, a field riding its implicit
+            // getter plus — non-final only — its implicit setter, the same
+            // two-face split `check_override` applies. Each member is
+            // boundary-projected first so its `Ty` slots read through the
+            // diagnosing pool (the mixin body is a foreign file's pool).
+            // Ordering the faces keeps the oracle's per-member loop
+            // deterministic; NameMap's ascending-id order is only the
+            // bucket source.
+            let mut declared: Vec<(
+                StringId,
+                MemberKind,
+                Option<MemberEntry>,
+                Projected<'a, MemberEntry>,
+            )> = Vec::new();
+            for (spelling, member) in mixin_container.members.iter() {
+                if member.is_static {
+                    continue;
+                }
+                let projected = self.boundary.member(mixin_owner, mixin, *spelling, member);
+                match member.kind {
+                    MemberKind::Method => declared.push((*spelling, MemberKind::Method, None, projected)),
+                    MemberKind::Getter => declared.push((*spelling, MemberKind::Getter, None, projected)),
+                    MemberKind::Setter => declared.push((*spelling, MemberKind::Setter, None, projected)),
+                    MemberKind::Field => {
+                        declared.push((*spelling, MemberKind::Getter, None, projected.clone()));
+                        if !projected.is_final {
+                            let setter_face = MemberEntry {
+                                kind: MemberKind::Setter,
+                                formals: Some(Box::new(Formals {
+                                    positional: Box::new([Formal {
+                                        name: *spelling,
+                                        ty: projected.var_ty,
+                                        required: true,
+                                        covariant: false,
+                                        default_value: None,
+                                    }]),
+                                    named: Box::new([]),
+                                })),
+                                ..(*projected).clone()
+                            };
+                            declared.push((*spelling, MemberKind::Setter, Some(setter_face), projected));
+                        }
+                    }
+                }
+            }
+            // methods → getters → setters, matching `type.methods` /
+            // `type.getters` / `type.setters`: fields contribute one getter
+            // and one setter slot in-place, so a stable bucket order over
+            // the tagged kinds reproduces the upstream sequence.
+            declared.sort_by_key(|(_, kind, _, _)| match kind {
+                MemberKind::Method => 0u8,
+                MemberKind::Getter | MemberKind::Field => 1,
+                MemberKind::Setter => 2,
+            });
+            // Per declared face (getter / setter): the inherited members
+            // already judged broken, keyed by pointer — one diagnostic per
+            // inherited member.
+            let mut broken_seen: Vec<(bool, *const MemberEntry)> = Vec::new();
+            for (spelling, face_kind, face_entry, projected) in &declared {
+                let setter_face = *face_kind == MemberKind::Setter;
+                // The declared face's signature under the application-site
+                // substitution: a generic mixin member read through
+                // `Mixin<XmlNode>` carries the application's written
+                // arguments. Foreign single-parameter hops map the one free
+                // spelling to the one written argument (the name-forced
+                // rule); multi-parameter foreign hops stay undecidable and
+                // suppress the face.
+                let declared_cmp_owned;
+                let declared_cmp: &MemberEntry = match self.mixin_env(
+                    container,
+                    mixin,
+                    mixin_owner,
+                    projected,
+                    &mut facts,
+                ) {
+                    Instantiated::Unchanged => face_entry.as_ref().unwrap_or(projected),
+                    Instantiated::Applied(env) => {
+                        declared_cmp_owned = self.substitute_entry(
+                            face_entry.as_ref().unwrap_or(projected),
+                            &env,
+                        );
+                        &declared_cmp_owned
+                    }
+                    Instantiated::Undecidable => continue,
+                };
+                let lookup = if setter_face {
+                    self.setter_spelling(*spelling)
+                } else {
+                    *spelling
+                };
+                for &face in &accumulated {
+                    let Some((inherited, face_name, origin, chain)) =
+                        self.face_member_tracked(face, lookup)
+                    else {
+                        continue;
+                    };
+                    if inherited.kind != *face_kind {
+                        continue;
+                    }
+                    if broken_seen
+                        .iter()
+                        .any(|(tag, ptr)| *tag == setter_face && *ptr == inherited.ptr())
+                    {
+                        continue;
+                    }
+                    let substituted;
+                    let inherited_ref: &MemberEntry = match self.instantiate_inherited(
+                        &chain,
+                        &inherited,
+                        container,
+                        &mut facts,
+                    ) {
+                        Instantiated::Unchanged => &inherited,
+                        Instantiated::Applied(env) => {
+                            substituted = self.substitute_entry(&inherited, &env);
+                            &substituted
+                        }
+                        Instantiated::Undecidable => continue,
+                    };
+                    if self.override_broken(
+                        declared_cmp,
+                        (mixin_owner, mixin),
+                        inherited_ref,
+                        (origin, face_name),
+                    ) {
+                        broken_seen.push((setter_face, inherited.ptr()));
+                        let display = self.strings.resolve(*spelling);
+                        let display = display.strip_suffix('=').unwrap_or(display);
+                        let container_text = self.strings.resolve(mixin);
+                        let declared_text = self.override_signature_text(declared_cmp);
+                        let face_text = self.strings.resolve(face_name);
+                        let inherited_text = self.override_signature_text(inherited_ref);
+                        let code = if setter_face {
+                            SemanticCode::InvalidOverrideSetter
+                        } else {
+                            SemanticCode::InvalidOverride
+                        };
+                        self.emit5_with_context(
+                            code,
+                            spans[index],
+                            display,
+                            container_text,
+                            &declared_text,
+                            face_text,
+                            &inherited_text,
+                            overridden_member_context(inherited_ref, origin, setter_face),
+                        );
+                    }
+                }
+            }
+            // The mixin joins the accumulated super-interfaces after its own
+            // members were checked — the oracle's `directSuperInterfaces
+            // .add(mixinType)` at the end of the iteration.
+            accumulated.push(mixin);
+        }
+    }
+
+    /// The mixin-application substitution environment for a declared mixin
+    /// member's free container parameters: same-file mixins zip the written
+    /// arguments onto the declaring header's own parameter spellings,
+    /// foreign single-parameter hops map the one free spelling to the one
+    /// written argument (the name-forced rule `instantiate_inherited`
+    /// keeps), anything else stays undecidable — the under-report
+    /// direction. The written arguments live in the diagnosing file's
+    /// clause facts as the whole `Ty::Named` the clause scanner stored, so
+    /// its own `args` list — not the one-element wrapping — supplies the
+    /// substitution operands.
+    fn mixin_env(
+        &self,
+        container: StringId,
+        mixin: StringId,
+        mixin_owner: FileId,
+        member: &MemberEntry,
+        facts: &mut Option<FxHashMap<StringId, HeaderClause>>,
+    ) -> Instantiated {
+        // The declaring container's parameters that occur anywhere in this
+        // member's signature — bare heads AND nested type-argument slots
+        // (`XmlNodeList<T>`'s `T` is a free container parameter the bare
+        // `super_free_params` walk deliberately misses, since the
+        // substitution must reach into argument lists). Each spelling maps
+        // once, in first-seen order.
+        let mut free: Vec<StringId> = Vec::new();
+        {
+            let mut collect = |ty: Ty| self.free_params_in(ty, member, mixin_owner, &mut free);
+            collect(member.var_ty);
+            collect(member.return_ty);
+            if let Some(formals) = member.formals.as_deref() {
+                for formal in formals.positional.iter().chain(formals.named.iter()) {
+                    collect(formal.ty);
+                }
+            }
+        }
+        if free.is_empty() {
+            return Instantiated::Unchanged;
+        }
+        // The written arguments at the application site: the clause
+        // scanner stores each super face as `(head, vec![whole_named_ty])`,
+        // so the real argument list is the stored `Ty::Named`'s own `args`.
+        let written: Option<Vec<Ty>> = {
+            let clause = facts.get_or_insert_with(|| self.scan_header_clauses());
+            clause
+                .get(&container)
+                .and_then(|c| c.supers.iter().find(|(head, _)| *head == mixin))
+                .and_then(|(_, stored)| match stored.as_slice() {
+                    [Ty::Named { args, .. }] if *args != crate::model::ArgListId::EMPTY => {
+                        Some(self.boundary.pool().get(*args).to_vec())
+                    }
+                    _ => None,
+                })
+        };
+        let Some(written) = written else {
+            return Instantiated::Undecidable;
+        };
+        if mixin_owner == self.file {
+            let clause = facts.get_or_insert_with(|| self.scan_header_clauses());
+            let Some(params) = clause.get(&mixin).map(|c| c.params.clone()) else {
+                return Instantiated::Undecidable;
+            };
+            if params.len() == written.len() {
+                return Instantiated::Applied(params.into_iter().zip(written).collect());
+            }
+            return Instantiated::Undecidable;
+        }
+        // Foreign hop: name-forced only when the declaration exposes exactly
+        // one free parameter and the application writes exactly one argument.
+        if free.len() == 1 && written.len() == 1 {
+            let mut map = FxHashMap::default();
+            map.insert(free[0], written[0]);
+            return Instantiated::Applied(map);
+        }
+        Instantiated::Undecidable
+    }
+
+    /// One type's contribution to the free-parameter set the
+    /// mixin-application environment resolves ([`Self::mixin_env`]):
+    /// descends into argument lists so a parameter nested inside
+    /// `Wrapper<T>` counts exactly like a bare `T`. A spelling qualifies
+    /// when the declaring file's declaration set records it as a
+    /// `TypeParam` and the member's own generics do not shadow it — the
+    /// same gate [`Self::super_free_params`] applies, widened to nested
+    /// argument positions.
+    fn free_params_in(
+        &self,
+        ty: Ty,
+        member: &MemberEntry,
+        scope_file: FileId,
+        free: &mut Vec<StringId>,
+    ) {
+        if let Ty::Named { name, args, .. } = ty {
+            let is_type_param = !member.type_param_names.contains(&name)
+                && self
+                    .index
+                    .get(scope_file)
+                    .and_then(|f| f.decl(name))
+                    .is_some_and(|decl| decl.kind == crate::model::MicroKind::TypeParam);
+            if args == crate::model::ArgListId::EMPTY {
+                if is_type_param && !free.contains(&name) {
+                    free.push(name);
+                }
+                return;
+            }
+            // A type-parameter head with its own arguments cannot occur
+            // (parameters are never generic), but the head still counts
+            // when it is a parameter spelling — record it, then descend.
+            if is_type_param && !free.contains(&name) {
+                free.push(name);
+            }
+            let pool = self.boundary.pool();
+            for arg in pool.get(args).iter().copied().collect::<Vec<_>>() {
+                self.free_params_in(arg, member, scope_file, free);
+            }
+        }
+    }
+
     /// The `@override` presence face (`override_verifier.dart`): an
     /// `@override`-annotated instance member must override *something* — the
     /// oracle's `_isOverride` is the name-level `getOverridden(name) !=
@@ -5137,4 +5501,3 @@ mod field_face_and_set_base_tests {
         );
     }
 }
-
