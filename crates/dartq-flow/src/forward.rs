@@ -1988,6 +1988,10 @@ impl ParserListener for SharedFlow<'_> {
         self.0.borrow_mut().begin_assert(token, kind);
     }
 
+    fn assert_after_condition(&mut self) {
+        self.0.borrow_mut().assert_after_condition();
+    }
+
     fn end_assert(
         &mut self,
         begin: Token,

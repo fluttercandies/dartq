@@ -960,7 +960,36 @@ impl Interp<'_> {
                 self.stack.push(Frame::Assert {
                     previous: self.current.clone(),
                     exprs_base,
+                    cond_true: None,
                 });
+            }
+            Ev::AssertAfterCondition => {
+                if self.collecting() {
+                    return true;
+                }
+                // Official `assert_afterCondition`
+                // (flow_analysis.dart:6478-6485): latch the condition's
+                // true state for the end's join, then run the message on
+                // the FALSE state — `assert(x == null, '${x.entries}')`
+                // reads `x` promoted non-null inside the message (the
+                // null-check's false arm), and `assert(t != null, ...)`'s
+                // message reads `t` null.
+                let Some(Frame::Assert { cond_true, .. }) = self.stack.last_mut()
+                else {
+                    return true;
+                };
+                let cond = self.exprs.last();
+                let (if_true, if_false) = cond
+                    .and_then(|c| c.branches.as_ref().map(|(t, f)| (t.clone(), f.clone())))
+                    .unwrap_or_else(|| {
+                        // A non-branching condition (official
+                        // `_makeTrivialExpressionInfo`): both states are the
+                        // merged current.
+                        let cur = self.current.clone();
+                        (cur.clone(), cur)
+                    });
+                *cond_true = Some(if_true);
+                self.current = if_false;
             }
             Ev::AssertEnd => {
                 if self.collecting() {
@@ -969,6 +998,7 @@ impl Interp<'_> {
                 let Some(Frame::Assert {
                     previous,
                     exprs_base,
+                    cond_true,
                 }) = self.stack.pop()
                 else {
                     return true;
@@ -988,11 +1018,18 @@ impl Interp<'_> {
                 {
                     self.emit(FlowFact::ConditionType { span, ty, args });
                 }
-                let cond_true = self.exprs.get(exprs_base).and_then(|cond| {
-                    cond.branches
-                        .as_ref()
-                        .map(|(if_true, _)| if_true.clone())
-                        .or(cond.bool_value.filter(|&b| b).map(|_| self.current.clone()))
+                // The latched condition-true state wins when the message
+                // boundary ran (the message's own reads left `current` on
+                // the false arm — the end's join reads only the latched
+                // true arm); a message-less assert reads the condition's
+                // true arm off the merged state as before.
+                let cond_true = cond_true.or_else(|| {
+                    self.exprs.get(exprs_base).and_then(|cond| {
+                        cond.branches
+                            .as_ref()
+                            .map(|(if_true, _)| if_true.clone())
+                            .or(cond.bool_value.filter(|&b| b).map(|_| self.current.clone()))
+                    })
                 });
                 // The assert's expressions end: rejoin null-shorting opened
                 // inside them before the previous-state join.

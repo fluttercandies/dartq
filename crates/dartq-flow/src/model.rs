@@ -605,6 +605,15 @@ impl State {
         names: &[Box<str>],
     ) -> Self {
         let model = self.model(var);
+        // A write-captured variable is never promotable (the official
+        // `writeCaptured` bail gating every promotion entry —
+        // `tryMarkNonNullable` :4055, `tryPromoteForTypeCast` :4097,
+        // `tryPromoteForTypeCheck` :4136): its value version is gone, so no
+        // type test refines it and no tested type latches (the bail lands
+        // before `_finishTypeTest` runs).
+        if model.captured() {
+            return self;
+        }
         let mut new_tested = model.tested;
         if let Some((tested, args)) = tested
             && !lists.iter(model.tested).any(|t| t == tested)
@@ -996,6 +1005,14 @@ fn covers(
 ) -> bool {
     if entry.base == Base::Unknown && !entry.nullable {
         return ops.classify(written) == Classification::NonNullable;
+    }
+    // The official's InvalidType recovery (subtype.dart:274 — `T0 is
+    // InvalidType` subtypes everything): a write whose value the layer
+    // cannot type (`x = unresolvedCall()`, `x ??= unknownRhs`) satisfies
+    // every standing promotion — it preserves the chain instead of
+    // demoting what the earlier checks promoted.
+    if written.base == Base::Unknown {
+        return true;
     }
     ops.is_subtype_typed(written, written_args, entry, entry_args, arena, names)
 }

@@ -1510,6 +1510,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         if self.peek_kind() == TokenKind::Comma {
             self.cursor.advance();
             if self.peek_kind() != TokenKind::CloseParen {
+                self.listener.assert_after_condition();
                 comma = Some(self.peek_span());
                 let _ = self.parse_expression();
                 if self.peek_kind() == TokenKind::Comma {

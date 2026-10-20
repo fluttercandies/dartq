@@ -292,6 +292,11 @@ pub enum Ev {
     AssertBegin {
         span: TokenSpan,
     },
+    /// The boundary between an assertion's condition and its optional
+    /// message (official `assert_afterCondition`,
+    /// `flow_analysis.dart:6478`): the message evaluates on the
+    /// condition-false state. Fires only when a message expression follows.
+    AssertAfterCondition,
     AssertEnd,
 
     // —— expressions ——

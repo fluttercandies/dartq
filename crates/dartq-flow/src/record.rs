@@ -1092,6 +1092,10 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::AssertBegin { span: token });
     }
 
+    fn assert_after_condition(&mut self) {
+        self.record(Ev::AssertAfterCondition);
+    }
+
     fn end_assert(
         &mut self,
         _begin: Token,

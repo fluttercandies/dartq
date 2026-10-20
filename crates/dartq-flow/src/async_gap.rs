@@ -1502,6 +1502,9 @@ impl GapPass {
                 base: self.markers.len(),
                 saved: self.slots,
             }),
+            // The condition/message boundary is transparent to the gap
+            // walk — the message is just another expression to it.
+            Ev::AssertAfterCondition => {}
             Ev::AssertEnd => {
                 if let Some(Frame::Assert { base, saved }) = self.stack.pop() {
                     self.markers.truncate(base);

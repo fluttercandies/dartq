@@ -80,7 +80,13 @@ impl Interp<'_> {
                             // under an active promotion emits here, so the
                             // retraction removes this fact too — the
                             // target identifier is a write, not a read.
-                            if self.reachable() && ty != declared {
+                            // Dead-region reads still carry the row: the
+                            // official materializes the promotion under an
+                            // unreachable state too (its `PromotedRead`
+                            // evidence keys the consumer's verdict, not the
+                            // reachability), and the region's own dead row
+                            // stays the only reachability face.
+                            if ty != declared {
                                 self.emit(FlowFact::PromotedRead {
                                     span: *token,
                                     ty,
@@ -88,21 +94,19 @@ impl Interp<'_> {
                                 });
                             }
                             // The read-type row (the semantic query face's
-                            // family-a): every reachable read carries its
-                            // flow type — promoted or declared — so a
-                            // consumer can ask for the static type at the
+                            // family-a): every read carries its flow type —
+                            // promoted or declared, reachable or dead — so
+                            // a consumer can ask for the static type at the
                             // span without re-running the fold. Same
                             // retraction invariant as the promotion fact
                             // above: a plain assignment's target read
                             // retracts with it (the target identifier is a
                             // write, not a read).
-                            if self.reachable() {
-                                self.emit(FlowFact::ReadType {
-                                    span: *token,
-                                    ty,
-                                    args,
-                                });
-                            }
+                            self.emit(FlowFact::ReadType {
+                                span: *token,
+                                ty,
+                                args,
+                            });
                             // The why-not-promoted row (upstream
                             // `whyNotPromoted`'s variable arm,
                             // flow_analysis.dart:8832-8857): a reachable
@@ -564,6 +568,14 @@ impl Interp<'_> {
                     // keeps `c` live), where stamping the left's non-null
                     // form alone deads every later `??` arm.
                     let mut result_ty = ifnull_ty.unwrap_or(Ty::UNKNOWN);
+                    // The join's other operand: the official's
+                    // `LUB(NonNull(lhs), rhs)` sees the RIGHT side too —
+                    // an unresolved LHS (`c.x` reading the opaque marker)
+                    // still types the result as the RHS's face
+                    // (`LUB(InvalidType, String)` = `String`,
+                    // least_upper_bound.dart:55), and a nullable RHS widens
+                    // a spelled LHS the same way `int? ?? int?` does.
+                    result_ty = self.name_lub(result_ty, right.ty);
                     if !rhs_dead_entry
                         && self.classify(result_ty) == Classification::NonNullable
                         && self.classify(right.ty) != Classification::NonNullable
@@ -607,7 +619,9 @@ impl Interp<'_> {
                 };
                 let operand = self.pop_value();
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
-                if let Some(var) = operand.reference {
+                if let Some(var) = operand.reference
+                    && !self.current.model(var).captured()
+                {
                     let promoted = self.promotion_candidate(var, tested, tested_args);
                     let (matched, unmatched) =
                         self.branch_type_test(var, tested, tested_args, promoted);
@@ -844,9 +858,12 @@ impl Interp<'_> {
                             // An information-less RHS (an SDK static's return
                             // this layer cannot see; a tear-off of a
                             // top-level function the flow walk does not
-                            // resolve) still leaves the lvalue non-null —
-                            // `x ??= e` can never widen x back to nullable.
-                            (lhs_nn, lhs_nn_args)
+                            // resolve) types as the official's InvalidType:
+                            // `LUB(NonNull(T1), InvalidType)` is InvalidType —
+                            // never a promotion step, and `InvalidType <:
+                            // everything` keeps any standing promotion intact
+                            // (the demotion arm's `covers` recovery, #2320).
+                            (Ty::UNKNOWN, crate::ty::EMPTY_ARGS)
                         } else {
                             let joined = self.name_lub(lhs_nn, rhs.ty);
                             let joined_args = if joined == rhs.ty {

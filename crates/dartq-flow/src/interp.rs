@@ -197,6 +197,12 @@ pub(crate) enum Frame {
     Assert {
         previous: State,
         exprs_base: usize,
+        /// The condition's true state, latched at `AssertAfterCondition`
+        /// (official `_AssertContext._conditionTrue`,
+        /// `flow_analysis.dart:6481`): `assert_end` joins `previous` with
+        /// it. `None` when no message follows (the end reads the
+        /// condition's own true arm).
+        cond_true: Option<State>,
     },
     /// A switch statement or switch expression (the case-alternatives
     /// machinery).
@@ -1440,8 +1446,19 @@ impl<'o> Interp<'o> {
     /// Name-level least upper bound (official `typeOperations.join`): the
     /// subtype-ordered join — `a <: b` gives `b`, `b <: a` gives `a`, and a
     /// name-unordered pair joins to the unknown face (the real hierarchy's
-    /// LUB is the resolved back-end's question, not the name layer's).
+    /// LUB is the resolved back-end's question, not the name layer's). An
+    /// unknown operand is the official's InvalidType — the subtype check
+    /// answers `InvalidType <: X` true for every `X`
+    /// (subtype.dart:274), so the join lands on the spelled side
+    /// (`LUB(InvalidType, String)` = `String`) instead of the unknown
+    /// face the plain `is_subtype` order would keep.
     pub(crate) fn name_lub(&self, a: Ty, b: Ty) -> Ty {
+        if a.base == Base::Unknown {
+            return b;
+        }
+        if b.base == Base::Unknown {
+            return a;
+        }
         if self.ops.is_subtype(a, b) {
             return b;
         }
@@ -2677,8 +2694,21 @@ impl Interp<'_> {
         // open.
         self.flush_null_shorts_above(self.exprs.len().saturating_sub(1));
         // The iterable expression value is on the stack; it contributes no
-        // promotion state.
-        self.exprs.pop();
+        // promotion state. Its written-argument tree is the element-type
+        // source below: `for (e in xs)` on `List<int>` iterates `int`
+        // (upstream `_inferForEachVariable` reads the resolved element
+        // type; the name-level face of `Iterable<E>`'s `E` is the
+        // iterable's first written argument).
+        let element_ty = self
+            .exprs
+            .pop()
+            .and_then(|iterable| {
+                self.args
+                    .get(iterable.args as usize)
+                    .and_then(|args| args.first())
+                    .map(|arg| (Ty { base: arg.base, nullable: arg.nullable }, arg.args))
+            })
+            .unwrap_or((Ty::UNKNOWN, crate::ty::EMPTY_ARGS));
         // The zero-iteration state (the loop head's cond-false arm) is the
         // state BEFORE the loop variable's per-iteration write: official
         // `forEach_bodyBegin` writes on the body path only, so a loop that
@@ -2699,6 +2729,19 @@ impl Interp<'_> {
             Ev::InitializedIdent { name, .. } => self.resolve(*name),
             _ => None,
         }) {
+            // The declared slot the `final e`/`var e` head left unknown
+            // adopts the iterable's element type — the same inferred-type
+            // fill `InitializerEnd` performs for `var v = e` (#2140's
+            // staged face aside; the fold's own recovery here is the
+            // iterable's written first argument). An explicitly spelled
+            // head (`for (int e in xs)`) keeps its annotation — only the
+            // unknown face fills.
+            if let Some(meta) = self.vars.get_mut(var as usize)
+                && meta.ty.base == crate::ty::Base::Unknown
+            {
+                meta.ty = element_ty.0;
+                meta.args = element_ty.1;
+            }
             // Not a write in the official sets (the loop variable can be
             // `final`) and carries no demotion reason (the official
             // `forEach_assigns_to_declared_var` declares — no
@@ -2706,7 +2749,7 @@ impl Interp<'_> {
             // state moves without the write-site record.
             // (The searched names declared in this buffer always resolve
             // local — the top-level face never reaches this write.)
-            self.apply_write(var, Ty::UNKNOWN, crate::ty::EMPTY_ARGS, false, None);
+            self.apply_write(var, element_ty.0, element_ty.1, false, None);
         }
         let body_start = (i..end).find(|&j| matches!(events[j], Ev::ForInBodyBegin));
         let body = match body_start {

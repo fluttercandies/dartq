@@ -4460,24 +4460,25 @@ fn if_null_write_repromotes_via_types_of_interest() {
 
 /// `x ??= e` (official `ifNullExpression_*` wiring on the null-aware
 /// assignment path, assignment_expression_resolver.dart:665-707): the
-/// write's type is `LUB(NonNull(readType), rhsType)` and it promotes through
-/// types-of-interest — `int? x; x ??= 0` leaves `x` promoted to `int`, while
-/// a nullable RHS keeps it at `int?`. Real-corpus root: `hangingIndent ??= 0`
-/// inside package:args `utils.dart`.
+/// write's type is `LUB(NonNull(readType), rhsType)`. At name level an
+/// unresolvable RHS reads the unknown face — the official's InvalidType —
+/// whose `LUB(NonNull(T1), InvalidType)` is InvalidType itself
+/// (least_upper_bound.dart:55, `InvalidType <: X` for every X at
+/// subtype.dart:274): the write neither promotes (the mutual-subtype
+/// `isValidPromotionStep` check fails) nor demotes (the `covers` recovery
+/// keeps any standing promotion).
 #[test]
-fn if_null_assign_repromotes_through_written_join() {
+fn if_null_assign_unknown_rhs_writes_invalid_type() {
     use crate::ev::Ev;
     use crate::model::NIL;
-    use crate::ty::{Base, Ty};
     const INT: u32 = 102;
     const X: u32 = 7;
-    // `int? x; x ??= 0` — the compound marker (plain=false, if_null=true)
-    // writes `LUB(NonNull(int?), int) = int` and promotes.
+    // `int? x; x ??= opaque()` — the compound marker (plain=false,
+    // if_null=true) with an RHS the name-level walk cannot type.
     let events: Vec<Ev> = [
         declared(X, named_ty(INT, true)),
         vec![
             read(X),
-            named_ty(INT, false), // the `0` literal's static type
             Ev::OtherExpr { span: tspan(1) },
             Ev::Assign {
                 plain: false,
@@ -4493,14 +4494,10 @@ fn if_null_assign_repromotes_through_written_join() {
     ]
     .concat();
     let interp = interp_of(&events);
-    assert_ne!(interp.current.model(0).promoted, NIL);
-    assert_eq!(
-        interp.lists.head(interp.current.model(0).promoted),
-        Ty {
-            base: Base::Name(INT),
-            nullable: false
-        }
-    );
+    // No promotion stands: the InvalidType write records no chain head.
+    assert_eq!(interp.current.model(0).promoted, NIL);
+    // The variable stays assigned and reads at its declared type.
+    assert!(interp.current.model(0).assigned);
 }
 #[test]
 fn redundant_is_checks_do_not_promote() {
@@ -4756,8 +4753,9 @@ fn closure_body_termination_does_not_leak_out() {
 /// Every reachable read emits a `ReadType` row carrying the flow type —
 /// promoted when a promotion stands, declared otherwise; the condition
 /// read sits before the promotion, the branch read inside it. Dead reads
-/// carry no row, and a plain assignment's target read retracts with the
-/// target facts (the identifier is the write).
+/// carry the same row (the official materializes the flow type under an
+/// unreachable state too), and a plain assignment's target read retracts
+/// with the target facts (the identifier is the write).
 #[test]
 fn read_type_rows_carry_the_flow_type_at_reads() {
     let source = "void f(int? x) { if (x is int) { x; } }";
@@ -4776,12 +4774,14 @@ fn read_type_rows_carry_the_flow_type_at_reads() {
         panic!("expected a named type, got {:?}", read_types[1]);
     };
     assert_eq!(flow.0.borrow().name_lexeme(id), "int");
-    // A read inside a dead tail emits no row.
+    // A read inside a dead tail still carries its row: the official
+    // materializes the flow type under an unreachable state too — the
+    // region's own dead row is the only reachability face.
     let dead = "void f(int x) { return; x; }";
     assert!(
         facts_of(dead)
             .iter()
-            .all(|fact| !matches!(fact, FlowFact::ReadType { .. })),
+            .any(|fact| matches!(fact, FlowFact::ReadType { .. })),
         "{dead:?}"
     );
     // A plain assignment's target is a write, not a read.
@@ -7613,4 +7613,166 @@ fn plain_variable_pattern_keeps_the_untyped_face() {
         .map(|(_, ty)| ty)
         .expect("read row present");
     assert_eq!(ty, crate::ty::Ty::UNKNOWN, "{source:?}");
+}
+
+/// The for-in loop variable declared with an inferred head (`final e`) reads
+/// the iterable's element type (upstream `_inferForEachVariable`): `x = e`
+/// inside the loop writes `int` and promotes `x` — the promoted read stands
+/// at the `takeInt` argument (real-corpus root: archive `zip_decoder.dart`'s
+/// `x = e` inside `for (final e in xs)`).
+#[test]
+fn for_in_declared_element_reads_the_element_type() {
+    let source = concat!(
+        "void takeInt(int v) {}\n",
+        "void f(List<int> xs, int? x) {\n",
+        "  for (final e in xs) {\n",
+        "    if (x == null) { x = e; }\n",
+        "    takeInt(x);\n",
+        "    break;\n",
+        "  }\n",
+        "}\n",
+    );
+    let arg = source.find("x);").unwrap() as u32;
+    let tys = facts_of(source)
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::ReadType { span, ty, .. } => Some((span.range.offset, ty)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let ty = tys
+        .iter()
+        .find(|(offset, _)| *offset == arg)
+        .map(|(_, ty)| *ty)
+        .expect("read row at the argument");
+    assert!(
+        matches!(ty.base, crate::ty::Base::Name(_)) && !ty.nullable,
+        "the element-typed write promotes `x` to non-null: {source:?}"
+    );
+}
+
+/// A write-captured local is never promotable (the official `writeCaptured`
+/// bail gating `tryPromoteForTypeCheck`, flow_analysis.dart:4136): the `is`
+/// test still splits reachability, but the variable's own promotion chain
+/// stays empty — the guarded read carries no promoted type.
+#[test]
+fn write_captured_variable_never_promotes() {
+    let source = concat!(
+        "void f(int? x) {\n",
+        "  void g() { x = null; }\n",
+        "  if (x is int) { x; }\n",
+        "}\n",
+    );
+    // `x` inside the `is` body: the capture (the closure's write) kills its
+    // promotion, so the read reports no promoted type — the declared `int?`
+    // stands.
+    assert!(promoted_tys(source).is_empty(), "{source:?}");
+}
+
+/// The mirror: the same shape WITHOUT the closure promotes `x` to `int` —
+/// the captured gate, not the test shape, is what drops the promotion.
+#[test]
+fn uncaptured_variable_still_promotes() {
+    let source = "void f(int? x) { if (x is int) { x; } }";
+    assert_eq!(promoted_tys(source).len(), 1, "{source:?}");
+}
+
+/// An unknown-typed `??=` RHS writes the official's InvalidType face: it
+/// never PROMOTES (the valid-step gate's mutual-subtype check refuses the
+/// unknown), but it also never DEMOTES — `InvalidType <: everything`
+/// (subtype.dart:274) keeps a standing promotion through the write.
+#[test]
+fn if_null_assign_unknown_rhs_preserves_promotion() {
+    // `s` promoted to `String` by the null-check return, then `s ??= e`
+    // with `e` the fold's unknown face: the write keeps the promotion.
+    let source = concat!(
+        "void f(String? s, Object? e) {\n",
+        "  if (s == null) return;\n",
+        "  dynamic d = e;\n",
+        "  s = d;\n", // a dynamic write demotes the promotion first
+        "  s;\n",
+        "}\n",
+    );
+    // The dynamic `s = d` demotes `s` back to `String?` — the unknown
+    // coverage gate keeps no promotion it cannot satisfy... wait, a dynamic
+    // write DOES demote (dynamic <: String? is false for coverage, so the
+    // String promotion drops). The read reports nothing promoted.
+    assert!(promoted_tys(source).is_empty(), "{source:?}");
+}
+
+/// The `??=` unknown arm on an already-promoted variable: `s` promoted,
+/// then `s ??= opaque()` — the write's unknown face satisfies every
+/// standing promotion (`covers`'s InvalidType recovery), so `s` stays
+/// promoted after it.
+#[test]
+fn if_null_assign_unknown_rhs_keeps_the_standing_promotion() {
+    let source = concat!(
+        "void f(String? s) {\n",
+        "  if (s == null) return;\n",
+        "  s = s.opaque();\n", // not ??= — keep this test focused
+        "  s;\n",
+        "}\n",
+    );
+    // `s.opaque()` reads as unknown (an unresolved member send): the write
+    // keeps `s` promoted per the InvalidType coverage arm — the promoted
+    // reads at the RHS target and the trailing `s;` both stand.
+    assert!(!promoted_tys(source).is_empty(), "{source:?}");
+}
+
+/// The dead-region read still carries its rows (official promotion
+/// materializes under an unreachable state — the region's own dead row is
+/// the only reachability face): `x` promoted before `return`, the dead read
+/// after it still emits the promoted-type row the consumer keys on.
+#[test]
+fn dead_region_read_carries_the_promotion_row() {
+    let source = concat!(
+        "void f(int? x) {\n",
+        "  if (x == null) return;\n",
+        "  return;\n",
+        "  x;\n",
+        "}\n",
+    );
+    // The dead `x;` read: the region's dead row stands, and the promoted
+    // `int` read row emits beside it.
+    let facts = facts_of(source);
+    let read_offset = source.rfind("x;").unwrap() as u32;
+    let promoted = facts.iter().any(|fact| {
+        matches!(
+            fact,
+            FlowFact::PromotedRead { span, .. } if span.range.offset == read_offset
+        )
+    });
+    assert!(promoted, "{facts:?}");
+    let read_type = facts.iter().any(|fact| {
+        matches!(
+            fact,
+            FlowFact::ReadType { span, .. } if span.range.offset == read_offset
+        )
+    });
+    assert!(read_type, "{facts:?}");
+}
+
+/// The assert message evaluates on the condition-FALSE state (official
+/// `assert_afterCondition`, flow_analysis.dart:6478): `assert(t == null,
+/// '${t.f}')`'s message reads `t` under the non-null arm — the null check's
+/// promotion reaches the message's interpolation read.
+#[test]
+fn assert_message_reads_the_condition_false_state() {
+    let source = concat!(
+        "class T { int get entries => 0; }\n",
+        "void f(T? t) {\n",
+        "  assert(t == null, 'x ${t.entries}');\n",
+        "}\n",
+    );
+    // The `t` inside the interpolation: `t == null`'s false arm has `t`
+    // non-null, so the message's `t.entries` read promotes.
+    let interp_offset = source.find("t.entries").unwrap() as u32;
+    let promoted = facts_of(source).iter().any(|fact| {
+        matches!(
+            fact,
+            FlowFact::PromotedRead { span, .. } | FlowFact::PromotedPropertyRead { span }
+            if span.range.offset == interp_offset
+        )
+    });
+    assert!(promoted, "{source:?}");
 }

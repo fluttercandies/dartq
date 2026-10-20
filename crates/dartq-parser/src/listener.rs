@@ -1374,6 +1374,11 @@ pub trait ParserListener {
     fn begin_rethrow_statement(&mut self, token: Token) {}
     fn end_rethrow_statement(&mut self, rethrow_kw: Token, end: Token) {}
     fn begin_assert(&mut self, token: Token, kind: AssertKind) {}
+    /// `assert_afterCondition` (official `flow_analysis.dart:6478`): the
+    /// boundary between an assertion's condition and its optional message
+    /// — the message evaluates on the condition-false state. Fires only
+    /// when a comma (and hence a message expression) follows.
+    fn assert_after_condition(&mut self) {}
     fn end_assert(
         &mut self,
         begin: Token,
