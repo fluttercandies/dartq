@@ -12,6 +12,7 @@ use dartq_parser::{
 use dartq_parser::TokenSpan as Token;
 use dartq_parser::TokenSpan;
 use dartq_scanner::TokenTable;
+use dartq_source::saturate_slot_u32;
 
 use rustc_hash::FxHashMap;
 
@@ -366,7 +367,7 @@ impl<'t> Flow<'t> {
             if let Some(&id) = self.names.get(&key) {
                 return id;
             }
-            let id = u32::try_from(self.names.len()).expect("interned name count fits u32");
+            let id = saturate_slot_u32(self.names.len());
             self.names_by_id.push(key.clone());
             self.names.insert(key, id);
             id
@@ -381,7 +382,7 @@ impl<'t> Flow<'t> {
         if let Some(&id) = self.names.get(lexeme) {
             return id;
         }
-        let id = u32::try_from(self.names.len()).expect("interned name count fits u32");
+        let id = saturate_slot_u32(self.names.len());
         let key: Box<str> = lexeme.into();
         self.names_by_id.push(key.clone());
         self.names.insert(key, id);

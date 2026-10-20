@@ -100,8 +100,7 @@ impl FileTable {
         if let Some(&id) = self.ids_by_path.get(normalized.as_ref()) {
             return id;
         }
-        let id =
-            FileId(u32::try_from(self.paths.len()).expect("more than u32::MAX paths interned"));
+        let id = FileId(crate::saturate_slot_u32(self.paths.len()));
         self.paths.push(Some(Arc::clone(&normalized)));
         self.ids_by_path.insert(normalized, id);
         id

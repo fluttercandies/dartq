@@ -3,6 +3,7 @@
 //! decision order.
 
 use dartq_parser::TokenSpan;
+use dartq_source::saturate_slot_u32;
 
 use crate::ev::{BlockKind, Ev};
 use crate::facts::FlowFact;
@@ -1702,7 +1703,7 @@ fn attach_finally(
     before_finally: &State,
     after_finally: &State,
 ) -> State {
-    let vars = u32::try_from(interp.vars.len()).expect("variable count fits u32");
+    let vars = saturate_slot_u32(interp.vars.len());
     let slots = after_try
         .props
         .len()
@@ -1721,7 +1722,7 @@ fn attach_finally(
     }
     let mut props = Vec::with_capacity(slots);
     for slot in 0..slots {
-        let slot = u32::try_from(slot).expect("property slot count fits u32");
+        let slot = saturate_slot_u32(slot);
         let v1 = after_try.prop(slot);
         let v2 = before_finally.prop(slot);
         let v3 = after_finally.prop(slot);

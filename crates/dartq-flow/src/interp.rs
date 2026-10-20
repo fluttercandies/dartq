@@ -11,7 +11,7 @@
 use std::ops::Range;
 
 use dartq_parser::TokenSpan;
-use dartq_source::SourceRange;
+use dartq_source::{SourceRange, saturate_slot_u32};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::ev::Ev;
@@ -1071,7 +1071,7 @@ impl<'o> Interp<'o> {
     /// locals, or parameters) start assigned; plain locals without one
     /// start unassigned.
     pub(crate) fn declare_var(&mut self, name: u32, meta: VarMeta, initialized: bool) -> u32 {
-        let var = u32::try_from(self.vars.len()).expect("variable count fits u32");
+        let var = saturate_slot_u32(self.vars.len());
         self.vars.push(meta);
         if let Some(frames) = self.collect.as_mut() {
             for frame in frames.iter_mut() {
@@ -1191,7 +1191,7 @@ impl<'o> Interp<'o> {
         if let Some(&slot) = self.prop_slots.get(&(receiver, field)) {
             return slot;
         }
-        let slot = u32::try_from(self.props.len()).expect("property slot count fits u32");
+        let slot = saturate_slot_u32(self.props.len());
         self.props.push((receiver, field));
         self.prop_slots.insert((receiver, field), slot);
         slot
@@ -2950,6 +2950,6 @@ fn build_match_map(events: &[Ev]) -> Vec<u32> {
 
 /// Records the matching begin/end indices of one construct extent.
 fn link_pair(match_of: &mut [u32], begin: usize, end: usize) {
-    match_of[begin] = u32::try_from(end).expect("event index fits u32");
-    match_of[end] = u32::try_from(begin).expect("event index fits u32");
+    match_of[begin] = saturate_slot_u32(end);
+    match_of[end] = saturate_slot_u32(begin);
 }

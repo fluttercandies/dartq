@@ -22,7 +22,7 @@ use dartq_resolution::{
     UNDEFINED_SHOWN_NAME, compose_canonical_uri,
 };
 use dartq_semantic::{ElementIndex, MicroKind};
-use dartq_source::{FileId, FileTable, SourceRange, StringId, StringTable};
+use dartq_source::{FileId, FileTable, SourceRange, StringId, StringTable, saturate_slot_u32};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -1994,10 +1994,7 @@ fn digest_u64(buf: &mut Vec<u8>, value: u64) {
 
 /// A length-prefixed byte string (URI / dotted-name text).
 fn digest_bytes(buf: &mut Vec<u8>, bytes: &[u8]) {
-    digest_u32(
-        buf,
-        u32::try_from(bytes.len()).expect("directive text within u32"),
-    );
+    digest_u32(buf, saturate_slot_u32(bytes.len()));
     buf.extend_from_slice(bytes);
 }
 

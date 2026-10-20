@@ -43,7 +43,7 @@
 //!   are declaration-scoped in truth; consumers must not treat them as
 //!   top-level declarations.
 
-use dartq_source::{SourceRange, StringId, StringTable};
+use dartq_source::{SourceRange, StringId, StringTable, saturate_slot_u32};
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
@@ -574,17 +574,6 @@ pub struct ArgPool {
     functions: Vec<FnShape>,
     /// Structural hash → function slots, same confirmed-bucket discipline.
     function_at: FxHashMap<u64, Vec<u32>>,
-}
-
-/// Saturating `usize` → `u32` conversion for the intern-pool slot caps
-/// (the stability audit's pool-cap class): the pools address slots by
-/// `u32` ([`ArgListId`], [`RecordShapeId`], [`FnShapeId`]), and a pool
-/// cannot grow past `u32::MAX` entries before RSS exhaustion (every entry
-/// costs at least one heap allocation), so saturation replaces a
-/// provably unreachable panic with a defined value.
-#[must_use]
-fn saturate_slot_u32(len: usize) -> u32 {
-    u32::try_from(len).unwrap_or(u32::MAX)
 }
 
 impl Default for ArgPool {
@@ -1781,17 +1770,6 @@ mod tests {
         fn render(&self, ty: Ty) -> String {
             ty.render(&self.strings, &self.pool)
         }
-    }
-
-    /// The pool-cap saturation contract: pass-through below the cap,
-    /// identity at the cap, saturation past it.
-    #[test]
-    fn slot_saturation_passes_lengths_through_and_saturates_past_u32_max() {
-        assert_eq!(saturate_slot_u32(0), 0);
-        assert_eq!(saturate_slot_u32(1234), 1234);
-        assert_eq!(saturate_slot_u32(u32::MAX as usize), u32::MAX);
-        assert_eq!(saturate_slot_u32(u32::MAX as usize + 1), u32::MAX);
-        assert_eq!(saturate_slot_u32(usize::MAX), u32::MAX);
     }
 
     /// Argument-less construction never touches the pool, and the

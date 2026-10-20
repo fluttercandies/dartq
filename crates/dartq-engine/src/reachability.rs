@@ -146,7 +146,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use dartq_index::{DeclKind, DeclRow, FileCapture, LibraryIndex, RefKind, RefRow};
-use dartq_source::{ContentId, FileId, StringId};
+use dartq_source::{ContentId, FileId, StringId, saturate_slot_u32};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -418,7 +418,7 @@ pub(crate) fn build(state: &EngineState, salvage: Option<Arc<Reachability>>) -> 
     let mut bases: Vec<u32> = Vec::with_capacity(order.len());
     let mut node_total: u32 = 0;
     for (index, file) in order.iter().enumerate() {
-        unit_of.insert(*file, u32::try_from(index).expect("unit index fits u32"));
+        unit_of.insert(*file, saturate_slot_u32(index));
         bases.push(node_total);
         node_total = node_total
             .checked_add(products[file].rows)
@@ -505,12 +505,7 @@ fn derive_unit(
         .decls()
         .iter()
         .enumerate()
-        .map(|(row, decl)| {
-            (
-                decl.range.offset,
-                u32::try_from(row).expect("decl row fits u32"),
-            )
-        })
+        .map(|(row, decl)| (decl.range.offset, saturate_slot_u32(row)))
         .collect();
     by_offset.sort_unstable_by_key(|&(offset, _)| offset);
 
@@ -520,7 +515,7 @@ fn derive_unit(
     // the `main=` spelling and never matches).
     for (row, decl) in capture.index.decls().iter().enumerate() {
         if decl.kind == DeclKind::TopLevelFn && decl.name == main {
-            seeds.push(u32::try_from(row).expect("decl row fits u32"));
+            seeds.push(saturate_slot_u32(row));
         }
     }
 
@@ -618,14 +613,14 @@ fn derive_unit(
                 edges.push((
                     source,
                     row.target_file,
-                    u32::try_from(target_row).expect("decl row fits u32"),
+                    saturate_slot_u32(target_row),
                 ));
             }
         }
         // A member-targeted reference also marks the enclosing
         // top-level container (the official double marking).
         if decls[first].container != DeclRow::NONE {
-            let top = top_container(target, u32::try_from(first).expect("decl row fits u32"));
+            let top = top_container(target, saturate_slot_u32(first));
             for source in sources.into_iter().flatten() {
                 edges.push((source, row.target_file, top));
             }
@@ -634,7 +629,7 @@ fn derive_unit(
 
     UnitProduct {
         key,
-        rows: u32::try_from(capture.index.decls().len()).expect("row count fits u32"),
+        rows: saturate_slot_u32(capture.index.decls().len()),
         seeds,
         edges: edges.into(),
     }

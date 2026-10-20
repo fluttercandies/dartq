@@ -33,7 +33,9 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use dartq_source::{ContentId, MAX_SOURCE_BYTES, MemorySourceStore, SourceStore, SourceText};
+use dartq_source::{
+    ContentId, MAX_SOURCE_BYTES, MemorySourceStore, SourceStore, SourceText, saturate_slot_u32,
+};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::analysis_options;
@@ -193,9 +195,7 @@ impl Runtime {
         let engine = Engine::new(config.engine)?;
         let id = match self.free.pop() {
             Some(id) => id,
-            None => ContextId::from_index(
-                u32::try_from(self.contexts.len()).expect("more than u32::MAX contexts opened"),
-            ),
+            None => ContextId::from_index(saturate_slot_u32(self.contexts.len())),
         };
         let index = id.index() as usize;
         if index >= self.contexts.len() {

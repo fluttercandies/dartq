@@ -91,7 +91,7 @@ use dartq_resolution::{LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder,
 use dartq_semantic::{
     ElementIndex, MicroKind, StrictModes, analyze_unit, container_modifiers, fold_unit,
 };
-use dartq_source::{ContentId, FileId, LineIndex};
+use dartq_source::{ContentId, FileId, LineIndex, saturate_slot_u32};
 
 /// The enable set one governing entry selects: `None` (no options file in
 /// the governed file's ancestry) selects nothing — the official
@@ -1509,9 +1509,8 @@ fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
                 let mut hits = Vec::new();
                 check_url(range.clone(), value, &mut hits);
                 rows.extend(hits.into_iter().filter_map(|hit| {
-                    let (line, _) =
-                        lines.byte_to_line_col(u32::try_from(hit.range.start).unwrap_or(u32::MAX));
-                    (!ignores.ignored(line, "secure_pubspec_urls")).then(|| Lint {
+                let (line, _) = lines.byte_to_line_col(saturate_slot_u32(hit.range.start));
+                (!ignores.ignored(line, "secure_pubspec_urls")).then(|| Lint {
                         rule,
                         range: utf16_range(&lines, text, &hit.range),
                         message: spec.render_problem(&[hit.scheme]),
@@ -1527,8 +1526,7 @@ fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
                 let mut hits = Vec::new();
                 check_name(name.range.clone(), &name.value, &mut hits);
                 rows.extend(hits.into_iter().filter_map(|hit| {
-                    let (line, _) =
-                        lines.byte_to_line_col(u32::try_from(hit.range.start).unwrap_or(u32::MAX));
+                    let (line, _) = lines.byte_to_line_col(saturate_slot_u32(hit.range.start));
                     (!ignores.ignored(line, "package_names")).then(|| Lint {
                         rule,
                         range: utf16_range(&lines, text, &hit.range),
@@ -1550,8 +1548,7 @@ fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
                 let Some(range) = check_section(entries) else {
                     continue;
                 };
-                let (line, _) =
-                    lines.byte_to_line_col(u32::try_from(range.start).unwrap_or(u32::MAX));
+                let (line, _) = lines.byte_to_line_col(saturate_slot_u32(range.start));
                 if ignores.ignored(line, "sort_pub_dependencies") {
                     continue;
                 }
@@ -1582,8 +1579,7 @@ fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
             };
             let rule = path_rule(verdict).expect("registry-pinned dependency-validator code");
             let spec = &RULES[rule.0 as usize];
-            let (line, _) =
-                lines.byte_to_line_col(u32::try_from(entry.range.start).unwrap_or(u32::MAX));
+            let (line, _) = lines.byte_to_line_col(saturate_slot_u32(entry.range.start));
             if ignores.ignored(line, spec.name) {
                 continue;
             }
@@ -1609,8 +1605,7 @@ fn pubspec_rows(engine: &Engine, roots: &[PathBuf]) -> Vec<Diagnostic> {
             let rule =
                 rule_by_name("path_does_not_exist").expect("registry-pinned path_does_not_exist");
             let spec = &RULES[rule.0 as usize];
-            let (line, _) =
-                lines.byte_to_line_col(u32::try_from(entry.range.start).unwrap_or(u32::MAX));
+            let (line, _) = lines.byte_to_line_col(saturate_slot_u32(entry.range.start));
             if ignores.ignored(line, spec.name) {
                 continue;
             }
@@ -1751,7 +1746,7 @@ impl YamlIgnores {
             for_file: Vec::new(),
         };
         for (index, line) in text.lines().enumerate() {
-            let line_no = u32::try_from(index).expect("line count fits u32") + 1;
+            let line_no = saturate_slot_u32(index) + 1;
             if let Some((before, names)) = yaml_ignore_entry(line, "ignore:") {
                 // Alone on the line -> the next line (ignore_info.dart:157).
                 let target = if before.trim().is_empty() {

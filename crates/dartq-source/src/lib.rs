@@ -45,3 +45,37 @@ pub use store::{
 };
 pub use string_table::{StringId, StringTable};
 pub use text::{MAX_SOURCE_BYTES, MMAP_MIN_BYTES, OpenError, SourceText, open_mapped, open_source};
+
+/// Saturating `usize` → `u32` conversion for pool-slot and length caps
+/// (the stability audit's pool-cap class). Pool-backed ids across the
+/// stack address entries by `u32` ([`FileId`], [`StringId`], semantic
+/// intern-pool slots, flow state slots); a pool cannot grow past
+/// `u32::MAX` entries before RSS exhaustion (every entry costs at least
+/// one heap allocation), so saturation replaces a provably unreachable
+/// panic with a defined value. This is defense in depth, not a reachable
+/// path: call sites are structurally bounded far below the cap.
+///
+/// Defined here because `dartq-source` is the common base dependency of
+/// the parser / flow / semantic / lints stack — one definition, one
+/// saturation contract everywhere.
+#[must_use]
+#[inline]
+pub fn saturate_slot_u32(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::saturate_slot_u32;
+
+    /// The pool-cap saturation contract: pass-through below the cap,
+    /// identity at the cap, saturation past it.
+    #[test]
+    fn slot_saturation_passes_lengths_through_and_saturates_past_u32_max() {
+        assert_eq!(saturate_slot_u32(0), 0);
+        assert_eq!(saturate_slot_u32(1234), 1234);
+        assert_eq!(saturate_slot_u32(u32::MAX as usize), u32::MAX);
+        assert_eq!(saturate_slot_u32(u32::MAX as usize + 1), u32::MAX);
+        assert_eq!(saturate_slot_u32(usize::MAX), u32::MAX);
+    }
+}

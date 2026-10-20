@@ -173,7 +173,7 @@ use dartq_pub::{PackageConfig, PackageConfigEntry};
 use dartq_scanner::{Keyword, TokenKind, TokenTable};
 use dartq_source::{
     FileId, LineIndex, MAX_SOURCE_BYTES, SourceRange, byte_offset_to_utf16, normalize_path,
-    utf16_len_of, utf16_offset_to_byte,
+    saturate_slot_u32, utf16_len_of, utf16_offset_to_byte,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_yaml::Value as Yaml;
@@ -527,7 +527,7 @@ fn locate(text: &str, edit: &Edit) -> Option<usize> {
         if any_match.is_none() {
             any_match = Some(start);
         }
-        let (line, _) = lines.byte_to_line_col(u32::try_from(start).expect("offset exceeds u32"));
+        let (line, _) = lines.byte_to_line_col(saturate_slot_u32(start));
         if line == edit.anchor.line {
             line_matches += 1;
             line_match = Some(start);

@@ -10,6 +10,7 @@
 //! bookkeeping). Promoted-type and tested-type chains are persistent
 //! cons-cells in a shared pool, so chain sharing across states is free.
 
+use dartq_source::saturate_slot_u32;
 use rustc_hash::FxHashSet;
 
 use crate::ty::{Base, Classification, Ty, TypeOps};
@@ -76,7 +77,7 @@ impl ReachArena {
             overall: node.overall,
             depth: node.depth + 1,
         });
-        u32::try_from(self.nodes.len()).expect("checkpoint count fits u32") - 1
+        saturate_slot_u32(self.nodes.len()) - 1
     }
 
     /// The same checkpoint, locally unreachable (official `setUnreachable`).
@@ -91,7 +92,7 @@ impl ReachArena {
             overall: false,
             depth: node.depth,
         });
-        u32::try_from(self.nodes.len()).expect("checkpoint count fits u32") - 1
+        saturate_slot_u32(self.nodes.len()) - 1
     }
 
     /// Drops the most recent checkpoint (official `unsplit`). The root has
@@ -159,7 +160,7 @@ impl Reasons {
         next: u32,
     ) -> u32 {
         self.cells.push((ty, args, cause, next));
-        u32::try_from(self.cells.len()).expect("reason cell count fits u32") - 1
+        saturate_slot_u32(self.cells.len()) - 1
     }
 
     /// The chain as a slice walk (front to back — most recent demotion
@@ -183,7 +184,7 @@ impl Reasons {
 impl Lists {
     pub(crate) fn cons(&mut self, ty: Ty, args: u32, next: u32) -> u32 {
         self.cells.push((ty, args, next));
-        u32::try_from(self.cells.len()).expect("tested-set cell count fits u32") - 1
+        saturate_slot_u32(self.cells.len()) - 1
     }
 
     pub(crate) fn head(&self, id: u32) -> Ty {
@@ -701,7 +702,7 @@ impl State {
         if !reach.locally_reachable(first.reach) {
             return second;
         }
-        let vars = u32::try_from(vars).expect("variable count fits u32");
+        let vars = saturate_slot_u32(vars);
         let mut models = Vec::with_capacity(vars as usize);
         for var in 0..vars {
             let a = first.model(var);
@@ -711,7 +712,7 @@ impl State {
         let slots = first.props.len().max(second.props.len());
         let mut props = Vec::with_capacity(slots);
         for slot in 0..slots {
-            let slot = u32::try_from(slot).expect("property slot count fits u32");
+            let slot = saturate_slot_u32(slot);
             let a = first.prop(slot);
             let b = second.prop(slot);
             props.push(join_model(a, b, lists));
@@ -811,8 +812,7 @@ impl State {
     /// types of interest for writes after the loop.
     pub(crate) fn inherit_tested(self, other: &Self, lists: &mut Lists) -> Self {
         let mut this = self;
-        let var_count = u32::try_from(this.models.len().max(other.models.len()))
-            .expect("variable count fits u32");
+        let var_count = saturate_slot_u32(this.models.len().max(other.models.len()));
         for var in 0..var_count {
             let a = this.model(var);
             let b = other.model(var);

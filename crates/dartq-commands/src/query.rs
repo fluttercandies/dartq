@@ -45,7 +45,7 @@ use dartq_index::{DeclRow, LibraryIndex, TargetRef};
 use dartq_semantic::model::{
     ArgPool, Formal, Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
 };
-use dartq_source::{FileId, StringId, StringTable};
+use dartq_source::{FileId, StringId, StringTable, saturate_slot_u32};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use serde_json::json;
@@ -280,7 +280,7 @@ pub fn implementations_after_analysis<'a>(engine: &'a Engine, name: &str) -> Sym
                         });
                     }
                     if member_containers.contains(&(target_file, target_name)) {
-                        let anchor = u32::try_from(index).expect("more than u32::MAX rows");
+                        let anchor = saturate_slot_u32(index);
                         for member in capture
                             .index
                             .decls()

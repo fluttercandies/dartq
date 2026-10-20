@@ -25,7 +25,7 @@ use dartq_sdk::{AllowedExperiments, SdkSnapshot};
 use dartq_semantic::{ApiSignature, FileElements};
 use dartq_source::{
     ContentId, FileId, FileTable, LineIndex, SourceRange, SourceStore, SourceText, StringId,
-    StringTable,
+    StringTable, saturate_slot_u32,
 };
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
@@ -412,13 +412,7 @@ pub(crate) fn use_view_of(surface: &LibraryIndex) -> UseView {
         .refs()
         .iter()
         .enumerate()
-        .map(|(i, row)| {
-            (
-                row.file,
-                row.range.offset,
-                u32::try_from(i).expect("ref rows fit u32"),
-            )
-        })
+        .map(|(i, row)| (row.file, row.range.offset, saturate_slot_u32(i)))
         .collect();
     grouped.sort_unstable_by_key(|&(file, offset, _)| (file, offset));
     let mut view: Vec<(FileId, Vec<u32>)> = Vec::new();
@@ -1035,7 +1029,7 @@ impl LibraryId {
 
     /// Mints the next id of the arena.
     pub(crate) fn next(existing: usize) -> Self {
-        Self(u32::try_from(existing).expect("more than u32::MAX libraries interned"))
+        Self(saturate_slot_u32(existing))
     }
 }
 
@@ -1928,8 +1922,7 @@ impl EngineState {
             self.decl_order.resize_with(index + 1, || None);
         }
         let decls = fresh.index.decls();
-        let mut order: Vec<u32> =
-            (0..u32::try_from(decls.len()).expect("decl rows fit u32")).collect();
+        let mut order: Vec<u32> = (0..saturate_slot_u32(decls.len())).collect();
         order.sort_unstable_by_key(|&i| decls[i as usize].range.offset);
         self.decl_order[index] = Some(order.into_boxed_slice());
         self.feed_sites(file);
