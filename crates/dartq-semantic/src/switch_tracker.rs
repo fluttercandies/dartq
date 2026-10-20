@@ -491,6 +491,11 @@ pub(crate) struct NameWorld<'a> {
     /// interface type carries without a written clause
     /// ([`Self::decide_subtype`]).
     pub(crate) object_id: StringId,
+    /// The interned dart:core `Enum` spelling: the implicit supertype edge
+    /// every enum declaration carries without a written clause
+    /// ([`Self::direct_edges`]; the type-hierarchy side synthesizes the
+    /// same edge, `DeclAction::Enum` — #2370).
+    pub(crate) enum_id: StringId,
     /// The core primitives' interned names
     /// ([`crate::member_face::FINAL_PRIMITIVES`] → ids): their `Object`
     /// edge is invisible to the written-clause walk (`int`/`double`/`num`
@@ -1171,6 +1176,13 @@ impl<'a> NameWorld<'a> {
     }
 
     /// The declared direct edges out of `name` (superclass + interfaces).
+    /// An enum declaration adds dart:core's `Enum`: the analyzer's element
+    /// model hangs the interface on every enum without a written clause
+    /// (the mirror of the hierarchy snapshot's synthesized edge —
+    /// `E <: Enum` holds, so `e is Enum` is a guaranteed-true test both
+    /// the flow and the check tiers must answer; #2370/#2380). `Enum`
+    /// itself carries no self-edge: a class (and the `bool` builtin, a
+    /// plain class there) keeps `x is Enum` decidable.
     fn direct_edges(&self, name: StringId) -> Vec<StringId> {
         let Some(container) = self.container(name) else {
             return Vec::new();
@@ -1182,6 +1194,9 @@ impl<'a> NameWorld<'a> {
         edges.extend(container.with_clause.iter().copied());
         edges.extend(container.implements_clause.iter().copied());
         edges.extend(container.on_clause.iter().copied());
+        if container.kind == ContainerKind::Enum && name != self.enum_id {
+            edges.push(self.enum_id);
+        }
         edges
     }
 

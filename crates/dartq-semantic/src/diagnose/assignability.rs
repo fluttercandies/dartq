@@ -1938,6 +1938,7 @@ impl<'a> Engine<'a> {
             resolved: std::cell::RefCell::default(),
             bool_id: self.intern("bool"),
             object_id: self.intern("Object"),
+            enum_id: self.intern("Enum"),
             primitive_ids: self.members.primitive_ids,
             core_supertypes: self.members.core_supertypes,
             unknowns: std::cell::Cell::new(0),

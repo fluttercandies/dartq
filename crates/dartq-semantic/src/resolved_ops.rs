@@ -3353,6 +3353,164 @@ mod tests {
         );
     }
 
+    // —— #2380: the `unnecessary_type_check` static-warning face over the
+    // same is-test shapes — the check tier (`check_type_check`) beside the
+    // flow's dead-arm rows above. The oracle reports the code on every
+    // provably-constant test at `warning` severity, the span at the `is`
+    // operator, polarity in the message ('true' for `is`, 'false' for
+    // `is!`); all shapes probed (dart analyze 3.13.1).
+
+    /// The enum receiver's guaranteed-true `is Enum` reports the warning
+    /// beside the else's dead row (`enum_recv.dart` probe).
+    #[test]
+    fn ticket_2380_enum_receiver_is_enum_reports_the_check_warning() {
+        let codes = diagnose_codes(
+            "enum Color { r } \
+             void f(Color c) { \
+               if (c is Enum) { c; } else { 1; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            codes.contains(&"unnecessary_type_check"),
+            "E is Enum must report unnecessary_type_check: {codes:?}"
+        );
+    }
+
+    /// The subclass/superclass and implements faces report the same
+    /// warning (`class_super.dart` / `iface_impl.dart` probes).
+    #[test]
+    fn ticket_2380_supertype_is_test_reports_the_check_warning() {
+        let codes = diagnose_codes(
+            "class A {} \
+             class B extends A {} \
+             void f(B b) { \
+               if (b is A) { b; } else { 1; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            codes.contains(&"unnecessary_type_check"),
+            "B is A must report unnecessary_type_check: {codes:?}"
+        );
+        let codes = diagnose_codes(
+            "abstract class I {} \
+             class C implements I {} \
+             void f(C c) { \
+               if (c is I) { c; } else { 1; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            codes.contains(&"unnecessary_type_check"),
+            "C is I must report unnecessary_type_check: {codes:?}"
+        );
+    }
+
+    /// The typed receiver's wrong-arity test reports the warning beside
+    /// the arity error and the dead row (`recv_arity.dart` probe) — the
+    /// same recovered `Response<Invalid>` interface the flow face reads.
+    #[test]
+    fn ticket_2380_wrong_arity_test_reports_the_check_warning() {
+        let codes = diagnose_codes(
+            "class Response<T> { T? data; } \
+             void f(Response<int> x) { \
+               if (x is Response<int, int>) { x; } else { 1; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            codes.contains(&"unnecessary_type_check"),
+            "the typed receiver's wrong-arity test must report the warning: {codes:?}"
+        );
+    }
+
+    /// The `is!` polarity reports the complement row — the recovered
+    /// interface makes the test constant-false (`recv_arity_isnot.dart`
+    /// probe), so the warning fires on `is!` too.
+    #[test]
+    fn ticket_2380_wrong_arity_isnot_reports_the_check_warning() {
+        let codes = diagnose_codes(
+            "class Response<T> { T? data; } \
+             void f(Response<int> x) { \
+               if (x is! Response<int, int>) { 1; } else { 2; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            codes.contains(&"unnecessary_type_check"),
+            "the constant-false is! must report unnecessary_type_check: {codes:?}"
+        );
+    }
+
+    /// The undecidable face stays silent: `Object is Response<int, int>`
+    /// answers false, not constant (`recv_arity_obj.dart` probe reports
+    /// only `wrong_number_of_type_arguments`).
+    #[test]
+    fn ticket_2380_object_wrong_arity_test_stays_silent() {
+        let codes = diagnose_codes(
+            "class Response<T> { T? data; } \
+             void f(Object o) { \
+               if (o is Response<int, int>) { o; } else { 1; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"unnecessary_type_check"),
+            "a decidable-false test must not report the warning: {codes:?}"
+        );
+    }
+
+    /// #2380 face 2: the RECEIVER's own wrong-arity annotation recovers
+    /// to the same `Response<Invalid>` interface, so `x is String`
+    /// answers a decidable false — the is-test face stays silent, only
+    /// the arity error reports (`recv_self_arity.dart` probe).
+    #[test]
+    fn ticket_2380_wrong_arity_receiver_is_string_stays_silent() {
+        let codes = diagnose_codes(
+            "class Response<T> { T? data; } \
+             void f(Response<int, int> x) { \
+               if (x is String) { 1; } else { 2; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"unnecessary_type_check") && !codes.contains(&"dead_code"),
+            "a wrong-arity receiver's is String must stay silent: {codes:?}"
+        );
+        let codes = diagnose_codes(
+            "class Response<T> { T? data; } \
+             void f(Response<int, int> x) { \
+               if (x is! String) { 1; } else { 2; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"unnecessary_type_check") && !codes.contains(&"dead_code"),
+            "a wrong-arity receiver's is! String must stay silent: {codes:?}"
+        );
+    }
+
+    /// #2380 face 2's admitting control: the same wrong-arity receiver
+    /// against a bare right-arity `Response` target — any instantiation
+    /// of the recovered interface is a `Response`, so the test is
+    /// constant-true and the warning fires beside the dead row
+    /// (`recv_self_arity_same.dart` probe).
+    #[test]
+    fn ticket_2380_wrong_arity_receiver_is_bare_response_reports() {
+        let codes = diagnose_codes(
+            "class Response<T> { T? data; } \
+             void f(Response<int, int> x) { \
+               if (x is Response) { x; } else { 2; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            codes.contains(&"unnecessary_type_check"),
+            "the wrong-arity receiver's bare-head test must report: {codes:?}"
+        );
+    }
+
     /// Phase D acceptance pin: a real supertype clause tree reaches the
     /// hierarchy. `class A extends S<int>` edges `A → S<int>` (not the
     /// to-bounds `S<dynamic>` the name-level arm produces), so the
