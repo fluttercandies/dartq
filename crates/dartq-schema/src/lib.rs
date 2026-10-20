@@ -242,6 +242,29 @@
 //! entry URIs). No writer emits `since` on this face — the pull face has
 //! no delta parameter — so none is declared.
 //!
+//! Index export documents (`dartq index --full`; JSONL — one header line
+//! then one document per analyzed file; the document's `path` is the red
+//! line and `symbol_count` rides it, so `minimal` lists the documents and
+//! their symbol counts; `compact` adds the per-document short-id `symbols`
+//! table and the `declarations` rows; `full` adds the `occurrences` and
+//! `supertypes` rows):
+//!
+//! | document field   | minimal | compact | full |
+//! |------------------|---------|---------|------|
+//! | `schema_version` | ●       | ●       | ●    |
+//! | `path`           | ●       | ●       | ●    |
+//! | `symbol_count`   | ●       | ●       | ●    |
+//! | `symbols`        |         | ●       | ●    |
+//! | `declarations`   |         | ●       | ●    |
+//! | `occurrences`    |         |         | ●    |
+//! | `supertypes`     |         |         | ●    |
+//!
+//! The header line counts the stream's emitted rows: `documents` and
+//! `declarations` ride every tier; `occurrences` and `supertypes` join
+//! only at `full` — the tiers that emit no such rows must not carry the
+//! keys, so consumers read "zero exported" apart from "not exported".
+//! Full row-shape detail lives in `index_export`'s module docs.
+//!
 //! Assists documents (`dartq assists` / `dartq/assists`; per assist row —
 //! the row's provenance tag and title ride every tier, unlike the fix
 //! patch's human-name rows: the writer drops only the priority and the
@@ -309,6 +332,9 @@
 //! * [`Domain::RunMetrics`] — the `--metrics-json` run summary
 //!   ([`run_metrics_schema`]).
 //! * [`Domain::Index`] — the index run summary ([`index_schema`]).
+//! * [`Domain::IndexExport`] — the `dartq index --full` JSONL export's
+//!   lines, header and per-file document ([`index_export_schema`];
+//!   validated line-by-line — the validator accepts either shape).
 //! * [`Domain::Check`] — the daemon's `dartq/check` answer
 //!   ([`check_schema`]).
 //! * [`Domain::Analyze`] — the daemon's `dartq/analyze` answer
@@ -356,6 +382,7 @@ mod explain;
 mod fix_patch;
 mod impact;
 mod index;
+mod index_export;
 mod query;
 mod run_metrics;
 mod support;
@@ -370,6 +397,9 @@ pub use explain::{SCHEMA_VERSION_EXPLAIN, explain_schema};
 pub use fix_patch::{SCHEMA_VERSION_FIX_PATCH, fix_patch_schema};
 pub use impact::{SCHEMA_VERSION_IMPACT, impact_schema};
 pub use index::{SCHEMA_VERSION_INDEX, index_schema};
+pub use index_export::{
+    EXPORT_REF_KINDS, SCHEMA_VERSION_INDEX_EXPORT, SUPER_CLAUSES, index_export_schema,
+};
 pub use query::{DECL_KINDS, REF_KINDS, SCHEMA_VERSION_QUERY, query_schema};
 pub use run_metrics::{SCHEMA_VERSION_RUN_METRICS, run_metrics_schema};
 
@@ -392,6 +422,9 @@ pub enum Domain {
     RunMetrics,
     /// The index run summary (`dartq index`).
     Index,
+    /// The `dartq index --full` export stream's lines (header + per-file
+    /// documents — the JSONL face).
+    IndexExport,
     /// The daemon's `dartq/check` answer (`schema_version` + machine rows).
     Check,
     /// The daemon's `dartq/analyze` answer (LSP diagnostic entries).
@@ -479,6 +512,7 @@ pub fn validate(payload: &str, domain: Domain) -> Result<(), SchemaViolation> {
         Domain::Compat => compat::validate_compat(&value),
         Domain::RunMetrics => run_metrics::validate_run_metrics(&value),
         Domain::Index => index::validate_index(&value),
+        Domain::IndexExport => index_export::validate_index_export(&value),
         Domain::Check => check::validate_check(&value),
         Domain::Analyze => analyze::validate_analyze(&value),
         Domain::Assists => assists::validate_assists(&value),
@@ -516,6 +550,7 @@ pub fn validate_at_tier(
         (Domain::Impact, _) => impact::validate_impact(&value),
         (Domain::RunMetrics, _) => run_metrics::validate_run_metrics(&value),
         (Domain::Index, _) => index::validate_index(&value),
+        (Domain::IndexExport, tier) => index_export::validate_index_export_at_tier(&value, tier),
         (Domain::Diagnostics, tier) => diagnostics::validate_diagnostics_at_tier(&value, tier),
         (Domain::FixPatch, tier) => fix_patch::validate_fix_patch_at_tier(&value, tier),
         (Domain::Query, tier) => query::validate_query_at_tier(&value, tier),

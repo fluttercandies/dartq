@@ -23,9 +23,11 @@ use crate::exit;
 
 #[derive(Args)]
 pub(crate) struct IndexArgs {
-    /// Force a rebuild instead of reusing incremental state. The engine has
-    /// no resident index yet — every run builds fresh — so both modes build
-    /// full today; the flag pins the output contract.
+    /// Export the maintained index as a JSONL document stream (the SCIP
+    /// document model over JSON): a header line of row totals, then one
+    /// document per analyzed file. `-v/--verbosity` shapes the documents
+    /// (minimal = path + symbol counts, compact = + symbol table and
+    /// declaration rows, full = + occurrence and supertype rows).
     #[arg(long)]
     pub(crate) full: bool,
     /// Package directory holding pubspec.yaml and
@@ -35,18 +37,20 @@ pub(crate) struct IndexArgs {
     /// Dart SDK root; defaults to `$DART_SDK`.
     #[arg(long)]
     pub(crate) sdk: Option<PathBuf>,
-    /// Report detail tier (`-v`/`--verbosity minimal|compact|full`), for
-    /// grammar parity with the other faces. The run summary is
-    /// tier-invariant (the canonical tables: four verdict totals — no
-    /// locator, no prose, nothing to trim), so every tier emits the same
-    /// bytes; the default `compact` was already the only shape.
+    /// Report detail tier (`-v`/`--verbosity minimal|compact|full`). Without
+    /// `--full` the run summary is tier-invariant (four verdict totals —
+    /// no locator, no prose, nothing to trim); under `--full` the tier
+    /// shapes the export documents (the canonical `Domain::IndexExport`
+    /// tier table).
     #[arg(short = 'v', long, value_enum, default_value_t = Verbosity::Compact)]
     pub(crate) verbosity: Verbosity,
 }
 
-/// Crash tier like the other engine faces: a panic aborts with exit 4 and
-/// stdout kept empty, because [`run`] writes only after the build fully
-/// succeeded.
+/// Crash tier like the other engine faces: a panic aborts with exit 4. The
+/// summary face keeps stdout empty because it writes only after the build
+/// fully succeeds; the `--full` export streams incrementally, so a mid-run
+/// panic can leave a truncated prefix — the same trade every streaming face
+/// makes, and a consumer detects it by the missing terminal newline/counts.
 pub(crate) fn run_entry(args: &IndexArgs) -> u8 {
     run(args, &mut BufWriter::new(io::stdout().lock()))
 }
@@ -61,10 +65,9 @@ fn run(args: &IndexArgs, out: &mut impl Write) -> u8 {
 }
 
 fn run_checked(args: &IndexArgs, out: &mut impl Write) -> u8 {
-    // The tier parses for grammar parity and shapes nothing: the run summary
-    // is tier-invariant (the canonical tables trim nothing here), the same
-    // accept-and-document posture the daemon's `dartq/index` answer holds.
-    let _ = args.verbosity;
+    if args.full {
+        return export_checked(args, out);
+    }
     let built = match index_run(&args.dir, args.sdk.as_deref(), args.full) {
         Ok(built) => built,
         // Workspace/engine-bind problems are the usage tier (their Display
@@ -93,6 +96,28 @@ fn run_checked(args: &IndexArgs, out: &mut impl Write) -> u8 {
         return exit::INTERNAL_ERROR;
     }
     exit::CLEAN
+}
+
+/// The `--full` half: the JSONL export stream (header + one document per
+/// analyzed file), tier-shaped by `-v/--verbosity`. Errors map onto the
+/// same tiers as the summary face.
+fn export_checked(args: &IndexArgs, out: &mut impl Write) -> u8 {
+    match dartq_commands::index::run_export(
+        &args.dir,
+        args.sdk.as_deref(),
+        args.verbosity.into_commands(),
+        out,
+    ) {
+        Ok(_) => exit::CLEAN,
+        Err(error @ (IndexError::Workspace(_) | IndexError::Engine(_))) => {
+            eprintln!("error: {error}");
+            exit::USAGE
+        }
+        Err(error) => {
+            eprintln!("dartq: internal error: {error}");
+            exit::INTERNAL_ERROR
+        }
+    }
 }
 
 #[cfg(test)]
@@ -145,7 +170,7 @@ mod tests {
 
     fn args(root: &std::path::Path) -> IndexArgs {
         IndexArgs {
-            full: true,
+            full: false,
             dir: root.to_path_buf(),
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
@@ -174,6 +199,57 @@ mod tests {
             ..args(&root)
         };
         assert_eq!(run(&missing, &mut Vec::new()), exit::USAGE);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `--full` face end to end over the same fixture: the stream opens
+    /// with the header counts (2 documents, 4 declaration rows, 2
+    /// occurrences) and each document line is a schema-valid export object
+    /// in canonical-path order.
+    #[test]
+    fn index_full_streams_jsonl_documents() {
+        let root = fixture("full");
+        let mut out: Vec<u8> = Vec::new();
+        let export = IndexArgs {
+            full: true,
+            ..args(&root)
+        };
+        assert_eq!(run(&export, &mut out), exit::CLEAN);
+        let text = String::from_utf8(out).expect("UTF-8 stream");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 documents");
+        let header: serde_json::Value = serde_json::from_str(lines[0]).expect("header");
+        assert_eq!(header["documents"], 2);
+        assert_eq!(header["declarations"], 4);
+        // Compact tier: no occurrence/supertype rows.
+        assert!(header.get("occurrences").is_none());
+        for line in &lines[1..] {
+            let doc: serde_json::Value = serde_json::from_str(line).expect("document");
+            assert_eq!(doc["schema_version"], 1);
+            assert!(doc["path"].is_string());
+            assert!(doc["declarations"].is_array());
+        }
+
+        // Full verbosity exposes the occurrence rows end to end.
+        let mut out: Vec<u8> = Vec::new();
+        let export = IndexArgs {
+            verbosity: Verbosity::Full,
+            ..export
+        };
+        assert_eq!(run(&export, &mut out), exit::CLEAN);
+        let text = String::from_utf8(out).expect("UTF-8 stream");
+        let header: serde_json::Value =
+            serde_json::from_str(text.lines().next().expect("header")).expect("header");
+        assert_eq!(header["occurrences"], 2, "Foo() and foo() in b.dart");
+        assert_eq!(header["supertypes"], 0);
+        let b_doc = text
+            .lines()
+            .nth(2)
+            .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .expect("b.dart document");
+        assert_eq!(b_doc["path"], "package:fixture/lib/b.dart");
+        assert_eq!(b_doc["occurrences"].as_array().expect("rows").len(), 2);
 
         fs::remove_dir_all(&root).ok();
     }

@@ -72,7 +72,9 @@ mod test_graph;
 pub use capture::{
     Capturer, DeclKind, DeclRow, FileCapture, FileIndex, SuperClause, SuperEdge, capture,
 };
-pub use library::{LibraryBuilder, LibraryIndex, NameRow, RefKind, RefRow, TargetRef};
+pub use library::{
+    LibraryBuilder, LibraryIndex, NameRow, RefKind, RefRow, SubtypeEdge, TargetRef,
+};
 pub use postings::{Postings, distinct_decl_names};
 pub use test_graph::TestGraph;
 

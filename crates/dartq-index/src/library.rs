@@ -304,6 +304,14 @@ impl LibraryIndex {
         &self.refs
     }
 
+    /// Every resolved supertype edge, ordered by the table's sort
+    /// (`(subtype file, name, clause)` — the export face's document
+    /// assembly filters this slice by file, keeping the stored order).
+    #[must_use]
+    pub fn supers(&self) -> &[SubtypeEdge] {
+        &self.supers
+    }
+
     /// The surface's owned heap bytes: the boxed columns at their exact
     /// lengths plus the overflow rows at reserved capacity. Exact over the
     /// columns this type owns; the allocator's per-block rounding is not
