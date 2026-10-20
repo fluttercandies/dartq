@@ -426,12 +426,6 @@ impl<'a> Engine<'a> {
                     && !self.in_cascade
                 {
                     let member_offset = member.range.offset;
-                    eprintln!(
-                        "P2401 latch member@{member_offset} recv_span@{}..{} popped={:?}",
-                        recv_span.offset,
-                        recv_span.end(),
-                        popped_shape
-                    );
                     if let Err(index) = self
                         .promoted_recv_reads
                         .binary_search_by(|(member, _)| member.cmp(&member_offset))
@@ -2484,8 +2478,13 @@ impl<'a> Engine<'a> {
             self.file,
             enum_name,
         )
-        .and_then(|(container, _)| {
+        .and_then(|(container, owner)| {
             let mut formals = (**container.ctor_formals.get(&key)?).clone();
+            // The resolved table lives in `owner`'s pool — re-intern every
+            // `formal.ty` into the diagnosing pool before the per-argument
+            // assignability walk derefs a slot (a same-file owner is a
+            // no-op).
+            self.project_formals(owner, &mut formals);
             // An untyped field formal (`this.describe`) takes its field's
             // declared type (`FieldFormalParameterElement.type`); the field
             // may be declared after the constructor, so the whole-file
@@ -2500,7 +2499,9 @@ impl<'a> Engine<'a> {
                     && entry.kind == MemberKind::Field
                     && !entry.is_static
                 {
-                    formal.ty = entry.var_ty;
+                    // The field's declared type shares the constructor
+                    // table's foreign pool — project it too.
+                    formal.ty = self.boundary.ty(owner, entry.var_ty);
                 }
             }
             Some((formals, container.has_const_constructor))
@@ -2814,7 +2815,7 @@ impl<'a> Engine<'a> {
                     self.file,
                     superclass,
                 ) {
-                    Some((super_container, _)) => {
+                    Some((super_container, super_owner)) => {
                         let key = selector
                             .filter(|name| *name != self.intern("new"))
                             .unwrap_or(superclass);
@@ -2832,10 +2833,15 @@ impl<'a> Engine<'a> {
                         // A chained forward's sentinel resolves against the
                         // hop above it (the super constructor's own
                         // `super.name` formal reads the grandparent's
-                        // associated parameter).
+                        // associated parameter). The resolved table lives in
+                        // `super_owner`'s pool, so the clone re-interns into
+                        // the diagnosing pool before the argument walk
+                        // derefs a `formal.ty` slot (a same-file owner is a
+                        // no-op).
                         let mut formals = formals;
+                        self.project_formals(super_owner, &mut formals);
                         self.patch_super_formals(superclass, &mut formals);
-                        (formals, Some(super_container), Some(superclass))
+                        (formals, Some((super_container, super_owner)), Some(superclass))
                     }
                     // The dead-edge super face (`resolver.dart`'s null
                     // element arm): an unresolvable superclass — the
@@ -2888,7 +2894,7 @@ impl<'a> Engine<'a> {
         // type — the field may be declared after the constructor, so the
         // whole-file member table answers it (the enum-constant walk
         // applies the same face).
-        if let Some(super_container) = super_container {
+        if let Some((super_container, super_owner)) = super_container {
             for formal in formals
                 .positional
                 .iter_mut()
@@ -2899,7 +2905,9 @@ impl<'a> Engine<'a> {
                     && entry.kind == MemberKind::Field
                     && !entry.is_static
                 {
-                    formal.ty = entry.var_ty;
+                    // The field's declared type is owned by the same foreign
+                    // pool as the constructor table — project it too.
+                    formal.ty = self.boundary.ty(super_owner, entry.var_ty);
                 }
             }
         }
@@ -3100,6 +3108,25 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Re-interns a constructor's formal table into the diagnosing pool.
+    /// `resolve_container`'s `ctor_formals` hit is owned by `owner`'s unit —
+    /// its `formal.ty` slots index that pool, and the member-walk
+    /// projections ([`Boundary::member`]) cover member tables only, never a
+    /// constructor's own table. Reading a foreign slot through the
+    /// diagnosing pool indexes the wrong universe (an out-of-bounds read —
+    /// the `model.rs` `ArgListId`/`FnShapeId` panic — or silently a
+    /// different shape), so every `formal.ty` re-interns here before the
+    /// argument walk derefs it. A same-file `owner` short-circuits.
+    fn project_formals(&self, owner: FileId, formals: &mut Formals) {
+        for formal in formals
+            .positional
+            .iter_mut()
+            .chain(formals.named.iter_mut())
+        {
+            formal.ty = self.boundary.ty(owner, formal.ty);
+        }
+    }
+
     /// An untyped constructor formal's declared type is its field's own
     /// (`this.name` initializes the field — `FieldFormalParameterElement
     /// .type` is the field's type): the captured formal stays `Unknown`
@@ -3203,7 +3230,7 @@ impl<'a> Engine<'a> {
                 return Ty::UNKNOWN;
             }
             depth += 1;
-            let Some((super_container, superclass, formals)) =
+            let Some((super_container, super_owner, superclass, formals)) =
                 self.associated_super_formals(container)
             else {
                 return Ty::UNKNOWN;
@@ -3243,21 +3270,25 @@ impl<'a> Engine<'a> {
                 // The associated field-formal declares its field's type.
                 Ty::UNKNOWN => {
                     return self
-                        .declared_field_ty(super_container, associated.name)
+                        .declared_field_ty(super_container, super_owner, associated.name)
                         .unwrap_or(Ty::UNKNOWN);
                 }
-                ty => return ty,
+                // The associated parameter's declared type lives in
+                // `super_owner`'s pool — project it before it becomes the
+                // patched formal's `formal.ty`.
+                ty => return self.boundary.ty(super_owner, ty),
             }
         }
     }
 
     /// The unnamed super constructor's formal table one hop up, with the
     /// hop's owning container and name for the next link of a chained
-    /// forward.
+    /// forward — and the super container's owning file, the key every
+    /// `formal.ty`/field type read through the returned tables projects by.
     fn associated_super_formals(
         &self,
         container: StringId,
-    ) -> Option<(&'a Container, StringId, &'a Formals)> {
+    ) -> Option<(&'a Container, FileId, StringId, &'a Formals)> {
         let (container, _) = resolve_container(
             self.graph,
             self.namespaces,
@@ -3267,7 +3298,7 @@ impl<'a> Engine<'a> {
             container,
         )?;
         let superclass = container.superclass?;
-        let (super_container, _) = resolve_container(
+        let (super_container, super_owner) = resolve_container(
             self.graph,
             self.namespaces,
             self.index,
@@ -3276,14 +3307,16 @@ impl<'a> Engine<'a> {
             superclass,
         )?;
         let formals = super_container.ctor_formals.get(&superclass)?;
-        Some((super_container, superclass, formals))
+        Some((super_container, super_owner, superclass, formals))
     }
 
     /// The instance field's declared type under `name`, the associated
-    /// field-formal's own answer.
-    fn declared_field_ty(&self, container: &Container, name: StringId) -> Option<Ty> {
+    /// field-formal's own answer — projected out of `owner`'s pool, the
+    /// universe the returned `member.var_ty` slots index.
+    fn declared_field_ty(&self, container: &Container, owner: FileId, name: StringId) -> Option<Ty> {
         let member = container.members.get(&name)?;
-        (member.kind == MemberKind::Field && !member.is_static).then_some(member.var_ty)
+        (member.kind == MemberKind::Field && !member.is_static)
+            .then(|| self.boundary.ty(owner, member.var_ty))
     }
 
     /// The bare-invocation head that names a type alias the creation can

@@ -3665,3 +3665,13 @@ mod ticket_2416_tests;
 /// header latch for `<T>` after a GFT return annotation all hold.
 #[cfg(test)]
 mod ticket_2419_tests;
+
+/// The #2417 pins: the cross-file constructor-formals projection — a
+/// foreign container's `ctor_formals` table cloned verbatim carried
+/// `ArgListId`/`FnShapeId` slots that index the *foreign* `ArgPool`, so the
+/// super-invocation/enum-const argument walks read just-past-end and
+/// panicked (the xml/intl corpus zero-diagnostics abort). Every `formal.ty`
+/// now re-interns through `boundary.ty(owner, ty)` before the walk derefs
+/// it. See the module for the upstream `resolve_container` owner contract.
+#[cfg(test)]
+mod ticket_2417_tests;
