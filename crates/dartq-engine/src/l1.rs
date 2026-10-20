@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, Severity};
+use dartq_diagnostics::{CodeInfo, CodeRegistry, Diagnostic, DiagnosticType, Severity};
 use dartq_language::{
     DEFAULT_LANGUAGE_VERSION, Feature, FeatureSet, LanguageVersion, MIN_LANGUAGE_VERSION_CONSTRAINT,
 };
@@ -928,7 +928,7 @@ pub(crate) fn compute_unit(
         &capture.index,
     ));
     let (directives, directive_region, doc_imports) =
-        extract_directives(text, &scanned.tokens, strings);
+        extract_directives(text, &scanned.tokens, strings, file, &mut diagnostics);
     let face = directive_face(text, &scanned.tokens, directive_region);
 
     let facts = UnitFacts {
@@ -1229,6 +1229,23 @@ fn has_placeholder_above_zero(template: &str) -> bool {
 /// the dtype — no separate severity map), the published flag rides into the
 /// code info (JSON `documentation`), and the verbatim correction is carried
 /// through (`uri_does_not_exist` family rows have one).
+/// `import`/`export` with more than one `show`/`hide` clause — registry row
+/// verbatim (diagnostic.g.dart `multipleCombinatorsDeprecated`, dart 3.15
+/// main: the default feature set routes here, and the deprecated twin shares
+/// the `multiple_combinators` code name). `STATIC_WARNING`, published; the
+/// span rides the whole combinator list and the emission is unconditional on
+/// the directive's resolution (error_verifier.dart:8489-8504).
+const MULTIPLE_COMBINATORS: dartq_resolution::ResolutionCodeInfo =
+    dartq_resolution::ResolutionCodeInfo {
+        name: "multiple_combinators",
+        machine: "MULTIPLE_COMBINATORS",
+        message: "Using multiple 'hide' or 'show' combinators is never necessary and often \
+                  produces surprising results.",
+        correction: Some("Try using a single combinator."),
+        dtype: DiagnosticType::StaticWarning,
+        has_published: true,
+    };
+
 pub(crate) fn uri_diagnostic(
     code: dartq_resolution::ResolutionCode,
     uri: &str,
@@ -1632,6 +1649,8 @@ fn extract_directives(
     text: &str,
     tokens: &TokenTable,
     strings: &StringTable,
+    file: FileId,
+    diagnostics: &mut Vec<Diagnostic>,
 ) -> (Vec<DirectiveFacts>, usize, Vec<DocImportFacts>) {
     let mut directives = Vec::new();
     let mut i = 0;
@@ -1672,6 +1691,8 @@ fn extract_directives(
                     strings,
                     &mut directives,
                     DirectiveKind::Import,
+                    diagnostics,
+                    file,
                 );
             }
             TokenKind::Keyword(Keyword::Export) => {
@@ -1683,6 +1704,8 @@ fn extract_directives(
                     strings,
                     &mut directives,
                     DirectiveKind::Export,
+                    diagnostics,
+                    file,
                 );
             }
             TokenKind::Keyword(Keyword::Part) => {
@@ -1735,7 +1758,16 @@ fn extract_directives(
                     _ => None,
                 };
                 let next = match kind {
-                    Some(kind) => walk_import_export(text, tokens, i, strings, &mut directives, kind),
+                    Some(kind) => walk_import_export(
+                        text,
+                        tokens,
+                        i,
+                        strings,
+                        &mut directives,
+                        kind,
+                        diagnostics,
+                        file,
+                    ),
                     None => walk_part(text, tokens, i, strings, &mut directives),
                 };
                 i = next.max(i + 1);
@@ -1846,11 +1878,39 @@ fn is_name_token(kind: TokenKind) -> bool {
     }
 }
 
+/// The directive-head keywords (`import`/`export`/`part`/`library`): all
+/// built-in identifiers, so the annotation-name walk must treat one in name
+/// position as the decorated directive's head, not as a name continuation.
+fn is_directive_head(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Keyword(Keyword::Import | Keyword::Export | Keyword::Part | Keyword::Library)
+    )
+}
+
 /// Skips `@qualifiedName[(args)]` starting after the `@`.
 fn skip_annotation(tokens: &TokenTable, mut i: usize) -> usize {
-    while kind_at(tokens, i).is_some_and(is_name_token)
-        || kind_at(tokens, i) == Some(TokenKind::Period)
-    {
+    // The name head may itself be a built-in identifier (`@import`), and a
+    // segment after a `.` always continues the name; but a directive-head
+    // keyword in a fresh name position starts the decorated directive
+    // (`@internal import 'dart:async';`) — consuming it there drops the
+    // whole directive from the unit's face.
+    let mut head = true;
+    let mut after_period = false;
+    while match kind_at(tokens, i) {
+        Some(kind) if is_name_token(kind) => {
+            let stop = !head && !after_period && is_directive_head(kind);
+            head = false;
+            after_period = false;
+            !stop
+        }
+        Some(TokenKind::Period) => {
+            head = false;
+            after_period = true;
+            true
+        }
+        _ => false,
+    } {
         i += 1;
     }
     if kind_at(tokens, i) == Some(TokenKind::OpenParen) {
@@ -1917,6 +1977,8 @@ fn walk_import_export(
     strings: &StringTable,
     out: &mut Vec<DirectiveFacts>,
     kind: DirectiveKind,
+    diagnostics: &mut Vec<Diagnostic>,
+    file: FileId,
 ) -> usize {
     let (uri, uri_span, mut i) = read_uri(text, tokens, start + 1);
     let mut prefix = None;
@@ -1924,6 +1986,12 @@ fn walk_import_export(
     let mut clauses: Vec<(CombinatorClause, Box<[SourceRange]>)> = Vec::new();
     let mut configurations: Vec<Configuration> = Vec::new();
     let mut configuration_spans: Vec<SourceRange> = Vec::new();
+    // The combinator list's first clause keyword and last name end: the
+    // oracle's `multiple_combinators` span (error_verifier.dart
+    // `_reportForMultipleCombinators` — `combinators.beginToken` through
+    // `combinators.endToken`, more than one clause).
+    let mut first_combinator_offset: Option<u32> = None;
+    let mut last_combinator_end = 0u32;
     loop {
         match kind_at(tokens, i) {
             None | Some(TokenKind::Eof) => break,
@@ -1960,6 +2028,14 @@ fn walk_import_export(
             }
             Some(TokenKind::Keyword(Keyword::Show | Keyword::Hide)) => {
                 let hide = kind_at(tokens, i) == Some(TokenKind::Keyword(Keyword::Hide));
+                // The clause keyword opens the combinator list the oracle
+                // spans for `multiple_combinators`
+                // (`_reportForMultipleCombinators`: the list's beginToken
+                // through endToken).
+                if first_combinator_offset.is_none() {
+                    first_combinator_offset =
+                        Some(tokens.get(i).expect("kind_at checked").utf16_offset);
+                }
                 i += 1;
                 let mut names = Vec::new();
                 let mut name_spans: Vec<SourceRange> = Vec::new();
@@ -1972,6 +2048,8 @@ fn walk_import_export(
                             // per-token combinator-warning anchor
                             // (dead_code_verifier.dart:148-158).
                             let token = tokens.get(i).expect("kind_at checked");
+                            let end = token.utf16_offset + utf16_len_of(lexeme);
+                            last_combinator_end = last_combinator_end.max(end);
                             name_spans.push(SourceRange {
                                 offset: token.utf16_offset,
                                 length: utf16_len_of(lexeme),
@@ -1992,6 +2070,7 @@ fn walk_import_export(
             _ => i += 1,
         }
     }
+    let clause_count = clauses.len();
     out.push(DirectiveFacts {
         kind,
         uri,
@@ -2005,6 +2084,31 @@ fn walk_import_export(
         configurations: configurations.into(),
         configuration_spans: configuration_spans.into(),
     });
+    // `multiple_combinators` (error_verifier.dart:8489-8504): more than one
+    // `show`/`hide` clause on one import/export — the warning rides the
+    // whole combinator list, unconditional on the directive's resolution
+    // (the visit runs before any target question). The default feature set
+    // routes to the deprecated twin, whose code name is the same
+    // `multiple_combinators` and whose message is the "never necessary"
+    // row (diagnostic.g.dart `multipleCombinatorsDeprecated`).
+    if let (Some(first), true) = (first_combinator_offset, clause_count > 1) {
+        diagnostics.push(Diagnostic::new(
+            MULTIPLE_COMBINATORS.dtype.severity(),
+            CodeInfo::new(
+                MULTIPLE_COMBINATORS.name,
+                MULTIPLE_COMBINATORS.machine,
+                MULTIPLE_COMBINATORS.dtype,
+                MULTIPLE_COMBINATORS.has_published,
+            ),
+            MULTIPLE_COMBINATORS.message.to_owned(),
+            file,
+            SourceRange {
+                offset: first,
+                length: last_combinator_end.saturating_sub(first),
+            },
+            MULTIPLE_COMBINATORS.correction.map(str::to_owned),
+        ));
+    }
     i
 }
 
@@ -4185,7 +4289,9 @@ pub(crate) mod tests {
         let (_, _, scanned, warnings) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file, &grants);
         assert!(warnings.is_empty());
         let strings = StringTable::new();
-        let (_, region_end, _) = extract_directives(text, &scanned.tokens, &strings);
+        let mut diagnostics = Vec::new();
+        let (_, region_end, _) =
+            extract_directives(text, &scanned.tokens, &strings, file, &mut diagnostics);
         let face = directive_face(text, &scanned.tokens, region_end);
 
         let mut expected = Vec::new();
@@ -4240,7 +4346,9 @@ pub(crate) mod tests {
         let grants = state.grants();
         let (_, _, scanned, _) = scan_unit(text, DEFAULT_LANGUAGE_VERSION, file, &grants);
         let strings = StringTable::new();
-        let (_, region_end, _) = extract_directives(text, &scanned.tokens, &strings);
+        let mut diagnostics = Vec::new();
+        let (_, region_end, _) =
+            extract_directives(text, &scanned.tokens, &strings, file, &mut diagnostics);
         let face = directive_face(text, &scanned.tokens, region_end);
 
         let retired = "import\u{1}'a\u{1}b.dart'\u{1};\u{1}".as_bytes().to_vec();
@@ -5209,5 +5317,102 @@ pub(crate) mod tests {
         for row in &rows {
             assert_eq!(row.range.length, 1);
         }
+    }
+
+    /// `multiple_combinators` (error_verifier.dart:8489-8504): more than one
+    /// `show`/`hide` clause on one import/export reports a static warning
+    /// spanning the whole combinator list (first clause keyword through the
+    /// last written name), unconditional on the directive's resolution; a
+    /// single clause stays silent.
+    #[test]
+    fn multiple_combinator_clauses_warn() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let main = set(
+            &mut state,
+            &lib.join("main.dart"),
+            "import 'dart:async' show Future hide Stream;\n\
+             import 'dart:math' show Random;\n\
+             export 'dart:convert' show utf8 hide json;\n\
+             void f() {}\n",
+        );
+        apply(&mut state, &mut |_| {});
+        let rows: Vec<_> = state.residency[&main]
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "multiple_combinators")
+            .collect();
+        assert_eq!(rows.len(), 2, "{:?}", state.residency[&main].diagnostics);
+        // The first import's list: `show Future hide Stream` — keyword
+        // start at column 21 (offset 20), through `Stream`'s end.
+        assert_eq!(rows[0].severity, Severity::Warning);
+        assert_eq!(
+            rows[0].message,
+            "Using multiple 'hide' or 'show' combinators is never necessary and often \
+             produces surprising results."
+        );
+        assert_eq!(rows[0].range.offset, 20);
+        assert_eq!(rows[0].range.length, "show Future hide Stream".len() as u32);
+        // The export's list spans `show utf8 hide json` after its URI (the
+        // two preceding import lines precede it in the file).
+        let export_head = "import 'dart:async' show Future hide Stream;\n\
+             import 'dart:math' show Random;\n\
+             export 'dart:convert' "
+            .len();
+        assert_eq!(rows[1].range.offset, export_head as u32);
+        assert_eq!(
+            rows[1].range.length,
+            "show utf8 hide json".len() as u32
+        );
+    }
+
+    /// A `part`'s missing target spells the resolved absolute form — the
+    /// oracle reports `includedFile.uriStr` (the `file://` URI) from the
+    /// non-part-kind arm (library_analyzer.dart:1038-1046) — while
+    /// import/export rows keep the written literal.
+    #[test]
+    fn part_missing_target_spells_absolute_uri() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let main = set(
+            &mut state,
+            &lib.join("main.dart"),
+            "part 'sub/gone.dart';\nimport 'nope.dart';\n",
+        );
+        apply(&mut state, &mut |_| {});
+        // The absolute spelling is the pipeline's report-layer rewrite: the
+        // stored run's rows (not the raw residency facts) carry it.
+        let mut graph: Option<crate::pipeline::ResolvedGraph> = None;
+        let cancel = crate::cancel::CancellationToken::new();
+        crate::pipeline::analyze(&mut state, &mut graph, None, &[], &mut |_| {}, &cancel)
+            .expect("cold analyze");
+        let owner = state.library_of_file[&main];
+        let rows = &state.results[&owner].diagnostics;
+        let part = rows
+            .iter()
+            .find(|d| d.range.offset == 5)
+            .expect("the part row reports");
+        assert_eq!(part.code.name, "uri_does_not_exist");
+        let expected = format!(
+            "Target of URI doesn't exist: 'file://{}'.",
+            lib.join("sub").join("gone.dart").display()
+        );
+        let spelled: String = part.message.to_string();
+        assert_eq!(spelled, expected, "part spells the absolute form");
+        let import = rows
+            .iter()
+            .find(|d| {
+                d.range.offset
+                    == ("part 'sub/gone.dart';\n".len() + "import ".len()) as u32
+            })
+            .expect("the import row reports");
+        let import_spelled: String = import.message.to_string();
+        assert_eq!(
+            import_spelled,
+            "Target of URI doesn't exist: 'nope.dart'.",
+            "import keeps the written literal"
+        );
     }
 }

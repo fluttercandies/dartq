@@ -807,7 +807,46 @@ fn diagnose_library(
     let mut out = Vec::new();
     for file in &members {
         let facts = &state.residency[file];
-        out.extend(facts.diagnostics.iter().cloned());
+        // A part's missing-target row spells the RESOLVED absolute form:
+        // the oracle's part-include state lands the URI on a `FileState`
+        // even when the file is absent, and the non-part-kind arm reports
+        // `includedFile.uriStr` — the `file://` URI
+        // (library_analyzer.dart:1030-1046). Imports/exports keep the
+        // written literal (`selectedUri.relativeUriStr`), so only `part`
+        // rows re-spell, and only ones the URI layer coded at a target.
+        out.extend(facts.diagnostics.iter().map(|row| {
+            if row.code.name != "uri_does_not_exist"
+                && row.code.name != "uri_has_not_been_generated"
+            {
+                return row.clone();
+            }
+            let Some(directive) = facts.directives.iter().find(|d| {
+                d.kind == DirectiveKind::Part
+                    && d.uri_span == row.range
+                    && matches!(
+                        d.code,
+                        Some(
+                            ResolutionCode::UriDoesNotExist
+                                | ResolutionCode::UriHasNotBeenGenerated
+                        )
+                    )
+            }) else {
+                return row.clone();
+            };
+            let ResolvedTarget::Resolved(target) = directive.target else {
+                return row.clone();
+            };
+            let Some(path) = state.files.path(target) else {
+                return row.clone();
+            };
+            let code = directive.code.expect("matched some above");
+            Arc::new(l1::uri_diagnostic(
+                code,
+                &format!("file://{}", path.display()),
+                row.range,
+                row.file,
+            ))
+        }));
         // Directive-combinator static warnings (dead_code_verifier.dart
         // :85-98/:58-70 visit the import/export directives alike): every
         // written `show`/`hide` token the resolved target's export scope
@@ -837,9 +876,22 @@ fn diagnose_library(
                 // this check stays silent.
                 && !state.deps.units.contains_key(&target)
             {
+                // A part spells the resolved absolute form like the baked
+                // rows above (`includedFile.uriStr`); imports/exports keep
+                // the written literal.
+                let uri = match directive.kind {
+                    DirectiveKind::Part => state
+                        .files
+                        .path(target)
+                        .map(|path| format!("file://{}", path.display()))
+                        .unwrap_or_else(|| {
+                            directive.uri.clone().unwrap_or_default().to_string()
+                        }),
+                    _ => directive.uri.clone().unwrap_or_default().to_string(),
+                };
                 out.push(Arc::new(l1::uri_diagnostic(
                     ResolutionCode::UriDoesNotExist,
-                    directive.uri.as_deref().unwrap_or_default(),
+                    &uri,
                     directive.uri_span,
                     *file,
                 )));
