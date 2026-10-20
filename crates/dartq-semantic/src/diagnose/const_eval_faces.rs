@@ -532,7 +532,30 @@ impl<'a> Engine<'a> {
             return true;
         }
         let Some(decl) = self.const_ctor_decl(container) else {
-            return false;
+            // A qualified creation arrives named for its SELECTOR
+            // (`C.named(` closes with the selector as the callee), which
+            // resolves to no container: the written head at the span is
+            // the container the verifier answers.
+            let text = self
+                .source
+                .get(span.offset as usize..span.end() as usize)
+                .unwrap_or("");
+            let head = text.split('(').next().unwrap_or("");
+            let Some((head_text, selector)) = head.split_once('.') else {
+                return false;
+            };
+            return resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                self.intern(head_text),
+            )
+            .map(|(decl, _)| decl)
+            .is_some_and(|decl| {
+                decl.has_const_constructor && decl.constructors.contains(&self.intern(selector))
+            });
         };
         let text = self
             .source
@@ -552,6 +575,19 @@ impl<'a> Engine<'a> {
             return true;
         }
         decl.constructors.contains(&self.intern(selector))
+    }
+
+    /// The receiver row below the pending selector row (`recv.selector(`):
+    /// the selector row must be QUALIFIED (`invokes.last()` indexes it,
+    /// the receiver sits immediately below) — `None` for a bare callee,
+    /// whose send carries no receiver row.
+    fn qualified_recv(&self) -> Option<&Row> {
+        let callee = self.invokes.last().and_then(|slot| *slot)?;
+        let row = self.rows.get(callee)?;
+        if !row.qualified {
+            return None;
+        }
+        self.rows.get(callee.checked_sub(1)?)
     }
 
     /// The callee classification a closed bare-identifier call resolves
@@ -585,6 +621,27 @@ impl<'a> Engine<'a> {
         if self.const_ctor_target(name) {
             return CallClass::ConstCtor;
         }
+        // `C.named(` over an in-file class container: the implicit
+        // `const C.named(...)` creation when a declared CONST constructor
+        // answers the selector — the oracle resolves the creation and
+        // validates each argument against it
+        // (`_validateConstantArguments`). The arm precedes the selector's
+        // own bare-miss short-circuit: a private selector (`C._(`) names
+        // nothing in the bare namespace yet still resolves through the
+        // receiver. A selector no declared constructor answers falls
+        // through to the unknown-callee face (the
+        // `const_with_undefined_constructor` world).
+        if let Some(recv) = self.qualified_recv()
+            && let RowShape::Bare(BareInfo::Container {
+                name: container,
+                kind: ContainerKind::Class,
+            }) = &recv.shape
+            && self
+                .const_ctor_decl(*container)
+                .is_some_and(|decl| decl.constructors.contains(&name))
+        {
+            return CallClass::ConstCtor;
+        }
         if matches!(self.resolve_bare(name).0, BareInfo::Missing { .. }) {
             return CallClass::Unknown;
         }
@@ -596,21 +653,7 @@ impl<'a> Engine<'a> {
         // the implicit `const C.named(...)` creation (staged for the tail
         // pass beside the unnamed-`C(...)` arm), a value/creation result is
         // the `constEvalMethodInvocation` fault.
-        let recv = self
-            .invokes
-            .last()
-            .and_then(|slot| *slot)
-            .filter(|&callee| {
-                self.rows
-                    .get(callee)
-                    .is_some_and(|row| row.qualified)
-            })
-            .and_then(|callee| {
-                callee
-                    .checked_sub(1)
-                    .and_then(|index| self.rows.get(index))
-            });
-        if let Some(recv) = recv {
+        if let Some(recv) = self.qualified_recv() {
             match &recv.shape {
                 RowShape::Bare(BareInfo::Plain { .. }) => {
                     let (info, target) = self.resolve_bare(recv.name);
@@ -1145,6 +1188,48 @@ impl<'a> Engine<'a> {
     /// anchor; the oracle's diagnostic set collapses the identical row
     /// (`RecordingDiagnosticListener` stores a `Set<Diagnostic>`), so the
     /// emit skips an exact repeat.
+    /// The invocation's own span when the element leaf at `span` closed an
+    /// unresolved callee's invocation (`[Undefined()]`): the head answer is
+    /// the span's FIRST bare reference row — a bare miss there is the callee
+    /// (`undefined` names nothing), a resolved head is a
+    /// method-invocation/deferral world the probe must not speak for
+    /// (`resolvableFn(missing())`'s invocation fault is override-listed),
+    /// and literal-completion rows (`Value` — a string key beside the call)
+    /// are not references at all. The row's offset re-anchors the face when
+    /// a neighboring operand widened the staged span (the close's receiver
+    /// extension cannot tell a `:` from a `.`). Only the literal element
+    /// faces consult this — a declaration root's unresolved callee keeps
+    /// the deferred-creation verdict path (its
+    /// `const_initialized_with_non_constant_value` row anchors through the
+    /// tail pass beside the resolution rows).
+    fn unresolved_call(&self, span: SourceRange) -> Option<SourceRange> {
+        let mut at = self.rows.partition_point(|row| row.range.offset < span.offset);
+        while let Some(row) = self.rows.get(at)
+            && row.range.offset < span.end()
+        {
+            match &row.shape {
+                // A literal/receiver completion: not a reference — skip.
+                RowShape::Value => {}
+                _ => {
+                    if !row.qualified
+                        && row.range.end() <= span.end()
+                        && matches!(row.shape, RowShape::Bare(BareInfo::Missing { .. }))
+                    {
+                        return Some(SourceRange {
+                            offset: row.range.offset,
+                            length: span.end().saturating_sub(row.range.offset),
+                        });
+                    }
+                    // A resolved reference heads the invocation: the
+                    // overridden/deferred world — not an unresolved call.
+                    return None;
+                }
+            }
+            at += 1;
+        }
+        None
+    }
+
     pub fn check_const_elements(
         &mut self,
         code: SemanticCode,
@@ -1168,30 +1253,41 @@ impl<'a> Engine<'a> {
         }
         let mut failed = None;
         for part in parts {
-            match eval(part, self) {
-                Verdict::Value(_) | Verdict::Constant => {}
+            let failed_at = match eval(part, self) {
+                // An element folding clean but closing an unresolved
+                // callee's invocation (`[Undefined()]`): the oracle's
+                // evaluation is known-invalid at the invocation
+                // (`undefined_function` is not override-listed,
+                // `constant_verifier.dart` `_reportError`), so the element's
+                // site default fires there like an eval-failed element.
+                Verdict::Value(_) | Verdict::Constant => self.unresolved_call(part.span),
                 Verdict::NotConstant(span) | Verdict::Unresolved(span) => {
                     // A leading-dot shorthand resolves against the context
                     // type upstream — the bare-name verdict is ambiguous.
                     if self.dot_shorthand_context(span.offset) {
-                        continue;
+                        None
+                    } else {
+                        Some(span)
                     }
-                    let info = code.code_info();
-                    let repeat = self
-                        .report
-                        .diagnostics
-                        .iter()
-                        .rev()
-                        .any(|d| d.range == span && d.code == info);
-                    if !repeat {
-                        self.emit(code, span, "", "");
-                    }
-                    failed.get_or_insert(span);
                 }
                 Verdict::Fault(fault, span) => {
                     self.emit_const_fault(fault, span);
                     failed.get_or_insert(span);
+                    None
                 }
+            };
+            if let Some(span) = failed_at {
+                let info = code.code_info();
+                let repeat = self
+                    .report
+                    .diagnostics
+                    .iter()
+                    .rev()
+                    .any(|d| d.range == span && d.code == info);
+                if !repeat {
+                    self.emit(code, span, "", "");
+                }
+                failed.get_or_insert(span);
             }
         }
         failed

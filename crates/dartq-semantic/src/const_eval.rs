@@ -2980,16 +2980,46 @@ impl ConstCapture {
 
     /// Pushes a known constant leaf (an opaque collection/creation value
     /// the engine built at a construct's close).
+    ///
+    /// A qualified creation (`C.named(...)`) closes with its receiver head
+    /// still on the operand stack and the engine reporting the SELECTOR as
+    /// the callee — the value replaces the head (the
+    /// [`Self::push_named_creation`] mechanics) and the instance names the
+    /// CONTAINER: the head is the type the creation folds to, the selector
+    /// is not.
     pub fn push_value(&mut self, span: SourceRange, value: ConstantValue) {
-        if self.open() {
-            self.push(
-                Node {
-                    expr: Expr::Value(value),
-                    span,
-                },
-                true,
-            );
+        if !self.open() {
+            return;
         }
+        let mut span = span;
+        let value = if let ConstantValue::Created(callee) = value {
+            let base = self.base();
+            let head = self.stack.last();
+            if self.stack.len() > base
+                && let Some(Node {
+                    expr: Expr::Ident(head_name),
+                    span: head_span,
+                }) = head
+                // The receiver head is the call span's first token: the
+                // close extended the span back over it only when the head
+                // is a plain (unlatched) operand, so equality separates it
+                // from an unrelated binary/conditional operand below.
+                && head_span.offset == span.offset
+            {
+                span = SourceRange {
+                    offset: head_span.offset,
+                    length: span.end().saturating_sub(head_span.offset),
+                };
+                let value = ConstantValue::Created(*head_name);
+                self.stack.pop();
+                value
+            } else {
+                ConstantValue::Created(callee)
+            }
+        } else {
+            value
+        };
+        self.push(Node { expr: Expr::Value(value), span }, true);
     }
 
     /// The implicit named creation `C.named(...)`: the capture keeps the
