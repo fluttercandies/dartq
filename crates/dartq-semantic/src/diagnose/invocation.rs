@@ -60,6 +60,52 @@ impl<'a> Engine<'a> {
         let Some(mut member) = self.rows.pop() else {
             return;
         };
+        // A member send's explicit type arguments (`c.m<T>(...)`) leave their
+        // `TypeUse` rows stacked above the member-name row: the send folds
+        // nothing (`open_arguments` links no callee behind the group's
+        // trailing rows), so without this drain the merge below would fold
+        // the type argument AS the member and the name row AS its receiver.
+        // The oracle resolves every written type argument's name in place
+        // whatever the callee's resolution (`named_type_resolver.dart`'s
+        // `_isTypeInTypeArgumentList` — the argument's parent is a
+        // `TypeArgumentList` either way), so each row defers to pass 2
+        // (its `type_arg_miss_rows` entry rides) and the real member row
+        // merges against its receiver.
+        let mut type_arg_rows: Vec<Row> = Vec::new();
+        while matches!(member.shape, RowShape::TypeUse(..))
+            && let Some(next) = self.rows.pop()
+        {
+            type_arg_rows.push(member);
+            member = next;
+        }
+        if !type_arg_rows.is_empty() {
+            // The invoked spelling (`c.m<T>(...)`) keeps the invocation
+            // intent on the member row: the send's own fold skipped it (no
+            // callee link behind the group), and pass 2's member-miss face
+            // picks the code from the intent (`undefined_method`, never the
+            // property read's `undefined_getter` — probed
+            // `b.noSuch<Missing>()` vs oracle). A tear-off application
+            // (`c.m<T>;`) keeps the read intent.
+            let after = type_arg_rows.last().expect("checked non-empty").range.end();
+            let mut next = self.skip_whitespace(after);
+            while self.byte_at(next) == Some(b'>') {
+                next = self.skip_whitespace(next + 1);
+            }
+            if self.byte_at(next) == Some(b'(') {
+                member.intent = Intent::Invoke;
+            }
+            // The merge removes every row at or above the member row's slot
+            // (the member and receiver pops below replace the receiver's
+            // slot with the merged row), so index-keyed entries pointing
+            // there lose their rows — the F-H drain's same under-report
+            // discipline. A stale entry would otherwise re-ground on a
+            // LATER send's callee and check the dead group's count against
+            // an unrelated method (the `_isValidContext` misattribution).
+            let first_removed = self.rows.len();
+            self.deferred_args.retain(|(row, _, _)| *row < first_removed);
+            self.call_type_args.retain(|(row, _)| *row < first_removed);
+            self.deferred_miss_rows.append(&mut type_arg_rows);
+        }
         // The `.{`/`?.{` operand recovery (`AstBuilder.doDotExpression`):
         // the operand parses as a set-literal Value row anchored at `{` —
         // the oracle instead resolves a member named `{` at that token
@@ -1326,6 +1372,15 @@ impl<'a> Engine<'a> {
         }
         let start = self.rows.get(mark)?.range.offset;
         let end = self.rows.get(hi - 1)?.range.end();
+        // The closure-argument shape (`f((e) => e.type)`) folds the body's
+        // member row BELOW the arrow's Value row — a later stack row ending
+        // before an earlier one starts. The window is geometric garbage; no
+        // composite answer is honest there (the caller's unknown zero-span
+        // face takes over). The release build's wrap-around length hid this
+        // as a nonsense span; debug builds panic.
+        if end < start {
+            return None;
+        }
         let covered = self
             .bool_decided
             .iter()
