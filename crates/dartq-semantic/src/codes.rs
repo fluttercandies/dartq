@@ -230,6 +230,12 @@ pub enum SemanticCode {
     /// `A value of type '{0}' can't be returned from the {host} '{2}'
     /// because it has a return type of '{1}'.` — one analyzerCode with a
     /// per-host message (`uniqueName` `..._FROM_FUNCTION`/`_FROM_METHOD`).
+    /// The [`ExecKind::Closure`] host carries its own analyzerCode face —
+    /// `return_of_invalid_type_from_closure`, whose template answers the
+    /// literal's context-inferred return type instead of the declared-host
+    /// shape (the closure check stages this host; the oracle splits the
+    /// same `returnOfInvalidType` shared name per
+    /// `EnclosingExecutableContext`).
     ReturnOfInvalidType(ExecKind),
     /// `The type '{0}' used in the 'for' loop must implement '{1}'.` — the
     /// for-each iterable/stream check (`forInOfInvalidType`,
@@ -1242,6 +1248,13 @@ pub enum ExecKind {
     /// [`SemanticCode::WrongNumberOfTypeArgumentsElement`] has no
     /// constructor row and never receives it.
     Constructor,
+    /// `closure` — the function-literal return host: the literal's context
+    /// return type is inferred (never declared), so its check stages this
+    /// host and the message face renders the dedicated
+    /// `return_of_invalid_type_from_closure` template. Never reaches the
+    /// shared `{host}` slot (its template has no host word) and never the
+    /// element face of [`SemanticCode::WrongNumberOfTypeArgumentsElement`].
+    Closure,
 }
 
 impl ExecKind {
@@ -1252,6 +1265,7 @@ impl ExecKind {
             Self::Function => "function",
             Self::Method => "method",
             Self::Constructor => "constructor",
+            Self::Closure => "closure",
         }
     }
 }
@@ -1391,6 +1405,13 @@ impl SemanticCode {
             Self::ExtensionOverrideArgumentNotAssignable => (
                 "extension_override_argument_not_assignable",
                 "EXTENSION_OVERRIDE_ARGUMENT_NOT_ASSIGNABLE",
+            ),
+            // The closure host carries its own analyzerCode face (the
+            // `returnOfInvalidTypeFromClosure` row, diagnostic.g.dart
+            // :15314-15328); the declared hosts share `return_of_invalid_type`.
+            Self::ReturnOfInvalidType(ExecKind::Closure) => (
+                "return_of_invalid_type_from_closure",
+                "RETURN_OF_INVALID_TYPE_FROM_CLOSURE",
             ),
             Self::ReturnOfInvalidType(_) => ("return_of_invalid_type", "RETURN_OF_INVALID_TYPE"),
             Self::ForInOfInvalidType => ("for_in_of_invalid_type", "FOR_IN_OF_INVALID_TYPE"),
@@ -2767,6 +2788,15 @@ impl SemanticCode {
                     "The type of the argument to the extension override '{a0}' isn't assignable to the extended type '{a1}'."
                 )
             }
+            // The closure host's dedicated face (`returnOfInvalidTypeFromClosure`,
+            // diagnostic.g.dart:15314-15328): `{0}` is the returned type, `{1}`
+            // the closure's context-inferred return type — no host word, no
+            // name slot (the staging's third placeholder stays empty).
+            Self::ReturnOfInvalidType(ExecKind::Closure) => {
+                format!(
+                    "The returned type '{a0}' isn't returnable from a '{a1}' function, as required by the closure's context."
+                )
+            }
             // One template shape under sharedName `returnOfInvalidType`; the
             // host word picks the oracle face — `function`/`method`/
             // `constructor` (`returnOfInvalidTypeFromFunction`/`FromMethod`/
@@ -3417,6 +3447,7 @@ mod tests {
             SemanticCode::ReturnOfInvalidType(ExecKind::Function),
             SemanticCode::ReturnOfInvalidType(ExecKind::Method),
             SemanticCode::ReturnOfInvalidType(ExecKind::Constructor),
+            SemanticCode::ReturnOfInvalidType(ExecKind::Closure),
             SemanticCode::InvalidNullAwareOperator,
             // The switch-exhaustiveness cluster.
             SemanticCode::NonExhaustiveSwitchStatement,
@@ -3699,6 +3730,7 @@ mod tests {
         SemanticCode::ReturnOfInvalidType(ExecKind::Function),
         SemanticCode::ReturnOfInvalidType(ExecKind::Method),
         SemanticCode::ReturnOfInvalidType(ExecKind::Constructor),
+        SemanticCode::ReturnOfInvalidType(ExecKind::Closure),
         SemanticCode::InvalidNullAwareOperator,
         SemanticCode::NonExhaustiveSwitchStatement,
         SemanticCode::NonExhaustiveSwitchExpression,
@@ -3916,6 +3948,13 @@ mod tests {
         assert_eq!(
             SemanticCode::ReturnOfInvalidType(ExecKind::Constructor).message3("int", "E", "E"),
             "A value of type 'int' can't be returned from the constructor 'E' because it has a return type of 'E'."
+        );
+        // The closure face (returnOfInvalidTypeFromClosure,
+        // diagnostic.g.dart:15314-15328): the returned type leads, the
+        // context-inferred return type follows, the name slot stays empty.
+        assert_eq!(
+            SemanticCode::ReturnOfInvalidType(ExecKind::Closure).message3("int", "String", ""),
+            "The returned type 'int' isn't returnable from a 'String' function, as required by the closure's context."
         );
         assert_eq!(
             SemanticCode::InvalidNullAwareOperator.message("?.", "."),
@@ -4503,6 +4542,7 @@ mod tests {
             SemanticCode::ReturnOfInvalidType(ExecKind::Function),
             SemanticCode::ReturnOfInvalidType(ExecKind::Method),
             SemanticCode::ReturnOfInvalidType(ExecKind::Constructor),
+            SemanticCode::ReturnOfInvalidType(ExecKind::Closure),
             SemanticCode::StrictRawType,
             SemanticCode::SubtypeOfSealedClass,
             SemanticCode::TypeArgumentNotMatchingBounds,

@@ -1269,22 +1269,28 @@ impl<'a> Engine<'a> {
     pub(crate) fn check_return(&mut self, from: Ty, range: SourceRange, from_literal: bool) {
         // The innermost executable frame owns the return. A frame with no
         // latched return (`ret: None` — a function literal or closure whose
-        // return type is context-inferred) stops the walk: its `return`/`=>`
-        // checks against the literal's own face, which the name-level model
-        // leaves undecided — under-report, never leak to the enclosing
+        // return type is context-inferred) no longer stops the walk flat:
+        // its body's returns check against the literal's context return
+        // type ([`Engine::check_closure_return`], the oracle's
+        // `isClosure` arm, rtv.dart:160-165) — still never the enclosing
         // method's declared return (`firstDepleted`'s `Future<InventoryEvent?>`
         // must not adjudicate `onTimeout: () => null`).
-        let Some(ret) = self.frames.iter().rev().find_map(|f| match &f.kind {
-            FrameKind::Executable { ret, is_async, .. } => Some(
-                ret.as_ref()
-                    .map(|ret| (ret.ty, ret.host, ret.name, ret.ctor, *is_async)),
-            ),
+        let found = self.frames.iter().rev().find_map(|f| match &f.kind {
+            FrameKind::Executable { ret, is_async, .. } => Some(match ret {
+                Some(ret) => Ok((ret.ty, ret.host, ret.name, ret.ctor, *is_async)),
+                None => Err(*is_async),
+            }),
             _ => None,
-        }) else {
+        });
+        let Some(found) = found else {
             return;
         };
-        let Some((to, host, name, ctor, is_async)) = ret else {
-            return;
+        let (to, host, name, ctor, is_async) = match found {
+            Ok(latched) => latched,
+            Err(is_async) => {
+                self.check_closure_return(from, range, from_literal, is_async);
+                return;
+            }
         };
         // An unannotated collection literal's row carries no type of its
         // own: the host's declared return is the context that resolves it
@@ -1331,6 +1337,105 @@ impl<'a> Engine<'a> {
                 from_literal,
             );
         }
+    }
+
+    /// The closure body's return check (`rtv.dart:160-165`'s `isClosure`
+    /// arm): the literal's return type is context-inferred, never
+    /// declared, so the verdict asks the context return type the model
+    /// knows ([`Engine::closure_context_return`]) and stages under the
+    /// closure host — the teardown's promotion join and re-decision matrix
+    /// are the declared path's, the message face is the closure's
+    /// (`return_of_invalid_type_from_closure`). No decidable context stays
+    /// the under-report posture (the oracle's remaining inference channels
+    /// — an argument formal's signature, a generic method's solved `T` —
+    /// are not this layer's knowledge).
+    fn check_closure_return(
+        &mut self,
+        from: Ty,
+        range: SourceRange,
+        from_literal: bool,
+        is_async: bool,
+    ) {
+        let Some(to) = self.closure_context_return() else {
+            return;
+        };
+        // The declared path's context gate: an unresolved written head
+        // (`named_type_resolver.dart`'s InvalidType annotation) asks no
+        // assignability question.
+        if let Ty::Named { name: head, .. } = to
+            && !self.named_type_is_type(head)
+        {
+            return;
+        }
+        if self.return_verdict(from, to, from_literal, is_async) == Some(false) {
+            self.stage(
+                StagedKind::Return {
+                    host: ExecKind::Closure,
+                    // The closure template has no name slot; the staging's
+                    // third placeholder renders the interned empty string.
+                    name: self.intern(""),
+                    ctor: false,
+                    is_async,
+                },
+                range,
+                from,
+                to,
+                from_literal,
+            );
+        }
+    }
+
+    /// The context return type a function literal's body checks against.
+    /// The two channels this name-level model carries: the declaration
+    /// initializer's written function type (the literal IS the
+    /// initializer), and the enclosing executable's return position (the
+    /// literal IS the `return` expression, whose declared type is
+    /// function-shaped — the literal's context is that function type, its
+    /// body checks against the shape's return). Every other context (an
+    /// argument formal, a generic method's solved `T`, the enclosing
+    /// `=>` body) answers `None` — under-report.
+    fn closure_context_return(&self) -> Option<Ty> {
+        let frame = self.frames.last()?;
+        let FrameKind::Executable { body_brace, .. } = &frame.kind else {
+            return None;
+        };
+        let open_mark = frame.row_mark;
+        // The declaration initializer: the literal opened exactly where the
+        // initializer began, so its context is the group's written function
+        // type's return (`String Function() f = () => 1;`). A deeper
+        // literal inside the initializer (`f = g(() => 1)`) opened after
+        // the callee's row — its mark no longer equals the initializer's.
+        if self.init_mark == Some(open_mark)
+            && let Some(Ty::Function { shape, .. }) = self.pending_decl_ty
+        {
+            let ret = {
+                let pool = self.boundary.pool();
+                pool.function_shape(shape).return_ty
+            };
+            return Some(ret);
+        }
+        // The enclosing executable's return position: the literal opened
+        // exactly where the in-flight `return` began, and the enclosing
+        // declared return is function-shaped — its return is the literal's
+        // context. An arrow-bodied literal only: a block body's own first
+        // `return` re-arms the mark inside the literal, where the equality
+        // can no longer separate the outer return position from the
+        // literal's own body returns (the false direction — never
+        // reported). The `=>`-body position of the enclosing executable
+        // stays under-report: the literal's own body event consumes the
+        // body mark before this check reads it.
+        if body_brace.is_some() || self.return_mark != Some(open_mark) {
+            return None;
+        }
+        let enclosing = self
+            .frames
+            .iter()
+            .rev()
+            .find_map(|f| match &f.kind {
+                FrameKind::Executable { ret: Some(ret), .. } => Some(ret.ty),
+                _ => None,
+            })?;
+        self.function_shape_return(enclosing)
     }
 
     /// An unannotated collection literal's static type in a return
@@ -2236,6 +2341,21 @@ impl<'a> Engine<'a> {
                 _ => None,
             };
         }
+        // The function-shape face: when both sides carry a written function
+        // shape — directly, or through a function-typed alias, which is
+        // transparent at the subtype question (`subtype.dart` unfolds the
+        // alias before `_isFunctionSubtypeOf`) — the function rule decides
+        // (formal contravariance, return covariance). The invariant
+        // same-head argument rule would misread a `bool Function(String?)`
+        // alias instantiation against `bool Function(String)`, and the
+        // interface walk cannot relate two alias heads at all. Non-function
+        // pairs (and pairs where one side alone unfolds) keep the ordinary
+        // paths below, byte-identical.
+        if let (Some(from_fn), Some(to_fn)) =
+            (self.function_shape_sig(from), self.function_shape_sig(to))
+        {
+            return self.fn_sig_subtype(&from_fn, &to_fn);
+        }
         if let Some(verdict) = to.assignable_from(from) {
             // The strict-casts overlay (`type_system.dart:891-930`: with
             // `strict-casts: true`, "the option disables all downcasts,
@@ -2444,6 +2564,207 @@ impl<'a> Engine<'a> {
             }
         }
         (!unknown).then_some(true)
+    }
+
+    /// The return type of a function-shaped written type — the
+    /// [`Engine::function_shape_sig`] answer's own return. `None` for
+    /// every non-function shape.
+    fn function_shape_return(&self, ty: Ty) -> Option<Ty> {
+        Some(self.function_shape_sig(ty)?.return_ty)
+    }
+
+    /// The written function shape of a type, aliases unfolded: a
+    /// `Ty::Function` reads its pool shape, a named head answers through
+    /// the alias faces — the use-site-instantiated parameterized alias
+    /// ([`Engine::instantiated_alias_sig`]) or the written-shape faces
+    /// (`alias_fn_sig`: raw heads, co-alias chains, the SDK
+    /// `Comparator`). `None` for every other shape — the caller keeps its
+    /// ordinary path. The alias gates read the parse-time capture first,
+    /// so the non-alias matrix pairs pay two hash probes, not a
+    /// resolution walk.
+    fn function_shape_sig(&self, ty: Ty) -> Option<Box<FnVarSig>> {
+        match ty {
+            Ty::Function { shape, nullable: false } => {
+                let (return_ty, positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.function_shape(shape);
+                    (shape.return_ty, shape.positional.to_vec(), shape.named.to_vec())
+                };
+                Some(Box::new(FnVarSig {
+                    params: Box::default(),
+                    required_positional: u16::try_from(positional.len()).unwrap_or(u16::MAX),
+                    positional: positional.into(),
+                    named: named
+                        .iter()
+                        .map(|(name, ty)| (*name, *ty, false))
+                        .collect(),
+                    return_ty,
+                }))
+            }
+            Ty::Named {
+                name,
+                nullable: false,
+                args,
+            } => {
+                // A capture answers a function-RHS alias directly; a
+                // named-RHS one joins the co-alias chain the signature
+                // face chases (`typedef B = A<int>` over
+                // `A<X> = X Function()`). No capture — a use before this
+                // file's declaration, a foreign head, or no alias at all —
+                // keeps the ordinary path (the under-report direction the
+                // pre-face verdicts already had).
+                let capture = self.bounds.alias_fn_shape(name).is_some()
+                    || self.bounds.alias_named_shape(name).is_some();
+                if !capture {
+                    return None;
+                }
+                if args == ArgListId::EMPTY {
+                    self.alias_fn_sig(name)
+                } else {
+                    self.instantiated_alias_sig(name, args)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// A use-site-instantiated parameterized function-type alias's shape
+    /// (`Pred2<String>` over `typedef Pred2<T> = bool Function(T)`): the
+    /// written right-hand shape with the alias's own type parameters
+    /// substituted by the written arguments — the instantiation the
+    /// written-shape face cannot carry (its leaves stay the parameter
+    /// names). `None` on an arity residue (the `wrong_number` family's
+    /// business), when the written capture failed, or when the head is no
+    /// function-RHS alias.
+    fn instantiated_alias_sig(&self, name: StringId, args: ArgListId) -> Option<Box<FnVarSig>> {
+        let params: Box<[StringId]> = match self.bounds.alias_fn_shape(name) {
+            Some((params, ..)) => params.iter().map(|(param, ..)| *param).collect(),
+            None => return None,
+        };
+        let written: Vec<Ty> = {
+            let pool = self.boundary.pool();
+            pool.get(args).to_vec()
+        };
+        if written.len() != params.len() {
+            return None;
+        }
+        let map: FxHashMap<StringId, Ty> = params
+            .iter()
+            .copied()
+            .zip(written)
+            .collect();
+        let sig = self.alias_fn_sig(name)?;
+        Some(Box::new(FnVarSig {
+            params: Box::default(),
+            positional: sig.positional.iter().map(|ty| self.subst_ty(*ty, &map)).collect(),
+            required_positional: sig.required_positional,
+            named: sig
+                .named
+                .iter()
+                .map(|(name, ty, required)| (*name, self.subst_ty(*ty, &map), *required))
+                .collect(),
+            return_ty: self.subst_ty(sig.return_ty, &map),
+        }))
+    }
+
+    /// Substitutes one alias instantiation map through a written type:
+    /// parameter leaves become their arguments (the written `?` joins the
+    /// argument's own nullability), named/function/record nodes rebuild
+    /// with substituted children — one re-intern each, the canonical
+    /// pools dedupe. A map miss passes through (a miss-spelled leaf is no
+    /// parameter of this alias). Pool reads scope before the re-intern
+    /// borrows (one `RefCell`, no overlap).
+    fn subst_ty(&self, ty: Ty, map: &FxHashMap<StringId, Ty>) -> Ty {
+        if let Ty::Named {
+            name,
+            nullable,
+            args: ArgListId::EMPTY,
+        } = ty
+            && let Some(replacement) = map.get(&name)
+        {
+            return Self::join_nullable(*replacement, nullable);
+        }
+        match ty {
+            Ty::Named { name, nullable, args } if args != ArgListId::EMPTY => {
+                let written: Vec<Ty> = {
+                    let pool = self.boundary.pool();
+                    pool.get(args).to_vec()
+                };
+                let substituted: Vec<Ty> =
+                    written.iter().map(|arg| self.subst_ty(*arg, map)).collect();
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .named(name, nullable, &substituted)
+            }
+            Ty::Function { shape, nullable } => {
+                let (type_params, return_ty, positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.function_shape(shape);
+                    (
+                        shape.type_params,
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                    )
+                };
+                let positional: Vec<Ty> =
+                    positional.iter().map(|ty| self.subst_ty(*ty, map)).collect();
+                let named: Vec<(StringId, Ty)> = named
+                    .iter()
+                    .map(|(name, ty)| (*name, self.subst_ty(*ty, map)))
+                    .collect();
+                self.boundary.args.borrow_mut().function(
+                    type_params,
+                    self.subst_ty(return_ty, map),
+                    &positional,
+                    &named,
+                    nullable,
+                )
+            }
+            Ty::Record { shape, nullable } => {
+                let (positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.record_shape(shape);
+                    (shape.positional.to_vec(), shape.named.to_vec())
+                };
+                let positional: Vec<Ty> =
+                    positional.iter().map(|ty| self.subst_ty(*ty, map)).collect();
+                let named: Vec<(StringId, Ty)> = named
+                    .iter()
+                    .map(|(name, ty)| (*name, self.subst_ty(*ty, map)))
+                    .collect();
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .record(&positional, &named, nullable)
+            }
+            other => other,
+        }
+    }
+
+    /// Joins a written `?` onto a type: the suffix face rides the named,
+    /// record, and function shapes; the top and sentinel types ignore it.
+    fn join_nullable(ty: Ty, nullable: bool) -> Ty {
+        if !nullable {
+            return ty;
+        }
+        match ty {
+            Ty::Named { name, args, .. } => Ty::Named {
+                name,
+                nullable: true,
+                args,
+            },
+            Ty::Record { shape, .. } => Ty::Record {
+                shape,
+                nullable: true,
+            },
+            Ty::Function { shape, .. } => Ty::Function {
+                shape,
+                nullable: true,
+            },
+            other => other,
+        }
     }
 
     /// The unsolved-formal head test: a named head that is neither a final
@@ -2714,7 +3035,7 @@ mod async_return_tests {
     use dartq_source::FileTable;
     use std::path::Path;
 
-    fn code_names(report: &FileReport) -> Vec<&'static str> {
+    pub(super) fn code_names(report: &FileReport) -> Vec<&'static str> {
         report
             .diagnostics
             .iter()
@@ -3014,5 +3335,202 @@ mod assignability_face_tests {
             "{:?}",
             report.diagnostics.iter().map(|d| (&d.code.name, &d.message)).collect::<Vec<_>>()
         );
+    }
+}
+
+/// The closure-return face's pins (`return_of_invalid_type_from_closure`):
+/// the literal's body return checks against the context return type the
+/// model carries — the declaration initializer's written function type and
+/// the enclosing executable's return position — and never leaks to a
+/// farther context. The rig is the async-return module's single-file
+/// pipeline; the fixture heads avoid core spellings (`String` walks as an
+/// SDK-degenerate head there, the supertype ask stays open) so the
+/// distinct-class rejection decides.
+#[cfg(test)]
+mod closure_return_tests {
+    use super::async_return_tests::{code_names, report};
+
+    /// `Str Function() f = () => DB();` reports at the literal's body: the
+    /// context is the initializer's written function type, the message the
+    /// closure template (diagnostic.g.dart:15314-15328).
+    #[test]
+    fn initializer_context_reports_the_closure_face() {
+        let report = report(
+            "class DB {}\nclass Str {}\nStr Function() f = () => DB();",
+        );
+        assert_eq!(code_names(&report), ["return_of_invalid_type_from_closure"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The returned type 'DB' isn't returnable from a 'Str' function, as required by the closure's context."
+        );
+    }
+
+    /// The block-bodied literal's own `return` checks through the same
+    /// initializer context.
+    #[test]
+    fn block_literal_statement_return_uses_the_same_context() {
+        let report = report(
+            "class DB {}\nclass Str {}\nStr Function() f = () { return DB(); };",
+        );
+        assert_eq!(code_names(&report), ["return_of_invalid_type_from_closure"]);
+    }
+
+    /// A fitting body stays silent: the subtype answer cleans the check.
+    #[test]
+    fn fitting_body_stays_silent() {
+        let report = report(
+            "class Str {}\nclass Sub extends Str {}\n\
+             Str Function() f = () => Sub();",
+        );
+        assert!(
+            code_names(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The return position, alias-spelled: the literal is the enclosing
+    /// executable's `return` expression, whose declared function-shaped
+    /// return is the context. The alias spelling is the live one — a
+    /// direct `Str Function()` return annotation latches shapeless (the
+    /// type-capture face opens no capture in an executable's return
+    /// position, so the pool shape stays empty and the context answer is
+    /// `dynamic`).
+    #[test]
+    fn enclosing_return_statement_position_reports() {
+        let report = report(
+            "class DB {}\nclass Str {}\n\
+             typedef F = Str Function();\n\
+             F h() {\n  return () => DB();\n}",
+        );
+        assert_eq!(code_names(&report), ["return_of_invalid_type_from_closure"]);
+    }
+
+    /// The direct function-typed return spelling under-reports: the
+    /// written shape never reaches the pool (`FnShapeId::EMPTY`), the
+    /// context answer degrades to `dynamic` and the verdict stays clean —
+    /// the oracle reports here; the recovery belongs to the type-capture
+    /// face (executable return positions open no capture), not this file.
+    #[test]
+    fn direct_function_typed_return_spelling_stays_silent() {
+        let report = report(
+            "class DB {}\nclass Str {}\n\
+             Str Function() h() {\n  return () => DB();\n}",
+        );
+        assert!(
+            code_names(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The leak control: a literal nested deeper in the body (an argument,
+    /// not the return expression) checks nothing — the oracle's context is
+    /// the argument formal's signature, which this layer does not carry,
+    /// and the enclosing declared return must never adjudicate it. The
+    /// final return-position literal stays clean. With the alias spelling
+    /// the enclosing context IS decidable, so a leaked mark equality would
+    /// misjudge the argument literal — the empty report proves the
+    /// channel's mark discipline.
+    #[test]
+    fn argument_position_literal_never_leaks_to_the_enclosing_return() {
+        let report = report(
+            "class DB {}\nclass Str {}\n\
+             typedef F = Str Function();\n\
+             F take(F f) => Str();\n\
+             F h() {\n  take(() => DB());\n  return () => Str();\n}",
+        );
+        assert!(
+            code_names(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A non-function context is no context: a literal initialized into a
+    /// plain named type stays silent (the ordinary matrix is the outer
+    /// check's business, and its Unknown literal row suppresses).
+    #[test]
+    fn non_function_context_stays_silent() {
+        let report = report(
+            "class DB {}\nclass Holder {}\nHolder h = () => DB();",
+        );
+        assert!(
+            code_names(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+}
+
+/// The instantiated function-type alias's pins (#2317①): a parameterized
+/// function-typed alias participates in subtyping as its aliased function
+/// shape — formal contravariance across the instantiation (`Pred2<String?>`
+/// into `Pred2<String>` fits), the return-mismatch control reports, and the
+/// non-alias same-head pair keeps the invariant argument rule.
+#[cfg(test)]
+mod alias_function_subtyping_tests {
+    use super::async_return_tests::{code_names, report};
+
+    /// The triage §4 repro (typeprobe 113), rig head: `Pred2<Cat?>` fits
+    /// `Pred2<Cat>` — the alias unfolds, the formal slot is contravariant
+    /// (`Cat <: Cat?`), the returns coincide. The fixture avoids core head
+    /// spellings (the rig rejects a redeclared core name as
+    /// `undefined_class`).
+    #[test]
+    fn instantiated_alias_contravariant_formals_fit() {
+        let report = report(
+            "class Cat {}\n\
+             typedef Pred2<T> = Cat Function(T);\n\
+             Cat pick(Cat c) => c;\n\
+             Pred2<Cat?> p = pick;\nPred2<Cat> q = p;",
+        );
+        assert!(
+            code_names(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// The identity instantiation stays silent (the same-name fast path's
+    /// old answer, now through the function rule).
+    #[test]
+    fn identical_instantiation_stays_silent() {
+        let report = report(
+            "class Cat {}\n\
+             typedef Pred2<T> = Cat Function(T);\n\
+             Cat pick(Cat c) => c;\n\
+             Pred2<Cat> p = pick;\nPred2<Cat> q = p;",
+        );
+        assert!(
+            code_names(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
+    }
+
+    /// A return-type mismatch across the instantiation reports — the
+    /// function rule's covariance leg decides negatively.
+    #[test]
+    fn return_mismatch_instantiation_reports() {
+        let report = report(
+            "class Cat {}\nclass Dog {}\n\
+             typedef Pick<T> = T Function();\n\
+             Pick<Cat> p = Cat();\nPick<Dog> q = p;",
+        );
+        assert_eq!(code_names(&report), ["invalid_assignment"]);
+    }
+
+    /// The regression control: a same-head non-alias instantiated pair
+    /// keeps the invariant covariant-argument rule (a `Box<Cat>` never
+    /// fits `Box<Dog>`).
+    #[test]
+    fn non_alias_same_head_pair_still_reports() {
+        let report = report(
+            "class Cat {}\nclass Dog {}\n\
+             class Box<T> { T item; }\n\
+             Box<Cat> bc = Box<Cat>();\nBox<Dog> bd = bc;",
+        );
+        assert_eq!(code_names(&report), ["invalid_assignment"]);
     }
 }
