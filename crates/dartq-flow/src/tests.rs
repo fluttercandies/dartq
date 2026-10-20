@@ -7498,6 +7498,7 @@ void f(int? a, int? b) {
             base: crate::ty::Base::Name(int_name),
             nullable: true,
         },
+        Vec::new(),
     );
     let mut parser = dartq_parser::Parser::new(source, tokens, features, &mut flow);
     parser.parse_unit();
@@ -7855,6 +7856,19 @@ fn analyze_with_staged_rhs(
     name: &str,
     nullable: bool,
 ) -> Vec<FlowFact> {
+    analyze_with_staged_rhs_args(source, target, name, nullable, &[]).1
+}
+
+/// [`analyze_with_staged_rhs`] with a written-argument tree on the staged
+/// face (#2364). Returns the flow too, so a pin can read the promotion
+/// row's argument arena.
+fn analyze_with_staged_rhs_args<'a>(
+    source: &'a str,
+    target: &str,
+    name: &str,
+    nullable: bool,
+    args: &[crate::ty::StagedArg],
+) -> (SharedFlow<'a>, Vec<FlowFact>) {
     let target_offset = source.find(target).unwrap() as u32;
     let result = dartq_scanner::scan(
         source,
@@ -7881,12 +7895,23 @@ fn analyze_with_staged_rhs(
                 base: crate::ty::Base::Name(id),
                 nullable,
             },
+            args.to_vec(),
         );
     }
     let mut parser = dartq_parser::Parser::new(source, tokens, features, &mut flow);
     parser.parse_unit();
     drop(parser);
-    flow.0.borrow_mut().take_facts()
+    let facts = flow.0.borrow_mut().take_facts();
+    (flow, facts)
+}
+
+/// A named one-level staged argument (`Issue` of `List<Issue>`).
+fn named_arg(lexeme: &str) -> crate::ty::StagedArg {
+    crate::ty::StagedArg::Named {
+        lexeme: lexeme.to_string(),
+        nullable: false,
+        args: Vec::new(),
+    }
 }
 
 /// The promoted-read face at `needle`'s last occurrence, when one stands.
@@ -8005,6 +8030,93 @@ fn if_null_invalid_rhs_keeps_the_receiver_unpromoted() {
         promoted_read_at_last(source, &facts, "n;").is_none(),
         "{facts:?}"
     );
+}
+
+// —— #2364: the staged RHS's written-argument tree ———————————————————————
+// Oracle-pinned at /tmp/probe2360 (gen.py, 2026-10-21): an arg-bearing
+// named RHS (`<Issue>[]`, `{}`, `<Und>[]`) leaves the receiver read after
+// the null-aware write silent — the write promotes through the resolved
+// face, its written arguments riding beside it. At HEAD the staging gate
+// dropped every arg-bearing tree, the write stayed unknown and the
+// receiver read over-reported the unchecked face.
+
+/// #2364 pin ① (`h_typed_listlit`): `issues ??= <Issue>[]` with the
+/// resolved `List<Issue>` RHS — the written-argument tree rides the staged
+/// face into the join, the write promotes, and the promotion row carries
+/// the staged `<Issue>` tree (the #1010 transport contract over the
+/// staging channel).
+#[test]
+fn if_null_staged_named_args_list_lit_promotes_the_receiver() {
+    let source = "void f(List<Issue>? issues) { issues ??= <Issue>[]; issues; }";
+    let (flow, facts) =
+        analyze_with_staged_rhs_args(source, "issues ??=", "List", false, &[named_arg("Issue")]);
+    let promoted =
+        promoted_read_at_last(source, &facts, "issues;").expect("promotion expected: {facts:?}");
+    assert!(!promoted.nullable, "{promoted:?}");
+    let flow = flow.0.borrow();
+    let trees: Vec<Vec<(String, u32)>> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::PromotedRead { span, args, .. }
+                if span.range.offset == source.rfind("issues;").unwrap() as u32 =>
+            {
+                Some(
+                    flow.type_args_at(*args)
+                        .iter()
+                        .map(|entry| {
+                            (
+                                flow.name_lexeme(match entry.base {
+                                    crate::ty::Base::Name(id) => id,
+                                    _ => panic!("staged trees spell named types"),
+                                })
+                                .to_string(),
+                                entry.args,
+                            )
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(trees.len(), 1, "{trees:?}");
+    assert_eq!(trees[0], vec![("Issue".to_string(), crate::ty::EMPTY_ARGS)]);
+}
+
+/// #2364 pin ② (`g_ctx_setlit`): `seen ??= {}` with the context-resolved
+/// `Set<int>` RHS — the same tree-bearing join, the receiver read stays
+/// promoted (the oracle reports nothing).
+#[test]
+fn if_null_staged_named_args_empty_braces_promote_the_receiver() {
+    let source = "void f(Set<int>? seen) { seen ??= {}; seen; }";
+    let (_, facts) =
+        analyze_with_staged_rhs_args(source, "seen ??=", "Set", false, &[named_arg("int")]);
+    let promoted =
+        promoted_read_at_last(source, &facts, "seen;").expect("promotion expected: {facts:?}");
+    assert!(!promoted.nullable, "{promoted:?}");
+}
+
+/// #2364 pin ③ (`i_undeclared_elem_listlit`): `issues ??= <Und>[]` — the
+/// element spelling resolves nowhere, so the oracle's literal type is
+/// `List<InvalidType>` whose element subtypes everything (subtype.dart
+/// :274): the write joins to the non-null `List` face and promotes (the
+/// oracle reports only the element's `non_type_as_type_argument`, never
+/// the receiver's unchecked face). The staged tree spells the element as
+/// the invalid face — `Base::Unknown` — whose entry admits the declared
+/// co-argument.
+#[test]
+fn if_null_staged_named_args_undeclared_element_promotes_the_receiver() {
+    let source = "void f(List<Issue>? issues) { issues ??= <Und>[]; issues; }";
+    let (_, facts) = analyze_with_staged_rhs_args(
+        source,
+        "issues ??=",
+        "List",
+        false,
+        &[crate::ty::StagedArg::Invalid],
+    );
+    let promoted =
+        promoted_read_at_last(source, &facts, "issues;").expect("promotion expected: {facts:?}");
+    assert!(!promoted.nullable, "{promoted:?}");
 }
 
 /// ③ `case final v?:` on a possibly-null matched value promotes the matched

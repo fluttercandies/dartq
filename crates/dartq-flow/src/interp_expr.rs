@@ -914,25 +914,28 @@ impl Interp<'_> {
                 // combination, #2360 — the oracle discriminates the null-aware
                 // write's downstream verdict on the resolved RHS type alone).
                 // The staged type is the resolution-level static type of the
-                // RHS; a bare local read's fold type is its flow type — the
-                // read's own promotion included. When the staged face is
-                // exactly the read's declared type while the fold already
-                // narrowed it (`a = b` with `b` promoted by an earlier
+                // RHS beside its written-argument tree (#2364); a bare local
+                // read's fold type is its flow type — the read's own
+                // promotion included. When the staged face is exactly the
+                // read's declared type while the fold already narrowed it
+                // (`a = b` with `b` promoted by an earlier
                 // `if (b == null) return;`), the promotion is the oracle's
                 // write type: keep it (the official read's static type IS the
                 // promoted one).
-                let staged_ty = if *plain || *if_null {
+                let staged = if *plain || *if_null {
                     target.read_span.and_then(|span| {
-                        let staged = *self.staged_rhs.get(&span.range.offset)?;
+                        let (staged_ty, staged_args) = *self.staged_rhs.get(&span.range.offset)?;
                         match rhs.reference.and_then(|var| self.vars.get(var as usize)) {
-                            Some(meta) if staged == meta.ty && rhs.ty != meta.ty => Some(rhs.ty),
-                            _ => Some(staged),
+                            Some(meta) if staged_ty == meta.ty && rhs.ty != meta.ty => {
+                                Some((rhs.ty, rhs_args))
+                            }
+                            _ => Some((staged_ty, staged_args)),
                         }
                     })
                 } else {
                     None
                 };
-                let rhs_ty = staged_ty.unwrap_or(rhs.ty);
+                let (rhs_ty, rhs_ty_args) = staged.unwrap_or((rhs.ty, rhs_args));
                 // A plain assignment's target identifier is the write, not
                 // a read: retract its facts. Both read facts can coexist at
                 // this span — the target read may run under an active
@@ -979,7 +982,7 @@ impl Interp<'_> {
                     // therefore never demotes what the read had
                     // promoted).
                     let (written, written_args) = if *plain {
-                        (rhs_ty, rhs_args)
+                        (rhs_ty, rhs_ty_args)
                     } else if *if_null {
                         // `LUB(NonNull(readType), rhsType)` — the boundary-
                         // aware non-null form first, then the name-level
@@ -988,7 +991,8 @@ impl Interp<'_> {
                         // An untyped RHS still leaves the lvalue non-null —
                         // `x ??= e` can never widen x back to nullable.
                         // The winning side's written arguments ride beside
-                        // the joined type (#2204 phase D). The staged face
+                        // the joined type (#2204 phase D, #2364 the staged
+                        // tree). The staged face
                         // rides the same join (#2360): a resolved nullable
                         // RHS (`Node?`) joins back to nullable — the
                         // receiver read after the write stays unpromoted,
@@ -1016,7 +1020,7 @@ impl Interp<'_> {
                         } else {
                             let joined = self.name_lub(lhs_nn, rhs_ty);
                             let joined_args = if joined == rhs_ty {
-                                rhs_args
+                                rhs_ty_args
                             } else {
                                 lhs_nn_args
                             };

@@ -2824,8 +2824,9 @@ mod tests {
     /// (`dead_code`) and the check reported a false constant-true
     /// `unnecessary_type_check`. The flow face burns through the
     /// signature-less guard; the check face splits because the formal's
-    /// captured shape and the body check's shapeless face
-    /// (`type_capture.rs` gates body captures out) key to different
+    /// captured shape and the body check's own captured shape (#2359 —
+    /// `type_capture.rs` composes body-position spellings into real
+    /// shapes instead of the shapeless sentinel) key to different
     /// sentinels.
     #[test]
     fn function_is_test_between_unrelated_signatures_stays_live() {

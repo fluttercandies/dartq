@@ -59,6 +59,29 @@ pub struct ArgTy {
     pub args: u32,
 }
 
+/// One node of a staged type's written-argument tree as spelled from
+/// outside the event stream (#2364). The recorder interns the tree into
+/// the same arena as the written ones ([`ArgTy`]), so the interpreter's
+/// id equality stays tree equality.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StagedArg {
+    /// A named spelling (`Issue`, the `List` of `List<List<int>>`).
+    Named {
+        lexeme: String,
+        nullable: bool,
+        /// The node's own written arguments.
+        args: Vec<StagedArg>,
+    },
+    /// `dynamic` — the top face, admitting every co-argument.
+    Dynamic,
+    /// The invalid face ([`Base::Unknown`]) — a spelling that resolves
+    /// nowhere (`Und` of `<Und>[]`), the oracle's `InvalidType` stand-in
+    /// (`InvalidType <: X` for every `X`, subtype.dart:274, so a
+    /// `List<Invalid>` RHS keeps the write promotable — probe2360 case
+    /// `i` reports only the element's `non_type_as_type_argument`).
+    Invalid,
+}
+
 impl Ty {
     pub const UNKNOWN: Ty = Ty {
         base: Base::Unknown,

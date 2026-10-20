@@ -736,10 +736,11 @@ pub(crate) struct Interp<'o> {
     /// unknown. Read-only for the replay.
     pub(crate) inferred_locals: &'o FxHashMap<u32, crate::ty::Ty>,
     /// The staged assignment RHS types the semantic layer resolved for this
-    /// unit (#2174), keyed on the write target token's offset — adopted at
-    /// `Ev::Assign` when the fold's own RHS read is the unknown face.
-    /// Read-only for the replay.
-    pub(crate) staged_rhs: &'o FxHashMap<u32, crate::ty::Ty>,
+    /// unit (#2174), beside their written-argument arena index (#2364),
+    /// keyed on the write target token's offset — adopted at `Ev::Assign`
+    /// when the fold's own RHS read is the unknown face. Read-only for the
+    /// replay.
+    pub(crate) staged_rhs: &'o FxHashMap<u32, (crate::ty::Ty, u32)>,
     /// `this`-read types keyed on the `this` token's offset: the semantic
     /// layer resolves a `this` read its event stream leaves unknown — an
     /// extension or extension-type instance member's extended type — and
@@ -909,7 +910,7 @@ static NO_INFERRED_LOCALS: std::sync::LazyLock<FxHashMap<u32, crate::ty::Ty>> =
 /// The direct-construction default for [`Interp::staged_rhs`]: no staged
 /// assignment RHS types — every plain `=` write keeps the fold's own RHS
 /// read (the pre-#2174 behavior).
-static NO_STAGED_RHS: std::sync::LazyLock<FxHashMap<u32, crate::ty::Ty>> =
+static NO_STAGED_RHS: std::sync::LazyLock<FxHashMap<u32, (crate::ty::Ty, u32)>> =
     std::sync::LazyLock::new(FxHashMap::default);
 
 /// The direct-construction default for [`Interp::staged_this`]: no staged

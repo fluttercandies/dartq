@@ -70,15 +70,18 @@ pub struct Flow<'t> {
     /// annotated ones. Entries whose executable never replays are inert
     /// (bounded by the unit's declarator count).
     inferred_locals: FxHashMap<u32, crate::ty::Ty>,
-    /// Assignment right-hand-side types keyed on the write target token's
-    /// offset: the semantic layer resolves a plain assignment's RHS shape
-    /// its own rows carry (an SDK static's declared return — `RangeError
+    /// Assignment right-hand-side types beside their written-argument
+    /// arena index, keyed on the write target token's offset: the
+    /// semantic layer resolves an assignment's RHS shape its own rows
+    /// carry (an SDK static's declared return — `RangeError
     /// .checkValidRange` — is invisible to the name-level flow walk, whose
-    /// RHS reads `Unknown`), and stages it here before the assignment's
-    /// fold runs. The fold adopts it when its own answer is the unknown
-    /// face; a resolved RHS keeps its own type. Entries whose assignment
-    /// never folds are inert (bounded by the unit's write count).
-    staged_rhs: FxHashMap<u32, crate::ty::Ty>,
+    /// RHS reads `Unknown`; an argument-bearing literal — `<Issue>[]` —
+    /// spells a tree the bare `Ty` cannot carry, #2364), and stages it
+    /// here before the assignment's fold runs. The fold adopts it when
+    /// its own answer is the unknown face; a resolved RHS keeps its own
+    /// type. Entries whose assignment never folds are inert (bounded by
+    /// the unit's write count).
+    staged_rhs: FxHashMap<u32, (crate::ty::Ty, u32)>,
     /// `this`-read types keyed on the `this` token's offset (#2292): the
     /// semantic layer's resolved extended type for a `this` read inside an
     /// extension/extension-type member, staged before the executable's
@@ -309,6 +312,42 @@ impl<'t> Flow<'t> {
         let id = self.type_args.len() as u32;
         self.type_args.push(entries);
         id
+    }
+
+    /// Interns a staged written-argument tree (#2364) into the same arena
+    /// as the written ones: a named spelling's lexeme joins the lexeme
+    /// table (`Base::Name`), `dynamic`/invalid spell their special bases —
+    /// equal trees share one entry.
+    fn intern_staged_args(&mut self, args: &[crate::ty::StagedArg]) -> u32 {
+        use crate::ty::StagedArg;
+        if args.is_empty() {
+            return crate::ty::EMPTY_ARGS;
+        }
+        let entries = args
+            .iter()
+            .map(|arg| match arg {
+                StagedArg::Named {
+                    lexeme,
+                    nullable,
+                    args,
+                } => crate::ty::ArgTy {
+                    base: crate::ty::Base::Name(self.intern_lexeme(lexeme)),
+                    nullable: *nullable,
+                    args: self.intern_staged_args(args),
+                },
+                StagedArg::Dynamic => crate::ty::ArgTy {
+                    base: crate::ty::Base::Dynamic,
+                    nullable: false,
+                    args: crate::ty::EMPTY_ARGS,
+                },
+                StagedArg::Invalid => crate::ty::ArgTy {
+                    base: crate::ty::Base::Unknown,
+                    nullable: false,
+                    args: crate::ty::EMPTY_ARGS,
+                },
+            })
+            .collect();
+        self.intern_args(entries)
     }
 
     /// Interns a name token's lexeme to a dense id. Synthetic tokens
@@ -619,14 +658,21 @@ impl<'t> Flow<'t> {
         self.inferred_locals.insert(decl_offset, ty);
     }
 
-    /// Stages one assignment's right-hand-side type (#2174): the semantic
-    /// layer's resolved RHS static type for a plain `=` write, keyed on the
-    /// write target token's offset. The fold adopts it at `Ev::Assign` when
-    /// its own RHS read is the unknown face; shapes the flow lattice cannot
-    /// spell never arrive (the stager drops them, the unknown-written
-    /// demotion stands).
-    pub fn stage_assignment_rhs(&mut self, target_offset: u32, ty: crate::ty::Ty) {
-        self.staged_rhs.insert(target_offset, ty);
+    /// Stages one assignment's right-hand-side type beside its written
+    /// argument tree (#2174 plain `=`, #2360 `??=`, #2364 the tree): the
+    /// semantic layer's resolved RHS static type for a spellable write,
+    /// keyed on the write target token's offset. The fold adopts it at
+    /// `Ev::Assign` when its own RHS read is the unknown face; shapes the
+    /// flow lattice cannot spell never arrive (the stager drops them, the
+    /// unknown-written demotion stands).
+    pub fn stage_assignment_rhs(
+        &mut self,
+        target_offset: u32,
+        ty: crate::ty::Ty,
+        args: Vec<crate::ty::StagedArg>,
+    ) {
+        let args = self.intern_staged_args(&args);
+        self.staged_rhs.insert(target_offset, (ty, args));
     }
 
     /// Stages one `this` read's static type (#2292): the semantic layer's

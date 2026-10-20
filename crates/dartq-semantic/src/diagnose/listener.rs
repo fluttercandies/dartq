@@ -2977,11 +2977,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // `=` and the `??=` if-null combination (#2360 — the oracle's
         // downstream verdict on a null-aware write discriminates on the
         // resolved RHS type alone); the compound operators' read-modify-write
-        // face keeps the unknown written type. Single-row window, EMPTY-args
-        // named shapes only (the flow lattice cannot spell wider shapes; the
-        // unknown-written demotion stands). The staging precedes the flow
+        // face keeps the unknown written type. Single-row window; a named
+        // shape rides its written-argument tree (#2364 — the flow lattice
+        // interns it beside the type, `<Issue>[]` spells `List<Issue>`), a
+        // tree any non-named entry cannot spell drops (the unknown-written
+        // demotion stands). The staging precedes the flow
         // forward: the fold inside the call adopts the staged type.
-        let staged = || -> Option<(u32, String, bool)> {
+        let staged = || -> Option<(u32, String, bool, Vec<dartq_flow::ty::StagedArg>)> {
             let engine = &mut self.engine;
             let text = engine.text_of(operator)?;
             // The token text is exact: a `??` binary expression is never
@@ -3028,7 +3030,7 @@ impl ParserListener for DiagnoseListener<'_> {
             if let Ty::Named {
                 name,
                 nullable,
-                args: ArgListId::EMPTY,
+                args,
             } = from_ty
             {
                 // The inference feed: the write target's name keys the
@@ -3047,16 +3049,23 @@ impl ParserListener for DiagnoseListener<'_> {
                         ),
                     );
                 }
+                // The flow face: the head's lexeme plus the written-argument
+                // tree. A tree with a non-named entry (an invalid or dynamic
+                // spelling) cannot stage faithfully — `None` keeps the
+                // unknown-written demotion, the oracle's no-promotion face
+                // for an invalid written type.
+                let tree = staged_arg_tree(&engine.boundary.args.borrow(), &engine.strings, args)?;
                 Some((
                     engine.rows[target].range.offset,
                     engine.strings.resolve(name).to_string(),
                     nullable,
+                    tree,
                 ))
             } else {
                 None
             }
         }();
-        if let Some((offset, lexeme, nullable)) = staged {
+        if let Some((offset, lexeme, nullable, tree)) = staged {
             let base = self.flow().intern_name(&lexeme);
             self.flow().stage_assignment_rhs(
                 offset,
@@ -3064,6 +3073,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     base: FlowBase::Name(base),
                     nullable,
                 },
+                tree,
             );
         }
         self.flow().handle_assignment_expression(operator, end);
@@ -7636,6 +7646,37 @@ fn typed_group_head(engine: &Engine<'_>, left: Token) -> Option<usize> {
             _ => {}
         }
     }
+}
+
+/// The written-argument tree a staged assignment RHS type carries (#2364):
+/// a named entry spells its lexeme, nullability, and its own nested tree;
+/// `dynamic` and the not-a-type face (`Ty::Unknown` — an unresolved
+/// spelling, the oracle's `InvalidType` element) spell their special
+/// faces. Any other entry (a record or function shape) cannot stage
+/// faithfully, so the whole tree drops — the unknown-written demotion
+/// stands, the conservative face for an unspellable tree.
+fn staged_arg_tree(
+    pool: &ArgPool,
+    strings: &StringTable,
+    args: ArgListId,
+) -> Option<Vec<dartq_flow::ty::StagedArg>> {
+    pool.get(args)
+        .iter()
+        .map(|ty| match *ty {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => Some(dartq_flow::ty::StagedArg::Named {
+                lexeme: strings.resolve(name).to_string(),
+                nullable,
+                args: staged_arg_tree(pool, strings, args)?,
+            }),
+            Ty::Dynamic => Some(dartq_flow::ty::StagedArg::Dynamic),
+            Ty::Unknown => Some(dartq_flow::ty::StagedArg::Invalid),
+            _ => None,
+        })
+        .collect()
 }
 
 impl Engine<'_> {
