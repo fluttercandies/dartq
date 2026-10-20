@@ -45,6 +45,7 @@
 
 use dartq_source::{SourceRange, StringId, StringTable};
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 
 /// The M1 static type: the nullability dimension plus a name — the minimal
@@ -133,6 +134,9 @@ impl Ty {
     /// Renders the type in the official display form (`List<int>?`): the
     /// head name, the explicit arguments `, `-joined, then the `?`
     /// projection (the analyzer's `getDisplayName`, type.dart:1425-1467).
+    /// Record fields and named formals display in name-byte order — a
+    /// deterministic total order over the interned texts, never the pool's
+    /// intern-arrival [`StringId`] order (see [`display_named`]).
     /// [`Ty::Unknown`] renders empty — the diagnoser's message slots for
     /// unknown declared types.
     #[must_use]
@@ -163,7 +167,9 @@ impl Ty {
                         text.push_str(", ");
                     }
                     text.push('{');
-                    for (index, (name, ty)) in shape.named.iter().enumerate() {
+                    for (index, (name, ty)) in
+                        display_named(&shape.named, strings).iter().enumerate()
+                    {
                         if index > 0 {
                             text.push_str(", ");
                         }
@@ -202,7 +208,9 @@ impl Ty {
                         text.push_str(", ");
                     }
                     text.push('{');
-                    for (index, (name, ty)) in shape.named.iter().enumerate() {
+                    for (index, (name, ty)) in
+                        display_named(&shape.named, strings).iter().enumerate()
+                    {
                         if index > 0 {
                             text.push_str(", ");
                         }
@@ -251,6 +259,32 @@ fn render_record_field(ty: Ty, strings: &StringTable, args: &ArgPool) -> String 
     match ty {
         Ty::Unknown => "InvalidType".to_string(),
         _ => ty.render(strings, args),
+    }
+}
+
+/// The named pairs in display order: byte order over the interned texts.
+///
+/// The pool stores the pairs sorted by [`StringId`] — intern-arrival order,
+/// because the string table is shared across the parallel fan-out, so which
+/// worker interned a name first decides the ids. Sorting on the ids at
+/// intern therefore buys within-run canonicality (equal name sets share one
+/// slot) but not across-run stability: the same shape renders differently
+/// between runs. The display derives its own total order from the texts —
+/// the only scheduling-independent key — and borrows the slice untouched
+/// when it is already in that order.
+fn display_named<'a>(
+    named: &'a [(StringId, Ty)],
+    strings: &StringTable,
+) -> Cow<'a, [(StringId, Ty)]> {
+    if named
+        .windows(2)
+        .all(|pair| strings.resolve(pair[0].0) <= strings.resolve(pair[1].0))
+    {
+        Cow::Borrowed(named)
+    } else {
+        let mut sorted = named.to_vec();
+        sorted.sort_by(|a, b| strings.resolve(a.0).cmp(strings.resolve(b.0)));
+        Cow::Owned(sorted)
     }
 }
 
@@ -2185,6 +2219,102 @@ mod tests {
             collected.get(&fix.strings.intern("map")),
             Some(&0),
             "duplicate keeps the first"
+        );
+    }
+
+    /// Record fields display in name-byte order regardless of which table
+    /// minted which id first: the shared fan-out string table deals ids in
+    /// intern-arrival order, so the stored pairs' order varies between runs
+    /// and must never reach the output. Two tables interning the same three
+    /// names in opposite orders — the stored pairs land fully reversed —
+    /// render one identical string.
+    #[test]
+    fn record_display_order_is_independent_of_intern_arrival() {
+        let reverse = StringTable::new();
+        let (c, b, a) = (reverse.intern("c"), reverse.intern("b"), reverse.intern("a"));
+        let forward = StringTable::new();
+        let (a2, b2, c2) = (forward.intern("a"), forward.intern("b"), forward.intern("c"));
+        let (int_r, int_f) = (reverse.intern("int"), forward.intern("int"));
+
+        let mut pool_r = ArgPool::default();
+        let mut pool_f = ArgPool::default();
+        let ty_r = pool_r.record(
+            &[],
+            &[(b, Ty::named(int_r)), (a, Ty::named(int_r)), (c, Ty::named(int_r))],
+            false,
+        );
+        let ty_f = pool_f.record(
+            &[],
+            &[(b2, Ty::named(int_f)), (a2, Ty::named(int_f)), (c2, Ty::named(int_f))],
+            false,
+        );
+        assert_eq!(ty_r.render(&reverse, &pool_r), "({int a, int b, int c})");
+        assert_eq!(ty_f.render(&forward, &pool_f), "({int a, int b, int c})");
+        assert_eq!(
+            ty_r.render(&reverse, &pool_r),
+            ty_f.render(&forward, &pool_f),
+            "arrival order must not decide the rendering"
+        );
+    }
+
+    /// The display sorts against the stored order even inside one table:
+    /// `b` interned before `a` puts the pairs in id order `(b, a)`, and the
+    /// rendering still shows the texts' order. Re-interning the same name
+    /// set in the other written order shares the slot — the canonical-intern
+    /// contract is a name-set identity, untouched by the display order.
+    #[test]
+    fn record_display_sorts_names_against_intern_order() {
+        let strings = StringTable::new();
+        let b = strings.intern("b");
+        let a = strings.intern("a");
+        let int = strings.intern("int");
+        let mut pool = ArgPool::default();
+        let ty = pool.record(&[], &[(a, Ty::named(int)), (b, Ty::named(int))], false);
+        assert_eq!(ty.render(&strings, &pool), "({int a, int b})");
+        let twin = pool.record(&[], &[(b, Ty::named(int)), (a, Ty::named(int))], false);
+        assert_eq!(ty, twin, "written order does not change the shape's identity");
+        assert_eq!(twin.render(&strings, &pool), "({int a, int b})");
+    }
+
+    /// Named formals display in name-byte order under the same
+    /// arrival-independence contract as record fields: `T Function({int b,
+    /// int a})` renders identically whichever table minted the ids.
+    #[test]
+    fn function_display_order_is_independent_of_intern_arrival() {
+        let reverse = StringTable::new();
+        let (b, a) = (reverse.intern("b"), reverse.intern("a"));
+        let forward = StringTable::new();
+        let (a2, b2) = (forward.intern("a"), forward.intern("b"));
+        let (int_r, int_f) = (reverse.intern("int"), forward.intern("int"));
+
+        let mut pool_r = ArgPool::default();
+        let mut pool_f = ArgPool::default();
+        let ty_r = pool_r.function(
+            0,
+            Ty::named(int_r),
+            &[],
+            &[(b, Ty::named(int_r)), (a, Ty::named(int_r))],
+            false,
+        );
+        let ty_f = pool_f.function(
+            0,
+            Ty::named(int_f),
+            &[],
+            &[(b2, Ty::named(int_f)), (a2, Ty::named(int_f))],
+            false,
+        );
+        assert_eq!(
+            ty_r.render(&reverse, &pool_r),
+            "int Function({int a, int b})"
+        );
+        assert_eq!(
+            ty_f.render(&forward, &pool_f),
+            "int Function({int a, int b})"
+        );
+        assert_eq!(
+            ty_r.render(&reverse, &pool_r),
+            ty_f.render(&forward, &pool_f),
+            "arrival order must not decide the rendering"
         );
     }
 }
