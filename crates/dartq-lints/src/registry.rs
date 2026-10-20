@@ -487,21 +487,87 @@ pub static RULES: LazyLock<Vec<&'static RuleSpec>> = LazyLock::new(|| {
     // The open batch: name order across the domain slices (the wave-order
     // contract the pin test judges).
     rules[base..].sort_unstable_by_key(|spec| spec.name);
-    // The sort above (and `rule_by_name`'s first-match position lookup) is
-    // well-defined only under unique names — a duplicate would leave the
-    // tail order to pdqsort internals. Debug-only, one-time init: a
-    // duplicate surfaces at build time instead of as a silent reorder (the
-    // wave-order pin `rule_names_are_unique` holds the invariant in tests).
-    debug_assert!(
-        {
-            let mut names: Vec<&str> = rules.iter().map(|spec| spec.name).collect();
-            names.sort_unstable();
-            names.windows(2).all(|pair| pair[0] != pair[1])
-        },
-        "duplicate registered rule name"
-    );
+    // The startup consistency check: the sort above (and `rule_by_name`'s
+    // first-match position lookup) is well-defined only under unique names,
+    // and every name-keyed wiring table below must resolve against the
+    // merged registry. Runs in release too — a drifted gate or mount name
+    // is a wrong-but-silent run, which fails loudly here (the audit's
+    // registry-wiring class) instead of at a distant first query.
+    assert_startup_consistency(&rules);
     rules
 });
+
+/// The one-time registry startup check (runs at [`RULES`] init, the first
+/// registry touch of any process): duplicate machine names break the name
+/// order and `rule_by_name`'s first-match lookup, and every name-keyed
+/// wiring table — [`SEMANTIC_RULES`], [`VERSION_GATES`],
+/// [`INCOMPATIBLE_RULES`] (keys and peers), [`PUBSPEC_PASS_SEAM`],
+/// [`RUN_EPILOGUE_SEAM`], [`LATE_JOIN_RULES`] — must resolve against the
+/// registry, case-insensitively like [`rule_by_name`]. A miss fails fast
+/// here with the offenders named, instead of surfacing as a silent no-op
+/// (a skipped version gate, a shrunk semantic mount, an empty incompatible
+/// set). Takes the merged slice rather than calling [`rules()`]: this runs
+/// inside the [`RULES`] initializer, and re-entry would deadlock.
+fn assert_startup_consistency(rules: &[&'static RuleSpec]) {
+    let mut sorted: Vec<&str> = rules.iter().map(|spec| spec.name).collect();
+    sorted.sort_unstable();
+    let duplicates: Vec<&str> = sorted
+        .windows(2)
+        .filter_map(|pair| (pair[0] == pair[1]).then_some(pair[0]))
+        .collect();
+
+    fn unresolved<'a>(
+        rules: &'a [&'static RuleSpec],
+        names: impl Iterator<Item = &'static str>,
+    ) -> Vec<&'static str> {
+        names
+            .filter(|name| !rules.iter().any(|spec| spec.name.eq_ignore_ascii_case(name)))
+            .collect()
+    }
+
+    let mut drift: Vec<String> = Vec::new();
+    if !duplicates.is_empty() {
+        drift.push(format!("duplicate rule names {duplicates:?}"));
+    }
+    let semantic = unresolved(rules, SEMANTIC_RULES.iter().copied());
+    if !semantic.is_empty() {
+        drift.push(format!("SEMANTIC_RULES unregistered names {semantic:?}"));
+    }
+    let gated = unresolved(rules, VERSION_GATES.iter().map(|(name, _)| *name));
+    if !gated.is_empty() {
+        drift.push(format!("VERSION_GATES unregistered names {gated:?}"));
+    }
+    let incompatible_keys = unresolved(rules, INCOMPATIBLE_RULES.iter().map(|(name, _)| *name));
+    if !incompatible_keys.is_empty() {
+        drift.push(format!("INCOMPATIBLE_RULES unregistered keys {incompatible_keys:?}"));
+    }
+    let incompatible_peers =
+        unresolved(rules, INCOMPATIBLE_RULES.iter().flat_map(|(_, peers)| peers.iter().copied()));
+    if !incompatible_peers.is_empty() {
+        drift.push(format!(
+            "INCOMPATIBLE_RULES unregistered peer names {incompatible_peers:?}"
+        ));
+    }
+    let pubspec_seam = unresolved(rules, PUBSPEC_PASS_SEAM.iter().copied());
+    if !pubspec_seam.is_empty() {
+        drift.push(format!("PUBSPEC_PASS_SEAM unregistered names {pubspec_seam:?}"));
+    }
+    let epilogue_seam = unresolved(rules, RUN_EPILOGUE_SEAM.iter().copied());
+    if !epilogue_seam.is_empty() {
+        drift.push(format!("RUN_EPILOGUE_SEAM unregistered names {epilogue_seam:?}"));
+    }
+    let late_join = unresolved(rules, LATE_JOIN_RULES.iter().copied());
+    if !late_join.is_empty() {
+        drift.push(format!("LATE_JOIN_RULES unregistered names {late_join:?}"));
+    }
+
+    assert!(
+        drift.is_empty(),
+        "lint registry wiring drift — fix the named tables in this file \
+         (or register the named rules) before shipping:\n  {}",
+        drift.join("\n  ")
+    );
+}
 
 /// All registered rules in registry order — the registry's read face
 /// ([`RuleId`] indexes this slice; the machine name is the cross-process
@@ -876,18 +942,12 @@ pub static SEMANTIC_RULES: &[&str] = &[
 
 /// The fold-consumer set resolved from [`SEMANTIC_RULES`]: the word-AND
 /// target behind [`mounts_semantics`]. Built once — the names are
-/// compile-time constants, the positions registry-derived.
+/// compile-time constants, the positions registry-derived. Name drift is
+/// impossible past [`assert_startup_consistency`] (which holds every
+/// [`SEMANTIC_RULES`] name against the registry, in release too, at the
+/// earlier [`RULES`] init this lock depends on).
 static SEMANTIC_SET: LazyLock<EnableSet> = LazyLock::new(|| {
-    let (set, unknown) = EnableSet::resolve(SEMANTIC_RULES.iter().copied());
-    // A name drifted out of the registry is a build-invariant break — the
-    // table above enumerates registered rules only (the pin test holds the
-    // membership); surface it loudly instead of silently shrinking the
-    // mount set.
-    debug_assert!(
-        unknown.is_empty(),
-        "SEMANTIC_RULES names unregistered rules: {unknown:?}"
-    );
-    set
+    EnableSet::resolve(SEMANTIC_RULES.iter().copied()).0
 });
 
 /// Whether `set` enables any fold-consuming rule — the predicate behind the

@@ -770,9 +770,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         let before_group = if is_bang {
             self.peek_id()
         } else {
-            self.cursor
-                .last_consumed_id()
-                .expect("the block only runs after a parsed operand")
+            // The block only runs after a parsed operand, so the cursor has
+            // always consumed — a `None` here means a rejected speculative
+            // parse left the cursor at the group head. Degrade to the peek
+            // id (the group's own head) instead of panicking: the follower
+            // probe reads a neighboring token and the parse stays forward.
+            self.cursor.last_consumed_id().unwrap_or_else(|| self.peek_id())
         };
         // `computeMethodTypeArguments` (type_info.dart:485-491) keeps the
         // group only while the scan never recovered: a recovered scan is a

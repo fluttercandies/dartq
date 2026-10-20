@@ -514,8 +514,14 @@ pub(crate) mod path_dependencies {
                     return (abs..abs + i + 1, value, true);
                 }
                 _ => {
-                    // Multi-byte UTF-8: copy the whole char.
-                    let ch = trimmed[i..].chars().next().expect("char boundary");
+                    // Multi-byte UTF-8: copy the whole char. `i` is a char
+                    // boundary by construction (every advance consumes a
+                    // whole char or an ASCII escape/quote pair), so a
+                    // `get` miss is a program bug — fail closed like the
+                    // unhandled-escape arm instead of panicking.
+                    let Some(ch) = trimmed.get(i..).and_then(|s| s.chars().next()) else {
+                        return (abs..abs, String::new(), true);
+                    };
                     value.push(ch);
                     i += ch.len_utf8();
                 }

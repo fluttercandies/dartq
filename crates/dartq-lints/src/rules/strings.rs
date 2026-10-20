@@ -242,8 +242,14 @@ pub(crate) mod unnecessary_string_escapes {
         if bytes.len() <= leading + trailing {
             return;
         }
-        let contents = core::str::from_utf8(&bytes[leading..bytes.len() - trailing])
-            .expect("contents of a valid lexeme");
+        // A scanner lexeme is always UTF-8, so a decode failure is a
+        // program bug — degrade to the official empty-contents face (no
+        // candidates, `visitLexeme` :44-91) instead of panicking.
+        let Some(contents) =
+            core::str::from_utf8(&bytes[leading..bytes.len() - trailing]).ok()
+        else {
+            return;
+        };
         let contents_end = bytes.len() - trailing; // lexeme-local
         let Some(token) = c.token(segment as u32) else {
             return;
@@ -281,12 +287,24 @@ pub(crate) mod unnecessary_string_escapes {
             // `char_indices` for-loop would re-read the second backslash.
             let mut rel = 0;
             while rel < contents.len() {
-                let mut current = contents[rel..].chars().next().expect("char boundary");
+                // `rel` advances by whole chars from a char boundary, so a
+                // `get` miss is a program bug — end the walk instead of
+                // panicking on user string content.
+                let Some(rest) = contents.get(rel..) else {
+                    break;
+                };
+                let Some(mut current) = rest.chars().next() else {
+                    break;
+                };
                 let mut escaped = false;
                 if current == '\\' && rel + 1 < contents.len() {
                     escaped = true;
                     rel += current.len_utf8();
-                    current = contents[rel..].chars().next().expect("checked above");
+                    let Some(escaped_char) = contents.get(rel..).and_then(|r| r.chars().next())
+                    else {
+                        break;
+                    };
+                    current = escaped_char;
                     if (is_single && current == '"')
                         || (!is_single && current == '\'')
                         || !ALLOWED_ESCAPED_CHARS.contains(&current)
@@ -1460,7 +1478,9 @@ fn segments_contain_quote(c: &Check<'_>, extent: &core::ops::Range<u32>, quote: 
     let Some(&first) = segments.first() else {
         return false;
     };
-    let last = *segments.last().expect("first checked above");
+    let Some(&last) = segments.last() else {
+        return false;
+    };
     segments.iter().any(|&t| {
         let lexeme = c.lexeme(t);
         let text = if t == first {

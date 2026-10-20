@@ -576,6 +576,17 @@ pub struct ArgPool {
     function_at: FxHashMap<u64, Vec<u32>>,
 }
 
+/// Saturating `usize` → `u32` conversion for the intern-pool slot caps
+/// (the stability audit's pool-cap class): the pools address slots by
+/// `u32` ([`ArgListId`], [`RecordShapeId`], [`FnShapeId`]), and a pool
+/// cannot grow past `u32::MAX` entries before RSS exhaustion (every entry
+/// costs at least one heap allocation), so saturation replaces a
+/// provably unreachable panic with a defined value.
+#[must_use]
+fn saturate_slot_u32(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
 impl Default for ArgPool {
     fn default() -> Self {
         Self {
@@ -626,7 +637,7 @@ impl ArgPool {
                 }
             }
         }
-        let slot = u32::try_from(self.lists.len()).expect("argument pool exceeds u32::MAX");
+        let slot = saturate_slot_u32(self.lists.len());
         self.lists.push(Box::from(args));
         self.at.entry(hash).or_default().push(slot);
         ArgListId(slot)
@@ -681,7 +692,7 @@ impl ArgPool {
                 }
             }
         }
-        let slot = u32::try_from(self.records.len()).expect("record pool exceeds u32::MAX");
+        let slot = saturate_slot_u32(self.records.len());
         self.records.push(RecordShape {
             positional: Box::from(positional),
             named: Box::from(named),
@@ -753,7 +764,7 @@ impl ArgPool {
                 }
             }
         }
-        let slot = u32::try_from(self.functions.len()).expect("function pool exceeds u32::MAX");
+        let slot = saturate_slot_u32(self.functions.len());
         self.functions.push(FnShape {
             type_params,
             return_ty,
@@ -1770,6 +1781,17 @@ mod tests {
         fn render(&self, ty: Ty) -> String {
             ty.render(&self.strings, &self.pool)
         }
+    }
+
+    /// The pool-cap saturation contract: pass-through below the cap,
+    /// identity at the cap, saturation past it.
+    #[test]
+    fn slot_saturation_passes_lengths_through_and_saturates_past_u32_max() {
+        assert_eq!(saturate_slot_u32(0), 0);
+        assert_eq!(saturate_slot_u32(1234), 1234);
+        assert_eq!(saturate_slot_u32(u32::MAX as usize), u32::MAX);
+        assert_eq!(saturate_slot_u32(u32::MAX as usize + 1), u32::MAX);
+        assert_eq!(saturate_slot_u32(usize::MAX), u32::MAX);
     }
 
     /// Argument-less construction never touches the pool, and the
