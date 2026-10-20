@@ -71,8 +71,13 @@
 //! - The caller must [`declare`](LibraryGraphBuilder::declare) every
 //!   library whose public face should contribute names; a node registered
 //!   only as an edge target exports nothing.
-//! - A file belongs to exactly one library, so an export entry is identified
-//!   by its declaring file alone (the name is the map key).
+//! - A file's owning library is first-wins, not exclusive: the part graph can
+//!   double-register a file (another library's part and its own library's
+//!   defining unit at once), and the earliest-registered library answers
+//!   [`LibraryGraph::library_of_file`] — registration order is the caller's
+//!   deterministic fold, so the answer is a total function of the input.
+//! - An export entry is identified by its declaring file alone (the name is
+//!   the map key).
 //! - The graph is sized entirely by its input (libraries × names × edges);
 //!   nothing grows after [`LibraryGraphBuilder::finish`].
 
@@ -800,9 +805,10 @@ impl<'t> LibraryGraphBuilder<'t> {
         // first-wins contract.
         let mut declarations: FxHashMap<StringId, Vec<LibraryId>> = FxHashMap::default();
         // The unit → owning-library reverse map
-        // ([`LibraryGraph::library_of_file`]): one entry per registered
-        // unit — bounded by the input, built once here so a query is one
-        // hash hit instead of a scan over every library's `unit_files`.
+        // ([`LibraryGraph::library_of_file`]): one entry per distinct
+        // registered file — bounded by the input, built once here so a
+        // query is one hash hit instead of a scan over every library's
+        // `unit_files`.
         let mut file_lib: FxHashMap<FileId, LibraryId> = FxHashMap::with_capacity_and_hasher(
             nodes.iter().map(|node| node.units.len()).sum(),
             FxBuildHasher,
@@ -831,9 +837,14 @@ impl<'t> LibraryGraphBuilder<'t> {
                 for &name in classes.keys() {
                     declarations.entry(name).or_default().push(lib);
                 }
-                // A file belongs to exactly one library (the module
-                // contract), so every entry is fresh; first-wins keeps the
-                // declared duplicate posture should a caller fold twice.
+                // Membership is first-wins, not exclusive: the part graph
+                // can double-register a file (another library's part and
+                // its own library's defining unit at once — the part file
+                // also imported by name shape). Nodes are visited in
+                // registration (intern) order, so the earliest-registered
+                // library keeps the file; that order is the caller's
+                // deterministic fold, making the answer a total function
+                // of the input.
                 for &file in &node.units {
                     file_lib.entry(file).or_insert(lib);
                 }
@@ -978,7 +989,9 @@ pub struct LibraryGraph {
     /// registration order ([`LibraryGraph::declaring_libraries`]).
     declarations: FxHashMap<StringId, Vec<LibraryId>>,
     /// Registered unit → owning library ([`LibraryGraph::library_of_file`]):
-    /// one entry per registered unit, built at [`LibraryGraphBuilder::finish`].
+    /// one entry per distinct registered file, built at
+    /// [`LibraryGraphBuilder::finish`]; dual registration resolves first-wins
+    /// by registration order (the accessor doc pins the terms).
     file_lib: FxHashMap<FileId, LibraryId>,
 }
 
@@ -1071,6 +1084,14 @@ impl LibraryGraph {
     /// file id, no scan over the nodes; `None` when the file registered no
     /// unit with any library (a file outside the analysis set — the map
     /// carries only registered units, so the answer is never fabricated).
+    ///
+    /// A file is normally one library's unit, but the part graph permits
+    /// dual registration: a file can be another library's part and its own
+    /// library's defining unit at once (the part file also imported by name
+    /// shape). There the earliest-registered library wins — nodes claim
+    /// their units in registration (intern) order at
+    /// [`LibraryGraphBuilder::finish`], and that order is the caller's
+    /// deterministic fold, so the answer is a total function of the input.
     #[must_use]
     pub fn library_of_file(&self, file: FileId) -> Option<LibraryId> {
         self.file_lib.get(&file).copied()
