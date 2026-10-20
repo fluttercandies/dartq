@@ -435,6 +435,13 @@ mod ticket_undefined_family_tests;
 #[cfg(test)]
 mod ticket_2313_tests;
 
+/// The #2316 recipe-(a) pins: a subclass's bare read of an inherited
+/// field records against the declaring container, sparing `unused_field`
+/// on `Base._f` while unread siblings and static-reads still report.
+/// Kept as a standalone module so the shared `tests` rig stays untouched.
+#[cfg(test)]
+mod ticket_2316_tests;
+
 /// The dead/unused-family differential pins: the `InvalidType` checked
 /// type's `factor` remainder (the losing `is`/`is!` arm's `dead_code`),
 /// `unused_field`'s `unresolvedReadMembers` spelling fallback and the

@@ -1722,19 +1722,28 @@ impl<'a> Engine<'a> {
             self.self_scope_rows.insert(range.offset);
         }
         // A bare mention of a field name inside its own container: the
-        // final intent decides read vs write at resolve time.
+        // final intent decides read vs write at resolve time. The member
+        // scope reaches past the container's own map — an inherited field
+        // reads through `this` identically (#2316 recipe-a): the defining
+        // container (superclass, mixin application, or interface face —
+        // `member_lookup_defining`'s climb) records the read so
+        // `member_was_read` spares `unused_field` on the declaring member.
+        // Statics ride no receiver and never mark.
         if let Some((container, _)) = self.container_context()
-            && self
-                .index
-                .get(self.file)
-                .and_then(|f| f.container(container))
-                .is_some_and(|c| {
-                    c.members
-                        .get(&name)
-                        .is_some_and(|m| m.kind == MemberKind::Field)
-                })
+            && let Some((declaring, entry)) = member_lookup_defining(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                container,
+                name,
+                false,
+            )
+            && entry.kind == MemberKind::Field
+            && !entry.is_static
         {
-            self.field_read_rows.insert(range.offset, container);
+            self.field_read_rows.insert(range.offset, declaring);
         }
         // The implicit-this face's push-time snapshots: the field-group
         // state tears down before pass 2 resolves the row. The second set
