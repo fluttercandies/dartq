@@ -3709,7 +3709,7 @@ impl<'a> Engine<'a> {
                 clause(self, facts)
                     .get(&container)
                     .and_then(|c| c.supers.iter().find(|(head, _)| *head == hop))
-                    .map(|(_, args)| args.clone())
+                    .and_then(|(_, stored)| self.face_args(stored))
             } else {
                 let (prev, prev_file) = chain[index - 1];
                 if prev_file != self.file {
@@ -3718,7 +3718,7 @@ impl<'a> Engine<'a> {
                     clause(self, facts)
                         .get(&prev)
                         .and_then(|c| c.supers.iter().find(|(head, _)| *head == hop))
-                        .map(|(_, args)| args.clone())
+                        .and_then(|(_, stored)| self.face_args(stored))
                 }
             };
             let Some(args) = incoming else {
@@ -3762,7 +3762,7 @@ impl<'a> Engine<'a> {
             let incoming = clause(self, facts)
                 .get(&container)
                 .and_then(|c| c.supers.iter().find(|(head, _)| *head == hop_name))
-                .map(|(_, args)| args.clone());
+                .and_then(|(_, stored)| self.face_args(stored));
             if let Some([arg]) = incoming.as_deref() {
                 let mut map = FxHashMap::default();
                 map.insert(free[0], *arg);
@@ -3770,6 +3770,21 @@ impl<'a> Engine<'a> {
             }
         }
         Instantiated::Undecidable
+    }
+
+    /// The real type-argument list of a stored super face: the clause
+    /// scanner wraps each face as `(head, vec![whole_named_ty])`, so the
+    /// stored `Ty::Named`'s own `args` — not the one-element wrapping —
+    /// supplies the substitution operands (the same unwrap `mixin_env`
+    /// keeps). `None` marks a face with no written type arguments —
+    /// nothing to substitute.
+    fn face_args(&self, stored: &[Ty]) -> Option<Vec<Ty>> {
+        match stored {
+            [Ty::Named { args, .. }] if *args != crate::model::ArgListId::EMPTY => {
+                Some(self.boundary.pool().get(*args).to_vec())
+            }
+            _ => None,
+        }
     }
 
     /// The dead-superclass-edge subtype verdict — the oracle's `extends
@@ -4069,11 +4084,12 @@ impl<'a> Engine<'a> {
     }
 
     /// Parses one clause type at `i` — `Head`, `Head<...args...>`, `Head?`,
-    /// `dynamic`/`void` — appending `(head, [value])` to `supers` (the
-    /// value list zips 1:1 with the face's parameter list) and returns the
-    /// position past it. `None` marks the clause unfaithful (a
-    /// non-identifier head, an unbalanced group, a function- or
-    /// record-typed argument): the header contributes no facts.
+    /// `dynamic`/`void` — appending `(head, [whole_named_ty])` to `supers`
+    /// (the one stored value is the face's whole `Ty::Named`; its own
+    /// `args` list is the real argument list — `face_args`/`mixin_env`
+    /// unwrap it) and returns the position past it. `None` marks the clause
+    /// unfaithful (a non-identifier head, an unbalanced group, a function-
+    /// or record-typed argument): the header contributes no facts.
     fn scan_clause_type(
         &self,
         start: usize,

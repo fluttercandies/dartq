@@ -3532,3 +3532,15 @@ mod ticket_2328_tests;
 /// full instantiated-alias recursion to its verdict.
 #[cfg(test)]
 mod ticket_2348_tests;
+
+/// The #2362 differential pins: the generic-supertype instantiation's
+/// whole-`Ty::Named` unwrap — `instantiate_inherited` binds each declaring
+/// hop's parameter to the stored super face's own argument list, never to
+/// the one-element wrapping, so a same-file `Sub<X> extends Box<X>` face
+/// substitutes the written argument, a nested `Outer<Inner<E>>` argument
+/// substitutes into the member, and the foreign name-forced hop
+/// (`XmlNodeList<E> extends DelegatingList<E>`) stops false-firing on
+/// every inherited member while a genuine mismatch across the edge keeps
+/// reporting.
+#[cfg(test)]
+mod ticket_2362_tests;
