@@ -269,7 +269,37 @@ impl<'a> Engine<'a> {
             // report nothing, the verifier's redirect early-return silencing
             // each one).
             if !has_generative_ctor {
+                // An extension type never reports here: upstream's
+                // representation constructor is generative
+                // (`element.constructors.any(isGenerative)`,
+                // error_verifier.dart:7114), so the
+                // `ConstructorFieldsVerifier` owns the container and the
+                // primary's formal binds the rep — even when the only other
+                // constructor is a factory (the
+                // `extension type E._(int i) { external factory E(); }`
+                // shape, whose factory registers no generative site). Our
+                // site capture keeps the primary out of `decl_sites`, so
+                // that shape lands the rep in this arm; the pending rep row
+                // carries the primary formal's own name span, so the span
+                // match identifies it without a text pass. Extension types
+                // declare no other instance fields, so non-rep finals are
+                // impossible here and the loop degenerates for them.
+                let rep_spans: Vec<SourceRange> = self
+                    .index
+                    .get(self.file)
+                    .and_then(|elements| elements.container(container))
+                    .filter(|decl| decl.kind == ContainerKind::ExtensionType)
+                    .map(|decl| {
+                        decl.primary_formals
+                            .iter()
+                            .map(|rep| rep.name_range)
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 for (name, range) in &finals {
+                    if rep_spans.contains(range) {
+                        continue;
+                    }
                     self.emit(SemanticCode::FinalNotInitialized, *range, name, "");
                 }
                 for (name, range) in &non_finals {

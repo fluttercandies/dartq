@@ -16348,3 +16348,188 @@
             code_names(&r)
         );
     }
+
+    // —— #2298 T6: constructor/declaration faces ————————————————————————
+
+    /// An explicit `super(...)` initializer satisfies the
+    /// implicit-super face regardless of its argument shapes: the bare
+    /// positional form (the corpus archive row,
+    /// `PcSHA1Digest() : super(Endian.big, 5, 80);`), the named-selector
+    /// form (the corpus html row, `: super(name, selfClosing);`), and the
+    /// mixed-initializer-list form (the corpus intl row,
+    /// `: _fullPattern = pattern, super(_patchQuotes(pattern), parent);`)
+    /// all fold to a `SuperConstructorInvocation` — the early return the
+    /// official `_checkForUndefinedConstructorInInitializerImplicit` takes
+    /// (upstream Dart SDK source, error_verifier.dart).
+    #[test]
+    fn explicit_super_invocation_satisfies_implicit_super_face() {
+        // Bare positional `super(...)`.
+        let r = report(
+            "class int {} class S { S(int a, int b, int c) {} }\n\
+             class D extends S { D() : super(1, 2, 3); }",
+        );
+        assert!(
+            !code_names(&r)
+                .contains(&"implicit_super_initializer_missing_arguments"),
+            "{:?}",
+            code_names(&r)
+        );
+        // Named selector `super.n(...)`.
+        let r = report(
+            "class int {} class S { S.n(int a) {} }\n\
+             class D extends S { D() : super.n(1); }",
+        );
+        assert!(
+            !code_names(&r)
+                .contains(&"implicit_super_initializer_missing_arguments"),
+            "{:?}",
+            code_names(&r)
+        );
+        // Mixed list: a field initializer, then the super invocation.
+        let r = report(
+            "class int {} class S { S(int a) {} }\n\
+             class D extends S {\n  int f;\n  D() : f = 0, super(1);\n}",
+        );
+        assert!(
+            !code_names(&r)
+                .contains(&"implicit_super_initializer_missing_arguments"),
+            "{:?}",
+            code_names(&r)
+        );
+        // The control: no super invocation at all — the face fires at the
+        // constructor head.
+        let r = report(
+            "class int {} class S { S(int a) {} }\n\
+             class D extends S { D() {} }",
+        );
+        assert_eq!(
+            code_names(&r),
+            ["implicit_super_initializer_missing_arguments"],
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// An extension type's representation field never reports
+    /// `final_not_initialized`: upstream's representation constructor is
+    /// generative (`element.constructors.any(isGenerative)`,
+    /// error_verifier.dart:7114), so the `ConstructorFieldsVerifier` owns
+    /// the container and the primary's formal binds the rep — even when
+    /// the only other constructor is a factory (the corpus drift row,
+    /// `extension type _SerializedRequest._(JSObject inner)` beside
+    /// `external factory _SerializedRequest(...)`).
+    #[test]
+    fn extension_type_rep_field_never_reports_uninitialized() {
+        // Named rep primary + an unnamed external factory: the factory
+        // registers no generative site, but the rep is bound regardless.
+        let r = report("class int {} extension type E._(int i) { external factory E(); }");
+        assert!(
+            !code_names(&r).contains(&"final_not_initialized"),
+            "{:?}",
+            code_names(&r)
+        );
+        // A named-rep primary with no other declaration at all.
+        let r = report("class int {} extension type F._(int i) {}");
+        assert!(r.diagnostics.is_empty(), "{:?}", code_names(&r));
+        // A redirecting generative secondary keeps the declaration face
+        // off (the redirect target's primary binds the rep).
+        let r = report("class int {} extension type G._(int i) { G.other(int v) : this._(v); }");
+        assert!(
+            !code_names(&r).contains(&"final_not_initialized"),
+            "{:?}",
+            code_names(&r)
+        );
+    }
+
+    /// A bare miss in a creation's ARGUMENTS is an ordinary expression:
+    /// the oracle names it `undefined_identifier` (the corpus intl row,
+    /// `List<String>.from(dateTimeSymbols.keys)` at 525:25, and the
+    /// analyzer row, `List<TypeImpl>.filled(_, DynamicTypeImpl.instance)`
+    /// at 510:53). Only a `new`/`const` creation HEAD is a type position —
+    /// `creation_with_non_type` at its name (upstream Dart SDK source,
+    /// error_verifier.dart's `visitInstanceCreationExpression`).
+    #[test]
+    fn new_const_creation_argument_miss_is_undefined_identifier() {
+        // Resolved head, missing argument: the T6 corpus shape. The const
+        // creation's argument face rides beside the undefined name (the
+        // oracle's row set on `const C.n(missX); new C.n(missY);`).
+        let r = report(
+            "class int {} class C { const C.n(int x); }\n\
+             void f() { const C.n(missX); new C.n(missY); }",
+        );
+        assert_eq!(
+            code_names(&r),
+            [
+                "const_with_non_constant_argument",
+                "undefined_identifier",
+                "undefined_identifier",
+            ],
+            "{:?}",
+            code_names(&r)
+        );
+        // Missing head stays `creation_with_non_type`; a nested creation's
+        // head reads the same way, its own argument stays ordinary.
+        let r = report(
+            "class int {} class H { H(int x); }\n\
+             void g() { new MissZ(new H(missA)); }",
+        );
+        let names = code_names(&r);
+        assert!(
+            names.contains(&"creation_with_non_type"),
+            "{names:?}"
+        );
+        assert!(
+            !names.contains(&"undefined_class"),
+            "{names:?}"
+        );
+    }
+
+    /// A file-local function-type alias declared AFTER the use's enclosing
+    /// declaration still types the tear-off argument check: the streaming
+    /// bounds capture has not registered the typedef when the check reads
+    /// it, so the callable verdict falls back to the element model's
+    /// declaration-ordered armed type (the corpus html rows,
+    /// `_data._skipUntil(_isSpaceOrAngleBracket)` at 226:32 and
+    /// `data._skipUntil(isWhitespace)` at 359:27 over the file-trailing
+    /// `typedef _CharPredicate = bool Function(String char);`).
+    #[test]
+    fn typedef_after_use_still_types_tear_off_argument() {
+        // The corpus shape: a top-level function tear-off into a
+        // cross-class formal typed by the trailing alias.
+        let r = report(
+            "class int {} class bool {} class String {} class Data {\n\
+             \x20 String? skipUntil(Pred until) => null;\n\
+             }\n\
+             class Parser {\n\
+             \x20 final Data data = Data();\n\
+             \x20 void step() { data.skipUntil(isSpace); }\n\
+             }\n\
+             bool isSpace(String char) => char == ' ';\n\
+             typedef Pred = bool Function(String char);",
+        );
+        assert!(r.diagnostics.is_empty(), "{:?}", code_names(&r));
+        // The genuine mismatch still reports against the trailing alias:
+        // an arity-wider tear-off refuses at the argument.
+        let source = "class int {} class bool {} class String {} class Data {\n\
+             \x20 String? skipUntil(Pred until) => null;\n\
+             }\n\
+             class Parser {\n\
+             \x20 final Data data = Data();\n\
+             \x20 void step() { data.skipUntil(wider); }\n\
+             }\n\
+             bool wider(String a, String b) => a == b;\n\
+             typedef Pred = bool Function(String char);";
+        let r = report(source);
+        let rows: Vec<(&str, u32)> = r
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.name, d.range.offset))
+            .collect();
+        let at = u32::try_from(
+            source
+                .find("wider);")
+                .unwrap_or_else(|| panic!("{source:?}")),
+        )
+        .expect("offset fits u32");
+        assert_eq!(rows, [("argument_type_not_assignable", at)], "{rows:?}");
+    }

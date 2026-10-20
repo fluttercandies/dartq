@@ -253,7 +253,21 @@ impl<'a> Engine<'a> {
                     required_positional,
                 );
             }
-            let (_params, tree) = self.bounds.alias_named_shape(cur)?;
+            let (_params, tree) = match self.bounds.alias_named_shape(cur) {
+                Some((params, tree)) => (params, tree),
+                // The capture walks in declaration order, so a typedef
+                // trailing the use's own declaration is not registered yet
+                // when the streaming check reads it (the corpus html rows,
+                // `_CharPredicate` declared after the `_skipUntil` /
+                // `isWhitespace` tear-off arguments). The element model is
+                // complete and order-independent — a non-parameterized
+                // alias's RHS rides the declaration's armed type — so the
+                // direct-alias case answers from there. A chain in flight
+                // keeps the capture's substitution face (its `None` stays
+                // the under-report direction).
+                None if pending_args.is_empty() => return self.element_model_alias_sig(cur),
+                None => return None,
+            };
             pending_args = tree.args.clone();
             cur = tree.head;
         };
@@ -282,6 +296,57 @@ impl<'a> Engine<'a> {
                 .unwrap_or(Ty::Dynamic),
         };
         Some(Box::new(sig))
+    }
+
+    /// The element-model fallback of [`Self::alias_fn_sig`]: a
+    /// non-parameterized function-type alias the streaming bounds capture
+    /// has not reached yet. The collector stores the alias's RHS as the
+    /// declaration's armed type (`Ty::Function`), so the complete element
+    /// model answers where the walk-order capture cannot. `None` for every
+    /// other shape: a parameterized alias keeps the capture's substitution
+    /// face, and a non-function RHS is [`Self::alias_rhs`]'s business. The
+    /// shape's optional-ness columns are not modeled (a `FnShape` carries
+    /// no required boundary and no named-required flags) — positional
+    /// formals claim required and named formals claim optional, the
+    /// function-subtype direction the written `bool Function(String)`
+    /// corpus shapes never leave.
+    fn element_model_alias_sig(&self, name: StringId) -> Option<Box<FnVarSig>> {
+        let (owner, decl) = match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::Local(decl) => (self.file, decl),
+            ScopedHit::Found(NamespaceEntry::Decl(file)) => {
+                (file, self.index.get(file).and_then(|f| f.decl(name))?)
+            }
+            _ => return None,
+        };
+        let ty = match decl.kind {
+            MicroKind::TypeAlias if decl.type_params == 0 && decl.var_ty != Ty::UNKNOWN => {
+                self.boundary.ty(owner, decl.var_ty)
+            }
+            _ => return None,
+        };
+        let Ty::Function { shape, .. } = ty else {
+            return None;
+        };
+        let pool = self.boundary.pool();
+        let shape = pool.function_shape(shape);
+        Some(Box::new(FnVarSig {
+            params: Box::default(),
+            positional: shape.positional.iter().copied().collect(),
+            required_positional: u16::try_from(shape.positional.len()).unwrap_or(u16::MAX),
+            named: shape
+                .named
+                .iter()
+                .map(|(name, ty)| (*name, *ty, false))
+                .collect(),
+            return_ty: shape.return_ty,
+        }))
     }
 
     /// A container member's declared field type from a clean walk
@@ -1574,6 +1639,24 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Whether the token immediately before `utf16` is the `new` or `const`
+    /// keyword: the creation-head test for the bare-miss row shaping (the
+    /// preceding token of a creation head is always the creation keyword —
+    /// comments never intervene, the scanner drops them). The table is
+    /// offset-ordered, so the predecessor is one partition point.
+    fn preceded_by_creation_keyword(&self, utf16: u32) -> bool {
+        let tokens = self.tokens.as_slice();
+        let at = tokens.partition_point(|token| token.utf16_offset < utf16);
+        let Some(token) = at.checked_sub(1).and_then(|i| tokens.get(i)) else {
+            return false;
+        };
+        matches!(
+            token.kind,
+            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::New)
+                | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Const)
+        )
+    }
+
     /// Whether `name` resolves to the SDK projection's names-only stub of a
     /// dart:core collection head — the resolution grade a generic class
     /// type literal takes in a value position (`List` of `List < 1` names
@@ -1686,16 +1769,29 @@ impl<'a> Engine<'a> {
             }
         }
         if self.ctor_pos > 0 && matches!(info, BareInfo::Missing { .. }) {
-            self.push_row(Row {
-                name,
-                range,
-                qualified: false,
-                shape: RowShape::TypeUse(TypeVerdict::Missing, false),
-                intent: Intent::Read,
-                write_op: None,
-                ty: Ty::UNKNOWN,
-            });
-            return;
+            // Only a `new`/`const` creation HEAD is a type position: the
+            // oracle names a miss at the head `creation_with_non_type`
+            // while a miss in the creation's arguments is an ordinary
+            // expression (`undefined_identifier` — the
+            // `List<String>.from(miss.keys)` argument face). `ctor_pos`
+            // arms for whole creations, so the head is discriminated by
+            // its preceding token: the creation keyword itself. A nested
+            // creation head (`new O(new I(x))`) reads the same way; the
+            // implicit-creation form (`Foo<T>.sel(...)`) arms late — its
+            // head is pushed before the arm engages — so only keyword
+            // heads ever reach here.
+            if self.preceded_by_creation_keyword(range.offset) {
+                self.push_row(Row {
+                    name,
+                    range,
+                    qualified: false,
+                    shape: RowShape::TypeUse(TypeVerdict::Missing, false),
+                    intent: Intent::Read,
+                    write_op: None,
+                    ty: Ty::UNKNOWN,
+                });
+                return;
+            }
         }
         // F-C: a bare name inside the constructor-initializer list joins
         // the initializer world — the write intent is the field-initializer
@@ -2151,7 +2247,35 @@ impl<'a> Engine<'a> {
                 // code set; the extension instance `this` is legal.
                 ReceiverState::Skip | ReceiverState::Valid => {}
             }
-        } else if !is_super {
+        } else if is_super {
+            // A `super` keyword heading an initializer item folds to a
+            // `SuperConstructorInvocation` when its tail invokes (`super(...)`
+            // or `super.name(...)`) — the explicit-super satisfaction the
+            // `implicit_super_initializer_missing_arguments` face reads
+            // (upstream `error_verifier.dart`'s
+            // `_checkForUndefinedConstructorInInitializerImplicit` early
+            // return on `SuperConstructorInvocation`). A `super.name = v`
+            // item is a `ConstructorFieldInitializer` instead — no
+            // satisfaction — so the invocation tail is read off the token
+            // table: `(` decides immediately; a `.` selector decides on the
+            // `(` after its name. Comments and whitespace never intervene —
+            // the scanner drops them.
+            let tokens = self.tokens.as_slice();
+            let at = tokens.partition_point(|t| t.utf16_offset < token.range.end());
+            let satisfied = match tokens.get(at).map(|t| &t.kind) {
+                Some(dartq_scanner::TokenKind::OpenParen) => true,
+                Some(dartq_scanner::TokenKind::Period) => matches!(
+                    tokens.get(at + 2).map(|t| &t.kind),
+                    Some(dartq_scanner::TokenKind::OpenParen)
+                ),
+                _ => false,
+            };
+            if satisfied
+                && let Some(site) = self.open_ctor_site
+            {
+                self.ctor_super_init.insert(site);
+            }
+        } else {
             // `this` as the bare initializer TARGET — `this = 0` parses its
             // `this` as the field-initializer's head but no `.field` follows.
             // Upstream `buildInitializer` (ast_builder.dart:634-756) folds
