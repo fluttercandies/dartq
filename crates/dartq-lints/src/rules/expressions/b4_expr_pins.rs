@@ -154,13 +154,28 @@ fn literal_only_condition_faces() {
         .len(),
         1
     );
+    // The `for` face reports at the whole statement: the body's closing
+    // token seals in (oracle span length 15 — the `}` included).
+    let source = "void f() {\n  for (;true;) {}\n}\n";
+    let lints = run_semantic(source, "literal_only_boolean_expressions");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
     assert_eq!(
-        run_semantic(
-            "void f() {\n  for (;true;) {}\n}\n",
-            "literal_only_boolean_expressions"
-        )
-        .len(),
-        1
+        lints[0].range.start,
+        utf16_at(&f, tok(source, &f.tokens, "for", 0))
+    );
+    assert_eq!(
+        lints[0].range.end,
+        utf16_at(&f, tok(source, &f.tokens, "}", 0)) + 1
+    );
+    // A non-block body ends at its own terminator (oracle span length 12).
+    let source = "void f() {\n  for (;1;) 2;\n}\n";
+    let lints = run_semantic(source, "literal_only_boolean_expressions");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    assert_eq!(
+        lints[0].range.end,
+        utf16_at(&f, tok(source, &f.tokens, ";", 2)) + 1
     );
     // The `when` guard face.
     assert_eq!(
@@ -566,6 +581,53 @@ fn unnecessary_statements_for_header_faces() {
     let f = Fixture::parse(source);
     let one = tok(source, &f.tokens, "1", 0);
     assert_eq!(lints[0].range.start, utf16_at(&f, one));
+}
+
+/// The oracle span faces: a bare-send-tailed binary container seals past
+/// the enclosing close (`;`, `,`, `)`), so the report ends at the
+/// children's tiled tail operand — never a byte past it — and a
+/// classic-`for` initialization whose wide seal crosses the left
+/// separator still joins the initialization walk.
+#[test]
+fn unnecessary_statements_span_faces() {
+    // The block binary ends at `s` (oracle length 6 — the `;` stays out).
+    let source = "void f(int a, String s) {\n  a == s;\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    assert_eq!(lints[0].range.start, utf16_at(&f, tok(source, &f.tokens, "a", 1)));
+    assert_eq!(lints[0].range.end, utf16_at(&f, tok(source, &f.tokens, "s", 1)) + 1);
+
+    // A member-access tail bounds the same way (oracle length 13).
+    let source = "void f(int a, String s) {\n  a == s.length;\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    assert_eq!(
+        lints[0].range.end,
+        utf16_at(&f, tok(source, &f.tokens, "length", 0)) + "length".len() as u32
+    );
+
+    // The header faces report separately, each ending at its own `s`
+    // (oracle lengths 6 and 6).
+    let source =
+        "void f(int a, String s, bool b) {\n  for (a == s; b; a == s) {\n    a = 1;\n  }\n}";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 2, "{lints:?}");
+    let f = Fixture::parse(source);
+    assert_eq!(lints[0].range.start, utf16_at(&f, tok(source, &f.tokens, "a", 1)));
+    assert_eq!(lints[0].range.end, utf16_at(&f, tok(source, &f.tokens, "s", 1)) + 1);
+    assert_eq!(lints[1].range.start, utf16_at(&f, tok(source, &f.tokens, "a", 2)));
+    assert_eq!(lints[1].range.end, utf16_at(&f, tok(source, &f.tokens, "s", 2)) + 1);
+
+    // The non-block body statement ends at its own tail too (oracle
+    // length 6).
+    let source = "void f(int a, String s) {\n  for (;;) a == s;\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    assert_eq!(lints[0].range.start, utf16_at(&f, tok(source, &f.tokens, "a", 1)));
+    assert_eq!(lints[0].range.end, utf16_at(&f, tok(source, &f.tokens, "s", 1)) + 1);
 }
 
 /// The cascade face: a bare method section is a tear-off and reports;

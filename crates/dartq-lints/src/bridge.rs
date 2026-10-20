@@ -1912,7 +1912,13 @@ impl ParserListener for AstListener {
     }
 
     fn end_for_statement(&mut self, end: TokenSpan) {
-        self.end_at(NodeKind::ForStatement, self.t(end.id));
+        // The parser passes the body's last consumed token (inclusive —
+        // official parser_impl.dart:10339-10340 `parseForRest` returns the
+        // statement's last token), and the official `ForStatementImpl`
+        // spans to the body's end token (ast_builder.dart endForStatement:
+        // the `body` child decides the tail), so a block body's `}` seals
+        // in.
+        self.end_incl(NodeKind::ForStatement, end);
     }
 
     fn handle_for_loop_parts(

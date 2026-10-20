@@ -240,8 +240,38 @@ fn root_of(c: &Check<'_>, run: &[u32]) -> Option<u32> {
 /// at the operand head.
 fn report(c: &mut Check<'_>, root: u32, run: &[u32]) {
     let start = slice::run_utf16_start(c, run).unwrap_or(c.utf16_span(root).start);
-    let range = start..c.utf16_span(root).end;
+    let tail = content_end_row(c, root);
+    let range = start..c.utf16_span(tail).end;
     c.report(range, &[]);
+}
+
+/// The row whose end bounds the expression's true content: the
+/// binary/assignment containers seal past their last operand (the
+/// parser's expression return carries the follower `;`/`,`/`)`), so the
+/// content ends at the children's tiled tail; every other row seals at
+/// its own content exactly. The `No*` sentinel leaves anchor at the
+/// follower token and the bare-send `Send` leaf and the member-selector
+/// `DotAccess` handle tile through it (the #585 send/selector span
+/// posture), so none of them bound the content.
+fn content_end_row(c: &Check<'_>, root: u32) -> u32 {
+    match c.kind(root) {
+        NodeKind::BinaryExpression | NodeKind::Assignment => {
+            let window = c.children(root);
+            (window.start..window.end)
+                .filter(|&row| {
+                    !matches!(
+                        c.kind(row),
+                        NodeKind::NoTypeArguments
+                            | NodeKind::NoArguments
+                            | NodeKind::Send
+                            | NodeKind::DotAccess
+                    )
+                })
+                .max_by_key(|&row| c.byte_span(row).end)
+                .unwrap_or(root)
+        }
+        _ => root,
+    }
 }
 
 /// The `visitSimpleIdentifier`/`visitPrefixedIdentifier`/
@@ -504,11 +534,14 @@ fn check_for(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     ) else {
         return;
     };
-    // The initialization run: the pieces before the first separator.
+    // The initialization run: the pieces before the first separator. The
+    // content bound (not the row's own seal — a bare-send-tailed
+    // initialization seals past the separator) keeps the row inside the
+    // initialization window.
     let init: Vec<u32> = fragments
         .iter()
         .copied()
-        .filter(|&row| c.byte_span(row).end <= left_start)
+        .filter(|&row| c.byte_span(content_end_row(c, row)).end <= left_start)
         .collect();
     walk(c, analysis, &init);
     // Each comma-delimited updater walks separately (:212-215).

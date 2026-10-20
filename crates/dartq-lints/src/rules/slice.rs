@@ -722,9 +722,11 @@ pub(crate) mod no_self_assignments {
         }
         if c.lexeme(c.head_token(*lhs)) == c.lexeme(c.head_token(*rhs)) {
             // The official reports at the whole `AssignmentExpression` —
-            // the adopted node's own span covers only the sealed tail,
-            // so the range opens at the left operand's head.
-            c.report(c.utf16_span(*lhs).start..c.utf16_span(node).end, &[]);
+            // the range opens at the left operand's head and ends at the
+            // right operand's own tail (the container row's seal runs past
+            // it when the bare-send tail parses through the follower, so
+            // the node's own span is not the bound).
+            c.report(c.utf16_span(*lhs).start..c.utf16_span(*rhs).end, &[]);
         }
     }
 
@@ -743,12 +745,18 @@ pub(crate) mod no_self_assignments {
             assert_eq!(lints.len(), 1, "{lints:?}");
             let write = tok(&f.source, &f.tokens, "a", 2);
             assert_eq!(lints[0].range.start, utf16_at(&f, write));
+            // The span ends at the right operand's own tail (oracle span
+            // length 5), never at the container's sealed `;`.
+            let rhs = tok(&f.source, &f.tokens, "a", 3);
+            assert_eq!(lints[0].range.end, utf16_at(&f, rhs) + 1);
 
             let f = Fixture::parse("void f(int a) { while (a < 1) a = a; }");
             let lints = f.run(&one_rule("no_self_assignments"));
             assert_eq!(lints.len(), 1, "{lints:?}");
             let write = tok(&f.source, &f.tokens, "a", 2);
             assert_eq!(lints[0].range.start, utf16_at(&f, write));
+            let rhs = tok(&f.source, &f.tokens, "a", 3);
+            assert_eq!(lints[0].range.end, utf16_at(&f, rhs) + 1);
         }
 
         /// The flow-body arms of the header-fragment cut: a self-assignment
@@ -763,6 +771,10 @@ pub(crate) mod no_self_assignments {
             assert_eq!(lints.len(), 1, "{lints:?}");
             let write = tok(&f.source, &f.tokens, "i", 1);
             assert_eq!(lints[0].range.start, utf16_at(&f, write));
+            // The header write ends at its right operand (the sealed row
+            // runs past the `)` — the rhs tail is the bound).
+            let rhs = tok(&f.source, &f.tokens, "i", 2);
+            assert_eq!(lints[0].range.end, utf16_at(&f, rhs) + 1);
 
             let f =
                 Fixture::parse("void f(int i, bool b) {\n  for (i = 0; b; i = i) {\n    i = 2;\n  }\n}");
@@ -770,6 +782,8 @@ pub(crate) mod no_self_assignments {
             assert_eq!(lints.len(), 1, "{lints:?}");
             let write = tok(&f.source, &f.tokens, "i", 2);
             assert_eq!(lints[0].range.start, utf16_at(&f, write));
+            let rhs = tok(&f.source, &f.tokens, "i", 3);
+            assert_eq!(lints[0].range.end, utf16_at(&f, rhs) + 1);
         }
 
         /// A switch-member body self-assignment reads whole under a
@@ -800,6 +814,8 @@ pub(crate) mod no_self_assignments {
                 "The variable or property is being assigned to itself."
             );
             assert_eq!(lints[0].range.start, 16);
+            // Oracle span length 5: `a = a` — the `;` stays out.
+            assert_eq!(lints[0].range.end, 21);
         }
 
         #[test]
