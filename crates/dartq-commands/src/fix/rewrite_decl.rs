@@ -2104,7 +2104,7 @@ pub(crate) fn remove_parameter_entry(input: &FixInput<'_>) -> Option<(u32, u32, 
     remove_listed_item(input, ItemMode::Parameter)
 }
 
-/// `prefer_iterable_whereType`: `x.where((e) => e is T)` becomes
+/// `prefer_iterable_wheretype`: `x.where((e) => e is T)` becomes
 /// `x.whereType<T>()` (the official `ConvertToWhereType` over the reported
 /// method name: one parameter, an `=>` body or a single return whose `is`
 /// test applies the parameter, and no `is!`).

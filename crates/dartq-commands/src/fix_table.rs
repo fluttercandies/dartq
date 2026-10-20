@@ -1645,7 +1645,7 @@ static FIX_TABLE: &[FixSpec] = &[
     // different-name legs re-spell the closure bodies through a
     // parameter-reference face and are absent.
     FixSpec {
-        code: "prefer_for_elements_to_map_fromIterable",
+        code: "prefer_for_elements_to_map_fromiterable",
         source: FixSource::Lint,
         needs_tokens: true,
         action: FixAction::Rewrite(map_from_iterable_for_element),
@@ -1748,7 +1748,7 @@ static FIX_TABLE: &[FixSpec] = &[
     // `x.where((e) => e is T)` becomes `x.whereType<T>()` (official
     // `ConvertToWhereType`).
     FixSpec {
-        code: "prefer_iterable_whereType",
+        code: "prefer_iterable_wheretype",
         source: FixSource::Lint,
         needs_tokens: true,
         action: FixAction::Rewrite(where_type_entry),

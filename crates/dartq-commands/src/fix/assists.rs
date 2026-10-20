@@ -5037,7 +5037,7 @@ pub(crate) fn for_in_from_for_each(input: &FixInput<'_>) -> Option<(u32, u32, St
     ))
 }
 
-/// `prefer_for_elements_to_map_fromIterable`: `Map.fromIterable(xs, key:
+/// `prefer_for_elements_to_map_fromiterable`: `Map.fromIterable(xs, key:
 /// (k) => k.id, value: (k) => k.name)` becomes
 /// `{ for (var k in xs) k.id : k.name }` — the official
 /// `ConvertMapFromIterableToForLiteral`'s same-parameter leg (upstream Dart

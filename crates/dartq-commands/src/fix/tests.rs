@@ -3411,7 +3411,7 @@
     fn map_from_iterable_for_element_faces() {
         let source = "var m = Map.fromIterable(xs, key: (k) => k.id, value: (k) => k.name);\n";
         assert_rewrite(
-            "prefer_for_elements_to_map_fromIterable",
+            "prefer_for_elements_to_map_fromiterable",
             source,
             full_span(
                 source,
@@ -3422,7 +3422,7 @@
         // The single-`return` block body face.
         let source = "var m = Map.fromIterable(xs, key: (k) { return k.id; }, value: (k) => k.id);";
         assert_rewrite(
-            "prefer_for_elements_to_map_fromIterable",
+            "prefer_for_elements_to_map_fromiterable",
             source,
             full_span(
                 source,
@@ -3433,7 +3433,7 @@
         // Different parameter names need the reference face — no row.
         let source = "var m = Map.fromIterable(xs, key: (k) => v.id, value: (v) => v.name);\n";
         assert_no_fix(
-            "prefer_for_elements_to_map_fromIterable",
+            "prefer_for_elements_to_map_fromiterable",
             source,
             full_span(
                 source,
@@ -5548,21 +5548,21 @@
     fn where_type_faces() {
         let source = "var t = list.where((e) => e is int);\n";
         assert_rewrite(
-            "prefer_iterable_whereType",
+            "prefer_iterable_wheretype",
             source,
             full_span(source, "where"),
             "var t = list.whereType<int>();\n",
         );
         let source = "var t = list.where((e) {\n  return e is int;\n});\n";
         assert_rewrite(
-            "prefer_iterable_whereType",
+            "prefer_iterable_wheretype",
             source,
             full_span(source, "where"),
             "var t = list.whereType<int>();\n",
         );
         let source = "var t = list.where((e) => e is! int);\n";
         assert_no_fix(
-            "prefer_iterable_whereType",
+            "prefer_iterable_wheretype",
             source,
             full_span(source, "where"),
         );
