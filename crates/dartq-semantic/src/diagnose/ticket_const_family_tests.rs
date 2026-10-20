@@ -24,11 +24,17 @@
 //! Out of that lane's granted files (#2248 follow-up): the
 //! annotation-argument const context (`@Target({TargetKind.classType})` —
 //! the drift corpus rows) now opens its capture window in the listener's
-//! `begin_metadata`/`end_metadata` — pattern 3 below. Still out of the
-//! model: the ANNOTATION-HEAD faces (a resolved annotation head validates
-//! its arguments against the resolved const constructor —
-//! `const_with_non_constant_argument` and the arity faces); those live in
-//! the annotation-resolution machinery, not the capture window.
+//! `begin_metadata`/`end_metadata` — pattern 3 below. Pattern 4 (#2261)
+//! closes the window lane's deferred heads, each probe-paired: the
+//! ANNOTATION-HEAD faces (a resolved annotation head validates its
+//! arguments against the resolved const constructor —
+//! `const_with_non_constant_argument` with the label-resolution split to
+//! `invalid_constant`, plus the argument-count faces), the rider
+//! `invalid_constant` at an unresolved leaf inside a resolved creation's
+//! arguments (the corpus's `ast.dart` `GenerateNodeProperty('element',
+//! type: ExtensionElementImpl)` row), and the ERROR-tier duplicate twins
+//! (`equal_keys_in_const_map` / `equal_elements_in_const_set`) over const
+//! literals.
 
 use super::*;
 use crate::collector::collect;
@@ -348,37 +354,71 @@ fn annotation_set_element_reports_at_unresolved_prefix() {
     );
 }
 
-/// An unresolved callee inside an annotation's set literal: the element
-/// face reports at the whole invocation (the W4 pattern-1 pairing — the
-/// oracle's evaluation is known-invalid there), on class, enum-constant,
-/// and parameter annotations alike. The callee's own face is the plain
-/// `undefined_method` (dartq resolves the argument position as an
-/// ordinary invocation; the oracle's const-creation reading pairs
-/// `undefined_function` — a head-context face outside this window).
+/// An unresolved callee inside an annotation's set literal: the argument
+/// pairing (`const_with_non_constant_argument` at the whole invocation)
+/// pairs on every host beside the callee's own miss face, and the
+/// call-shaped element's own face follows the probed host split — a
+/// type-declaration host's evaluation owns the report (no element face on
+/// `class`), an enum-constant or parameter host keeps it (probed
+/// 3.47.1). The declaration-level verdict never substitutes.
 #[test]
 fn unresolved_callee_in_annotation_set_reports_element_face() {
-    for source in [
-        "class T { const T(); }\n@T({Missing()})\nclass C {}",
-        "class T { const T(); }\nenum E {\n  @T({Missing()}) a, b,\n}",
-        "class T { const T(); }\nvoid h(@T({Missing()}) int p) {}",
-    ] {
-        let rep = report(source);
-        let rows = rows(&rep, source);
-        assert!(
-            rows.contains(&("non_constant_set_element", "Missing()")),
-            "{rows:?}"
-        );
-        assert_eq!(
-            count(&rows, "const_initialized_with_non_constant_value"),
-            0,
-            "{rows:?}"
-        );
-        assert_eq!(
-            count(&rows, "const_with_non_constant_argument"),
-            0,
-            "{rows:?}"
-        );
-    }
+    let class_source = "class T { const T(); }\n@T({Missing()})\nclass C {}";
+    let rep = report(class_source);
+    let got = rows(&rep, class_source);
+    assert!(
+        got.contains(&("const_with_non_constant_argument", "Missing()")),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&("undefined_function", "Missing")),
+        "{got:?}"
+    );
+    assert_eq!(count(&got, "non_constant_set_element"), 0, "{got:?}");
+    assert_eq!(
+        count(&got, "const_initialized_with_non_constant_value"),
+        0,
+        "{got:?}"
+    );
+
+    // The enum-constant and parameter hosts keep the element face. The
+    // enum host's callee face reads `undefined_method` (the row's
+    // instance-scope this-type snapshot names the enum) where the oracle
+    // pairs `undefined_function` — the snapshot is taken at the
+    // identifier's push in the resolution layer, outside this window's
+    // files (recorded for the owning lane).
+    let enum_source = "class T { const T(); }\nenum E {\n  @T({Missing()}) a, b,\n}";
+    let rep = report(enum_source);
+    let got = rows(&rep, enum_source);
+    assert!(
+        got.contains(&("const_with_non_constant_argument", "Missing()")),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&("non_constant_set_element", "Missing()")),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&("undefined_method", "Missing")),
+        "{got:?}"
+    );
+    assert_eq!(count(&got, "undefined_function"), 0, "{got:?}");
+
+    let param_source = "class T { const T(); }\nvoid h(@T({Missing()}) int p) {}";
+    let rep = report(param_source);
+    let got = rows(&rep, param_source);
+    assert!(
+        got.contains(&("const_with_non_constant_argument", "Missing()")),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&("non_constant_set_element", "Missing()")),
+        "{got:?}"
+    );
+    assert!(
+        got.contains(&("undefined_function", "Missing")),
+        "{got:?}"
+    );
 }
 
 /// A known function invocation inside an annotation's literal: the
@@ -430,3 +470,286 @@ fn constant_annotation_literal_stays_silent() {
         assert_eq!(count(&rows, "const_eval_method_invocation"), 0, "{rows:?}");
     }
 }
+
+// —— pattern 4: the annotation const-context deferred faces (#2261) ———
+
+/// The rider (the corpus's `ast.dart` `GenerateNodeProperty('element',
+/// type: ExtensionElementImpl)` shape): an unresolved leaf inside a
+/// RESOLVED const creation's argument list reports `invalid_constant` at
+/// the leaf — the oracle's creation evaluation reports the leaf directly
+/// (value.dart `genericError`) and the literal's element face never
+/// substitutes. The `type:` named-argument leaf never reaches the
+/// positional argument check, so nothing else pairs at the span.
+#[test]
+fn rider_named_leaf_in_resolved_creation_reports_invalid_constant() {
+    let source = "class Prop {\n  final String name;\n  final Type? type;\n  const Prop(this.name, {this.type});\n}\n\
+                  class Gen {\n  final List<Prop> props;\n  const Gen({required this.props});\n}\n\
+                  @Gen(props: [Prop('a'), Prop('e', type: Missing)])\nclass C {}";
+    let rep = report(source);
+    let rows = rows(&rep, source);
+    assert!(
+        rows.contains(&("invalid_constant", "Missing")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&("undefined_identifier", "Missing")),
+        "{rows:?}"
+    );
+    assert_eq!(count(&rows, "invalid_constant"), 1, "{rows:?}");
+    assert_eq!(count(&rows, "non_constant_list_element"), 0, "{rows:?}");
+    assert_eq!(
+        count(&rows, "const_with_non_constant_argument"),
+        0,
+        "{rows:?}"
+    );
+}
+
+/// The same leaf world in a const initializer (`const x = [Prop('g',
+/// type: Missing)]`): `invalid_constant` at the leaf, the declaration's
+/// own verdict silent (the propagation is avoid-reporting upstream —
+/// nothing but the undefined name reports beside it).
+#[test]
+fn rider_initializer_named_leaf_reports_invalid_constant() {
+    let source = "class Prop {\n  final String name;\n  final Type? type;\n  const Prop(this.name, {this.type});\n}\n\
+                  const x = [Prop('g', type: Missing)];";
+    let rep = report(source);
+    let rows = rows(&rep, source);
+    assert!(rows.contains(&("invalid_constant", "Missing")), "{rows:?}");
+    assert!(
+        rows.contains(&("undefined_identifier", "Missing")),
+        "{rows:?}"
+    );
+    assert_eq!(count(&rows, "invalid_constant"), 1, "{rows:?}");
+    assert_eq!(count(&rows, "non_constant_list_element"), 0, "{rows:?}");
+    assert_eq!(
+        count(&rows, "const_initialized_with_non_constant_value"),
+        0,
+        "{rows:?}"
+    );
+}
+
+/// A POSITIONAL unresolved leaf keeps the creation's
+/// `const_with_non_constant_argument` (the pinned `Precedence._`
+/// pairing) — never an `invalid_constant` twin, and the list element
+/// face stays silent at that leaf (one argument, or several: the
+/// preceding valid element changes nothing).
+#[test]
+fn positional_leaf_keeps_const_with_non_constant_argument() {
+    for tail in ["const q = [Prop(Missing)];", "const z = [Prop('a'), Prop(Missing)];"] {
+        let source = format!(
+            "class Prop {{\n  final String name;\n  const Prop(this.name);\n}}\n{tail}"
+        );
+        let rep = report(&source);
+        let rows = rows(&rep, &source);
+        assert!(
+            rows.contains(&("const_with_non_constant_argument", "Missing")),
+            "{rows:?}"
+        );
+        assert_eq!(
+            count(&rows, "const_with_non_constant_argument"),
+            1,
+            "{rows:?}"
+        );
+        assert_eq!(count(&rows, "invalid_constant"), 0, "{rows:?}");
+        assert_eq!(count(&rows, "non_constant_list_element"), 0, "{rows:?}");
+    }
+}
+
+/// A bare unresolved leaf as the list element itself (the annotation's
+/// const creation takes the list): the element face AND the argument
+/// face pair at the leaf (the probed `@P([Missing])` triple) — the leaf
+/// is not inside a nested creation, so no `invalid_constant` world.
+#[test]
+fn annotation_bare_list_element_pairs_argument_face() {
+    let source = "class W {\n  final List<int> xs;\n  const W(this.xs);\n}\n\
+                  @W([Missing])\nclass C {}";
+    let rep = report(source);
+    let rows = rows(&rep, source);
+    assert!(
+        rows.contains(&("const_with_non_constant_argument", "Missing")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&("non_constant_list_element", "Missing")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&("undefined_identifier", "Missing")),
+        "{rows:?}"
+    );
+    assert_eq!(count(&rows, "invalid_constant"), 0, "{rows:?}");
+}
+
+/// A resolved const constructor in annotation position validates its
+/// arguments: a known non-const argument reports
+/// `const_with_non_constant_argument` at it, the declaration-side
+/// verdicts stay silent (the annotation evaluation has no initializer
+/// site default).
+#[test]
+fn annotation_head_checks_non_constant_argument() {
+    let source = "class P {\n  final int a;\n  const P(this.a);\n}\n\
+                  var g = 1;\n\
+                  @P(g)\nclass C {}";
+    let rep = report(source);
+    let rows = rows(&rep, source);
+    assert!(rows.contains(&("const_with_non_constant_argument", "g")), "{rows:?}");
+    assert_eq!(
+        count(&rows, "const_with_non_constant_argument"),
+        1,
+        "{rows:?}"
+    );
+    assert_eq!(
+        count(&rows, "const_initialized_with_non_constant_value"),
+        0,
+        "{rows:?}"
+    );
+}
+
+/// The argument-count faces in annotation position: a deficit anchors at
+/// the head, a surplus at the first extra positional argument (the
+/// probed `@P()` / `@P(1, 2, 3)` pairings — capacity two puts the
+/// surplus on the third).
+#[test]
+fn annotation_head_arity_faces() {
+    let source = "class P {\n  final int a;\n  final int b;\n  const P(this.a, [this.b = 1]);\n}\n\
+                  @P()\nclass C {}\n\
+                  @P(1, 2, 3)\nclass D {}";
+    let rep = report(source);
+    let rows = rows(&rep, source);
+    assert!(
+        rows.contains(&("not_enough_positional_arguments", "P")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&("extra_positional_arguments", "3")),
+        "{rows:?}"
+    );
+    assert_eq!(
+        count(&rows, "not_enough_positional_arguments"),
+        1,
+        "{rows:?}"
+    );
+    assert_eq!(
+        count(&rows, "extra_positional_arguments"),
+        1,
+        "{rows:?}"
+    );
+}
+
+/// The named-argument worlds: a label that resolves to a formal pairs
+/// the argument check (`const_with_non_constant_argument` at the value);
+/// a label naming no formal never pairs — the official's evaluation
+/// reports the leaf directly (`invalid_constant`).
+#[test]
+fn annotation_head_named_argument_worlds() {
+    let source = "class Q {\n  final Type? t;\n  const Q({this.t});\n}\n\
+                  class R {\n  final int a;\n  const R(this.a);\n}\n\
+                  @Q(t: Missing)\nclass A {}\n\
+                  @R(zz: Missing)\nclass B {}";
+    let rep = report(source);
+    let rows = rows(&rep, source);
+    assert!(
+        rows.contains(&("const_with_non_constant_argument", "Missing")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&("invalid_constant", "Missing")),
+        "{rows:?}"
+    );
+    assert_eq!(
+        count(&rows, "const_with_non_constant_argument"),
+        1,
+        "{rows:?}"
+    );
+    assert_eq!(count(&rows, "invalid_constant"), 1, "{rows:?}");
+}
+
+/// An unresolved callee invocation inside the annotation's list: the
+/// callee face stays `undefined_function` (the oracle's
+/// invocation-context choice), the element face reports at the whole
+/// invocation, and the annotation's argument check pairs
+/// `const_with_non_constant_argument` there — beside the head's own
+/// argument-count face (the list is one positional over the zero-arg
+/// `T()`).
+#[test]
+fn annotation_unresolved_callee_argument_faces() {
+    let source = "class T { const T(); }\n@T([Missing()])\nclass C {}";
+    let rep = report(source);
+    let rows = rows(&rep, source);
+    assert!(
+        rows.contains(&("undefined_function", "Missing")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&("non_constant_list_element", "Missing()")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&("const_with_non_constant_argument", "Missing()")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&("extra_positional_arguments", "[Missing()]")),
+        "{rows:?}"
+    );
+}
+
+/// The ERROR-tier duplicate twins over const literals — annotation
+/// arguments and const initializers alike (the WARNING twins of the
+/// non-const literals keep their lane): the later equal key/element
+/// reports at its own span, once per literal.
+#[test]
+fn const_literal_duplicates_report_error_twins() {
+    let source = "class T { const T(); }\n\
+                  @T({1: 'a', 1: 'b'})\nclass C {}\n\
+                  @T({1, 2, 1})\nclass D {}\n\
+                  const m = {1: 'a', 1: 'b'};\n\
+                  const s = {1, 2, 1};";
+    let rep = report(source);
+    let rows = rows(&rep, source);
+    assert_eq!(count(&rows, "equal_keys_in_const_map"), 2, "{rows:?}");
+    assert_eq!(
+        count(&rows, "equal_elements_in_const_set"),
+        2,
+        "{rows:?}"
+    );
+    // The WARNING twins never fire on const literals.
+    assert_eq!(count(&rows, "equal_keys_in_map"), 0, "{rows:?}");
+    assert_eq!(count(&rows, "equal_elements_in_set"), 0, "{rows:?}");
+}
+
+/// Valid annotation arguments of a resolved const constructor keep
+/// every face silent — the argument check, the count faces, and the
+/// duplicate twins included.
+#[test]
+fn valid_annotation_arguments_stay_silent() {
+    for source in [
+        "class W {\n  final List<int> xs;\n  const W(this.xs);\n}\n@W([1, 2])\nclass C {}",
+        "class Q {\n  final Type? t;\n  const Q({this.t});\n}\nconst k = 1;\n@Q(t: k)\nclass C {}",
+        "class T { final Object m; const T(this.m); }\n@T({'a': 1, 'b': 2})\nclass C {}",
+    ] {
+        let rep = report(source);
+        let rows = rows(&rep, source);
+        assert_eq!(count(&rows, "invalid_constant"), 0, "{rows:?}");
+        assert_eq!(
+            count(&rows, "const_with_non_constant_argument"),
+            0,
+            "{rows:?}"
+        );
+        assert_eq!(
+            count(&rows, "not_enough_positional_arguments"),
+            0,
+            "{rows:?}"
+        );
+        assert_eq!(count(&rows, "extra_positional_arguments"), 0, "{rows:?}");
+        assert_eq!(count(&rows, "equal_keys_in_const_map"), 0, "{rows:?}");
+        assert_eq!(
+            count(&rows, "equal_elements_in_const_set"),
+            0,
+            "{rows:?}"
+        );
+        assert_eq!(count(&rows, "non_constant_list_element"), 0, "{rows:?}");
+        assert_eq!(count(&rows, "non_constant_set_element"), 0, "{rows:?}");
+    }
+}
+

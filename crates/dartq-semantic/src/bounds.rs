@@ -229,6 +229,10 @@ enum AliasRhs {
         positional: Vec<TypeTree>,
         named: Vec<(StringId, TypeTree, bool)>,
         required_positional: Option<usize>,
+        /// The RHS spelled a trailing `?` after the formals group
+        /// (`typedef W = void Function()?;`) — the expansion is that
+        /// nullable function type.
+        nullable: bool,
     },
     /// `List<X>`: a named-type RHS expands by substitution like an
     /// interface head.
@@ -249,6 +253,7 @@ impl AliasRhs {
                 positional,
                 named,
                 required_positional: _,
+                nullable: _,
             } => positional.iter().any(mentions) || named.iter().any(|(_, tree, _)| mentions(tree)),
             AliasRhs::Named(_) => false,
         }
@@ -263,6 +268,7 @@ impl AliasRhs {
                 positional,
                 named,
                 required_positional: _,
+                nullable: _,
             } => {
                 ret.as_ref().is_some_and(mentions_poison)
                     || positional.iter().any(mentions_poison)
@@ -328,6 +334,7 @@ fn expand_alias(
             positional,
             named,
             required_positional,
+            nullable,
         } => {
             // An unwritten return type reads `dynamic` (`Function` bare).
             // A tree that fails to map defers the whole alias.
@@ -360,7 +367,7 @@ fn expand_alias(
                         named,
                         required_positional,
                     },
-                    false,
+                    *nullable,
                 )
                 .ok()
         }
@@ -399,6 +406,9 @@ struct AliasSink {
     required_positional: Option<usize>,
     /// The RHS parsed a function-type formals region.
     fn_seen: bool,
+    /// The RHS spelled a trailing `?` after the function type's formals
+    /// (`typedef W = void Function()?;`) — the expansion is nullable.
+    rhs_nullable: bool,
     /// Recovery debris: the alias never expands.
     poisoned: bool,
 }
@@ -742,6 +752,7 @@ impl<'a> Bounds<'a> {
             named: Vec::new(),
             required_positional: None,
             fn_seen: false,
+            rhs_nullable: false,
             poisoned: false,
         });
     }
@@ -880,6 +891,21 @@ impl<'a> Bounds<'a> {
         }
     }
 
+    /// The RHS function type closed with (`?`) or without a nullability
+    /// suffix (`end_function_type`'s question token): only the outermost
+    /// function type's own close answers — the formals region is already
+    /// closed and `fn_seen` holds; a nested function-typed formal's close
+    /// (region still open) leaves the latch alone.
+    pub(crate) fn alias_rhs_question(&mut self, nullable: bool) {
+        let Some(alias) = self.alias.as_mut() else {
+            return;
+        };
+        if !alias.fn_seen || alias.region.is_some() {
+            return;
+        }
+        alias.rhs_nullable = nullable;
+    }
+
     /// The typedef closed: the capture finalizes into the index
     /// (keep-first like the containers). A poisoned capture, a
     /// function-type RHS with debris, or a named RHS that is not exactly
@@ -895,6 +921,7 @@ impl<'a> Bounds<'a> {
                 positional: alias.positional,
                 named: alias.named,
                 required_positional: alias.required_positional,
+                nullable: alias.rhs_nullable,
             })
         } else if stray == 1 {
             alias.sink.done.pop().map(AliasRhs::Named)
@@ -1129,6 +1156,7 @@ impl<'a> Bounds<'a> {
                 positional,
                 named,
                 required_positional,
+                ..
             } => Some((
                 &capture.params,
                 ret.as_ref(),

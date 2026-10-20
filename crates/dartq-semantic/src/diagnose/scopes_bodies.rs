@@ -1063,6 +1063,23 @@ impl<'a> Engine<'a> {
             // gate [`Self::named_type_is_type`] applies at the return
             // matrix.
             Ty::Never => SemanticCode::BodyMightCompleteNormally,
+            // A non-nullable `FutureOr<void>`/`FutureOr<dynamic>` head is
+            // not potentially non-nullable (the union's void/dynamic base
+            // admits a normal completion), and it is not a `?`-spelled
+            // nullable either — both twins stay silent. The same
+            // `future_or_base` read the nullable arm below applies.
+            Ty::Named {
+                name,
+                nullable: false,
+                ..
+            } if name == self.intern("FutureOr")
+                && matches!(
+                    self.future_or_base(ret),
+                    Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Void
+                ) =>
+            {
+                return None
+            }
             Ty::Named {
                 name,
                 nullable: false,

@@ -855,6 +855,12 @@ impl<'a> Engine<'a> {
         // the first `nc`); an unresolved argument continues with a
         // placeholder, so later arguments still evaluate.
         for arg in args {
+            // A named-argument value (the written `name:` label before
+            // it): the oracle's creation evaluation reports its failures
+            // through the value's own evaluation — an unresolved leaf
+            // collects `invalid_constant` (value.dart `genericError`),
+            // not the positional arm's argument face.
+            let named = self.named_argument_value(arg.span.offset);
             let verdict = eval(arg, self);
             match verdict {
                 Verdict::Value(_) | Verdict::Constant => {}
@@ -873,9 +879,15 @@ impl<'a> Engine<'a> {
                 // shorthand resolves against the context type upstream —
                 // under-report beside the declaration-root arm.
                 Verdict::Unresolved(span) => {
-                    if !self.dot_shorthand_context(span.offset) {
-                        self.emit(SemanticCode::ConstWithNonConstantArgument, span, "", "");
+                    if self.dot_shorthand_context(span.offset) {
+                        continue;
                     }
+                    let code = if named {
+                        SemanticCode::InvalidConstant
+                    } else {
+                        SemanticCode::ConstWithNonConstantArgument
+                    };
+                    self.emit(code, span, "", "");
                 }
                 Verdict::Fault(fault, span) => {
                     self.emit_const_fault(fault, span);
@@ -883,6 +895,127 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+    }
+
+    /// Whether the argument value starting at `offset` carries a written
+    /// `name:` label: the previous non-space character is a colon whose
+    /// left side is an identifier character.
+    fn named_argument_value(&self, offset: u32) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut i = self.byte_of(offset);
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i < 2 || bytes[i - 1] != b':' {
+            return false;
+        }
+        let before = bytes[i - 2];
+        before.is_ascii_alphanumeric() || before == b'_'
+    }
+
+    /// Whether the span's last character is `)` — the invocation shape
+    /// (`Missing()`) the set/map element suppression keys on.
+    fn span_ends_call(&self, span: SourceRange) -> bool {
+        let end = self.byte_of(span.end());
+        end > 0 && self.source.as_bytes()[end - 1] == b')'
+    }
+
+    /// Whether the annotated declaration following the metadata's `)` is a
+    /// type declaration (`class`/`enum`/`mixin`/`extension`/`typedef`,
+    /// behind any written modifiers): only those hosts' set/map literals
+    /// lose the call-element face (the probed host split — the oracle's
+    /// evaluation path owns the report on type declarations, the element
+    /// checks on every other host). Earlier metadata annotations and
+    /// comments are skipped.
+    fn annotation_host_is_type_declaration(&self, close: SourceRange) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut i = self.byte_of(close.end());
+        loop {
+            while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b';') {
+                i += 1;
+            }
+            if bytes[i..].starts_with(b"//") {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i..].starts_with(b"/*") {
+                i += 2;
+                while i + 1 < bytes.len() && !bytes[i..].starts_with(b"*/") {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+                continue;
+            }
+            if bytes.get(i) == Some(&b'@') {
+                i += 1;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric()
+                        || bytes[i] == b'_'
+                        || bytes[i] == b'$'
+                        || bytes[i] == b'.')
+                {
+                    i += 1;
+                }
+                if bytes.get(i) == Some(&b'<') {
+                    let mut depth = 0usize;
+                    while i < bytes.len() {
+                        match bytes[i] {
+                            b'<' => depth += 1,
+                            b'>' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    i += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                if bytes.get(i) == Some(&b'(') {
+                    let mut depth = 0usize;
+                    while i < bytes.len() {
+                        match bytes[i] {
+                            b'(' => depth += 1,
+                            b')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    i += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            break;
+        }
+        // The declaration keyword, behind any written class modifiers.
+        for _ in 0..4 {
+            let mut end = i;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
+            {
+                end += 1;
+            }
+            match &bytes[i..end] {
+                b"class" | b"enum" | b"mixin" | b"extension" | b"typedef" => return true,
+                b"abstract" | b"base" | b"final" | b"sealed" | b"interface" | b"augment" => {
+                    i = end;
+                }
+                _ => return false,
+            }
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+        }
+        false
     }
 
     /// Takes the capture stack's top node into the const-constructor
@@ -1044,6 +1177,13 @@ impl<'a> Engine<'a> {
     /// `top_is_literal_ctor` probe keeps a desynced slot from stashing an
     /// empty-args entry, which would adjudicate feasible).
     pub(crate) fn close_literal_ctor_args(&mut self, end: SourceRange) {
+        // The annotation window's own argument list closes through the
+        // same event (#2261): its head never became a capture operand (a
+        // metadata reference is not an expression), so the generic close
+        // drops the level unreported — the drain takes it here, ahead of
+        // the capture's own `end_arguments`, while the engine's argument
+        // level still holds the labels.
+        self.check_annotation_arguments(end);
         let Some(arm) = self.literal_ctor_arms.pop().flatten() else {
             return;
         };
@@ -1276,6 +1416,12 @@ impl<'a> Engine<'a> {
                     None
                 }
             };
+            // An element folding clean can still carry unresolved leaves
+            // deeper inside a resolved const creation's arguments (the
+            // corpus's `GenerateNodeProperty('element', type:
+            // ExtensionElementImpl)`): the oracle's creation evaluation
+            // reports the leaf itself and nothing above it (#2261).
+            self.check_invalid_constant_leaves(part.span);
             if let Some(span) = failed_at {
                 let info = code.code_info();
                 let repeat = self
@@ -1285,12 +1431,183 @@ impl<'a> Engine<'a> {
                     .rev()
                     .any(|d| d.range == span && d.code == info);
                 if !repeat {
-                    self.emit(code, span, "", "");
+                    if self.leaf_in_resolved_creation(span.offset) {
+                        // The failing leaf sits inside a resolved const
+                        // creation's argument list: the oracle reports the
+                        // leaf directly there and the literal's element
+                        // face never substitutes — the positional arm's
+                        // `const_with_non_constant_argument` already owns
+                        // the span, everything else is `invalid_constant`.
+                        if !self.const_arg_row_at(span) {
+                            self.emit(SemanticCode::InvalidConstant, span, "", "");
+                        }
+                    } else {
+                        self.emit(code, span, "", "");
+                        // A leaf under an open annotation window joins the
+                        // argument faces' pairing log (#2261); a set/map
+                        // element's own face rides retractable — the
+                        // type-declaration hosts' evaluation owns the
+                        // report there, decided at the annotation's close
+                        // (the element check has no host view).
+                        let retractable = matches!(
+                            code,
+                            SemanticCode::NonConstantSetElement
+                                | SemanticCode::NonConstantMapValue
+                                | SemanticCode::NonConstantMapKey
+                        ) && self.span_ends_call(span);
+                        self.const_capture.note_annotation_leaf(span, retractable);
+                    }
                 }
                 failed.get_or_insert(span);
             }
         }
         failed
+    }
+
+    /// The unresolved leaves (`Bare(Missing)` rows) under `span` that sit
+    /// inside a resolved const creation's argument list: the oracle
+    /// reports `invalid_constant` at the leaf (value.dart `genericError`
+    /// — an unevaluatable operand reaches the constant machinery there)
+    /// and marks the propagation avoid-reporting, so no enclosing literal
+    /// or declaration face substitutes (#2261).
+    fn check_invalid_constant_leaves(&mut self, span: SourceRange) {
+        let mut at = self.rows.partition_point(|row| row.range.offset < span.offset);
+        while let Some(row) = self.rows.get(at)
+            && row.range.offset < span.end()
+        {
+            at += 1;
+            if row.qualified
+                || row.range.end() > span.end()
+                || !matches!(row.shape, RowShape::Bare(BareInfo::Missing { .. }))
+            {
+                continue;
+            }
+            if self.const_arg_row_at(row.range) || !self.leaf_in_resolved_creation(row.range.offset)
+            {
+                continue;
+            }
+            self.emit(SemanticCode::InvalidConstant, row.range, "", "");
+        }
+    }
+
+    /// Whether a const-argument row (`const_with_non_constant_argument`
+    /// or `invalid_constant`) already reports at exactly `span` — the
+    /// positional arm of a resolved creation's argument check runs before
+    /// the literal closes, and the invalid-constant faces must not twin
+    /// it.
+    fn const_arg_row_at(&self, span: SourceRange) -> bool {
+        let infos = [
+            SemanticCode::ConstWithNonConstantArgument.code_info(),
+            SemanticCode::InvalidConstant.code_info(),
+        ];
+        self.report
+            .diagnostics
+            .iter()
+            .any(|d| d.range == span && infos.contains(&d.code))
+    }
+
+    /// Whether the leaf at `offset` sits inside a resolved const
+    /// creation's argument list: the innermost enclosing bracket is a `(`
+    /// whose head (the identifier before it, a `.selector`'s container
+    /// when one is written) resolves to a class carrying a const
+    /// constructor. Pure source reading — the capture's folds carry no
+    /// argument spans for the shapes the oracle keys on (value.dart
+    /// `genericError`'s `ArgumentList`-parent branch).
+    fn leaf_in_resolved_creation(&self, offset: u32) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut i = self.byte_of(offset);
+        let mut depth = 0usize;
+        while i > 0 {
+            let byte = bytes[i - 1];
+            i -= 1;
+            match byte {
+                b')' | b']' | b'}' => depth += 1,
+                b'(' | b'[' | b'{' => {
+                    if depth == 0 {
+                        return byte == b'(' && self.head_before_is_const_ctor(i);
+                    }
+                    depth -= 1;
+                }
+                b'\'' | b'"' => {
+                    // A string literal's interior: walk to its opening
+                    // quote so brackets inside never skew the depth.
+                    let quote = byte;
+                    while i > 0 {
+                        let previous = bytes[i - 1];
+                        i -= 1;
+                        if previous == quote && bytes.get(i.wrapping_sub(1)) != Some(&b'\\') {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Whether the identifier ending right before the bracket at byte
+    /// `paren` heads a const creation: `Head(` answers on the container's
+    /// const-ctor set, `Head.selector(` also requires the selector to
+    /// name a declared constructor (the oracle's
+    /// `ConstructorInvocation.isConst` reading — a non-const selector is
+    /// not a const creation). A two-dot prefix shape under-reports.
+    fn head_before_is_const_ctor(&self, paren: usize) -> bool {
+        let bytes = self.source.as_bytes();
+        let Some(ident_end) = self.ident_end_before(paren) else {
+            return false;
+        };
+        let head_start = self.ident_start_before(ident_end);
+        if head_start > 0 && bytes[head_start - 1] == b'.' {
+            let Some(container_end) = self.ident_end_before(head_start - 1) else {
+                return false;
+            };
+            if container_end > 0 && bytes[container_end - 1] == b'.' {
+                return false;
+            }
+            let container_start = self.ident_start_before(container_end);
+            let head_name = self.intern(&self.source[container_start..container_end]);
+            let Some(decl) = self.const_ctor_decl(head_name) else {
+                return false;
+            };
+            let selector = self.intern(&self.source[head_start..ident_end]);
+            return decl.constructors.contains(&selector);
+        }
+        let head_name = self.intern(&self.source[head_start..ident_end]);
+        self.const_ctor_target(head_name)
+    }
+
+    /// The byte index just past the identifier ending right before byte
+    /// `at` (whitespace between), `None` when no identifier is there.
+    fn ident_end_before(&self, at: usize) -> Option<usize> {
+        let bytes = self.source.as_bytes();
+        let mut end = at;
+        while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        if end == 0 {
+            return None;
+        }
+        let byte = bytes[end - 1];
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' {
+            Some(end)
+        } else {
+            None
+        }
+    }
+
+    /// The byte index where the identifier ending at `end` starts.
+    fn ident_start_before(&self, end: usize) -> usize {
+        let bytes = self.source.as_bytes();
+        let mut start = end;
+        while start > 0 {
+            let byte = bytes[start - 1];
+            if !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$') {
+                break;
+            }
+            start -= 1;
+        }
+        start
     }
 
     /// Whether an open argument level's callee is a constructor-initializer
@@ -1351,6 +1668,13 @@ impl<'a> Engine<'a> {
         end: SourceRange,
         kind: crate::const_eval::InstanceKind,
     ) {
+        // The ERROR-tier duplicate twins of a const literal (#2261): the
+        // capture staged this literal's parts at its close; the oracle's
+        // `visitSetOrMapLiteral` checks every `isConst` literal's keys
+        // and elements — after the element faces, at the value push.
+        if let Some((shape, _)) = self.const_capture.take_staged_dup(kind) {
+            self.check_const_duplicates(shape);
+        }
         match failed {
             Some(span) if !self.const_capture.in_arguments() => {
                 self.const_capture.push_non_constant(span);
@@ -1358,6 +1682,35 @@ impl<'a> Engine<'a> {
             _ => self
                 .const_capture
                 .push_value(end, ConstantValue::Instance(kind)),
+        }
+    }
+
+    /// The const-literal twin of [`Self::check_equal_duplicates`] (the
+    /// `visitSetOrMapLiteral` `isConst` branch,
+    /// constant_verifier.dart:430-475): the same later-part repeat
+    /// report under the ERROR-tier `equal_elements_in_const_set` /
+    /// `equal_keys_in_const_map` codes, at the later element's span. The
+    /// per-part [`Verdict::Value`] gate absorbs spread/if/for elements
+    /// (their folded operands never value) — the oracle's key-equality
+    /// walk skips them the same way.
+    fn check_const_duplicates(&mut self, shape: crate::const_eval::SetOrMap) {
+        use crate::const_eval::SetOrMap;
+        let (code, parts): (SemanticCode, Vec<crate::const_eval::Node>) = match shape {
+            SetOrMap::Set(elements) => (SemanticCode::EqualElementsInConstSet, elements),
+            SetOrMap::Map(entries) => (
+                SemanticCode::EqualKeysInConstMap,
+                entries.into_iter().map(|(key, _)| key).collect(),
+            ),
+        };
+        let mut seen: Vec<ConstantValue> = Vec::new();
+        for part in &parts {
+            if let Verdict::Value(v) = eval(part, self) {
+                if seen.contains(&v) {
+                    self.emit_with_correction(code, part.span);
+                } else {
+                    seen.push(v);
+                }
+            }
         }
     }
 
@@ -1403,6 +1756,298 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The annotation-argument faces (#2261): a RESOLVED const
+    /// constructor called in annotation position validates its arguments
+    /// (`constant_verifier.dart` `_validateConstantArguments` over the
+    /// annotation's invocation) against the argument-constancy and
+    /// argument-count faces, exactly like the initializer world's
+    /// creation check. The capture never holds the head (a metadata
+    /// reference is not an expression operand), so the drain re-reads
+    /// the written head from the source before the open paren and
+    /// resolves it through the container faces; the engine's still-open
+    /// argument level supplies the written labels (a named argument
+    /// whose label names no formal never pairs with the creation's
+    /// argument check — the official's evaluation reports the leaf
+    /// directly there, `invalid_constant` at the value).
+    fn check_annotation_arguments(&mut self, close: SourceRange) {
+        let Some((args, named)) = self.const_capture.take_annotation_args() else {
+            return;
+        };
+        // The engine's argument level still holds this list: flush its
+        // tail so the written labels align with the capture's arguments
+        // (the generic close runs the same flushes right after, and both
+        // are no-ops once flushed).
+        self.flush_unclaimed();
+        self.flush_argument();
+        let labels: Vec<(Option<StringId>, SourceRange)> = self
+            .arg_levels
+            .last()
+            .map(|level| {
+                level
+                    .args
+                    .iter()
+                    .map(|(name, _, _, range)| (*name, *range))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The literal-element leaves under this annotation's arguments are
+        // consumed here unconditionally — a nested annotation's own drain
+        // (its `(` closes first) already stripped its leaves, so what is
+        // left belongs to this window even when the alignment check below
+        // bails.
+        let leaves = self.const_capture.take_annotation_leaves(0, close.end());
+        let Some((head_range, head_name, selector)) = self.annotation_head_before(close) else {
+            return;
+        };
+        if labels.len() != args.len() {
+            return;
+        };
+        let Some(decl) = self.const_ctor_decl(head_name) else {
+            return;
+        };
+        let Some(formals) = decl.ctor_formals.get(&selector.unwrap_or(head_name)) else {
+            return;
+        };
+        // The argument-count faces: a deficit anchors at the annotation
+        // head, a surplus at the first extra positional argument (the
+        // probed `@P()` / `@P(1, 2, 3)` pairings).
+        let given = named.iter().filter(|flag| !**flag).count();
+        // Required-ness derives from the default value, not the stored
+        // flag alone: a required positional never carries one and an
+        // optional always does, while initializing formals (`this.a`)
+        // lose the parser's required classification upstream — the flag
+        // stays in the disjunction for the plain-formal worlds.
+        let required = formals
+            .positional
+            .iter()
+            .filter(|f| f.required || f.default_value.is_none())
+            .count();
+        if given < required {
+            let display = match selector {
+                Some(id) => format!(
+                    "{}.{}",
+                    self.strings.resolve(head_name),
+                    self.strings.resolve(id)
+                ),
+                None => format!("{}.new", self.strings.resolve(head_name)),
+            };
+            let (code, message) = if required == 1 {
+                let code = SemanticCode::NotEnoughPositionalArguments(ArgCountShape::NameSingular);
+                let message = code.message(&display, "");
+                (code, message)
+            } else {
+                let code = SemanticCode::NotEnoughPositionalArguments(ArgCountShape::NamePlural);
+                let message = code.message3(&required.to_string(), &given.to_string(), &display);
+                (code, message)
+            };
+            self.emit_message_with_correction(code, head_range, message);
+        } else if given > formals.positional.len() {
+            let capacity = formals.positional.len();
+            if let Some((arg, _)) = args
+                .iter()
+                .zip(named.iter())
+                .filter(|(_, flag)| !**flag)
+                .nth(capacity)
+            {
+                let code = SemanticCode::ExtraPositionalArguments;
+                let message = code.message(&capacity.to_string(), &given.to_string());
+                let surplus = self.literal_arg_span(arg.span);
+                self.emit_message_with_correction(code, surplus, message);
+            }
+        }
+        // The per-argument const check: each top-level argument evaluates
+        // against `const_with_non_constant_argument` (the `@P(g)` pairing);
+        // a named argument whose label names no formal reports
+        // `invalid_constant` at the value instead (the probed
+        // `Prop(name: Missing)` pairing), and a leading-dot shorthand stays
+        // silent beside its resolution rows.
+        for ((arg, flag), (label, _)) in args.iter().zip(named.iter()).zip(labels.iter()) {
+            let label_resolved = label.is_some_and(|n| formals.named.iter().any(|f| f.name == n));
+            let invalid_world = *flag && !label_resolved;
+            match eval(arg, self) {
+                Verdict::Value(_) | Verdict::Constant => {}
+                Verdict::NotConstant(span) => {
+                    if !self.const_arg_row_at(span) {
+                        self.emit(SemanticCode::ConstWithNonConstantArgument, span, "", "");
+                    }
+                }
+                Verdict::Unresolved(span) => {
+                    if self.dot_shorthand_context(span.offset) || self.const_arg_row_at(span) {
+                        continue;
+                    }
+                    let code = if invalid_world {
+                        SemanticCode::InvalidConstant
+                    } else {
+                        SemanticCode::ConstWithNonConstantArgument
+                    };
+                    self.emit(code, span, "", "");
+                }
+                Verdict::Fault(fault, span) => self.emit_const_fault(fault, span),
+            }
+        }
+        // The literal-element leaves the element check recorded under this
+        // annotation's arguments (the `@W([Missing])` pairing): the
+        // argument validation pairs its own face at each —
+        // `invalid_constant` when the leaf's label names no formal, the
+        // argument face otherwise. A leaf already owned by an
+        // `invalid_constant` row (inside a nested creation) stays
+        // single-reported, and a call-shaped set/map element face on a
+        // type-declaration host is retracted — the oracle's evaluation
+        // owns the report there (the probed `@T({Missing()}) class C {}`
+        // vs the enum/parameter hosts keeping it).
+        let host_is_type_declaration = self.annotation_host_is_type_declaration(close);
+        for (leaf, retractable) in leaves {
+            if retractable && host_is_type_declaration {
+                let codes = [
+                    SemanticCode::NonConstantSetElement.code_info(),
+                    SemanticCode::NonConstantMapValue.code_info(),
+                    SemanticCode::NonConstantMapKey.code_info(),
+                ];
+                self.report
+                    .diagnostics
+                    .retain(|d| !(d.range == leaf && codes.contains(&d.code)));
+            }
+            if self.const_arg_row_at(leaf) {
+                continue;
+            }
+            let invalid_world = labels
+                .iter()
+                .rev()
+                .find(|(_, range)| range.offset <= leaf.offset)
+                .and_then(|(name, _)| *name)
+                .is_some_and(|n| !formals.named.iter().any(|f| f.name == n));
+            let code = if invalid_world {
+                SemanticCode::InvalidConstant
+            } else {
+                SemanticCode::ConstWithNonConstantArgument
+            };
+            self.emit(code, leaf, "", "");
+        }
+    }
+
+    /// The written span of a literal argument value: the staged operand
+    /// anchors at the literal's close token, so the extension matches the
+    /// span's own opener and walks back through any enclosing ones (the
+    /// `[Missing()]` surplus anchor).
+    fn literal_arg_span(&self, span: SourceRange) -> SourceRange {
+        let bytes = self.source.as_bytes();
+        let mut start = self.byte_of(span.offset);
+        if start == 0 {
+            return span;
+        }
+        let mut closer = match bytes[start] {
+            b']' => b'[',
+            b')' => b'(',
+            b'}' => b'{',
+            _ => return span,
+        };
+        loop {
+            let mut depth = 0usize;
+            let mut i = start;
+            let open = loop {
+                if i == 0 {
+                    return span;
+                }
+                i -= 1;
+                match bytes[i] {
+                    b if b == closer && depth == 0 => break i,
+                    b']' | b')' | b'}' => depth += 1,
+                    b'[' | b'(' | b'{' => depth = depth.saturating_sub(1),
+                    _ => {}
+                }
+            };
+            start = open;
+            if start == 0 || !matches!(bytes[start - 1], b']' | b')' | b'}') {
+                break;
+            }
+            closer = match bytes[start - 1] {
+                b']' => b'[',
+                b')' => b'(',
+                _ => b'{',
+            };
+        }
+        SourceRange {
+            offset: self.utf16_of(start),
+            length: span.end().saturating_sub(self.utf16_of(start)),
+        }
+    }
+
+    /// The annotation head written before the argument list's open paren:
+    /// the bracket-matched `(`'s preceding identifier, its UTF-16 span
+    /// (the deficit face's anchor), and the written `.selector` when one
+    /// follows (`@P.named(...)` — a two-dot prefix shape under-reports).
+    fn annotation_head_before(
+        &self,
+        close: SourceRange,
+    ) -> Option<(SourceRange, StringId, Option<StringId>)> {
+        let bytes = self.source.as_bytes();
+        let mut i = self.byte_of(close.offset);
+        let mut depth = 0usize;
+        let open = loop {
+            if i == 0 {
+                return None;
+            }
+            i -= 1;
+            match bytes[i] {
+                b')' | b']' | b'}' => depth += 1,
+                b'(' => {
+                    if depth == 0 {
+                        break i;
+                    }
+                    depth -= 1;
+                }
+                b'[' | b'{' => {
+                    if depth == 0 {
+                        return None;
+                    }
+                    depth -= 1;
+                }
+                b'\'' | b'"' => i = self.string_open_before(i),
+                _ => {}
+            }
+        };
+        let Some(head_end) = self.ident_end_before(open) else {
+            return None;
+        };
+        let mut head_start = self.ident_start_before(head_end);
+        let mut head_text_end = head_end;
+        let mut selector = None;
+        if head_start > 0 && bytes[head_start - 1] == b'.' {
+            selector = Some(self.intern(&self.source[head_start..head_end]));
+            let Some(container_end) = self.ident_end_before(head_start - 1) else {
+                return None;
+            };
+            if container_end > 0 && bytes[container_end - 1] == b'.' {
+                return None;
+            }
+            head_text_end = container_end;
+            head_start = self.ident_start_before(container_end);
+        }
+        let head_name = self.intern(&self.source[head_start..head_text_end]);
+        let head_offset = self.utf16_of(head_start);
+        Some((
+            SourceRange {
+                offset: head_offset,
+                length: self.utf16_of(head_text_end).saturating_sub(head_offset),
+            },
+            head_name,
+            selector,
+        ))
+    }
+
+    /// The byte index of the opening quote ending the string literal whose
+    /// closing quote sits at `i` (best-effort: a failed walk lands at 0).
+    fn string_open_before(&self, mut i: usize) -> usize {
+        let bytes = self.source.as_bytes();
+        let quote = bytes[i];
+        while i > 0 {
+            i -= 1;
+            if bytes[i] == quote && bytes.get(i.wrapping_sub(1)) != Some(&b'\\') {
+                return i;
+            }
+        }
+        0
+    }
     /// Emits with the row's oracle `correctionMessage` (the plain
     /// [`Engine::emit`] passes none).
     pub(crate) fn emit_with_correction(&mut self, code: SemanticCode, range: SourceRange) {

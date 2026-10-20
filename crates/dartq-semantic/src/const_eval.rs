@@ -1647,6 +1647,8 @@ struct ArgLevel {
     mark: usize,
     named_pending: bool,
     args: Vec<Node>,
+    /// One namedness flag per flushed argument (same order as `args`).
+    named: Vec<bool>,
     /// `windows.len()` at open — an argument list is its window's own
     /// when no level of the same window remains below it.
     window_seq: usize,
@@ -1675,6 +1677,20 @@ pub struct ConstCapture {
     /// Latched stack lengths of open opaque groups (`await`, `new`,
     /// cascades, function literals): body debris truncates away.
     opaque_marks: Vec<usize>,
+    /// The const set/map literals whose parts await the ERROR-tier
+    /// duplicate check (#2261): staged at `literal_set_or_map`'s const
+    /// path, drained LIFO by the engine at the literal's value push
+    /// (the oracle's `visitSetOrMapLiteral` checks every `isConst`
+    /// literal, constant_verifier.dart:430-475).
+    staged_dups: Vec<(SetOrMap, SourceRange)>,
+    /// The element-check leaf spans recorded while an annotation window
+    /// was open (#2261): the annotation's argument faces consume them at
+    /// the window's own `(` close, pairing the const-argument face at
+    /// each leaf (the literal folds carry no argument spans for the
+    /// shapes the oracle keys on). The flag marks a set/map element face
+    /// that a type-declaration host retracts there (the probed host
+    /// split — the element check has no host view, the drain does).
+    annotation_leaves: Vec<(SourceRange, bool)>,
 }
 
 /// The closed argument list of a call whose const-ness the engine
@@ -1692,6 +1708,7 @@ pub struct ClosedArgs {
 
 /// The shape a set-or-map literal resolved to, with the parts whose
 /// const-ness the explicit window checks.
+#[derive(Clone, Debug)]
 pub enum SetOrMap {
     Set(Vec<Node>),
     Map(Vec<(Node, Node)>),
@@ -1734,6 +1751,8 @@ impl ConstCapture {
             string_interps: Vec::new(),
             string_marks: Vec::new(),
             opaque_marks: Vec::new(),
+            staged_dups: Vec::new(),
+            annotation_leaves: Vec::new(),
         }
     }
 
@@ -2552,7 +2571,100 @@ impl ConstCapture {
             return None;
         }
         let staged = self.pop_operands(count);
-        Some(split_set_or_map(staged, has_set_entry))
+        let shape = split_set_or_map(staged, has_set_entry);
+        // The const path stages the parts for the ERROR-tier duplicate
+        // check (#2261): the engine drains them at this literal's value
+        // push (`push_literal_value`), so the rows land beside the
+        // element faces. Non-const literals never reach here (the
+        // `close_non_const_dup` branch owns them upstream).
+        self.staged_dups.push((shape.clone(), span));
+        Some(shape)
+    }
+
+    /// Records an element-check leaf span while an annotation window is
+    /// open (the annotation-argument faces' pairing input, #2261); the
+    /// flag marks a retractable set/map element face.
+    pub fn note_annotation_leaf(&mut self, span: SourceRange, retractable: bool) {
+        if self.annotation_open() {
+            self.annotation_leaves.push((span, retractable));
+        }
+    }
+
+    /// Whether any annotation window is open.
+    pub fn annotation_open(&self) -> bool {
+        self.windows.iter().any(|w| w.kind == WindowKind::Annotation)
+    }
+
+    /// Takes every recorded leaf span, keeping only those inside
+    /// `[start, end)`; a nested annotation's own drain (its `(` closes
+    /// first) strips its leaves, so the outer window's drain sees only
+    /// its own — the LIFO close order makes the removal-all safe.
+    pub fn take_annotation_leaves(&mut self, start: u32, end: u32) -> Vec<(SourceRange, bool)> {
+        let (kept, taken) = self
+            .annotation_leaves
+            .drain(..)
+            .partition(|(span, _)| span.offset < start || span.end() > end);
+        self.annotation_leaves = kept;
+        taken
+    }
+
+    /// Pops the staged const-literal parts whose shape matches `want`
+    /// (the engine calls it at the literal's value push — LIFO pairs the
+    /// staging with its own literal; a mismatched top stays for recovery
+    /// worlds and only ever pairs a later same-kind push).
+    pub fn take_staged_dup(&mut self, want: InstanceKind) -> Option<(SetOrMap, SourceRange)> {
+        let matches_kind = self.staged_dups.last().is_some_and(|(shape, _)| {
+            matches!(
+                (want, shape),
+                (InstanceKind::Map, SetOrMap::Map(_)) | (InstanceKind::Set, SetOrMap::Set(_))
+            )
+        });
+        if matches_kind {
+            self.staged_dups.pop()
+        } else {
+            None
+        }
+    }
+
+    /// Takes the annotation window's own argument list: `Some((args,
+    /// named))` when the top window is an Annotation and its own
+    /// argument level is on top (the annotation head's `(`). The
+    /// engine's argument-list close calls it BEFORE the generic close so
+    /// the annotation-argument faces run in source order; the generic
+    /// close then finds no level and stays silent. The paren depth stays
+    /// here untouched — the generic close's unconditional decrement
+    /// balances the open. An INNER argument list's close (`@T(g())`)
+    /// shares the window and must leave both stacks be — the same
+    /// no-older-level-of-this-window test the generic close applies to
+    /// the creation kinds (end_arguments).
+    pub fn take_annotation_args(&mut self) -> Option<(Vec<Node>, Vec<bool>)> {
+        if !self
+            .windows
+            .last()
+            .is_some_and(|w| w.kind == WindowKind::Annotation)
+        {
+            return None;
+        }
+        let level_seq = self.args.last()?.window_seq;
+        if !self.args[..self.args.len() - 1]
+            .iter()
+            .all(|l| l.window_seq < level_seq)
+        {
+            return None;
+        }
+        self.apply_unaries_at(self.depth);
+        // Complete a trailing argument the listener has not flushed yet;
+        // a no-argument close flushes nothing (a bare flush would push a
+        // namedness flag without an argument behind it).
+        if self
+            .args
+            .last()
+            .is_some_and(|level| self.stack.len() > level.mark)
+        {
+            self.flush_argument();
+        }
+        let level = self.args.pop()?;
+        Some((level.args, level.named))
     }
 
     /// A map entry: stages key and value as one pseudo-operand.
@@ -2643,15 +2755,19 @@ impl ConstCapture {
             mark: self.stack.len(),
             named_pending: false,
             args: Vec::new(),
+            named: Vec::new(),
             window_seq: self.windows.len(),
         });
     }
 
-    /// A named-argument label (fires before the value).
+    /// A named-argument label. The listener's event lands after the
+    /// value's operands are staged (`NamedArgumentExpression` event
+    /// order), so only the namedness flag sets here — advancing the
+    /// operand floor would strand the value below it and drop it from
+    /// the level's arguments (the annotation-argument faces read it).
     pub fn named_argument(&mut self) {
         if let Some(level) = self.args.last_mut() {
             level.named_pending = true;
-            level.mark = self.stack.len();
         }
     }
 
@@ -2667,6 +2783,11 @@ impl ConstCapture {
         let Some(level) = self.args.last_mut() else {
             return;
         };
+        // One namedness flag per argument, in flush order — the
+        // annotation-argument faces read it (the official's
+        // `genericError` distinguishes the named value's leaf by the
+        // parameter resolution, value.dart:2550-2561).
+        level.named.push(level.named_pending);
         level.named_pending = false;
         let mark = level.mark;
         let mut nodes = self.stack.split_off(mark.min(self.stack.len()));
@@ -4545,7 +4666,7 @@ final Map<String, String> cur = {"A": "A", "B": "B", "C": "C"};
 /// arrives here bare with the receiver below it).
 #[cfg(test)]
 mod method_invocation_2194 {
-    use super::{ConstCapture, ConstantValue, Expr};
+    use super::ConstCapture;
     use dartq_source::{SourceRange, StringTable};
 
     fn span(offset: u32, end: u32) -> SourceRange {

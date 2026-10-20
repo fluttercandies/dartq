@@ -598,6 +598,19 @@ impl<'a> Engine<'a> {
                         )
                         .with_context(self.non_promotion_context_at(check.range.offset)),
                     );
+                } else if check.literal && self.known_non_bool(from) {
+                    // The staged non-`bool` candidate (a promotable read's
+                    // parse-time type): the flow's re-decided type still
+                    // names a non-`bool` — `non_bool_condition` reports at
+                    // the operand's own span.
+                    survivors.push(Diagnostic::new(
+                        SemanticCode::NonBoolCondition.severity(),
+                        SemanticCode::NonBoolCondition.code_info(),
+                        SemanticCode::NonBoolCondition.message("", ""),
+                        self.file,
+                        check.range,
+                        None,
+                    ));
                 }
                 continue;
             }
@@ -638,8 +651,17 @@ impl<'a> Engine<'a> {
                 StagedKind::Return {
                     ctor, is_async, ..
                 } => {
-                    let verdict =
-                        self.return_verdict(from, check.to, check.literal, is_async);
+                    // The declared return's verdict reads the alias's RHS
+                    // face (`typedef WhenComplete = void Function(...)?` —
+                    // `return null` is legal because the alias spells a
+                    // nullable function type); the diagnostic's display
+                    // still writes the spelled name (`check.to`).
+                    let verdict = self.return_verdict(
+                        from,
+                        self.fold_alias_ty(check.to),
+                        check.literal,
+                        is_async,
+                    );
                     if verdict.is_none() && ctor {
                         self.declared_subtype_negative(&from, &check.to)
                     } else {
@@ -1188,7 +1210,29 @@ impl<'a> Engine<'a> {
         // ([`Self::bind_declared_type`]): the verdict reads the resolved
         // interface type — `x is IntAlias` over an `int` operand is
         // constant-true.
-        let checked = self.fold_alias_ty(checked);
+        let mut checked = self.fold_alias_ty(checked);
+        // A prefixed `is p.T` arms the prefix token's name (the parser's
+        // `handle_type` anchors the qualified head at `p`, never `T`):
+        // `Named{p}` resolves to the import prefix, not a type. The real
+        // checked head is the continuation's own TypeUse row — the last
+        // type-use the `is` target pushed. Substituting it keeps the
+        // name-level verdict honest (`entity is io.Directory` reads
+        // `Directory`, not `io`); a non-prefixed target reads `checked`
+        // unchanged.
+        if let Ty::Named { name, .. } = checked
+            && matches!(self.resolve_bare(name).1, RefTarget::Prefix)
+            && let Some(row) = self
+                .rows
+                .iter()
+                .rev()
+                .find(|row| matches!(row.shape, RowShape::TypeUse(..)))
+        {
+            checked = Ty::Named {
+                name: row.name,
+                nullable: false,
+                args: ArgListId::EMPTY,
+            };
+        }
         let verdict = if checked == Ty::Dynamic {
             Some(true)
         } else if checked == Ty::Unknown {
@@ -1229,7 +1273,14 @@ impl<'a> Engine<'a> {
             } else {
                 Ty::Unknown
             };
-            if operand_ty == Ty::Unknown {
+            // A `p.T`-declared operand binds `Named{p}` (the same prefixed
+            // completion head): the prefix answers no subtype question, and
+            // the member the annotation really wrote is unrecoverable at
+            // this layer — the verdict stays silent (the under-report
+            // direction every unresolved side already takes).
+            if operand_ty == Ty::Unknown
+                || matches!(operand_ty, Ty::Named { name, .. } if matches!(self.resolve_bare(name).1, RefTarget::Prefix))
+            {
                 return;
             }
             // A non-matching pair is informative — the official order has
@@ -1294,6 +1345,25 @@ impl<'a> Engine<'a> {
         if row.ty != Ty::UNKNOWN {
             if let Ty::Function { shape, .. } = row.ty {
                 return self.boundary.pool().function_shape(shape).return_ty;
+            }
+            // The row keeps the callee's DECLARED type, never the send's
+            // result — a spelled named type that is a type alias's head
+            // (`Predicate<T> p` invoked as `p(x)`) or the bare `Function`
+            // interface (`Function findLocale` called `findLocale(x)`)
+            // answers nothing about the call: the alias head is
+            // undecidable when its RHS is unresolvable here (the verdict
+            // drops to the declared-return walk), and a bare `Function`
+            // send's static result is `dynamic` (the oracle's
+            // `Function.apply`-less face).
+            if let Ty::Named { name, .. } = row.ty {
+                if self.strings.resolve(name) == "Function" {
+                    return Ty::Dynamic;
+                }
+                if let Some(decl) = self.top_level_decl(name)
+                    && matches!(decl.kind, MicroKind::TypeAlias)
+                {
+                    return self.callee_return_ty(row);
+                }
             }
             return row.ty;
         }
@@ -1388,8 +1458,27 @@ impl<'a> Engine<'a> {
     }
 
     pub(crate) fn initializer_static_ty(&self, row: &Row) -> Option<Ty> {
-        if row.ty != Ty::UNKNOWN {
-            return Some(row.ty);
+        // A completed send's static type is the callee's RESULT, never
+        // the callee's declared type the row keeps (`var s = f(x)` infers
+        // `f`'s return — [`Self::operand_static_ty`] resolves it through
+        // the local-signature, alias, and declared-return faces).
+        if matches!(row.intent, Intent::Invoke) {
+            let ty = self.operand_static_ty(row);
+            if ty != Ty::UNKNOWN {
+                return Some(ty);
+            }
+        } else if row.ty != Ty::UNKNOWN {
+            // A `?.`-merged member read keeps the field's written type —
+            // the null-aware `?` the merge could not join (`x?.f` reads
+            // `f?`) re-arms here from the member's offset latch, so the
+            // inferred slot carries the nullable face (`var a = c?.id`
+            // keeps `a` nullable).
+            let ty = row.ty;
+            return Some(if self.null_aware_members.contains(&row.range.offset) {
+                Self::nullable_form(ty)
+            } else {
+                ty
+            });
         }
         let ty = match &row.shape {
             RowShape::Receiver(Receiver::This {
@@ -1509,14 +1598,36 @@ impl<'a> Engine<'a> {
         };
         let right_is_null = right.ty == Ty::Null && matches!(right.shape, RowShape::Value);
         let left_is_null = left.ty == Ty::Null && matches!(left.shape, RowShape::Value);
-        let operand = if right_is_null {
-            left
+        let (operand, null_row) = if right_is_null {
+            (left, right)
         } else if left_is_null {
-            right
+            (right, left)
         } else {
             return;
         };
-        let never_null = operand.ty.is_strictly_non_nullable()
+        // A `?.`-merged member operand keeps the field's written type —
+        // the null-aware `?` the merge could not join re-arms here from
+        // the member's offset latch (`x?.f != null` reads `f?`).
+        let operand_ty = if self.null_aware_members.contains(&operand.range.offset) {
+            Self::nullable_form(operand.ty)
+        } else {
+            operand.ty
+        };
+        // A type-parameter read (`T` with any bound) is never
+        // decided-never-null here: the official
+        // `isStrictlyNonNullable(TypeParameterType)` reads the bound, and
+        // a nullable bound (`T extends AstNodeImpl?`) answers false — the
+        // written name carries no bound at this layer, so the read
+        // suppresses (the under-report direction).
+        let strictly_non_null = match &operand_ty {
+            Ty::Named {
+                name,
+                nullable: false,
+                ..
+            } => !self.type_params.contains(name) && !self.pending_type_params.contains(name),
+            _ => operand_ty.is_strictly_non_nullable(),
+        };
+        let never_null = strictly_non_null
             || match &operand.shape {
                 RowShape::Receiver(Receiver::Super { .. }) => true,
                 // A `this` receiver answers through its written face: an
@@ -1536,7 +1647,21 @@ impl<'a> Engine<'a> {
         } else {
             SemanticCode::UnnecessaryNullComparisonFalse
         };
-        let range = operand.range;
+        // The oracle anchors at the operator-through-`null` extent (`==
+        // null` / `null ==`), never the compared operand alone.
+        let op = self
+            .trimmed_span(operand.range.end(), null_row.range.offset)
+            .or_else(|| self.trimmed_span(null_row.range.end(), operand.range.offset));
+        let range = match op {
+            Some(op) => {
+                let offset = op.offset.min(null_row.range.offset);
+                SourceRange {
+                    offset,
+                    length: op.end().max(null_row.range.end()) - offset,
+                }
+            }
+            None => operand.range,
+        };
         self.stage_usage(code, range, "");
     }
 
@@ -1849,11 +1974,38 @@ impl<'a> Engine<'a> {
         // (`begin_binary_expression`'s `mark_operator`); the right operand
         // is the last non-TypeUse row above it. Anything else between
         // them is debris the pass-2 walk still owes a verdict.
-        let Some(left_index) = self
+        let mut left_index = self
             .rows
             .iter()
-            .rposition(|row| matches!(row.intent, Intent::Operator(o, _) if o == op))
-        else {
+            .rposition(|row| matches!(row.intent, Intent::Operator(o, _) if o == op));
+        if left_index.is_none() {
+            // The statically-`bool` operators carry no mark
+            // (`mark_operator` only tags `USER_OPERATORS`) — the left
+            // operand is then the last row wholly before the operator: an
+            // interpolated-string right operand's inner reads end after
+            // the operator and never qualify. Without the fold the right
+            // operand stays on top and downstream type reads (`var`/
+            // `final` inference, `return`, enclosing conditions) see ITS
+            // type instead of `bool` — `flag = s == path` inferred the
+            // right operand's type and `if (x == '$a')` fired
+            // `non_bool_condition` on the literal row.
+            let bool_op = op == self.intern("==")
+                || op == self.intern("!=")
+                || op == self.intern("&&")
+                || op == self.intern("||")
+                || op == self.intern("<")
+                || op == self.intern(">")
+                || op == self.intern("<=")
+                || op == self.intern(">=");
+            if !bool_op {
+                return;
+            }
+            left_index = self.rows.iter().rposition(|row| {
+                !matches!(row.shape, RowShape::TypeUse(..))
+                    && row.range.end() <= op_range.offset
+            });
+        }
+        let Some(left_index) = left_index else {
             return;
         };
         let Some(right_index) = self
@@ -2366,7 +2518,22 @@ impl<'a> Engine<'a> {
                 None => None,
             }
             .unwrap_or(row.range);
-            if !self.const_capture.open() {
+            // A promotable read's parse-time non-`bool` type can still be
+            // promoted to `bool` by teardown (`dartValue is bool &&
+            // dartValue` — the promoted operand is the oracle's own
+            // silent face): stage for the flow join instead of emitting
+            // eagerly. The `literal` flag marks the non-`bool` candidate
+            // inside the nullable-condition kind (the staged kinds cannot
+            // grow here).
+            if self.local_hits.contains_key(&row.range.offset) {
+                self.staged_checks.push(StagedCheck {
+                    kind: StagedKind::NullableCondition,
+                    range: row.range,
+                    from: ty,
+                    to: Ty::UNKNOWN,
+                    literal: true,
+                });
+            } else if !self.const_capture.open() {
                 self.emit(SemanticCode::NonBoolCondition, anchor, "", "");
             }
             self.stage_condition_offset(row.range.offset);
@@ -2416,14 +2583,27 @@ impl<'a> Engine<'a> {
     }
 
     /// The known non-`bool` verdict of a condition operand's static type:
-    /// every named non-`bool` type and `null` report; `dynamic`, `Never`,
-    /// and unknown types are assignable-or-undecidable and stay silent.
-    /// `void` stays silent too — the oracle answers `use_of_void_result`
-    /// there instead (`bool_expression_verifier.dart:81` early-returns).
+    /// every named non-`bool` type, `null`, and function types report;
+    /// `dynamic`, `Never`, and unknown types are assignable-or-undecidable
+    /// and stay silent. A spelled type alias folds to its RHS face first —
+    /// an alias head whose RHS this layer cannot resolve (parameterized
+    /// or cross-file) is undecidable, not non-`bool`. `void` stays silent
+    /// too — the oracle answers `use_of_void_result` there instead
+    /// (`bool_expression_verifier.dart:81` early-returns).
     pub(crate) fn known_non_bool(&self, ty: Ty) -> bool {
         match ty {
-            Ty::Named { name, .. } => name != self.members.primitive_ids[3],
-            Ty::Null => true,
+            Ty::Named { .. } => match self.fold_alias_ty(ty) {
+                Ty::Named { name, .. } => {
+                    name != self.members.primitive_ids[3]
+                        && !matches!(
+                            self.top_level_decl(name).map(|decl| decl.kind),
+                            Some(MicroKind::TypeAlias)
+                        )
+                }
+                Ty::Function { .. } => true,
+                _ => false,
+            },
+            Ty::Function { .. } | Ty::Null => true,
             _ => false,
         }
     }
@@ -3025,5 +3205,153 @@ mod tests {
             report.diagnostics[0].message,
             "The getter 'isEven' isn't defined for the type 'Future'."
         );
+    }
+
+    /// A nullable-function-type alias expands carrying its RHS's trailing
+    /// `?` (`typedef W = void Function()?`): `return null` answers
+    /// assignable, no `return_of_invalid_type`. The direct-written form
+    /// (`void Function()? g()` → `return null`) already stayed silent —
+    /// the alias path expands through the captured RHS.
+    #[test]
+    fn nullable_function_alias_rhs_expands_nullable() {
+        let report = report(
+            "typedef W = void Function()?;\n\
+             W create() {\n\
+             \x20 return null;\n\
+             }\n\
+             void Function()? direct() {\n\
+             \x20 return null;\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// A type-parameter operand's `!= null` never decides never-null (the
+    /// bound's nullability is unmodeled at this layer; a nullable bound
+    /// `T extends B?` answers false officially): no
+    /// `unnecessary_null_comparison`.
+    #[test]
+    fn type_parameter_operand_suppresses_null_comparison() {
+        let report = report(
+            "class B {}\n\
+             class A {\n\
+             \x20 B? last;\n\
+             \x20 T f<T extends B?>(T t) {\n\
+             \x20\x20 if (t != null) {\n\
+             \x20\x20\x20 last = t;\n\
+             \x20\x20 }\n\
+             \x20\x20 return t;\n\
+             \x20 }\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// A `var`-inferred local bound from a typedef-typed formal's send
+    /// reads the signature's return — the alias's `C?` face — never the
+    /// formal's own declared type: `s != null` stays silent.
+    #[test]
+    fn typedef_call_inferred_local_keeps_nullable() {
+        let report = report(
+            "class C {}\n\
+             typedef P = C? Function();\n\
+             void g(P f) {\n\
+             \x20 var s = f();\n\
+             \x20 if (s != null) {}\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// A send on a function-typed formal with a nullable return carries
+    /// the signature's `C?` face to the `var`-inferred local — `n != null`
+    /// stays silent. Twin of the `typedef P` pin above; the bare
+    /// `Function` (dart:core) spelling is unreachable in this no-core
+    /// rig, so the inline `C? Function()` shape stands in for the
+    /// "signature's own return type wins" face.
+    #[test]
+    fn function_param_send_keeps_nullable_return() {
+        let report = report(
+            "class C {}\n\
+             void g(C? Function() find) {\n\
+             \x20 var n = find();\n\
+             \x20 if (n != null) {}\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// A `?.`-merged member read carries the null-aware `?` the merge
+    /// could not join — `var a = c?.id` keeps `a` nullable even over a
+    /// non-nullable field, so `a != null` stays silent.
+    #[test]
+    fn null_aware_member_read_stays_nullable() {
+        let report = report(
+            "class C { D id = D(); }\n\
+             class D {}\n\
+             void g(C? c) {\n\
+             \x20 var a = c?.id;\n\
+             \x20 if (a != null) {}\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// An interpolated-string left operand still folds `==` to `bool` —
+    /// the `USER_OPERATORS` gap never marked it, so the verdict used to
+    /// read the last interpolation child row instead of folding: the
+    /// condition stays silent.
+    #[test]
+    fn interp_left_operand_comparison_folds_bool() {
+        let report = report(
+            "class C {}\n\
+             void g(C x, C y) {\n\
+             \x20 if ('a${x}b' == y) {}\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// `e is Sub` over the operand's own subtype family is a narrowing
+    /// test, not a constant — no `unnecessary_type_check`.
+    #[test]
+    fn sibling_type_check_stays_silent() {
+        let report = report(
+            "class FSE {}\n\
+             class Dir implements FSE {}\n\
+             void g(FSE e) {\n\
+             \x20 if (e is Dir) {}\n\
+             }",
+        );
+        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+    }
+
+    /// A non-async body under a non-nullable `FutureOr<void>` return type
+    /// stays silent (the union's void base admits a normal completion),
+    /// while the `FutureOr<K>` sibling is potentially non-nullable and
+    /// reports the ERROR twin. The `FutureOr`/`K` spellings are locally
+    /// declared — the no-core rig reaches dart:core through declarations
+    /// only, and the engine's FutureOr identity keys on the name.
+    #[test]
+    fn future_or_void_body_stays_silent() {
+        let report = report(
+            "class FutureOr<T> {}\n\
+             class K {}\n\
+             class C {\n\
+             \x20 FutureOr<void> write(K k) {\n\
+             \x20\x20 k = K();\n\
+             \x20 }\n\
+             \x20 FutureOr<K> compute(K k) {\n\
+             \x20\x20 k = K();\n\
+             \x20 }\n\
+             }",
+        );
+        assert_eq!(
+            code_names(&report),
+            ["body_might_complete_normally"],
+            "{:?}",
+            code_names(&report)
+        );
+        assert_eq!(report.diagnostics[0].range.offset > 0, true);
     }
 }

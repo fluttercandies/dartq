@@ -818,6 +818,19 @@ pub enum SemanticCode {
     /// map literal (same verifier site, reported at the later key); map
     /// values never participate. `messages.yaml` :26951.
     EqualKeysInMap,
+    // —— #2261: the const-literal ERROR twins (`COMPILE_TIME_ERROR`) ————————
+    /// `Two elements in a constant set literal can't be equal.` — a CONST
+    /// set literal (explicit `const` or implicitly const through an
+    /// annotation argument / const declaration) whose later top-level
+    /// element constant-evaluates to a value an earlier element already
+    /// produced (`visitSetOrMapLiteral`'s `isConst` branch,
+    /// constant_verifier.dart:430-475, reported at the later element).
+    /// `messages.yaml` :5870-5874.
+    EqualElementsInConstSet,
+    /// `Two keys in a constant map literal can't be equal.` — the same
+    /// predicate over each entry's KEY of a const map literal (same
+    /// verifier site, reported at the later key). `messages.yaml` :5905.
+    EqualKeysInConstMap,
     // —— #748: the W5 member-invocation pair (all `STATIC_WARNING`) —————————
     /// `The parameter type of '==' operators should be non-nullable.` — an
     /// `==` operator whose single parameter's written type is `Object?`
@@ -1660,6 +1673,13 @@ impl SemanticCode {
             // `hasPublishedDocs: true`).
             Self::EqualElementsInSet => ("equal_elements_in_set", "EQUAL_ELEMENTS_IN_SET"),
             Self::EqualKeysInMap => ("equal_keys_in_map", "EQUAL_KEYS_IN_MAP"),
+            // The #2261 const twins (`messages.yaml` :5870/:5905 — both
+            // `type: compileTimeError`).
+            Self::EqualElementsInConstSet => (
+                "equal_elements_in_const_set",
+                "EQUAL_ELEMENTS_IN_CONST_SET",
+            ),
+            Self::EqualKeysInConstMap => ("equal_keys_in_const_map", "EQUAL_KEYS_IN_CONST_MAP"),
             // The #748 W5 pair (diagnostic.g.dart :13184-13191 and
             // :17517-17523 — both `hasPublishedDocs: true`).
             Self::NonNullableEqualsParameter => (
@@ -2454,6 +2474,14 @@ impl SemanticCode {
             Self::EqualKeysInMap => {
                 "Two keys in a map literal shouldn't be equal.".to_string()
             }
+            // The #2261 const twins: no-argument rows, verbatim
+            // (messages.yaml :5873 and :5906).
+            Self::EqualElementsInConstSet => {
+                "Two elements in a constant set literal can't be equal.".to_string()
+            }
+            Self::EqualKeysInConstMap => {
+                "Two keys in a constant map literal can't be equal.".to_string()
+            }
             // The #748 W5 pair: no-argument rows, verbatim
             // (diagnostic.g.dart :13186 and :17518).
             Self::NonNullableEqualsParameter => {
@@ -3048,6 +3076,14 @@ impl SemanticCode {
                 Some("Change or remove the duplicate element.".to_string())
             }
             Self::EqualKeysInMap => Some("Change or remove the duplicate key.".to_string()),
+            // The #2261 const twins' verbatim oracle correctionMessages
+            // (messages.yaml :5874 and :5907).
+            Self::EqualElementsInConstSet => {
+                Some("Change or remove the duplicate element.".to_string())
+            }
+            Self::EqualKeysInConstMap => {
+                Some("Change or remove the duplicate key.".to_string())
+            }
             // The #748 W5 pair's verbatim oracle correctionMessages
             // (diagnostic.g.dart :13187 and :17519).
             Self::NonNullableEqualsParameter => {
@@ -4168,7 +4204,9 @@ mod tests {
             | SemanticCode::DuplicateDefinition
             | SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded
             | SemanticCode::EnumWithoutConstants
+            | SemanticCode::EqualElementsInConstSet
             | SemanticCode::EqualElementsInSet
+            | SemanticCode::EqualKeysInConstMap
             | SemanticCode::EqualKeysInMap
             | SemanticCode::ExpectedRepresentationType
             | SemanticCode::ExtensionOverrideArgumentNotAssignable

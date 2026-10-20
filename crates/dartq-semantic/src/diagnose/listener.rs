@@ -6509,6 +6509,11 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().end_function_type(function, question);
         self.engine.var_end_function_type(question.is_some());
         self.engine.fn_capture_end(question.is_some());
+        // The #1351 capture: a typedef RHS function type's own close
+        // latches its nullability suffix (`typedef W = void Function()?;`
+        // expands nullable); a nested function-typed formal's close is
+        // not the RHS's own and leaves the latch alone.
+        self.engine.bounds.alias_rhs_question(question.is_some());
     }
 
     fn end_function_typed_formal_parameter(&mut self, token: Token, question: Option<Token>) {
