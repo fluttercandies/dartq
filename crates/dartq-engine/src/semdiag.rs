@@ -79,16 +79,17 @@ use dartq_language::Feature;
 use dartq_parser::ParserFeatures;
 use dartq_resolution::LibraryClassModifiers;
 use dartq_semantic::{
-    ElementIndex, ExportUseFace, ImportUseFace, LibraryUsages, StrictModes, UnitUseFace,
+    ElementIndex, ExportUseFace, ImportUseFace, LibraryUsages, LibraryUseSet, StrictModes,
+    UnitUseFace,
 };
 use dartq_source::{ContentId, FileId, LineIndex, SourceRange, StringId, StringTable};
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::PoisonError;
 
 use crate::l1;
 use crate::pipeline::ResolvedGraph;
-use crate::state::{EngineState, FactsKey, ScannedFace, UnitFacts};
+use crate::state::{DirectiveKind, EngineState, FactsKey, ScannedFace, UnitFacts};
 use crate::{LibraryView, SemanticDiagnoser};
 
 // Test-only build counter for the #775 sharing pin: counting invocations
@@ -118,6 +119,14 @@ fn unused_element_name() -> &'static str {
         .name
 }
 
+/// The `unused_import` code name — the other family the library-wide close
+/// re-decides (see [`MemberFold::unused_imports`]).
+fn unused_import_name() -> &'static str {
+    dartq_semantic::codes::SemanticCode::UnusedImport
+        .code_info()
+        .name
+}
+
 /// The declaration name an `unused_element` row's verdict tested: the
 /// written spelling at the row's anchor — the declaration-name token the
 /// per-file pass anchored on (a named constructor's rewritten selector, a
@@ -135,6 +144,239 @@ fn staged_decl_name(
     let start = index.utf16_to_byte(text, range.offset);
     let end = index.utf16_to_byte(text, range.end());
     strings.intern(text.get(start as usize..end as usize).unwrap_or_default())
+}
+
+/// Releases the staged `unused_import` rows whose import the library's
+/// merged faces credit (#2251). The per-file pass fired each row against
+/// its own unit's use set only; the oracle's `ImportsTracking` is
+/// library-scoped — a `part of` file's uses resolve through the library
+/// scope and spare the importing library's imports, and a `[Name]`
+/// doc-comment reference spares the import that provides `Name` (probed:
+/// dart analyze 3.13.1 — a `///` or `/**` mention spares, a plain `//`
+/// does not, a member selector `[Alpha.two]` spares through its first
+/// segment, a prefix ref `[a.Alpha]` spares the prefixed import, a `show`
+/// combinator gates the credit, and a library-local declaration shadows
+/// the import so the row stays).
+///
+/// Each row maps to its import directive through the defining file's
+/// directive facts (the row anchors the URI literal, the facts carry the
+/// same span), then to its graph edge positionally — the same alignment
+/// `report_unused_imports` runs, implicit `dart:core` prelude excluded.
+/// An unmappable row (count mismatch, unknown span) stays reported: the
+/// mapping can only under-release, never over-release.
+fn release_unused_imports(
+    library: &LibraryView<'_>,
+    staged: Vec<Arc<Diagnostic>>,
+    doc_refs: &[StringId],
+    consumed: &LibraryUseSet,
+    out: &mut Vec<Arc<Diagnostic>>,
+) {
+    if staged.is_empty() {
+        return;
+    }
+    // Unused imports anchor in the defining file: part files carry no
+    // import directives (`files` is defining first, then parts).
+    let defining = &library.facts[&library.files[0]];
+    let imports: Vec<&crate::state::DirectiveFacts> = defining
+        .directives
+        .iter()
+        .filter(|d| d.kind == DirectiveKind::Import)
+        .collect();
+    let mut edges = library.graph.import_edges(library.graph_library);
+    // The implicit prelude edge is exactly one leading entry (the merge
+    // inserts it before every written edge), targets `dart:core`, and
+    // carries no prefix, no deferral, and no combinator clauses — the
+    // alignment predicate `report_unused_imports` runs, copied verbatim.
+    if edges.len() == imports.len() + 1
+        && edges.first().is_some_and(|edge| {
+            edge.prefix.is_none()
+                && !edge.deferred
+                && edge.combinators.written().next().is_none()
+                && edge
+                    .target
+                    .is_some_and(|t| library.graph.uri(t) == "dart:core")
+        })
+    {
+        edges = &edges[1..];
+    }
+    if edges.len() != imports.len() {
+        out.extend(staged);
+        return;
+    }
+    // The library's own declarations shadow every import for the whole
+    // library (the scope chain resolves locals before imports), so a pool
+    // name spelled as a local declaration cannot credit an import — the
+    // local-shadow probe keeps such rows reported.
+    let mut own = FxHashSet::default();
+    for &file in library.files {
+        let elements = &library.facts[&file].elements;
+        own.extend(elements.declarations().map(|(name, _)| name));
+        own.extend(elements.containers().map(|(name, _)| name));
+    }
+    'rows: for row in staged {
+        let Some(index) = imports
+            .iter()
+            .enumerate()
+            .find(|(_, d)| d.uri_span == row.range)
+            .map(|(index, _)| index)
+        else {
+            out.push(row);
+            continue;
+        };
+        let edge = &edges[index];
+        let Some(target) = edge.target else {
+            out.push(row);
+            continue;
+        };
+        // The per-file pass never stages a `dart:core` or unresolved
+        // target; reaching one here means the positional mapping slipped.
+        if library.graph.uri(target) == "dart:core" {
+            out.push(row);
+            continue;
+        }
+        if let Some(prefix) = edge.prefix {
+            // A prefixed use anywhere in the library credits the prefix
+            // (the prefix namespace holds only the import's exports — no
+            // local shadowing applies); a doc reference spelled through
+            // the prefix credits the same way.
+            if consumed.used.contains(&prefix) || doc_refs.contains(&prefix) {
+                continue;
+            }
+            out.push(row);
+            continue;
+        }
+        // Unprefixed: any merged use or doc-reference spelling the target
+        // exports under this directive's combinators credits the import.
+        let credited = consumed
+            .used
+            .iter()
+            .copied()
+            .chain(doc_refs.iter().copied())
+            .filter(|name| !own.contains(name))
+            .any(|name| {
+                edge.combinators.allows(name)
+                    && library.graph.exported(target, name).is_some()
+            });
+        if credited {
+            continue 'rows;
+        }
+        out.push(row);
+    }
+}
+
+/// The doc-comment reference spellings of one compilation unit (#2251):
+/// every identifier that opens a bracketed reference in a `///` line doc
+/// or a `/**` block doc, first segment only (`[Alpha.two]` contributes
+/// `Alpha` — the selector's member half resolves against the first
+/// segment's element). Plain `//` comments contribute nothing, block
+/// comments nest, and a `\[` escape is not a reference. The scan is
+/// spelling-level over the unit text: the oracle's full dartdoc comment
+/// resolution (markdown link exclusion, constructor anchors, parameter
+/// scopes) is out of scope for the import-credit parity this drives.
+///
+/// Returns the deduplicated, sorted name ids — the fold's memoized form.
+fn doc_reference_names(text: &str, strings: &StringTable) -> Box<[StringId]> {
+    let bytes = text.as_bytes();
+    let mut names = FxHashSet::default();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                if bytes.get(i + 2) == Some(&b'/') {
+                    // A `///` line doc: the reference text runs to EOL.
+                    let end = bytes[i..]
+                        .iter()
+                        .position(|&b| b == b'\n')
+                        .map_or(bytes.len(), |line_feed| i + line_feed);
+                    scan_bracket_refs(&text[i + 3..end], strings, &mut names);
+                    i = end;
+                } else {
+                    // A plain line comment: its text never credits.
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let doc = bytes.get(i + 2) == Some(&b'*') && bytes.get(i + 3) != Some(&b'/');
+                let body = if doc { i + 3 } else { i + 2 };
+                // Walk to the matching `*/`, nesting on `/*` — the
+                // scanner's block-comment depth rule.
+                let (body_end, comment_end) = block_comment_span(bytes, body);
+                if doc {
+                    let end = body_end.min(text.len());
+                    scan_bracket_refs(&text[body..end], strings, &mut names);
+                }
+                i = comment_end;
+            }
+            _ => i += 1,
+        }
+    }
+    let mut sorted: Vec<StringId> = names.into_iter().collect();
+    sorted.sort_unstable();
+    sorted.into_boxed_slice()
+}
+
+/// The span of one block comment's body from `bytes[start..]`: the index
+/// of the `*` closing the outermost `*/` and the index past the comment's
+/// final `/`. An unterminated comment runs to the text end.
+fn block_comment_span(bytes: &[u8], start: usize) -> (usize, usize) {
+    let mut depth = 1usize;
+    let mut j = start;
+    while j + 1 < bytes.len() {
+        if bytes[j] == b'/' && bytes[j + 1] == b'*' {
+            depth += 1;
+            j += 2;
+        } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+            depth -= 1;
+            if depth == 0 {
+                return (j, j + 2);
+            }
+            j += 2;
+        } else {
+            j += 1;
+        }
+    }
+    (bytes.len(), bytes.len())
+}
+
+/// The bracketed reference spellings of one doc text region into `names`:
+/// `[`, then an optional `new ` keyword, then an identifier — the first
+/// segment before any `.`/selector. A backslash-escaped `[` is markdown
+/// text, not a reference.
+fn scan_bracket_refs(text: &str, strings: &StringTable, names: &mut FxHashSet<StringId>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'[' {
+            i += 1;
+            continue;
+        }
+        let escaped = i > 0 && bytes[i - 1] == b'\\';
+        i += 1;
+        if escaped {
+            continue;
+        }
+        if text[i..].starts_with("new")
+            && text[i + 3..]
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_whitespace())
+        {
+            i += 4;
+        }
+        let start = i;
+        while i < bytes.len()
+            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+        {
+            i += 1;
+        }
+        let valid = start < i
+            && (bytes[start].is_ascii_alphabetic() || bytes[start] == b'_' || bytes[start] == b'$');
+        if valid {
+            names.insert(strings.intern(&text[start..i]));
+        }
+    }
 }
 
 /// The analyze's element index: every resident file's model enters as an
@@ -293,11 +535,24 @@ pub(crate) struct FoldInputs {
 /// spares a declaration in every other file. The candidate rows ride the
 /// fold with the declaration name their verdict tested, and the library
 /// close releases only those the merged set still shows unused.
+///
+/// The `unused_import` split is the import-credit close (#2251): the
+/// per-file pass fires against its own unit's use set, but the oracle's
+/// `ImportsTracking` runs against the library — a use in a `part of` file
+/// resolves through the library scope, so it spares the importing
+/// library's imports (library_analyzer.dart:305-315 shape, imports
+/// edition). Doc-comment references credit too (the dartdoc reference
+/// machinery): a `[Name]` in a `///`/`/**` doc resolves through the
+/// library scope and spares the import that provides `Name`. The rows
+/// ride the fold and the library close re-decides them against the
+/// merged library pool.
 pub(crate) struct MemberFold {
     inputs: FoldInputs,
     content: ContentId,
     diagnostics: Arc<[Arc<Diagnostic>]>,
     unused: Arc<[(Arc<Diagnostic>, StringId)]>,
+    unused_imports: Arc<[Arc<Diagnostic>]>,
+    doc_refs: Box<[StringId]>,
     face: CompactUseFace,
 }
 
@@ -321,6 +576,8 @@ impl MemberFold {
         size_of::<Self>()
             + self.diagnostics.len() * size_of::<Arc<Diagnostic>>()
             + self.unused.len() * size_of::<(Arc<Diagnostic>, StringId)>()
+            + self.unused_imports.len() * size_of::<Arc<Diagnostic>>()
+            + self.doc_refs.len() * size_of::<StringId>()
             + self.face.heap_bytes()
     }
 }
@@ -462,6 +719,13 @@ impl SemanticDiagnoser for Diagnoser {
         // paths (fresh and memo-served — the split is part of the memoized
         // product), released after the close.
         let mut staged: Vec<(Arc<Diagnostic>, StringId)> = Vec::new();
+        // The import-credit staging (#2251) plus the per-unit doc-reference
+        // names: the close's credit pool re-decides the staged
+        // `unused_import` rows against the library-merged use set and every
+        // member's doc-comment `[Name]` spellings.
+        let mut staged_imports: Vec<Arc<Diagnostic>> = Vec::new();
+        let mut doc_refs: Vec<StringId> = Vec::new();
+        let unused_import = unused_import_name();
         for &file in library.files {
             let facts = &library.facts[&file];
             // The member-level memo (#1384): a member whose identity inputs
@@ -476,6 +740,8 @@ impl SemanticDiagnoser for Diagnoser {
                         .iter()
                         .map(|(row, name)| (Arc::clone(row), *name)),
                 );
+                staged_imports.extend(fold.unused_imports.iter().cloned());
+                doc_refs.extend(fold.doc_refs.iter().copied());
                 usages.add_unit(library.graph_library, fold.face.expand());
                 continue;
             }
@@ -557,6 +823,7 @@ impl SemanticDiagnoser for Diagnoser {
             // clone, never fresh bytes.
             let mut live: Vec<Arc<Diagnostic>> = Vec::new();
             let mut candidates: Vec<(Arc<Diagnostic>, StringId)> = Vec::new();
+            let mut import_rows: Vec<Arc<Diagnostic>> = Vec::new();
             for diagnostic in report.diagnostics {
                 if diagnostic.code.name == duplicate {
                     continue;
@@ -570,10 +837,18 @@ impl SemanticDiagnoser for Diagnoser {
                         library.strings,
                     );
                     candidates.push((row, name));
+                } else if row.code.name == unused_import {
+                    import_rows.push(row);
                 } else {
                     live.push(row);
                 }
             }
+            // The doc-reference names ride the fold (#2251): the scan reads
+            // the unit's own text once per fold and the memo serves it —
+            // the close's credit pool is library-wide, so a part's docs
+            // spare the importing library's imports too.
+            let doc_names = doc_reference_names(text, library.strings);
+            doc_refs.extend(doc_names.iter().copied());
             out.extend(live.iter().cloned());
             // The memo owns the rows; the staging holds refcount bumps
             // released at the close below.
@@ -582,6 +857,7 @@ impl SemanticDiagnoser for Diagnoser {
                     .iter()
                     .map(|(row, name)| (Arc::clone(row), *name)),
             );
+            staged_imports.extend(import_rows.iter().cloned());
             // The memo keeps the compact form; the live face moves into the
             // substrate as-is (no clone on the fresh path).
             let compact = CompactUseFace::of(&face);
@@ -593,6 +869,8 @@ impl SemanticDiagnoser for Diagnoser {
                     content: facts.content,
                     diagnostics: live.into(),
                     unused: candidates.into(),
+                    unused_imports: import_rows.into(),
+                    doc_refs: doc_names,
                     face: compact,
                 },
             );
@@ -610,6 +888,7 @@ impl SemanticDiagnoser for Diagnoser {
                 .into_iter()
                 .filter_map(|(row, name)| (!consumed.used(name)).then_some(row)),
         );
+        release_unused_imports(&library, staged_imports, &doc_refs, &consumed, out);
     }
 }
 
@@ -1398,5 +1677,295 @@ mod tests {
         );
         assert_matches_wholesale(&root, &engine, &current, &out);
         assert_eq!(unused_rows(&engine, &out), unused, "served == fresh");
+    }
+
+    /// The unused-import rows of one analyze output: (path, message) pairs
+    /// in emission order.
+    fn unused_import_rows(
+        engine: &Engine,
+        rows: &[Diagnostic],
+    ) -> Vec<(String, String)> {
+        rows.iter()
+            .filter(|row| row.code.name == unused_import_name())
+            .map(|row| {
+                (
+                    engine
+                        .file_table()
+                        .path(row.file)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                    row.message.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Sets a fresh multi-file workspace, analyzes it whole, and returns
+    /// the engine (for path resolution) with the merged diagnostics.
+    fn analyze_files(
+        root: &Path,
+        files: &[(&str, &str)],
+    ) -> (Engine, Vec<Diagnostic>) {
+        let mut engine = memo_engine(root);
+        for (relative, content) in files {
+            engine.set_content(&root.join(relative), content.as_bytes());
+        }
+        let out = engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        (engine, out)
+    }
+
+    /// The import-credit close (#2251), doc-reference face: a `[Name]`
+    /// mention in a `///` doc spares the import that exports `Name` — the
+    /// oracle's dartdoc reference machinery credits the import (probed:
+    /// dart analyze 3.13.1 keeps the import silent). The controls stay
+    /// reported: no mention at all, a plain `//` comment, and a
+    /// `show`-combinator gate on a name the doc does not spell.
+    #[test]
+    fn doc_reference_spares_the_import_and_controls_stay() {
+        let root = memo_workspace();
+        let widget = "class Widget {}\n";
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "import 'other.dart';\n\n/// Docs mention [Widget].\nclass Local {}\n",
+                ),
+                ("lib/other.dart", widget),
+            ],
+        );
+        assert!(
+            unused_import_rows(&engine, &out).is_empty(),
+            "the doc mention must spare the import: {:?}",
+            unused_import_rows(&engine, &out)
+        );
+
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                ("lib/main.dart", "import 'other.dart';\n\nclass Local {}\n"),
+                ("lib/other.dart", widget),
+            ],
+        );
+        assert_eq!(
+            unused_import_rows(&engine, &out).len(),
+            1,
+            "the no-mention control reports"
+        );
+
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "import 'other.dart';\n\n// A plain comment: [Widget].\nclass Local {}\n",
+                ),
+                ("lib/other.dart", widget),
+            ],
+        );
+        assert_eq!(
+            unused_import_rows(&engine, &out).len(),
+            1,
+            "a plain comment never credits"
+        );
+
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "import 'other.dart' show Local;\n\n/// Docs mention [Widget].\nclass Local {}\n",
+                ),
+                ("lib/other.dart", widget),
+            ],
+        );
+        assert_eq!(
+            unused_import_rows(&engine, &out).len(),
+            1,
+            "the combinator gates the doc credit: the shown name is not spelled"
+        );
+
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "import 'other.dart';\n\n/** Block docs mention [Widget]. */\nclass Local {}\n",
+                ),
+                ("lib/other.dart", widget),
+            ],
+        );
+        assert!(
+            unused_import_rows(&engine, &out).is_empty(),
+            "a block doc credits like a line doc: {:?}",
+            unused_import_rows(&engine, &out)
+        );
+    }
+
+    /// The doc credit resolves the reference's first segment (`[W.make]`
+    /// contributes `W`) and honors the prefix spelling of a prefixed
+    /// import; a library-local declaration shadows the import's spelling,
+    /// so the row stays (the scope chain resolves locals before imports).
+    #[test]
+    fn doc_reference_segments_prefixes_and_shadowing() {
+        let root = memo_workspace();
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "import 'other.dart';\n\n/// See [Widget.make] for the factory.\nclass Local {}\n",
+                ),
+                ("lib/other.dart", "class Widget {\n  Widget make() => this;\n}\n"),
+            ],
+        );
+        assert!(
+            unused_import_rows(&engine, &out).is_empty(),
+            "the member selector credits through its first segment: {:?}",
+            unused_import_rows(&engine, &out)
+        );
+
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "import 'other.dart' as o;\n\n/// See [o.Widget].\nclass Local {}\n",
+                ),
+                ("lib/other.dart", "class Widget {}\n"),
+            ],
+        );
+        assert!(
+            unused_import_rows(&engine, &out).is_empty(),
+            "a prefixed doc reference credits the prefixed import: {:?}",
+            unused_import_rows(&engine, &out)
+        );
+
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "import 'other.dart';\n\nclass Widget {}\n\n/// Docs mention [Widget] — the local one.\nclass Local {}\n",
+                ),
+                ("lib/other.dart", "class Widget {}\n"),
+            ],
+        );
+        assert_eq!(
+            unused_import_rows(&engine, &out).len(),
+            1,
+            "the local declaration shadows: the reference never consulted the import"
+        );
+    }
+
+    /// The import-credit close, part-file face (#2251): a `part of` file's
+    /// uses resolve through the library scope, so a code use in the part
+    /// spares the importing library's import — a doc mention in the part
+    /// likewise, a prefixed use in the part spares the prefixed import,
+    /// and the no-use control stays reported.
+    #[test]
+    fn part_file_uses_credit_the_library_imports() {
+        let root = memo_workspace();
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "import 'other.dart';\n\npart 'p.dart';\n\nvoid main() {}\n",
+                ),
+                ("lib/p.dart", "part of 'main.dart';\n\nint use() => 0;\n"),
+                ("lib/other.dart", "class Widget {}\n"),
+            ],
+        );
+        assert_eq!(
+            unused_import_rows(&engine, &out).len(),
+            1,
+            "the no-use control reports"
+        );
+
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "import 'other.dart';\n\npart 'p.dart';\n\nvoid main() {}\n",
+                ),
+                (
+                    "lib/p.dart",
+                    "part of 'main.dart';\n\nWidget make() => Widget();\n",
+                ),
+                ("lib/other.dart", "class Widget {}\n"),
+            ],
+        );
+        assert!(
+            unused_import_rows(&engine, &out).is_empty(),
+            "the part's code use spares the library's import: {:?}",
+            unused_import_rows(&engine, &out)
+        );
+
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "import 'other.dart';\n\npart 'p.dart';\n\nvoid main() {}\n",
+                ),
+                (
+                    "lib/p.dart",
+                    "part of 'main.dart';\n\n/// The part's docs mention [Widget].\nvoid partFn() {}\n",
+                ),
+                ("lib/other.dart", "class Widget {}\n"),
+            ],
+        );
+        assert!(
+            unused_import_rows(&engine, &out).is_empty(),
+            "the part's doc mention spares the library's import: {:?}",
+            unused_import_rows(&engine, &out)
+        );
+
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "import 'other.dart' as o;\n\npart 'p.dart';\n\nvoid main() {}\n",
+                ),
+                (
+                    "lib/p.dart",
+                    "part of 'main.dart';\n\no.Widget make() => o.Widget();\n",
+                ),
+                ("lib/other.dart", "class Widget {}\n"),
+            ],
+        );
+        assert!(
+            unused_import_rows(&engine, &out).is_empty(),
+            "the part's prefixed use spares the prefixed import: {:?}",
+            unused_import_rows(&engine, &out)
+        );
+    }
+
+    /// The doc credit never reaches the `unused_element` face: a doc
+    /// mention of a library-private declaration keeps it reported (probed:
+    /// dart analyze 3.13.1 reports both the element and the import), and
+    /// the mention of the import-provided name still spares the import.
+    #[test]
+    fn doc_reference_never_spares_unused_element() {
+        let root = memo_workspace();
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "import 'other.dart';\n\n/// Docs mention [_Orphan].\nvoid _host() {}\n\nclass _Orphan {}\n",
+                ),
+                ("lib/other.dart", "class Widget {}\n"),
+            ],
+        );
+        let elements = unused_rows(&engine, &out);
+        assert_eq!(elements.len(), 2, "host and orphan both report: {elements:?}");
+        let imports = unused_import_rows(&engine, &out);
+        assert_eq!(imports.len(), 1, "the import stays: no exported name is spelled");
     }
 }
