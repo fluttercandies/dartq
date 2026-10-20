@@ -1049,23 +1049,41 @@ impl Interp<'_> {
                 let var = self.pending_inits.pop();
                 let rhs = self.exprs.pop();
                 if let (Some(var), Some(rhs)) = (var, rhs) {
-                    // The declared-type slot the written header left
-                    // unknown adopts the semantic layer's staged inferred
-                    // type (#2140): the initializer's resolved static type
-                    // IS the local's declared type (the official
-                    // `_inferLocalVariable`), so every later read's flow
-                    // type and the promotion machinery answer exactly like
-                    // an annotated declarator's. Adoption precedes the
-                    // initialization write, which then compares against
-                    // the real declared face. Shapes the flow lattice
-                    // cannot spell never arrive (the stager drops them) —
-                    // the unknown-declared under-report stands.
+                    // The declared-type slot the written header left unknown
+                    // adopts the initializer's inferred face (#2140): the
+                    // semantic layer's staged type wins when present.
+                    // Otherwise the fold's own initializer read is the
+                    // official `_inferLocalVariable` input, so a nullable
+                    // spelled face adopts whole — the written-argument tree
+                    // included, which the staging seam cannot carry
+                    // (#2243). A non-nullable spelled face keeps the
+                    // unknown slot: every null-check disjointness and
+                    // promotion answer it produced would be new output the
+                    // pre-#2243 fold never made, and no promotion hangs on
+                    // it. The unresolved-nullable marker adopts as the
+                    // opaque-nullable declared face — the null check's
+                    // marker step (#2243) keys on it, and every other
+                    // consumer reads it exactly like the unknown it was.
                     if let Some(meta) = self.vars.get_mut(var as usize)
                         && meta.ty.base == crate::ty::Base::Unknown
-                        && let Some(span) = meta.decl_span
-                        && let Some(&staged) = self.inferred_locals.get(&span.offset)
                     {
-                        meta.ty = staged;
+                        let staged = meta
+                            .decl_span
+                            .and_then(|span| self.inferred_locals.get(&span.offset))
+                            .copied();
+                        if let Some(staged) = staged {
+                            meta.ty = staged;
+                        } else if rhs.ty.nullable
+                            && matches!(
+                                rhs.ty.base,
+                                crate::ty::Base::Name(_) | crate::ty::Base::Function
+                            )
+                        {
+                            meta.ty = rhs.ty;
+                            meta.args = rhs.args;
+                        } else if rhs.ty == Ty::UNKNOWN_NULLABLE {
+                            meta.ty = Ty::UNKNOWN_NULLABLE;
+                        }
                     }
                     // The declaration's own initialization moves the flow
                     // state (assignments, promotions) but is not a write in

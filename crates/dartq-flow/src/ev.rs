@@ -415,7 +415,16 @@ pub enum Ev {
     IndexAccess {
         null_aware: bool,
     },
-    Send,
+    /// An invocation's close. `args` is the invocation's own method
+    /// type-argument tree (`C<int>()`'s written `<int>`, an arena index;
+    /// [`crate::ty::EMPTY_ARGS`] when argument-less or absent): the group
+    /// completes with no head `handle_type` to consume it — the head is
+    /// the callee identifier — so the send carries it beside the callee's
+    /// implicit-creation face (#2243), and taking it here keeps a
+    /// dangling group from leaking into the next construct's type row.
+    Send {
+        args: u32,
+    },
     SendNoArgs,
     ArgumentsBegin,
     ArgumentsEnd {

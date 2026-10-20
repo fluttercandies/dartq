@@ -2149,7 +2149,15 @@ impl ParserListener for Flow<'_> {
     }
 
     fn handle_send(&mut self, _begin: Token, _end: Token) {
-        self.record(Ev::Send);
+        // The invocation's own method type arguments (`C<int>()`) complete
+        // with no head `handle_type` to consume them — the head is the
+        // callee identifier — so they ride the send (the implicit-creation
+        // face's written tree, #2243). Taking them here also clears a
+        // group no consumer claimed, which would otherwise leak into the
+        // next construct's type row (the same posture
+        // `handle_object_pattern` takes for its head-less group).
+        let args = std::mem::take(&mut self.pending_type_args);
+        self.record(Ev::Send { args });
     }
 
     fn handle_send_without_arguments(&mut self, _begin: Token, _end: Token, _next: Token) {

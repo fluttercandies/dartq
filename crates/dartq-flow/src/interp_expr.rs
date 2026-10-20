@@ -1100,7 +1100,7 @@ impl Interp<'_> {
                 }
                 self.exprs.push(expr);
             }
-            Ev::Send | Ev::SendNoArgs => {
+            ev @ (Ev::Send { .. } | Ev::SendNoArgs) => {
                 // The callee flows through as the send's result: a bare
                 // identifier keeps its variable reference and promoted type
                 // (a plain assignment's target is exactly such a reference).
@@ -1121,18 +1121,25 @@ impl Interp<'_> {
                     // tear-off names the callable, not the class), and
                     // the callee is the unresolved bare-head expression
                     // (a `prop` slot marks it — member callees carry
-                    // none, resolved callees keep their own type).
-                    if matches!(ev, Ev::Send)
+                    // none, resolved callees keep their own type). The
+                    // send's written argument tree rides beside the
+                    // class face (#2243): `x ??= C<int>()` promotes
+                    // through the instantiated spelling.
+                    if matches!(ev, Ev::Send { .. })
                         && matches!(events.get(i.wrapping_sub(1)), Some(Ev::ArgumentsEnd { .. }))
                         && callee.reference.is_none()
                         && callee.prop.is_some()
                         && let Some(name) = callee.name
                     {
+                        let Ev::Send { args } = ev else {
+                            unreachable!("gated on Ev::Send above")
+                        };
                         if self.is_class_head(name) {
                             callee.ty = Ty {
                                 base: Base::Name(name),
                                 nullable: false,
                             };
+                            callee.args = *args;
                         } else {
                             callee.ty = Ty::UNKNOWN;
                         }
@@ -1633,7 +1640,23 @@ impl Interp<'_> {
             // The variable-check face (a promotable reference operand).
             if let Some(var) = operand.and_then(|e| e.reference) {
                 let operand = operand.expect("reference implies operand");
-                let (promoted, promoted_args) = self.promote_to_non_null(operand.ty, operand.args);
+                let (mut promoted, mut promoted_args) =
+                    self.promote_to_non_null(operand.ty, operand.args);
+                // The opaque-declared local's marker step (#2243): the
+                // declared face is the unresolved-nullable marker (a
+                // `var`-inferred local whose initializer type the flow
+                // lattice cannot spell — an unresolved field read), so
+                // `tryMarkNonNullable`'s non-null face is the plain
+                // unknown marker — the local mirror of the property-slot
+                // marker chain (#1409). The step always refines (the
+                // unpromoted marker is potentially nullable), and the
+                // consumer re-decides the promoted type from its own
+                // resolved static type (#2174's opaque-head arm strips
+                // the resolved type's `?`).
+                if promoted == operand.ty && operand.ty == Ty::UNKNOWN_NULLABLE {
+                    promoted = Ty::UNKNOWN;
+                    promoted_args = crate::ty::EMPTY_ARGS;
+                }
                 if promoted == operand.ty {
                     // Official `tryMarkNonNullable` bails on
                     // `isSameType` (flow_analysis.dart:4059-4068): the

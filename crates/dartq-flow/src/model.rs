@@ -12,7 +12,7 @@
 
 use rustc_hash::FxHashSet;
 
-use crate::ty::{Ty, TypeOps};
+use crate::ty::{Base, Classification, Ty, TypeOps};
 
 /// Absent list / null reference marker.
 pub(crate) const NIL: u32 = u32::MAX;
@@ -460,9 +460,7 @@ impl State {
         let nodes: Vec<(Ty, u32)> = lists.iter_entries(model.promoted).collect();
         let keep_from = nodes
             .iter()
-            .position(|&(ty, args)| {
-                ops.is_subtype_typed(written, written_args, ty, args, arena, names)
-            })
+            .position(|&(ty, args)| covers(written, written_args, ty, args, ops, arena, names))
             .unwrap_or(nodes.len());
         let mut promoted = NIL;
         for (ty, args) in nodes[keep_from..].iter().rev() {
@@ -978,6 +976,28 @@ fn add_promoted(
         return chain;
     }
     lists.cons(ty, args, chain)
+}
+
+/// Whether a written value keeps a promotion entry (the coverage question
+/// of [`State::write`]'s demotion, official `_demoteViaAssignment`'s
+/// `written <: promotedTypes[k]`). A non-null unknown entry is the opaque
+/// marker promotion (#2243 — a `var`-inferred local whose declared type
+/// the lattice cannot spell): its only content is non-nullness, so the
+/// written value keeps it exactly when it cannot be null — the bare
+/// unknown face is top and would admit a null write.
+fn covers(
+    written: Ty,
+    written_args: u32,
+    entry: Ty,
+    entry_args: u32,
+    ops: &dyn TypeOps,
+    arena: &[Vec<crate::ty::ArgTy>],
+    names: &[Box<str>],
+) -> bool {
+    if entry.base == Base::Unknown && !entry.nullable {
+        return ops.classify(written) == Classification::NonNullable;
+    }
+    ops.is_subtype_typed(written, written_args, entry, entry_args, arena, names)
 }
 
 /// The same-type dedup of the promotion chain (official `isSameType` —

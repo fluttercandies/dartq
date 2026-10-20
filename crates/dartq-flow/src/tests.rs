@@ -3990,7 +3990,9 @@ fn never_call_exit_inside_arguments_keeps_the_stack() {
         // `handle_expression_statement` after `parse_expression`).
         vec![
             crate::ev::Ev::OtherExpr { span: tspan(11) },
-            crate::ev::Ev::Send,
+            crate::ev::Ev::Send {
+                args: crate::ty::EMPTY_ARGS,
+            },
             crate::ev::Ev::ArgumentsBegin,
             crate::ev::Ev::OtherExpr { span: tspan(13) },
             crate::ev::Ev::Exit { end: tspan(19) },
@@ -6579,4 +6581,156 @@ fn cross_base_raw_tested_against_written_declaration_promotes() {
             .all(|offset| !promoted_offsets.contains(offset)),
         "the same-base raw test must not promote: {facts:?}"
     );
+}
+
+// —— #2243: promotion through inferred declared faces and written type
+// arguments ——————————————————————————————————————————————————————————————
+
+/// The `(offset, ty, args)` triples of a source's promoted reads, for the
+/// pins that key on where a promotion stands and what tree it carries.
+fn promoted_read_rows(
+    source: &str,
+) -> (std::rc::Rc<std::cell::RefCell<crate::record::Flow<'_>>>, Vec<(u32, crate::ty::Ty, u32)>) {
+    let (flow, facts) = analyze(source);
+    let rows = facts
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::PromotedRead { span, ty, args } => Some((span.range.offset, ty, args)),
+            _ => None,
+        })
+        .collect();
+    (flow.0, rows)
+}
+
+/// A `var` local initialized from a nullable read adopts the initializer's
+/// declared face whole — written type arguments included (#2243) — so the
+/// null-check promotion stands on the return path with the instantiated
+/// spelling. Before the adoption the slot stayed unknown, the promotion
+/// no-oped, and every downstream type question read the declared
+/// `List<int>?`.
+#[test]
+fn inferred_local_adopts_nullable_initializer_face_and_promotes() {
+    let source = "void f(List<int>? p) { var l = p; if (l == null) return; l; }";
+    let (flow, rows) = promoted_read_rows(source);
+    // Exactly one promoted read: the statement-position `l` after the
+    // early return.
+    let read = source.rfind('l').unwrap() as u32;
+    let list = flow.borrow_mut().intern_name("List");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, read);
+    assert_eq!(
+        rows[0].1,
+        crate::ty::Ty {
+            base: crate::ty::Base::Name(list),
+            nullable: false,
+        }
+    );
+    // The promotion tree spells the written `<int>`.
+    let tree: Vec<crate::ty::ArgTy> = flow.borrow().type_args_at(rows[0].2).to_vec();
+    assert_eq!(tree.len(), 1);
+    assert!(matches!(tree[0].base, crate::ty::Base::Name(_)));
+    assert!(!tree[0].nullable);
+}
+
+/// The adopted face's promotion answers writes like any named promotion: a
+/// null write demotes it (the official keeps a promotion only while the
+/// written value satisfies it).
+#[test]
+fn inferred_local_promotion_demotes_on_a_null_write() {
+    let source = "void f(List<int>? p) { var l = p; if (l == null) return; l = null; l; }";
+    let (_, rows) = promoted_read_rows(source);
+    assert!(rows.is_empty(), "the null write demotes: {rows:?}");
+}
+
+/// The unresolved-field initializer shape (the differential's own face):
+/// the initializer's type is the unresolved-nullable marker, so the local
+/// adopts the opaque-nullable declared face and the null check takes the
+/// marker promotion — the non-null unknown face, the local mirror of the
+/// property-slot marker chain. The consumer re-decides the promoted type
+/// from its own resolved static type.
+#[test]
+fn opaque_nullable_inferred_local_takes_the_marker_promotion() {
+    let source = "class C {\n  List<int>? field;\n  void m() {\n    var l = field;\n    if (l == null) return;\n    l;\n  }\n}";
+    let (_, rows) = promoted_read_rows(source);
+    let read = source.rfind('l').unwrap() as u32;
+    assert_eq!(
+        rows,
+        vec![(read, crate::ty::Ty::UNKNOWN, crate::ty::EMPTY_ARGS)],
+        "{rows:?}"
+    );
+}
+
+/// The marker promotion stays a real promotion: a null write drops it (a
+/// nullable written value never satisfies a non-null face, opaque or not),
+/// and the demoted read carries no row.
+#[test]
+fn marker_promotion_demotes_on_a_null_write() {
+    let source = "class C {\n  List<int>? field;\n  void m() {\n    var l = field;\n    if (l == null) return;\n    l = null;\n    l;\n  }\n}";
+    let (_, rows) = promoted_read_rows(source);
+    assert!(rows.is_empty(), "the null write demotes the marker: {rows:?}");
+}
+
+/// A non-nullable spelled initializer face is NOT adopted: the unknown
+/// slot keeps every pre-#2243 answer — the null check stays a live split
+/// (no dead-code row the fold never made), and no promotion hangs on the
+/// read.
+#[test]
+fn non_nullable_initializer_face_keeps_the_unknown_slot() {
+    let source = "void f(int p) { var l = p; if (l == null) { l; } }";
+    let (_, rows) = promoted_read_rows(source);
+    assert!(rows.is_empty(), "{rows:?}");
+    assert!(dead_snippets(source).is_empty(), "{source:?}");
+}
+
+/// `x ??= C<int>();` promotes through the instantiated spelling: the
+/// send's written argument tree rides the implicit-creation face (#2243),
+/// so the write's LUB lands on `C<int>` and the read after the statement
+/// carries the promotion with the `<int>` tree.
+#[test]
+fn if_null_assignment_through_args_constructor_promotes() {
+    let source = "class C<T> {}\nvoid f() {\n  C<int>? x;\n  x ??= C<int>();\n  x;\n}";
+    let (flow, rows) = promoted_read_rows(source);
+    let read = source.rfind('x').unwrap() as u32;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].0, read);
+    assert_eq!(
+        rows[0].1,
+        crate::ty::Ty {
+            base: crate::ty::Base::Name(flow.borrow_mut().intern_name("C")),
+            nullable: false,
+        }
+    );
+    let tree: Vec<crate::ty::ArgTy> = flow.borrow().type_args_at(rows[0].2).to_vec();
+    assert_eq!(tree.len(), 1);
+    assert!(matches!(tree[0].base, crate::ty::Base::Name(_)));
+    assert!(!tree[0].nullable);
+}
+
+/// The argument-less control: `x ??= Foo();` promoted before #2243 and
+/// still does.
+#[test]
+fn if_null_assignment_through_constructor_promotes() {
+    let source = "class Foo {}\nvoid f() {\n  Foo? x;\n  x ??= Foo();\n  x;\n}";
+    let (flow, rows) = promoted_read_rows(source);
+    let read = source.rfind('x').unwrap() as u32;
+    let foo = flow.borrow_mut().intern_name("Foo");
+    assert_eq!(
+        rows,
+        vec![(read, crate::ty::Ty {
+            base: crate::ty::Base::Name(foo),
+            nullable: false,
+        }, crate::ty::EMPTY_ARGS)],
+        "{rows:?}"
+    );
+}
+
+/// The raw-spelling guard: `x ??= C();` on `C<int>? x` types the RHS as
+/// the raw face (`C<dynamic>` at the oracle), whose LUB with the declared
+/// `C<int>` promotes nothing — the write must not narrow `x` to a spelling
+/// the RHS never carried.
+#[test]
+fn if_null_assignment_through_raw_constructor_stays_unpromoted() {
+    let source = "class C<T> {}\nvoid f() {\n  C<int>? x;\n  x ??= C();\n  x;\n}";
+    let (_, rows) = promoted_read_rows(source);
+    assert!(rows.is_empty(), "{rows:?}");
 }
