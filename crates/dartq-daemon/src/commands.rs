@@ -129,7 +129,9 @@ use dartq_commands::discover::{self, DiscoverError};
 use dartq_commands::explain::{ExplainError, explain as explain_core};
 use dartq_commands::fix::FileFixSet;
 use dartq_commands::layout::EngineLayout;
-use dartq_commands::query::{BatchQuery, QueryKind, decl_kind_name, ref_kind_name};
+use dartq_commands::query::{BatchQuery, QueryKind};
+use dartq_commands::resolve as resolve_core;
+use dartq_commands::resolve::ResolveError;
 use dartq_commands::{Verbosity, check, compat as compat_core, fix, impact as impact_core, query};
 use dartq_diagnostics::{Diagnostic, FileLayoutProvider};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -1399,86 +1401,19 @@ fn query_answer_shaped(
 // offset-keyed substrate the cursor-interactive faces share)
 // ---------------------------------------------------------------------------
 
-/// The `dartq/resolveAt` answer: what the analyzed view's maintained index
-/// rows hold under `offset` (UTF-16 code units — the engine's external
-/// convention, the same units the query rows' `offset` fields carry) in
-/// `file`. The engine face carries the full contract (freshness, answer
-/// domain, cost shape — `Engine::resolve_at`); this layer adds the wire
-/// shape: `hit` is `null` for every uncovered position (a non-identifier,
-/// an unresolved use, an out-of-range offset — none is a params error), and
-/// a hit carries the identifier's own span plus the target declaration's
-/// identity and name span — goto-def's target, hover's subject, rename's
-/// anchor. Tier-invariant: every field is a locator or a verdict (the
-/// impact posture).
-///
-/// # Errors
-///
-/// A `file` the analyzed view never interned (the fail-loud rule for a
-/// typo'd path; a resident-but-unanalyzed file answers `hit: null` like
-/// every other uncovered position).
+/// The `dartq/resolveAt` answer over the analyzed view. The wire shape and
+/// its contract live in the shared core
+/// ([`dartq_commands::resolve`]) — the same implementation the CLI's
+/// one-shot `resolve-at` face serves, so the two cannot drift; this layer
+/// maps the core's failure set onto the session's error tiers (the
+/// residency miss is the params tier, the prelude's own failures cannot
+/// arise on this path — the read task has just run the analysis pass).
 fn resolve_at_answer(drain: &Drain<'_>, file: &Path, offset: u32) -> Result<Value, SessionError> {
-    let Some(file_id) = drain.engine.file_table().try_file_id(file) else {
-        return Err(SessionError::InvalidParams(format!(
-            "not a resident file: {}",
-            file.display()
-        )));
-    };
-    // Engine answers carry ids the file table issued; a `forget` between
-    // the analyze and this read severs the id's spelling (the immortal-id
-    // contract). The locator degrades to the daemon's `<unknown>` spelling
-    // (the server's client-label convention), never a panic.
-    let path_of = |id| match drain.engine.file_table().path(id) {
-        Some(path) => path.display().to_string(),
-        None => "<unknown>".to_owned(),
-    };
-    let hit = match drain.engine.resolve_at(file_id, offset) {
-        // The verdict slot: an uncovered position stays an explicit null (not omit-on-absent).
-        None => Value::Null,
-        Some(dartq_engine::PositionAnswer::Declaration(decl)) => {
-            let mut hit = json!({
-                "kind": "declaration",
-                "name": decl.name,
-                "decl_kind": decl_kind_name(decl.kind),
-                "file": path_of(decl.file),
-                "range": { "offset": decl.range.offset, "length": decl.range.length },
-            });
-            // The convenience column is omit-on-absent: a top-level
-            // declaration has no container, so the key drops rather than
-            // spelling a null.
-            if let Some(container) = decl.container {
-                hit["container"] = json!(container);
-            }
-            hit
-        }
-        Some(dartq_engine::PositionAnswer::Use(use_hit)) => {
-            let mut hit = json!({
-                "kind": "reference",
-                "name": use_hit.name,
-                "decl_kind": decl_kind_name(use_hit.decl_kind),
-                "file": path_of(use_hit.target_file),
-                "range": { "offset": use_hit.range.offset, "length": use_hit.range.length },
-                "target_range": {
-                    "offset": use_hit.target_range.offset,
-                    "length": use_hit.target_range.length,
-                },
-                "ref_kind": ref_kind_name(use_hit.kind.into()),
-                "qualified": use_hit.qualified,
-            });
-            if let Some(container) = use_hit.container {
-                hit["container"] = json!(container);
-            }
-            if let Some(prefix) = use_hit.prefix {
-                hit["prefix"] = json!(prefix);
-            }
-            hit
-        }
-    };
-    Ok(json!({
-        "schema_version": SCHEMA_VERSION,
-        "file": file.display().to_string(),
-        "offset": offset,
-        "hit": hit,
-    }))
+    resolve_core::resolve_at_after_analysis(drain.engine, file, offset).map_err(|error| match error
+    {
+        ResolveError::NotResident(_) => SessionError::InvalidParams(error.to_string()),
+        ResolveError::Analyze(_) => SessionError::Internal(error.to_string()),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1486,89 +1421,14 @@ fn resolve_at_answer(drain: &Drain<'_>, file: &Path, offset: u32) -> Result<Valu
 // maintained index proves at one cursor; the charter has no plugin escape)
 // ---------------------------------------------------------------------------
 
-/// The stable machine spelling of a completion origin.
-#[must_use]
-fn completion_origin_name(origin: dartq_engine::CompletionOrigin) -> &'static str {
-    match origin {
-        dartq_engine::CompletionOrigin::Declaration => "declaration",
-        dartq_engine::CompletionOrigin::Reference => "reference",
-        dartq_engine::CompletionOrigin::Prefix => "prefix",
-    }
-}
-
-/// The `dartq/completion` answer: the candidates the analyzed view's
-/// maintained index proves visible at `offset` (UTF-16 code units — the
-/// engine's external convention) in `file`, prefix-filtered by the
-/// identifier fragment the engine extracts from the analyzed text at the
-/// cursor. The engine face carries the full contract (freshness, candidate
-/// domain, the M1 member/local boundary, cost shape —
-/// `Engine::complete_at`); this layer adds the wire shape. Tier-invariant:
-/// every field is a locator or a verdict (the impact posture).
-///
-/// # Errors
-///
-/// A `file` the analyzed view never interned (the fail-loud rule for a
-/// typo'd path, the `dartq/resolveAt` rule). An uncovered position — a
-/// past-end offset, a file cold in the view, a member-access cursor —
-/// answers the empty set, never an error.
+/// The `dartq/completion` answer over the analyzed view — the shared
+/// core's implementation (see [`resolve_at_answer`]'s layering notes).
 fn completion_answer(drain: &Drain<'_>, file: &Path, offset: u32) -> Result<Value, SessionError> {
-    let Some(file_id) = drain.engine.file_table().try_file_id(file) else {
-        return Err(SessionError::InvalidParams(format!(
-            "not a resident file: {}",
-            file.display()
-        )));
-    };
-    // Engine answers carry ids the file table issued; a `forget` between
-    // the analyze and this read severs the id's spelling (the immortal-id
-    // contract). The locator degrades to the daemon's `<unknown>` spelling
-    // (the server's client-label convention), never a panic.
-    let path_of = |id| match drain.engine.file_table().path(id) {
-        Some(path) => path.display().to_string(),
-        None => "<unknown>".to_owned(),
-    };
-    let answer = drain.engine.complete_at(file_id, offset);
-    let (prefix, items) = match &answer {
-        Some(answer) => (
-            answer.prefix,
-            answer
-                .items
-                .iter()
-                .map(|item| {
-                    let mut row = json!({
-                        "name": item.name,
-                        "origin": completion_origin_name(item.origin),
-                    });
-                    // Omit-on-absent identity columns: a prefix item is a
-                    // wire word, not a declaration — no decl_kind,
-                    // container, file, or range — so those keys drop
-                    // rather than spelling nulls.
-                    if let Some(kind) = item.decl_kind {
-                        row["decl_kind"] = json!(decl_kind_name(kind));
-                    }
-                    if let Some(container) = item.container {
-                        row["container"] = json!(container);
-                    }
-                    if let Some(file) = item.file {
-                        row["file"] = json!(path_of(file));
-                    }
-                    if let Some(range) = item.range {
-                        row["range"] = json!({ "offset": range.offset, "length": range.length });
-                    }
-                    row
-                })
-                .collect(),
-        ),
-        // The uncovered set (a cold file, a past-end offset): the empty
-        // answer, never an error.
-        None => ("", Vec::new()),
-    };
-    Ok(json!({
-        "schema_version": SCHEMA_VERSION,
-        "file": file.display().to_string(),
-        "offset": offset,
-        "prefix": prefix,
-        "items": items,
-    }))
+    resolve_core::completion_after_analysis(drain.engine, file, offset).map_err(|error| match error
+    {
+        ResolveError::NotResident(_) => SessionError::InvalidParams(error.to_string()),
+        ResolveError::Analyze(_) => SessionError::Internal(error.to_string()),
+    })
 }
 
 // ---------------------------------------------------------------------------

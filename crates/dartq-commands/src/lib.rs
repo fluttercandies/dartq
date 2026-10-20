@@ -17,6 +17,10 @@
 //!   compat face's axis-root resolution over it.
 //! * [`analyze`] — the full engine pass (discover + analyze + oracle sort).
 //! * [`query`] — the symbol index query over the analyzed state.
+//! * [`resolve`] — the position faces' shared core: `resolveAt` (the
+//!   symbol under one offset) and `completion` (the visible-name set at
+//!   one cursor), the daemon RPC answers and the CLI one-shot subcommands'
+//!   one implementation.
 //! * [`rename`] — the symbol rename face: the anchor resolution joined
 //!   with the reference rows, as a machine-readable edit set plus the
 //!   drift-checked patcher.
@@ -53,6 +57,7 @@ mod pkg_label;
 pub mod plugins;
 pub mod query;
 pub mod rename;
+pub mod resolve;
 mod rule_states;
 pub mod uri;
 pub mod workspace;
