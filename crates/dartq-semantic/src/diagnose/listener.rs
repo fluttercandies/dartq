@@ -633,7 +633,10 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.equals_type_poison();
     }
 
-    fn begin_record_type(&mut self, _left_paren: Token) {
+    fn begin_record_type(&mut self, left_paren: Token) {
+        // #2358: flow latches `tv_in_record` so a record type's own field
+        // shapes never capture a type-variable bound (`tv_capturing`).
+        self.flow().begin_record_type(left_paren);
         let depth = std::mem::take(&mut self.engine.type_arg_depth);
         self.engine.type_arg_depth_saved.push(depth);
         self.engine.bounds.poison();
@@ -652,11 +655,15 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_record_type(
         &mut self,
-        _left_paren: Token,
+        left_paren: Token,
         question: Option<Token>,
-        _count: usize,
-        _has_named_fields: bool,
+        count: usize,
+        has_named_fields: bool,
     ) {
+        // #2358: flow clears `tv_in_record` — the bound-capture gate closes
+        // with the record type's own shape.
+        self.flow()
+            .end_record_type(left_paren, question, count, has_named_fields);
         if let Some(depth) = self.engine.type_arg_depth_saved.pop() {
             self.engine.type_arg_depth = depth;
         }
@@ -1654,6 +1661,10 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_type_variable(&mut self, token: Token) {
+        // #2358: flow keys each `boundaries` row on the variable's
+        // interned name — the row's registration must see every open
+        // variable (flow keeps its own stack; the engine's is separate).
+        self.flow().begin_type_variable(token);
         let engine = &mut self.engine;
         // The name token anchors this variable's unbounded declaration: an
         // unbounded variable's `handle_no_type` fires against it.
@@ -1677,7 +1688,11 @@ impl ParserListener for DiagnoseListener<'_> {
         }
     }
 
-    fn begin_type_variables(&mut self, _token: Token) {
+    fn begin_type_variables(&mut self, token: Token) {
+        // #2358: forwarded for pairing with flow's `end_type_variables`
+        // cleanup (its begin arm is a no-op today; the open half keeps the
+        // capture state machine's halves symmetric).
+        self.flow().begin_type_variables(token);
         let engine = &mut self.engine;
         // The open signature capture's own `<T, S extends num>` pass: the
         // variables' bound completions belong to the variables (each is
@@ -1707,12 +1722,19 @@ impl ParserListener for DiagnoseListener<'_> {
     fn end_type_variable(
         &mut self,
         token: Token,
-        _index: usize,
+        index: usize,
         extends_or_super: Option<Token>,
         variance: Option<Token>,
     ) {
+        // #2358: the `boundaries` registration itself — flow pairs this
+        // variable's bound (`extends`-written or the implicit `Object?`)
+        // into its table, the exhaustiveness verdict's bound source.
+        // Fires before the engine's latched-name early return: flow's own
+        // name stack must stay balanced even when the engine latched
+        // nothing (recovery), and its end arm tolerates that emptiness.
+        self.flow()
+            .end_type_variable(token, index, extends_or_super, variance);
         let engine = &mut self.engine;
-        // The completing name: the Complex path fires the variable's own
         // name token, the Simple1 fast path (`<T>`) fires the group's
         // closer (the official event shape) — the name rides the stack
         // pushed at `begin_type_variable`, so the closer's text never keys
@@ -1745,7 +1767,11 @@ impl ParserListener for DiagnoseListener<'_> {
         }
     }
 
-    fn end_type_variables(&mut self, _begin: Token, end: Token) {
+    fn end_type_variables(&mut self, begin: Token, end: Token) {
+        // #2358: flow drops its capture stacks with the group (a missed
+        // cleanup would leak names into the next declaration's rows —
+        // the committed boundaries themselves survive).
+        self.flow().end_type_variables(begin, end);
         let engine = &mut self.engine;
         engine.close_type_variables(end);
         engine.bounds.end_type_variables();

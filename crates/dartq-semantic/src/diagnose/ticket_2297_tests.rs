@@ -4,20 +4,16 @@
 //! the primitives `bool`/`String` included), and the conservative arm
 //! of the switch-end `isExhaustive` verdict.
 //!
-//! The `TypeParameterTypeImpl` bound-recursion itself is pinned at the
-//! flow level (`dartq_flow::record::tests`), because that arm's bound
-//! source is the recorder's `boundaries` table — and the production
-//! `DiagnoseListener` (a separate `ParserListener` that wraps `Flow`)
-//! forwards `handle_type`/`end_formal_parameter` but not the
-//! `begin/end_type_variable`/`end_top_level_declaration` events that
-//! populate it. Under this rig `Flow::boundaries` is empty, so a
-//! type-parameter scrutinee answers the conservative `false` (its
-//! post-switch unmatched path stays live) — the correct under-report
-//! until the listener forwards the type-variable events
-//! (`type_system.dart:868-877`). The cells below therefore pin the
-//! faces that hold at this level: the `can_be_equal` implicit-`Object`
-//! edge (independent of the bound source) and the unbounded-parameter
-//! conservative arm.
+//! The `TypeParameterTypeImpl` bound-recursion rides the recorder's
+//! `boundaries` table. Since #2358 the production `DiagnoseListener`
+//! forwards the `begin/end_type_variable(s)` (and record-type) events
+//! that populate it, so a type-parameter scrutinee resolves through its
+//! *declared* bound under the real pipeline (`type_system.dart:868-877`):
+//! `T extends St` over the enum `St` splits completely and the full
+//! switch is exhaustive. The conservative arm survives exactly where the
+//! official's is conservative too: the implicit `Object?` bound of an
+//! unbounded parameter never exhausts, and a circular bound chain
+//! exhausts the walk's recursion budget into `false`.
 
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
@@ -94,18 +90,14 @@ fn has(report: &FileReport, name: &str) -> bool {
 
 // —— the type-parameter bound arm ————————————————————————————————————
 
-/// A type-parameter scrutinee under this rig carries no bound source:
-/// `Flow::boundaries` is populated by the `begin/end_type_variable`
-/// events the production `DiagnoseListener` does not forward to `flow`,
-/// so `exhaustive_within` answers the conservative `false` — the
-/// post-switch unmatched path stays live and the body end is reachable.
-/// This pins the conservative under-report as the current contract (the
-/// exhaustive arm is pinned at the flow level, where `Flow` is the
-/// listener and the table is populated). When the type-variable events
-/// forward, this cell inverts to the oracle answer (`body_might` absent
-/// for `T extends St` over an enum).
+/// A type-parameter scrutinee resolves through its declared bound: the
+/// forwarded `begin/end_type_variable` events populate `Flow::boundaries`
+/// (#2358), and the switch-end verdict recurses into `T extends St`'s
+/// bound (`type_system.dart:868-877`) — over the enum `St` the space
+/// splits completely, so the full-coverage switch is exhaustive and the
+/// body end is unreachable (oracle silent: no `body_might` row).
 #[test]
-fn type_param_scrutinee_conservative_without_a_bound_source() {
+fn type_param_scrutinee_exhaustive_through_its_declared_bound() {
     let source = "\
 class int {}
 enum St { a, b }
@@ -115,6 +107,87 @@ int f<T extends St>(T v) {
       return 1;
     case St.b:
       return 2;
+  }
+}
+";
+    let report = unit_report(source);
+    assert!(
+        !has(&report, "body_might_complete_normally"),
+        "{:?}",
+        rows(&report)
+    );
+}
+
+/// #2358 completeness pin: the same bound-sourced exhaustiveness must
+/// also silence the switch's own row — `T extends St` with full coverage
+/// reports neither `non_exhaustive_switch_statement` nor a reachable
+/// body end.
+#[test]
+fn type_param_scrutinee_full_coverage_is_not_non_exhaustive() {
+    let source = "\
+class int {}
+enum St { a, b }
+int f<T extends St>(T v) {
+  switch (v) {
+    case St.a:
+      return 1;
+    case St.b:
+      return 2;
+  }
+}
+";
+    let report = unit_report(source);
+    assert!(
+        !has(&report, "non_exhaustive_switch_statement"),
+        "{:?}",
+        rows(&report)
+    );
+    assert!(
+        !has(&report, "body_might_complete_normally"),
+        "{:?}",
+        rows(&report)
+    );
+}
+
+/// Contrast — the conservative faces survive the forwarding: an
+/// unbounded `T` over the same enum carries the implicit `Object?` bound
+/// (subtype.dart:313), which never exhausts — the post-switch unmatched
+/// path stays live and the declared `int` return reports
+/// `body_might_complete_normally`.
+#[test]
+fn unbounded_type_param_over_enum_stays_conservative() {
+    let source = "\
+class int {}
+enum St { a, b }
+int f<T>(T v) {
+  switch (v) {
+    case St.a:
+      return 1;
+    case St.b:
+      return 2;
+  }
+}
+";
+    let report = unit_report(source);
+    assert!(
+        has(&report, "body_might_complete_normally"),
+        "{:?}",
+        rows(&report)
+    );
+}
+
+/// Contrast — a circular bound chain (`T extends U, U extends T`, which
+/// the oracle rejects as `type_parameter_supertype_of_its_bound`) must
+/// cycle into the walk's recursion budget and answer the conservative
+/// `false`: the body end stays live.
+#[test]
+fn circular_bound_chain_stays_conservative() {
+    let source = "\
+class int {}
+int f<T extends U, U extends T>(T v) {
+  switch (v) {
+    case 1:
+      return 1;
   }
 }
 ";
