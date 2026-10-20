@@ -64,7 +64,23 @@ impl<'a> Engine<'a> {
                     head = next;
                     head_nullable |= rhs_nullable;
                 }
-                Ty::Named { .. } => break,
+                // A non-empty argument list stands for the use whole —
+                // `typedef BlobColumn = Column<Uint8List>` is `Column<
+                // Uint8List>` at the use site, not `BlobColumn` (the same
+                // stand-for-the-whole rule the function/record arms apply);
+                // the use-site `?` joins the right-hand's own (`typedef B =
+                // A<int>?` is nullable on both spellings).
+                Ty::Named {
+                    name: next,
+                    nullable: rhs_nullable,
+                    args,
+                } => {
+                    return Ty::Named {
+                        name: next,
+                        nullable: rhs_nullable | head_nullable,
+                        args,
+                    };
+                }
                 // A non-named right-hand side stands for the use whole
                 // (`typedef V = void Function();`): the use-site `?` joins.
                 Ty::Dynamic => return Ty::Dynamic,
@@ -927,6 +943,31 @@ impl<'a> Engine<'a> {
             );
         }
         if let Some((container, kind)) = self.container_context() {
+            // A record or function `on` type gives `this` a fully decidable
+            // member face: the record's field getters (the function type's
+            // `call`), then nothing — no supertype climb can hide a member.
+            // A `$N`/named-field hit resolves like a member; a miss is
+            // decidable too, so the own-face climb below must not suppress
+            // it — the `Container` model has no clause edges for the written
+            // `on` type, and the unindexed SDK heads its members walk
+            // happens to climb (`int` of `on (int, int)` — latched as the
+            // face's `on_type` name) would answer `ChainBroken` and steal
+            // every miss the oracle reports (`$9`'s `undefined_identifier`,
+            // `thirdMiss()`'s `undefined_method` for '<unknown>').
+            let decidable_this = kind == ContainerKind::Extension
+                && matches!(
+                    self.this_static_ty(container, kind),
+                    Ty::Record { nullable: false, .. } | Ty::Function { nullable: false, .. }
+                );
+            if decidable_this
+                && let Some(ty) = self.record_field_ty(
+                    self.this_static_ty(container, kind),
+                    name,
+                    false,
+                )
+            {
+                return (BareInfo::Plain { ty }, RefTarget::Opaque);
+            }
             // #1701: an unnamed extension resolves bare names against its
             // application face's member map — upstream treats named and
             // unnamed declarations alike on this face (upstream Dart SDK
@@ -948,6 +989,16 @@ impl<'a> Engine<'a> {
                         return (BareInfo::Plain { ty }, RefTarget::Member { container });
                     }
                     false
+                }
+                // A named extension still consults its own member map (the
+                // `walk_members` climb's first level is the container's
+                // declared members — a declared `helper` answers before any
+                // `on`-type face). For a record/function `this` the climb
+                // past that level cannot hide anything, so the own-face
+                // miss reads as `Walk::Missing` rather than the broken
+                // chain the unindexed `on`-type head would answer.
+                None if decidable_this => {
+                    matches!(self.walk_members(container, name), Walk::Found(_))
                 }
                 None => !matches!(self.walk_members(container, name), Walk::Missing),
             };
@@ -1063,6 +1114,24 @@ impl<'a> Engine<'a> {
                 )
             }
             ContainerKind::Extension => {
+                // The written `on` type's own shape decides first: a record
+                // (`on (A, B)`) or function (`on void Function()`) `this`
+                // carries no climbable supertype edge — its member face is
+                // the field getters/`call` alone (answered in the
+                // record-`this` arm before this walk), so the member scope
+                // ends in a clean miss and the scoped lookup decides. The
+                // latched `on_type` name cannot see that: for a record
+                // clause it is the LAST field type's head (`on (int, int)`
+                // latches `int`), which resolves to an unindexed SDK
+                // declaration — a `ChainBroken` that would suppress every
+                // bare miss the oracle reports (`$9`'s
+                // `undefined_identifier`, `thirdMiss()`'s
+                // `undefined_method` for '<unknown>'). An `Unknown` `on_ty`
+                // (missing/recovery clause) contributes nothing either.
+                let on_ty = self.this_static_ty(container, ContainerKind::Extension);
+                if !matches!(on_ty, Ty::Named { .. }) {
+                    return Walk::Missing;
+                }
                 let Some(on) = self.enclosing_extension_on_type(container) else {
                     // No honest `on` name — the extended type contributes
                     // nothing (the oracle's `InvalidType` extendedType).
@@ -1144,6 +1213,20 @@ impl<'a> Engine<'a> {
                     )
                 })
                 .map(|(name, _)| name),
+            // Inside an `extension` body a bare invocation miss names the
+            // ON type's `this` — `undefined_method` for the extended type
+            // (probed: `extension E on C` → 'C', `on List<int>` → 'List',
+            // `on void Function()` → 'Function', `on (int, int)` →
+            // '<unknown>'; upstream `unpromotedThisType` is the extended
+            // type, the receiver the method lookup reports). An
+            // unresolvable `on` name reports NOTHING — the `this` is the
+            // oracle's `InvalidType` and the lookup dies on it — and a
+            // nullable `this` (`on int?`, an unbounded `on T`) takes the
+            // `unchecked_use_of_nullable_value` face this family cannot
+            // spell, so both keep `None` (the under-report direction).
+            ext_invoke: context
+                .filter(|(_, kind)| *kind == ContainerKind::Extension)
+                .map(|(container, _)| self.extension_invoke_target(container)),
             in_exec: self.in_executable(),
             // The constraint-member conservatism (#2186 S2), now the
             // oracle's own decision procedure instead of the blanket skip:
@@ -1162,6 +1245,52 @@ impl<'a> Engine<'a> {
                         Walk::ChainBroken
                     )
             }),
+        }
+    }
+
+    /// The `undefined_method` host for a bare invocation miss inside an
+    /// `extension` body (the `ext_invoke` slot of [`BareInfo::Missing`]):
+    /// `Some` the display name the oracle reports — the resolved `on`
+    /// type's head (`on C` → 'C', `on List<int>` → 'List'), `<unknown>`
+    /// for a face that never interned a named head (a record `on` clause's
+    /// `this` is the record itself — its spelled display is '<unknown>')
+    /// or `on void Function()` (whose head displays 'Function'). `None`
+    /// when the `this` cannot carry the face: an unresolvable `on` name
+    /// (the `InvalidType` `this` — every member question on it is silent),
+    /// a nullable `this` (the `unchecked_use_of_nullable_value` family),
+    /// or an in-scope type-parameter head (`on T` — a `T` bound the model
+    /// cannot decide, same nullable family).
+    fn extension_invoke_target(&self, container: StringId) -> Option<StringId> {
+        match self.this_static_ty(container, ContainerKind::Extension) {
+            Ty::Named {
+                name, nullable: false, ..
+            } => {
+                if self.type_params.contains(&name)
+                    || self.pending_type_params.contains(&name)
+                {
+                    None
+                } else {
+                    match self.type_resolution(name).0 {
+                        TypeResolution::Type => Some(name),
+                        _ => None,
+                    }
+                }
+            }
+            // `on void Function()`: the `this` is the function type, whose
+            // display head is 'Function' (the oracle's element display).
+            Ty::Function {
+                nullable: false, ..
+            } => Some(self.intern("Function")),
+            // `on (int, int)`: a record `this` displays '<unknown>' in the
+            // oracle's message — the extended type has no element name.
+            Ty::Record {
+                nullable: false, ..
+            } => Some(self.intern("<unknown>")),
+            // A nullable `this` (`on int?`, `on T`, `on C?`) takes the
+            // `unchecked_use_of_nullable_value` face this family cannot
+            // spell — the under-report direction. `dynamic`/`Never`/`Null`
+            // `on` types carry no decidable member face either.
+            _ => None,
         }
     }
 
@@ -1975,6 +2104,35 @@ impl<'a> Engine<'a> {
                             }
                             return;
                         }
+                        // A creation head that resolved to an import prefix
+                        // (`fb.RuleState.stable()`): the constructor-reference
+                        // dispatch's importPrefix arm owns it — the head is a
+                        // resolved prefix (its use counts, no row reports on
+                        // its span), and the class segment's prefixed lookup
+                        // decides at `end_constructor_reference`
+                        // (named_type_resolver.dart:140-147 + the tail's
+                        // `creation_with_non_type` at `node.name`). Every
+                        // other resolving non-type keeps the miss machinery
+                        // below (`creation_with_non_type` at the head).
+                        (TypeResolution::NonType, _)
+                            if self.ctor_pos > 0
+                                && matches!(
+                                    lookup_scoped(
+                                        self.graph,
+                                        self.namespaces,
+                                        self.index,
+                                        self.lib,
+                                        self.file,
+                                        name,
+                                    ),
+                                    ScopedHit::Found(NamespaceEntry::Prefix)
+                                ) =>
+                        {
+                            self.import_used.insert(name);
+                            self.used_names.insert(name);
+                            self.ctor_prefix_heads.push(range.offset);
+                            return;
+                        }
                         _ => {}
                     }
                 }
@@ -2288,6 +2446,56 @@ impl<'a> Engine<'a> {
             {
                 self.creation_miss_rows.remove(entry);
             }
+        }
+    }
+
+    /// The class segment's verdict for a prefix-headed constructor
+    /// reference (`fb.RuleState.stable()` — the head latched in
+    /// [`Engine::ctor_prefix_heads`], resolved here at
+    /// `end_constructor_reference`): `_lookupGetter(prefixElement.scope,
+    /// node.name)` upstream (named_type_resolver.dart:140-147). A type hit
+    /// stays silent — the constructor-selector face owns any remaining
+    /// question. A miss or a non-type element reports
+    /// `creation_with_non_type` at the class-name token (the tail's
+    /// `diagnostic.at(node.name)`, :305-330); an ambiguous composition is
+    /// the oracle's `MultiplyDefinedElement` → `InvalidType`, also silent.
+    /// An unindexed declaring file keeps the under-report direction (the
+    /// SDK face's kind is unknowable here). A selector-less `fb.RuleState`
+    /// still latches its class segment through the qualified rest, so
+    /// `class_name`/`class_range` always name the written second segment —
+    /// except a bare `fb()` where the segment IS the head's span (the same
+    /// token upstream's `node.name` reports at).
+    pub(crate) fn resolve_ctor_prefix_class(
+        &mut self,
+        prefix: StringId,
+        class_name: StringId,
+        class_range: SourceRange,
+    ) {
+        let silent = match self
+            .namespaces
+            .lookup_prefixed(self.graph, self.lib, prefix, class_name)
+        {
+            dartq_resolution::Lookup::Found(NamespaceEntry::Decl(file)) => self
+                .index
+                .get(file)
+                .and_then(|f| f.decl(class_name))
+                .map_or(true, |decl| {
+                    type_resolution_of(decl.kind) == TypeResolution::Type
+                }),
+            // Multiply-defined → `InvalidType` with no report; a prefix
+            // entry cannot nest inside a prefix scope.
+            dartq_resolution::Lookup::Ambiguous(_)
+            | dartq_resolution::Lookup::Found(NamespaceEntry::Prefix) => true,
+            dartq_resolution::Lookup::NotFound => false,
+        };
+        if !silent {
+            let name_text = self.strings.resolve(class_name).to_string();
+            self.emit(
+                SemanticCode::CreationWithNonType,
+                class_range,
+                &name_text,
+                "",
+            );
         }
     }
 }

@@ -5765,6 +5765,26 @@ impl ParserListener for DiagnoseListener<'_> {
                 });
             engine.factory_redirect_target = Some((name, target, span));
         }
+        // A prefix-headed constructor reference (`fb.RuleState.stable()`)
+        // resolves its class segment through the prefix's export scope —
+        // the oracle's `resolveConstructorTypeReference` importPrefix arm
+        // (named_type_resolver.dart:140-147). A hit on a type stays silent;
+        // a miss or a non-type element reports `creation_with_non_type` at
+        // the class-name token (the tail's `diagnostic.at(node.name)`, the
+        // `errorTarget.element is PrefixElement` branch — :305-330).
+        if let Some(index) = engine
+            .ctor_prefix_heads
+            .iter()
+            .position(|offset| *offset == start.range.offset)
+        {
+            engine.ctor_prefix_heads.remove(index);
+            let prefix = engine.name_of(start).unwrap_or_else(|| engine.intern(""));
+            let (class_name, class_range) = engine
+                .creation_ref
+                .and_then(|(_, selector)| selector)
+                .map_or((prefix, start.range), |(name, range)| (name, range));
+            engine.resolve_ctor_prefix_class(prefix, class_name, class_range);
+        }
         // The reference closed — its segments stop matching type-argument
         // groups (a plain invocation's group inside `new C(...)`'s
         // arguments must not).

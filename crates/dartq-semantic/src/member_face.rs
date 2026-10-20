@@ -641,7 +641,7 @@ pub(crate) const CORE_STATIC_RETURNS: [(&str, &str, &str); 1] =
 /// (`toString`, `hashCode`, `==`, `noSuchMethod`, `runtimeType`) are
 /// excluded — the `@override` gate spares them before the frozen face is
 /// consulted.
-pub(crate) const CORE_INTERFACE_MEMBERS: [(&str, &[&str]); 19] = [
+pub(crate) const CORE_INTERFACE_MEMBERS: [(&str, &[&str]); 26] = [
     ("Comparable", &["compareTo"]),
     ("Pattern", &["allMatches", "matchAsPrefix"]),
     // `sdk/lib/core/exceptions.dart:43` — `FormatException implements
@@ -805,6 +805,66 @@ pub(crate) const CORE_INTERFACE_MEMBERS: [(&str, &[&str]); 19] = [
             "writeCharCode",
         ],
     ),
+    // `sdk/lib/convert/codec.dart:19` — `Codec`'s declared face: the two
+    // directional getters, `encode`/`decode`, and `fuse`/`inverted`
+    // (`_FusedCodec`/`_InvertedCodec` are private — the frozen face is the
+    // public interface a subclass overrides against).
+    (
+        "Codec",
+        &["encode", "decode", "encoder", "decoder", "fuse", "inverted"],
+    ),
+    // `sdk/lib/convert/converter.dart:11` — `Converter implements
+    // StreamTransformerBase<S, T>`: `convert`, the `StreamTransformerBase`
+    // `bind`/`cast` pair (the row above's union), plus its own `fuse` and
+    // `startChunkedConversion`.
+    (
+        "Converter",
+        &[
+            "convert",
+            "fuse",
+            "startChunkedConversion",
+            "bind",
+            "cast",
+        ],
+    ),
+    // `sdk/lib/convert/chunked_conversion.dart:13` —
+    // `ChunkedConversionSink implements Sink`: the same `add`/`close` face,
+    // re-declared at the interface.
+    ("ChunkedConversionSink", &["add", "close"]),
+    // `sdk/lib/convert/string_conversion.dart:15` — `StringConversionSink
+    // extends ChunkedConversionSink<String>`: the sink face plus `addSlice`
+    // and the `asStringSink` adapter getter.
+    (
+        "StringConversionSink",
+        &["addSlice", "add", "close", "asStringSink"],
+    ),
+    // `sdk/lib/convert/byte_conversion.dart:12` — `ByteConversionSink`'s
+    // declared face (`addSlice` has a default body; `add`/`close` are the
+    // `ChunkedConversionSink` interface it extends).
+    ("ByteConversionSink", &["addSlice", "add", "close"]),
+    // `sdk/lib/convert/string_conversion.dart:61` — `ClosableStringSink
+    // implements StringSink`: the `StringSink` write face plus `close`.
+    (
+        "ClosableStringSink",
+        &["write", "writeAll", "writeln", "writeCharCode", "close"],
+    ),
+    // `sdk/lib/core/stopwatch.dart:60` — `Stopwatch`'s declared instance
+    // face (the `external` members still spell the same names; `start`/
+    // `stop`/`reset`, the `elapsed*` getters, `frequency`, `isRunning`).
+    (
+        "Stopwatch",
+        &[
+            "frequency",
+            "elapsedTicks",
+            "elapsed",
+            "elapsedMicroseconds",
+            "elapsedMilliseconds",
+            "isRunning",
+            "start",
+            "stop",
+            "reset",
+        ],
+    ),
     // `sdk/lib/async/stream_controller.dart:70` — `StreamController
     // implements StreamSink`: the sink face plus the controller's own
     // `stream`/`sink` getters, the assignable `onListen`/`onPause`/
@@ -845,7 +905,7 @@ pub(crate) const CORE_INTERFACE_MEMBERS: [(&str, &[&str]); 19] = [
 /// `IterableMixin` implement `Iterable`. The union of the mapped rows is the
 /// face's member set; the base/mixin's OWN members (`ListMixin.add`…) are a
 /// subset of that face.
-pub(crate) const COLLECTION_INTERFACE_ALIASES: [(&str, &[&str]); 33] = [
+pub(crate) const COLLECTION_INTERFACE_ALIASES: [(&str, &[&str]); 36] = [
     ("ListBase", &["List", "Iterable"]),
     ("ListMixin", &["List", "Iterable"]),
     ("UnmodifiableListBase", &["List", "Iterable"]),
@@ -879,6 +939,16 @@ pub(crate) const COLLECTION_INTERFACE_ALIASES: [(&str, &[&str]); 33] = [
     ("HasNext", &["Iterator"]),
     ("HasNextIterator", &["Iterator"]),
     ("LinkedListEntry", &["Object"]),
+    // `sdk/lib/convert/string_conversion.dart:159` — `typedef
+    // StringConversionSinkBase = StringConversionSink`: the base-class
+    // spelling an `extends` clause writes, same member face.
+    ("StringConversionSinkBase", &["StringConversionSink"]),
+    // `sdk/lib/convert/string_conversion.dart:163` — `typedef
+    // StringConversionSinkMixin = StringConversionSink`.
+    ("StringConversionSinkMixin", &["StringConversionSink"]),
+    // `sdk/lib/convert/byte_conversion.dart:38` — `typedef
+    // ByteConversionSinkBase = ByteConversionSink`.
+    ("ByteConversionSinkBase", &["ByteConversionSink"]),
 ];
 
 /// The `dart:core` classes whose constructors are const-constructible but

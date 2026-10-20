@@ -466,6 +466,7 @@ impl<'a> Engine<'a> {
                 this_type,
                 in_exec,
                 on_opaque,
+                ext_invoke,
             } => {
                 // Mixin `on` constraints and extension `on` types are
                 // invisible to the model: inside their instance members a
@@ -476,6 +477,32 @@ impl<'a> Engine<'a> {
                 }
                 match row.intent {
                     Intent::Invoke => {
+                        // The extension face decides first (its slot is
+                        // `Some` only inside an `extension` body): a
+                        // resolved `on` type's `this` hosts the miss
+                        // (`undefined_method` for 'C' of `on C`, '<unknown>'
+                        // of `on (int, int)`), an `InvalidType`/nullable
+                        // `this` reports nothing (upstream
+                        // `unpromotedThisType` — the oracle's lookup dies on
+                        // the invalid extended type).
+                        if let Some(host) = ext_invoke {
+                            if let Some(container) = host {
+                                let type_text =
+                                    self.strings.resolve(container).to_string();
+                                if !Self::synthetic_reference(row.range)
+                                    && !self.keyword_bare_reference(row.range)
+                                {
+                                    self.emit(
+                                        SemanticCode::UndefinedMethod,
+                                        row.range,
+                                        name_text,
+                                        &type_text,
+                                    );
+                                }
+                            }
+                            self.record_miss(row.name, row.range, false, NameUse::Invoke);
+                            return;
+                        }
                         // UnqualifiedLookupDomain: inside a class or enum
                         // instance member the invocation miss names `this`'s
                         // type (`undefined_method`); everywhere else it is
@@ -1287,13 +1314,10 @@ impl<'a> Engine<'a> {
     /// cascades). Mixin `on` constraints and extension `on` types are
     /// invisible to the model, so bodies of those containers record only.
     pub(crate) fn check_instance_member(&mut self, row: &Row, recv: Receiver) {
-        let (Receiver::This { container, .. }
-        | Receiver::Typed {
-            type_name: container,
-            ..
-        }) = recv
-        else {
-            return;
+        let (container, this_kind) = match recv {
+            Receiver::This { container, kind } => (container, Some(kind)),
+            Receiver::Typed { type_name, .. } => (type_name, None),
+            _ => return,
         };
         // The extension-application faces read the receiver's nullability
         // (applicability and the unchecked-access companion both split on
@@ -1417,6 +1441,49 @@ impl<'a> Engine<'a> {
             Receiver::This { container, kind } => self.this_static_ty(container, kind),
             _ => Ty::UNKNOWN,
         };
+        // An extension `this` whose `on` type is a record or function type
+        // has a fully DECIDABLE member face — the record's field getters
+        // (or the function type's `call`), then nothing — so a miss reports
+        // exactly like the oracle: `undefined_method`/`-getter`/`-setter`
+        // against the extended type's display ('<unknown>' for a record,
+        // 'Function' for `on void Function()`). `member_defined` cannot see
+        // this (a non-named receiver reads as the suppress-everything
+        // face), so the record/function `this` is answered here. A nullable
+        // `this` keeps the under-report (the oracle's
+        // `unchecked_use_of_nullable_value` face).
+        if this_kind == Some(ContainerKind::Extension) {
+            let record_hit = matches!(receiver_ty, Ty::Record { .. })
+                && self
+                    .record_field_ty(receiver_ty, row.name, receiver_nullable)
+                    .is_some();
+            let function_hit = matches!(receiver_ty, Ty::Function { nullable: false, .. })
+                && row.name == self.intern("call");
+            if record_hit || function_hit {
+                return;
+            }
+            let (decidable, display) = match receiver_ty {
+                Ty::Record { nullable: false, .. } => (true, "<unknown>"),
+                Ty::Function { nullable: false, .. } => (true, "Function"),
+                _ => (false, ""),
+            };
+            if decidable {
+                let name_text = self.strings.resolve(row.name);
+                match row.intent {
+                    Intent::Invoke => {
+                        self.emit(SemanticCode::UndefinedMethod, row.range, name_text, display);
+                    }
+                    Intent::Read => {
+                        self.emit(SemanticCode::UndefinedGetter, row.range, name_text, display);
+                    }
+                    Intent::Write | Intent::ReadWrite => {
+                        self.emit(SemanticCode::UndefinedSetter, row.range, name_text, display);
+                    }
+                    Intent::Operator(..) => {}
+                }
+                self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                return;
+            }
+        }
         if self.member_defined(container, receiver_ty, row, false, receiver_nullable) {
             // The implicit-this face (`_checkForInvalidInstanceMemberAccess2`,
             // error_verifier.dart — `ThisContext.instanceFieldDeclaration`
@@ -2627,18 +2694,38 @@ impl<'a> Engine<'a> {
                     reaches(receiver_head, arg_head)
                 })
         };
+        // The oracle's applicability test instantiates the extended type
+        // against the receiver's RESOLVED type — an `InvalidType` receiver
+        // never applies an extension (`applicableTo` returns no
+        // `ExtensionResolution`), so the member stays uncredited and the
+        // access keeps its own `undefined_*` face. The name-level
+        // `InvalidType` read is [`Self::extension_receiver_resolves`]; a
+        // `dynamic` receiver dispatches dynamically — no extension binds it
+        // either.
+        // An extension body's `this` receiver carries the container as its
+        // head (the extension's own name resolves NonType — a getter-scope
+        // element, not a type): the `on` clause's interned `Ty` is the
+        // resolvable receiver shape, so the head check defers to it there.
+        let receiver_valid = !matches!(receiver_ty, Ty::Dynamic)
+            && if receiver_ty == Ty::UNKNOWN {
+                self.type_resolution(receiver).0 == TypeResolution::Type
+            } else {
+                self.extension_receiver_resolves(receiver_ty)
+            };
         let mut applicable: Vec<(&ExtensionFace, StringId, FileId)> = Vec::new();
-        for &(face, face_file) in faces {
-            let Some(on) = face.on_type else { continue };
-            if !(face.members.contains_key(&member)
-                || (accept_setter && face.members.contains_key(&setter)))
-            {
-                continue;
+        if receiver_valid {
+            for &(face, face_file) in faces {
+                let Some(on) = face.on_type else { continue };
+                if !(face.members.contains_key(&member)
+                    || (accept_setter && face.members.contains_key(&setter)))
+                {
+                    continue;
+                }
+                if !reaches(receiver, on) || !arg_applicable(face, face_file) {
+                    continue;
+                }
+                applicable.push((face, on, face_file));
             }
-            if !reaches(receiver, on) || !arg_applicable(face, face_file) {
-                continue;
-            }
-            applicable.push((face, on, face_file));
         }
         // `_isMoreSpecific` steps 3-4 at the name level: a face whose `on`
         // type is a strict subtype of another applicable face's dominates
@@ -2684,9 +2771,16 @@ impl<'a> Engine<'a> {
         // (`ImportsTracking.notifyExtensionUsed`, scope.dart:308-321): the
         // import that provided the extension is used, an own-library face
         // contributes nothing.
+        // An unsafe match credits nothing: `applicableTo` rejects the
+        // non-nullable `on` type against the nullable receiver (the access
+        // reads a possibly-null receiver — the oracle's
+        // `unchecked_use_of_nullable_value` row, emitted by the caller's
+        // `UnsafeSingle` arm), so the member never enters `usedElements`
+        // and the import stays uncredited — the oracle's `unused_element`/
+        // `unused_import` still fire on both.
         // An ambiguous access resolves no member (the oracle leaves every
         // candidate unreferenced — `unused_element` still fires on each).
-        if candidates.len() == 1 {
+        if candidates.len() == 1 && !unsafe_match {
             let (face, face_file, _) = candidates[0];
             self.extension_member_used.insert(member);
             if accept_setter {
@@ -2705,6 +2799,48 @@ impl<'a> Engine<'a> {
                     .collect(),
             ),
         }
+    }
+
+    /// Whether the receiver's interned type resolves everywhere — the
+    /// oracle's `InvalidType` test `extension_application` gates on. A
+    /// written type carrying an unresolvable name anywhere inside
+    /// (`List<UnresolvedName>` — the head `List` still resolves, so the
+    /// caller's `Ty::UNKNOWN` probe arm runs the head check itself;
+    /// `(Missing,)`, `Missing Function()`) is an `InvalidType`: the
+    /// resolver reports the spelling's own row and the access resolves
+    /// nothing, so no extension member may credit or suppress it. The walk
+    /// unfolds the `Ty` recursively through the boundary pool —
+    /// `Named.args`, a record's field types, a function type's return and
+    /// formal types — every `Named` head re-running the access's own
+    /// `type_resolution` verdict; non-named leaves (`dynamic`, `void`, the
+    /// bottom shapes) resolve by construction.
+    fn extension_receiver_resolves(&self, receiver_ty: Ty) -> bool {
+        let mut stack = vec![receiver_ty];
+        while let Some(ty) = stack.pop() {
+            match ty {
+                Ty::Named { name, args, .. } => {
+                    if self.type_resolution(name).0 != TypeResolution::Type {
+                        return false;
+                    }
+                    stack.extend_from_slice(self.boundary.pool().get(args));
+                }
+                Ty::Record { shape, .. } => {
+                    let pool = self.boundary.pool();
+                    let shape = pool.record_shape(shape);
+                    stack.extend_from_slice(&shape.positional);
+                    stack.extend(shape.named.iter().map(|&(_, ty)| ty));
+                }
+                Ty::Function { shape, .. } => {
+                    let pool = self.boundary.pool();
+                    let shape = pool.function_shape(shape);
+                    stack.push(shape.return_ty);
+                    stack.extend_from_slice(&shape.positional);
+                    stack.extend(shape.named.iter().map(|&(_, ty)| ty));
+                }
+                _ => {}
+            }
+        }
+        true
     }
 
     /// The `accessibleExtensions` list `extension_application` probes

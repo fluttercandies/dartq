@@ -199,6 +199,14 @@ pub(crate) enum BareInfo {
         /// The enclosing container's face cannot answer `on`-constraint
         /// members (mixin/extension bodies): a bare miss may be defined.
         on_opaque: bool,
+        /// The `undefined_method` host for an invocation miss inside an
+        /// `extension` body — `Some` when the enclosing container is a
+        /// plain extension (the arm replaces `this_type`, which stays
+        /// `None` for extensions), carrying the display name the oracle
+        /// reports: `Some(name)` for a resolved `on` head, `None` for an
+        /// `InvalidType`/nullable `this` whose lookup is silent (upstream
+        /// `unpromotedThisType` — `extension on Missing` never reports).
+        ext_invoke: Option<Option<StringId>>,
     },
 }
 
@@ -1622,6 +1630,15 @@ pub(crate) struct Engine<'a> {
     /// two-segment qualified reference's (`Missing.new`) importPrefix face
     /// spans the whole written head. Cleared at `end_constructor_reference`.
     pub(crate) creation_ref: Option<(StringId, Option<(StringId, SourceRange)>)>,
+    /// Constructor-reference heads that resolved to an import prefix
+    /// (`fb.RuleState.stable()`): the oracle's `resolveConstructorTypeReference`
+    /// importPrefix arm looks the class segment up in the prefix's scope — a
+    /// hit stays silent, a miss (or a non-type element) reports
+    /// `creation_with_non_type` AT the class-name token, never the prefix's
+    /// span (named_type_resolver.dart:134-332). The head offset latches here
+    /// at `push_type_use`; `end_constructor_reference` resolves the latched
+    /// head against `creation_ref`'s class segment and reports or clears.
+    pub(crate) ctor_prefix_heads: Vec<u32>,
     /// Open redirecting-factory body depth (`= C.new;`): the target
     /// reference's head resolves through the redirect face — a miss is the
     /// oracle's `redirect_to_non_class` (outside the frozen gate), never

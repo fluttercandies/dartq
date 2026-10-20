@@ -106,6 +106,7 @@ impl<'a> Engine<'a> {
             ctor_pos: 0,
             implicit_creation_depth: 0,
             creation_ref: None,
+            ctor_prefix_heads: Vec::new(),
             redirect_target_depth: 0,
             factory_redirect_target: None,
             factory_ret_open: false,
