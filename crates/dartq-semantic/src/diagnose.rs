@@ -3581,6 +3581,13 @@ mod ticket_2344_tests;
 #[cfg(test)]
 mod ticket_2365_tests;
 
+/// The #2325 pins: a mixin application's member face substitutes the
+/// mixin's own type parameters with the application's written `with`
+/// arguments at the member-table fold — `XmlElement`'s `children` reads
+/// `XmlNodeList<XmlNode>`, never the mixin's `XmlNodeList<T>` spelling.
+#[cfg(test)]
+mod ticket_2325_tests;
+
 /// The #2329 pins: the annotation name's resolution order — locals, the
 /// container's type parameters, the own-container member face (own statics
 /// for class bodies, every own member inside an extension body), then the

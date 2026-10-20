@@ -201,6 +201,13 @@ impl<'a> Engine<'a> {
         // faces. Collecting per level and seeding deepest-first preserves
         // that order while the chain climbs.
         let mut pending_faces: Vec<Vec<(StringId, FileId)>> = Vec::new();
+        // The current file's written supertype clauses, built on first
+        // need — a found mixin member whose signature carries the mixin's
+        // own type parameters (the application-site substitution face). The
+        // scanner only covers `self.file`, so a foreign application class
+        // (the `with M<Arg>` edge living in another unit) stays undecidable
+        // and the raw entry passes through — the under-report direction.
+        let mut facts: Option<FxHashMap<StringId, HeaderClause>> = None;
         loop {
             if !seen.insert(name) {
                 return Walk::ChainBroken;
@@ -255,7 +262,26 @@ impl<'a> Engine<'a> {
                     *mixin,
                 ) && let Some(entry) = mixin_container.members.get(&member)
                 {
-                    return Walk::Found(self.boundary.member(mixin_owner, *mixin, member, entry));
+                    // The application-site substitution face: the member
+                    // was found through `name`'s `with M<Arg>` edge, so its
+                    // declaring signature reads through the application's
+                    // written arguments (`XmlHasChildren<T>`'s `children`
+                    // types `XmlNodeList<XmlNode>` on `XmlElement`, not
+                    // `XmlNodeList<T>`). `mixin_env` composes the
+                    // environment from `name`'s own header clause — the
+                    // same source `check_mixin_application_overrides`
+                    // reads — and stays undecidable when the clause facts
+                    // are unknowable (a foreign application class), where
+                    // the raw entry keeps the under-report posture.
+                    let projected = self.boundary.member(mixin_owner, *mixin, member, entry);
+                    let found_entry =
+                        match self.mixin_env(name, *mixin, mixin_owner, &projected, &mut facts) {
+                            Instantiated::Applied(env) => Projected::Foreign(std::rc::Rc::new(
+                                self.substitute_entry(&projected, &env),
+                            )),
+                            Instantiated::Unchanged | Instantiated::Undecidable => projected,
+                        };
+                    return Walk::Found(found_entry);
                 }
             }
             if !found.implements_clause.is_empty() {
