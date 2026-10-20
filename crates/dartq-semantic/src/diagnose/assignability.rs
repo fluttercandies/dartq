@@ -3404,21 +3404,54 @@ mod assignability_face_tests {
     }
 
     /// The written-group control: a real `<String>[...]` literal still
-    /// checks its elements against the declared type.
+    /// checks its elements against the declared type. Oracle-pinned
+    /// (dart analyze 3.13.1, probe5/probe5c): `<String>['x']` carries no
+    /// element mismatch — the literal is `List<String>`, so only the
+    /// outer `return_of_invalid_type` fires against the `List<int>`
+    /// return; a real mismatch element (`42` under `<String>`) reports
+    /// `list_element_type_not_assignable` at that element. The fixture
+    /// stub-declares `List`/`int`/`String` — the bare unit carries no
+    /// `dart:core` scope for them to resolve through.
     #[test]
     fn written_group_literal_still_checks_elements() {
-        let report = report("List<int> g() => <String>['x'];");
+        // No element mismatch — the written `<String>` matches `'x'`
+        // exactly, so only the enclosing return-type face fires.
+        let matched = report(
+            "class List<E> {} class int {} class String {}\n\
+             List<int> g() => <String>['x'];",
+        );
+        let names: Vec<&'static str> = matched
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect();
         assert!(
-            report
-                .diagnostics
-                .iter()
-                .any(|d| d.code.name == "list_element_type_not_assignable"),
-            "{:?}",
-            report
-                .diagnostics
-                .iter()
-                .map(|d| (&d.code.name, &d.message))
-                .collect::<Vec<_>>()
+            names.contains(&"return_of_invalid_type"),
+            "expected return_of_invalid_type, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"list_element_type_not_assignable"),
+            "element face must not fire on a matching element: {names:?}"
+        );
+
+        // A real mismatch element reports `list_element_type_not_assignable`
+        // at that element (the oracle puts it on `42`, probe5c).
+        let mismatched = report(
+            "class List<E> {} class int {} class String {}\n\
+             List<int> g() => <String>['x', 42];",
+        );
+        let names: Vec<&'static str> = mismatched
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect();
+        assert!(
+            names.contains(&"return_of_invalid_type"),
+            "expected return_of_invalid_type, got {names:?}"
+        );
+        assert!(
+            names.contains(&"list_element_type_not_assignable"),
+            "element face must fire on the mismatched `42`: {names:?}"
         );
     }
 

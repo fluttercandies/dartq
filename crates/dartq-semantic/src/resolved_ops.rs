@@ -142,6 +142,16 @@ pub struct LibraryTypes {
     /// function or variable): a spelling that resolves to one maps
     /// `Invalid` rather than borrowing a same-named builtin.
     non_containers: FxHashSet<StringId>,
+    /// `typedef` name → the aliased head name plus its own `?` flag —
+    /// captured only when the element model carried the RHS as a bare
+    /// `Ty::Named` with no written arguments (`typedef A = B`,
+    /// `typedef A = B?`). A `typedef A = List<int>` or
+    /// `typedef F = void Function()` RHS stays in `non_containers` only:
+    /// its `ArgListId`/`FnShapeId` slots index the element model's
+    /// `ArgPool` this snapshot does not hold, so the spelled use keeps
+    /// the opaque face today (the under-report direction — oracle-true
+    /// only for the bare-Named arm this map covers).
+    typedef_targets: FxHashMap<StringId, (StringId, bool)>,
     /// Type-parameter spellings → a synthetic parameter id each
     /// (`MicroKind::TypeParam` declarations). Declaration-scoped in the
     /// official element model but name-keyed here exactly like the flow
@@ -292,6 +302,7 @@ impl LibraryTypes {
         let mut decl_params: FxHashMap<TypeDeclId, Vec<TypeParamId>> = FxHashMap::default();
         let decl_owner: FxHashMap<TypeDeclId, (FileId, LibraryId)> = FxHashMap::default();
         let non_containers: FxHashSet<StringId> = FxHashSet::default();
+        let typedef_targets: FxHashMap<StringId, (StringId, bool)> = FxHashMap::default();
         let type_params: FxHashMap<StringId, TypeParamId> = FxHashMap::default();
         let mut next_decl = FIRST_BUILTIN_RAW;
         let mut next_param = 2_u32;
@@ -365,6 +376,7 @@ impl LibraryTypes {
             decl_params,
             decl_owner,
             non_containers,
+            typedef_targets,
             type_params,
             facts,
             next_decl: FIRST_CONTAINER_RAW,
@@ -424,6 +436,7 @@ impl LibraryTypes {
             decl_params,
             decl_owner,
             non_containers,
+            typedef_targets,
             type_params,
             facts,
             ..
@@ -573,6 +586,7 @@ impl LibraryTypes {
             facts,
             decl_params,
             non_containers,
+            typedef_targets,
             type_params,
         }
     }
@@ -631,6 +645,10 @@ struct Registry {
     decl_params: FxHashMap<TypeDeclId, Vec<TypeParamId>>,
     decl_owner: FxHashMap<TypeDeclId, (FileId, LibraryId)>,
     non_containers: FxHashSet<StringId>,
+    /// Bare `Ty::Named` typedef right-hand sides keyed on the alias's
+    /// own spelling — the only alias shape the snapshot can resolve
+    /// without the element model's `ArgPool` (see [`LibraryTypes::typedef_targets`]).
+    typedef_targets: FxHashMap<StringId, (StringId, bool)>,
     /// Type-parameter spellings → their synthetic parameter ids: the
     /// `TypeKind::TypeParameter` map the adapter answers instead of
     /// `Invalid` for a `T`-shaped name (#2186 S4-C).
@@ -718,6 +736,23 @@ impl Registry {
             );
             if !container_like {
                 self.non_containers.insert(name);
+                // A bare `typedef A = B;` resolves `A` to `B` at the oracle's
+                // face — capture the RHS head so `map_name` chases it instead
+                // of minting an opaque declaration (subtype.dart's `C c = a`
+                // arm would otherwise under-report through `Invalid`).
+                // Argument-carrying and `Function`/`Record` RHS shapes index
+                // the element model's `ArgPool`, which this snapshot does
+                // not hold — they keep the opaque face (under-report).
+                if decl.kind == MicroKind::TypeAlias
+                    && let crate::model::Ty::Named {
+                        name: rhs_name,
+                        nullable: rhs_nullable,
+                        args,
+                    } = decl.var_ty
+                    && args == crate::model::ArgListId::EMPTY
+                {
+                    self.typedef_targets.insert(name, (rhs_name, rhs_nullable));
+                }
             }
         }
     }
@@ -1131,15 +1166,91 @@ impl<'a> ResolvedTypeOps<'a> {
     /// and the builtin table both miss: a resolved-but-unmodeled spelling
     /// (`non_containers`) mints its argument-less opaque face, so the base
     /// ops answer "unrelated" exactly like `map_scrutinee`'s arm, and
-    /// every other miss is the oracle's `InvalidType`.
+    /// every other miss is the oracle's `InvalidType`. A typedef name
+    /// first chases its captured `Ty::Named` head — `typedef A = B` reads
+    /// the `B` pair, so `is_subtype(A, B)` answers through the real
+    /// `B <: B` edge rather than the opaque face's "unrelated" arm
+    /// (the oracle resolves the alias wholesale: `C c = a` over
+    /// `A a` still reports `invalid_assignment`).
     fn observed_opaque_pair(&self, name: StringId) -> (TypeId, TypeId) {
         if !self.snapshot.non_containers.contains(&name) {
             return (self.invalid, self.invalid);
         }
+        let (chased, chased_nullable) = self.chase_typedef(name);
+        if chased != name && !self.snapshot.non_containers.contains(&chased) {
+            // The chase landed on a registered container or builtin:
+            // intern the same `Interface`/builtin pair the `registry`
+            // arm above produces, nullability composed. A terminal name
+            // that declares nowhere answers the `Invalid` pair.
+            let lexeme = self.strings.resolve(chased);
+            if let Some(&decl) = self.snapshot.registry.get(&chased) {
+                let params = self
+                    .snapshot
+                    .decl_params
+                    .get(&decl)
+                    .map_or(&[][..], Vec::as_slice);
+                let args = if params.is_empty() {
+                    Vec::new()
+                } else {
+                    instantiate_type_formals_to_bounds(
+                        &self.snapshot.table,
+                        &self.snapshot.facts,
+                        params,
+                    )
+                    .defaults
+                };
+                return (
+                    self.snapshot.table.intern(
+                        UninternedType::Interface {
+                            decl,
+                            args: args.clone(),
+                        },
+                        chased_nullable,
+                    ),
+                    self.snapshot
+                        .table
+                        .intern(UninternedType::Interface { decl, args }, true),
+                );
+            }
+            if let Some(non_null) = self.builtin_spelling(lexeme, chased_nullable) {
+                let nullable = self
+                    .builtin_spelling(lexeme, true)
+                    .unwrap_or(non_null);
+                return (non_null, nullable);
+            }
+            return (self.invalid, self.invalid);
+        }
         (
-            self.opaque_ty(name, Vec::new(), false),
-            self.opaque_ty(name, Vec::new(), true),
+            self.opaque_ty(chased, Vec::new(), chased_nullable),
+            self.opaque_ty(chased, Vec::new(), true),
         )
+    }
+
+    /// The bare-`Named` typedef chase shared by every name-resolution
+    /// arm: walks `typedef_targets` from `name` while each hop stays
+    /// inside `non_containers` (a terminal name that resolves to a
+    /// container or builtin leaves the set and the caller re-enters the
+    /// normal precedence on it). Returns the terminal name plus the
+    /// accumulated `?` flag — each hop's own `nullable` composes into
+    /// the alias's face exactly like the oracle's `A?`-for-`B?` read.
+    /// Bounded by `typedef_targets.len()` — a cyclic chain
+    /// (`typedef A = B; typedef B = A;`) exhausts the bound and the
+    /// terminal name keeps the opaque face rather than looping.
+    fn chase_typedef(&self, name: StringId) -> (StringId, bool) {
+        let mut chased = name;
+        let mut nullable = false;
+        for _ in 0..=self.snapshot.typedef_targets.len() {
+            let Some(&(rhs_name, rhs_nullable)) = self.snapshot.typedef_targets.get(&chased)
+            else {
+                break;
+            };
+            chased = rhs_name;
+            nullable |= rhs_nullable;
+            if !self.snapshot.non_containers.contains(&chased) {
+                break;
+            }
+        }
+        (chased, nullable)
     }
 
     /// One written name's resolved mapping — the shared core of
@@ -1186,9 +1297,30 @@ impl<'a> ResolvedTypeOps<'a> {
             return builtin;
         }
         if self.snapshot.non_containers.contains(&name) {
+            // A bare `typedef A = B` chases its aliased head before the
+            // opaque face — the oracle resolves `A` to `B` wholesale
+            // (`B f(A a) => a` is silent, `C c = a` still reports
+            // `invalid_assignment`). Argument-carrying and non-Named RHS
+            // shapes are not modeled here and fall through to opaque
+            // (the under-report direction).
+            let (chased, chased_nullable) = self.chase_typedef(name);
+            let nullable = nullable || chased_nullable;
+            if chased != name && !self.snapshot.non_containers.contains(&chased) {
+                // The chase left `non_containers` — the terminal resolves
+                // through the full precedence chain (a container, a
+                // builtin spelling, or `Invalid` when it declares
+                // nowhere).
+                return self.map_name(
+                    self.strings.resolve(chased),
+                    args,
+                    arena,
+                    names,
+                    nullable,
+                );
+            }
             let written = arena.get(args as usize).map_or(&[][..], Vec::as_slice);
             let mapped = self.opaque_args(written, arena, names);
-            return self.opaque_ty(name, mapped, nullable);
+            return self.opaque_ty(chased, mapped, nullable);
         }
         self.invalid
     }
@@ -2770,11 +2902,13 @@ mod tests {
             NameTypeOps.factor(unobserved, base)
         );
 
-        // The observed-but-unregistered face answers through `Invalid`
-        // (the suppress posture), not through the name-level rules: a
-        // typedef's name is never a decl, and `Missing` is declared
-        // nowhere — both map `Invalid`, so `is_subtype` answers `true`
-        // (subtype.dart's 0c arm) where `NameTypeOps` says `false`.
+        // A typedef name resolves through its captured RHS — `Alias`
+        // stands for `Base`, so `is_subtype(alias, base)` answers `true`
+        // via the real `B <: B` edge, matching the oracle
+        // (`B f(A a) => a` is silent; `C c = a` reports
+        // `invalid_assignment`). `Missing` still maps `Invalid` — its
+        // `is_subtype(missing, open)` answers `true` through
+        // subtype.dart's 0c arm where `NameTypeOps` says `false`.
         assert!(ops.is_subtype(alias, base));
         assert!(ops.is_subtype(missing, open));
     }
