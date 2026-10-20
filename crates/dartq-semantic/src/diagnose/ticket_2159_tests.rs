@@ -166,10 +166,9 @@ fn enum_constant_member_access_spares() {
 
 /// The control: a genuinely unread private field still reports — the
 /// sparing pins above depend on the verdict actually firing when no read
-/// resolves. (`+=` alone on a field — `visitCompoundAssignment`'s
-/// `readCountsAsUse: parent is! ExpressionStatement` — still reports; that
-/// arm lives in `row_resolution.rs`'s `resolve_member_row` and rides a
-/// separate lane, so it is pinned by the corpus rather than here.)
+/// resolves. (`+=` alone on a field — `_isReadIdentifier`'s
+/// statement-discard arm — still reports: #2409's bare-row read-credit
+/// gate, pinned by `ticket_2409_tests.rs`.)
 #[test]
 fn write_only_private_field_still_reports() {
     let source = "class C {\n\

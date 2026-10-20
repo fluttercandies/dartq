@@ -593,11 +593,23 @@ impl<'a> Engine<'a> {
                     self.check_top_level_unused_result(row);
                 }
                 // A non-write resolution of a field name is the implicit
-                // getter's read (writes never spare a field). Inside an
-                // extension body `this` reads the `on` type's member — the
-                // owner credits the extended container, not the extension
-                // (the same face `note_member_read`'s `This` arm carries).
-                if !matches!(row.intent, Intent::Write) {
+                // getter's read (writes never spare a field) — unless the
+                // statement window discarded the read (`_isReadIdentifier`'s
+                // false arm, upstream Dart SDK source,
+                // pkg/analyzer/lib/src/error/unused_local_elements_verifier
+                // .dart:418-440: a bare compound-assignment LHS, prefix, or
+                // postfix operand whose parent is the ExpressionStatement
+                // joins no read set, so `_x += 1;`/`_x++;`/`-_x;` leave the
+                // field unused while `??=` and member targets keep theirs).
+                // Inside an extension body `this` reads the `on` type's
+                // member — the owner credits the extended container, not
+                // the extension (the same face `note_member_read`'s `This`
+                // arm carries).
+                if !matches!(row.intent, Intent::Write)
+                    && !self
+                        .statement_discarded_rows
+                        .contains(&row.range.offset)
+                {
                     if let Some(&pushed) = self.field_read_rows.get(&row.range.offset) {
                         self.read_names.insert(row.name);
                         let owner = self

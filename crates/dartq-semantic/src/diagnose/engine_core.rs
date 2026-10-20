@@ -288,6 +288,7 @@ impl<'a> Engine<'a> {
             site_params: FxHashMap::default(),
             self_scope_rows: FxHashSet::default(),
             field_read_rows: FxHashMap::default(),
+            statement_discarded_rows: FxHashSet::default(),
             ctor_pending: None,
             open_toplevel_site: None,
             open_member_setter: false,

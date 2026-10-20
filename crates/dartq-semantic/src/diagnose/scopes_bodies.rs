@@ -144,6 +144,10 @@ impl<'a> Engine<'a> {
     /// (`visitCompoundAssignment`'s `readCountsAsUse: parent is!
     /// ExpressionStatement`). Plain `v;`, `v + 1;`, and `v ??= 1;` are
     /// useful reads.
+    ///
+    /// A discarded bare row also joins `statement_discarded_rows`, the
+    /// pass-2 gate that refuses the field's implicit-getter read credit
+    /// (`unused_field`) — one verdict, both faces.
     pub(crate) fn check_statement_use(&mut self, begin: Token, end: Token) {
         // The statement boundary closes the pattern-declaration window: a
         // later group is its own all-or-nothing set.
@@ -215,7 +219,15 @@ impl<'a> Engine<'a> {
         });
         if compound_write {
             for (row_range, bare) in &rw_rows {
-                if *bare && let Some(hit) = self.local_hits.remove(&row_range.offset) {
+                if !*bare {
+                    continue;
+                }
+                // The field-face twin: the pass-2 bare read-credit gate
+                // consults the same discard (`_isReadIdentifier` gates the
+                // official `readMembers` join and the local `uses` count
+                // with one verdict).
+                self.statement_discarded_rows.insert(row_range.offset);
+                if let Some(hit) = self.local_hits.remove(&row_range.offset) {
                     self.locals[hit as usize].uses -= 1;
                 }
             }
@@ -227,11 +239,11 @@ impl<'a> Engine<'a> {
             let tail_op = window_ops.iter().any(|(offset, text)| {
                 *offset == row_range.end() && matches!(*text, "!" | "++" | "--")
             });
-            if (head_op || tail_op)
-                && bare
-                && let Some(hit) = self.local_hits.remove(&row_range.offset)
-            {
-                self.locals[hit as usize].uses -= 1;
+            if (head_op || tail_op) && bare {
+                self.statement_discarded_rows.insert(row_range.offset);
+                if let Some(hit) = self.local_hits.remove(&row_range.offset) {
+                    self.locals[hit as usize].uses -= 1;
+                }
             }
         }
     }

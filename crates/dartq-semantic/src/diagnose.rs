@@ -3607,3 +3607,26 @@ mod ticket_2329_tests;
 /// `part_file_unused_field_closes_library_wide` (#2286).
 #[cfg(test)]
 mod ticket_2159_tests;
+
+/// The #2405 pins: the `ambiguous_set_or_map_literal_both` over-report
+/// cluster — a typed `<int, dynamic>{}` entry value whose `<...>` group
+/// comma mis-split the leaf scan into a phantom set side. See the module
+/// for the upstream `_computeSetOrMapResolution` three-leg order.
+#[cfg(test)]
+mod ticket_2405_tests;
+
+/// The #2406 pins: the `equal_elements_in_const_set` /
+/// `equal_keys_in_const_map` equality face over structural values —
+/// records/collections/symbols fold to payload-carrying constants so the
+/// duplicate twins compare by value, never by opaque kind (the html
+/// package's 103-row record over-report cluster).
+#[cfg(test)]
+mod ticket_2406_tests;
+
+/// The #2409 pins: the statement-window read discard on the
+/// `unused_field`/`unused_local_variable` faces — a bare identifier under a
+/// compound-assignment LHS, prefix, or postfix whose parent is the
+/// ExpressionStatement joins no read set (`_x += 1;` reports), while `??=`,
+/// member targets, binary reads, and later genuine reads keep theirs.
+#[cfg(test)]
+mod ticket_2409_tests;

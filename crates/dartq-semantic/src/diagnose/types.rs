@@ -2583,6 +2583,17 @@ pub(crate) struct Engine<'a> {
     /// spares exactly the field of that container (a primary-constructor
     /// field read inside a getter included).
     pub(crate) field_read_rows: FxHashMap<u32, StringId>,
+    /// Bare rows whose statement-window read is discarded (the official
+    /// `_isReadIdentifier`, upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/error/unused_local_elements_verifier.dart:418-
+    /// 440: an identifier directly under a compound-assignment LHS, a
+    /// prefix, or a postfix whose own parent is the ExpressionStatement is
+    /// no read — `_x += 1;`, `_x++;`, `-_x;`; `??=` and member targets
+    /// (`this._x += 1;`) keep theirs). The offset joins at the statement
+    /// close and pass 2's bare read-credit gate consults it for the
+    /// `unused_field` face — the same discard the local `uses` decrement
+    /// already carries.
+    pub(crate) statement_discarded_rows: FxHashSet<u32>,
     /// The container of the constructor/factory being parsed (`None`
     /// outside one).
     /// The open constructor/factory's container id plus the provisional
