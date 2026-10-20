@@ -3553,3 +3553,12 @@ mod ticket_2362_tests;
 /// collision keep their existing verdicts.
 #[cfg(test)]
 mod ticket_2344_tests;
+
+/// The #2365 pins: the bare implicit-call invocation — a callable
+/// instance called without an explicit .call resolves the call member's
+/// formals (counts and argument checks included) and writes its declared
+/// return type, with the method's own type parameters feeding the
+/// substitution, while non-callable callees keep the non-function face
+/// and explicit .call tear-offs stay untouched.
+#[cfg(test)]
+mod ticket_2365_tests;

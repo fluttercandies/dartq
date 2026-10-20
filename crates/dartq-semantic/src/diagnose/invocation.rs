@@ -1991,8 +1991,10 @@ impl<'a> Engine<'a> {
     /// abstract (the xml corpus's `XPathExpression.call`). The member must
     /// be an instance method; a generic container instantiation and every
     /// function-typed alias keep their own faces (`None`). Returns the
-    /// call method's formals and declared return type.
-    fn implicit_call_face(&self, ty: Ty) -> Option<(Formals, Ty)> {
+    /// call method's formals, its declared return type, and its own
+    /// type-parameter names (the inference parameters a generic
+    /// `R call<R>(R x)` solves at the send).
+    fn implicit_call_face(&self, ty: Ty) -> Option<(Formals, Ty, Box<[StringId]>)> {
         let Ty::Named {
             name: container,
             args: ArgListId::EMPTY,
@@ -2004,11 +2006,19 @@ impl<'a> Engine<'a> {
         let call = self.intern("call");
         match self.walk_members(container, call) {
             Walk::Found(entry) if entry.kind == MemberKind::Method && !entry.is_static => {
-                let (formals, return_ty) = match &entry {
-                    Projected::Own(e) => (e.formals.as_deref()?.clone(), e.return_ty),
-                    Projected::Foreign(e) => (e.formals.as_deref()?.to_owned(), e.return_ty),
+                let (formals, return_ty, params) = match &entry {
+                    Projected::Own(e) => (
+                        e.formals.as_deref()?.clone(),
+                        e.return_ty,
+                        e.type_param_names.clone(),
+                    ),
+                    Projected::Foreign(e) => (
+                        e.formals.as_deref()?.to_owned(),
+                        e.return_ty,
+                        e.type_param_names.clone(),
+                    ),
                 };
-                Some((formals, return_ty))
+                Some((formals, return_ty, params))
             }
             _ => None,
         }
@@ -3766,18 +3776,23 @@ impl<'a> Engine<'a> {
                 .map(std::borrow::Cow::into_owned),
             _ => None,
         };
-        // The implicit-`call` face (the member placeholder's type names a
-        // container whose `call` method answers): the invocation checks
-        // against the call method's formals — `body(inner)` over
-        // `XPathExpression body` checks `inner` against
-        // `XPathContext` (`XPathExpression.call`'s formal), the oracle's
-        // FunctionExpressionInvocation `.call` resolution.
+        // The implicit-`call` face (the callee's type names a container
+        // whose `call` method answers — bare `body(inner)` over
+        // `XPathExpression body` and the dot-spelled `body.call(inner)`
+        // alike): the invocation checks against the call method's formals
+        // — `inner` against `XPathContext` (`XPathExpression.call`'s
+        // formal), the oracle's CallInvocation `.call` resolution
+        // (function_expression_invocation_resolver.dart:141-203). The
+        // face's executable facts ride along for the parameter
+        // substitution and the result-type write below (the call method's
+        // own type parameters stand in for the element model's, and the
+        // call's declared return becomes the send's return face).
+        let mut implicit_call: Option<(Ty, Box<[StringId]>)> = None;
         let formals = formals.or_else(|| {
             let row = self.rows.get(callee)?;
-            row.qualified
-                .then(|| self.implicit_call_face(row.ty))
-                .flatten()
-                .map(|(formals, _)| formals)
+            let (formals, ret, params) = self.implicit_call_face(row.ty)?;
+            implicit_call = Some((ret, params));
+            Some(formals)
         });
         let Some(formals) = formals else {
             return;
@@ -3829,7 +3844,7 @@ impl<'a> Engine<'a> {
         // class's own. The declared return face rides along for the
         // substituted-return write at the close (the row borrow must not
         // reach the emits below).
-        let (creation_container, return_face) = match &row.shape {
+        let (creation_container, mut return_face) = match &row.shape {
             RowShape::Bare(BareInfo::Container {
                 name,
                 kind: ContainerKind::Class,
@@ -3874,6 +3889,14 @@ impl<'a> Engine<'a> {
             RowShape::Member { .. } => (None, Some(self.callee_return_ty(row))),
             _ => (None, None),
         };
+        // The implicit-`call` face's return: the call method's declared
+        // return is the send's return face, whatever spelling the callee
+        // row carries (a bare `body(...)`'s top-level lookup answered
+        // nothing; a dot-spelled `body.call(...)` whose member walk missed
+        // must not inherit a same-spelled top-level `call`'s return).
+        if let Some((ret, _)) = implicit_call {
+            return_face = Some(ret);
+        }
         // Read before the first mutation below: the row borrow must not
         // reach the emits.
         let unnamed_creation = matches!(&row.shape, RowShape::Bare(BareInfo::Container { .. }));
@@ -3907,6 +3930,16 @@ impl<'a> Engine<'a> {
             && !sig.params.is_empty()
         {
             exec_params = Some(sig.params.iter().copied().collect());
+        }
+        // The implicit-`call` face's parameters (the call method's own
+        // type parameters — `R call<R>(R x)` solves `R` like any generic
+        // send's, downward from the context type, upward from the first
+        // matched argument).
+        if exec_params.is_none()
+            && let Some((_, params)) = &implicit_call
+            && !params.is_empty()
+        {
+            exec_params = Some(params.iter().map(|name| (*name, None)).collect());
         }
         // The count decisions. The parser's total is exact where the row
         // recovery is not, so the positional supply is the total less the
@@ -4338,6 +4371,12 @@ impl<'a> Engine<'a> {
         // only (a compound return keeps the declared face). The row
         // carries it for the downstream assignment/argument checks; a
         // nullable solution under-reports.
+        // The implicit-`call` face's result type (the concrete-return
+        // shape — the exactly-parameter shape above already wrote the
+        // solved one): `return body(inner)` reads `XPathSequence`
+        // (`Expr.call`'s), never the callee's own `Expr` class — the
+        // oracle types the invocation node with the called member's
+        // return (function_expression_invocation_resolver.dart:230-256).
         if let Some(params) = &exec_params
             && let Some(Ty::Named {
                 name: param,
@@ -4348,6 +4387,8 @@ impl<'a> Engine<'a> {
             && let Some(index) = params.iter().position(|(p, _)| *p == param)
         {
             self.rows[callee].ty = effective[index];
+        } else if let Some((ret, _)) = implicit_call {
+            self.rows[callee].ty = ret;
         }
         // The creation's instantiated self type: the send merge replaces
         // the folded row (its type lost), so the solved face rides in
@@ -4707,15 +4748,21 @@ impl<'a> Engine<'a> {
         }
         // The implicit-`call` result type: a member value invocation whose
         // type names a container with a `call` method yields the method's
-        // return type — `return body(inner)` reads `XPathSequence`
+        // return type — `return body.call(inner)` reads `XPathSequence`
         // (`XPathExpression.call`'s), never the receiver's own
         // `XPathExpression` (the oracle's `.call` resolution types the
         // invocation node with the called member's return). A `Never`-typed
         // member keeps its own face (the dead-flow arm above reads it).
+        // Bare spellings take the write from the argument-check face at
+        // the group's close (the substitution needs the live arguments);
+        // this block covers the dot-spelled rows whose member walk
+        // resolved the formals ahead of that face, and self-guards
+        // against a row the face already retyped (the written return
+        // names no `call` member).
         if let Some(row) = self.rows.get(callee)
             && row.qualified
             && !self.is_never_ty(row.ty)
-            && let Some((_, call_ret)) = self.implicit_call_face(row.ty)
+            && let Some((_, call_ret, _)) = self.implicit_call_face(row.ty)
         {
             self.rows[callee].ty = call_ret;
         }
