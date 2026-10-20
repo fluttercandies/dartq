@@ -402,6 +402,7 @@ mod rewrite_stmt;
 mod rewrite_structure;
 mod rewrite_text;
 mod scan;
+mod switch_cases;
 
 pub(crate) use assists::*;
 pub(crate) use evidence::*;
@@ -420,6 +421,7 @@ pub(crate) use rewrite_stmt::*;
 pub(crate) use rewrite_structure::*;
 pub(crate) use rewrite_text::*;
 pub(crate) use scan::*;
+pub(crate) use switch_cases::*;
 
 // Public API preserved byte-for-byte: these items were `pub` in this module
 // before the split; daemon/CLI (and any external consumer) import them via

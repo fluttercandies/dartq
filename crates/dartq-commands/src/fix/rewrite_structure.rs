@@ -2229,6 +2229,29 @@ pub(crate) fn drop_head_const_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u3
     }
 }
 
+/// `invalid_constant`: upstream `RemoveConst` — the reported expression's
+/// `constantContext` resolves to a `const`/`new`-headed literal or
+/// creation whose keyword drops through its trivia run
+/// (`startStart(constKeyword, constKeyword.next!)`), or to a
+/// `const`-headed `VariableDeclarationList` whose keyword becomes
+/// `final`. The token-stream provable arms ride the two existing
+/// rewriters; an Annotation or const-pattern context carries no const
+/// token upstream's `constantContext` would resolve — both rewriters
+/// answer `None` there and the row stays silent rather than fabricate.
+/// Upstream's `ExpressionImpl → constantContext` dispatch and the
+/// `SourceRange(offset, length + 1)` CompilationUnit arm read resolved
+/// nodes the fix pass does not carry and stay absent.
+pub(crate) fn invalid_const_entry(input: &FixInput<'_>) -> Option<Vec<(u32, u32, String)>> {
+    // The declaration-list arm first — a `const`/`final` keyword heading
+    // the owning list wins over any `const` the value expression itself
+    // carries (the list arm is upstream's `VariableDeclarationList`
+    // dispatch; the value's own keyword is the literal/creation arm).
+    if let Some(edits) = drop_head_const_entry(input) {
+        return Some(edits);
+    }
+    drop_enclosing_const(input).map(|edit| vec![edit])
+}
+
 /// `constant_pattern_with_non_constant_expression`: `const ` lands before
 /// the reported operand — the official `AddConst` `ConstantPattern` arm.
 /// A const-eligible single operand (literal, identifier, named reference,

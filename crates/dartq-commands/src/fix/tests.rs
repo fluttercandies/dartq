@@ -8461,3 +8461,218 @@
         let (_, _, replacement) = edit(source, "dart:core");
         assert_eq!(replacement, "import 'dart:core';\n\n");
     }
+
+    // --- T10: the missing-switch-cases + invalid-const waves (#2399) ---
+
+    /// A semantic row whose `correction` slot carries the oracle's
+    /// correction message — the missing-switch-cases family un-renders the
+    /// `{a2}` pattern out of it (the witness text lives between the last
+    /// two `'` quotes).
+    fn switch_row(code: &'static str, offset: u32, correction: &str) -> Diagnostic {
+        Diagnostic::new(
+            Severity::Warning,
+            CodeInfo::new(code, "", DiagnosticType::StaticWarning, false),
+            "",
+            FileTable::new().intern(Path::new("t.dart")),
+            SourceRange { offset, length: 6 },
+            Some(correction.to_owned()),
+        )
+    }
+
+    /// The single fix [`super::from_switch_cases`] materializes over
+    /// `source`, tagged `builtin-semantic`.
+    fn one_switch_fix(source: &str, diagnostic: Diagnostic) -> RuleFix {
+        let parsed = parse_unit(source, Features::default());
+        let fixes = from_switch_cases(
+            &[diagnostic],
+            source,
+            &parsed.tokens,
+            &parsed.lines,
+            &walk_fuse(),
+        );
+        assert_eq!(fixes.len(), 1, "expected exactly one fix for {source:?}");
+        fixes.into_iter().next().expect("one fix")
+    }
+
+    /// `non_exhaustive_switch_statement` on an empty multi-line body — the
+    /// arm lands at the start of the closing bracket's line, `case
+    /// <pattern>:` plus the two-space-deeper `// TODO:` and `throw`
+    /// (upstream `test_empty`, `insertCaseClauseAtEnd`).
+    #[test]
+    fn missing_switch_case_statement_multiline() {
+        let source = "void f(E e) {\n  switch (e) {\n  }\n}\n";
+        let row = switch_row(
+            "non_exhaustive_switch_statement",
+            at(source, "switch"),
+            "Try adding a default case or cases that match 'E.a'.",
+        );
+        let fix = one_switch_fix(source, row);
+        assert_eq!(fix.rule, "non_exhaustive_switch_statement");
+        assert_eq!(fix.source, BUILTIN_SEMANTIC_SOURCE);
+        assert_eq!(fix.message, "Add missing switch cases");
+        let (patched, outcomes) = apply(source, std::slice::from_ref(&fix.edit));
+        assert_eq!(outcomes, &[EditOutcome::Applied]);
+        assert_eq!(
+            patched,
+            "void f(E e) {\n  switch (e) {\n    case E.a:\n      // TODO: Handle this \
+             case.\n      throw UnimplementedError();\n  }\n}\n"
+        );
+    }
+
+    /// The single-line body inserts at the left bracket's end — a
+    /// newline, the arm, then the switch line's prefix re-seats the `}`
+    /// (upstream `test_empty_singleLine`).
+    #[test]
+    fn missing_switch_case_statement_single_line() {
+        let source = "void f(E e) {\n  switch (e) {}\n}\n";
+        let row = switch_row(
+            "non_exhaustive_switch_statement",
+            at(source, "switch"),
+            "Try adding a default case or cases that match 'E.a'.",
+        );
+        let fix = one_switch_fix(source, row);
+        let (patched, outcomes) = apply(source, std::slice::from_ref(&fix.edit));
+        assert_eq!(outcomes, &[EditOutcome::Applied]);
+        assert_eq!(
+            patched,
+            "void f(E e) {\n  switch (e) {\n    case E.a:\n      // TODO: Handle this \
+             case.\n      throw UnimplementedError();\n  }\n}\n"
+        );
+    }
+
+    /// `non_exhaustive_switch_expression` writes the `<pattern> => throw
+    /// UnimplementedError(),` arm — the `// TODO:` line leads, the
+    /// wildcard-correction text lands as the pattern.
+    #[test]
+    fn missing_switch_case_expression_multiline() {
+        let source = "var y = switch (e) {\n  E.a => 1,\n};\n";
+        let row = switch_row(
+            "non_exhaustive_switch_expression",
+            at(source, "switch"),
+            "Try adding a wildcard pattern or cases that match 'E.b'.",
+        );
+        let fix = one_switch_fix(source, row);
+        assert_eq!(fix.rule, "non_exhaustive_switch_expression");
+        assert_eq!(fix.source, BUILTIN_SEMANTIC_SOURCE);
+        let (patched, outcomes) = apply(source, std::slice::from_ref(&fix.edit));
+        assert_eq!(outcomes, &[EditOutcome::Applied]);
+        assert_eq!(
+            patched,
+            "var y = switch (e) {\n  E.a => 1,\n  // TODO: Handle this case.\n  E.b => \
+             throw UnimplementedError(),\n};\n"
+        );
+    }
+
+    /// A correction slot that carries no pattern — an empty quote pair —
+    /// yields no fix rather than a fabricated arm.
+    #[test]
+    fn missing_switch_case_without_pattern_produces_nothing() {
+        let source = "void f(E e) {\n  switch (e) {\n  }\n}\n";
+        let parsed = parse_unit(source, Features::default());
+        let row = switch_row(
+            "non_exhaustive_switch_statement",
+            at(source, "switch"),
+            "Try adding a default case or cases that match ''.",
+        );
+        let fixes = from_switch_cases(
+            &[row],
+            source,
+            &parsed.tokens,
+            &parsed.lines,
+            &walk_fuse(),
+        );
+        assert!(fixes.is_empty());
+    }
+
+    /// A row with no correction at all (a hand-built diagnostic) yields
+    /// no fix.
+    #[test]
+    fn missing_switch_case_without_correction_produces_nothing() {
+        let source = "void f(E e) {\n  switch (e) {\n  }\n}\n";
+        let parsed = parse_unit(source, Features::default());
+        let row = sem_row(
+            "non_exhaustive_switch_statement",
+            "",
+            at(source, "switch"),
+            6,
+        );
+        let fixes = from_switch_cases(
+            &[row],
+            source,
+            &parsed.tokens,
+            &parsed.lines,
+            &walk_fuse(),
+        );
+        assert!(fixes.is_empty());
+    }
+
+    /// The switch-cases rows validate against the FixPatch schema and
+    /// carry the `builtin-semantic` provenance tag.
+    #[test]
+    fn missing_switch_case_passes_the_fixpatch_schema() {
+        let source = "void f(E e) {\n  switch (e) {\n  }\n}\n";
+        let parsed = parse_unit(source, Features::default());
+        let row = switch_row(
+            "non_exhaustive_switch_statement",
+            at(source, "switch"),
+            "Try adding a default case or cases that match 'E.a'.",
+        );
+        let fixes = from_switch_cases(
+            &[row],
+            source,
+            &parsed.tokens,
+            &parsed.lines,
+            &walk_fuse(),
+        );
+        assert_eq!(fixes.len(), 1);
+        let set = FileFixSet {
+            path: "lib/t.dart".to_owned(),
+            fixes,
+            plugin: Vec::new(),
+        };
+        let doc = patch_json(&set, Verbosity::Compact);
+        let text = doc.to_string();
+        dartq_schema::validate(&text, dartq_schema::Domain::FixPatch).expect("schema-valid");
+        assert_eq!(doc["edits"][0]["source"], BUILTIN_SEMANTIC_SOURCE);
+    }
+
+    /// `invalid_constant` on a `const`-headed variable list — the
+    /// upstream `VariableDeclarationList` arm turns the list's `const`
+    /// into `final` (`const x = <non-const>` → `final x = <non-const>`).
+    #[test]
+    fn invalid_constant_list_keyword_becomes_final() {
+        let source = "void f() {\n  const x = C();\n}\n";
+        assert_sem_rewrite(
+            "invalid_constant",
+            "",
+            source,
+            at(source, "C()"),
+            3,
+            "void f() {\n  final x = C();\n}\n",
+        );
+    }
+
+    /// `invalid_constant` on a `const`-headed creation expression drops
+    /// the keyword through its trivia run (`startStart(constKeyword,
+    /// constKeyword.next!)`).
+    #[test]
+    fn invalid_constant_creation_keyword_drops() {
+        let source = "void f() {\n  var x = const C();\n}\n";
+        assert_sem_rewrite(
+            "invalid_constant",
+            "",
+            source,
+            at(source, "C()"),
+            3,
+            "void f() {\n  var x = C();\n}\n",
+        );
+    }
+
+    /// A reported expression inside an `const`-free context — a plain
+    /// assignment — carries no const token `constantContext` would
+    /// resolve; the row stays silent rather than fabricate.
+    #[test]
+    fn invalid_constant_without_const_produces_nothing() {
+        let source = "void f() {\n  var x = C();\n}\n";
+        assert_sem_no_fix("invalid_constant", "", source, at(source, "C()"), 3);
+    }

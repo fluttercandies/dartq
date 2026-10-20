@@ -248,8 +248,8 @@ use crate::fix::{
     drop_wildcard_and_operand, eight_digit_hex, equality_is_check, equality_null_operand,
     expected_token_fix, expression_function_body, field_public, flutter_style_todo,
     for_each_tear_off, for_in_from_for_each, function_type_syntax, generic_alias_syntax,
-    if_null_bools, inline_typedef, is_empty_call, is_not_empty_access, is_null_to_eq_null,
-    make_declaration_final, make_parameter_final, map_from_iterable_for_element,
+    if_null_bools, inline_typedef, invalid_const_entry, is_empty_call, is_not_empty_access,
+    is_null_to_eq_null, make_declaration_final, make_parameter_final, map_from_iterable_for_element,
     missing_body_block, move_init_to_field_entry, move_type_args_to_class,
     named_constant_reference, new_to_const, not_null_aware_operator, null_aware_element,
     null_check_argument, null_check_assignment, null_check_condition, omit_type_with_var,
@@ -1208,6 +1208,24 @@ static FIX_TABLE: &[FixSpec] = &[
         source: FixSource::Semantic,
         needs_tokens: true,
         action: FixAction::Rewrite(null_check_assignment),
+    },
+    // A `const` context whose reported expression is not constant —
+    // upstream `RemoveConst` (fix_internal.dart:
+    // `invalidConstant: [RemoveConst.new]`; fix kind
+    // `dart.fix.remove.const`). The producer's `constantContext` arm the
+    // token stream can prove lands on one of two shapes: an enclosing
+    // `const`/`new`-headed literal or creation drops its keyword through
+    // the trivia run (`startStart(constKeyword, constKeyword.next!)` —
+    // `drop_enclosing_const`), or a `const`-headed
+    // `VariableDeclarationList`'s keyword becomes `final` (the upstream
+    // list arm — `drop_head_const_entry`). An Annotation or const-pattern
+    // context carries no const token upstream's `constantContext` would
+    // resolve; the rewriters return `None` there rather than fabricate.
+    FixSpec {
+        code: "invalid_constant",
+        source: FixSource::Semantic,
+        needs_tokens: true,
+        action: FixAction::MultiRewrite(invalid_const_entry),
     },
     // `case 1 + 2:` — the constant expression wraps in `const (…)`, or
     // `const ` lands before an enclosing parenthesized pattern (official
@@ -2948,6 +2966,7 @@ mod tests {
             "extension_type_declares_member_of_object",
             "final_not_initialized",
             "import_of_non_library",
+            "invalid_constant",
             "invalid_null_aware_operator",
             "invocation_of_non_function_expression",
             "mixin_super_class_constraint_non_interface",
@@ -3051,7 +3070,7 @@ mod tests {
             .iter()
             .filter(|spec| spec.source == FixSource::Semantic)
             .count();
-        assert_eq!(semantic_rows, 61);
+        assert_eq!(semantic_rows, 62);
         for code in [
             "experiment_not_enabled",
             "missing_identifier",

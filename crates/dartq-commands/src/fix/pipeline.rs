@@ -202,6 +202,13 @@ pub fn collect_set_with_evidence(
             &fuse,
         ));
         applied.extend(from_parser(semantic_rows, &text, &parsed.lines, path, &fuse));
+        applied.extend(from_switch_cases(
+            semantic_rows,
+            &text,
+            &parsed.tokens,
+            &parsed.lines,
+            &fuse,
+        ));
         if fuse.tripped() {
             break 'files;
         }

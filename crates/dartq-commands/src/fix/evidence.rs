@@ -86,7 +86,9 @@ pub(crate) fn semantic_fix_diagnostics(
         let Some(path) = targets.get(&diagnostic.file) else {
             continue;
         };
-        if crate::fix_table::is_engine_fix_code(diagnostic.code.name) {
+        if crate::fix_table::is_engine_fix_code(diagnostic.code.name)
+            || switch_case_arm(diagnostic.code.name).is_some()
+        {
             rows.entry(path.clone())
                 .or_insert_with(Vec::new)
                 .push(diagnostic.clone());
