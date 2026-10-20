@@ -606,11 +606,7 @@ impl<'a> Engine<'a> {
         let selector = text
             .strip_prefix(head)
             .and_then(|rest| rest.strip_prefix('.'))
-            .map(|rest| {
-                rest.split(['(', ' ', '?', '\n', '\t'])
-                    .next()
-                    .unwrap_or("")
-            })
+            .map(|rest| rest.split(['(', ' ', '?', '\n', '\t']).next().unwrap_or(""))
             .unwrap_or("");
         if selector.is_empty() || selector == "new" {
             return true;
@@ -705,14 +701,13 @@ impl<'a> Engine<'a> {
                     // type-valued decl is the implicit const creation, a
                     // value-typed read (a local, a member, a const var) is
                     // the method-invocation fault.
-                    let is_const_ctor = decl_type
-                        && {
-                            let container = self.strings.resolve(recv.name);
-                            let selector = self.strings.resolve(name);
-                            CORE_CONST_CTOR.iter().any(|(c, sels)| {
-                                *c == container && sels.iter().any(|s| *s == selector)
-                            })
-                        };
+                    let is_const_ctor = decl_type && {
+                        let container = self.strings.resolve(recv.name);
+                        let selector = self.strings.resolve(name);
+                        CORE_CONST_CTOR
+                            .iter()
+                            .any(|(c, sels)| *c == container && sels.iter().any(|s| *s == selector))
+                    };
                     if decl_type && !is_const_ctor {
                         // The `const_with_non_const` face fires when the
                         // container's constructor exists but is not const
@@ -756,10 +751,10 @@ impl<'a> Engine<'a> {
                 | RowShape::Record(_)
                 | RowShape::Receiver(
                     Receiver::Unknown
-                        | Receiver::Typed { .. }
-                        | Receiver::Created { .. }
-                        | Receiver::This { .. }
-                        | Receiver::Super { .. },
+                    | Receiver::Typed { .. }
+                    | Receiver::Created { .. }
+                    | Receiver::This { .. }
+                    | Receiver::Super { .. },
                 ) => {
                     return CallClass::Invocable;
                 }
@@ -921,8 +916,11 @@ impl<'a> Engine<'a> {
                         self.emit(code, span, "", "");
                     }
                     if let Some(init) = self.pending_init_names.last().copied() {
-                        self.open_const_creations
-                            .push((init, span, ConstCreationEntry::ArgFailure));
+                        self.open_const_creations.push((
+                            init,
+                            span,
+                            ConstCreationEntry::ArgFailure,
+                        ));
                     }
                     return;
                 }
@@ -1111,9 +1109,7 @@ impl<'a> Engine<'a> {
         // The declaration keyword, behind any written class modifiers.
         for _ in 0..4 {
             let mut end = i;
-            while end < bytes.len()
-                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
-            {
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
                 end += 1;
             }
             match &bytes[i..end] {
@@ -1455,7 +1451,9 @@ impl<'a> Engine<'a> {
     /// `const_initialized_with_non_constant_value` row anchors through the
     /// tail pass beside the resolution rows).
     fn unresolved_call(&self, span: SourceRange) -> Option<SourceRange> {
-        let mut at = self.rows.partition_point(|row| row.range.offset < span.offset);
+        let mut at = self
+            .rows
+            .partition_point(|row| row.range.offset < span.offset);
         while let Some(row) = self.rows.get(at)
             && row.range.offset < span.end()
         {
@@ -1583,7 +1581,9 @@ impl<'a> Engine<'a> {
     /// and marks the propagation avoid-reporting, so no enclosing literal
     /// or declaration face substitutes (#2261).
     fn check_invalid_constant_leaves(&mut self, span: SourceRange) {
-        let mut at = self.rows.partition_point(|row| row.range.offset < span.offset);
+        let mut at = self
+            .rows
+            .partition_point(|row| row.range.offset < span.offset);
         while let Some(row) = self.rows.get(at)
             && row.range.offset < span.end()
         {
@@ -1760,7 +1760,10 @@ impl<'a> Engine<'a> {
     /// constructor — `Utf8Decoder()`) carries no row and stays silent, the
     /// oracle's resolved non-const posture.
     pub(crate) fn const_failure_row_at(&self, offset: u32) -> bool {
-        self.report.diagnostics.iter().any(|d| d.range.offset == offset)
+        self.report
+            .diagnostics
+            .iter()
+            .any(|d| d.range.offset == offset)
     }
 
     /// Whether the argument containing `span` already anchored a const
@@ -1778,9 +1781,7 @@ impl<'a> Engine<'a> {
         ];
         let anchored = |start: u32| {
             self.report.diagnostics.iter().any(|d| {
-                d.range.offset >= start
-                    && d.range.offset < span.offset
-                    && infos.contains(&d.code)
+                d.range.offset >= start && d.range.offset < span.offset && infos.contains(&d.code)
             })
         };
         let bytes = self.source.as_bytes();
@@ -1885,10 +1886,7 @@ impl<'a> Engine<'a> {
     /// ([`Engine::pending_init_super`], the same shapes
     /// [`Engine::init_super_callee`] decides at the arglist close).
     fn init_invocation_level(&self, level: &ArgLevel) -> bool {
-        let Some(head) = level
-            .callee_row
-            .and_then(|index| self.rows.get(index))
-        else {
+        let Some(head) = level.callee_row.and_then(|index| self.rows.get(index)) else {
             return false;
         };
         match &head.shape {
@@ -1908,9 +1906,7 @@ impl<'a> Engine<'a> {
                         && self.rows.get(index - 1).is_some_and(|below| {
                             matches!(
                                 below.shape,
-                                RowShape::Receiver(
-                                    Receiver::This { .. } | Receiver::Super { .. }
-                                )
+                                RowShape::Receiver(Receiver::This { .. } | Receiver::Super { .. })
                             )
                         })
                 });
@@ -2381,10 +2377,7 @@ impl<'a> Engine<'a> {
     pub fn const_string_leaf(&mut self, begin: SourceRange, end: SourceRange) {
         let text = self
             .source
-            .get(
-                self.byte_of(begin.offset) + 1
-                    ..self.byte_of(begin.end()).saturating_sub(1)
-            )
+            .get(self.byte_of(begin.offset) + 1..self.byte_of(begin.end()).saturating_sub(1))
             .unwrap_or("");
         self.const_capture
             .end_literal_string(0, begin, end, ConstantValue::Str(text.into()));
@@ -2556,7 +2549,12 @@ mod face_tests {
              const A(V? value, V? kind) : this._((value, kind: kind, source: null), e: [kind], l: {value});\n\
              }",
         );
-        assert_eq!(code_names(&rep), Vec::<&str>::new(), "{:?}", code_names(&rep));
+        assert_eq!(
+            code_names(&rep),
+            Vec::<&str>::new(),
+            "{:?}",
+            code_names(&rep)
+        );
         // A `super(...)` invocation's argument list suppresses the same
         // faces.
         let rep = unit_report(
@@ -2564,7 +2562,12 @@ mod face_tests {
              class B { const B([V? a, V? b]); }\n\
              class C extends B { const C(V? x) : super((x,), {x: x}); }",
         );
-        assert_eq!(code_names(&rep), Vec::<&str>::new(), "{:?}", code_names(&rep));
+        assert_eq!(
+            code_names(&rep),
+            Vec::<&str>::new(),
+            "{:?}",
+            code_names(&rep)
+        );
         // Negative control: the same literals in a const initializer keep
         // the element faces.
         let rep = unit_report("void m() { var l = 1; const a = (l,); }");
@@ -2696,7 +2699,12 @@ mod face_tests {
                 .filter(|d| d.code.name == name)
                 .count()
         };
-        assert_eq!(count("const_with_non_constant_argument"), 1, "{:?}", code_names(&rep));
+        assert_eq!(
+            count("const_with_non_constant_argument"),
+            1,
+            "{:?}",
+            code_names(&rep)
+        );
         assert_eq!(count("invalid_constant"), 4, "{:?}", code_names(&rep));
         // Every `missing` leaf reports exactly one resolution row (the
         // oracle probe: five `UNDEFINED_IDENTIFIER`s — the prefixed head's
@@ -2708,7 +2716,12 @@ mod face_tests {
             "{:?}",
             code_names(&rep)
         );
-        assert_eq!(count("const_initialized_with_non_constant_value"), 0, "{:?}", code_names(&rep));
+        assert_eq!(
+            count("const_initialized_with_non_constant_value"),
+            0,
+            "{:?}",
+            code_names(&rep)
+        );
         // A genuinely non-constant leaf: direct bare-ident keeps the
         // argument face beside the declaration's `const_init`; composites
         // flip to `invalid_constant` (the declaration verdict still fires
@@ -2729,9 +2742,19 @@ mod face_tests {
                 .filter(|d| d.code.name == name)
                 .count()
         };
-        assert_eq!(count("const_with_non_constant_argument"), 1, "{:?}", code_names(&rep));
+        assert_eq!(
+            count("const_with_non_constant_argument"),
+            1,
+            "{:?}",
+            code_names(&rep)
+        );
         assert_eq!(count("invalid_constant"), 2, "{:?}", code_names(&rep));
-        assert_eq!(count("const_initialized_with_non_constant_value"), 3, "{:?}", code_names(&rep));
+        assert_eq!(
+            count("const_initialized_with_non_constant_value"),
+            3,
+            "{:?}",
+            code_names(&rep)
+        );
         // The drift shape: an unresolved prefixed member as a positional
         // argument collects `invalid_constant`, not the argument face. The
         // head's own resolution row (`UNDEFINED_IDENTIFIER` per the oracle
@@ -2747,7 +2770,12 @@ mod face_tests {
                 .count()
         };
         assert_eq!(count("invalid_constant"), 1, "{:?}", code_names(&rep));
-        assert_eq!(count("const_with_non_constant_argument"), 0, "{:?}", code_names(&rep));
+        assert_eq!(
+            count("const_with_non_constant_argument"),
+            0,
+            "{:?}",
+            code_names(&rep)
+        );
         // Enum-constant arguments keep `const_with_non_constant_argument`
         // for the same leaf shapes (`_validateConstantArguments`'s
         // default code), including a member-selector leaf.
@@ -2764,7 +2792,12 @@ mod face_tests {
                 .filter(|d| d.code.name == name)
                 .count()
         };
-        assert_eq!(count("const_with_non_constant_argument"), 2, "{:?}", code_names(&rep));
+        assert_eq!(
+            count("const_with_non_constant_argument"),
+            2,
+            "{:?}",
+            code_names(&rep)
+        );
         assert_eq!(count("invalid_constant"), 0, "{:?}", code_names(&rep));
         assert_eq!(count("undefined_identifier"), 2, "{:?}", code_names(&rep));
     }

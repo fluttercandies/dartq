@@ -136,12 +136,9 @@ impl<'a> Engine<'a> {
         // declaration face OFF: the primary formal binds the representation
         // field for the redirect target. `DeclKind::Constructor` sites are
         // generative ctor declarations only (factories register none).
-        let has_generative_ctor = self
-            .decl_sites
-            .iter()
-            .any(|site| {
-                matches!(site.kind, DeclKind::Constructor { container: c } if c == container)
-            });
+        let has_generative_ctor = self.decl_sites.iter().any(
+            |site| matches!(site.kind, DeclKind::Constructor { container: c } if c == container),
+        );
         // `member_duplicate_definition_verifier.dart`'s constructor pass:
         // per container, constructor names dedupe by selector — the unnamed
         // spelling keys as `new` (`member.name?.lexeme ?? 'new'`), a named
@@ -159,9 +156,7 @@ impl<'a> Engine<'a> {
                 .decl_sites
                 .iter()
                 .rev()
-                .find(|site| {
-                    matches!(site.kind, DeclKind::Container) && site.name == container
-                })
+                .find(|site| matches!(site.kind, DeclKind::Container) && site.name == container)
                 .map(|site| site.range.offset);
             let new_name = self.intern("new");
             // `errorRange` (`ConstructorDeclaration`): the type name through
@@ -577,7 +572,12 @@ impl<'a> Engine<'a> {
     /// (`out`/`in`/`inout`, `shared_type.dart:28-47`); anything else reads
     /// as the legacy default. The window collects regardless of the
     /// experiment (#742) — the legacy face reads the same capture.
-    pub(crate) fn var_type_variable(&mut self, name: StringId, variance: Option<Token>, range: SourceRange) {
+    pub(crate) fn var_type_variable(
+        &mut self,
+        name: StringId,
+        variance: Option<Token>,
+        range: SourceRange,
+    ) {
         let declared = variance.and_then(|token| match self.text_of(token) {
             Some("out") => Some(Variance::Covariant),
             Some("in") => Some(Variance::Contravariant),
@@ -1028,13 +1028,11 @@ impl<'a> Engine<'a> {
         let suspends = self.frames.last().is_some_and(|frame| {
             matches!(
                 frame.kind,
-                FrameKind::Executable {
-                    is_async: true,
-                    ..
-                } | FrameKind::Executable {
-                    generator: true,
-                    ..
-                }
+                FrameKind::Executable { is_async: true, .. }
+                    | FrameKind::Executable {
+                        generator: true,
+                        ..
+                    }
             )
         });
         if capture.poisoned || capture.list_depth == 0 || suspends {

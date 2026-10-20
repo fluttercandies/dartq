@@ -30,7 +30,10 @@ fn report(source: &str) -> FileReport {
         },
         file,
     );
-    assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+    assert!(
+        scanned.diagnostics.is_empty(),
+        "scanner diagnostics: {source:?}"
+    );
     let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
     let features = ParserFeatures::from_feature_set(set);
     let elements = collect(source, &scanned.tokens, features, &strings);
@@ -139,9 +142,7 @@ fn inherited_getter_read_does_not_spare_a_field() {
 /// static (the member scope's climb now admits statics).
 #[test]
 fn static_bare_read_spares() {
-    let rep = report(
-        "class C { static const int _k = 1; int f() => _k; }",
-    );
+    let rep = report("class C { static const int _k = 1; int f() => _k; }");
     assert!(
         rows_for(&rep, "unused_field").is_empty(),
         "{:?}",
@@ -169,9 +170,7 @@ fn static_qualified_cross_class_read_spares() {
 /// write — the pass-2 arm credits any non-write intent.
 #[test]
 fn static_read_write_spares() {
-    let rep = report(
-        "class C { static int _n = 0; int f() => ++_n; }",
-    );
+    let rep = report("class C { static int _n = 0; int f() => ++_n; }");
     assert!(
         rows_for(&rep, "unused_field").is_empty(),
         "{:?}",
@@ -183,9 +182,7 @@ fn static_read_write_spares() {
 /// implicit getter — the static still reports.
 #[test]
 fn static_write_only_still_reports() {
-    let rep = report(
-        "class C { static int _k = 0; void f() { _k = 1; } }",
-    );
+    let rep = report("class C { static int _k = 0; void f() { _k = 1; } }");
     assert!(
         !rows_for(&rep, "unused_field").is_empty(),
         "{:?}",

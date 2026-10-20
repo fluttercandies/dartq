@@ -141,10 +141,7 @@ fn unresolved_callee_in_const_list_reports_element_face() {
         "{rows:?}"
     );
     assert!(
-        rows.contains(&(
-            "const_initialized_with_non_constant_value",
-            "ClassSpec()"
-        )),
+        rows.contains(&("const_initialized_with_non_constant_value", "ClassSpec()")),
         "{rows:?}"
     );
     assert_eq!(count(&rows, "const_initialized_with_non_constant_value"), 1);
@@ -164,10 +161,7 @@ fn unresolved_callee_in_const_map_value_reports_value_face() {
         "{rows:?}"
     );
     assert!(
-        rows.contains(&(
-            "const_initialized_with_non_constant_value",
-            "LibrarySpec()"
-        )),
+        rows.contains(&("const_initialized_with_non_constant_value", "LibrarySpec()")),
         "{rows:?}"
     );
     assert_eq!(count(&rows, "non_constant_map_key"), 0, "{rows:?}");
@@ -184,7 +178,10 @@ fn nested_const_literal_elements_report_per_literal() {
     let rep = report(source);
     let rows = rows(&rep, source);
     assert!(
-        rows.contains(&("non_constant_map_value", "LibrarySpec(classes: [ClassSpec()])")),
+        rows.contains(&(
+            "non_constant_map_value",
+            "LibrarySpec(classes: [ClassSpec()])"
+        )),
         "{rows:?}"
     );
     assert!(
@@ -257,7 +254,10 @@ fn qualified_const_creation_pairs_known_bad_argument() {
     let source = "int g = 1;\nclass P {\n  static const p = P._(g);\n  final int i;\n  const P._(this.i);\n}";
     let rep = report(source);
     let rows = rows(&rep, source);
-    assert!(rows.contains(&("const_with_non_constant_argument", "g")), "{rows:?}");
+    assert!(
+        rows.contains(&("const_with_non_constant_argument", "g")),
+        "{rows:?}"
+    );
     assert!(
         rows.contains(&("const_initialized_with_non_constant_value", "g")),
         "{rows:?}"
@@ -275,14 +275,22 @@ fn valid_qualified_const_creation_stays_silent() {
     let source = "class C {\n  final int i;\n  const C.named(this.i);\n}\nconst x = C.named(1);";
     let rep = report(source);
     let rows = rows(&rep, source);
-    assert_eq!(count(&rows, "const_with_non_constant_argument"), 0, "{rows:?}");
+    assert_eq!(
+        count(&rows, "const_with_non_constant_argument"),
+        0,
+        "{rows:?}"
+    );
     assert_eq!(
         count(&rows, "const_initialized_with_non_constant_value"),
         0,
         "{rows:?}"
     );
     assert_eq!(count(&rows, "const_with_non_const"), 0, "{rows:?}");
-    assert_eq!(count(&rows, "const_with_undefined_constructor"), 0, "{rows:?}");
+    assert_eq!(
+        count(&rows, "const_with_undefined_constructor"),
+        0,
+        "{rows:?}"
+    );
 }
 
 /// A qualified creation whose selector answers no constructor keeps the
@@ -294,7 +302,11 @@ fn qualified_creation_with_unknown_selector_defers() {
     let source = "class C {\n  final int i;\n  const C.named(this.i);\n}\nconst x = C.other(1);";
     let rep = report(source);
     let rows = rows(&rep, source);
-    assert_eq!(count(&rows, "const_with_non_constant_argument"), 0, "{rows:?}");
+    assert_eq!(
+        count(&rows, "const_with_non_constant_argument"),
+        0,
+        "{rows:?}"
+    );
     assert!(
         rows.contains(&("const_initialized_with_non_constant_value", "C.other(1)")),
         "{rows:?}"
@@ -333,7 +345,10 @@ fn annotation_set_element_reports_at_unresolved_prefix() {
     let source = "@Target({TargetKind.classType})\nclass C {}";
     let rep = report(source);
     let rows = rows(&rep, source);
-    assert!(rows.contains(&("undefined_annotation", "@Target")), "{rows:?}");
+    assert!(
+        rows.contains(&("undefined_annotation", "@Target")),
+        "{rows:?}"
+    );
     assert!(
         rows.contains(&("undefined_identifier", "TargetKind")),
         "{rows:?}"
@@ -342,11 +357,7 @@ fn annotation_set_element_reports_at_unresolved_prefix() {
         rows.contains(&("non_constant_set_element", "TargetKind")),
         "{rows:?}"
     );
-    assert_eq!(
-        count(&rows, "non_constant_set_element"),
-        1,
-        "{rows:?}"
-    );
+    assert_eq!(count(&rows, "non_constant_set_element"), 1, "{rows:?}");
     assert_eq!(
         count(&rows, "const_initialized_with_non_constant_value"),
         0,
@@ -370,10 +381,7 @@ fn unresolved_callee_in_annotation_set_reports_element_face() {
         got.contains(&("const_with_non_constant_argument", "Missing()")),
         "{got:?}"
     );
-    assert!(
-        got.contains(&("undefined_function", "Missing")),
-        "{got:?}"
-    );
+    assert!(got.contains(&("undefined_function", "Missing")), "{got:?}");
     assert_eq!(count(&got, "non_constant_set_element"), 0, "{got:?}");
     assert_eq!(
         count(&got, "const_initialized_with_non_constant_value"),
@@ -398,10 +406,7 @@ fn unresolved_callee_in_annotation_set_reports_element_face() {
         got.contains(&("non_constant_set_element", "Missing()")),
         "{got:?}"
     );
-    assert!(
-        got.contains(&("undefined_method", "Missing")),
-        "{got:?}"
-    );
+    assert!(got.contains(&("undefined_method", "Missing")), "{got:?}");
     assert_eq!(count(&got, "undefined_function"), 0, "{got:?}");
 
     let param_source = "class T { const T(); }\nvoid h(@T({Missing()}) int p) {}";
@@ -415,10 +420,7 @@ fn unresolved_callee_in_annotation_set_reports_element_face() {
         got.contains(&("non_constant_set_element", "Missing()")),
         "{got:?}"
     );
-    assert!(
-        got.contains(&("undefined_function", "Missing")),
-        "{got:?}"
-    );
+    assert!(got.contains(&("undefined_function", "Missing")), "{got:?}");
 }
 
 /// A known function invocation inside an annotation's literal: the
@@ -487,10 +489,7 @@ fn rider_named_leaf_in_resolved_creation_reports_invalid_constant() {
                   @Gen(props: [Prop('a'), Prop('e', type: Missing)])\nclass C {}";
     let rep = report(source);
     let rows = rows(&rep, source);
-    assert!(
-        rows.contains(&("invalid_constant", "Missing")),
-        "{rows:?}"
-    );
+    assert!(rows.contains(&("invalid_constant", "Missing")), "{rows:?}");
     assert!(
         rows.contains(&("undefined_identifier", "Missing")),
         "{rows:?}"
@@ -535,10 +534,12 @@ fn rider_initializer_named_leaf_reports_invalid_constant() {
 /// preceding valid element changes nothing).
 #[test]
 fn positional_leaf_keeps_const_with_non_constant_argument() {
-    for tail in ["const q = [Prop(Missing)];", "const z = [Prop('a'), Prop(Missing)];"] {
-        let source = format!(
-            "class Prop {{\n  final String name;\n  const Prop(this.name);\n}}\n{tail}"
-        );
+    for tail in [
+        "const q = [Prop(Missing)];",
+        "const z = [Prop('a'), Prop(Missing)];",
+    ] {
+        let source =
+            format!("class Prop {{\n  final String name;\n  const Prop(this.name);\n}}\n{tail}");
         let rep = report(&source);
         let rows = rows(&rep, &source);
         assert!(
@@ -592,7 +593,10 @@ fn annotation_head_checks_non_constant_argument() {
                   @P(g)\nclass C {}";
     let rep = report(source);
     let rows = rows(&rep, source);
-    assert!(rows.contains(&("const_with_non_constant_argument", "g")), "{rows:?}");
+    assert!(
+        rows.contains(&("const_with_non_constant_argument", "g")),
+        "{rows:?}"
+    );
     assert_eq!(
         count(&rows, "const_with_non_constant_argument"),
         1,
@@ -629,11 +633,7 @@ fn annotation_head_arity_faces() {
         1,
         "{rows:?}"
     );
-    assert_eq!(
-        count(&rows, "extra_positional_arguments"),
-        1,
-        "{rows:?}"
-    );
+    assert_eq!(count(&rows, "extra_positional_arguments"), 1, "{rows:?}");
 }
 
 /// The named-argument worlds: a label that resolves to a formal pairs
@@ -652,10 +652,7 @@ fn annotation_head_named_argument_worlds() {
         rows.contains(&("const_with_non_constant_argument", "Missing")),
         "{rows:?}"
     );
-    assert!(
-        rows.contains(&("invalid_constant", "Missing")),
-        "{rows:?}"
-    );
+    assert!(rows.contains(&("invalid_constant", "Missing")), "{rows:?}");
     assert_eq!(
         count(&rows, "const_with_non_constant_argument"),
         1,
@@ -708,11 +705,7 @@ fn const_literal_duplicates_report_error_twins() {
     let rep = report(source);
     let rows = rows(&rep, source);
     assert_eq!(count(&rows, "equal_keys_in_const_map"), 2, "{rows:?}");
-    assert_eq!(
-        count(&rows, "equal_elements_in_const_set"),
-        2,
-        "{rows:?}"
-    );
+    assert_eq!(count(&rows, "equal_elements_in_const_set"), 2, "{rows:?}");
     // The WARNING twins never fire on const literals.
     assert_eq!(count(&rows, "equal_keys_in_map"), 0, "{rows:?}");
     assert_eq!(count(&rows, "equal_elements_in_set"), 0, "{rows:?}");
@@ -743,13 +736,8 @@ fn valid_annotation_arguments_stay_silent() {
         );
         assert_eq!(count(&rows, "extra_positional_arguments"), 0, "{rows:?}");
         assert_eq!(count(&rows, "equal_keys_in_const_map"), 0, "{rows:?}");
-        assert_eq!(
-            count(&rows, "equal_elements_in_const_set"),
-            0,
-            "{rows:?}"
-        );
+        assert_eq!(count(&rows, "equal_elements_in_const_set"), 0, "{rows:?}");
         assert_eq!(count(&rows, "non_constant_list_element"), 0, "{rows:?}");
         assert_eq!(count(&rows, "non_constant_set_element"), 0, "{rows:?}");
     }
 }
-

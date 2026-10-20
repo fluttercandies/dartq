@@ -431,7 +431,14 @@ impl<'a> Engine<'a> {
     }
 
     /// The three-placeholder emit (`message3`).
-    pub(crate) fn emit3(&mut self, code: SemanticCode, range: SourceRange, a0: &str, a1: &str, a2: &str) {
+    pub(crate) fn emit3(
+        &mut self,
+        code: SemanticCode,
+        range: SourceRange,
+        a0: &str,
+        a1: &str,
+        a2: &str,
+    ) {
         self.report.diagnostics.push(Diagnostic::new(
             code.severity(),
             code.code_info(),
@@ -516,7 +523,14 @@ impl<'a> Engine<'a> {
     /// executable only at its end), so the emission defers to the teardown,
     /// where a promoted-read fact on the expression can still clean the row
     /// ([`Engine::filter_staged`]).
-    pub(crate) fn stage(&mut self, kind: StagedKind, range: SourceRange, from: Ty, to: Ty, literal: bool) {
+    pub(crate) fn stage(
+        &mut self,
+        kind: StagedKind,
+        range: SourceRange,
+        from: Ty,
+        to: Ty,
+        literal: bool,
+    ) {
         self.staged_checks.push(StagedCheck {
             kind,
             range,
@@ -656,9 +670,7 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let verdict = match check.kind {
-                StagedKind::Return {
-                    ctor, is_async, ..
-                } => {
+                StagedKind::Return { ctor, is_async, .. } => {
                     // The declared return's verdict reads the alias's RHS
                     // face (`typedef WhenComplete = void Function(...)?` —
                     // `return null` is legal because the alias spells a
@@ -838,7 +850,13 @@ impl<'a> Engine<'a> {
     /// uses (`l1::combinator_diagnostic`). `{0}`/`{1}` fill the outside-
     /// library and subtype-family templates; the declaration-site rows carry
     /// no arguments.
-    pub(crate) fn emit_modifier(&mut self, code: ModifierCode, range: SourceRange, a0: &str, a1: &str) {
+    pub(crate) fn emit_modifier(
+        &mut self,
+        code: ModifierCode,
+        range: SourceRange,
+        a0: &str,
+        a1: &str,
+    ) {
         let info = code.info();
         self.report.diagnostics.push(Diagnostic::new(
             info.dtype.severity(),
@@ -850,7 +868,13 @@ impl<'a> Engine<'a> {
         ));
     }
 
-    pub(crate) fn record_miss(&mut self, name: StringId, range: SourceRange, qualified: bool, kind: NameUse) {
+    pub(crate) fn record_miss(
+        &mut self,
+        name: StringId,
+        range: SourceRange,
+        qualified: bool,
+        kind: NameUse,
+    ) {
         self.report.names.push(NameRow {
             name,
             range,
@@ -1032,7 +1056,13 @@ impl<'a> Engine<'a> {
 
     /// Stages one two-argument diagnostic (the disjointness pair's type
     /// displays).
-    pub(crate) fn stage_typed(&mut self, code: SemanticCode, range: SourceRange, a0: &str, a1: &str) {
+    pub(crate) fn stage_typed(
+        &mut self,
+        code: SemanticCode,
+        range: SourceRange,
+        a0: &str,
+        a1: &str,
+    ) {
         let correction = code.correction_message("");
         self.report.usage.push(Diagnostic::new(
             code.severity(),
@@ -1082,7 +1112,12 @@ impl<'a> Engine<'a> {
     /// must already equal the cast type structurally, with `dynamic` and
     /// bare `Function` targets excluded (there the explicit cast is the
     /// recommended spelling) and unresolved sides answering no.
-    pub(crate) fn check_unnecessary_cast(&mut self, at: SourceRange, operand: Ty, cast: Option<Ty>) {
+    pub(crate) fn check_unnecessary_cast(
+        &mut self,
+        at: SourceRange,
+        operand: Ty,
+        cast: Option<Ty>,
+    ) {
         let Some(cast) = cast else { return };
         if operand == Ty::Unknown || cast == Ty::Unknown || cast == Ty::Dynamic {
             return;
@@ -1378,9 +1413,7 @@ impl<'a> Engine<'a> {
                     return self.callee_return_ty(row);
                 }
             }
-            return self
-                .callable_call_ret(row, row.ty)
-                .unwrap_or(row.ty);
+            return self.callable_call_ret(row, row.ty).unwrap_or(row.ty);
         }
         self.callee_return_ty(row)
     }
@@ -1623,12 +1656,13 @@ impl<'a> Engine<'a> {
         let named: Vec<(StringId, Ty)> = formals
             .map(|f| f.named.iter().map(|p| (p.name, p.ty)).collect())
             .unwrap_or_default();
-        Some(
-            self.boundary
-                .args
-                .borrow_mut()
-                .function(entry.type_params, entry.return_ty, &positional, &named, false),
-        )
+        Some(self.boundary.args.borrow_mut().function(
+            entry.type_params,
+            entry.return_ty,
+            &positional,
+            &named,
+            false,
+        ))
     }
 
     /// The `e!` pair (`visitNullAssertionExpression`,
@@ -1674,9 +1708,7 @@ impl<'a> Engine<'a> {
             self.stage_usage(SemanticCode::NullCheckAlwaysFails, at, "");
         } else if ty.is_strictly_non_nullable() {
             self.stage_usage(SemanticCode::UnnecessaryNonNullAssertion, at, "");
-        } else if ty != Ty::Unknown
-            && !qualified
-            && self.local_hits.contains_key(&read_span.offset)
+        } else if ty != Ty::Unknown && !qualified && self.local_hits.contains_key(&read_span.offset)
         {
             // The staged re-decision reads the local promotion table at the
             // operand's own span, so it keys the operand's OWN local read —
@@ -1792,7 +1824,12 @@ impl<'a> Engine<'a> {
     /// operand through the operator (`reportStartEnd`). The
     /// constant-pattern face (`visitConstantPattern` :317-324) is the
     /// documented under-report.
-    pub(crate) fn check_nan_comparison(&mut self, mark: usize, negated: bool, op_range: SourceRange) {
+    pub(crate) fn check_nan_comparison(
+        &mut self,
+        mark: usize,
+        negated: bool,
+        op_range: SourceRange,
+    ) {
         let Some(right) = self.rows.last() else {
             return;
         };
@@ -1997,12 +2034,13 @@ impl<'a> Engine<'a> {
             // answers `1 + x` on `int` receivers too); `String`/`bool` are
             // not `num` receivers and never take this fallback.
             .or_else(|| {
-                num_family.then(|| {
-                    CORE_BINARY_OPERATORS
-                        .iter()
-                        .find(|(recv, o, ..)| *o == op && *recv == "num")
-                })
-                .flatten()
+                num_family
+                    .then(|| {
+                        CORE_BINARY_OPERATORS
+                            .iter()
+                            .find(|(recv, o, ..)| *o == op && *recv == "num")
+                    })
+                    .flatten()
             })
         {
             return Some((Ty::named(self.intern(*param)), Ty::named(self.intern(*ret))));
@@ -2027,7 +2065,13 @@ impl<'a> Engine<'a> {
     /// bound — a user `extends num` class refines identically — so the
     /// call is unconditional on the resolved signature; non-`num`
     /// receivers and the other operators keep the declared return.
-    pub(crate) fn refine_numeric_binary(&self, op: &str, left_ty: Ty, right_ty: Ty, declared: Ty) -> Ty {
+    pub(crate) fn refine_numeric_binary(
+        &self,
+        op: &str,
+        left_ty: Ty,
+        right_ty: Ty,
+        declared: Ty,
+    ) -> Ty {
         if !matches!(op, "+" | "-" | "*" | "%") {
             return declared;
         }
@@ -2119,8 +2163,7 @@ impl<'a> Engine<'a> {
                 return;
             }
             left_index = self.rows.iter().rposition(|row| {
-                !matches!(row.shape, RowShape::TypeUse(..))
-                    && row.range.end() <= op_range.offset
+                !matches!(row.shape, RowShape::TypeUse(..)) && row.range.end() <= op_range.offset
             });
         }
         let Some(left_index) = left_index else {
@@ -2141,7 +2184,8 @@ impl<'a> Engine<'a> {
         let left_ty = self.equality_operand_ty(&left);
         let right_ty = self.equality_operand_ty(&right);
         let bool_id = self.members.primitive_ids[3];
-        let result = if matches!(op, o if o == self.intern("==") || o == self.intern("!=") || o == self.intern("&&") || o == self.intern("||")) {
+        let result = if matches!(op, o if o == self.intern("==") || o == self.intern("!=") || o == self.intern("&&") || o == self.intern("||"))
+        {
             // `==`/`!=` and the lazy boolean composites are `bool` by
             // construction (binary_expression_resolver.dart:499-500 and
             // `_resolveLogicalExpression`).
@@ -3159,7 +3203,11 @@ mod tests {
     #[test]
     fn flatten_unwraps_future_or() {
         let (strings, mut args) = rig();
-        let list = args.named(strings.intern("List"), false, &[Ty::named(strings.intern("int"))]);
+        let list = args.named(
+            strings.intern("List"),
+            false,
+            &[Ty::named(strings.intern("int"))],
+        );
         let fut_or = args.named(strings.intern("FutureOr"), false, &[list]);
         assert_eq!(flatten_ty(&strings, &args, fut_or), list);
     }
@@ -3225,7 +3273,10 @@ mod tests {
             },
             file,
         );
-        assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
         let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
         let features = ParserFeatures::from_feature_set(set);
         let elements = collect(source, &scanned.tokens, features, &strings);
@@ -3282,7 +3333,12 @@ mod tests {
              \x20 db.run();\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// `await` on a `Future<DB>?` operand flattens to `DB?` — the
@@ -3298,7 +3354,12 @@ mod tests {
              \x20 n!.run();\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// `await` on `FutureOr<DB>` flattens to `DB` — the member resolves
@@ -3314,7 +3375,12 @@ mod tests {
              \x20 n.run();\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// True-positive pin (evidence-2186 §A fixture 4's under-report bias):
@@ -3330,7 +3396,12 @@ mod tests {
              \x20 x.isEven;\n\
              }",
         );
-        assert_eq!(code_names(&report), ["undefined_getter"], "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            ["undefined_getter"],
+            "{:?}",
+            code_names(&report)
+        );
         assert_eq!(
             report.diagnostics[0].message,
             "The getter 'isEven' isn't defined for the type 'Future'."
@@ -3353,7 +3424,12 @@ mod tests {
              \x20 return null;\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// A type-parameter operand's `!= null` never decides never-null (the
@@ -3374,7 +3450,12 @@ mod tests {
              \x20 }\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// A `var`-inferred local bound from a typedef-typed formal's send
@@ -3390,7 +3471,12 @@ mod tests {
              \x20 if (s != null) {}\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// A send on a function-typed formal with a nullable return carries
@@ -3408,7 +3494,12 @@ mod tests {
              \x20 if (n != null) {}\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// A `?.`-merged member read carries the null-aware `?` the merge
@@ -3424,7 +3515,12 @@ mod tests {
              \x20 if (a != null) {}\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// An interpolated-string left operand still folds `==` to `bool` —
@@ -3439,7 +3535,12 @@ mod tests {
              \x20 if ('a${x}b' == y) {}\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// `e is Sub` over the operand's own subtype family is a narrowing
@@ -3453,7 +3554,12 @@ mod tests {
              \x20 if (e is Dir) {}\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// A send on an implicit-`this` field whose declared type declares
@@ -3476,7 +3582,12 @@ mod tests {
              \x20 }\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// The same dispatch through an explicit receiver (`box.expr(ctx)`):
@@ -3496,7 +3607,12 @@ mod tests {
              \x20 }\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// The value's declared type is the interface declaring `call` (the
@@ -3522,7 +3638,12 @@ mod tests {
              \x20 }\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// `call` inherited from a superclass of the value's static type: the
@@ -3544,7 +3665,12 @@ mod tests {
              \x20 }\n\
              }",
         );
-        assert_eq!(code_names(&report), Vec::<&'static str>::new(), "{:?}", code_names(&report));
+        assert_eq!(
+            code_names(&report),
+            Vec::<&'static str>::new(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// A non-async body under a non-nullable `FutureOr<void>` return type

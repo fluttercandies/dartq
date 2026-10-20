@@ -182,7 +182,12 @@ impl<'a> Engine<'a> {
     /// The climb behind [`Engine::walk_members`]: `skip_own` starts at the
     /// container but excludes its own member map (the `super.member` shape —
     /// the application classes `S&M2` are still the chain).
-    pub(crate) fn walk_from(&self, container: StringId, member: StringId, mut skip_own: bool) -> Walk<'a> {
+    pub(crate) fn walk_from(
+        &self,
+        container: StringId,
+        member: StringId,
+        mut skip_own: bool,
+    ) -> Walk<'a> {
         let mut name = container;
         let mut owner = self.file;
         let mut scope_lib = self.lib;
@@ -592,19 +597,15 @@ impl<'a> Engine<'a> {
                 // edges live in this file), suppresses the face where they do
                 // not (the under-report direction).
                 let substituted;
-                let inherited_ref: &MemberEntry = match self.instantiate_inherited(
-                    &chain,
-                    &inherited,
-                    container,
-                    &mut facts,
-                ) {
-                    Instantiated::Unchanged => &inherited,
-                    Instantiated::Applied(env) => {
-                        substituted = self.substitute_entry(&inherited, &env);
-                        &substituted
-                    }
-                    Instantiated::Undecidable => continue,
-                };
+                let inherited_ref: &MemberEntry =
+                    match self.instantiate_inherited(&chain, &inherited, container, &mut facts) {
+                        Instantiated::Unchanged => &inherited,
+                        Instantiated::Applied(env) => {
+                            substituted = self.substitute_entry(&inherited, &env);
+                            &substituted
+                        }
+                        Instantiated::Undecidable => continue,
+                    };
                 let declared_cmp = face_entry.as_ref().unwrap_or(entry);
                 if self.override_broken(
                     declared_cmp,
@@ -682,10 +683,9 @@ impl<'a> Engine<'a> {
         // to pair: bail rather than anchor at a wrong offset.
         let with_count = decl.with_clause.len();
         let spans: Vec<SourceRange> = match self.deferred_modifier.as_ref() {
-            Some(deferred) if deferred.spans.buffered.len() >= with_count => deferred
-                .spans
-                .buffered[deferred.spans.buffered.len() - with_count..]
-                .to_vec(),
+            Some(deferred) if deferred.spans.buffered.len() >= with_count => {
+                deferred.spans.buffered[deferred.spans.buffered.len() - with_count..].to_vec()
+            }
             _ => return,
         };
         // The oracle's accumulation set: the direct super-interfaces already
@@ -747,9 +747,15 @@ impl<'a> Engine<'a> {
                 }
                 let projected = self.boundary.member(mixin_owner, mixin, *spelling, member);
                 match member.kind {
-                    MemberKind::Method => declared.push((*spelling, MemberKind::Method, None, projected)),
-                    MemberKind::Getter => declared.push((*spelling, MemberKind::Getter, None, projected)),
-                    MemberKind::Setter => declared.push((*spelling, MemberKind::Setter, None, projected)),
+                    MemberKind::Method => {
+                        declared.push((*spelling, MemberKind::Method, None, projected))
+                    }
+                    MemberKind::Getter => {
+                        declared.push((*spelling, MemberKind::Getter, None, projected))
+                    }
+                    MemberKind::Setter => {
+                        declared.push((*spelling, MemberKind::Setter, None, projected))
+                    }
                     MemberKind::Field => {
                         declared.push((*spelling, MemberKind::Getter, None, projected.clone()));
                         if !projected.is_final {
@@ -767,7 +773,12 @@ impl<'a> Engine<'a> {
                                 })),
                                 ..(*projected).clone()
                             };
-                            declared.push((*spelling, MemberKind::Setter, Some(setter_face), projected));
+                            declared.push((
+                                *spelling,
+                                MemberKind::Setter,
+                                Some(setter_face),
+                                projected,
+                            ));
                         }
                     }
                 }
@@ -795,23 +806,16 @@ impl<'a> Engine<'a> {
                 // rule); multi-parameter foreign hops stay undecidable and
                 // suppress the face.
                 let declared_cmp_owned;
-                let declared_cmp: &MemberEntry = match self.mixin_env(
-                    container,
-                    mixin,
-                    mixin_owner,
-                    projected,
-                    &mut facts,
-                ) {
-                    Instantiated::Unchanged => face_entry.as_ref().unwrap_or(projected),
-                    Instantiated::Applied(env) => {
-                        declared_cmp_owned = self.substitute_entry(
-                            face_entry.as_ref().unwrap_or(projected),
-                            &env,
-                        );
-                        &declared_cmp_owned
-                    }
-                    Instantiated::Undecidable => continue,
-                };
+                let declared_cmp: &MemberEntry =
+                    match self.mixin_env(container, mixin, mixin_owner, projected, &mut facts) {
+                        Instantiated::Unchanged => face_entry.as_ref().unwrap_or(projected),
+                        Instantiated::Applied(env) => {
+                            declared_cmp_owned = self
+                                .substitute_entry(face_entry.as_ref().unwrap_or(projected), &env);
+                            &declared_cmp_owned
+                        }
+                        Instantiated::Undecidable => continue,
+                    };
                 let lookup = if setter_face {
                     self.setter_spelling(*spelling)
                 } else {
@@ -833,12 +837,9 @@ impl<'a> Engine<'a> {
                         continue;
                     }
                     let substituted;
-                    let inherited_ref: &MemberEntry = match self.instantiate_inherited(
-                        &chain,
-                        &inherited,
-                        container,
-                        &mut facts,
-                    ) {
+                    let inherited_ref: &MemberEntry = match self
+                        .instantiate_inherited(&chain, &inherited, container, &mut facts)
+                    {
                         Instantiated::Unchanged => &inherited,
                         Instantiated::Applied(env) => {
                             substituted = self.substitute_entry(&inherited, &env);
@@ -1083,9 +1084,9 @@ impl<'a> Engine<'a> {
         faces.extend(decl.with_clause.iter().copied());
         faces.extend(decl.implements_clause.iter().copied());
         faces.extend(decl.on_clause.iter().copied());
-        faces
-            .into_iter()
-            .any(|face| self.face_member(face, spelling).is_some() || self.face_member_frozen(face, spelling))
+        faces.into_iter().any(|face| {
+            self.face_member(face, spelling).is_some() || self.face_member_frozen(face, spelling)
+        })
     }
 
     /// The frozen-table half of [`Self::face_member_any`]: climbs the face's
@@ -1185,11 +1186,7 @@ impl<'a> Engine<'a> {
             if mixin_hit {
                 return true;
             }
-            for super_face in found
-                .implements_clause
-                .iter()
-                .chain(found.on_clause.iter())
-            {
+            for super_face in found.implements_clause.iter().chain(found.on_clause.iter()) {
                 pending.push_back((*super_face, found_owner, owner_lib));
             }
             match found.superclass {
@@ -1488,7 +1485,10 @@ impl<'a> Engine<'a> {
     fn header_is_external(&self, name_range: SourceRange) -> bool {
         let tokens = self.tokens.as_slice();
         let at = tokens.partition_point(|token| token.utf16_offset < name_range.offset);
-        let mut index = match at.checked_sub(1) { Some(i) => i, None => return false };
+        let mut index = match at.checked_sub(1) {
+            Some(i) => i,
+            None => return false,
+        };
         for _ in 0..512 {
             match self.tokens.lexeme(self.source, index) {
                 ";" | "{" | "}" => return false,
@@ -1610,7 +1610,12 @@ impl<'a> Engine<'a> {
     /// contract), so both ends are comment-proof; `{ return X; }` passes,
     /// `{ if (c) return X; }` fails at `if`.
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
-    pub(crate) fn block_interior_is_the_candidate(&self, begin: Token, end: Token, check: &NsmCheck) -> bool {
+    pub(crate) fn block_interior_is_the_candidate(
+        &self,
+        begin: Token,
+        end: Token,
+        check: &NsmCheck,
+    ) -> bool {
         let (Some(kw), Some(semi_end)) = (check.return_kw, check.return_semi_end) else {
             return false;
         };
@@ -2045,7 +2050,11 @@ impl<'a> Engine<'a> {
     /// analyzed package stay silent (`_isLibraryInWorkspacePackage`: the
     /// sealed contract restricts only other packages), so a same-package
     /// `@sealed` base never fires.
-    pub(crate) fn check_sealed_supertype_contract(&mut self, container: StringId, decl_range: SourceRange) {
+    pub(crate) fn check_sealed_supertype_contract(
+        &mut self,
+        container: StringId,
+        decl_range: SourceRange,
+    ) {
         if !self.reported_sealed_checks.insert(container) {
             return;
         }
@@ -2475,7 +2484,11 @@ impl<'a> Engine<'a> {
     /// members, mixins, and the super chain only,
     /// `inheritance_manager3.dart:333`). `None` = an unresolvable or cyclic
     /// hop — the caller suppresses rather than reports.
-    pub(crate) fn face_entries(&self, face: StringId, top_concrete: bool) -> Option<Vec<FaceEntry<'a>>> {
+    pub(crate) fn face_entries(
+        &self,
+        face: StringId,
+        top_concrete: bool,
+    ) -> Option<Vec<FaceEntry<'a>>> {
         let mut name = face;
         let mut owner = self.file;
         let mut scope_lib = self.lib;
@@ -3170,7 +3183,10 @@ impl<'a> Engine<'a> {
     /// validly overrides every other hit (the oracle's interface-map
     /// selection at name level). `None` when the candidates do not
     /// linearize — conflict territory.
-    pub(crate) fn most_specific<'e>(&self, hits: &[&'e FaceEntry<'e>]) -> Option<&'e FaceEntry<'e>> {
+    pub(crate) fn most_specific<'e>(
+        &self,
+        hits: &[&'e FaceEntry<'e>],
+    ) -> Option<&'e FaceEntry<'e>> {
         hits.iter().copied().find(|candidate| {
             hits.iter().all(|other| {
                 std::ptr::eq(*candidate, *other)
@@ -3204,8 +3220,7 @@ impl<'a> Engine<'a> {
             !e.is_static
                 && !e.is_abstract
                 && if setter_face {
-                    e.kind == MemberKind::Setter
-                        || (e.kind == MemberKind::Field && !e.is_final)
+                    e.kind == MemberKind::Setter || (e.kind == MemberKind::Field && !e.is_final)
                 } else {
                     e.kind == MemberKind::Getter || e.kind == MemberKind::Field
                 }
@@ -3260,9 +3275,8 @@ impl<'a> Engine<'a> {
         };
         for face in decl.with_clause.iter().copied().chain(decl.superclass) {
             if let Some(hit) = hits_of(face).and_then(|hits| {
-                hits.iter().find(|h| {
-                    h.name == name && h.concrete_source && !h.entry.is_abstract
-                })
+                hits.iter()
+                    .find(|h| h.name == name && h.concrete_source && !h.entry.is_abstract)
             }) {
                 return Some(hit.clone());
             }
@@ -3387,7 +3401,11 @@ impl<'a> Engine<'a> {
 
     /// The five-tier missing-implementation row: sorted descriptions select
     /// the official message shape.
-    pub(crate) fn emit_missing_members(&mut self, mut descriptions: Vec<String>, name_range: SourceRange) {
+    pub(crate) fn emit_missing_members(
+        &mut self,
+        mut descriptions: Vec<String>,
+        name_range: SourceRange,
+    ) {
         descriptions.sort();
         let code = match descriptions.len() {
             0 => return,
@@ -3622,11 +3640,7 @@ impl<'a> Engine<'a> {
             // and the mixin `on` constraints join the pending queue — a face
             // whose `extends`/`with` chain ends still contributes its
             // interfaces' members.
-            for super_face in found
-                .implements_clause
-                .iter()
-                .chain(found.on_clause.iter())
-            {
+            for super_face in found.implements_clause.iter().chain(found.on_clause.iter()) {
                 pending.push_back((*super_face, found_owner, owner_lib));
             }
             match found.superclass {
@@ -3781,7 +3795,8 @@ impl<'a> Engine<'a> {
             self.graph,
             self.namespaces,
             self.index,
-            self.owner_library_of(sub_scope.0, sub_scope.1).unwrap_or(self.lib),
+            self.owner_library_of(sub_scope.0, sub_scope.1)
+                .unwrap_or(self.lib),
             sub_scope.0,
             sub,
         ) else {
@@ -3830,9 +3845,7 @@ impl<'a> Engine<'a> {
                 }
             }
             for (base, parent) in crate::switch_tracker::CORE_SUPERTYPES {
-                if self.strings.resolve(container) == base
-                    && self.strings.resolve(sup) == parent
-                {
+                if self.strings.resolve(container) == base && self.strings.resolve(sup) == parent {
                     return Some(true);
                 }
                 if self.strings.resolve(container) == base {
@@ -3912,12 +3925,17 @@ impl<'a> Engine<'a> {
                 args,
             } if args != crate::model::ArgListId::EMPTY => {
                 let old: Vec<Ty> = self.boundary.pool().get(args).to_vec();
-                let substituted: Vec<Ty> =
-                    old.iter().map(|arg| self.substitute_ty(*arg, keys)).collect();
+                let substituted: Vec<Ty> = old
+                    .iter()
+                    .map(|arg| self.substitute_ty(*arg, keys))
+                    .collect();
                 if substituted == old {
                     return ty;
                 }
-                self.boundary.args.borrow_mut().named(name, nullable, &substituted)
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .named(name, nullable, &substituted)
             }
             Ty::Named {
                 name,
@@ -4415,9 +4433,7 @@ impl<'a> Engine<'a> {
         entry: &MemberEntry,
     ) -> bool {
         let (file, container) = owner;
-        if self.members.primitive_ids.contains(&name)
-            || entry.type_param_names.contains(&name)
-        {
+        if self.members.primitive_ids.contains(&name) || entry.type_param_names.contains(&name) {
             return false;
         }
         // The declaring container's own members are never types
@@ -4670,9 +4686,8 @@ mod sealed_abstract_fold_tests {
     /// asserts the completeness silence and the row shapes, not a count.)
     #[test]
     fn abstract_sealed_combo_stays_abstract_for_completeness() {
-        let report = report(
-            "abstract class I { void m(); }\nabstract sealed class S implements I {}\n",
-        );
+        let report =
+            report("abstract class I { void m(); }\nabstract sealed class S implements I {}\n");
         let names = code_names(&report);
         assert!(
             names.iter().all(|n| *n == "abstract_sealed_class"),
@@ -4702,10 +4717,7 @@ mod sealed_abstract_fold_tests {
                       \x20 String fromSql(int dbValue) => throw '';\n\
                       }\n";
         let names = code_names(&report(source));
-        let overrides: Vec<_> = names
-            .iter()
-            .filter(|n| **n == "invalid_override")
-            .collect();
+        let overrides: Vec<_> = names.iter().filter(|n| **n == "invalid_override").collect();
         assert_eq!(
             overrides.len(),
             1,
@@ -4754,7 +4766,10 @@ mod sealed_abstract_fold_tests {
                 .iter()
                 .any(|d| d.message.contains("setter List.length")),
             "the length setter must be among the missing: {:?}",
-            bare.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+            bare.diagnostics
+                .iter()
+                .map(|d| &d.message)
+                .collect::<Vec<_>>()
         );
         let full = report(
             "class D with ListMixin<int> {\n\
@@ -5003,7 +5018,8 @@ mod invalid_type_override_tests {
         // `Missing` resolves to nothing in a.dart's scope — the broken
         // import face (a `URI_DOES_NOT_EXIST` import contributes no names).
         let source_a = "class P { Missing get s => throw 0; }";
-        let source_m = "import 'a.dart';\nclass C extends P { @override Missing? get s => throw 0; }\n";
+        let source_m =
+            "import 'a.dart';\nclass C extends P { @override Missing? get s => throw 0; }\n";
         let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
             LanguageVersion::new(3, 15),
         ));
@@ -5361,7 +5377,12 @@ mod field_face_and_set_base_tests {
             .iter()
             .find(|d| d.code.name == "non_abstract_class_inherits_abstract_member")
             .expect("the seven forwarding points demand implementations");
-        for name in ["SetBase.add", "SetBase.contains", "SetBase.lookup", "SetBase.remove"] {
+        for name in [
+            "SetBase.add",
+            "SetBase.contains",
+            "SetBase.lookup",
+            "SetBase.remove",
+        ] {
             assert!(
                 missing.message.contains(name),
                 "the demand names {name}: {}",

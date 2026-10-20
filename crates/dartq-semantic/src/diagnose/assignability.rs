@@ -1,5 +1,5 @@
-use super::*;
 use super::engine_core::flatten_ty;
+use super::*;
 
 impl<'a> Engine<'a> {
     pub(crate) fn typed_list_literal_ty(&mut self, left: Token) -> Option<Ty> {
@@ -250,7 +250,10 @@ impl<'a> Engine<'a> {
     /// name-level): `extension E on List<Book>` answers
     /// `(List, [Book])`. `None` when the header never reaches an honest
     /// `on` — the caller keeps the name-level type.
-    pub(crate) fn extension_on_type_args(&self, name: StringId) -> Option<(StringId, Vec<StringId>)> {
+    pub(crate) fn extension_on_type_args(
+        &self,
+        name: StringId,
+    ) -> Option<(StringId, Vec<StringId>)> {
         // Extensions never join `decl_sites` (the unused-element face owns
         // that table's membership), so the header is located textually: the
         // `extension <name>` needle is word-bounded on both sides and the
@@ -260,8 +263,7 @@ impl<'a> Engine<'a> {
         let name_text = self.strings.resolve(name);
         let needle = format!("extension {name_text}");
         let bytes = self.source.as_bytes();
-        let ident_byte =
-            |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
         let mut search = 0usize;
         loop {
             let at = self.source[search..].find(&needle)? + search;
@@ -307,9 +309,7 @@ impl<'a> Engine<'a> {
             // The `on` keyword, word-bounded.
             if !(bytes.get(i) == Some(&b'o')
                 && bytes.get(i + 1) == Some(&b'n')
-                && !bytes
-                    .get(i + 2)
-                    .is_some_and(|b| ident_byte(*b)))
+                && !bytes.get(i + 2).is_some_and(|b| ident_byte(*b)))
             {
                 continue;
             }
@@ -380,7 +380,10 @@ impl<'a> Engine<'a> {
         while let Some(found) = self.source[search..].find(&needle) {
             let at = search + found;
             search = at + 1;
-            let before_ok = self.source[..at].chars().next_back().is_none_or(|c| !ident(c));
+            let before_ok = self.source[..at]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !ident(c));
             let rest = &self.source[at + needle.len()..];
             if !before_ok || rest.chars().next().is_some_and(ident) {
                 continue;
@@ -413,12 +416,19 @@ impl<'a> Engine<'a> {
             let mut nest = 0usize;
             let mut seg = 0usize;
             let inner = &group[..close];
-            for (k, c) in inner.char_indices().chain(std::iter::once((inner.len(), ','))) {
+            for (k, c) in inner
+                .char_indices()
+                .chain(std::iter::once((inner.len(), ',')))
+            {
                 match c {
                     '<' => nest += 1,
                     '>' => nest = nest.saturating_sub(1),
                     ',' if nest == 0 => {
-                        let word: String = inner[seg..k].trim_start().chars().take_while(|c| ident(*c)).collect();
+                        let word: String = inner[seg..k]
+                            .trim_start()
+                            .chars()
+                            .take_while(|c| ident(*c))
+                            .collect();
                         if !word.is_empty() {
                             params.push(&inner[seg..k].trim_start()[..word.len()]);
                         }
@@ -432,7 +442,9 @@ impl<'a> Engine<'a> {
                 return false;
             };
             let on_clause = on_clause.split(['{', ';']).next().unwrap_or("");
-            return on_clause.split(|c: char| !ident(c)).any(|word| params.contains(&word));
+            return on_clause
+                .split(|c: char| !ident(c))
+                .any(|word| params.contains(&word));
         }
         false
     }
@@ -527,7 +539,9 @@ impl<'a> Engine<'a> {
                                         an != bn
                                     }
                                     (a, b) => {
-                                        a != b && !matches!(a, Ty::Unknown) && !matches!(b, Ty::Unknown)
+                                        a != b
+                                            && !matches!(a, Ty::Unknown)
+                                            && !matches!(b, Ty::Unknown)
                                     }
                                 })
                     }
@@ -675,10 +689,7 @@ impl<'a> Engine<'a> {
                     (_, RefTarget::Member { container }) => {
                         match self.walk_members(container, row.name) {
                             Walk::Found(entry)
-                                if matches!(
-                                    entry.kind,
-                                    MemberKind::Getter | MemberKind::Field
-                                ) =>
+                                if matches!(entry.kind, MemberKind::Getter | MemberKind::Field) =>
                             {
                                 answer(&entry)
                             }
@@ -692,8 +703,13 @@ impl<'a> Engine<'a> {
                 let container = match recv {
                     Receiver::This { container, .. }
                     | Receiver::Super { container, .. }
-                    | Receiver::Container { name: container, .. }
-                    | Receiver::Typed { type_name: container, .. } => Some(*container),
+                    | Receiver::Container {
+                        name: container, ..
+                    }
+                    | Receiver::Typed {
+                        type_name: container,
+                        ..
+                    } => Some(*container),
                     _ => None,
                 };
                 match container {
@@ -1427,14 +1443,10 @@ impl<'a> Engine<'a> {
         if body_brace.is_some() || self.return_mark != Some(open_mark) {
             return None;
         }
-        let enclosing = self
-            .frames
-            .iter()
-            .rev()
-            .find_map(|f| match &f.kind {
-                FrameKind::Executable { ret: Some(ret), .. } => Some(ret.ty),
-                _ => None,
-            })?;
+        let enclosing = self.frames.iter().rev().find_map(|f| match &f.kind {
+            FrameKind::Executable { ret: Some(ret), .. } => Some(ret.ty),
+            _ => None,
+        })?;
         self.function_shape_return(enclosing)
     }
 
@@ -1456,9 +1468,7 @@ impl<'a> Engine<'a> {
                 UntypedLiteral::MapEntries => name == map,
                 // An empty `{}` resolves to the context's shape whichever
                 // collection head it names.
-                UntypedLiteral::EmptyBraces => {
-                    name == map || name == set || name == iterable
-                }
+                UntypedLiteral::EmptyBraces => name == map || name == set || name == iterable,
             };
             if adopts {
                 return to;
@@ -1610,7 +1620,12 @@ impl<'a> Engine<'a> {
     /// matrix's own convention. The message placeholders keep the raw `S`
     /// and the declared `T` (`reportTypeError`, :155-205) — the
     /// projections are verdict-side only.
-    pub(crate) fn async_return_verdict(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
+    pub(crate) fn async_return_verdict(
+        &self,
+        from: Ty,
+        to: Ty,
+        from_literal: bool,
+    ) -> Option<bool> {
         // Right Bottom: a `throw` expression's `Never` assigns into every
         // declared shape — `Future<void> f() async => throw 'x';` is clean
         // through the subtype leg before the flatten projections ask their
@@ -1726,9 +1741,9 @@ impl<'a> Engine<'a> {
         // `isNullable` — the nullable-dereference face owns it.
         let nullable = match ty {
             Ty::Null | Ty::Dynamic => true,
-            Ty::Named { nullable, .. } | Ty::Record { nullable, .. } | Ty::Function { nullable, .. } => {
-                nullable
-            }
+            Ty::Named { nullable, .. }
+            | Ty::Record { nullable, .. }
+            | Ty::Function { nullable, .. } => nullable,
             _ => false,
         };
         if nullable {
@@ -1764,7 +1779,12 @@ impl<'a> Engine<'a> {
             // unmodeled SDK face keeps the open verdict — the under-report
             // direction.
             None => {
-                let Ty::Named { name, nullable: false, .. } = ty else {
+                let Ty::Named {
+                    name,
+                    nullable: false,
+                    ..
+                } = ty
+                else {
                     return;
                 };
                 if implements_interface(
@@ -2093,7 +2113,9 @@ impl<'a> Engine<'a> {
         // `_private` code family instead — unmodeled here, so the face
         // suppresses rather than emit the public row.
         let private_foreign_enum = match value {
-            NameTy::Named(name, _) if world.is_enum_name(name) && world.is_foreign_library(name) => {
+            NameTy::Named(name, _)
+                if world.is_enum_name(name) && world.is_foreign_library(name) =>
+            {
                 self.strings.resolve(name).starts_with('_')
                     || match &report.exhaustiveness {
                         Exhaustiveness::NonExhaustive(witnesses) => witnesses
@@ -2401,8 +2423,16 @@ impl<'a> Engine<'a> {
             // the oracle's splice stays silent on the other fields'
             // nullable-vs-non-nullable mismatches too. The scan runs over
             // the whole shape before any field decides.
-            if from.positional.iter().chain(from.named.iter().map(|(_, f)| f)).any(|f| *f == Ty::Unknown)
-                || to.positional.iter().chain(to.named.iter().map(|(_, t)| t)).any(|t| *t == Ty::Unknown)
+            if from
+                .positional
+                .iter()
+                .chain(from.named.iter().map(|(_, f)| f))
+                .any(|f| *f == Ty::Unknown)
+                || to
+                    .positional
+                    .iter()
+                    .chain(to.named.iter().map(|(_, t)| t))
+                    .any(|t| *t == Ty::Unknown)
             {
                 return None;
             }
@@ -2584,20 +2614,24 @@ impl<'a> Engine<'a> {
     /// resolution walk.
     fn function_shape_sig(&self, ty: Ty) -> Option<Box<FnVarSig>> {
         match ty {
-            Ty::Function { shape, nullable: false } => {
+            Ty::Function {
+                shape,
+                nullable: false,
+            } => {
                 let (return_ty, positional, named) = {
                     let pool = self.boundary.pool();
                     let shape = pool.function_shape(shape);
-                    (shape.return_ty, shape.positional.to_vec(), shape.named.to_vec())
+                    (
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                    )
                 };
                 Some(Box::new(FnVarSig {
                     params: Box::default(),
                     required_positional: u16::try_from(positional.len()).unwrap_or(u16::MAX),
                     positional: positional.into(),
-                    named: named
-                        .iter()
-                        .map(|(name, ty)| (*name, *ty, false))
-                        .collect(),
+                    named: named.iter().map(|(name, ty)| (*name, *ty, false)).collect(),
                     return_ty,
                 }))
             }
@@ -2648,15 +2682,15 @@ impl<'a> Engine<'a> {
         if written.len() != params.len() {
             return None;
         }
-        let map: FxHashMap<StringId, Ty> = params
-            .iter()
-            .copied()
-            .zip(written)
-            .collect();
+        let map: FxHashMap<StringId, Ty> = params.iter().copied().zip(written).collect();
         let sig = self.alias_fn_sig(name)?;
         Some(Box::new(FnVarSig {
             params: Box::default(),
-            positional: sig.positional.iter().map(|ty| self.subst_ty(*ty, &map)).collect(),
+            positional: sig
+                .positional
+                .iter()
+                .map(|ty| self.subst_ty(*ty, &map))
+                .collect(),
             required_positional: sig.required_positional,
             named: sig
                 .named
@@ -2685,7 +2719,11 @@ impl<'a> Engine<'a> {
             return Self::join_nullable(*replacement, nullable);
         }
         match ty {
-            Ty::Named { name, nullable, args } if args != ArgListId::EMPTY => {
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } if args != ArgListId::EMPTY => {
                 let written: Vec<Ty> = {
                     let pool = self.boundary.pool();
                     pool.get(args).to_vec()
@@ -2708,8 +2746,10 @@ impl<'a> Engine<'a> {
                         shape.named.to_vec(),
                     )
                 };
-                let positional: Vec<Ty> =
-                    positional.iter().map(|ty| self.subst_ty(*ty, map)).collect();
+                let positional: Vec<Ty> = positional
+                    .iter()
+                    .map(|ty| self.subst_ty(*ty, map))
+                    .collect();
                 let named: Vec<(StringId, Ty)> = named
                     .iter()
                     .map(|(name, ty)| (*name, self.subst_ty(*ty, map)))
@@ -2728,8 +2768,10 @@ impl<'a> Engine<'a> {
                     let shape = pool.record_shape(shape);
                     (shape.positional.to_vec(), shape.named.to_vec())
                 };
-                let positional: Vec<Ty> =
-                    positional.iter().map(|ty| self.subst_ty(*ty, map)).collect();
+                let positional: Vec<Ty> = positional
+                    .iter()
+                    .map(|ty| self.subst_ty(*ty, map))
+                    .collect();
                 let named: Vec<(StringId, Ty)> = named
                     .iter()
                     .map(|(name, ty)| (*name, self.subst_ty(*ty, map)))
@@ -3103,14 +3145,8 @@ mod async_return_tests {
     /// flattened face.
     #[test]
     fn async_return_of_future_value_stays_silent() {
-        let report = report(
-            "class Future<T> {}\nclass DB {}\nFuture<DB> f() async => DB();",
-        );
-        assert!(
-            code_names(&report).is_empty(),
-            "{:?}",
-            code_names(&report)
-        );
+        let report = report("class Future<T> {}\nclass DB {}\nFuture<DB> f() async => DB();");
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 
     /// The sync control: without `async`, the same declared shape still
@@ -3118,9 +3154,7 @@ mod async_return_tests {
     /// pre-#2224 verdict).
     #[test]
     fn sync_return_of_future_typed_expression_still_reports() {
-        let report = report(
-            "class Future<T> {}\nclass DB {}\nFuture<DB> f() => DB();",
-        );
+        let report = report("class Future<T> {}\nclass DB {}\nFuture<DB> f() => DB();");
         assert_eq!(code_names(&report), ["return_of_invalid_type"]);
         assert_eq!(
             report.diagnostics[0].message,
@@ -3138,11 +3172,7 @@ mod async_return_tests {
             "class Future<T> {}\nclass int {}\n\
              Future<int> f() async { return 3 as Future<int>; }",
         );
-        assert!(
-            code_names(&report).is_empty(),
-            "{:?}",
-            code_names(&report)
-        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 
     /// The `T_v`-void branch: `Future<void> f() async { return 3 as
@@ -3174,11 +3204,7 @@ mod async_return_tests {
             "class Future<T> {}\nclass int {}\n\
              Future<Future<int>> f() async { return 3 as Future<int>; }",
         );
-        assert!(
-            code_names(&report).is_empty(),
-            "{:?}",
-            code_names(&report)
-        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 
     /// A bare `return;` in an async body reads `flatten_S = void` (branch
@@ -3187,12 +3213,10 @@ mod async_return_tests {
     /// silent (`T_v = void`, branch a's ok-set).
     #[test]
     fn async_bare_return_follows_the_flattened_hosts() {
-        let demands_a_value = report(
-            "class Future<T> {}\nclass int {}\nFuture<int> f() async { return; }",
-        );
+        let demands_a_value =
+            report("class Future<T> {}\nclass int {}\nFuture<int> f() async { return; }");
         assert_eq!(code_names(&demands_a_value), ["return_of_invalid_type"]);
-        let keeps_it_silent =
-            report("class Future<T> {}\nFuture<void> f() async { return; }");
+        let keeps_it_silent = report("class Future<T> {}\nFuture<void> f() async { return; }");
         assert!(
             code_names(&keeps_it_silent).is_empty(),
             "{:?}",
@@ -3270,7 +3294,11 @@ mod assignability_face_tests {
                 .iter()
                 .any(|d| d.code.name == "list_element_type_not_assignable"),
             "{:?}",
-            report.diagnostics.iter().map(|d| (&d.code.name, &d.message)).collect::<Vec<_>>()
+            report
+                .diagnostics
+                .iter()
+                .map(|d| (&d.code.name, &d.message))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -3285,7 +3313,11 @@ mod assignability_face_tests {
                 .iter()
                 .any(|d| d.code.name == "list_element_type_not_assignable"),
             "{:?}",
-            report.diagnostics.iter().map(|d| (&d.code.name, &d.message)).collect::<Vec<_>>()
+            report
+                .diagnostics
+                .iter()
+                .map(|d| (&d.code.name, &d.message))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -3312,7 +3344,11 @@ mod assignability_face_tests {
                 .iter()
                 .any(|d| d.code.name == "argument_type_not_assignable"),
             "{:?}",
-            report.diagnostics.iter().map(|d| (&d.code.name, &d.message)).collect::<Vec<_>>()
+            report
+                .diagnostics
+                .iter()
+                .map(|d| (&d.code.name, &d.message))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -3333,7 +3369,11 @@ mod assignability_face_tests {
                 .iter()
                 .any(|d| d.code.name == "argument_type_not_assignable"),
             "{:?}",
-            report.diagnostics.iter().map(|d| (&d.code.name, &d.message)).collect::<Vec<_>>()
+            report
+                .diagnostics
+                .iter()
+                .map(|d| (&d.code.name, &d.message))
+                .collect::<Vec<_>>()
         );
     }
 }
@@ -3355,9 +3395,7 @@ mod closure_return_tests {
     /// closure template (diagnostic.g.dart:15314-15328).
     #[test]
     fn initializer_context_reports_the_closure_face() {
-        let report = report(
-            "class DB {}\nclass Str {}\nStr Function() f = () => DB();",
-        );
+        let report = report("class DB {}\nclass Str {}\nStr Function() f = () => DB();");
         assert_eq!(code_names(&report), ["return_of_invalid_type_from_closure"]);
         assert_eq!(
             report.diagnostics[0].message,
@@ -3369,9 +3407,7 @@ mod closure_return_tests {
     /// initializer context.
     #[test]
     fn block_literal_statement_return_uses_the_same_context() {
-        let report = report(
-            "class DB {}\nclass Str {}\nStr Function() f = () { return DB(); };",
-        );
+        let report = report("class DB {}\nclass Str {}\nStr Function() f = () { return DB(); };");
         assert_eq!(code_names(&report), ["return_of_invalid_type_from_closure"]);
     }
 
@@ -3382,11 +3418,7 @@ mod closure_return_tests {
             "class Str {}\nclass Sub extends Str {}\n\
              Str Function() f = () => Sub();",
         );
-        assert!(
-            code_names(&report).is_empty(),
-            "{:?}",
-            code_names(&report)
-        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 
     /// The return position, alias-spelled: the literal is the enclosing
@@ -3417,11 +3449,7 @@ mod closure_return_tests {
             "class DB {}\nclass Str {}\n\
              Str Function() h() {\n  return () => DB();\n}",
         );
-        assert!(
-            code_names(&report).is_empty(),
-            "{:?}",
-            code_names(&report)
-        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 
     /// The leak control: a literal nested deeper in the body (an argument,
@@ -3440,11 +3468,7 @@ mod closure_return_tests {
              F take(F f) => Str();\n\
              F h() {\n  take(() => DB());\n  return () => Str();\n}",
         );
-        assert!(
-            code_names(&report).is_empty(),
-            "{:?}",
-            code_names(&report)
-        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 
     /// A non-function context is no context: a literal initialized into a
@@ -3452,14 +3476,8 @@ mod closure_return_tests {
     /// check's business, and its Unknown literal row suppresses).
     #[test]
     fn non_function_context_stays_silent() {
-        let report = report(
-            "class DB {}\nclass Holder {}\nHolder h = () => DB();",
-        );
-        assert!(
-            code_names(&report).is_empty(),
-            "{:?}",
-            code_names(&report)
-        );
+        let report = report("class DB {}\nclass Holder {}\nHolder h = () => DB();");
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 }
 
@@ -3485,11 +3503,7 @@ mod alias_function_subtyping_tests {
              Cat pick(Cat c) => c;\n\
              Pred2<Cat?> p = pick;\nPred2<Cat> q = p;",
         );
-        assert!(
-            code_names(&report).is_empty(),
-            "{:?}",
-            code_names(&report)
-        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 
     /// The identity instantiation stays silent (the same-name fast path's
@@ -3502,11 +3516,7 @@ mod alias_function_subtyping_tests {
              Cat pick(Cat c) => c;\n\
              Pred2<Cat> p = pick;\nPred2<Cat> q = p;",
         );
-        assert!(
-            code_names(&report).is_empty(),
-            "{:?}",
-            code_names(&report)
-        );
+        assert!(code_names(&report).is_empty(), "{:?}", code_names(&report));
     }
 
     /// A return-type mismatch across the instantiation reports — the

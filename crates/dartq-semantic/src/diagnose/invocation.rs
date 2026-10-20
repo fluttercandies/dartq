@@ -18,7 +18,12 @@ impl<'a> Engine<'a> {
     /// nullable local's read latches the dead-chain candidate (the
     /// `_verifyUnassignedVariable` face — resolved at teardown against the
     /// definite-unassignment facts).
-    pub(crate) fn merge_member(&mut self, is_null_aware: bool, op_range: SourceRange, chain_end: u32) {
+    pub(crate) fn merge_member(
+        &mut self,
+        is_null_aware: bool,
+        op_range: SourceRange,
+        chain_end: u32,
+    ) {
         // F-H arg-window displacement: a completed send's callee placeholder
         // is the member row this merge must fold, but recovery shapes can
         // leave the argument window's rows above it — every row above the
@@ -111,7 +116,8 @@ impl<'a> Engine<'a> {
             // LATER send's callee and check the dead group's count against
             // an unrelated method (the `_isValidContext` misattribution).
             let first_removed = self.rows.len();
-            self.deferred_args.retain(|(row, _, _)| *row < first_removed);
+            self.deferred_args
+                .retain(|(row, _, _)| *row < first_removed);
             self.call_type_args.retain(|(row, _)| *row < first_removed);
             self.deferred_miss_rows.append(&mut type_arg_rows);
         }
@@ -247,45 +253,45 @@ impl<'a> Engine<'a> {
         // (`..version = version`, a `Bare` leftover) collapses exactly like
         // a literal `Value` one.
         let cascade_recv = (self.in_cascade)
-        .then(|| {
-            // The latched target read is the LAST CASCADE-SECTION read, not
-            // `member_reads`' plain tail: a member-read RHS (`..p =
-            // original.p`) records its own read AFTER the section's, so the
-            // tail answers the RHS's face and the next section resolves
-            // against the RHS type (`..followRedirects =
-            // original.followRedirects` then reports `..maxRedirects`
-            // against `bool`). Scanning back to the newest read whose
-            // selector offset is in `cascade_sections` answers the section's
-            // own record; the walk is short in practice (the entries past a
-            // section's selector are just its RHS's own reads).
-            self.member_reads
-                .iter()
-                .rev()
-                .find(|read| self.cascade_sections.contains(&read.offset))
-        })
-        .flatten()
-        .filter(|_| {
-            // A chained access ON a section (`..headers.addAll(x)`) pops the
-            // section's own selector row — that send must resolve against
-            // the section's member type, never the latched target. An RHS
-            // leftover never sits at a section offset, so the popped row's
-            // own offset answers which shape this merge is.
-            popped_receiver.as_ref().is_none_or(|row| {
-                !self.cascade_sections.contains(&row.range.offset)
+            .then(|| {
+                // The latched target read is the LAST CASCADE-SECTION read, not
+                // `member_reads`' plain tail: a member-read RHS (`..p =
+                // original.p`) records its own read AFTER the section's, so the
+                // tail answers the RHS's face and the next section resolves
+                // against the RHS type (`..followRedirects =
+                // original.followRedirects` then reports `..maxRedirects`
+                // against `bool`). Scanning back to the newest read whose
+                // selector offset is in `cascade_sections` answers the section's
+                // own record; the walk is short in practice (the entries past a
+                // section's selector are just its RHS's own reads).
+                self.member_reads
+                    .iter()
+                    .rev()
+                    .find(|read| self.cascade_sections.contains(&read.offset))
             })
-        })
-        .filter(|last| {
-            // A `;` inside the popped RHS's own span (a `"a;b"` literal) is
-            // part of the expression, not a boundary — the separator probe
-            // ends where the leftover row begins.
-            let start = self.byte_of(last.offset);
-            let end = popped_receiver
-                .as_ref()
-                .map(|row| self.byte_of(row.range.offset))
-                .unwrap_or_else(|| self.byte_of(member.range.offset));
-            !self.source.as_bytes()[start.min(end)..end].contains(&b';')
-        })
-        .map(|last| last.recv);
+            .flatten()
+            .filter(|_| {
+                // A chained access ON a section (`..headers.addAll(x)`) pops the
+                // section's own selector row — that send must resolve against
+                // the section's member type, never the latched target. An RHS
+                // leftover never sits at a section offset, so the popped row's
+                // own offset answers which shape this merge is.
+                popped_receiver
+                    .as_ref()
+                    .is_none_or(|row| !self.cascade_sections.contains(&row.range.offset))
+            })
+            .filter(|last| {
+                // A `;` inside the popped RHS's own span (a `"a;b"` literal) is
+                // part of the expression, not a boundary — the separator probe
+                // ends where the leftover row begins.
+                let start = self.byte_of(last.offset);
+                let end = popped_receiver
+                    .as_ref()
+                    .map(|row| self.byte_of(row.range.offset))
+                    .unwrap_or_else(|| self.byte_of(member.range.offset));
+                !self.source.as_bytes()[start.min(end)..end].contains(&b';')
+            })
+            .map(|last| last.recv);
         let receiver_offset = popped_receiver
             .as_ref()
             .map(|r| r.range.offset)
@@ -913,7 +919,11 @@ impl<'a> Engine<'a> {
     /// last registration wins (a file declares a spelling once; recovery
     /// residue keeps the settled face). Foreign containers hold no sites
     /// here (`None` — the under-report posture).
-    pub(crate) fn ctor_decl_site(&self, container: StringId, selector: StringId) -> Option<&DeclSite> {
+    pub(crate) fn ctor_decl_site(
+        &self,
+        container: StringId,
+        selector: StringId,
+    ) -> Option<&DeclSite> {
         // The unnamed face has three spellings: the class name (`C()`), the
         // `.new` selector, and the bare `new` head (`const new();`), whose
         // head token is the `(` — its site carries that spelling.
@@ -931,7 +941,12 @@ impl<'a> Engine<'a> {
     /// of `decl`: a named selector joins through the container's selector
     /// set, the unnamed spellings (the head itself, `new`) through the
     /// implicit/explicit unnamed face.
-    pub(crate) fn ctor_face_exists(&self, decl: &Container, container: StringId, selector: StringId) -> bool {
+    pub(crate) fn ctor_face_exists(
+        &self,
+        decl: &Container,
+        container: StringId,
+        selector: StringId,
+    ) -> bool {
         decl.constructors.contains(&selector)
             || ((selector == container || selector == self.intern("new"))
                 && decl.has_unnamed_constructor)
@@ -991,9 +1006,7 @@ impl<'a> Engine<'a> {
         let reads = self.member_reads.clone();
         let mut derived: FxHashMap<u32, Ty> = FxHashMap::default();
         for read in &reads {
-            let Ok(index) = latches
-                .binary_search_by(|(member, _)| member.cmp(&read.offset))
-            else {
+            let Ok(index) = latches.binary_search_by(|(member, _)| member.cmp(&read.offset)) else {
                 continue;
             };
             let span = latches[index].1;
@@ -1235,7 +1248,12 @@ impl<'a> Engine<'a> {
     /// (`error_verifier.dart`, the `SuperConstructorInvocation` resolution):
     /// the direct superclass's named constructor set decides. An
     /// unresolvable superclass (external, `on`-constraint chain) suppresses.
-    pub(crate) fn check_super_constructor(&mut self, container: StringId, name: StringId, span: SourceRange) {
+    pub(crate) fn check_super_constructor(
+        &mut self,
+        container: StringId,
+        name: StringId,
+        span: SourceRange,
+    ) {
         let Some(superclass) = self
             .index
             .get(self.file)
@@ -1482,9 +1500,7 @@ impl<'a> Engine<'a> {
     fn named_selector_head_before(&self, open: u32) -> Option<(StringId, SourceRange)> {
         let bytes = self.source.as_bytes();
         let mut end = self.byte_of(open);
-        while end > 0
-            && (bytes[end - 1].is_ascii_alphanumeric() || bytes[end - 1] == b'_')
-        {
+        while end > 0 && (bytes[end - 1].is_ascii_alphanumeric() || bytes[end - 1] == b'_') {
             end -= 1;
         }
         let start = end;
@@ -1546,15 +1562,17 @@ impl<'a> Engine<'a> {
             }
         }
         let end = cursor;
-        while cursor > 0
-            && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_')
+        while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_')
         {
             cursor -= 1;
         }
         if cursor == end {
             return None;
         }
-        Some((self.intern(&self.source[cursor..end]), self.utf16_of(cursor)))
+        Some((
+            self.intern(&self.source[cursor..end]),
+            self.utf16_of(cursor),
+        ))
     }
 
     /// The creation argument group's open-paren offset: the first
@@ -1687,8 +1705,7 @@ impl<'a> Engine<'a> {
         // An enum constant's own argument list (`low(1)`): the enclosing
         // element window is open and no outer argument list owns this `(`
         // — the callee is the enum's selected constructor, never a row.
-        let enum_const =
-            self.in_enum_element.is_some() && self.arg_levels.is_empty();
+        let enum_const = self.in_enum_element.is_some() && self.arg_levels.is_empty();
         // The head row at group open: `top` when the invocation dispatch
         // found a callee, else the last row when it is a keyword receiver
         // (the bare `super(`/`this(` initializer-invocation head `invokes`
@@ -1770,9 +1787,7 @@ impl<'a> Engine<'a> {
             && matches!(self.type_resolution(class).0, TypeResolution::Type)
         {
             let open = self.creation_open_offset(selector_range.end());
-            let kept = self
-                .rows
-                .partition_point(|row| row.range.offset < open);
+            let kept = self.rows.partition_point(|row| row.range.offset < open);
             for row in self.rows.drain(kept..) {
                 self.deferred_miss_rows.push(row);
             }
@@ -2207,8 +2222,7 @@ impl<'a> Engine<'a> {
         if self.frames.iter().any(|f| f.locals.contains(&outer_name)) {
             return;
         }
-        let Some(outer_params) = self.exec_bounds.get(&outer_name).filter(|p| !p.is_empty())
-        else {
+        let Some(outer_params) = self.exec_bounds.get(&outer_name).filter(|p| !p.is_empty()) else {
             return;
         };
         let Some(outer_formal) = self.top_level_decl(outer_name).and_then(|decl| {
@@ -2245,9 +2259,10 @@ impl<'a> Engine<'a> {
         let mut solved = Vec::with_capacity(params.len());
         let mut open = Vec::with_capacity(params.len());
         for arg in &schema_args {
-            let (Some(with_hole), Some(with_top)) =
-                (self.subst_params(*arg, &to_hole), self.subst_params(*arg, &to_top))
-            else {
+            let (Some(with_hole), Some(with_top)) = (
+                self.subst_params(*arg, &to_hole),
+                self.subst_params(*arg, &to_top),
+            ) else {
                 return;
             };
             open.push(with_hole != *arg);
@@ -2330,7 +2345,10 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let param_text = self.strings.resolve(*param).to_string();
-            let formal_name = self.strings.resolve(formals.positional[slot].name).to_string();
+            let formal_name = self
+                .strings
+                .resolve(formals.positional[slot].name)
+                .to_string();
             let inferred = self.ty_display(solved[index]);
             let declared_args: Vec<Ty> = params.iter().map(|(p, _)| Ty::named(*p)).collect();
             let declared = Ty::Named {
@@ -2427,7 +2445,11 @@ impl<'a> Engine<'a> {
             // declared type (`FieldFormalParameterElement.type`); the field
             // may be declared after the constructor, so the whole-file
             // member table answers it here.
-            for formal in formals.positional.iter_mut().chain(formals.named.iter_mut()) {
+            for formal in formals
+                .positional
+                .iter_mut()
+                .chain(formals.named.iter_mut())
+            {
                 if formal.ty == Ty::UNKNOWN
                     && let Some(entry) = container.members.get(&formal.name)
                     && entry.kind == MemberKind::Field
@@ -2469,7 +2491,11 @@ impl<'a> Engine<'a> {
                 .unwrap_or(close);
             let enum_text = self.strings.resolve(enum_name).to_string();
             let (shape, a0, a1) = if required == 1 {
-                (ArgCountShape::NameSingular, enum_text.clone(), String::new())
+                (
+                    ArgCountShape::NameSingular,
+                    enum_text.clone(),
+                    String::new(),
+                )
             } else {
                 (
                     ArgCountShape::NamePlural,
@@ -2574,8 +2600,8 @@ impl<'a> Engine<'a> {
                         message,
                     );
                 }
-                let message = SemanticCode::ArgumentTypeNotAssignable
-                    .message3(&from_text, &to_text, "");
+                let message =
+                    SemanticCode::ArgumentTypeNotAssignable.message3(&from_text, &to_text, "");
                 self.emit_message_with_correction(
                     SemanticCode::ArgumentTypeNotAssignable,
                     *range,
@@ -2607,11 +2633,7 @@ impl<'a> Engine<'a> {
                 dartq_scanner::keyword_from_str(rest),
                 Some(k) if k.style() == dartq_scanner::KeywordStyle::Reserved
             );
-        if valid {
-            self.intern(rest)
-        } else {
-            name
-        }
+        if valid { self.intern(rest) } else { name }
     }
 
     /// The named formal a written `name:` argument resolves to: exact
@@ -2630,9 +2652,9 @@ impl<'a> Engine<'a> {
             // The written argument is already private (`_x:`): it resolves a
             // formal whose element name is exactly `_x` — a formal carrying
             // no public face (else its element name is `x`).
-            return formals.named_formal(name).filter(|f| {
-                self.formal_public_name(f.name) == f.name
-            });
+            return formals
+                .named_formal(name)
+                .filter(|f| self.formal_public_name(f.name) == f.name);
         }
         formals.named_formal(name).or_else(|| {
             formals
@@ -2641,7 +2663,6 @@ impl<'a> Engine<'a> {
                 .find(|f| self.formal_public_name(f.name) == name)
         })
     }
-
 
     /// The closed group's explicit super-constructor invocation, when it is
     /// one: `Some((enclosing container, selector, bare))` — the selector
@@ -2752,8 +2773,10 @@ impl<'a> Engine<'a> {
                         let key = selector
                             .filter(|name| *name != self.intern("new"))
                             .unwrap_or(superclass);
-                        let Some(formals) =
-                            super_container.ctor_formals.get(&key).map(|f| (**f).clone())
+                        let Some(formals) = super_container
+                            .ctor_formals
+                            .get(&key)
+                            .map(|f| (**f).clone())
                         else {
                             // A resolved class without the selector: the
                             // `undefined_constructor_in_initializer` face
@@ -2821,7 +2844,11 @@ impl<'a> Engine<'a> {
         // whole-file member table answers it (the enum-constant walk
         // applies the same face).
         if let Some(super_container) = super_container {
-            for formal in formals.positional.iter_mut().chain(formals.named.iter_mut()) {
+            for formal in formals
+                .positional
+                .iter_mut()
+                .chain(formals.named.iter_mut())
+            {
                 if formal.ty == Ty::UNKNOWN
                     && let Some(entry) = super_container.members.get(&formal.name)
                     && entry.kind == MemberKind::Field
@@ -2906,7 +2933,11 @@ impl<'a> Engine<'a> {
                 ctor_text.push_str(".new");
             }
             let (shape, a0, a1) = if required == 1 {
-                (ArgCountShape::NameSingular, ctor_text.clone(), String::new())
+                (
+                    ArgCountShape::NameSingular,
+                    ctor_text.clone(),
+                    String::new(),
+                )
             } else {
                 (
                     ArgCountShape::NamePlural,
@@ -2950,7 +2981,10 @@ impl<'a> Engine<'a> {
                     surplus = Some(*range);
                 }
             }
-            let anchor = (seen == given).then_some(surplus).flatten().unwrap_or(close);
+            let anchor = (seen == given)
+                .then_some(surplus)
+                .flatten()
+                .unwrap_or(close);
             let message = code.message(&capacity.to_string(), &given.to_string());
             self.emit_message_with_correction(code, anchor, message);
         }
@@ -3036,7 +3070,11 @@ impl<'a> Engine<'a> {
         else {
             return;
         };
-        for formal in formals.positional.iter_mut().chain(formals.named.iter_mut()) {
+        for formal in formals
+            .positional
+            .iter_mut()
+            .chain(formals.named.iter_mut())
+        {
             if formal.ty == Ty::UNKNOWN
                 && let Some(member) = entry.members.get(&formal.name)
                 && member.kind == MemberKind::Field
@@ -3100,11 +3138,8 @@ impl<'a> Engine<'a> {
         }
         for formal in formals.named.iter_mut() {
             if formal.ty == Ty::Never {
-                formal.ty = self.associated_super_formal_ty(
-                    container,
-                    SuperQuery::Named(formal.name),
-                    0,
-                );
+                formal.ty =
+                    self.associated_super_formal_ty(container, SuperQuery::Named(formal.name), 0);
             }
         }
     }
@@ -3287,7 +3322,12 @@ impl<'a> Engine<'a> {
     /// against the positional capacity, mutually exclusive); unresolved
     /// callees suppress.
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
-    pub(crate) fn check_arguments(&mut self, level: Option<ArgLevel>, positional: u16, close: SourceRange) {
+    pub(crate) fn check_arguments(
+        &mut self,
+        level: Option<ArgLevel>,
+        positional: u16,
+        close: SourceRange,
+    ) {
         let Some(level) = level else { return };
         // The enum constant's own argument list is an implicit constructor
         // invocation with no callee row — it checks against the enum's
@@ -3314,12 +3354,10 @@ impl<'a> Engine<'a> {
             // not an unnamed head — the latch also arms for the
             // named-selector creation fold, whose class-segment
             // resolution owns the spelling; the unnamed face skips it.
-            let dot_preceded = self
-                .pending_bare_creation
-                .is_some_and(|(_, range)| {
-                    let start = self.byte_of(range.offset);
-                    start > 0 && self.source.as_bytes()[start - 1] == b'.'
-                });
+            let dot_preceded = self.pending_bare_creation.is_some_and(|(_, range)| {
+                let start = self.byte_of(range.offset);
+                start > 0 && self.source.as_bytes()[start - 1] == b'.'
+            });
             if !dot_preceded && !self.report_alias_invocation_of_non_function() {
                 self.report_bare_creation_miss();
             }
@@ -3464,8 +3502,11 @@ impl<'a> Engine<'a> {
                 ))
             });
             if let Some((container, span)) = miss {
-                self.open_const_creations
-                    .push((init, span, ConstCreationEntry::Creation { container }));
+                self.open_const_creations.push((
+                    init,
+                    span,
+                    ConstCreationEntry::Creation { container },
+                ));
             }
         }
         let Some(row) = self.rows.get(callee) else {
@@ -3566,22 +3607,17 @@ impl<'a> Engine<'a> {
                 // — but the top-level fallback must never lend its formals
                 // to a call the member already claimed.
                 let member_found = !shadowed
-                    && self
-                        .container_context()
-                        .is_some_and(|(container, _)| {
-                            matches!(
-                                self.walk_members(container, row.name),
-                                Walk::Found(_)
-                            )
-                        });
+                    && self.container_context().is_some_and(|(container, _)| {
+                        matches!(self.walk_members(container, row.name), Walk::Found(_))
+                    });
                 member_owns_callee = member_found;
                 let member_sig: Option<Box<FnVarSig>> = match member {
                     Some(_) => None,
                     None if member_found => (!shadowed)
                         .then(|| self.container_context())
                         .flatten()
-                        .and_then(|(container, _)| {
-                            match self.walk_members(container, row.name) {
+                        .and_then(
+                            |(container, _)| match self.walk_members(container, row.name) {
                                 Walk::Found(entry) if entry.kind == MemberKind::Field => {
                                     match self.fold_alias_ty(entry.var_ty) {
                                         Ty::Named { name, .. } => Some(name),
@@ -3595,8 +3631,8 @@ impl<'a> Engine<'a> {
                                     }
                                 }
                                 _ => None,
-                            }
-                        })
+                            },
+                        )
                         .and_then(|name| self.alias_fn_sig(name)),
                     None => None,
                 };
@@ -3827,14 +3863,11 @@ impl<'a> Engine<'a> {
                 // callee never reads the namespace: the same-spelled
                 // top-level function's return is not the member's
                 // callable's return.
-                sig_from_row
-                    .as_ref()
-                    .map(|sig| sig.return_ty)
-                    .or_else(|| {
-                        (!member_owns_callee)
-                            .then(|| self.top_level_decl(row.name).map(|decl| decl.return_ty))
-                            .flatten()
-                    }),
+                sig_from_row.as_ref().map(|sig| sig.return_ty).or_else(|| {
+                    (!member_owns_callee)
+                        .then(|| self.top_level_decl(row.name).map(|decl| decl.return_ty))
+                        .flatten()
+                }),
             ),
             // The member's declared return rides the element walk (the
             // instantiation write below grounds `T` returns).
@@ -3987,7 +4020,12 @@ impl<'a> Engine<'a> {
         // required named).
         for name in missing_required {
             let text = self.strings.resolve(name).to_string();
-            self.emit(SemanticCode::MissingRequiredArgument, callee_range, &text, "");
+            self.emit(
+                SemanticCode::MissingRequiredArgument,
+                callee_range,
+                &text,
+                "",
+            );
         }
         // Per-parameter solution slots (`None` = unsolved).
         let mut solutions: Box<[Option<Ty>]> = exec_params
@@ -5054,7 +5092,11 @@ impl<'a> Engine<'a> {
     /// declared-constructor table. The receiver's class resolves by receiver
     /// kind (bare `C` in scope, `io.C` behind its prefix); a non-container or
     /// non-constructor name returns `None` and the member walk proceeds.
-    pub(crate) fn ctor_arity_target(&self, recv: &Receiver, name: StringId) -> Option<(StringId, StringId)> {
+    pub(crate) fn ctor_arity_target(
+        &self,
+        recv: &Receiver,
+        name: StringId,
+    ) -> Option<(StringId, StringId)> {
         let (resolved, class) = match *recv {
             Receiver::Container { name, .. } => (
                 resolve_container(
@@ -5093,7 +5135,11 @@ impl<'a> Engine<'a> {
     /// the member's declared type), whose message displays that function
     /// type: unrenderable at the name-level model, so those finds suppress
     /// (`None`, the under-report direction).
-    pub(crate) fn member_exec_arity(&self, recv: &Receiver, name: StringId) -> Option<(u16, ExecKind)> {
+    pub(crate) fn member_exec_arity(
+        &self,
+        recv: &Receiver,
+        name: StringId,
+    ) -> Option<(u16, ExecKind)> {
         let (container, super_walk) = match *recv {
             Receiver::Super { container, .. } => (container, true),
             Receiver::This { container, .. }
@@ -5316,7 +5362,12 @@ impl<'a> Engine<'a> {
     /// type-parameter count against the given count (`dynamic` and
     /// in-scope type parameters declare none; unresolved and external heads
     /// suppress).
-    pub(crate) fn check_annotation_arity(&mut self, name: StringId, count: u16, range: SourceRange) {
+    pub(crate) fn check_annotation_arity(
+        &mut self,
+        name: StringId,
+        count: u16,
+        range: SourceRange,
+    ) {
         let Some(declared) = self.declared_type_params(name) else {
             return;
         };
@@ -5740,7 +5791,10 @@ mod tests {
             },
             file,
         );
-        assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
         let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
         let features = ParserFeatures::from_feature_set(set);
         let elements = collect(source, &scanned.tokens, features, &strings);
@@ -5807,7 +5861,11 @@ mod tests {
                @override String get source => ''; \
              }",
         );
-        assert!(override_codes(&report).is_empty(), "{:?}", code_names(&report));
+        assert!(
+            override_codes(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// The petitparser `ParserMatch implements Match` shape: every
@@ -5828,7 +5886,11 @@ mod tests {
                @override String get pattern => ''; \
              }",
         );
-        assert!(override_codes(&report).is_empty(), "{:?}", code_names(&report));
+        assert!(
+            override_codes(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// The dio `_DefaultIfEmptyStreamSink implements EventSink` shape:
@@ -5845,7 +5907,11 @@ mod tests {
                @override void close() {} \
              }",
         );
-        assert!(override_codes(&report).is_empty(), "{:?}", code_names(&report));
+        assert!(
+            override_codes(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// The http `_ClientSocketException implements SocketException` shape:
@@ -5860,7 +5926,11 @@ mod tests {
                @override int get address => 0; \
              }",
         );
-        assert!(override_codes(&report).is_empty(), "{:?}", code_names(&report));
+        assert!(
+            override_codes(&report).is_empty(),
+            "{:?}",
+            code_names(&report)
+        );
     }
 
     /// The spare is exact, not a blanket silence: an `@override` member no
@@ -5868,9 +5938,7 @@ mod tests {
     /// (the frozen face answers `false` for absent spellings).
     #[test]
     fn absent_interface_member_keeps_the_override_row() {
-        let report = report(
-            "class C implements Match { @override int get absent => 0; }",
-        );
+        let report = report("class C implements Match { @override int get absent => 0; }");
         assert_eq!(
             override_codes(&report),
             ["override_on_non_overriding_member"],
@@ -5885,9 +5953,7 @@ mod tests {
     /// declared `dynamic` local's reads and invocations stay silent.
     #[test]
     fn dynamic_receiver_reports_no_member_face() {
-        let report = report(
-            "void f(dynamic x) { x.gone; x.missing(); x.absent = 1; }",
-        );
+        let report = report("void f(dynamic x) { x.gone; x.missing(); x.absent = 1; }");
         let member_rows: Vec<&'static str> = code_names(&report)
             .into_iter()
             .filter(|name| {
@@ -5926,7 +5992,11 @@ mod tests {
                     )
                 })
                 .collect();
-            assert!(member_rows.is_empty(), "{source}: {:?}", code_names(&report));
+            assert!(
+                member_rows.is_empty(),
+                "{source}: {:?}",
+                code_names(&report)
+            );
         }
     }
 
@@ -6014,8 +6084,7 @@ mod tests {
              }",
         );
         assert!(
-            !code_names(&report)
-                .contains(&"super_formal_parameter_without_associated_named"),
+            !code_names(&report).contains(&"super_formal_parameter_without_associated_named"),
             "{:?}",
             code_names(&report)
         );
@@ -6446,10 +6515,7 @@ mod tests {
             .map(|d| d.message.to_string())
             .collect();
         assert_eq!(rows.len(), 1, "{:?}", code_names(&report));
-        assert!(
-            rows[0].contains("for the type 'Refined'"),
-            "{rows:?}"
-        );
+        assert!(rows[0].contains("for the type 'Refined'"), "{rows:?}");
     }
 
     /// Without a promotion the frozen face stands: the chain miss names
@@ -6471,9 +6537,6 @@ mod tests {
             .map(|d| d.message.to_string())
             .collect();
         assert_eq!(rows.len(), 1, "{:?}", code_names(&report));
-        assert!(
-            rows[0].contains("for the type 'Frozen'"),
-            "{rows:?}"
-        );
+        assert!(rows[0].contains("for the type 'Frozen'"), "{rows:?}");
     }
 }

@@ -39,7 +39,10 @@ fn report(main: &str, mix: &str) -> FileReport {
             },
             file,
         );
-        assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
         scanned
     };
     let scanned_main = scan(main, file_main);

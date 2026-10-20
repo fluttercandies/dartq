@@ -36,7 +36,10 @@ fn report(source: &str) -> FileReport {
         },
         file,
     );
-    assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {source:?}");
+    assert!(
+        scanned.diagnostics.is_empty(),
+        "scanner diagnostics: {source:?}"
+    );
     let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
     let features = ParserFeatures::from_feature_set(set);
     let elements = collect(source, &scanned.tokens, features, &strings);
@@ -72,10 +75,7 @@ fn report(source: &str) -> FileReport {
 }
 
 fn has_code(report: &FileReport, code: &str) -> bool {
-    report
-        .diagnostics
-        .iter()
-        .any(|d| d.code.name == code)
+    report.diagnostics.iter().any(|d| d.code.name == code)
 }
 
 // —— #2337 face ①: the super-formal associated type ——————————————————————
