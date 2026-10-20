@@ -665,9 +665,7 @@ impl<'a> Engine<'a> {
     /// `container` is the open container frame's name (the class / named
     /// mixin application / enum being declared). Wired from the
     /// with-clause listener events before `drain_with_clause_spans` moves
-    /// the buffered spans into `pending_mixin_uses` — the listener hook
-    /// ships with its owning lane, so the check sits uncalled until then.
-    #[expect(dead_code, reason = "the with-clause listener hook lands with its lane (#2314)")]
+    /// the buffered spans into `pending_mixin_uses`.
     pub(crate) fn check_mixin_application_overrides(&mut self, container: StringId) {
         let Some(elements) = self.index.get(self.file) else {
             return;

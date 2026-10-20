@@ -490,6 +490,15 @@ mod ticket_2241_tests;
 #[cfg(test)]
 mod ticket_2324_tests;
 
+/// The #2326 differential pins: the with-clause override producer wired
+/// from the three with-clause listener handlers — the written NamedType
+/// span anchors each `invalid_override` row (type arguments included),
+/// the mixin field contributes both getter and setter faces, the
+/// accumulated set is `[superclass] + prior mixins` (never
+/// `implements`/`on`), and a foreign single-parameter mixin instantiates
+/// `T ↦ XmlNode` at the application site.
+#[cfg(test)]
+mod ticket_2326_tests;
 
 /// The const NON_CONSTANT-family differential pins (#2242): unresolved
 /// callees inside const literals report the element faces at the

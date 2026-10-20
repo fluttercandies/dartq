@@ -750,6 +750,7 @@ impl<'a> Engine<'a> {
         self.used_names = element_used;
         self.suppress_same_line_ignored_usage();
         self.report_unused_imports();
+        self.report_deprecated_sdk_libraries();
     }
 
     /// The trailing same-line `// ignore:` face over the local-variable
@@ -1187,6 +1188,123 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+    }
+
+    /// The `deprecated_member_use` face over `dart:` SDK libraries
+    /// (`element_usage_detector.dart:769-775` for imports, `:256` for
+    /// exports): each written `dart:` directive whose target carries an
+    /// SDK-level `@Deprecated` reports once at the whole-directive anchor
+    /// (the upstream `usageRange: node.sourceRange` — the ImportDirective
+    /// or ExportDirective, not the URI literal). The same-package rule
+    /// never applies — the `dart:` namespace has no package of its own —
+    /// but the URI must resolve: untabulated names (`web_sql`) report
+    /// nothing, matching the upstream resolved-library gate.
+    ///
+    /// The import-side directive span is derived lazily at emit time:
+    /// [`ImportSite`] carries no directive field (the sibling lane's
+    /// `types.rs`/`scopes_bodies.rs` boundary), so the anchor walks
+    /// `self.tokens` backward from `uri_range` to the `import` keyword and
+    /// forward to `;`. The export side arrives pre-captured on
+    /// [`ExportUseFace`].
+    pub(crate) fn report_deprecated_sdk_libraries(&mut self) {
+        for index in 0..self.imports.len() {
+            // Copied first: the emit below mutates the report while the
+            // site is read.
+            let (uri_text, uri_range) = {
+                let site = &self.imports[index];
+                (site.uri_text.clone(), site.uri_range)
+            };
+            let Some(range) =
+                self.directive_range_around(uri_range, dartq_scanner::Keyword::Import)
+            else {
+                continue;
+            };
+            self.emit_deprecated_sdk_library(&uri_text, range);
+        }
+        for index in 0..self.exports.len() {
+            let (uri_text, range) = {
+                let face = &self.exports[index];
+                (face.uri_text.clone(), face.directive_range)
+            };
+            // A zero-length span is a face built outside the listener — the
+            // capture never ran, so there is no anchor to report at.
+            if range.length == 0 {
+                continue;
+            }
+            self.emit_deprecated_sdk_library(&uri_text, range);
+        }
+    }
+
+    /// One `dart:` directive's library-level deprecation row, when the
+    /// written URI names a deprecated SDK library: the
+    /// `deprecatedMemberUse` / `deprecatedMemberUseWithMessage` shapes
+    /// (upstream Dart SDK source, `diagnostic.g.dart:3940/:4038`, both
+    /// named `deprecated_member_use`) with the whole-directive anchor.
+    fn emit_deprecated_sdk_library(&mut self, uri_text: &str, range: SourceRange) {
+        const CODE: dartq_diagnostics::CodeInfo = dartq_diagnostics::CodeInfo::new(
+            "deprecated_member_use",
+            "DEPRECATED_MEMBER_USE",
+            dartq_diagnostics::DiagnosticType::Hint,
+            true,
+        );
+        const CORRECTION: &str =
+            "Try replacing the use of the deprecated member with the replacement.";
+        let Some(name) = uri_text.strip_prefix("dart:") else {
+            return;
+        };
+        let (library, _) = name.split_once('/').unwrap_or((name, ""));
+        let Some(tag) = deprecated_sdk_library(library) else {
+            return;
+        };
+        let message = normalize_deprecation(tag).map_or_else(
+            || format!("'{uri_text}' is deprecated and shouldn't be used."),
+            |tail| format!("'{uri_text}' is deprecated and shouldn't be used. {tail}"),
+        );
+        self.report.usage.push(Diagnostic::new(
+            CODE.dtype.severity(),
+            CODE,
+            message,
+            self.file,
+            range,
+            Some(CORRECTION.to_string()),
+        ));
+    }
+
+    /// Derives the whole-directive span around a URI-literal range: walks
+    /// `self.tokens` backward from the token at `uri_range.offset` to the
+    /// `kw` keyword, forward to `;`, and returns `keyword start →`
+    /// `semicolon end`. `None` on any structural miss (recovery shapes —
+    /// the under-report direction matches the URI site's own gate).
+    fn directive_range_around(
+        &self,
+        uri_range: SourceRange,
+        kw: dartq_scanner::Keyword,
+    ) -> Option<SourceRange> {
+        let tokens = self.tokens.as_slice();
+        // Tokens are in source order, so the URI token is the partition
+        // point at its offset — the per-import lookup stays logarithmic
+        // rather than a fresh whole-table scan.
+        let uri_index = tokens.partition_point(|t| t.utf16_offset < uri_range.offset);
+        if tokens.get(uri_index)?.utf16_offset != uri_range.offset {
+            return None;
+        }
+        // Both searches stop at the directive's own boundary: `rposition`
+        // walks backward from the URI (the nearest preceding keyword is
+        // this directive's), `position` walks forward (the nearest `;`).
+        let kw_index = tokens[..uri_index]
+            .iter()
+            .rposition(|t| t.kind == dartq_scanner::TokenKind::Keyword(kw))?;
+        let semi_index = tokens[uri_index..]
+            .iter()
+            .position(|t| t.kind == dartq_scanner::TokenKind::Semicolon)
+            .map(|i| uri_index + i)?;
+        let start = tokens[kw_index].utf16_offset;
+        // `;` is one UTF-16 unit — the directive's end is its offset + 1.
+        let end = tokens[semi_index].utf16_offset + 1;
+        Some(SourceRange {
+            offset: start,
+            length: end - start,
+        })
     }
 
     /// The `notifyExtensionUsed` credit at the import site (scope.dart
@@ -1969,6 +2087,36 @@ impl<'a> Engine<'a> {
     }
 }
 
+/// The usage gate in front of [`dartq_sdk::deprecated_library_message`]:
+/// upstream only reaches the deprecation check through a resolved library,
+/// so a `dart:` URI the SDK does not tabulate (unresolvable — `web_sql` is
+/// on disk but absent from the flat table) reports nothing.
+fn deprecated_sdk_library(library: &str) -> Option<&'static str> {
+    if dartq_sdk::FLAT_LIBRARIES
+        .binary_search_by_key(&library, |entry| entry.0)
+        .is_err()
+    {
+        return None;
+    }
+    dartq_sdk::deprecated_library_message(library)
+}
+
+/// `normalizeDeprecationMessage` (upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/error/deprecated_member_use_verifier.dart:18-29`):
+/// trim; `""` or `"."` collapses to `None` (the no-message face emits the
+/// plain `deprecatedMemberUse` shape); a `.`/`?`/`!` tail keeps; anything
+/// else gains a `.`.
+fn normalize_deprecation(message: &str) -> Option<String> {
+    let message = message.trim();
+    if message.is_empty() || message == "." {
+        None
+    } else if message.ends_with(['.', '?', '!']) {
+        Some(message.to_string())
+    } else {
+        Some(format!("{message}."))
+    }
+}
+
 #[cfg(test)]
 mod pins {
     use super::super::{FileReport, StrictModes, diagnose_with};
@@ -2586,6 +2734,30 @@ mod pins {
             rows_with_code(source, "unused_element_parameter"),
             vec![(c_at, 2)],
             "{source:?}"
+        );
+    }
+
+    /// #2326: the SDK deprecation annotation normalizes exactly like
+    /// upstream `normalizeDeprecationMessage` — trim; empty or a bare `.`
+    /// collapses to `None` (the plain `deprecatedMemberUse` shape), a
+    /// `.`/`?`/`!` tail keeps, anything else gains a terminal period.
+    #[test]
+    fn deprecation_annotation_normalizes_like_upstream() {
+        assert_eq!(super::normalize_deprecation(""), None);
+        assert_eq!(super::normalize_deprecation("   "), None);
+        assert_eq!(super::normalize_deprecation("."), None);
+        assert_eq!(super::normalize_deprecation("  .  "), None);
+        assert_eq!(
+            super::normalize_deprecation("Use dart:js_interop instead."),
+            Some("Use dart:js_interop instead.".to_string())
+        );
+        assert_eq!(
+            super::normalize_deprecation("Done?"),
+            Some("Done?".to_string())
+        );
+        assert_eq!(
+            super::normalize_deprecation("  may be removed  "),
+            Some("may be removed.".to_string())
         );
     }
 }

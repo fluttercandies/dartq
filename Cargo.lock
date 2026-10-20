@@ -483,6 +483,7 @@ dependencies = [
  "dartq-parser",
  "dartq-resolution",
  "dartq-scanner",
+ "dartq-sdk",
  "dartq-source",
  "dartq-types",
  "rustc-hash",

@@ -713,6 +713,7 @@ impl CompactUseFace {
                 .iter()
                 .map(|shown| ExportUseFace {
                     shown: shown.to_vec(),
+                    ..ExportUseFace::default()
                 })
                 .collect(),
         }
@@ -1031,6 +1032,7 @@ mod compact_face_tests {
             ],
             exports: vec![ExportUseFace {
                 shown: vec![id("z")],
+                ..ExportUseFace::default()
             }],
         };
         let compact = CompactUseFace::of(&face);

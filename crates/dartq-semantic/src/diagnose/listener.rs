@@ -514,6 +514,14 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.clause_alias_super();
         // #1314 FAM14: the with entries completed before this event.
         self.engine.clause_buffer_snapshot(ClauseTag::With);
+        // The mixin-application override check runs against the buffered
+        // spans — after the snapshot latches the clause facts, before the
+        // drain hands them to `pending_mixin_uses` (upstream Dart SDK
+        // source, `pkg/analyzer/lib/src/error/inheritance_override.dart`
+        // `InheritanceOverrideVerifier.verify`).
+        if let Some((container, _)) = self.engine.container_context() {
+            self.engine.check_mixin_application_overrides(container);
+        }
         // The resolved entries join the `class_used_as_mixin` teardown.
         self.engine.drain_with_clause_spans();
     }
@@ -527,6 +535,9 @@ impl ParserListener for DiagnoseListener<'_> {
         // #1314 FAM14: the alias's superclass face, then its with entries.
         self.engine.clause_alias_super();
         self.engine.clause_buffer_snapshot(ClauseTag::With);
+        if let Some((container, _)) = self.engine.container_context() {
+            self.engine.check_mixin_application_overrides(container);
+        }
         self.engine.drain_with_clause_spans();
     }
 
@@ -534,6 +545,9 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.bounds.header_clause(Clause::With);
         self.engine.var_clause(VarSlot::With, None);
         self.engine.clause_buffer_snapshot(ClauseTag::With);
+        if let Some((container, _)) = self.engine.container_context() {
+            self.engine.check_mixin_application_overrides(container);
+        }
         self.engine.drain_with_clause_spans();
     }
 
@@ -5678,14 +5692,43 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.in_import = false;
     }
 
-    fn begin_export(&mut self, _export_keyword: Token) {
+    fn begin_export(&mut self, export_keyword: Token) {
         let engine = &mut self.engine;
         engine.in_export = true;
-        engine.exports.push(ExportUseFace::default());
+        let mut face = ExportUseFace {
+            directive_range: export_keyword.range,
+            ..ExportUseFace::default()
+        };
+        // The URI literal is the token after the keyword; only an honestly
+        // quoted literal joins (the recovery posture matches the import
+        // site's — a malformed URI stays silent for the deprecated-SDK
+        // face).
+        if let Some(uri) = engine.tokens.get(export_keyword.id as usize + 1) {
+            let raw = &engine.source[uri.byte_range()];
+            let bytes = raw.as_bytes();
+            if bytes.len() >= 2 {
+                let quote = bytes[0];
+                if (quote == b'\'' || quote == b'"') && bytes[bytes.len() - 1] == quote {
+                    face.uri_text = raw[1..raw.len() - 1].to_string();
+                }
+            }
+        }
+        engine.exports.push(face);
     }
 
-    fn end_export(&mut self, _export_keyword: Token, _semicolon: Token) {
-        self.engine.in_export = false;
+    fn end_export(&mut self, export_keyword: Token, semicolon: Token) {
+        let engine = &mut self.engine;
+        engine.in_export = false;
+        // Latch the whole-directive anchor: `export` keyword start → `;`
+        // end (the upstream `usageRange: node.sourceRange` face — the
+        // oracle reports the deprecated-SDK row over the ExportDirective,
+        // not the URI literal).
+        if let Some(export) = engine.exports.last_mut() {
+            export.directive_range = SourceRange {
+                offset: export_keyword.range.offset,
+                length: semicolon.range.end() - export_keyword.range.offset,
+            };
+        }
     }
 
     fn begin_show(&mut self, _token: Token) {

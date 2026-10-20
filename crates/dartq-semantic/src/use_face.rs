@@ -26,7 +26,7 @@
 //! per-library maps, no unbounded growth.
 
 use dartq_resolution::LibraryId;
-use dartq_source::StringId;
+use dartq_source::{SourceRange, StringId};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// One unit's observable uses (the per-file gather face).
@@ -69,10 +69,33 @@ pub struct ImportUseFace {
 }
 
 /// One export directive's written show face.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ExportUseFace {
     /// The `show` clause's names, in written order.
     pub shown: Vec<StringId>,
+    /// The URI as written (quotes stripped); `""` when the directive's URI
+    /// was not a clean literal (the recovery posture — the deprecated-SDK
+    /// face stays silent on it).
+    pub uri_text: String,
+    /// The whole directive's span (`export` keyword start → `;` end) —
+    /// the `deprecated_member_use` face's anchor (upstream
+    /// `element_usage_detector.dart:256`, `usageRange: node.sourceRange` =
+    /// the ExportDirective, not the URI literal). Zero-length when the
+    /// capture never ran (a `default()` face built outside the listener).
+    pub directive_range: SourceRange,
+}
+
+impl Default for ExportUseFace {
+    fn default() -> Self {
+        Self {
+            shown: Vec::new(),
+            uri_text: String::new(),
+            directive_range: SourceRange {
+                offset: 0,
+                length: 0,
+            },
+        }
+    }
 }
 
 /// The per-library consumed set (the official merged `UsedLocalElements`

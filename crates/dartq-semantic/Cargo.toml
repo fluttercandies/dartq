@@ -14,6 +14,7 @@ keywords = ["dart", "analyzer", "semantics"]
 blake3 = { workspace = true }
 dartq-diagnostics = { workspace = true }
 dartq-flow = { workspace = true }
+dartq-sdk = { workspace = true }
 dartq-types = { workspace = true }
 dartq-parser = { workspace = true }
 dartq-resolution = { workspace = true }
