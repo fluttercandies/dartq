@@ -308,6 +308,18 @@ impl PackageTable {
         self.root.as_ref()
     }
 
+    /// The context root the table was built over: the workspace root for a
+    /// configured resolution, the analyzed directory itself for the floors
+    /// ([`Self::basic`]). The bare no-pubspec floor has no package identity
+    /// to enumerate, so its discovery/options faces key off this directory
+    /// — the oracle's `BasicWorkspace` roots its context at the analyzed
+    /// directory and walks that whole folder (context_locator.dart
+    /// :517-522).
+    #[must_use]
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
     /// Looks a package up by name (raw, as it appears in `package:` URIs).
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&PackageIdentity> {

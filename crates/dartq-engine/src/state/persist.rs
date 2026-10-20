@@ -116,27 +116,34 @@ pub fn sdk_identity(sdk: &SdkSnapshot, target: &str) -> String {
 
 /// The context-fork salt the generation header carries (#482): blake3-128
 /// over the fork dimensions [`sdk_identity`] and
-/// [`package_graph_fingerprint`] do not already pin — the SDK target
-/// segment, the conditional-import declared-variables map, and the
-/// analysis-options content. Sorted keys and length-prefixed fields make
-/// the digest a pure function of the dimension values (equal contexts
-/// digest equally across processes); any difference forks the header, so
-/// two contexts that would analyze differently can never collide on one
-/// generation directory. Options fold the *located options file's* path
-/// and raw bytes per root — the same content the merged options derive
-/// from, the `context_key` precedent — so exclude-glob and lint edits
-/// both move it, and an unreadable file contributes exactly what the
-/// engine's own loader analyzed (empty bytes).
+/// [`package_graph_fingerprint`] do not already pin — the context root
+/// (the `.dart_tool` directory the engine was assembled over), the SDK
+/// target segment, the conditional-import declared-variables map, and the
+/// analysis-options content. The root is what keeps distinct workspaces
+/// apart when the package graph cannot (#2274): a pubspec-less tree's
+/// package table is empty, so without it the fingerprint degenerates to a
+/// constant and two byte-identical bare trees would share one generation
+/// directory. Sorted keys and length-prefixed fields make the digest a
+/// pure function of the dimension values (equal contexts digest equally
+/// across processes); any difference forks the header, so two contexts
+/// that would analyze differently can never collide on one generation
+/// directory. Options fold the *located options file's* path and raw
+/// bytes per root — the same content the merged options derive from, the
+/// `context_key` precedent — so exclude-glob and lint edits both move it,
+/// and an unreadable file contributes exactly what the engine's own
+/// loader analyzed (empty bytes).
 // The engine's declared-variables map is the face (its FxHasher is part
 // of the engine's identity, not a generalization axis).
 #[expect(clippy::implicit_hasher)] // FxHashMap is part of the digest's identity, not a generalization axis
 #[must_use]
 pub fn context_salt(
+    context_root: &Path,
     target: &str,
     declared_variables: &FxHashMap<String, String>,
     roots: &[PathBuf],
 ) -> [u8; 16] {
     let mut bytes = Vec::new();
+    field(&mut bytes, context_root.as_os_str().as_encoded_bytes());
     field(&mut bytes, target.as_bytes());
     let mut variables: Vec<(&str, &str)> = declared_variables
         .iter()
@@ -1505,33 +1512,39 @@ mod tests {
 
     /// The context salt is a pure function of the fork dimensions and
     /// sensitive to every one of them: equal dimensions digest equally;
-    /// the target, a declared variable, and the located options content
-    /// each move it.
+    /// the context root, the target, a declared variable, and the located
+    /// options content each move it.
     #[test]
     fn context_salt_is_stable_and_dimension_sensitive() {
         let plain = salt_config_dir("plain", None);
         let roots = |dir: &Path| vec![dir.to_path_buf()];
-        let base = context_salt("vm", &FxHashMap::default(), &roots(&plain));
+        let base = context_salt(&plain, "vm", &FxHashMap::default(), &roots(&plain));
         assert_eq!(
             base,
-            context_salt("vm", &FxHashMap::default(), &roots(&plain)),
+            context_salt(&plain, "vm", &FxHashMap::default(), &roots(&plain)),
             "equal dimensions digest equally"
         );
         assert_ne!(
             base,
-            context_salt("js", &FxHashMap::default(), &roots(&plain)),
+            context_salt(&plain, "js", &FxHashMap::default(), &roots(&plain)),
             "the target segment moves the salt"
         );
         let mut defined = FxHashMap::default();
         defined.insert("dart.vm.profile".to_owned(), "true".to_owned());
         assert_ne!(
             base,
-            context_salt("vm", &defined, &roots(&plain)),
+            context_salt(&plain, "vm", &defined, &roots(&plain)),
             "a declared variable moves the salt"
+        );
+        let other_root = salt_config_dir("other-root", None);
+        assert_ne!(
+            base,
+            context_salt(&other_root, "vm", &FxHashMap::default(), &roots(&plain)),
+            "the context root moves the salt"
         );
 
         let options = salt_config_dir("options", Some("linter:\n  rules:\n    - avoid_print\n"));
-        let with_options = context_salt("vm", &FxHashMap::default(), &roots(&options));
+        let with_options = context_salt(&options, "vm", &FxHashMap::default(), &roots(&options));
         assert_ne!(base, with_options, "located options content moves the salt");
         // The *content* (not the root path) is the folded dimension:
         // rewriting the same file in place moves the digest.
@@ -1542,8 +1555,102 @@ mod tests {
         .expect("rewrite options");
         assert_ne!(
             with_options,
-            context_salt("vm", &FxHashMap::default(), &roots(&options)),
+            context_salt(&options, "vm", &FxHashMap::default(), &roots(&options)),
             "an options edit moves the salt"
+        );
+    }
+
+    /// A pubspec-less workspace fixture: one `lib/main.dart` of identical
+    /// bytes, no pubspec, no package config — the bare-tree shape whose
+    /// empty package table once digested a context-invariant header
+    /// (#2274).
+    fn bare_workspace(tag: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dartq-engine-bare-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lib")).expect("fixture dir");
+        std::fs::write(root.join("lib/main.dart"), "void main() {}\n").expect("fixture file");
+        root
+    }
+
+    /// The bare-tree engine assembly: the empty package table and empty
+    /// package config the analyze face's floor builds (the
+    /// `bare_assembly` posture — no pubspec anywhere above the target).
+    fn bare_engine(root: &Path) -> Engine {
+        let pub_config = Arc::new(
+            PackageConfig::parse(r#"{"configVersion": 2, "packages": []}"#).expect("valid config"),
+        );
+        Engine::new(EngineConfig {
+            store: memory_store(),
+            sdk: sdk_snapshot("3.13.1\n", None, SDK_LIBRARIES),
+            packages: PackageTable::basic(root, None).expect("table"),
+            pub_config,
+            config_dir: root.join(".dart_tool"),
+            semdiag: None,
+            target: "vm".to_owned(),
+            declared_variables: FxHashMap::default(),
+            experiments: Vec::new(),
+        })
+        .expect("engine")
+    }
+
+    /// The #2274 cross-workspace collision pin: two pubspec-less
+    /// workspaces with byte-identical files digest distinct headers (the
+    /// context root rides the salt, so the generation directories fork),
+    /// the same workspace digests its header stably across engines (the
+    /// equality a same-path warm start needs), and one tree's saved
+    /// generation never loads under the other tree's header.
+    #[test]
+    fn bare_workspaces_fork_headers_and_never_cross_load() {
+        let root_a = bare_workspace("a");
+        let root_b = bare_workspace("b");
+        let mut engine_a = bare_engine(&root_a);
+        let engine_b = bare_engine(&root_b);
+
+        // Distinct trees, identical bytes: the salts — and the whole
+        // headers with them — stay apart.
+        let header_a = engine_a.snapshot_header();
+        let header_b = engine_b.snapshot_header();
+        assert_ne!(
+            header_a.context_salt, header_b.context_salt,
+            "two pubspec-less trees must not share a context salt"
+        );
+        assert_ne!(header_a, header_b, "the headers fork");
+
+        // Determinism: a fresh engine over the same root reproduces the
+        // header byte-for-byte.
+        assert_eq!(
+            header_a,
+            bare_engine(&root_a).snapshot_header(),
+            "the same workspace digests the same header across engines"
+        );
+
+        // No cross-load: A's saved generation answers A's header and misses
+        // B's — a `Some` for B would mean one shared generation directory
+        // replaying a foreign workspace's facts, the #2274 defect.
+        engine_a.set_content(&root_a.join("lib/main.dart"), b"void main() {}\n");
+        engine_a.apply_pending(&mut |_| {});
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(snapshot_cache_dir()),
+            capacity_bytes: 64 * 1024 * 1024,
+        })
+        .expect("open store");
+        assert_eq!(
+            engine_a.save_facts_snapshot(&store).expect("save"),
+            1,
+            "one entry for the one file"
+        );
+        assert!(
+            store.load::<PersistedFacts>(&header_a).is_some(),
+            "the workspace's own header loads its generation"
+        );
+        assert!(
+            store.load::<PersistedFacts>(&header_b).is_none(),
+            "a foreign pubspec-less workspace never loads the generation"
         );
     }
 

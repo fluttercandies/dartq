@@ -203,6 +203,13 @@ pub struct Engine {
     /// [`Engine::capture_pubspecs`]: a pubspec is re-read only when its
     /// mtime moved since the last capture.
     pubspec_mtimes: FxHashMap<PathBuf, SystemTime>,
+    /// The assembly's config directory (normally `.dart_tool/` under the
+    /// workspace root) — the context root the snapshot generation salt
+    /// folds. A pubspec-less workspace's package table is empty, so this
+    /// is the header dimension keeping two byte-identical bare trees on
+    /// distinct generations (#2274): same path, same salt; a different
+    /// tree forks.
+    context_root: PathBuf,
     /// The nested-pubspec scan's already-probed directories, tagged with
     /// the residency epoch their scan covered (the generation-tag memo —
     /// the moving counter is [`state::EngineState::residency_epoch`]). A
@@ -248,6 +255,7 @@ impl Engine {
             state,
             graph: None,
             semdiag,
+            context_root: config.config_dir,
             pubspec_mtimes: FxHashMap::default(),
             pubspec_dirs_scanned: FxHashMap::default(),
             nested_scan_epoch: 0,
@@ -918,7 +926,10 @@ impl Engine {
     /// discovery face: every package root (from the identity table),
     /// walked whole — each root-level `*.dart` file and every non-dot,
     /// non-excluded subdirectory, the oracle's included-folder walk
-    /// (context_root.dart `_includedFilesInFolder`). A nested package root
+    /// (context_root.dart `_includedFilesInFolder`). A bare no-pubspec
+    /// context carries no package identity, so its single root is the
+    /// analyzed directory itself ([`state::context_roots`]) — the oracle's
+    /// `BasicWorkspace` context root, walked whole. A nested package root
     /// is walked by its own pass, never by its parent's, so each file is
     /// discovered once under its own package. The only built-in exclusion is the
     /// oracle's dot rule, checked on every child path — directories and
@@ -942,14 +953,7 @@ impl Engine {
     ///
     /// Propagates I/O errors from reading discovered files.
     pub fn discover_workspace(&mut self) -> std::io::Result<DiscoveryStats> {
-        let mut roots: Vec<PathBuf> = self
-            .state
-            .packages
-            .iter()
-            .map(|package| package.root.clone())
-            .collect();
-        roots.sort();
-        roots.dedup();
+        let roots = state::context_roots(&self.state.packages);
 
         let mut stats = DiscoveryStats::default();
         // Every package root, so a parent's walk stops at a nested root:
@@ -1423,9 +1427,10 @@ impl Engine {
     /// The generation header facts snapshots key on: the
     /// container format version, the engine's `FACTS_SEMANTIC_VERSION`,
     /// the SDK identity, the package-graph fingerprint, and the context
-    /// salt (the remaining fork dimensions — target, declared variables,
-    /// analysis options). The same header drives `SnapshotStore::load` at
-    /// warm start and `save` at flush; callers never derive it by hand.
+    /// salt (the remaining fork dimensions — the context root, target,
+    /// declared variables, analysis options). The same header drives
+    /// `SnapshotStore::load` at warm start and `save` at flush; callers
+    /// never derive it by hand.
     #[must_use]
     pub fn snapshot_header(&self) -> GenerationHeader {
         let mut roots: Vec<PathBuf> = self
@@ -1444,6 +1449,7 @@ impl Engine {
                 &self.state.packages,
             ),
             context_salt: state::persist::context_salt(
+                &self.context_root,
                 &self.state.target,
                 &self.state.declared_variables,
                 &roots,
@@ -1840,6 +1846,98 @@ mod tests {
         })
         .expect("engine");
         (root, engine)
+    }
+
+    /// A throwaway pubspec-less tree + the synthetic SDK — the bare floor
+    /// ([`PackageTable::basic`] over `None`), the shape `dart analyze
+    /// <dir>` meets outside any package. The tree probes the walk's
+    /// exclusions: `.dot.dart` (the dot rule covers root files) and
+    /// `.hidden/c.dart` (a nested hidden directory) must stay undiscovered;
+    /// `a.dart` and `sub/b.dart` are the accepted set.
+    fn bare_floor_engine() -> (PathBuf, Engine) {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "dartq-engine-bare-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, content).expect("file");
+        };
+        write("a.dart", "var a = 1;\n");
+        write("sub/b.dart", "var b = 2;\n");
+        write(".dot.dart", "var dot = 3;\n");
+        write(".hidden/c.dart", "var hidden = 4;\n");
+        write("sdk/version", "3.13.1\n");
+        write(
+            "sdk/lib/libraries.json",
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+        );
+        write(
+            "sdk/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        );
+        // Canonicalize before discovery resolves it (the #287 spelling
+        // universe — macOS /var vs /private/var).
+        let root = root.canonicalize().expect("fixture root resolves");
+        let engine = Engine::new(EngineConfig {
+            store: memory_store(),
+            sdk: SdkSnapshot::load(&root.join("sdk"), None).expect("synthetic SDK loads"),
+            packages: PackageTable::basic(&root, None).expect("bare table"),
+            pub_config: Arc::new(PackageConfig {
+                packages: Vec::new(),
+                generator: None,
+                generator_version: None,
+                additional_properties: std::collections::BTreeMap::new(),
+            }),
+            config_dir: root.join(".dart_tool"),
+            semdiag: None,
+            target: DEFAULT_TARGET.to_owned(),
+            declared_variables: FxHashMap::default(),
+            experiments: Vec::new(),
+        })
+        .expect("engine");
+        (root, engine)
+    }
+
+    /// The bare floor's discovery face: with no package identity to
+    /// enumerate, the context root is the analyzed directory itself and the
+    /// walk accepts its `.dart` files — the oracle's `BasicWorkspace`
+    /// context-root walk, the face `dart analyze <bare-dir>` runs.
+    #[test]
+    fn bare_floor_discovery_walks_the_target_tree() {
+        let (root, mut engine) = bare_floor_engine();
+        let stats = engine.discover_workspace().expect("walk");
+        assert_eq!(stats.file_count, 2, "a.dart and sub/b.dart accepted");
+        for name in ["a.dart", "sub/b.dart"] {
+            assert!(
+                engine
+                    .file_table()
+                    .try_file_id(&root.join(name))
+                    .is_some(),
+                "{name} discovered"
+            );
+        }
+    }
+
+    /// The bare floor's walk keeps the oracle's built-in exclusions: the
+    /// dot rule covers files and directories alike, at the root and nested.
+    #[test]
+    fn bare_floor_discovery_excludes_dot_names() {
+        let (root, mut engine) = bare_floor_engine();
+        engine.discover_workspace().expect("walk");
+        for name in [".dot.dart", ".hidden/c.dart"] {
+            assert!(
+                engine
+                    .file_table()
+                    .try_file_id(&root.join(name))
+                    .is_none(),
+                "{name} excluded"
+            );
+        }
     }
 
     /// The ingest's stale policy: a fresh generation REPLACES the staged

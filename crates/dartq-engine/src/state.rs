@@ -1671,6 +1671,27 @@ pub(crate) struct EngineState {
     pub(crate) l3: Option<crate::store::ContentStore>,
 }
 
+/// The context roots the analysis surfaces derive from: every package
+/// root — or, when the identity table carries no package at all (the bare
+/// no-pubspec floor, `PackageTable::basic` over `None`), the table's
+/// workspace root, the analyzed directory itself. The oracle's
+/// `BasicWorkspace` over `Packages.empty` roots its context at the
+/// analyzed directory and walks that whole folder (context_locator.dart
+/// :517-522), so the bare floor's discovery and options faces key off the
+/// same directory a package root names in the configured face.
+pub(crate) fn context_roots(packages: &IdentityTable) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = packages
+        .iter()
+        .map(|package| package.root.clone())
+        .collect();
+    if roots.is_empty() {
+        roots.push(packages.workspace_root().to_path_buf());
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 impl EngineState {
     /// Assembles the state from the immutable analysis context.
     ///
@@ -1696,14 +1717,11 @@ impl EngineState {
         // options directories inside them (cold path, workspace-assembly
         // time). Built before the grant faces, which read the options
         // experiments (#936).
-        let mut roots: Vec<PathBuf> = packages
-            .iter()
-            .map(|package| package.root.clone())
-            .collect();
-        roots.sort();
-        roots.dedup();
-        let options =
-            crate::analysis_options::AnalysisOptions::for_roots(&roots, pub_config, config_dir);
+        let options = crate::analysis_options::AnalysisOptions::for_roots(
+            &context_roots(&packages),
+            pub_config,
+            config_dir,
+        );
         // The grant faces read the tables before they move into the state.
         let feature_grants = FeatureGrants::new(&sdk, &target, &packages, &options, experiments);
         Ok(Self {
