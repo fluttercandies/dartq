@@ -3027,6 +3027,17 @@ impl ParserListener for DiagnoseListener<'_> {
             } else {
                 rhs_row.ty
             };
+            // A `?.`-merged right side reads the short-circuit's nullable
+            // result into the flow's staged face (`x = a?.b` demotes `x`'s
+            // slot to the nullable written type). An operator-merged row
+            // keeps its operator result — `x?.m == y` types `bool`.
+            let from_ty = if engine.null_aware_members.contains(&rhs_row.range.offset)
+                && !matches!(rhs_row.intent, Intent::Operator(..))
+            {
+                Engine::nullable_form(from_ty)
+            } else {
+                from_ty
+            };
             if let Ty::Named {
                 name,
                 nullable,

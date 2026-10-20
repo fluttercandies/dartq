@@ -868,6 +868,27 @@ impl<'a> Engine<'a> {
         }
         if is_null_aware {
             self.null_aware_members.insert(member.range.offset);
+        } else if let Some(receiver_offset) = receiver_offset {
+            // The `?.` short-circuit's chain continuation (`a?.b.c`'s `.c`,
+            // `a?.b.c.d`'s `.d`): the guarded `?.` makes the WHOLE chain
+            // node nullable — upstream's `ShortCircuiting` resolution types
+            // `a?.b.c` as `C?` even though `.c` itself resolves on `b`'s
+            // written type. The member's result-nullability latch joins the
+            // chain here so the enclosing-expression reads (assignment,
+            // return, argument) see the `?` — but ONLY while the folded
+            // receiver reads non-null: a nullable member result (`a?.b.c`
+            // on `B?`) keeps the continuation's own
+            // `unchecked_use_of_nullable_value` verdict, which the
+            // receiver-side `!null_aware_members.contains` exclusion would
+            // otherwise silence. Cascade sections stay out — their own
+            // `?..` merge latches the first section, and a section's member
+            // row is never the cascade's value (the target is).
+            if !self.in_cascade
+                && self.null_aware_members.contains(&receiver_offset)
+                && !Self::is_nullable_ty(merged_receiver_ty)
+            {
+                self.null_aware_members.insert(member.range.offset);
+            }
         }
         self.push_row(Row {
             name: member.name,
@@ -1889,7 +1910,9 @@ impl<'a> Engine<'a> {
         }
         let arg = self.rows.get(mark).filter(|_| hi == mark + 1).map(|row| {
             (
-                row.ty,
+                // A `?.`-merged argument reads the short-circuit's nullable
+                // result (`g(a?.b)` offers `B?`).
+                self.expression_row_ty(row),
                 Self::primitive_literal(row, &self.members.primitive_ids),
                 row.range,
                 self.tear_off_sig(row),
@@ -1951,7 +1974,13 @@ impl<'a> Engine<'a> {
                     // argument is.
                     let covered =
                         row.ty == Ty::Null && self.const_capture.creation_covers(row.range.offset);
-                    let ty = if covered { Ty::UNKNOWN } else { row.ty };
+                    // A `?.`-merged argument reads the short-circuit's
+                    // nullable result (`g(a?.b)` offers `B?`).
+                    let ty = if covered {
+                        Ty::UNKNOWN
+                    } else {
+                        self.expression_row_ty(row)
+                    };
                     Some((
                         ty,
                         Self::primitive_literal(row, &self.members.primitive_ids),

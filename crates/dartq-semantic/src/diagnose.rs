@@ -3630,3 +3630,19 @@ mod ticket_2406_tests;
 /// member targets, binary reads, and later genuine reads keep theirs.
 #[cfg(test)]
 mod ticket_2409_tests;
+
+/// The #2413 pins: cross-library typedef call resolution (N5+N9 — a foreign
+/// file's alias resolves its callable signature at the use site) and the
+/// callable-class invocation return type (R4 — `c(3)` types as the `call`
+/// method's return and anchors the whole invocation).
+#[cfg(test)]
+mod ticket_2413_tests;
+
+/// The #2414 pins (U1/R1): the `?.` short-circuit's result nullability —
+/// `a?.b` types `B?` and the `?` propagates through the whole guarded
+/// chain (`a?.b.c` types `C?`), so the assignment, return, argument, and
+/// inference faces see the nullable result; the continuation's receiver
+/// check still reads the member's own written type (`a?.b.c` on `B?`
+/// reports `unchecked_use_of_nullable_value`, on `B` stays silent).
+#[cfg(test)]
+mod ticket_2414_tests;

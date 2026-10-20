@@ -2867,6 +2867,35 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The row's type read as the enclosing EXPRESSION's static type: a
+    /// `?.` short-circuit makes the whole chain node nullable — `a?.b`
+    /// types `B?` and `a?.b.c` types `C?` (upstream Dart SDK source,
+    /// pkg/analyzer's `ShortCircuiting` resolution: the `?` joins the
+    /// result of every node the operator guards). The row keeps the
+    /// member's own declared face — the continuation's receiver check reads
+    /// that face (`a?.b.c` resolves `c` on `b`'s written `B`/`B?`, never
+    /// the short-circuit's `B?`) — so the `?` re-arms only where the row is
+    /// consumed as a result (an assignment's right side, a `return`, an
+    /// argument, a condition operand). The member-offset latch
+    /// ([`Self::null_aware_members`]) marks every chain node the `?.`
+    /// guards: the `?.` member itself plus the plain continuations its
+    /// merge short-circuits (`merge_member` propagates the latch while the
+    /// receiver it folded reads non-null — a nullable member result keeps
+    /// the continuation's own unchecked-dereference verdict). An
+    /// operator-merged row keeps its operator result — and a row inside a
+    /// statically-`bool` composite keeps the composite's `bool`: `x?.m ==
+    /// y` types `bool`, never `bool?` — so the upgrade leaves both alone.
+    pub(crate) fn expression_row_ty(&self, row: &Row) -> Ty {
+        if self.null_aware_members.contains(&row.range.offset)
+            && !matches!(row.intent, Intent::Operator(..))
+            && !self.bool_decided_covers(row)
+        {
+            Self::nullable_form(row.ty)
+        } else {
+            row.ty
+        }
+    }
+
     /// The operator application on a known receiver type (`c + d`, `c[i]`,
     /// `c.j + 1` against the member result): each read/write spelling that
     /// the type's container genuinely lacks reports `undefined_operator` at

@@ -274,6 +274,7 @@ impl<'a> Engine<'a> {
             promoted_recv_reads: Vec::new(),
             prop_promotion_rows: PropPromotionStaging::default(),
             member_reads: Vec::new(),
+            call_ends: Vec::new(),
             non_promotions: Vec::new(),
             pending_non_promotion: Vec::new(),
             string_row_marks: Vec::new(),
@@ -742,13 +743,16 @@ impl<'a> Engine<'a> {
                 }
             };
             // The oracle anchors the assignability face at the whole
-            // right-hand expression — a `receiver.member` operand reports
-            // over the property-access span (receiver start through the
-            // member's end, `.at(expression)`), not the member name alone.
-            // A bare operand's row already is its own span.
+            // right-hand expression — a call operand reports over the
+            // invocation span (`f()`'s callee through `)`, or `c.m()`'s
+            // receiver through `)`), a `receiver.member` operand over the
+            // property-access span (receiver start through the member's
+            // end, `.at(expression)`), not the name alone. A bare operand's
+            // row already is its own span.
             let range = match check.kind {
                 StagedKind::Assignment | StagedKind::Argument => self
-                    .property_access_span(check.range)
+                    .invocation_span(check.range)
+                    .or_else(|| self.property_access_span(check.range))
                     .unwrap_or(check.range),
                 _ => check.range,
             };
@@ -1616,11 +1620,19 @@ impl<'a> Engine<'a> {
             // inferred slot carries the nullable face (`var a = c?.id`
             // keeps `a` nullable).
             let ty = row.ty;
-            return Some(if self.null_aware_members.contains(&row.range.offset) {
-                Self::nullable_form(ty)
-            } else {
-                ty
-            });
+            // An operator-merged row keeps its operator result, and a row
+            // inside a statically-`bool` composite keeps `bool` — `var v =
+            // x?.m == y` infers `bool`, never `bool?`.
+            return Some(
+                if self.null_aware_members.contains(&row.range.offset)
+                    && !matches!(row.intent, Intent::Operator(..))
+                    && !self.bool_decided_covers(row)
+                {
+                    Self::nullable_form(ty)
+                } else {
+                    ty
+                },
+            );
         }
         let ty = match &row.shape {
             RowShape::Receiver(Receiver::This {

@@ -1229,7 +1229,11 @@ impl<'a> Engine<'a> {
             }
             row.clone()
         };
-        let (from, range) = (rhs_row.ty, rhs_row.range);
+        // A `?.`-merged right side reads the short-circuit's nullable
+        // result (`x = a?.b` asks `B?` against `x`'s slot) —
+        // [`Engine::expression_row_ty`] re-arms the `?` the merge could not
+        // join onto the row's declared face.
+        let (from, range) = (self.expression_row_ty(&rhs_row), rhs_row.range);
         let literal = Self::primitive_literal(&rhs_row, &self.members.primitive_ids);
         let target_row = self.rows[target].clone();
         let to = self.assignment_target_ty(&target_row);
@@ -1272,8 +1276,11 @@ impl<'a> Engine<'a> {
         }
         let row = &self.rows[mark];
         let literal = Self::primitive_literal(row, &self.members.primitive_ids);
-        if self.assignable(row.ty, to, literal) == Some(false) {
-            self.stage(StagedKind::Assignment, row.range, row.ty, to, literal);
+        // A `?.`-merged initializer reads the short-circuit's nullable
+        // result (`int x = a?.b` asks `B?` against `int`).
+        let from = self.expression_row_ty(row);
+        if self.assignable(from, to, literal) == Some(false) {
+            self.stage(StagedKind::Assignment, row.range, from, to, literal);
         }
         self.init_mark = None;
     }
@@ -1695,6 +1702,21 @@ impl<'a> Engine<'a> {
                 }
                 _ => row.ty,
             }
+        };
+        // A `?.`-merged expression reads the short-circuit's nullable
+        // result (`return a?.b` asks `B?` against the declared return —
+        // the same member-offset latch the `var`-inference arm re-arms in
+        // [`Engine::initializer_static_ty`]). An operator-merged row keeps
+        // its operator result, and a row inside a statically-`bool`
+        // composite keeps the composite's `bool` — `x?.m == true`'s
+        // expression type is the `==`'s `bool`, never `bool?`.
+        let ty = if self.null_aware_members.contains(&row.range.offset)
+            && !matches!(row.intent, Intent::Operator(..))
+            && !self.bool_decided_covers(row)
+        {
+            Self::nullable_form(ty)
+        } else {
+            ty
         };
         Some((
             ty,
