@@ -1610,6 +1610,14 @@ pub enum WindowKind {
     /// `_evaluateAndReportError`, constant_verifier.dart:342-358). Opens per
     /// key, never nested — a key is a leaf constant context.
     MapPatternKey,
+    /// An annotation (`@Name(...)` metadata): every argument is a constant
+    /// expression by language rule, so the literals inside capture
+    /// implicitly-const and their element faces fire at the literal closes
+    /// (`@Target({TargetKind.classType})` over an unresolved `TargetKind`
+    /// reports `non_constant_set_element` at the element). No
+    /// declaration-level verdict — the oracle's annotation evaluation has
+    /// no initializer-style site default, so the window's capture discards.
+    Annotation,
 }
 
 struct Window {
@@ -1763,6 +1771,12 @@ impl ConstCapture {
 
     pub fn open_explicit_literal(&mut self) {
         self.open_window(WindowKind::ExplicitLiteral);
+    }
+
+    /// Opens an annotation's const-capture window (the `@` token): the
+    /// metadata's arguments are a const context by language rule.
+    pub fn open_annotation(&mut self) {
+        self.open_window(WindowKind::Annotation);
     }
 
     /// Opens a non-const duplicate window for a set/map literal WITHOUT a
@@ -1999,6 +2013,20 @@ impl ConstCapture {
         self.apply_unaries_at(self.depth);
         self.keep_top_above_base();
         self.windows.pop();
+    }
+
+    /// Closes an annotation window: the literal element faces already
+    /// reported at their closes; the annotation's own value feeds nothing
+    /// (no declaration-level verdict), so the capture discards. No-op
+    /// unless the window is on top (parse recovery symmetry).
+    pub fn close_annotation(&mut self) {
+        if self
+            .windows
+            .last()
+            .is_some_and(|w| w.kind == WindowKind::Annotation)
+        {
+            self.discard_window();
+        }
     }
 
     /// Closes a non-const duplicate window: the literal's parts return

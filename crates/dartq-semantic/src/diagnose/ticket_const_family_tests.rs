@@ -21,11 +21,14 @@
 //!   already implements), while a known non-constant argument pairs the
 //!   declaration row at the argument (the pinned probe pairing).
 //!
-//! Out of this lane's granted files: the annotation-argument const
-//! context (`@Target({TargetKind.classType})` — the drift corpus rows)
-//! never opens a capture window; the window arm lives in the listener's
-//! `begin_metadata`/`end_metadata`, so that cluster is a documented
-//! follow-up, not a silent skip.
+//! Out of that lane's granted files (#2248 follow-up): the
+//! annotation-argument const context (`@Target({TargetKind.classType})` —
+//! the drift corpus rows) now opens its capture window in the listener's
+//! `begin_metadata`/`end_metadata` — pattern 3 below. Still out of the
+//! model: the ANNOTATION-HEAD faces (a resolved annotation head validates
+//! its arguments against the resolved const constructor —
+//! `const_with_non_constant_argument` and the arity faces); those live in
+//! the annotation-resolution machinery, not the capture window.
 
 use super::*;
 use crate::collector::collect;
@@ -308,4 +311,122 @@ fn unresolved_callee_root_reports_single_declaration_row() {
         "{rows:?}"
     );
     assert_eq!(count(&rows, "const_with_non_const"), 0, "{rows:?}");
+}
+
+// —— pattern 3: annotation-argument const context (#2248) ——————————
+
+/// `@Target({TargetKind.classType})` over an unresolved `TargetKind` (the
+/// drift corpus's `dsl/table.dart` rows): the annotation's argument list
+/// is a const context, so the set literal's element face reports at the
+/// unresolved prefix (`TargetKind` — the verdict's span, not the whole
+/// `TargetKind.classType` access) beside its own `undefined_identifier`,
+/// and no declaration-level verdict substitutes (the annotation
+/// evaluation has no initializer-style site default).
+#[test]
+fn annotation_set_element_reports_at_unresolved_prefix() {
+    let source = "@Target({TargetKind.classType})\nclass C {}";
+    let rep = report(source);
+    let rows = rows(&rep, source);
+    assert!(rows.contains(&("undefined_annotation", "@Target")), "{rows:?}");
+    assert!(
+        rows.contains(&("undefined_identifier", "TargetKind")),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&("non_constant_set_element", "TargetKind")),
+        "{rows:?}"
+    );
+    assert_eq!(
+        count(&rows, "non_constant_set_element"),
+        1,
+        "{rows:?}"
+    );
+    assert_eq!(
+        count(&rows, "const_initialized_with_non_constant_value"),
+        0,
+        "{rows:?}"
+    );
+}
+
+/// An unresolved callee inside an annotation's set literal: the element
+/// face reports at the whole invocation (the W4 pattern-1 pairing — the
+/// oracle's evaluation is known-invalid there), on class, enum-constant,
+/// and parameter annotations alike. The callee's own face is the plain
+/// `undefined_method` (dartq resolves the argument position as an
+/// ordinary invocation; the oracle's const-creation reading pairs
+/// `undefined_function` — a head-context face outside this window).
+#[test]
+fn unresolved_callee_in_annotation_set_reports_element_face() {
+    for source in [
+        "class T { const T(); }\n@T({Missing()})\nclass C {}",
+        "class T { const T(); }\nenum E {\n  @T({Missing()}) a, b,\n}",
+        "class T { const T(); }\nvoid h(@T({Missing()}) int p) {}",
+    ] {
+        let rep = report(source);
+        let rows = rows(&rep, source);
+        assert!(
+            rows.contains(&("non_constant_set_element", "Missing()")),
+            "{rows:?}"
+        );
+        assert_eq!(
+            count(&rows, "const_initialized_with_non_constant_value"),
+            0,
+            "{rows:?}"
+        );
+        assert_eq!(
+            count(&rows, "const_with_non_constant_argument"),
+            0,
+            "{rows:?}"
+        );
+    }
+}
+
+/// A known function invocation inside an annotation's literal: the
+/// element's fault IS the row (`const_eval_method_invocation` — probe
+/// paired) and the element-face code stays silent. The list element
+/// anchors at the invocation; the map value's row rides the shared
+/// call-span heuristic (the `'k'` string key two bytes before the callee
+/// reads as a receiver — the oracle anchors at `g()`, a span-only
+/// divergence outside the (severity, code, file) gate).
+#[test]
+fn fault_element_in_annotation_literal_beats_element_face() {
+    let list = "class T { const T(); }\nvoid g() {}\n@T([g()])\nclass C {}";
+    let rep = report(list);
+    let got = rows(&rep, list);
+    assert!(
+        got.contains(&("const_eval_method_invocation", "g()")),
+        "{got:?}"
+    );
+    assert_eq!(count(&got, "non_constant_list_element"), 0, "{got:?}");
+
+    let map = "class T { const T(); }\nvoid g() {}\n@T({'k': g()})\nclass C {}";
+    let rep = report(map);
+    let got = rows(&rep, map);
+    assert!(
+        got.contains(&("const_eval_method_invocation", "'k': g()")),
+        "{got:?}"
+    );
+    assert_eq!(count(&got, "non_constant_map_value"), 0, "{got:?}");
+    assert_eq!(count(&got, "non_constant_map_key"), 0, "{got:?}");
+}
+
+/// A constant annotation literal stays fully silent — including on enum
+/// constants, where the annotation window nests over the previous
+/// element's still-open window (the capture discards back to it).
+#[test]
+fn constant_annotation_literal_stays_silent() {
+    for source in [
+        "class T { const T(); }\n@T({1, 2})\nclass C {}",
+        "class T { const T(); }\nenum E {\n  @T({1}) a, @T({2}) b,\n}",
+    ] {
+        let rep = report(source);
+        let rows = rows(&rep, source);
+        assert_eq!(count(&rows, "non_constant_set_element"), 0, "{rows:?}");
+        assert_eq!(
+            count(&rows, "const_initialized_with_non_constant_value"),
+            0,
+            "{rows:?}"
+        );
+        assert_eq!(count(&rows, "const_eval_method_invocation"), 0, "{rows:?}");
+    }
 }

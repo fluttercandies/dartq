@@ -2761,12 +2761,19 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_metadata(&mut self, token: Token) {
-        self.engine.annotation_at = Some(token.range);
+        let engine = &mut self.engine;
+        // The arguments are a const context by language rule: the literals
+        // inside capture implicitly-const and their element faces fire at
+        // the literal closes (`@Target({TargetKind.classType})` over an
+        // unresolved `TargetKind` reports `non_constant_set_element`).
+        engine.const_capture.open_annotation();
+        engine.annotation_at = Some(token.range);
     }
 
     fn end_metadata(&mut self, begin: Token, _period_before_name: Option<Token>, end: Token) {
         let engine = &mut self.engine;
         engine.note_metadata_args(begin, end);
+        engine.const_capture.close_annotation();
         engine.annotation_at = None;
     }
 
