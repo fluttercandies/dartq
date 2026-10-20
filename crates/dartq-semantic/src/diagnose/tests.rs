@@ -8508,15 +8508,30 @@ fn invalid_override_hits_the_implements_and_mixin_paths() {
         "class int {} class A { void f() {} } mixin M { void f(int x) {} } \
              class C extends A with M { void f() {} }",
     );
+    // Oracle-verified (#2367): the live analyzer reports both faces — the
+    // mixin-application verdict `M.f` vs `A.f` at `with M`, and the member
+    // verdict `C.f` vs `M.f` at the declaration.
     assert_eq!(
         code_names(&applied),
-        ["invalid_override"],
+        ["invalid_override", "invalid_override"],
         "{:?}",
         code_names(&applied)
     );
-    assert_eq!(
-        applied.diagnostics[0].message,
-        "'C.f' ('void Function()') isn't a valid override of 'M.f' ('void Function(int)')."
+    assert!(
+        applied
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("'M.f' ('void Function(int)') isn't a valid override of 'A.f'")),
+        "{:?}",
+        applied.diagnostics
+    );
+    assert!(
+        applied
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("'C.f' ('void Function()') isn't a valid override of 'M.f'")),
+        "{:?}",
+        applied.diagnostics
     );
 }
 
@@ -10225,11 +10240,11 @@ fn member_face_memo_keeps_repeated_probe_verdicts() {
 /// The override check sees the stacked winner: `C.m()` is arity-broken
 /// against `M2.m(int)` (the interface winner per
 /// `inheritance_manager3.dart:571-579`) — reported once for the stacked
-/// superclass face (the same inherited entry, pointer-deduped). The
-/// separate `B.m(int)` and `M2.m(int)` face entries are distinct
-/// declarations and keep the oracle's per-superinterface loop shape
-/// (#453), so the total stays at the incumbent two; `M1`'s own `m()` is
-/// a valid override and never reports.
+/// superclass face (the same inherited entry, pointer-deduped). Oracle-
+/// verified (#2367): the live analyzer reports four `invalid_override`
+/// rows on this shape — the two mixin-application verdicts (`M1.m` vs
+/// `B.m` at `with M1`, `M2.m` vs `M1.m` at `with M2`) and the two member
+/// verdicts (`C.m` vs `B.m`, `C.m` vs `M2.m`).
 #[test]
 fn override_check_reports_the_stacked_winner() {
     let report = report(
@@ -10240,7 +10255,12 @@ fn override_check_reports_the_stacked_winner() {
     );
     assert_eq!(
         code_names(&report),
-        ["invalid_override", "invalid_override"],
+        [
+            "invalid_override",
+            "invalid_override",
+            "invalid_override",
+            "invalid_override"
+        ],
         "{:?}",
         code_names(&report)
     );

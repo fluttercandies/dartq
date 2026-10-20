@@ -571,7 +571,19 @@ impl<'a> Engine<'a> {
                     // too).
                     continue;
                 };
-                if inherited.kind != *face_kind {
+                // The inherited entry's element kind: a stored `Field` is its
+                // implicit getter for the getter face (the oracle's
+                // `field.getter`/`field.setter` split — `A { int x }` answers
+                // the getter face exactly like a written `int get x`), while
+                // the setter face resolves under `name=` where fields never
+                // live, so only a written `Setter` answers it.
+                let kind_matches = match *face_kind {
+                    MemberKind::Getter => {
+                        inherited.kind == MemberKind::Getter || inherited.kind == MemberKind::Field
+                    }
+                    _ => inherited.kind == *face_kind,
+                };
+                if !kind_matches {
                     continue;
                 }
                 // The stacked climb can surface one inherited member through
@@ -925,18 +937,15 @@ impl<'a> Engine<'a> {
         }
         // The written arguments at the application site: the clause
         // scanner stores each super face as `(head, vec![whole_named_ty])`,
-        // so the real argument list is the stored `Ty::Named`'s own `args`.
+        // so the real argument list is the stored `Ty::Named`'s own `args`
+        // ([`Self::face_args`] — an empty list is a known non-generic edge,
+        // not an undecidable one).
         let written: Option<Vec<Ty>> = {
             let clause = facts.get_or_insert_with(|| self.scan_header_clauses());
             clause
                 .get(&container)
                 .and_then(|c| c.supers.iter().find(|(head, _)| *head == mixin))
-                .and_then(|(_, stored)| match stored.as_slice() {
-                    [Ty::Named { args, .. }] if *args != crate::model::ArgListId::EMPTY => {
-                        Some(self.boundary.pool().get(*args).to_vec())
-                    }
-                    _ => None,
-                })
+                .and_then(|(_, stored)| self.face_args(stored))
         };
         let Some(written) = written else {
             return Instantiated::Undecidable;
@@ -3130,8 +3139,25 @@ impl<'a> Engine<'a> {
                     h.name == bare && h.entry.kind == MemberKind::Field && !h.entry.is_final
                 }));
             }
-            let Some(specific) = self.most_specific(&hits) else {
-                continue;
+            // The oracle's interface map seats the own declared member first
+            // (`_getTypeMembers`: every non-static member, abstract included —
+            // `inheritance_manager3.dart:1336-1352`), and named candidates
+            // never replace a declared name (`map.containsKey(name) →
+            // continue`, `inheritance_manager3.dart:499`). With an own member
+            // declared, `interface.map[name]` is that member itself — comparing
+            // the concrete implementation against a super-face hit would
+            // fabricate a check the oracle never runs (its `concreteElement`
+            // is then the same entry, trivially valid).
+            let own_declared = self.own_declared_member(container, decl, *name, setter_face);
+            let specific_owned;
+            let specific = if let Some(own) = own_declared {
+                specific_owned = own;
+                &specific_owned
+            } else {
+                let Some(specific) = self.most_specific(&hits) else {
+                    continue;
+                };
+                specific
             };
             let Some(concrete) = self
                 .own_concrete_implementation(container, decl, *name, setter_face)
@@ -3200,6 +3226,47 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// The class's own declared member of `name` — the oracle's
+    /// `interface.map` seat (`_getTypeMembers`,
+    /// `inheritance_manager3.dart:1336-1352`): every non-static member joins
+    /// `declared`, abstract members included, and a non-final field's
+    /// synthesized setter fills the `name=` slot. Unlike
+    /// [`Self::own_concrete_implementation`] abstractness does not disqualify
+    /// the seat — an abstract own member still occupies the interface map
+    /// (the implemented map then falls through to the inherited sources).
+    /// `None` = no own member declares the name; the face candidates decide.
+    fn own_declared_member(
+        &self,
+        container: StringId,
+        decl: &'a Container,
+        name: StringId,
+        setter_face: bool,
+    ) -> Option<FaceEntry<'a>> {
+        let declared = |e: &MemberEntry| !e.is_static;
+        let entry = decl
+            .members
+            .get(&name)
+            .filter(|e| declared(*e))
+            .or_else(|| {
+                if !setter_face {
+                    return None;
+                }
+                let bare = self
+                    .strings
+                    .intern(self.strings.resolve(name).strip_suffix('=')?);
+                decl.members.get(&bare).filter(|e| {
+                    declared(*e) && e.kind == MemberKind::Field && !e.is_final
+                })
+            })?;
+        Some(FaceEntry {
+            name,
+            entry: self.boundary.member(self.file, container, name, entry),
+            owner_name: container,
+            owner_file: self.file,
+            concrete_source: true,
+        })
+    }
+
     /// The class's own concrete member of `name` — `_addImplemented`'s first
     /// source (upstream Dart SDK source,
     /// `pkg/analyzer/lib/src/dart/element/inheritance_manager3.dart:318-338`
@@ -3222,7 +3289,13 @@ impl<'a> Engine<'a> {
                 && if setter_face {
                     e.kind == MemberKind::Setter || (e.kind == MemberKind::Field && !e.is_final)
                 } else {
-                    e.kind == MemberKind::Getter || e.kind == MemberKind::Field
+                    // `_addImplemented` adds the own methods/getters/setters
+                    // (`inheritance_manager3.dart:333-351`), so an own
+                    // Method implements the `name` face too — skipping it
+                    // lets the inherited member claim the implemented seat
+                    // and fabricates a comparison against the own declared
+                    // signature the oracle never runs.
+                    e.kind == MemberKind::Method || e.kind == MemberKind::Getter || e.kind == MemberKind::Field
                 }
         };
         let entry = decl
@@ -3776,13 +3849,14 @@ impl<'a> Engine<'a> {
     /// scanner wraps each face as `(head, vec![whole_named_ty])`, so the
     /// stored `Ty::Named`'s own `args` — not the one-element wrapping —
     /// supplies the substitution operands (the same unwrap `mixin_env`
-    /// keeps). `None` marks a face with no written type arguments —
-    /// nothing to substitute.
+    /// keeps). A face written with no type arguments yields `Some([])` — the
+    /// edge is known (identity for a non-generic hop, under-applied for a
+    /// generic one, which the arity check then rejects as undecidable).
+    /// `None` marks a stored face that is not a plain `Named` — recovery
+    /// residue or an unsupported shape where the arguments are unknowable.
     fn face_args(&self, stored: &[Ty]) -> Option<Vec<Ty>> {
         match stored {
-            [Ty::Named { args, .. }] if *args != crate::model::ArgListId::EMPTY => {
-                Some(self.boundary.pool().get(*args).to_vec())
-            }
+            [Ty::Named { args, .. }] => Some(self.boundary.pool().get(*args).to_vec()),
             _ => None,
         }
     }
@@ -4706,8 +4780,11 @@ mod sealed_abstract_fold_tests {
     /// The drift `TypeConverter` shape: `W extends NATC<D?, S?>` inherits
     /// `TC.fromSql` two hops down with the intermediate hop's parameters in
     /// the signature — the composed environment instantiates them to the
-    /// override's own arguments, so the valid override stays silent while a
-    /// genuinely broken return still reports.
+    /// override's own arguments. Oracle-verified (#2367): the live analyzer
+    /// reports TWO `invalid_override` rows here — `W.fromSql`'s `S`
+    /// parameter cannot accept the inherited `S?` (the intermediate hop
+    /// widens the signature to `D? Function(S?)`), and `Bad.fromSql`'s
+    /// broken return.
     #[test]
     fn substitution_composes_through_intermediate_hop() {
         let source = "class TC<D, S> {\n\
@@ -4726,8 +4803,8 @@ mod sealed_abstract_fold_tests {
         let overrides: Vec<_> = names.iter().filter(|n| **n == "invalid_override").collect();
         assert_eq!(
             overrides.len(),
-            1,
-            "only the broken return may report: {names:?}"
+            2,
+            "the broken parameter and the broken return both report: {names:?}"
         );
     }
 
@@ -4812,10 +4889,13 @@ mod sealed_abstract_fold_tests {
     // —— #2301: own-member shadowing in the concrete-implementation face —
 
     /// The class's own concrete member shadows the inherited one in the
-    /// official `implemented` map: `Good`'s own `M substitute()` compares
-    /// validly against the interface member, and the inherited `Base`
-    /// signature must never be compared instead (the analyzer element.dart
-    /// false-positive shape).
+    /// official `implemented` map AND seats the interface map (the oracle's
+    /// `declared` first — `interface.map[name]` is the own member, so the
+    /// concrete-implementation comparison is self-to-self and emits
+    /// nothing). Oracle-verified (#2367): the live analyzer reports only
+    /// `Bad.substitute`'s member-level `invalid_override` (`B <: M` fails
+    /// against the `M` interface member) — no
+    /// `invalid_implementation_override` fires for either class.
     #[test]
     fn own_member_shadows_inherited_concrete_implementation() {
         let source = "abstract class B {}\n\
@@ -4840,8 +4920,14 @@ mod sealed_abstract_fold_tests {
             .collect();
         assert_eq!(
             implementations.len(),
+            0,
+            "own members seat the interface map — no implementation row: {names:?}"
+        );
+        let overrides: Vec<_> = names.iter().filter(|n| **n == "invalid_override").collect();
+        assert_eq!(
+            overrides.len(),
             1,
-            "only the broken own member may report: {names:?}"
+            "only Bad's member-level verdict may report: {names:?}"
         );
     }
 
@@ -4859,9 +4945,12 @@ mod sealed_abstract_fold_tests {
             .filter(|n| n.starts_with("missing_default_value_for_parameter"))
             .copied()
             .collect();
+        // Oracle-verified (#2367): the live analyzer emits
+        // `missing_default_value_for_parameter` — the bare code name, not
+        // the `_positional` suffixed variant.
         assert_eq!(
             defaults,
-            ["missing_default_value_for_parameter_positional"],
+            ["missing_default_value_for_parameter"],
             "only the non-external header may report: {names:?}"
         );
     }
