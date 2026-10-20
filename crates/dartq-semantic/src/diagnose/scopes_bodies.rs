@@ -751,7 +751,12 @@ impl<'a> Engine<'a> {
 
     /// Records a local declaration of the usage cluster: the frame's name
     /// set (resolution) plus the tracked entry (kind, anchor, group).
-    pub(crate) fn add_tracked_local(&mut self, name: StringId, range: SourceRange, kind: LocalKind) {
+    pub(crate) fn add_tracked_local(
+        &mut self,
+        name: StringId,
+        range: SourceRange,
+        kind: LocalKind,
+    ) {
         self.add_local(name);
         // A pattern-variable-declaration window claims the pattern-declared
         // variables of one declaration: the first opens it, the rest join
@@ -831,7 +836,12 @@ impl<'a> Engine<'a> {
     /// [`duplicate_definition_diagnostics`] renders for the file-level
     /// face. The usage sink is the staging pool the fold merges
     /// source-ordered into the report tail.
-    pub(crate) fn stage_local_duplicate(&mut self, name: StringId, second: SourceRange, first: SourceRange) {
+    pub(crate) fn stage_local_duplicate(
+        &mut self,
+        name: StringId,
+        second: SourceRange,
+        first: SourceRange,
+    ) {
         let text = self.strings.resolve(name).to_string();
         let diagnostic = Diagnostic::new(
             Severity::Error,
@@ -926,7 +936,11 @@ impl<'a> Engine<'a> {
         let slot = match level.pending_name {
             Some(label) => SchemaSlot::Named(label),
             None => SchemaSlot::Positional(
-                level.args.iter().filter(|(label, ..)| label.is_none()).count(),
+                level
+                    .args
+                    .iter()
+                    .filter(|(label, ..)| label.is_none())
+                    .count(),
             ),
         };
         let callee_row = level.callee_row?;
@@ -949,10 +963,9 @@ impl<'a> Engine<'a> {
         // signature closes.
         let callee_name = callee.name;
         let slot_ty = match slot {
-            SchemaSlot::Positional(index) => {
-                self.callee_formals(&recv, callee_name)
-                    .and_then(|f| f.positional.get(index).map(|f| f.ty))
-            }
+            SchemaSlot::Positional(index) => self
+                .callee_formals(&recv, callee_name)
+                .and_then(|f| f.positional.get(index).map(|f| f.ty)),
             SchemaSlot::Named(label) => self
                 .callee_formals(&recv, callee_name)
                 .and_then(|f| f.named_formal(label).map(|f| f.ty)),
@@ -1009,10 +1022,42 @@ impl<'a> Engine<'a> {
                 nullable,
                 args,
             } => {
-                if nullable || !self.named_type_is_type(head) || !self.args_are_types(args) {
-                    Some(self.object_question())
-                } else {
-                    None
+                if nullable {
+                    return Some(self.object_question());
+                }
+                if self.named_type_is_type(head) && self.args_are_types(args) {
+                    return None;
+                }
+                // The schema entry the formal's inference consumed carries
+                // a name the file cannot prove is a type — a declaration's
+                // own type parameter (`map`'s `E`, the receiver container's
+                // `T`) or a genuinely misspelt head. The oracle substitutes
+                // the receiver's instantiated element before answering: a
+                // `List<Node>.map((each) => each.copy())` binds `Node`, and
+                // a `dynamic` element never infers. The receiver's first
+                // written argument stands in for that substitution here —
+                // a decidable non-null named argument or a `dynamic` one
+                // reads the oracle's silent arm; every other shape keeps
+                // the `Object?` recovery (the `Und`-schema pins' verdict —
+                // a receiver argument the file cannot name collapses to the
+                // same invalid face the unresolved head already carried).
+                match recv {
+                    Receiver::Typed { ty, .. } => {
+                        match self.receiver_first_type_arg(ty) {
+                            Some(Ty::Dynamic) => None,
+                            Some(Ty::Named {
+                                name: arg_head,
+                                nullable: false,
+                                args: arg_args,
+                            }) if self.named_type_is_type(arg_head)
+                                && self.args_are_types(arg_args) =>
+                            {
+                                None
+                            }
+                            _ => Some(self.object_question()),
+                        }
+                    }
+                    _ => Some(self.object_question()),
                 }
             }
             _ => None,
@@ -1060,9 +1105,9 @@ impl<'a> Engine<'a> {
     /// top-level declaration).
     fn callee_formals(&self, recv: &Receiver, name: StringId) -> Option<Formals> {
         match recv {
-            Receiver::Unknown | Receiver::Prefix { .. } => {
-                self.top_level_decl(name).and_then(|d| d.formals.as_deref().cloned())
-            }
+            Receiver::Unknown | Receiver::Prefix { .. } => self
+                .top_level_decl(name)
+                .and_then(|d| d.formals.as_deref().cloned()),
             _ => self.member_formals_full(recv, name).map(|f| f.into_owned()),
         }
     }
@@ -1076,8 +1121,7 @@ impl<'a> Engine<'a> {
                 let shape = pool.function_shape(shape);
                 Some(FnVarSig {
                     params: Box::default(),
-                    required_positional: u16::try_from(shape.positional.len())
-                        .unwrap_or(u16::MAX),
+                    required_positional: u16::try_from(shape.positional.len()).unwrap_or(u16::MAX),
                     positional: shape.positional.clone(),
                     named: shape
                         .named
@@ -1344,7 +1388,7 @@ impl<'a> Engine<'a> {
                     Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Void
                 ) =>
             {
-                return None
+                return None;
             }
             Ty::Named {
                 name,
@@ -1447,7 +1491,12 @@ impl<'a> Engine<'a> {
     /// Latches the armed declared type as the innermost executable's return
     /// type (`begin_method`/`begin_top_level_method` fire before the return
     /// type's `parse_type`; the name identifier fires after it).
-    pub(crate) fn latch_return_type(&mut self, host: ExecKind, name: StringId, name_span: SourceRange) {
+    pub(crate) fn latch_return_type(
+        &mut self,
+        host: ExecKind,
+        name: StringId,
+        name_span: SourceRange,
+    ) {
         let ty = self.armed_ty.take().unwrap_or(Ty::UNKNOWN);
         if let Some(frame) = self.frames.last_mut()
             && let FrameKind::Executable { ret, .. } = &mut frame.kind

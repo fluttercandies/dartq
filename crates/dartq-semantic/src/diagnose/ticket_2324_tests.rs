@@ -701,3 +701,76 @@ fn inferred_slot_dynamic_face_keeps_the_silent_dispatch() {
     );
     assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
 }
+
+// —— #2347: the closure-formal schema's receiver-element substitution ———————
+//
+// `function_expression_resolver.dart`'s `_inferFormalParameters`: an
+// implicitly typed formal of an open function literal infers its schema
+// entry under `greatestClosure`. A schema entry that names a type the file
+// cannot prove — a declaration's own type parameter (`forEach`'s `T`, the
+// callee's `E`) — is not the oracle's `InvalidType` collapse: the oracle
+// substitutes the receiver's instantiated element before answering, so
+// `Bag<Node>.forEach((e) => e.copy())` binds `e` to `Node`, not `Object?`.
+// The receiver's first written argument stands in for that substitution at
+// name level: a decidable non-null named element or a `dynamic` one reads
+// the oracle's silent arm, while a receiver argument the file cannot name
+// keeps the `Object?` recovery (the `Und`-schema pins' verdict — the same
+// invalid face the unresolved head already carried).
+
+/// The receiver-first-argument substitution: `bag.forEach((e) =>
+/// e.copy())` where `forEach`'s written schema names a type the file
+/// cannot prove (`void Function(T)`'s `T`, a declaration's own type
+/// parameter) — the oracle substitutes the receiver's instantiated
+/// element before answering. A decidable non-null named element binds the
+/// formal to the silent arm, never `Object?`.
+#[test]
+fn generic_receiver_closure_formal_substitutes_the_element() {
+    let source = "class Node { Node copy() => Node(); } \
+                  class Bag<T> { void forEach(void Function(T) f) {} } \
+                  void f(Bag<Node> bag) { bag.forEach((e) => e.copy()); }";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// A `dynamic` element never infers: `List<dynamic>`'s closure formal
+/// binds `dynamic` and the member use stays silent — the receiver-first-
+/// argument substitution's `Dynamic` arm.
+#[test]
+fn dynamic_element_closure_formal_never_infers() {
+    let source = "class Bag<T> { void forEach(void Function(T) f) {} } \
+                  void f(Bag<dynamic> bag) { bag.forEach((e) => e.copy()); }";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// An invalid written element never reaches the closure formal:
+/// `Bag<Und>`'s `Und` is not a type, so the receiver's type-argument list
+/// collapses to `InvalidType` and the `void Function(T)` schema's `T`
+/// substitutes the invalid face — `greatestClosure` binds `e` `Object?`,
+/// and `e.copy()` is the oracle's invalid-bounded arm: silent on the
+/// unchecked code. The `Und` argument itself reports
+/// `non_type_as_type_argument`; the member use adds nothing.
+#[test]
+fn invalid_element_argument_keeps_the_object_question_recovery() {
+    let source = "class Bag<T> { void forEach(void Function(T) f) {} } \
+                  void f(Bag<Und> bag) { bag.forEach((e) => e.copy()); }";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(
+        has_code(&rep, "non_type_as_type_argument"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
