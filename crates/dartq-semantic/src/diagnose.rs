@@ -518,6 +518,20 @@ mod ticket_const_family_tests;
 #[cfg(test)]
 mod ticket_2336_tests;
 
+/// The #2337 differential pins: the `super.name` formal's associated-type
+/// face — a positional forward reads the super constructor's parameter at
+/// its own index among the super formals (a field-formal parameter takes
+/// its field's declared type, a chained forward climbs hop by hop, and a
+/// same-named local field never wins), so a nullable argument at a
+/// creation site reports against the associated non-nullable parameter
+/// while the written annotation, the matching nullable parameter, and the
+/// unassociated forward keep the silence — plus the error-recovery
+/// operator faces that already stand (an invalid-chain receiver keeps the
+/// binary node's fold unresolved; a known-typed `<<` operand reports the
+/// argument face).
+#[cfg(test)]
+mod ticket_2337_tests;
+
 pub use types::{FileReport, NameRow, NameUse, RefTarget, UndefinedGuard, UnitRef};
 pub(crate) use types::*;
 

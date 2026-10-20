@@ -2844,12 +2844,44 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 name_range: range,
             });
         }
+        // A positional `super.name` formal carries the marker so the
+        // use-site patch can count the forwards preceding it
+        // (`element.dart` `indexIn` indexes the associated parameter by
+        // the forward's own index among the super formals — an annotated
+        // forward (`Txt super.s`) carries its written type instead of the
+        // sentinel yet still displaces the count). Positional formals
+        // cannot declare defaults, so the slot is free; named forwards
+        // associate by spelling and never need the count.
+        let positional_super_forward = super_keyword.is_some()
+            && !matches!(
+                kind,
+                FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
+            );
         let formal = Formal {
             name,
-            ty,
+            ty: if super_keyword.is_some() && ty == Ty::UNKNOWN {
+                // A `super.name` formal forwards to the super constructor's
+                // associated parameter: without a written annotation its
+                // static type is that parameter's declared type
+                // (`SuperFormalParameterElement.type`), never the local
+                // field's and never `dynamic`. The association crosses
+                // containers (the superclass may live in another unit), so
+                // the capture parks the question in a `Never` sentinel —
+                // `Ty::Never` never occurs in captured annotations (a
+                // written `Never` stays a named type) — and the invocation
+                // layer's formal patch resolves it against the super
+                // constructor's formals at the use site.
+                Ty::Never
+            } else {
+                ty
+            },
             required,
             covariant,
-            default_value,
+            default_value: if positional_super_forward {
+                Some(builder.strings.intern("super.forward"))
+            } else {
+                default_value
+            },
         };
         if matches!(
             kind,

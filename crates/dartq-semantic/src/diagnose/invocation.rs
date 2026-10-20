@@ -1,5 +1,14 @@
 use super::*;
 
+/// Which associated parameter one parked `super.name` sentinel reads: the
+/// forward's own index among the constructor's super formals, or the named
+/// entry's spelling.
+#[derive(Clone, Copy)]
+enum SuperQuery {
+    Positional(usize),
+    Named(StringId),
+}
+
 impl<'a> Engine<'a> {
     /// Merges `receiver.member` at the dot/cascade event: pops the member row,
     /// classifies the receiver below it, and pushes the merged row. A
@@ -2752,6 +2761,12 @@ impl<'a> Engine<'a> {
                             // pairs no arguments against it.
                             return;
                         };
+                        // A chained forward's sentinel resolves against the
+                        // hop above it (the super constructor's own
+                        // `super.name` formal reads the grandparent's
+                        // associated parameter).
+                        let mut formals = formals;
+                        self.patch_super_formals(superclass, &mut formals);
                         (formals, Some(super_container), Some(superclass))
                     }
                     // The dead-edge super face (`resolver.dart`'s null
@@ -3030,6 +3045,165 @@ impl<'a> Engine<'a> {
                 formal.ty = member.var_ty;
             }
         }
+        self.patch_super_formals(container, formals);
+    }
+
+    /// A `super.name` formal's declared type is the super constructor's
+    /// associated parameter's own (`SuperFormalParameterElement.type` —
+    /// the association face [`Engine::check_super_formal`] implements: a
+    /// positional `super.locale` reads the target constructor's parameter
+    /// at the formal's own index among the super formals, a named one the
+    /// same-spelling entry under the public spelling). The capture parks
+    /// the untyped forward in a [`Ty::Never`] sentinel (a written
+    /// annotation wins, as upstream); this pass resolves it against the
+    /// superclass's constructor table — the unnamed face keyed by the
+    /// superclass's own name, the creation-site posture of the
+    /// superConstructor walk. The associated parameter answers through its
+    /// declared type; a field-formal associated parameter takes its
+    /// field's declared type (the super constructor's `this._locale` reads
+    /// `String` from the field table), and a chained `super.name` forward
+    /// climbs with the same rule, bounded by the ≤8-hop walk every
+    /// recovery loop keeps. Every unresolvable step settles on `Unknown` —
+    /// the unassociated formal's `InvalidType` suppresses the argument
+    /// check, the same silence [`Engine::check_super_formal`] reports its
+    /// own faces over.
+    fn patch_super_formals(&self, container: StringId, formals: &mut Formals) {
+        let pending = formals
+            .positional
+            .iter()
+            .chain(formals.named.iter())
+            .any(|f| f.ty == Ty::Never);
+        if !pending {
+            return;
+        }
+        // The positional association indexes the target's table by the
+        // forward's own index AMONG the constructor's super formals
+        // (`element.dart` `indexIn`) — the forwards consume the target's
+        // parameters in order, whatever non-forward parameters share the
+        // declaring list. Every positional forward carries the capture's
+        // marker (an annotated forward rides its written type instead of
+        // the sentinel yet still displaces the count).
+        let marker = self.strings.intern("super.forward");
+        let mut forward_index = 0usize;
+        for formal in formals.positional.iter_mut() {
+            let is_forward = formal.default_value == Some(marker);
+            if formal.ty == Ty::Never {
+                formal.ty = self.associated_super_formal_ty(
+                    container,
+                    SuperQuery::Positional(forward_index),
+                    0,
+                );
+            }
+            if is_forward {
+                forward_index += 1;
+            }
+        }
+        for formal in formals.named.iter_mut() {
+            if formal.ty == Ty::Never {
+                formal.ty = self.associated_super_formal_ty(
+                    container,
+                    SuperQuery::Named(formal.name),
+                    0,
+                );
+            }
+        }
+    }
+
+    /// The associated parameter's declared type for one `super.name`
+    /// sentinel, one hop up per chained forward. A chained hop re-derives
+    /// the positional query: the associated forward's own among-super-formals
+    /// index counts the sentinels its own table lists before it, which a
+    /// leading non-forward parameter displaces.
+    fn associated_super_formal_ty(&self, container: StringId, query: SuperQuery, depth: u8) -> Ty {
+        let mut container = container;
+        let mut query = query;
+        let mut depth = depth;
+        loop {
+            if depth >= 8 {
+                return Ty::UNKNOWN;
+            }
+            depth += 1;
+            let Some((super_container, superclass, formals)) =
+                self.associated_super_formals(container)
+            else {
+                return Ty::UNKNOWN;
+            };
+            let associated = match query {
+                SuperQuery::Positional(index) => formals.positional.get(index),
+                SuperQuery::Named(name) => {
+                    let public = self.formal_public_name(name);
+                    formals
+                        .named
+                        .iter()
+                        .find(|f| f.name == name || f.name == public)
+                }
+            };
+            let Some(associated) = associated else {
+                // The unassociated forward's parameter reads `InvalidType`
+                // upstream — every question it touches suppresses.
+                return Ty::UNKNOWN;
+            };
+            match associated.ty {
+                // The chained forward climbs to the next hop's association:
+                // the associated forward's own among-marker count is the
+                // table index its hop's target answers.
+                Ty::Never => {
+                    if let SuperQuery::Positional(index) = query {
+                        let marker = self.strings.intern("super.forward");
+                        let forward_index = formals
+                            .positional
+                            .iter()
+                            .take(index)
+                            .filter(|f| f.default_value == Some(marker))
+                            .count();
+                        query = SuperQuery::Positional(forward_index);
+                    }
+                    container = superclass;
+                }
+                // The associated field-formal declares its field's type.
+                Ty::UNKNOWN => {
+                    return self
+                        .declared_field_ty(super_container, associated.name)
+                        .unwrap_or(Ty::UNKNOWN);
+                }
+                ty => return ty,
+            }
+        }
+    }
+
+    /// The unnamed super constructor's formal table one hop up, with the
+    /// hop's owning container and name for the next link of a chained
+    /// forward.
+    fn associated_super_formals(
+        &self,
+        container: StringId,
+    ) -> Option<(&'a Container, StringId, &'a Formals)> {
+        let (container, _) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        )?;
+        let superclass = container.superclass?;
+        let (super_container, _) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            superclass,
+        )?;
+        let formals = super_container.ctor_formals.get(&superclass)?;
+        Some((super_container, superclass, formals))
+    }
+
+    /// The instance field's declared type under `name`, the associated
+    /// field-formal's own answer.
+    fn declared_field_ty(&self, container: &Container, name: StringId) -> Option<Ty> {
+        let member = container.members.get(&name)?;
+        (member.kind == MemberKind::Field && !member.is_static).then_some(member.var_ty)
     }
 
     /// The bare-invocation head that names a type alias the creation can
