@@ -53,6 +53,11 @@ pub(crate) struct ResolvedGraph {
     /// graph build joins External imports to these nodes; the nodes have no
     /// engine-library mapping, so `graph_ids` cannot answer for them).
     sdk_faces: FxHashMap<String, dartq_resolution::LibraryId>,
+    /// The dependency-interface nodes by interned target file (`deps`
+    /// module): the lazily indexed pub-cache files' graph identities, so an
+    /// import edge landing outside residency resolves to a real node the
+    /// same way an in-set target does.
+    dep_nodes: FxHashMap<FileId, dartq_resolution::LibraryId>,
     namespaces: OnceLock<Namespaces>,
 }
 
@@ -258,6 +263,12 @@ pub(crate) fn analyze(
     // snapshot; entries are the facts' own `Arc`s (see `semdiag`).
     let index = folding.then(|| {
         let mut index = crate::semdiag::build_index(&state.residency);
+        // The dependency-interface units join the same index: a dep file's
+        // containers are the faces the workspace's own rows resolve members
+        // and supertypes against.
+        for (&file, unit) in &state.deps.units {
+            index.insert(file, Arc::clone(&unit.facts.elements));
+        }
         // The SDK extension-member faces (#2186 S5): the synthetic
         // `<dart:…>` face files carry no element model, so the semantic
         // extension pool saw nothing for them and `dart:js_interop`'s
@@ -298,7 +309,51 @@ pub(crate) fn analyze(
                 }
             }
         }
+        // The dependency-interface containers join the set: a workspace
+        // class writing `extends DelegatingList<XmlNode>` captures its real
+        // argument tree only when the dep generic counts as one.
+        for unit in state.deps.units.values() {
+            let elements = &unit.facts.elements;
+            for &name in elements.container_order() {
+                if elements
+                    .container(name)
+                    .is_some_and(|container| container.type_params > 0)
+                {
+                    names.insert(name);
+                }
+            }
+        }
         names
+    });
+
+    // The dependency units' clause trees, captured once per analyze (the
+    // same bounded gate the members' capture runs): `class DelegatingList
+    // implements List<E>` in a dep file becomes the argument-bearing edge
+    // in every library fold below instead of the to-bounds face. Store or
+    // UTF-8 misses keep the name-level edges — the open direction.
+    let dep_clauses = folding.then(|| {
+        let generic = generic_containers.as_ref().expect("built above when folding");
+        let mut trees = dartq_semantic::ClauseTrees::empty();
+        for (&file, unit) in &state.deps.units {
+            if !clauses_a_generic_head(&unit.facts, generic) {
+                continue;
+            }
+            let Some(bytes) = state.store.get(unit.facts.content()) else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                continue;
+            };
+            dartq_semantic::capture_clause_trees(
+                file,
+                text,
+                &unit.scanned.tokens,
+                ParserFeatures::from_feature_set(unit.scanned.features),
+                &state.strings,
+                &mut trees,
+            );
+        }
+        trees
     });
 
     // Each job also rebuilds its library's symbol-index surface: the build
@@ -336,6 +391,7 @@ pub(crate) fn analyze(
                 index.as_ref(),
                 class_modifiers.as_ref(),
                 generic_containers.as_ref(),
+                dep_clauses.as_ref(),
                 *library,
             );
             // The run's canonical sort rides the job too (a pure read of the
@@ -743,6 +799,7 @@ fn diagnose_library(
     index: Option<&ElementIndex>,
     class_modifiers: Option<&LibraryClassModifiers>,
     generic_containers: Option<&FxHashSet<StringId>>,
+    dep_clauses: Option<&dartq_semantic::ClauseTrees>,
     library: LibraryId,
 ) -> Vec<Arc<Diagnostic>> {
     let info = state.libraries.info(library).expect("live library");
@@ -775,6 +832,10 @@ fn diagnose_library(
             if let ResolvedTarget::Resolved(target) = directive.target
                 && directive.code.is_none()
                 && !state.residency.contains_key(&target)
+                // An indexed dependency target is the analyzed world's
+                // face, not a staleness gap: its load exists exactly so
+                // this check stays silent.
+                && !state.deps.units.contains_key(&target)
             {
                 out.push(Arc::new(l1::uri_diagnostic(
                     ResolutionCode::UriDoesNotExist,
@@ -874,6 +935,12 @@ fn diagnose_library(
                     &mut clause_trees,
                 );
             }
+        }
+        // The dependency units' precomputed captures ride every fold: the
+        // dep files are no fold's members, so this merge is the only path
+        // their written supertype trees take into the per-library snapshot.
+        if let Some(dep_clauses) = dep_clauses {
+            dartq_semantic::extend_clause_trees(&mut clause_trees, dep_clauses);
         }
         // The per-library resolved-type snapshot (#2204 phase A): one
         // `dartq_types` table + hierarchy + name registry over the whole
@@ -1388,6 +1455,11 @@ struct LibraryRows {
 #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
     state.graph_generation += 1;
+    // The lazy dependency closure: pub-cache imports resolve to files
+    // discovery never made resident; their interface facts load here (the
+    // bounded BFS over the live libraries' targets) so the node pass below
+    // registers them beside the synthetic SDK faces.
+    crate::deps::load_dep_closure(state);
     let mut builder = LibraryGraphBuilder::new(&state.strings);
     let mut graph_ids: FxHashMap<LibraryId, dartq_resolution::LibraryId> = FxHashMap::default();
 
@@ -1447,6 +1519,98 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
     // import-namespace shape at name granularity.
     let core = sdk_faces["core"];
 
+    // The dependency-interface nodes: one per lazily indexed dep file, in
+    // path order (deterministic registration — node order is an observable
+    // contract downstream). Two passes, the live libraries' own shape:
+    // identities and declarations first (so an edge between two dep files
+    // resolves regardless of which registers first), then the edges.
+    let mut dep_nodes: FxHashMap<FileId, dartq_resolution::LibraryId> = FxHashMap::default();
+    let mut dep_files: Vec<FileId> = state.deps.units.keys().copied().collect();
+    dep_files.sort_by(|a, b| {
+        let key = |file: FileId| {
+            state
+                .files
+                .path(file)
+                .map_or(&[][..], |path| path.as_os_str().as_encoded_bytes())
+        };
+        key(*a).cmp(key(*b))
+    });
+    for &file in &dep_files {
+        let Some(unit) = state.deps.units.get(&file) else {
+            continue;
+        };
+        let Some(path) = state.files.path(file) else {
+            continue;
+        };
+        let uri = compose_canonical_uri(&state.uri_packages, path);
+        let node = builder.intern(&uri);
+        builder.library_name(
+            node,
+            l1::declared_library_name(&unit.facts).unwrap_or_default(),
+        );
+        builder.unit(node, file);
+        for (name, declaration) in unit.facts.elements.declarations() {
+            if declaration.kind == MicroKind::TypeParam {
+                continue;
+            }
+            match class_modifier_facts(&unit.facts.elements, name) {
+                Some(modifiers) => builder.declare_class(node, name, file, modifiers),
+                None => builder.declare(node, name, file),
+            }
+        }
+        dep_nodes.insert(file, node);
+    }
+    for &file in &dep_files {
+        let Some(unit) = state.deps.units.get(&file) else {
+            continue;
+        };
+        let Some(&node) = dep_nodes.get(&file) else {
+            continue;
+        };
+        builder.import(
+            node,
+            ImportEdge {
+                target: Some(core),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        for (directive, &target) in unit.facts.directives.iter().zip(unit.targets.iter()) {
+            match directive.kind {
+                DirectiveKind::Import => {
+                    let sdk_target = (target == ResolvedTarget::External)
+                        .then(|| {
+                            directive
+                                .uri
+                                .as_ref()
+                                .and_then(|uri| uri.strip_prefix("dart:"))
+                                .and_then(|name| sdk_faces.get(name).copied())
+                        })
+                        .flatten();
+                    builder.import(
+                        node,
+                        ImportEdge {
+                            target: sdk_target
+                                .or_else(|| graph_target(state, &graph_ids, &dep_nodes, target)),
+                            prefix: directive.prefix,
+                            deferred: directive.deferred,
+                            combinators: directive.combinators.clone(),
+                        },
+                    );
+                }
+                DirectiveKind::Export => builder.export(
+                    node,
+                    ExportEdge {
+                        target: graph_target(state, &graph_ids, &dep_nodes, target),
+                        combinators: directive.combinators.clone(),
+                    },
+                ),
+                _ => {}
+            }
+        }
+    }
+
     // The parallel collection: one task per live library over the frozen
     // facts — declaration names arrive pre-interned, edge payloads are owned
     // clones, and target resolution reads the completed `graph_ids` /
@@ -1487,15 +1651,16 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                                 })
                                 .flatten();
                             row.imports.push(ImportEdge {
-                                target: sdk_target
-                                    .or_else(|| graph_target(state, &graph_ids, directive.target)),
+                                target: sdk_target.or_else(|| {
+                                    graph_target(state, &graph_ids, &dep_nodes, directive.target)
+                                }),
                                 prefix: directive.prefix,
                                 deferred: directive.deferred,
                                 combinators: directive.combinators.clone(),
                             });
                         }
                         DirectiveKind::Export => row.exports.push(ExportEdge {
-                            target: graph_target(state, &graph_ids, directive.target),
+                            target: graph_target(state, &graph_ids, &dep_nodes, directive.target),
                             combinators: directive.combinators.clone(),
                         }),
                         _ => {}
@@ -1545,6 +1710,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
             .into_iter()
             .map(|(name, node)| (name.to_owned(), node))
             .collect(),
+        dep_nodes,
         namespaces: OnceLock::new(),
     }
 }
@@ -1755,18 +1921,21 @@ pub(crate) fn member_files(info: &LibraryInfo) -> Vec<FileId> {
 }
 
 /// Maps a directive's resolved target onto a graph library: in-set file
-/// targets map to their owning library; external/missing map to `None` (the
+/// targets map to their owning library, dependency-interface files (the
+/// `deps` module) to their dep node; external/missing map to `None` (the
 /// edge contributes no names, per the `ImportEdge` contract).
 fn graph_target(
     state: &EngineState,
     graph_ids: &FxHashMap<LibraryId, dartq_resolution::LibraryId>,
+    dep_nodes: &FxHashMap<FileId, dartq_resolution::LibraryId>,
     target: ResolvedTarget,
 ) -> Option<dartq_resolution::LibraryId> {
     match target {
         ResolvedTarget::Resolved(file) => state
             .library_of_file
             .get(&file)
-            .and_then(|library| graph_ids.get(library).copied()),
+            .and_then(|library| graph_ids.get(library).copied())
+            .or_else(|| dep_nodes.get(&file).copied()),
         _ => None,
     }
 }
@@ -1785,7 +1954,9 @@ fn directive_graph_target(
     directive: &DirectiveFacts,
 ) -> Option<dartq_resolution::LibraryId> {
     match directive.target {
-        ResolvedTarget::Resolved(_) => graph_target(state, &resolved.graph_ids, directive.target),
+        ResolvedTarget::Resolved(_) => {
+            graph_target(state, &resolved.graph_ids, &resolved.dep_nodes, directive.target)
+        }
         ResolvedTarget::External => directive
             .uri
             .as_deref()?
@@ -1830,7 +2001,7 @@ fn duplicate_target<'a>(
 ) -> Option<DuplicateTarget<'a>> {
     match directive.target {
         ResolvedTarget::Resolved(file) => {
-            match graph_target(state, &resolved.graph_ids, directive.target) {
+            match graph_target(state, &resolved.graph_ids, &resolved.dep_nodes, directive.target) {
                 Some(node) => Some(DuplicateTarget::Library(node)),
                 // Outside the analyzed world (absent on disk, or removed
                 // since parse — the oracle re-resolves to a library flagged
@@ -1939,10 +2110,21 @@ fn directive_library_uri(
 ) -> Option<String> {
     match directive.target {
         ResolvedTarget::Resolved(file) => {
-            let library = state.library_of_file.get(&file).copied()?;
-            let info = state.libraries.info(library)?;
-            let path = state.files.path(info.defining)?;
-            Some(format!("file://{}", path.display()))
+            if let Some(library) = state.library_of_file.get(&file).copied()
+                && let Some(info) = state.libraries.info(library)
+                && let Some(path) = state.files.path(info.defining)
+            {
+                return Some(format!("file://{}", path.display()));
+            }
+            // A dependency-interface target: the library URI is the dep
+            // file's own path — the oracle's defining-unit spelling for a
+            // resolved library outside the analyzed set.
+            if resolved.dep_nodes.contains_key(&file)
+                && let Some(path) = state.files.path(file)
+            {
+                return Some(format!("file://{}", path.display()));
+            }
+            None
         }
         ResolvedTarget::External => Some(resolved.graph.uri(node).to_owned()),
         ResolvedTarget::Missing => None,
@@ -3686,6 +3868,9 @@ mod tests {
     fn serial_library_graph(state: &mut EngineState) -> LibraryGraph {
         let mut builder = LibraryGraphBuilder::new(&state.strings);
         let mut graph_ids: FxHashMap<LibraryId, dartq_resolution::LibraryId> = FxHashMap::default();
+        // The parity fixtures carry no package dependencies, so the dep-node
+        // face this oracle predates stays empty.
+        let dep_nodes: FxHashMap<FileId, dartq_resolution::LibraryId> = FxHashMap::default();
         for library in state.libraries.live() {
             let info = state.libraries.info(library).expect("live library");
             let graph_id = builder.intern(&info.uri);
@@ -3751,7 +3936,7 @@ mod tests {
                                 graph_id,
                                 ImportEdge {
                                     target: sdk_target.or_else(|| {
-                                        graph_target(state, &graph_ids, directive.target)
+                                        graph_target(state, &graph_ids, &dep_nodes, directive.target)
                                     }),
                                     prefix: directive.prefix,
                                     deferred: directive.deferred,
@@ -3762,7 +3947,7 @@ mod tests {
                         DirectiveKind::Export => builder.export(
                             graph_id,
                             ExportEdge {
-                                target: graph_target(state, &graph_ids, directive.target),
+                                target: graph_target(state, &graph_ids, &dep_nodes, directive.target),
                                 combinators: directive.combinators.clone(),
                             },
                         ),

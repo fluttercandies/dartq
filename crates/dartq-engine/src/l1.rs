@@ -832,7 +832,7 @@ pub(crate) fn facts_key(grants: &Grants<'_>, file: FileId, content: ContentId) -
 /// file's capture and the scan face (tokens + settled feature set) — the
 /// face persists in the scanned cache so the analyze-phase consumers parse
 /// these tokens instead of re-scanning the file.
-fn compute_unit(
+pub(crate) fn compute_unit(
     file: FileId,
     content: ContentId,
     text: &str,

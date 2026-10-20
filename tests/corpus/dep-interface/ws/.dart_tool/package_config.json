@@ -1,0 +1,18 @@
+{
+  "configVersion": 2,
+  "packages": [
+    {
+      "name": "ws",
+      "rootUri": "../",
+      "packageUri": "lib/",
+      "languageVersion": "3.5"
+    },
+    {
+      "name": "dep",
+      "rootUri": "../../dep",
+      "packageUri": "lib/",
+      "languageVersion": "3.5"
+    }
+  ],
+  "generator": "pub"
+}

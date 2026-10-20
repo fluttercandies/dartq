@@ -157,7 +157,7 @@ pub(crate) mod switch_tracker;
 pub mod use_face;
 
 pub use analysis::{Analysis, Binding, BindingKind, CtorBinding, MemberBinding, analyze_unit};
-pub use clause_capture::capture_clause_trees;
+pub use clause_capture::{capture_clause_trees, extend_clause_trees};
 pub use collector::{DeclarationCollector, collect, container_modifiers};
 pub use diagnose::{
     FileReport, NameRow, NameUse, StrictModes, UnitFold, diagnose, diagnose_unit,

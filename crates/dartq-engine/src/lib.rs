@@ -45,6 +45,7 @@ mod budget;
 pub mod cancel;
 pub mod context;
 mod cycle;
+mod deps;
 pub mod event;
 pub mod l1;
 pub mod pipeline;

@@ -459,3 +459,18 @@ pub fn capture_clause_trees(
         );
     }
 }
+
+/// Merges `source`'s captured trees into `target` — the transport the
+/// engine's dependency-interface folds ride: a dep file's captures build
+/// once per analyze (they belong to no library's member set) and join
+/// every library's snapshot through this merge. First-wins per
+/// `(file, name)` key, the same discipline [`capture_clause_trees`]
+/// applies.
+pub fn extend_clause_trees(target: &mut ClauseTrees, source: &ClauseTrees) {
+    for (&key, capture) in &source.trees {
+        target.trees.entry(key).or_insert_with(|| ClauseCapture {
+            params: capture.params.clone(),
+            supers: capture.supers.clone(),
+        });
+    }
+}
