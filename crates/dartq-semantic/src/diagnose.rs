@@ -509,6 +509,15 @@ mod ticket_2326_tests;
 #[cfg(test)]
 mod ticket_const_family_tests;
 
+/// The #2336 pins: the InvalidType-scrutinee gate over the switch
+/// exhaustiveness rows — a broken-import scrutinee (the oracle's
+/// `hasInvalidType` posture, constant_verifier.dart:1035/:1095) suppresses
+/// the covering and per-case rows, while every resolved-scrutinee verdict
+/// (missing constant, full coverage, the nullable-arm reachability row)
+/// keeps its official shape.
+#[cfg(test)]
+mod ticket_2336_tests;
+
 pub use types::{FileReport, NameRow, NameUse, RefTarget, UndefinedGuard, UnitRef};
 pub(crate) use types::*;
 
@@ -1603,6 +1612,22 @@ pub fn fold_unit_with_ops<'t>(
     let mut staged = std::mem::take(&mut report.usage);
     staged.sort_by_key(|d| d.range.offset);
     report.diagnostics = merge_source_ordered(report.diagnostics, staged);
+    // The #2336 InvalidType-scrutinee gate runs once the parse-time
+    // emissions (the covering rows in `diagnostics`, the per-case rows
+    // staged into `usage`) share one list: a switch whose scrutinee type
+    // never resolved is the oracle's `InvalidType` — its whole
+    // exhaustiveness pass (reachability and covering alike) gates off
+    // behind `hasInvalidType` (constant_verifier.dart:1035/:1095).
+    gate_invalid_scrutinee_switches(
+        &mut report.diagnostics,
+        &engine.read_types,
+        tokens,
+        graph,
+        namespaces,
+        index,
+        file,
+        lib,
+    );
     // `duplicate_definition`s lead the report, each pointing at the SECOND
     // declaration's name token (the analyzer's diagnose-at-second rule).
     // Setters live under `name=` in the model; the oracle's message names
@@ -2814,6 +2839,159 @@ pub(crate) fn use_kind_of(intent: &Intent) -> NameUse {
         Intent::Write | Intent::ReadWrite => NameUse::Write,
         _ => NameUse::Read,
     }
+}
+
+/// Drops the switch-exhaustiveness rows whose switch the pass never had the
+/// right to decide (#2336).
+///
+/// The oracle's exhaustiveness verifier reads the scrutinee's resolved
+/// static type first: an `InvalidType` scrutinee
+/// (`patternConverter.hasInvalidType`, constant_verifier.dart:1035) gates
+/// the whole pass off — `computeExhaustiveness`, the per-case
+/// `unreachable_switch_case` walk, and the covering report all sit behind
+/// `if (!patternConverter.hasInvalidType)` (:1095). dartq's engine answers
+/// before that fact is available: the scrutinee's push-time latch keeps an
+/// as-written `Ty::Named` for a type annotation the unit's imports never
+/// brought in, and the world's unique-declaration fallback (a sealed-walk
+/// aid — `NameWorld::resolve_foreign`) then hands the verdict facts for a
+/// name the diagnosing scope cannot see, while the case patterns' own
+/// spellings stay unresolved. The rows that survive that mixed-resolution
+/// verdict are exactly the rows the oracle never emits.
+///
+/// The teardown join reads the same scope face the `undefined_class` rows
+/// came from ([`resolve_container`], namespace-only — never the fallback):
+/// a scrutinee identifier whose latched `Ty::Named` head resolves nowhere
+/// is the `InvalidType` shape, and its switch's
+/// `non_exhaustive_switch_statement` / `non_exhaustive_switch_expression` /
+/// `unreachable_switch_case` rows drop. Everything else keeps verbatim — a
+/// resolved head stays decidable (the promotion-narrowed unions the oracle
+/// exhausts are a separate face), and an unattributable header or a
+/// non-identifier scrutinee keeps its rows (fail-open, the pre-existing
+/// behavior).
+#[allow(clippy::too_many_arguments)] // the analysis context, one field each
+fn gate_invalid_scrutinee_switches(
+    diagnostics: &mut Vec<Diagnostic>,
+    read_types: &[(SourceRange, Ty)],
+    tokens: &TokenTable,
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    file: FileId,
+    lib: LibraryId,
+) {
+    let ne_statement = SemanticCode::NonExhaustiveSwitchStatement.code_info().name;
+    let ne_expression = SemanticCode::NonExhaustiveSwitchExpression.code_info().name;
+    let unreachable = SemanticCode::UnreachableSwitchCase.code_info().name;
+    // One resolution per distinct head: a corpus unit carries many rows on
+    // the same broken name (the analyzer corpus' `DeclarationKind` alone
+    // anchored three).
+    let mut resolvable: FxHashMap<StringId, bool> = FxHashMap::default();
+    diagnostics.retain_mut(|row| {
+        if row.code.name != ne_statement
+            && row.code.name != ne_expression
+            && row.code.name != unreachable
+        {
+            return true;
+        }
+        // The verdict read the scrutinee's push-time type; the joined read
+        // rows carry the same identifier's type at teardown.
+        let Some(head) = switch_scrutinee_head(row.range.offset, tokens) else {
+            return true;
+        };
+        let Ok(join) = read_types.binary_search_by_key(&head, |(range, _)| range.offset) else {
+            return true;
+        };
+        let Ty::Named { name, .. } = read_types[join].1 else {
+            return true;
+        };
+        *resolvable.entry(name).or_insert_with(|| {
+            resolve_container(graph, namespaces, index, lib, file, name).is_some()
+        })
+    })
+}
+
+/// The scrutinee identifier a switch-family row answers for: the single
+/// identifier token between the header's parentheses — directly after a
+/// covering row's anchor (that row rides the `switch` keyword) or, for a
+/// per-case row, ahead of the enclosing switch body that a backward group
+/// scan recovers. The offset is UTF-16 (the `SourceRange` units the read
+/// rows join by). `None` keeps the row's rows (a complex scrutinee, or a
+/// header the token walk cannot attribute — never a verdict input here).
+fn switch_scrutinee_head(offset: u32, tokens: &TokenTable) -> Option<u32> {
+    const SWITCH: dartq_scanner::TokenKind =
+        dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Switch);
+    let slice = tokens.as_slice();
+    let anchor = slice.partition_point(|t| t.utf16_offset < offset) as isize;
+    // The header's `(`: one token past the `switch` keyword for the
+    // covering rows; for the per-case rows the first unmatched `{` walking
+    // backward is the switch body's open brace (every nested group closes
+    // before its anchor, so only the enclosing body stays open), and the
+    // scrutinee parens sit immediately before it.
+    let open_paren = match slice.get(anchor as usize) {
+        Some(t) if t.kind == SWITCH => anchor + 1,
+        _ => {
+            let mut depth = 0i32;
+            let mut body = None;
+            for i in (0..anchor).rev() {
+                let step = match slice[i as usize].kind {
+                    dartq_scanner::TokenKind::CloseCurly
+                    | dartq_scanner::TokenKind::CloseParen
+                    | dartq_scanner::TokenKind::CloseSquare => 1,
+                    dartq_scanner::TokenKind::OpenCurly
+                    | dartq_scanner::TokenKind::StringInterpolationExpression
+                    | dartq_scanner::TokenKind::OpenParen
+                    | dartq_scanner::TokenKind::OpenSquare => -1,
+                    _ => 0,
+                };
+                depth += step;
+                if depth == -1 {
+                    body = Some(i as usize);
+                    break;
+                }
+            }
+            let body = body?;
+            // The body brace must close a `switch (...)` header; anything
+            // else (a block-typed anchor walk-off) is unattributable.
+            if slice[body].kind != dartq_scanner::TokenKind::OpenCurly {
+                return None;
+            }
+            if !slice
+                .get(body.wrapping_sub(1))
+                .is_some_and(|t| t.kind == dartq_scanner::TokenKind::CloseParen)
+            {
+                return None;
+            }
+            let mut paren = 0i32;
+            let mut header_open = None;
+            for i in (0..body - 1).rev() {
+                match slice[i].kind {
+                    dartq_scanner::TokenKind::CloseParen => paren += 1,
+                    dartq_scanner::TokenKind::OpenParen => {
+                        paren -= 1;
+                        if paren == -1 {
+                            header_open = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let header_open = header_open? as usize;
+            if !slice
+                .get(header_open.wrapping_sub(1))
+                .is_some_and(|t| t.kind == SWITCH)
+            {
+                return None;
+            }
+            header_open as isize
+        }
+    };
+    let close = tokens.matching_end(open_paren as usize)?;
+    let inner = slice.get((open_paren + 1) as usize..close)?;
+    let [only] = inner else {
+        return None;
+    };
+    (only.kind == dartq_scanner::TokenKind::Identifier).then_some(only.utf16_offset)
 }
 
 #[cfg(test)]
