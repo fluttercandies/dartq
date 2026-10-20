@@ -581,29 +581,31 @@ impl<'a> Engine<'a> {
                 self.stage_usage(code, range, &name_text);
             }
         }
-        self.suppress_same_line_ignored_locals();
+        self.suppress_same_line_ignored_usage();
         self.report_unused_imports();
     }
 
     /// The trailing same-line `// ignore:` face over the local-variable
-    /// rows (`IgnoreInfo.forDart`, ignore_info.dart:119-143): an ignore
-    /// comment whose line carries code before it applies to THAT line, so
-    /// `var x = 0; // ignore: unused_local_variable` spares the row exactly
-    /// as the standalone form does through the module root's
-    /// [`IgnoreSuppression`] — which materializes standalone comments only,
-    /// so the same-line form never reached the table (the archive census
-    /// rows, #2189-c). Scoped to `unused_local_variable`, this cluster's
-    /// verified population; every other code keeps its documented
-    /// under-report. A `//` head counts only after whitespace (or at line
-    /// start), so a `//` inside a string literal never reads as a comment.
-    fn suppress_same_line_ignored_locals(&mut self) {
+    /// and field rows (`IgnoreInfo.forDart`, ignore_info.dart:119-143): an
+    /// ignore comment whose line carries code before it applies to THAT
+    /// line, so `var x = 0; // ignore: unused_local_variable` and
+    /// `int _f = 0; // ignore: unused_field` spare the row exactly as the
+    /// standalone form does through the module root's [`IgnoreSuppression`]
+    /// — which materializes standalone comments only, so the same-line
+    /// form never reached the table (the archive census rows, #2189-c).
+    /// Scoped to the cluster's verified population (`unused_local_variable`,
+    /// `unused_field`); every other code keeps its documented under-report.
+    /// A `//` head counts only after whitespace (or at line start), so a
+    /// `//` inside a string literal never reads as a comment.
+    fn suppress_same_line_ignored_usage(&mut self) {
         if !self.source.contains("ignore:") {
             return;
         }
-        let code = SemanticCode::UnusedLocalVariable.code_info();
+        let local = SemanticCode::UnusedLocalVariable.code_info();
+        let field = SemanticCode::UnusedField.code_info();
         let mut drop: Vec<usize> = Vec::new();
         for (index, row) in self.report.usage.iter().enumerate() {
-            if row.code != code {
+            if row.code != local && row.code != field {
                 continue;
             }
             let byte = self.byte_of(row.range.offset).min(self.source.len());
@@ -631,8 +633,8 @@ impl<'a> Engine<'a> {
         });
     }
 
-    /// Whether the line carries a `// ignore:` entry naming
-    /// `unused_local_variable` with code before the comment (the trailing
+    /// Whether the line carries a `// ignore:` entry naming one of the
+    /// suppressed codes with code before the comment (the trailing
     /// form — a standalone comment's entry is the next line's, the root
     /// face's). A head only counts after whitespace (or at line start) —
     /// a `//` inside a string literal is not a comment — and the name
@@ -667,7 +669,9 @@ impl<'a> Engine<'a> {
                 let end = name
                     .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                     .unwrap_or(name.len());
-                name[..end].eq_ignore_ascii_case("unused_local_variable")
+                let head = &name[..end];
+                head.eq_ignore_ascii_case("unused_local_variable")
+                    || head.eq_ignore_ascii_case("unused_field")
             }) {
                 return true;
             }
@@ -1912,5 +1916,36 @@ mod pins {
                       \x20 sink(y);\n\
                       }\n";
         assert_eq!(unused_local_rows(source), vec![], "{source:?}");
+    }
+
+    /// The `unused_field` rows of `report`, as (offset, name-token length)
+    /// pairs in source order.
+    fn unused_field_rows(source: &str) -> Vec<(u32, u32)> {
+        report(source)
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unused_field")
+            .map(|d| (d.range.offset, d.range.length))
+            .collect()
+    }
+
+    /// The trailing same-line `// ignore:` form over a field (the archive
+    /// deflate.dart census row: `late int _method; // ignore:
+    /// unused_field`): an ignore comment whose line carries code before it
+    /// spares the row exactly as the standalone form does through the
+    /// module root's suppression, which materializes standalone comments
+    /// only. The un-ignored twin still reports.
+    #[test]
+    fn same_line_ignore_spares_the_field() {
+        let source = "class C {\n\
+                      \x20 int _kept = 0; // ignore: unused_field\n\
+                      \x20 int _gone = 0;\n\
+                      }\n";
+        let gone_at = source.find("_gone").unwrap() as u32;
+        assert_eq!(
+            unused_field_rows(source),
+            vec![(gone_at, 5)],
+            "{source:?}"
+        );
     }
 }

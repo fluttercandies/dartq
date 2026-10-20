@@ -267,3 +267,50 @@
         let unused = names.iter().filter(|c| **c == "unused_element").count();
         assert_eq!(unused, 1, "{names:?}");
     }
+
+    // —— #2216: the broken-chain iterable face ——————————————————————————
+
+    /// A supertype chain with a dead hop (the oracle's `InvalidType`
+    /// supertype — `class NL extends DelegatingList` over a broken
+    /// import) never reaches the sequence head: the for-in iterable face
+    /// reports even though the name-lattice ask stays open (the
+    /// broken-package xml corpus's `XmlNodeList` family). The
+    /// `undefined_class` mentions ride alongside; the pin is the
+    /// `for_in_of_invalid_type` row.
+    #[test]
+    fn for_in_reports_broken_chain_iterable() {
+        let source = "class NL extends DelegatingList {}\n\
+                      void m(NL l) { for (final x in l) {} }\n";
+        let names = code_names(&report(source));
+        assert!(
+            names.contains(&"for_in_of_invalid_type"),
+            "{names:?}"
+        );
+    }
+
+    /// The clean-chain control: a written `implements` edge to the core
+    /// face reaches the sequence head — the same for-in stays silent.
+    #[test]
+    fn for_in_clean_chain_stays_silent() {
+        let source = "class Iterable<T> {}\n\
+                      class NL implements Iterable<int> {}\n\
+                      void m(NL l) { for (final x in l) {} }\n";
+        let names = code_names(&report(source));
+        assert!(
+            !names.contains(&"for_in_of_invalid_type"),
+            "{names:?}"
+        );
+    }
+
+    /// The `await for` form asks `Stream` with the same broken-chain
+    /// verdict.
+    #[test]
+    fn await_for_in_reports_broken_chain_iterable() {
+        let source = "class NS extends DelegatingStream {}\n\
+                      void m(NS s) async { await for (final x in s) {} }\n";
+        let names = code_names(&report(source));
+        assert!(
+            names.contains(&"for_in_of_invalid_type"),
+            "{names:?}"
+        );
+    }

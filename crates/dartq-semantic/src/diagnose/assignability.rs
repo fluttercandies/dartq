@@ -635,9 +635,74 @@ impl<'a> Engine<'a> {
             return *ty;
         }
         if !matches!(row.intent, Intent::Invoke) {
-            return Ty::UNKNOWN;
+            // A getter/field READ's static type is the member's declared
+            // type (the official PropertyAccess/Identifier staticType):
+            // `sub.key`'s receiver reads the getter's declared return with
+            // no invocation in between — `Sub get sub` types the bare
+            // implicit-this read and the merged `this.sub` chain node alike
+            // (webview android_webview_controller.dart:1131
+            // `_androidParams.key`). A method read is a tear-off — its
+            // static type is the function signature the name-level model
+            // does not render, and answering the return type would resolve
+            // the next member against the wrong face — so only
+            // accessor/field entries answer.
+            return self.accessor_read_ty(row);
         }
         self.callee_return_ty(row)
+    }
+
+    /// The declared type of a getter/field read row. The implicit-this bare
+    /// face resolves the name through the enclosing container's member set
+    /// (`member_declared_ty` answers fields only — getters ride here); a
+    /// merged member row resolves through the receiver it names. Every
+    /// other shape (a broken climb, executables, unknown receivers) keeps
+    /// the unknown face.
+    fn accessor_read_ty(&self, row: &Row) -> Ty {
+        let answer = |entry: &MemberEntry| match entry.kind {
+            MemberKind::Field => self.fold_alias_ty(entry.var_ty),
+            _ => self.fold_alias_ty(entry.return_ty),
+        };
+        match &row.shape {
+            RowShape::Bare(BareInfo::Plain { .. }) if !row.qualified => {
+                match self.resolve_bare(row.name) {
+                    (_, RefTarget::Member { container }) => {
+                        match self.walk_members(container, row.name) {
+                            Walk::Found(entry)
+                                if matches!(
+                                    entry.kind,
+                                    MemberKind::Getter | MemberKind::Field
+                                ) =>
+                            {
+                                answer(&entry)
+                            }
+                            _ => Ty::UNKNOWN,
+                        }
+                    }
+                    _ => Ty::UNKNOWN,
+                }
+            }
+            RowShape::Member { recv } => {
+                let container = match recv {
+                    Receiver::This { container, .. }
+                    | Receiver::Super { container, .. }
+                    | Receiver::Container { name: container, .. }
+                    | Receiver::Typed { type_name: container, .. } => Some(*container),
+                    _ => None,
+                };
+                match container {
+                    Some(container) => match self.walk_members(container, row.name) {
+                        Walk::Found(entry)
+                            if matches!(entry.kind, MemberKind::Getter | MemberKind::Field) =>
+                        {
+                            answer(&entry)
+                        }
+                        _ => Ty::UNKNOWN,
+                    },
+                    None => Ty::UNKNOWN,
+                }
+            }
+            _ => Ty::UNKNOWN,
+        }
     }
 
     /// The flow read type at one read span (#1056's rows): the promoted
@@ -1571,10 +1636,43 @@ impl<'a> Engine<'a> {
             nullable: false,
             args: self.boundary.intern_list(&[Ty::Dynamic]),
         };
-        if self.assignable(ty, target, literal) == Some(false) {
-            let sequence = if await_ { "Stream" } else { "Iterable" };
-            let a0 = self.ty_display(ty);
-            self.emit(SemanticCode::ForInOfInvalidType, range, &a0, sequence);
+        match self.assignable(ty, target, literal) {
+            Some(false) => {
+                let sequence = if await_ { "Stream" } else { "Iterable" };
+                let a0 = self.ty_display(ty);
+                self.emit(SemanticCode::ForInOfInvalidType, range, &a0, sequence);
+            }
+            // The undecidable source side re-asks the core-face interface
+            // membership (`implements` semantics, never the entity ask —
+            // the sequence head is the core interface itself): a clean
+            // supertype chain reaching it stays silent, while a chain with
+            // a dead hop (the oracle's InvalidType supertype — the
+            // broken-import corpus's `XmlNodeList extends DelegatingList`)
+            // never reaches it and reports. An edge resolving behind an
+            // unmodeled SDK face keeps the open verdict — the under-report
+            // direction.
+            None => {
+                let Ty::Named { name, nullable: false, .. } = ty else {
+                    return;
+                };
+                if implements_interface(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.strings,
+                    self.lib,
+                    self.file,
+                    name,
+                    head,
+                    false,
+                ) == Some(false)
+                {
+                    let sequence = if await_ { "Stream" } else { "Iterable" };
+                    let a0 = self.ty_display(ty);
+                    self.emit(SemanticCode::ForInOfInvalidType, range, &a0, sequence);
+                }
+            }
+            Some(true) => {}
         }
     }
 
