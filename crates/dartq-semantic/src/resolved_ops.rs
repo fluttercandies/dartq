@@ -329,6 +329,13 @@ impl LibraryTypes {
         }
         let bool_decl = registry[&strings.intern("bool")];
         builder = builder.enumeration(bool_decl, 2);
+        // dart:core's `Enum` class — the implicit supertype every user
+        // enum declaration carries (`E <: Enum` holds in the oracle). The
+        // builtin row stays edge-free: `bool` is a plain class in the
+        // analyzer's element model, and the oracle keeps `b is Enum`
+        // decidable (probed: dart analyze 3.13.1, no dead_code), so only
+        // the user-declared enum actions synthesize the edge below.
+        let core_enum = registry[&strings.intern("Enum")];
 
         // The `CoreDecls` spellings: `Object`, `Function` and `Future` are
         // declared in the hierarchy but were never keyed into `registry`,
@@ -367,7 +374,7 @@ impl LibraryTypes {
         for &file in graph.unit_files(lib) {
             registry.register_file(index, file, lib, &mut actions);
             for action in actions.drain(..) {
-                builder = action.apply(builder);
+                builder = action.apply(builder, &table, core_enum);
             }
         }
 
@@ -398,7 +405,7 @@ impl LibraryTypes {
                         Some(Some(_)) => {
                             registry.register_file(index, entry.file, target, &mut actions);
                             for action in actions.drain(..) {
-                                builder = action.apply(builder);
+                                builder = action.apply(builder, &table, core_enum);
                             }
                         }
                         Some(None) | None => {
@@ -585,11 +592,31 @@ enum DeclAction {
 }
 
 impl DeclAction {
-    fn apply(self, builder: dartq_types::TypeHierarchyBuilder) -> dartq_types::TypeHierarchyBuilder {
+    fn apply(
+        self,
+        builder: dartq_types::TypeHierarchyBuilder,
+        table: &TypeTable,
+        core_enum: TypeDeclId,
+    ) -> dartq_types::TypeHierarchyBuilder {
         match self {
             Self::Decl(decl, params) => builder.decl(decl, params),
             Self::Sealed(decl) => builder.sealed(decl),
-            Self::Enum(decl, constants) => builder.enumeration(decl, constants),
+            // An enum declaration implicitly implements dart:core's
+            // `Enum` (the oracle's `E <: Enum` — `e is Enum` is a
+            // guaranteed-true test and the else branch deads; #2370).
+            // Synthesized where the enum enters the snapshot, so the
+            // whole resolved walk sees the edge; class declarations
+            // never grow it.
+            Self::Enum(decl, constants) => {
+                let enum_itf = table.intern(
+                    UninternedType::Interface {
+                        decl: core_enum,
+                        args: Vec::new(),
+                    },
+                    false,
+                );
+                builder.enumeration(decl, constants).supertype(decl, enum_itf)
+            }
         }
     }
 }
@@ -1387,6 +1414,76 @@ impl<'a> ResolvedTypeOps<'a> {
             _ => self.map_base(ty).unwrap_or(self.invalid),
         }
     }
+
+    /// The is-test face's tested-side map: [`Self::map_scrutinee`], except
+    /// an arity-vetoed registered spelling recovers to its declared
+    /// interface carrying one `Invalid` per type parameter. The official
+    /// builds that exact shape for a wrong-arity type annotation —
+    /// `_buildTypeArguments` (upstream Dart SDK source,
+    /// `pkg/analyzer/lib/src/dart/resolver/named_type_resolver.dart`)
+    /// reports `wrong_number_of_type_arguments` and fills `InvalidType`
+    /// into every parameter position, so the checked type is
+    /// `Response<InvalidType>`, still an `InterfaceType`, NOT the
+    /// whole-face `InvalidType`: `Object is Response<int, int>` answers
+    /// `Object <: Response<Invalid>` = false and keeps both branches live,
+    /// while `Response<int> is Response<int, int>` admits through the
+    /// carried argument's 0c arm and deads the else — both
+    /// oracle-probed (dart analyze 3.13.1). The bare `Invalid` read
+    /// instead answered vacuously true in both directions (subtype.dart's
+    /// 0c arm) and deaded a live else — the residual this recovery
+    /// removes (#2370). The pattern faces keep the whole-face `Invalid`
+    /// posture: `is_invalid_typed` reads `map_scrutinee` directly, and a
+    /// wrong-arity pattern skips its type test exactly as before.
+    ///
+    /// Only the registered-container spelling recovers. An unresolved head
+    /// (`x is Missing`) stays the whole-face `Invalid` whose 0c arm deads
+    /// the else exactly as the analyzer reports it, and a
+    /// resolved-but-unmodeled name keeps its opaque face; a bare spelling
+    /// instantiates to bounds instead of vetoing, so `row.is_empty()` and
+    /// the equal-count case never reach the recovery.
+    fn map_tested(
+        &self,
+        ty: FlowTy,
+        args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> TypeId {
+        let mapped = self.map_scrutinee(ty, args, arena, names);
+        if !matches!(self.snapshot.table.get(mapped).kind(), TypeKind::Invalid) {
+            return mapped;
+        }
+        let Base::Name(id) = ty.base else {
+            return mapped;
+        };
+        let Some(lexeme) = names.get(id as usize) else {
+            return mapped;
+        };
+        let name = self.strings.intern(lexeme);
+        let Some(&decl) = self
+            .snapshot
+            .registry
+            .get(&name)
+            .filter(|_| !self.snapshot.non_containers.contains(&name))
+        else {
+            return mapped;
+        };
+        let params = self
+            .snapshot
+            .decl_params
+            .get(&decl)
+            .map_or(&[][..], Vec::as_slice);
+        let row = arena.get(args as usize).map_or(&[][..], Vec::as_slice);
+        if row.is_empty() || row.len() == params.len() {
+            return mapped;
+        }
+        self.snapshot.table.intern(
+            UninternedType::Interface {
+                decl,
+                args: vec![self.invalid; params.len()],
+            },
+            ty.nullable,
+        )
+    }
 }
 
 impl TypeOps for ResolvedTypeOps<'_> {
@@ -1581,7 +1678,9 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// cannot resolve IS the oracle's `InvalidType` — a name the scopes
     /// do resolve (`non_containers`) maps opaque instead
     /// ([`ResolvedTypeOps::opaque_decl`]), keeping the remainder live
-    /// like the oracle's resolved class.
+    /// like the oracle's resolved class. The tested side's arity veto
+    /// recovers instead ([`Self::map_tested`]) — the official's
+    /// `Response<InvalidType>` keeps the test decidable.
     fn factor_typed(
         &self,
         from: FlowTy,
@@ -1593,7 +1692,7 @@ impl TypeOps for ResolvedTypeOps<'_> {
     ) -> FlowTy {
         self.observe_names(names);
         let f = self.map_scrutinee(from, from_args, arena, names);
-        let w = self.map_scrutinee(what, what_args, arena, names);
+        let w = self.map_tested(what, what_args, arena, names);
         // The signature-less function pair (see `is_subtype_typed`) skips
         // only the `Never` shortcut — no relation is provable between two
         // unknown signatures. The nullability rule below still splits the
@@ -1629,11 +1728,13 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// through `map_scrutinee` (the written-argument face — `List<int>`
     /// reads `Interface{List, [int]}`, a bare `List` its to-bounds
     /// instantiation) and the verdict answers through
-    /// [`TypeSystem::is_subtype`]. An `Invalid` arm (an unresolved head,
-    /// an arity mismatch) answers through the same call — subtype.dart's
-    /// 0c arm makes it a vacuous `true` in both directions, the oracle's
-    /// own `InvalidType` verdict, so the resolved face reports exactly
-    /// what the analyzer reports for a name it cannot resolve.
+    /// [`TypeSystem::is_subtype`]. An `Invalid` arm (an unresolved head)
+    /// answers through the same call — subtype.dart's 0c arm makes it a
+    /// vacuous `true` in both directions, the oracle's own `InvalidType`
+    /// verdict, so the resolved face reports exactly what the analyzer
+    /// reports for a name it cannot resolve. The tested side's arity veto
+    /// recovers instead ([`Self::map_tested`]) — the official's
+    /// `Response<InvalidType>` keeps the question decidable (#2370).
     fn is_subtype_typed(
         &self,
         left: FlowTy,
@@ -1663,7 +1764,7 @@ impl TypeOps for ResolvedTypeOps<'_> {
             return false;
         }
         let l = self.map_scrutinee(left, left_args, arena, names);
-        let r = self.map_scrutinee(right, right_args, arena, names);
+        let r = self.map_tested(right, right_args, arena, names);
         self.system.is_subtype(l, r)
     }
 
@@ -1673,11 +1774,14 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// with their written arguments, so a strict narrowing
     /// (`x is Response<T>` after `x is Response` — `Response<T> <:
     /// Response<dynamic>` holds) promotes, where the bare-`Ty` coverage
-    /// test would veto it. An `Invalid` arm (an unresolved head, an
-    /// arity mismatch) answers through the same gate — subtype.dart's
-    /// 0c arm makes both directions vacuously true, so the strict gate
-    /// refuses the step exactly as the oracle's `isValidPromotionStep`
-    /// refuses an `InvalidType` promotion (mutual subtypes are no step).
+    /// test would veto it. An `Invalid` arm (an unresolved head) answers
+    /// through the same gate — subtype.dart's 0c arm makes both
+    /// directions vacuously true, so the strict gate refuses the step
+    /// exactly as the oracle's `isValidPromotionStep` refuses an
+    /// `InvalidType` promotion (mutual subtypes are no step). The tested
+    /// side's arity veto recovers instead ([`Self::map_tested`]) — the
+    /// official promotes to its `Response<InvalidType>` face (probed:
+    /// `x.data` reads in the then branch, dart analyze 3.13.1).
     fn try_promote_to_typed(
         &self,
         to: FlowTy,
@@ -1688,7 +1792,7 @@ impl TypeOps for ResolvedTypeOps<'_> {
         names: &[Box<str>],
     ) -> Option<FlowTy> {
         self.observe_names(names);
-        let t = self.map_scrutinee(to, to_args, arena, names);
+        let t = self.map_tested(to, to_args, arena, names);
         let f = self.map_scrutinee(from, from_args, arena, names);
         // The strict-subtype gate (`isValidPromotionStep`,
         // flow_analysis.dart:7229-7247): `to <: from` is required, and a
@@ -3150,6 +3254,102 @@ mod tests {
                 && !codes.contains(&"undefined_getter")
                 && !codes.contains(&"undefined_method"),
             "the invalid-argument face must stay comparable and readable: {codes:?}"
+        );
+    }
+
+    /// #2370 form A: a wrong-arity is-test is not the whole-face
+    /// `InvalidType` — the official's `_buildTypeArguments` fills
+    /// `InvalidType` into the declared parameter positions and keeps the
+    /// interface, so `Object is Response<int, int>` is a decidable
+    /// question (`Object <: Response<Invalid>` = false) and the else
+    /// branch stays live. The pre-fix face vetoed the spelling to bare
+    /// `Invalid`, whose 0c arm answered vacuously true and deaded a live
+    /// else — the oracle probe reports only
+    /// `wrong_number_of_type_arguments` (dart analyze 3.13.1).
+    #[test]
+    fn ticket_2370_wrong_arity_is_test_keeps_the_else_live() {
+        let codes = diagnose_codes(
+            "class Response<T> { T? data; } \
+             void g() {} \
+             void f(Object x) { \
+               if (x is Response<int, int>) { return; } \
+               g(); \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"dead_code"),
+            "a wrong-arity is-test must keep the else branch live: {codes:?}"
+        );
+    }
+
+    /// #2370 form A's decidable face: the recovery keeps the interface
+    /// (one `Invalid` per declared parameter), so a typed receiver
+    /// answers its own head's question — `Response<int> <:
+    /// Response<Invalid>` admits through the carried argument's 0c arm,
+    /// the test is guaranteed true, and the else branch deads exactly as
+    /// the oracle reports (`wrong_number_of_type_arguments` +
+    /// `dead_code`; dart analyze 3.13.1). Pinning the dead direction
+    /// guards against an over-correction that would treat every
+    /// arity-vetoed spelling as undecidable.
+    #[test]
+    fn ticket_2370_wrong_arity_is_test_deads_on_typed_receiver() {
+        let codes = diagnose_codes(
+            "class Response<T> { T? data; } \
+             void g() {} \
+             void f(Response<int> x) { \
+               if (x is Response<int, int>) { return; } else { g(); } \
+             }",
+            |_| None,
+        );
+        assert!(
+            codes.contains(&"dead_code"),
+            "the typed receiver's wrong-arity test must dead the else: {codes:?}"
+        );
+    }
+
+    /// #2370 form B: a user enum declaration implicitly implements
+    /// dart:core's `Enum`, so `c is Enum` on an `E` receiver is a
+    /// guaranteed-true test and the else branch deads (`E <: Enum` holds
+    /// in the oracle — probed dart analyze 3.13.1, which reports
+    /// `dead_code` on the else; the accompanying
+    /// `unnecessary_type_check` row is the static-warning tier, not this
+    /// flow face). The pre-fix face grew no edge and kept the else live.
+    #[test]
+    fn ticket_2370_user_enum_is_enum_deads_the_else() {
+        let codes = diagnose_codes(
+            "enum Color { r } \
+             void f(Color c) { \
+               if (c is Enum) { c; } else { 1; } \
+             }",
+            |_| None,
+        );
+        assert!(
+            codes.contains(&"dead_code"),
+            "E is Enum must read as guaranteed true and dead the else: {codes:?}"
+        );
+    }
+
+    /// #2370 form B's negative face: the edge belongs to enum
+    /// declarations only — a class receiver keeps `c is Enum` decidable
+    /// (both branches live; probed dart analyze 3.13.1), and so does the
+    /// `bool` builtin, which the analyzer's element model declares a
+    /// plain class (its `b is Enum` probe reports nothing).
+    #[test]
+    fn ticket_2370_class_receiver_is_enum_keeps_both_branches_live() {
+        let codes = diagnose_codes(
+            "enum Color { r } \
+             class C {} \
+             void g() {} \
+             void f(C c) { \
+               if (c is Enum) { return; } \
+               g(); \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"dead_code"),
+            "a class receiver must keep the is-Enum test decidable: {codes:?}"
         );
     }
 
