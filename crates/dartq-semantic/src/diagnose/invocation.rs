@@ -1311,12 +1311,46 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The multi-row window's composite face. A statically-`bool` composite
+    /// (`==`/`!=`, the relational and lazy-boolean operators — the spans
+    /// `end_binary_expression` latches through `latch_bool_span`) whose
+    /// extent covers the whole window answers `bool` at the composite's own
+    /// extent: the oracle reads `BinaryExpression.staticType` there, while
+    /// this model folds no single row for these spellings (they carry no
+    /// `mark_operator` mark, so `fold_binary` keeps the two operand rows).
+    /// Any other multi-row shape stays `None` — the caller's unknown,
+    /// zero-span face (compound operands must not lend their type).
+    fn composite_bool_arg(&self, mark: usize, hi: usize) -> Option<(Ty, SourceRange)> {
+        if hi <= mark + 1 {
+            return None;
+        }
+        let start = self.rows.get(mark)?.range.offset;
+        let end = self.rows.get(hi - 1)?.range.end();
+        let covered = self
+            .bool_decided
+            .iter()
+            .any(|span| span.offset <= start && end <= span.end());
+        covered.then(|| {
+            (
+                Ty::named(self.members.primitive_ids[3]),
+                SourceRange {
+                    offset: start,
+                    length: end - start,
+                },
+            )
+        })
+    }
+
     /// Recovers the unclaimed window `[mark, rows.len())` as a positional
     /// argument. The normal expression path fires no per-argument events
     /// (only the const path emits `positional_argument`), so a group whose
     /// window holds exactly one row since `mark` reads that row as the
-    /// single positional argument; wider windows stay unattributed
-    /// (compound operands must not lend their type — under-report).
+    /// single positional argument. A wider window never vanishes: the
+    /// [`Self::composite_bool_arg`] face answers the statically-`bool`
+    /// composites (the `==`/`!=`/relational/lazy-boolean family — dropping
+    /// the window shifted every later argument onto the wrong formal, the
+    /// #2245 misalignment), anything else records the unknown zero-span
+    /// face so the positional pairing stays aligned (under-report).
     pub(crate) fn flush_unclaimed(&mut self) {
         let Some(level) = self.arg_levels.last() else {
             return;
@@ -1337,6 +1371,7 @@ impl<'a> Engine<'a> {
                 self.tear_off_sig(row),
             )
         });
+        let composite = self.composite_bool_arg(mark, hi);
         let level = self.arg_levels.last_mut().expect("level just read");
         level.mark = hi;
         if let Some((ty, literal, range, sig)) = arg {
@@ -1344,13 +1379,27 @@ impl<'a> Engine<'a> {
                 self.arg_sigs.insert(range.offset, sig);
             }
             level.args.push((None, ty, literal, range));
+        } else if let Some((ty, range)) = composite {
+            level.args.push((None, ty, false, range));
+        } else if hi > mark {
+            level.args.push((
+                None,
+                Ty::UNKNOWN,
+                false,
+                SourceRange {
+                    offset: 0,
+                    length: 0,
+                },
+            ));
         }
     }
 
     /// Closes the pending argument: exactly one pushed row since the last
     /// argument boundary is a terminal expression whose type stands for the
     /// whole argument; anything else stays `Unknown` (compound operands must
-    /// not lend their type). An empty window pushes nothing.
+    /// not lend their type), except the statically-`bool` composite face
+    /// ([`Self::composite_bool_arg`]) which answers at the composite's own
+    /// extent. An empty window pushes nothing.
     pub(crate) fn flush_argument(&mut self) {
         let Some(level) = self.arg_levels.last() else {
             return;
@@ -1371,15 +1420,18 @@ impl<'a> Engine<'a> {
                     row.range,
                     self.tear_off_sig(row),
                 )),
-                None => Some((
-                    Ty::UNKNOWN,
-                    false,
-                    SourceRange {
-                        offset: 0,
-                        length: 0,
-                    },
-                    None,
-                )),
+                None => match self.composite_bool_arg(mark, hi) {
+                    Some((ty, range)) => Some((ty, false, range, None)),
+                    None => Some((
+                        Ty::UNKNOWN,
+                        false,
+                        SourceRange {
+                            offset: 0,
+                            length: 0,
+                        },
+                        None,
+                    )),
+                },
             }
         };
         let level = self.arg_levels.last_mut().expect("level just read");
