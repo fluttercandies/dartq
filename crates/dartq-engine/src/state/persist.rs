@@ -2756,9 +2756,12 @@ mod tests {
     /// for a file whose imports stress adjacent same-kind clauses
     /// (`hide alpha hide alpha`; `show alpha show beta` next to
     /// `show alpha, beta`), the warm facts reproduce the cold combinator
-    /// shapes on every directive and the cold diagnostics — no
-    /// duplicate-combinator and no duplicate-import report on either side.
-    /// The merged-run payload collapsed the boundaries, so a warm start
+    /// shapes on every directive and the cold diagnostics row-for-row.
+    /// The two duplicate-clause imports legitimately carry one
+    /// `multiple_combinators` row each (the oracle reports both, verified
+    /// against `dart analyze`); the warm start must reproduce exactly that
+    /// pair — never a duplicate-combinator or duplicate-import row beyond
+    /// it. The merged-run payload collapsed the boundaries, so a warm start
     /// over-reported the duplicates and equated the paired imports.
     #[test]
     #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
@@ -2796,12 +2799,25 @@ mod tests {
         let mut on_event = |_event: EngineEvent| {};
         let cancel = CancellationToken::new();
         cold.analyze(&[], &mut on_event, &cancel).expect("analyze");
-        assert!(
+        // The cold face is the oracle's own: one MULTIPLE_COMBINATORS row
+        // per duplicate-clause import, spanning the whole combinator list
+        // (`import 'other.dart' ` is 20 columns, so the spans start at
+        // offsets 20/63 with lengths 21/20 — verified against
+        // `dart analyze --format machine` on this exact file shape).
+        let row =
+            |d: &Diagnostic| (d.code.name, d.range.offset, d.range.length, d.severity);
+        assert_eq!(
             cold.file_facts(main_cold)
                 .expect("resident")
                 .diagnostics
-                .is_empty(),
-            "fixture sanity: the oracle-clean file analyzes clean cold"
+                .iter()
+                .map(|d| row(d))
+                .collect::<Vec<_>>(),
+            vec![
+                ("multiple_combinators", 20, 21, Severity::Warning),
+                ("multiple_combinators", 63, 20, Severity::Warning),
+            ],
+            "fixture sanity: exactly the oracle's two MULTIPLE_COMBINATORS rows"
         );
 
         let cache = snapshot_cache_dir();
@@ -2832,15 +2848,22 @@ mod tests {
 
         let cold_facts = cold.file_facts(main_cold).expect("resident");
         let warm_facts = warm.file_facts(main_warm).expect("resident");
-        assert!(
-            warm_facts.diagnostics.is_empty(),
-            "the warm start must not report duplicate combinators or a \
-             duplicate import — got {:?}",
+        assert_eq!(
+            warm_facts.diagnostics.iter().map(|d| row(d)).collect::<Vec<_>>(),
+            cold_facts.diagnostics.iter().map(|d| row(d)).collect::<Vec<_>>(),
+            "the warm start must reproduce the cold rows exactly — no \
+             duplicate-combinator or duplicate-import row beyond them, got \
+             {:?} vs cold {:?}",
             warm_facts
                 .diagnostics
                 .iter()
                 .map(|diagnostic| diagnostic.code.name)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+            cold_facts
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.name)
+                .collect::<Vec<_>>(),
         );
         assert_eq!(
             cold_facts.directives.len(),
