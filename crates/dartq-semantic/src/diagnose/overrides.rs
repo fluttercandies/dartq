@@ -2824,11 +2824,20 @@ impl<'a> Engine<'a> {
         let world = self.name_world();
         // The single type-decision point for every face below: the M1
         // assignability first, the name lattice on its `None`. No consumer
-        // of this verdict re-derives either half.
+        // of this verdict re-derives either half. Both operands read
+        // through their type aliases first: the oracle compares resolved
+        // function types, so a parameterless alias's nullability joins the
+        // comparison (`typedef WhenComplete = void Function(...)?` — the
+        // spelled `WhenComplete?` and `WhenComplete` are the same type;
+        // riverpod's `create` override). The fold is identity for every
+        // non-alias spelling, and an alias to an unmodelable RHS keeps the
+        // written head — the same under-fold posture `fold_alias_ty` keeps.
         let decide = |from: (Ty, (FileId, StringId), &MemberEntry),
                       to: (Ty, (FileId, StringId), &MemberEntry)| {
             let (from_ty, from_scope, from_entry) = from;
             let (to_ty, to_scope, to_entry) = to;
+            let from_ty = self.fold_alias_ty(from_ty);
+            let to_ty = self.fold_alias_ty(to_ty);
             if let Ty::Named { name, .. } = from_ty
                 && self.named_head_is_invalid(name, from_scope, from_entry)
             {
@@ -2876,8 +2885,24 @@ impl<'a> Engine<'a> {
         };
         match (declared.formals.as_deref(), inherited.formals.as_deref()) {
             (Some(a), Some(b)) => {
-                // Positional arity first: both directions break it.
-                if a.positional.len() != b.positional.len() {
+                // The function-subtype arity rule, not an equality: the
+                // override must accept every call the super member accepts
+                // (upstream Dart SDK source,
+                // pkg/analyzer/lib/src/error/correct_override.dart:36-39 —
+                // one subtype question on the member function types), so
+                // fewer positional parameters breaks, and a positional
+                // parameter may be ADDED when it is optional
+                // (`Buf toUint8List([Buf? bytes])` over `Buf
+                // toUint8List()` — archive's stream classes). A newly
+                // required positional rejects the super's shorter calls;
+                // the model's required positionals lead their list, so the
+                // flag counts decide it.
+                if a.positional.len() < b.positional.len() {
+                    return true;
+                }
+                let a_required = a.positional.iter().filter(|f| f.required).count();
+                let b_required = b.positional.iter().filter(|f| f.required).count();
+                if a_required > b_required {
                     return true;
                 }
                 // The named set: every inherited name must survive (a
@@ -3478,6 +3503,170 @@ mod invalid_type_override_tests {
         assert!(
             !names.contains(&"invalid_override"),
             "InvalidType on the defining side satisfies the override: {names:?}"
+        );
+    }
+}
+
+/// The function-subtype verdict pins (#2281): the oracle's
+/// `isCorrectOverrideOf` is one subtype question on the member function
+/// types (correct_override.dart:36-39), and the function-subtype rule
+/// accepts an override that adds an OPTIONAL positional parameter and
+/// compares aliased spellings through their resolved types. Both pins were
+/// live `invalid_override` false positives on the real corpus (archive's
+/// `toUint8List([Uint8List? bytes])`, riverpod's `WhenComplete? create`).
+#[cfg(test)]
+mod function_subtype_override_tests {
+    use crate::collector::collect;
+    use crate::diagnose::{FileReport, StrictModes, diagnose, fold_unit, merge_source_ordered};
+    use crate::library::ElementIndex;
+    use crate::model::MicroKind;
+    use dartq_language::{FeatureSet, LanguageVersion};
+    use dartq_parser::ParserFeatures;
+    use dartq_resolution::{LibraryClassModifiers, LibraryGraphBuilder, Namespaces};
+    use dartq_scanner::ScanConfig;
+    use dartq_source::{FileTable, StringTable};
+    use std::path::Path;
+
+    /// Diagnoses `source` as the sole file of a library with no imports —
+    /// the same single-file rig the sibling modules keep.
+    fn report(source: &str) -> FileReport {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+        let features = ParserFeatures::from_feature_set(set);
+        let elements = collect(source, &scanned.tokens, features, &strings);
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/main.dart");
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let fold = fold_unit(
+            source,
+            &scanned.tokens,
+            features,
+            &strings,
+            file,
+            lib,
+            &graph,
+            &namespaces,
+            &index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+            set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+        );
+        let mut report = fold.report;
+        report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+        report
+    }
+
+    fn code_names(report: &FileReport) -> Vec<&'static str> {
+        report
+            .diagnostics
+            .iter()
+            .map(|d| d.code.name)
+            .collect::<Vec<_>>()
+    }
+
+    /// An added optional positional parameter is the valid-override
+    /// widening: the override accepts every call the super member accepts.
+    #[test]
+    fn added_optional_positional_parameter_is_a_valid_override() {
+        let report = report(
+            "class Buf {}\n\
+             class Base {\n\
+               Buf toUint8List() => Buf();\n\
+             }\n\
+             class Sub extends Base {\n\
+               @override\n\
+               Buf toUint8List([Buf? bytes]) => Buf();\n\
+             }\n",
+        );
+        let names = code_names(&report);
+        assert!(
+            !names.contains(&"invalid_override"),
+            "optional-positional addition is a valid override: {names:?}"
+        );
+    }
+
+    /// A newly required positional parameter rejects the super's shorter
+    /// calls — the arity rule's broken direction stays live.
+    #[test]
+    fn newly_required_positional_parameter_still_breaks() {
+        let report = report(
+            "class Base {\n\
+               void f([int x]) {}\n\
+             }\n\
+             class Sub extends Base {\n\
+               @override\n\
+               void f(int x) {}\n\
+             }\n",
+        );
+        let names = code_names(&report);
+        assert!(
+            names.contains(&"invalid_override"),
+            "required-izing an optional positional breaks the override: {names:?}"
+        );
+    }
+
+    /// Dropping a positional parameter the super has breaks the override.
+    #[test]
+    fn dropped_positional_parameter_still_breaks() {
+        let report = report(
+            "class Base {\n\
+               void f(int x) {}\n\
+             }\n\
+             class Sub extends Base {\n\
+               @override\n\
+               void f() {}\n\
+             }\n",
+        );
+        let names = code_names(&report);
+        assert!(
+            names.contains(&"invalid_override"),
+            "fewer positional parameters breaks the override: {names:?}"
+        );
+    }
+
+    /// A parameterless alias's nullability joins the comparison: with
+    /// `typedef W = void Function()?;` (a nullable RHS — riverpod's
+    /// `WhenComplete` shape), the spellings `W` and `W?` fold to the same
+    /// resolved nullable function type.
+    #[test]
+    fn aliased_nullable_result_reads_through_the_alias() {
+        let report = report(
+            "typedef W = void Function()?;\n\
+             class El {\n\
+               W create() => () {};\n\
+             }\n\
+             class Sub extends El {\n\
+               @override\n\
+               W? create() => () {};\n\
+             }\n",
+        );
+        let names = code_names(&report);
+        assert!(
+            !names.contains(&"invalid_override"),
+            "W and W? fold to the same resolved function type: {names:?}"
         );
     }
 }
