@@ -238,9 +238,9 @@ impl<'a> Engine<'a> {
     /// fold-deferred rows).
     pub(crate) fn resolve_row(&mut self, promotions: &PromotionStaging, row: &Row) {
         match &row.shape {
-            RowShape::Bare(info) => self.resolve_bare_row(row, *info),
+            RowShape::Bare(info) => self.resolve_bare_row(promotions, row, *info),
             RowShape::Member { recv } => {
-                let recv = self.promoted_receiver(row.range.offset, *recv);
+                let recv = self.tolerant_receiver(promotions, row, self.promoted_receiver(row.range.offset, *recv));
                 self.resolve_member_row(promotions, row, recv);
             }
             RowShape::Receiver(recv) => self.resolve_receiver_row(row, *recv),
@@ -343,7 +343,130 @@ impl<'a> Engine<'a> {
         }
     }
 
-    pub(crate) fn resolve_bare_row(&mut self, row: &Row, info: BareInfo) {
+    /// The receiver re-decide a member row resolves against when the keyed
+    /// [`Engine::promoted_receiver`] kept the push-time face. The flow's
+    /// promoted read-type fact for an assignment-window receiver stages at
+    /// the window's own shifted key (`target = target.julianday` — the
+    /// staged row sits one byte left of the receiver read, while the
+    /// unpromoted declared face holds the read's exact span), so the
+    /// re-decide consults both spans under the same rules the keyed path
+    /// applies — a named face that differs from the static type, minus the
+    /// `?`-widened same-head pre-state — then falls back to the #2241
+    /// promotion staging at the receiver read. The shifted window can only
+    /// match rows staged at it (reads never overlap, so no other variable's
+    /// row answers there); every miss keeps the keyed verdict.
+    fn tolerant_receiver(
+        &self,
+        promotions: &PromotionStaging,
+        row: &Row,
+        recv: Receiver,
+    ) -> Receiver {
+        let Receiver::Typed {
+            ty: static_ty,
+            type_name,
+            ..
+        } = recv
+        else {
+            return recv;
+        };
+        let Ok(index) = self
+            .promoted_recv_reads
+            .binary_search_by(|(member, _)| member.cmp(&row.range.offset))
+        else {
+            return recv;
+        };
+        let read_span = self.promoted_recv_reads[index].1;
+        if let Some(redecided) = self.redecided_face(static_ty, self.read_type_at(read_span)) {
+            return redecided;
+        }
+        // The assignment window's shifted staging key (`target` reads at
+        // `offset`, its promoted face stages at `offset - 1`).
+        if read_span.offset > 0 {
+            let shifted = SourceRange {
+                offset: read_span.offset - 1,
+                length: read_span.length,
+            };
+            if let Some(redecided) =
+                self.redecided_face(static_ty, self.read_type_at(shifted))
+            {
+                return redecided;
+            }
+        }
+        // The #2241 staging: an opaque marker carries only the nullability
+        // decision (the parse-time type's non-null form stands), a spelled
+        // face re-decides under the same widening guard.
+        let Some(promoted) = promotions.promoted(read_span) else {
+            return recv;
+        };
+        let redecided = match promoted {
+            Ty::Unknown => {
+                let non_null = Self::non_null_form(static_ty);
+                (non_null != static_ty).then(|| Receiver::Typed {
+                    type_name,
+                    ty: non_null,
+                })
+            }
+            Ty::Named { name, .. }
+                if promoted != static_ty && !self.widened_face(&promoted, &static_ty) =>
+            {
+                Some(Receiver::Typed {
+                    type_name: name,
+                    ty: promoted,
+                })
+            }
+            _ => None,
+        };
+        redecided.unwrap_or(recv)
+    }
+
+    /// The re-decide verdict of a flow read-type face: a named face that
+    /// differs from the push-time static type re-decides the receiver,
+    /// unless it merely `?`-widens the same head (the postfix-`!` pre-state
+    /// — promotion never widens nullability).
+    fn redecided_face(&self, static_ty: Ty, flow_ty: Option<Ty>) -> Option<Receiver> {
+        let flow_ty = flow_ty?;
+        let Ty::Named { name, .. } = flow_ty else {
+            return None;
+        };
+        if flow_ty == static_ty || self.widened_face(&flow_ty, &static_ty) {
+            return None;
+        }
+        Some(Receiver::Typed {
+            type_name: name,
+            ty: flow_ty,
+        })
+    }
+
+    /// Whether `flow` is exactly `static`'s own head widened to nullable —
+    /// the postfix-`!` pre-state signature, never a promotion.
+    fn widened_face(&self, flow: &Ty, static_ty: &Ty) -> bool {
+        matches!(
+            (flow, static_ty),
+            (
+                Ty::Named {
+                    name: flow_head,
+                    nullable: true,
+                    ..
+                },
+                Ty::Named {
+                    name: static_head,
+                    nullable: false,
+                    ..
+                },
+            ) if flow_head == static_head
+        )
+    }
+
+    /// One row's pass-2 dispatch (shared by the main stack and the
+    /// fold-deferred rows). Bare rows carry the promotions too: their
+    /// operator face re-decides against the flow-promoted type exactly
+    /// like the member walk's receiver verdict.
+    pub(crate) fn resolve_bare_row(
+        &mut self,
+        promotions: &PromotionStaging,
+        row: &Row,
+        info: BareInfo,
+    ) {
         let name_text = self.strings.resolve(row.name);
         match info {
             // A prefix used bare: invoking a prefix is an error the oracle
@@ -414,15 +537,24 @@ impl<'a> Engine<'a> {
                     self.check_top_level_unused_result(row);
                 }
                 // A non-write resolution of a field name is the implicit
-                // getter's read (writes never spare a field).
+                // getter's read (writes never spare a field). Inside an
+                // extension body `this` reads the `on` type's member — the
+                // owner credits the extended container, not the extension
+                // (the same face `note_member_read`'s `This` arm carries).
                 if !matches!(row.intent, Intent::Write)
                     && let Some(&pushed) = self.field_read_rows.get(&row.range.offset)
                 {
                     self.read_names.insert(row.name);
-                    if let Some(container) = self
-                        .read_owner_container(row.range.offset)
-                        .or(Some(pushed))
-                    {
+                    let owner = self
+                        .container_context()
+                        .and_then(|(container, kind)| {
+                            (kind == ContainerKind::Extension)
+                                .then(|| self.enclosing_extension_on_type(container))
+                                .flatten()
+                        })
+                        .or_else(|| self.read_owner_container(row.range.offset))
+                        .or(Some(pushed));
+                    if let Some(container) = owner {
                         self.member_read_owners
                             .entry(row.name)
                             .or_default()
@@ -430,7 +562,13 @@ impl<'a> Engine<'a> {
                     }
                 }
                 // A direct operator application on a declared-typed receiver
-                // (`c + d`, `c[i] = v`). A type whose static type the model
+                // (`c + d`, `c[i] = v`). The flow promotion's face re-decides
+                // first (#2241's join, the same face the member walk's
+                // receiver verdict reads): `if (sub is List) sub[i]` resolves
+                // `[]` against the promoted `List`, not the declared
+                // `Object?`. An opaque staged marker carries only the
+                // nullability decision (#2174) — the parse-time type's
+                // non-null form stands. A type whose static type the model
                 // leaves unknown is the SDK projection's names-only stub —
                 // for the dart:core collection heads that is the generic
                 // class type literal (`List < 1`), and the operator applies
@@ -438,6 +576,11 @@ impl<'a> Engine<'a> {
                 // of the user operators (the `A < 1` container face's
                 // decision, one resolution grade down).
                 if matches!(row.intent, Intent::Operator(..)) {
+                    let ty = match promotions.promoted(row.range) {
+                        Some(Ty::Unknown) => Self::non_null_form(ty),
+                        Some(promoted) => promoted,
+                        None => ty,
+                    };
                     if ty == Ty::UNKNOWN && self.sdk_collection_type_literal(row.name) {
                         let Intent::Operator(_, op_range) = row.intent else {
                             return;
@@ -948,6 +1091,21 @@ impl<'a> Engine<'a> {
     /// the use face.
     pub(crate) fn note_member_read(&mut self, name: StringId, recv: &Receiver) {
         let handle = match *recv {
+            // `this`/`super` inside an extension body resolves against the
+            // `on` type's instance face — `this`'s static type IS the
+            // extended type, so the read credits the `on` container's
+            // member, not the extension's. A `super` access is a plain
+            // container (extensions declare no `super` member face). A
+            // named-container `this` keeps its own container.
+            Receiver::This { container, kind }
+                if kind == ContainerKind::Extension =>
+            {
+                match self.enclosing_extension_on_type(container) {
+                    Some(on) => (self.file, on),
+                    // The on-name never resolved — no honest owner.
+                    None => return,
+                }
+            }
             Receiver::This { container, .. } | Receiver::Super { container, .. } => {
                 (self.file, container)
             }
@@ -987,26 +1145,32 @@ impl<'a> Engine<'a> {
 
     /// Whether a read resolved against the container or any of its
     /// supertypes (`Sub`'s read of an inherited `_f` spares the base
-    /// field; a sibling class's same-spelled field never does).
+    /// field; a sibling class's same-spelled field never does). The join
+    /// walks each recorded receiver's supertype closure toward the
+    /// declaring container — a `Sub`-typed receiver reading `Base._f`
+    /// reaches `Base` through `Sub`'s own ancestry. Walking the
+    /// declaration's supertypes instead would credit a base's read of its
+    /// own member to a same-spelled subtype field (the inverse relation).
     pub(crate) fn member_was_read(&self, container: StringId, name: &StringId) -> bool {
         let Some(receivers) = self.member_read_owners.get(name) else {
             return false;
         };
-        receivers.contains(&(self.file, container)) || {
-            let hierarchy = FoldHierarchy {
-                graph: self.graph,
-                namespaces: self.namespaces,
-                index: self.index,
-                file: self.file,
-                lib: self.lib,
-                memo: RefCell::default(),
-                in_progress: RefCell::default(),
-            };
-            hierarchy
-                .walk_supertypes((self.file, container))
-                .iter()
-                .any(|handle| receivers.contains(handle))
+        let decl = (self.file, container);
+        if receivers.contains(&decl) {
+            return true;
         }
+        let hierarchy = FoldHierarchy {
+            graph: self.graph,
+            namespaces: self.namespaces,
+            index: self.index,
+            file: self.file,
+            lib: self.lib,
+            memo: RefCell::default(),
+            in_progress: RefCell::default(),
+        };
+        receivers
+            .iter()
+            .any(|receiver| *receiver == decl || hierarchy.closure(*receiver).contains(&decl))
     }
 
     pub(crate) fn resolve_member_row(
@@ -1025,7 +1189,15 @@ impl<'a> Engine<'a> {
         if !self_named {
             self.used_names.insert(row.name);
         }
-        if !self_named && matches!(row.intent, Intent::Read | Intent::ReadWrite) {
+        // A read intent credits the field's implicit getter (the official
+        // `members` face); an `Intent::Operator` is the dot/index-merged
+        // read the `[]` fold rewrites from `Read` (`x._m[k]`, `C.f[i]`) —
+        // the operand still reads the member, so it credits the same.
+        // `ReadWrite` is the compound `??=`/`+=` face (a read before the
+        // write). A bare `Intent::Write` never reads the getter.
+        let reads_getter = matches!(row.intent, Intent::Read | Intent::ReadWrite)
+            || matches!(row.intent, Intent::Operator(..));
+        if !self_named && reads_getter {
             self.read_names.insert(row.name);
             self.note_member_read(row.name, &recv);
         }
@@ -1445,6 +1617,17 @@ impl<'a> Engine<'a> {
             return;
         }
         if let Intent::Operator(..) = row.intent {
+            // The `Object` face the walk cannot reach (its chain ends at an
+            // unindexed root): `hashCode`/`toString`/`==`/`noSuchMethod`/
+            // `runtimeType` are defined on every class-shaped receiver, so
+            // the plain member arm's walk below never fires on them
+            // (`member_defined`'s exemption). The operator-merged row owes
+            // the same guard — `inner.hashCode * 5` is a defined getter read
+            // followed by a check of `*` on the getter's result, never an
+            // `undefined_getter`.
+            if row.name == self.intern("==") || self.members.object_members.contains(&row.name) {
+                return;
+            }
             match self.walk_members(container, row.name) {
                 Walk::Found(entry) => {
                     let ty = Self::member_result_ty(&entry);
@@ -2641,19 +2824,22 @@ impl<'a> Engine<'a> {
         // extension on `I<T>` applies to `J extends I<T>` — the declared
         // supertype lattice, not name equality.
         // The name-level subtype walk plus the faces it cannot see: every
-        // type reaches `Object`, and the unindexed SDK collection roots
-        // (`List`/`Set` and the `dart:collection` bases, all `Iterable`).
+        // type reaches `Object`, and the unindexed SDK collection roots.
+        // `List`/`Set` reach `Iterable` by fiat; the `dart:collection` bases
+        // reach every interface their alias entry declares (`HashMap <: Map`,
+        // `HashSet <: Set`, `ListQueue <: Queue` — the stub declarations the
+        // declared-lattice walk cannot see).
         let reaches = |sub: StringId, sup: StringId| {
             sub == sup
                 || sup == object
                 || world.named_sub(sub, sup)
-                || (sup == iterable && {
-                    let text = strings.resolve(sub);
-                    matches!(text, "List" | "Set")
-                        || crate::member_face::COLLECTION_INTERFACE_ALIASES
-                            .iter()
-                            .any(|(alias, roots)| *alias == text && roots.contains(&"Iterable"))
-                })
+                || (sup == iterable && matches!(strings.resolve(sub), "List" | "Set"))
+                || crate::member_face::COLLECTION_INTERFACE_ALIASES.iter().any(
+                    |(alias, roots)| {
+                        *alias == strings.resolve(sub)
+                            && roots.contains(&strings.resolve(sup))
+                    },
+                )
         };
         // The `on` clause's argument list gates beside the head
         // (`applicable_extensions.dart:205-281` `applicableTo`: the oracle
@@ -2738,13 +2924,20 @@ impl<'a> Engine<'a> {
                         },
                     ) = (on_arg, receiver_arg)
                     else {
-                        // A `dynamic` receiver argument is a subtype of a
-                        // top-shaped `on` argument only — a concrete `on`
-                        // argument rejects it (`isSubtypeOf(dynamic, X)`
-                        // fails in the oracle's `applicableTo`); every other
-                        // non-named pair stays compatible.
-                        return !matches!(receiver_arg, Ty::Dynamic)
-                            || matches!(on_arg, Ty::Dynamic);
+                        // A `dynamic` receiver argument subtypes every
+                        // top-shaped `on` argument (`dynamic <: Object` and
+                        // `dynamic <: Object?` — the oracle's `applicableTo`
+                        // runs the real subtype test, and both tops accept
+                        // it); a concrete `on` argument still rejects it.
+                        // Every other non-named pair stays compatible.
+                        if matches!(receiver_arg, Ty::Dynamic) {
+                            return match on_arg {
+                                Ty::Dynamic => true,
+                                Ty::Named { name, .. } => name == object,
+                                _ => false,
+                            };
+                        }
+                        return true;
                     };
                     if arg_args != ArgListId::EMPTY || receiver_args != ArgListId::EMPTY {
                         return true;

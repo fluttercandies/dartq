@@ -84,6 +84,13 @@ fn unchecked(report: &FileReport) -> Vec<String> {
         .collect()
 }
 
+fn with_prefix(report: &FileReport, prefix: &str) -> Vec<String> {
+    code_names(report)
+        .into_iter()
+        .filter(|name| name.starts_with(prefix))
+        .collect()
+}
+
 /// Cell a: `var`-inferred from an implicit-this field read, `!= null`
 /// then-branch. The oracle is silent.
 #[test]
@@ -384,6 +391,173 @@ final f = () {
     assert!(
         !dead.is_empty(),
         "initializer closure lost the dead row: {:#?}",
+        code_names(&report)
+    );
+}
+
+// —— #2285: the promotion plumbing reaches the bare-row and extension
+// —— resolution faces. Each pin keeps a control within the same source
+// —— where the face can fire, so the assertion is not vacuous.
+
+/// #2285 item 1: a bare row's index operator resolves against the flow's
+/// promoted type. `o` is declared `O`; the `is!` guard promotes it to
+/// `A`, whose `[]` applies. The unguarded control keeps the
+/// `undefined_operator` miss (the operator face itself fires in this
+/// harness).
+#[test]
+fn pin_bare_operator_reads_the_flow_promotion() {
+    let source = "\
+class int {}
+class O {}
+class A extends O {
+  int operator [](int index) => 0;
+}
+void guarded(O o) {
+  if (o is! A) return;
+  o[0];
+}
+void unguarded(O p) {
+  p[0];
+}
+";
+    let report = unit_report(source);
+    let misses = with_prefix(&report, "undefined_operator");
+    assert_eq!(
+        misses.len(),
+        1,
+        "guarded index read lost the promotion: {:#?}",
+        code_names(&report)
+    );
+}
+
+/// #2285 item 3: the operator-merged member row over an `Object` face
+/// member. `hashCode` is defined for every class, but the walk cannot
+/// reach the unindexed root — the plain member arm exempts the
+/// `Object` members, and the operator arm owes the same exemption
+/// (`inner.hashCode * 5` is a getter read plus an operator check on its
+/// result).
+#[test]
+fn pin_operator_merged_object_member_reads_clean() {
+    let source = "\
+class int {}
+class A {}
+class C {
+  A inner = A();
+  int f() => inner.hashCode * 5;
+}
+";
+    let report = unit_report(source);
+    assert!(
+        with_prefix(&report, "undefined_").is_empty(),
+        "operator-merged Object member reported a miss: {:#?}",
+        code_names(&report)
+    );
+}
+
+/// #2285 item 4: the `dart:collection` alias entries reach their
+/// declared interfaces — `HashMap <: Map` through the alias table (the
+/// stub declarations the declared-lattice walk cannot see). The
+/// extension on `Map<K, V>` applies to a `HashMap` receiver.
+#[test]
+fn pin_collection_alias_reaches_its_interface() {
+    let source = "\
+class int {}
+class Map<K, V> {}
+class HashMap<K, V> {}
+extension MapSize<K, V> on Map<K, V> {
+  int get size => 0;
+}
+void f(HashMap<String, int> m) {
+  m.size;
+}
+";
+    let report = unit_report(source);
+    assert!(
+        with_prefix(&report, "undefined_").is_empty(),
+        "HashMap did not reach Map: {:#?}",
+        code_names(&report)
+    );
+}
+
+/// #2285 item 5: the assignment window's receiver read (`outer =
+/// outer.julianday`) resolves on the promoted face, so the extension on
+/// `Expression<DateTime>` applies. The raw declared `Expression`
+/// receiver would pad `dynamic` into the `on` argument and fail the
+/// gate, reporting the getter as undefined.
+#[test]
+fn pin_assignment_window_receiver_reads_promoted_face() {
+    let source = "\
+class bool {}
+class double {}
+class DateTime {}
+class Expression<T> {}
+extension DateTimeExpressions on Expression<DateTime> {
+  Expression<double> get julianday => Expression<double>();
+}
+class C {
+  final bool cond = true;
+  final Expression target = Expression();
+  void f() {
+    var outer = this.target;
+    if (cond) {
+      if (outer is Expression<DateTime>) outer = outer.julianday;
+    }
+  }
+}
+void main() {}
+";
+    let report = unit_report(source);
+    assert!(
+        with_prefix(&report, "undefined_").is_empty(),
+        "assignment-window receiver lost the promotion: {:#?}",
+        code_names(&report)
+    );
+}
+
+/// #2285 item 6: a `dynamic` receiver argument subtypes a top-shaped
+/// `on` argument (`dynamic <: Object?`), so the extension on
+/// `List<Object?>` applies to `List<dynamic>`.
+#[test]
+fn pin_dynamic_type_argument_reaches_top_on_argument() {
+    let source = "\
+class int {}
+class Object {}
+class List<E> {}
+extension ListExt on List<Object?> {
+  int get ext => 0;
+}
+void f(List<dynamic> values) {
+  values.ext;
+}
+";
+    let report = unit_report(source);
+    assert!(
+        with_prefix(&report, "undefined_").is_empty(),
+        "dynamic argument did not reach Object?: {:#?}",
+        code_names(&report)
+    );
+}
+
+/// #2285 item 7: a condition over a callable whose alias head is out of
+/// scope (`Predicate<T>` declared in another file, never imported) is
+/// undecidable at the name level — the condition faces stay silent. The
+/// condition operand's type keeps the unresolved alias head (the send's
+/// result is beyond the name-level model there), and an undecidable
+/// head must not decide a non-`bool` verdict.
+#[test]
+fn pin_unresolved_alias_condition_stays_silent() {
+    let source = "\
+class T {}
+Predicate<T> createMatcher() => (T value) => true;
+void f(T value) {
+  final tester = createMatcher();
+  if (tester(value)) {}
+}
+";
+    let report = unit_report(source);
+    assert!(
+        with_prefix(&report, "non_bool_condition").is_empty(),
+        "unresolved alias head fired a condition verdict: {:#?}",
         code_names(&report)
     );
 }

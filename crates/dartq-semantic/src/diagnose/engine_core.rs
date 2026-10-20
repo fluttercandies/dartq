@@ -566,6 +566,13 @@ impl<'a> Engine<'a> {
             // which matches upstream wherever the property is not
             // promotable (field promotion needs a private, final field).
             if matches!(check.kind, StagedKind::NullableCondition) {
+                // The opaque flow face's rescue (the same face the staged
+                // kinds' general arm takes): a flow row spelling `Unknown`
+                // carried only the nullability decision — the lattice
+                // cannot spell the type (a function-typed formal's send,
+                // #2144) — so the parse-time type stands. Deciding
+                // `non_bool_condition` on the opaque marker would drop a
+                // known non-`bool` candidate the parse-time face answers.
                 let from = conditions
                     .iter()
                     .rev()
@@ -573,6 +580,7 @@ impl<'a> Engine<'a> {
                     .map(|(_, ty)| *ty)
                     .or_else(|| promotions.promoted(check.range))
                     .or_else(|| self.promotable_field_substitution(props, check.range, check.from))
+                    .filter(|ty| *ty != Ty::Unknown)
                     .unwrap_or(check.from);
                 if self.nullable_bool_ty(from) {
                     let code = SemanticCode::UncheckedUseOfNullableValue;
@@ -2594,6 +2602,18 @@ impl<'a> Engine<'a> {
         match ty {
             Ty::Named { .. } => match self.fold_alias_ty(ty) {
                 Ty::Named { name, .. } => {
+                    // An out-of-scope head is a foreign projection this unit
+                    // cannot resolve (an unexported function-type alias rides
+                    // inference without an import — drift's `Predicate<T>`):
+                    // class-vs-alias is undecidable at the name level while
+                    // the oracle resolves it, so the condition faces keep
+                    // silent. The dart:core primitives have no declaring
+                    // stub, yet their non-`bool` verdicts are known.
+                    if self.top_level_decl(name).is_none()
+                        && !self.members.primitive_ids.contains(&name)
+                    {
+                        return false;
+                    }
                     name != self.members.primitive_ids[3]
                         && !matches!(
                             self.top_level_decl(name).map(|decl| decl.kind),
