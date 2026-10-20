@@ -1342,6 +1342,15 @@ impl<'a> Engine<'a> {
         row: &Row,
         recv: Receiver,
     ) {
+        // The never-receiver junction (`receiverType is NeverTypeImpl`,
+        // method_invocation_resolver.dart:644-667, the property resolver's
+        // twin guards): the member lookup never runs on a `Never` receiver —
+        // the staged receiver row (`receiver_of_type_never`) and the send's
+        // dead tail own the face, and `_resolveReceiverWithoutTarget`
+        // answers nothing (`f().foo()` reports the receiver pair alone).
+        if matches!(recv, Receiver::Typed { ty, .. } if self.is_never_ty(ty)) {
+            return;
+        }
         let (container, this_kind) = match recv {
             Receiver::This { container, kind } => (container, Some(kind)),
             Receiver::Typed { type_name, .. } => (type_name, None),
@@ -2850,46 +2859,25 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// Whether the receiver's interned type resolves everywhere — the
-    /// oracle's `InvalidType` test `extension_application` gates on. A
-    /// written type carrying an unresolvable name anywhere inside
-    /// (`List<UnresolvedName>` — the head `List` still resolves, so the
-    /// caller's `Ty::UNKNOWN` probe arm runs the head check itself;
-    /// `(Missing,)`, `Missing Function()`) is an `InvalidType`: the
-    /// resolver reports the spelling's own row and the access resolves
-    /// nothing, so no extension member may credit or suppress it. The walk
-    /// unfolds the `Ty` recursively through the boundary pool —
-    /// `Named.args`, a record's field types, a function type's return and
-    /// formal types — every `Named` head re-running the access's own
-    /// `type_resolution` verdict; non-named leaves (`dynamic`, `void`, the
-    /// bottom shapes) resolve by construction.
+    /// Whether the receiver's interned type resolves at its head — the
+    /// oracle's `InvalidType` test `extension_application` gates on. Only
+    /// the top-level `Named` head decides: `Missing x` leaves the receiver
+    /// an `InvalidType`, so `applicableTo` returns no `ExtensionResolution`
+    /// and the access resolves nothing. A resolved head carrying an
+    /// unresolvable name deeper inside is still a valid interface/record/
+    /// function type, not an `InvalidType`: `List<InvalidType>` stays an
+    /// `InterfaceType`, a `(Missing,)` record stays a `RecordType`, and a
+    /// callee's unbound type-parameter spelling (the `A` in `seq2`'s
+    /// declared `Parser<(A, B)>`) instantiates at the send — so the member
+    /// face runs and the `on`-clause gate decides applicability. Probed
+    /// against the oracle: `MyList<Missing>` applies `on MyList<C>` (the
+    /// member resolves, no `undefined_*`), while a `(Missing,)` receiver
+    /// reports `undefined_getter` through the argument gate's own verdict.
     fn extension_receiver_resolves(&self, receiver_ty: Ty) -> bool {
-        let mut stack = vec![receiver_ty];
-        while let Some(ty) = stack.pop() {
-            match ty {
-                Ty::Named { name, args, .. } => {
-                    if self.type_resolution(name).0 != TypeResolution::Type {
-                        return false;
-                    }
-                    stack.extend_from_slice(self.boundary.pool().get(args));
-                }
-                Ty::Record { shape, .. } => {
-                    let pool = self.boundary.pool();
-                    let shape = pool.record_shape(shape);
-                    stack.extend_from_slice(&shape.positional);
-                    stack.extend(shape.named.iter().map(|&(_, ty)| ty));
-                }
-                Ty::Function { shape, .. } => {
-                    let pool = self.boundary.pool();
-                    let shape = pool.function_shape(shape);
-                    stack.push(shape.return_ty);
-                    stack.extend_from_slice(&shape.positional);
-                    stack.extend(shape.named.iter().map(|&(_, ty)| ty));
-                }
-                _ => {}
-            }
+        match receiver_ty {
+            Ty::Named { name, .. } => self.type_resolution(name).0 == TypeResolution::Type,
+            _ => true,
         }
-        true
     }
 
     /// The `accessibleExtensions` list `extension_application` probes

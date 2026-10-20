@@ -662,7 +662,12 @@
         assert_eq!(last.range.offset as usize, head + "for (f(); f(); ".len());
     }
 
-    /// The cascade split: the target is a use, the section is not.
+    /// The cascade split: the target is a use, the section is not. The
+    /// section's callee resolves on the cascade target's static type
+    /// (`int`, the declared return of `f`) — `g` is no member of it, so
+    /// the section reports the oracle's member miss (probed 3.13.1:
+    /// "The method 'g' isn't defined for the type 'int'.") and carries no
+    /// `unused_result` (an undefined callee joins no `@UseResult` credit).
     #[test]
     fn cascade_target_silent_section_fires() {
         let src = "import 'package:meta/meta.dart';\n\
@@ -671,7 +676,11 @@
                    @UseResult()\nint g() => 2;\n\
                    void main() {\n  f()..g();\n}";
         let report = use_result_report(src);
-        assert_eq!(code_names(&report), ["unused_result"]);
+        assert_eq!(code_names(&report), ["undefined_method"]);
+        assert_eq!(
+            report.diagnostics[0].message,
+            "The method 'g' isn't defined for the type 'int'."
+        );
         let head = src.find("f()..g()").unwrap();
         assert_eq!(
             report.diagnostics[0].range.offset as usize,

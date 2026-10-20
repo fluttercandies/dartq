@@ -5458,16 +5458,16 @@
     /// side #2230): a bare name or `this.member` access resolves against
     /// the constraint face — hits stay silent; a member the constraint
     /// provably lacks reports, naming `this`'s static type (the oracle's
-    /// `InstanceLookupDomain` receiver type): the mixin itself for a mixin
-    /// body, the `on` type for an extension body.
+    /// `InstanceLookupDomain` receiver type).
     ///
-    /// Hand-trace: `real` hits `C`'s method through `mixin M on C`'s
-    /// constraint walk (silent). `this.real2` misses and names `M`.
-    /// `real3` is the bare decidable miss: `extension X on C` fully walks
-    /// `C`, `C` lacks the name, the member scope is final — the oracle
-    /// keeps the top-level `undefined_function` face (the on-type names
-    /// only the explicit-`this` member walks). `this.real4` misses and
-    /// names the `on`-type head `C`.
+    /// Hand-trace (probed 3.13.1: all three bare/`this` misses name the
+    /// face type — the bare walk rides the same on-face as `this`, there
+    /// is no top-level `undefined_function` fallback): `real` hits `C`'s
+    /// method through `mixin M on C`'s constraint walk (silent).
+    /// `this.real2` misses and names `M`. `real3` is the bare decidable
+    /// miss: `extension X on C` fully walks `C`, `C` lacks the name, the
+    /// member scope is final — the miss names the on-type head `C`.
+    /// `this.real4` misses and names `C` too.
     #[test]
     fn mixin_and_extension_bodies_decidable_misses_report_on_this_type() {
         let report = report(
@@ -5478,10 +5478,11 @@
         assert_eq!(
             code_names(&report),
             [
+                // real() — `C` declares it through M's constraint walk.
                 // this.real2() — a mixin body's `this` is the mixin itself.
                 "undefined_method",
-                // real3() — the bare miss keeps the top-level face.
-                "undefined_function",
+                // real3() — the bare miss names the extension's on type.
+                "undefined_method",
                 // this.real4() — an extension body's `this` is the on type.
                 "undefined_method",
             ],
@@ -5491,6 +5492,10 @@
         assert_eq!(
             report.diagnostics[0].message,
             "The method 'real2' isn't defined for the type 'M'."
+        );
+        assert_eq!(
+            report.diagnostics[1].message,
+            "The method 'real3' isn't defined for the type 'C'."
         );
         assert_eq!(
             report.diagnostics[2].message,
@@ -5942,7 +5947,11 @@
     /// operand's rows, and bare rows between them (`k`, a non-null `K`) must
     /// not become the target: the mark scan filters past the RHS rows
     /// instead of stopping at the first one (the corpus's `groupBy` row,
-    /// `functions.dart:59` — a for-in header row kept the fallthrough alive).
+    /// `functions.dart:59`). The for-in header reports the oracle's own row
+    /// (probed 3.13.1: `I<M>` implements no `Iterable` — "The type 'I<M>'
+    /// used in the 'for' loop must implement 'Iterable'."); the loop
+    /// variable reads `dynamic` and the compound body stays silent — the
+    /// mark scan's under-report posture still holds beside the header row.
     #[test]
     fn compound_mark_scan_reaches_through_the_right_operand_rows() {
         let source = "class Object {} class V {} class K {} class I<T> {} \
@@ -5950,7 +5959,7 @@
                       void operator []=(Object? k, V v) {} } \
                       void f(I<M> ms, K k, V v) { for (var m in ms) { (m[k] ??= v); } }";
         let names = code_names(&report(source));
-        assert!(names.is_empty(), "{names:?}");
+        assert_eq!(names, ["for_in_of_invalid_type"], "{names:?}");
     }
 
     /// `const x = Missing()` — an unresolved callee inside a const
@@ -16241,23 +16250,29 @@
     /// The invoke miss's `UnqualifiedLookupDomain`: inside `mixin M` the
     /// bare callee names the enclosing interface element — `undefined_method`
     /// on `M` (upstream's `enclosingClass` is an `InterfaceElement`, which
-    /// mixins are). An extension's miss keeps `undefined_function` (the
-    /// extension element is not an interface element upstream).
+    /// mixins are). An extension's bare miss names its `on` type the same
+    /// way (probed 3.13.1: `Bar` reports "for the type 'int'" — the
+    /// extended type is `this`'s static type in the member lookup, there
+    /// is no top-level `undefined_function` fallback).
     #[test]
-    fn mixin_invoke_miss_names_the_mixin_extension_keeps_function() {
+    fn mixin_and_extension_invoke_misses_name_the_face_type() {
         let r = report(
             "class int {}\n\
              mixin M {\n  void m() { Foo(); }\n}\n\
              extension E on int {\n  void g() { Bar(); }\n}",
         );
         let names = code_names(&r);
-        assert_eq!(names, ["undefined_method", "undefined_function"], "{names:?}");
+        assert_eq!(names, ["undefined_method", "undefined_method"], "{names:?}");
         assert!(
             r.diagnostics[0]
                 .message
                 .contains("for the type 'M'"),
             "{:?}",
             r.diagnostics[0].message
+        );
+        assert_eq!(
+            r.diagnostics[1].message,
+            "The method 'Bar' isn't defined for the type 'int'."
         );
     }
 
