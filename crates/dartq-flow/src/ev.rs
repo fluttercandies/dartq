@@ -126,6 +126,14 @@ pub enum Ev {
     IfBegin {
         span: TokenSpan,
     },
+    /// `handle_parenthesized_condition` with a `case` keyword: the
+    /// parenthesized if-condition ended in the pattern form
+    /// (`if (e case p when g)`). The parser passes `Some(case)` only for
+    /// the if-case shape, so this event is the exact marker that the
+    /// standalone pattern context opened inside the condition is the
+    /// clause's context; `ThenBegin` adopts it only after this event
+    /// turned its kind into `IfCase`.
+    IfCaseCondition,
     ThenBegin,
     ElseBegin,
     IfEnd {

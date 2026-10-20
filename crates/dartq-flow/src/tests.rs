@@ -6493,6 +6493,208 @@ String h(Object v) {
     assert!(dead_snippets(source).is_empty());
 }
 
+/// A for-in head pattern opens a standalone pattern context that official
+/// `patternForIn_end` pops at the `in` keyword, before the iterable runs.
+/// Leaked, its unreachable unmatched chain became the else branch of the
+/// NEXT plain if: a bare `ThenBegin` adopted any open `Decl` context and
+/// used its unmatched as the branch state (args `usage.dart:101` — the
+/// spurious else dead row after a for-in object pattern).
+#[test]
+fn for_in_pattern_head_does_not_dead_the_next_if_else() {
+    let source = r#"void f(Helper? helper, Iterable<(int, int)> pairs) {
+  for (final (a, b) in pairs) {
+    a + b;
+  }
+  if (helper != null) {
+    helper.hashCode;
+  } else {
+    'missing'.length;
+  }
+}"#;
+    assert_eq!(dead_snippets(source), Vec::<String>::new());
+}
+
+/// The pattern variable declaration's context closes at its own end
+/// (official `patternVariableDeclaration_end`): the declaration's
+/// unmatched chain must not become the next plain if's else branch.
+#[test]
+fn pattern_declaration_does_not_dead_the_next_if_else() {
+    let source = r#"void f(int? n) {
+  var (a, b) = (1, 2);
+  if (n == 3) {
+    n + 1;
+  } else {
+    'other'.length;
+  }
+}"#;
+    assert_eq!(dead_snippets(source), Vec::<String>::new());
+}
+
+/// The pattern assignment's context closes at the assignment's end
+/// (official `patternAssignment_end`) — no leak into the following if.
+#[test]
+fn pattern_assignment_does_not_dead_the_next_if_else() {
+    let source = r#"void f(int? n) {
+  int a, b;
+  (a, b) = (1, 2);
+  if (n == 3) {
+    n + 1;
+  } else {
+    'other'.length;
+  }
+}"#;
+    assert_eq!(dead_snippets(source), Vec::<String>::new());
+}
+
+/// An `is`-check consumed as a plain value narrows nothing: the split
+/// rides `Expr::branches` for the condition consumers, and a value
+/// context keeps the pre-test state. Narrowing at the fold poisoned later
+/// reads — a following `x ?? g()` saw a promoted `x` and deaded `g()`
+/// (dio `options.dart:629`, the `copyWith` argument list).
+#[test]
+fn value_context_null_comparison_does_not_narrow() {
+    let source = r#"int? g() => 1;
+void f(int? a) {
+  final b = a != null;
+  int c = a ?? g();
+  print(c);
+  print(b);
+}"#;
+    assert_eq!(dead_snippets(source), Vec::<String>::new());
+}
+
+/// An `is`-check in a plain initializer narrows nothing either; the
+/// condition context still splits (control below).
+#[test]
+fn value_context_is_check_does_not_narrow() {
+    let source = r#"void f(int? a) {
+  final b = a is int;
+  int c = a ?? 3;
+  print(c);
+  print(b);
+}"#;
+    assert_eq!(dead_snippets(source), Vec::<String>::new());
+}
+
+/// Condition-context null comparison still promotes (the split consumer
+/// control for the value-context pins).
+#[test]
+fn condition_context_null_comparison_still_promotes() {
+    let source = r#"void f(int? a) {
+  if (a != null) {
+    print(a + 1);
+  }
+}"#;
+    assert_eq!(dead_snippets(source), Vec::<String>::new());
+}
+
+/// A Never exit inside a then arm dies with its region: the IfEnd join
+/// revives the flow and retires the exit's anchoring latch, so a later
+/// flow-killing statement (`throw 'end';`) does not self-anchor on the
+/// stale exit (riverpod `async_value.dart:603`). Hand-driven: the exit
+/// event fires only when a resolved back-end answers Never, which the
+/// name-level pipeline never does.
+#[test]
+fn never_exit_in_then_arm_does_not_dead_post_join_throw() {
+    use crate::ev::Ev;
+    use crate::facts::FlowFact;
+    // `void g(bool c) { if (c) { boom(); } throw 'end'; }`
+    let events: Vec<Ev> = [
+        vec![
+            Ev::ExecBegin { is_closure: false },
+            Ev::BlockBodyBegin,
+        ],
+        vec![Ev::IfBegin { span: tspan(17) }],
+        vec![Ev::OtherExpr { span: tspan(21) }],
+        vec![
+            Ev::ThenBegin,
+            Ev::Block {
+                kind: crate::ev::BlockKind::Statement,
+                span: tspan(23),
+            },
+            // `boom();` — the call resolves to Never; the exit drains after
+            // the statement's own wrapper (the recorder latches it across
+            // the wrapper).
+            Ev::OtherExpr { span: tspan(25) },
+            Ev::Exit { end: tspan(30) },
+            Ev::ExprStmt { span: tspan(25) },
+            Ev::StmtEnd { end: 32 },
+            Ev::EndBlock { end: 34 },
+            Ev::IfEnd { has_else: false },
+            Ev::StmtEnd { end: 34 },
+        ],
+        // `throw 'end';` — kills the flow itself; its wrapper must stay
+        // silent (the join retired the exit latch).
+        vec![
+            Ev::OtherExpr { span: tspan(36) },
+            Ev::Throw,
+            Ev::ExprStmt { span: tspan(36) },
+            Ev::StmtEnd { end: 47 },
+        ],
+        vec![
+            Ev::BlockBodyEnd,
+            Ev::ExecEnd {
+                is_expr: false,
+                end: tspan(48),
+            },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(&events);
+    assert!(
+        !interp
+            .facts
+            .iter()
+            .any(|fact| matches!(fact, FlowFact::DeadCode { .. })),
+        "the throw after the revived join is oracle-clean: {:?}",
+        interp.facts
+    );
+}
+
+/// Control for the retirement pin: without the if-join the next statement
+/// anchors its own dead row (`boom(); g();` reports at `g();`).
+#[test]
+fn never_exit_still_anchors_the_next_statement() {
+    use crate::ev::Ev;
+    use crate::facts::FlowFact;
+    // `void g() { boom(); print('x'); }`
+    let events: Vec<Ev> = [
+        vec![
+            Ev::ExecBegin { is_closure: false },
+            Ev::BlockBodyBegin,
+        ],
+        vec![
+            Ev::OtherExpr { span: tspan(12) },
+            Ev::Exit { end: tspan(17) },
+            Ev::ExprStmt { span: tspan(12) },
+            Ev::StmtEnd { end: 19 },
+        ],
+        vec![
+            Ev::OtherExpr { span: tspan(20) },
+            Ev::ExprStmt { span: tspan(20) },
+            Ev::StmtEnd { end: 30 },
+        ],
+        vec![
+            Ev::BlockBodyEnd,
+            Ev::ExecEnd {
+                is_expr: false,
+                end: tspan(31),
+            },
+        ],
+    ]
+    .concat();
+    let interp = interp_of(&events);
+    let dead: Vec<_> = interp
+        .facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::DeadCode { span } => Some(span.range.offset),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dead, vec![20], "{:?}", interp.facts);
+}
+
 /// #2158 pin: a creation RHS types the write — `x = C()..m()` (the cascade
 /// keeps the head's named type as the target's), `x = new C()`,
 /// `x = const C()`, `x = C<T>.named()` and `x = C<T>()` all promote a `C?`
@@ -7248,4 +7450,96 @@ fn ifnull_guaranteed_non_null_left_still_deads_the_right() {
     // never evaluates the right (the oracle deads it too).
     let source = "int f(int a) => a ?? 1;";
     assert_eq!(dead_snippets(source), ["?? 1"]);
+}
+
+#[test]
+fn staged_declared_rhs_yields_to_the_folds_promoted_read() {
+    // The semantic layer stages an assignment RHS with its RESOLUTION
+    // type (declared, unpromoted — listener's staged-assignment face).
+    // When the RHS is a bare local read the flow already promoted
+    // (`if (b == null) return;` narrows `b` to `int`), the promoted flow
+    // type is the oracle's write type: the target narrows through it and
+    // the if-join leaves the promotion live for the argument check
+    // (analyzer `context_locator.dart:276` family). The staged declared
+    // face must not demote the write back to `int?`.
+    let source = r#"void g(int x) {}
+void f(int? a, int? b) {
+  if (b == null) return;
+  if (a == null) {
+    a = b;
+  }
+  g(a);
+}"#;
+    // Two passes with the staged face mounted (offsets are
+    // deterministic for the same source): the first finds the write
+    // target's token offset, the second stages `int?` there exactly like
+    // the semantic layer before the fold.
+    let target_offset = source.find("a = b").unwrap() as u32;
+    let result = dartq_scanner::scan(
+        source,
+        ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        },
+        dartq_source::FileTable::new().intern(std::path::Path::new("test.dart")),
+    );
+    assert!(result.diagnostics.is_empty());
+    let tokens: &'static TokenTable = Box::leak(Box::new(result.tokens));
+    let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+        LanguageVersion::new(3, 15),
+    ));
+    let mut flow = SharedFlow(std::rc::Rc::new(std::cell::RefCell::new(Flow::new(
+        tokens, source,
+    ))));
+    let int_name = flow.0.borrow_mut().intern_name("int");
+    flow.0.borrow_mut().stage_assignment_rhs(
+        target_offset,
+        crate::ty::Ty {
+            base: crate::ty::Base::Name(int_name),
+            nullable: true,
+        },
+    );
+    let mut parser = dartq_parser::Parser::new(source, tokens, features, &mut flow);
+    parser.parse_unit();
+    drop(parser);
+    let facts = flow.0.borrow_mut().take_facts();
+    // The read of `a` in `g(a)` carries the promoted `int`.
+    let g_arg = (source.find("g(a)").unwrap() + 2) as u32;
+    let promoted: Vec<crate::ty::Ty> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::PromotedRead { span, ty, .. } if span.range.offset == g_arg => Some(*ty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(promoted.len(), 1, "{facts:?}");
+    assert!(!promoted[0].nullable);
+}
+
+#[test]
+fn assignment_with_promoted_rhs_promotes_the_target_through_the_join() {
+    // The unstaged fold (bare flow harness): the promoted RHS read type
+    // is the write type, and the if-join keeps the target promoted for
+    // the read after the `if` — the oracle's clean `g(a)` (probe u3).
+    let source = r#"
+void g(int x) {}
+void f(int? a, int? b) {
+  if (b == null) return;
+  if (a == null) {
+    a = b;
+  }
+  g(a);
+}
+"#;
+    let (_, facts) = analyze(source);
+    let g_arg = (source.find("g(a)").unwrap() + 2) as u32;
+    let promoted: Vec<crate::ty::Ty> = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::PromotedRead { span, ty, .. } if span.range.offset == g_arg => Some(*ty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(promoted.len(), 1, "{facts:?}");
+    assert!(!promoted[0].nullable);
 }

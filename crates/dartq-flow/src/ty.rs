@@ -200,6 +200,28 @@ pub trait TypeOps {
         false
     }
 
+    /// Whether `ty` — a pattern's required type — is the resolved
+    /// `Invalid` type (official `promoteForPattern`'s
+    /// `knownType is SharedInvalidType` arm,
+    /// `flow_analysis.dart:7720-7723`). `args`/`arena`/`names` carry the
+    /// written spelling exactly like [`TypeOps::is_subtype_typed`]. The
+    /// default answers `false`: the name-level lattice has no `Invalid`
+    /// type. A resolved back-end overrides it so a pattern whose written
+    /// type resolves nowhere neither tests nor promotes — the official
+    /// rejoins the live state into the unmatched chain and keeps the body
+    /// running, where the `Invalid` factor would vacuously answer `Never`
+    /// (subtype.dart's 0c arm) and dead every pattern body.
+    fn is_invalid_typed(
+        &self,
+        ty: Ty,
+        args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> bool {
+        let _ = (ty, args, arena, names);
+        false
+    }
+
     /// Publishes the recorder's interned-name lexeme table to the back-end
     /// before a replay begins (`Interp::run`'s single call). The base ops
     /// take bare `Ty`s — a `Base::Name(id)` carries no lexeme of its own —

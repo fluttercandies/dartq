@@ -60,7 +60,7 @@ impl Interp<'_> {
                         let scrutinee = self.exprs.pop().and_then(|e| e.reference);
                         let unmatched = self.current.clone().set_unreachable(&mut self.reach);
                         self.pattern = Some(PatternState {
-                            kind: std::mem::replace(&mut self.pattern_kind_hint, PatternKind::Decl),
+                            kind: PatternKind::Decl,
                             unmatched,
                             scrutinee,
                             guard: None,
@@ -274,31 +274,30 @@ impl Interp<'_> {
                 if !self.collecting()
                     && self.pattern_depth == 1
                     && declared != Ty::UNKNOWN
-                    && let Some(var) = self.pattern_scrutinee()
                 {
-                    let model = self.current.model(var);
-                    let (matched_ty, matched_args) = (
-                        self.promoted_type_of(var, &model),
-                        self.promoted_args_of(var, &model),
-                    );
-                    let candidate =
-                        self.pattern_promotion_candidate(var, declared, declared_args);
-                    let (matched_arm, unmatched_arm) =
-                        self.branch_type_test(var, declared, declared_args, candidate);
-                    self.current = matched_arm;
-                    if !self.ops.is_subtype_typed(
-                        matched_ty,
-                        matched_args,
-                        declared,
-                        declared_args,
-                        self.args,
-                        self.names,
-                    ) && let Some(chain) =
-                        self.pattern.as_ref().map(|p| p.unmatched.clone())
-                    {
-                        let joined = self.join(Some(chain), Some(unmatched_arm));
-                        if let Some(pattern) = self.pattern.as_mut() {
-                            pattern.unmatched = joined;
+                    if self.pattern_known_invalid(declared, declared_args) {
+                        return;
+                    }
+                    if let Some(var) = self.pattern_scrutinee() {
+                        let model = self.current.model(var);
+                        let (matched_ty, matched_args) = (
+                            self.promoted_type_of(var, &model),
+                            self.promoted_args_of(var, &model),
+                        );
+                        let candidate =
+                            self.pattern_promotion_candidate(var, declared, declared_args);
+                        let (matched_arm, unmatched_arm) =
+                            self.branch_type_test(var, declared, declared_args, candidate);
+                        self.current = matched_arm;
+                        if !self.ops.is_subtype_typed(
+                            matched_ty,
+                            matched_args,
+                            declared,
+                            declared_args,
+                            self.args,
+                            self.names,
+                        ) {
+                            self.join_unmatched(unmatched_arm);
                         }
                     }
                 }
@@ -326,31 +325,30 @@ impl Interp<'_> {
                 if !self.collecting()
                     && self.pattern_depth == 1
                     && declared != Ty::UNKNOWN
-                    && let Some(var) = self.pattern_scrutinee()
                 {
-                    let model = self.current.model(var);
-                    let (matched_ty, matched_args) = (
-                        self.promoted_type_of(var, &model),
-                        self.promoted_args_of(var, &model),
-                    );
-                    let candidate =
-                        self.pattern_promotion_candidate(var, declared, declared_args);
-                    let (matched_arm, unmatched_arm) =
-                        self.branch_type_test(var, declared, declared_args, candidate);
-                    self.current = matched_arm;
-                    if !self.ops.is_subtype_typed(
-                        matched_ty,
-                        matched_args,
-                        declared,
-                        declared_args,
-                        self.args,
-                        self.names,
-                    ) && let Some(chain) =
-                        self.pattern.as_ref().map(|p| p.unmatched.clone())
-                    {
-                        let joined = self.join(Some(chain), Some(unmatched_arm));
-                        if let Some(pattern) = self.pattern.as_mut() {
-                            pattern.unmatched = joined;
+                    if self.pattern_known_invalid(declared, declared_args) {
+                        return;
+                    }
+                    if let Some(var) = self.pattern_scrutinee() {
+                        let model = self.current.model(var);
+                        let (matched_ty, matched_args) = (
+                            self.promoted_type_of(var, &model),
+                            self.promoted_args_of(var, &model),
+                        );
+                        let candidate =
+                            self.pattern_promotion_candidate(var, declared, declared_args);
+                        let (matched_arm, unmatched_arm) =
+                            self.branch_type_test(var, declared, declared_args, candidate);
+                        self.current = matched_arm;
+                        if !self.ops.is_subtype_typed(
+                            matched_ty,
+                            matched_args,
+                            declared,
+                            declared_args,
+                            self.args,
+                            self.names,
+                        ) {
+                            self.join_unmatched(unmatched_arm);
                         }
                     }
                 }
@@ -400,12 +398,15 @@ impl Interp<'_> {
         if self.pattern_depth != 1 {
             return;
         }
-        let Some(var) = self.pattern_scrutinee() else {
-            return;
-        };
         let known = Ty {
             base: Base::Name(name),
             nullable: false,
+        };
+        if self.pattern_known_invalid(known, args) {
+            return;
+        }
+        let Some(var) = self.pattern_scrutinee() else {
+            return;
         };
         let model = self.current.model(var);
         let (matched, matched_args) = (
@@ -425,13 +426,35 @@ impl Interp<'_> {
             args,
             self.args,
             self.names,
-        ) && let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone())
-        {
-            let joined = self.join(Some(chain), Some(unmatched_arm));
+        ) {
+            self.join_unmatched(unmatched_arm);
+        }
+    }
+
+    /// Rejoins one state into the open pattern's unmatched chain (official
+    /// `_unmatched = _join(_unmatched!, state)` at every may-fail arm).
+    fn join_unmatched(&mut self, state: crate::model::State) {
+        if let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) {
+            let joined = self.join(Some(chain), Some(state));
             if let Some(pattern) = self.pattern.as_mut() {
                 pattern.unmatched = joined;
             }
         }
+    }
+
+    /// The official `promoteForPattern` invalid-required-type arm
+    /// (`flow_analysis.dart:7720-7723`): a pattern whose written type
+    /// resolves nowhere neither tests nor promotes — the live state
+    /// rejoins the unmatched chain and the body keeps running on it.
+    /// Without the arm the type test's `factor(any, Invalid)` answers
+    /// `Never` (subtype.dart's 0c arm) and every such pattern body deads.
+    fn pattern_known_invalid(&mut self, known: Ty, args: u32) -> bool {
+        if !self.ops.is_invalid_typed(known, args, self.args, self.names) {
+            return false;
+        }
+        let cur = self.current.clone();
+        self.join_unmatched(cur);
+        true
     }
 
     /// The matched value's variable — the key every matched-type question
@@ -578,6 +601,38 @@ impl Interp<'_> {
         {
             *slot = unmatched;
         }
+    }
+
+    /// The if-case marker (`handle_parenthesized_condition` with a `case`
+    /// keyword): the standalone pattern context opened inside the condition
+    /// is this if's clause context. Turning the kind here — at the
+    /// condition's end — keeps `ThenBegin`'s adoption exact: an ordinary
+    /// if never sees an `IfCase` context and never adopts one.
+    pub(crate) fn if_case_condition(&mut self) {
+        if let Some(pattern) = self.pattern.as_mut()
+            && pattern.kind == PatternKind::Decl
+        {
+            pattern.kind = PatternKind::IfCase;
+        }
+    }
+
+    /// Closes a standalone pattern context at its construct's end — the
+    /// official `_popPattern(null)` sites (`patternVariableDeclaration_end`,
+    /// `patternAssignment_end`, `patternForIn_end`): the matched state's
+    /// split is undone (`_setCurrent(_current.unsplit())`) and the unmatched
+    /// chain is dropped (a declaration, assignment, or for-in head has no
+    /// alternative clause to fall through to). Only a `Decl` context closes
+    /// here: a switch context belongs to its clause machinery, and an
+    /// `IfCase` context is consumed by `ThenBegin`.
+    pub(crate) fn close_standalone_pattern(&mut self) {
+        let Some(pattern) = self.pattern.take() else {
+            return;
+        };
+        if pattern.kind != PatternKind::Decl {
+            self.pattern = Some(pattern);
+            return;
+        }
+        self.current = self.current.clone().unsplit(&mut self.reach);
     }
 
     /// Applies a pattern's guard to split matched/unmatched, returning the

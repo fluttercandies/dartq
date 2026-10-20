@@ -365,6 +365,12 @@ pub(crate) struct Expr {
     pub bool_value: Option<bool>,
     /// Non-trivial branch states (`ifTrue`/`ifFalse`); `None` = trivial.
     pub branches: Option<(State, State)>,
+    /// The branches are a type-test/equality split whose fold also
+    /// narrowed `self.current` to the true arm: a value consumer that
+    /// drops this expression rejoins both arms
+    /// ([`Interp::rejoin_value_split`]). Null-short and control-branch
+    /// pairs resolve through their own machinery and never rejoin here.
+    pub test_split: bool,
     /// The token of a bare variable read, when this expression is exactly
     /// one: a plain assignment target retracts the read's fact (the
     /// identifier is the write, not a read).
@@ -394,6 +400,7 @@ impl Expr {
             this_recv: false,
             bool_value: None,
             branches: None,
+            test_split: false,
             read_span: None,
             name: None,
             chain_base: None,
@@ -409,6 +416,7 @@ impl Expr {
             this_recv: false,
             bool_value: None,
             branches: None,
+            test_split: false,
             read_span: None,
             name: None,
             chain_base: None,
@@ -710,6 +718,15 @@ pub(crate) struct Interp<'o> {
     /// `Ev::Assign` when the fold's own RHS read is the unknown face.
     /// Read-only for the replay.
     pub(crate) staged_rhs: &'o FxHashMap<u32, crate::ty::Ty>,
+    /// `this`-read types keyed on the `this` token's offset: the semantic
+    /// layer resolves a `this` read its event stream leaves unknown — an
+    /// extension or extension-type instance member's extended type — and
+    /// stages it here before the executable's replay. The `Ev::This` fold
+    /// adopts it when its own answer is the unknown face; the `switch
+    /// (this)` scrutinee and every `this`-chained read then answer on the
+    /// real type. Entries whose `this` never folds are inert (bounded by
+    /// the unit's `this`-read count).
+    pub(crate) staged_this: &'o FxHashMap<u32, crate::ty::Ty>,
     /// The recorder's interned name lexemes, mounted at replay time: the
     /// class-head face (`x = C()`) reads the callee's spelling — a
     /// lowercase head is a function/getter call, not an implicit creation.
@@ -765,10 +782,6 @@ pub(crate) struct Interp<'o> {
     pub(crate) pending_decl_bases: Vec<usize>,
     pub(crate) pattern: Option<PatternState>,
     pub(crate) pattern_depth: usize,
-    /// Context for the next top-level pattern (case expressions and
-    /// switch-expression cases pre-announce; everything else defaults to
-    /// a declaration context).
-    pub(crate) pattern_kind_hint: PatternKind,
     pub(crate) type_test_pending: Option<(bool, Ty, u32)>,
     pub(crate) as_cast_pending: Option<Ty>,
     /// The type currently being parsed (test/cast/formal consumers).
@@ -877,6 +890,12 @@ static NO_INFERRED_LOCALS: std::sync::LazyLock<FxHashMap<u32, crate::ty::Ty>> =
 static NO_STAGED_RHS: std::sync::LazyLock<FxHashMap<u32, crate::ty::Ty>> =
     std::sync::LazyLock::new(FxHashMap::default);
 
+/// The direct-construction default for [`Interp::staged_this`]: no staged
+/// `this` types — every `this` read keeps the unknown face (the
+/// pre-#2292 behavior).
+static NO_STAGED_THIS: std::sync::LazyLock<FxHashMap<u32, crate::ty::Ty>> =
+    std::sync::LazyLock::new(FxHashMap::default);
+
 /// The direct-construction default for [`Interp::names`]: no lexemes —
 /// every invocation head reads as a non-class call.
 static NO_NAMES: std::sync::LazyLock<Vec<Box<str>>> = std::sync::LazyLock::new(Vec::new);
@@ -910,6 +929,7 @@ impl<'o> Interp<'o> {
             top_level: &NO_TOP_LEVEL,
             inferred_locals: &NO_INFERRED_LOCALS,
             staged_rhs: &NO_STAGED_RHS,
+            staged_this: &NO_STAGED_THIS,
             names: &NO_NAMES,
             reach: ReachArena::new(),
             lists: Lists::default(),
@@ -933,7 +953,6 @@ impl<'o> Interp<'o> {
             pending_decl_bases: Vec::new(),
             pattern: None,
             pattern_depth: 0,
-            pattern_kind_hint: PatternKind::Decl,
             type_test_pending: None,
             as_cast_pending: None,
             tested_ty: None,
@@ -1233,13 +1252,23 @@ impl<'o> Interp<'o> {
     }
 
     pub(crate) fn join(&mut self, first: Option<State>, second: Option<State>) -> State {
-        State::join(
+        let state = State::join(
             first,
             second,
             &mut self.reach,
             &mut self.lists,
             self.vars.len(),
-        )
+        );
+        // A join that revives the flow ends a latched Never-exit's anchoring
+        // duty (official `handleExit` kills only its own region; the branch
+        // rejoin's live state owns everything after it). Without the
+        // retirement the next flow-killing statement self-anchors on the
+        // stale exit (`if (c) { never(); } throw 'x';` anchored its own
+        // throw — oracle-clean).
+        if self.reach.overall_reachable(state.reach) {
+            self.exit_at = None;
+        }
+        state
     }
 
     /// Splits the current state in place (official `FlowModel.split`).
@@ -2364,6 +2393,18 @@ impl Interp<'_> {
         let base = self.exprs.len();
         let effects = self.collect_ranges(events, bounds.init.start..bounds.body.end, match_of);
         self.split_cur();
+        // The init runs before the head join: the official loop-head join
+        // sits at `for_conditionBegin` — after the initializer's one-time
+        // execution — and the join's live-variable filter needs the
+        // for-init declaration present (`vars.len()`), or the updater's
+        // write to a for-init variable never re-widens its promotion and
+        // the condition folds on the narrowed state
+        // (`for (N? n = v; n != null; n = n.parent)` read its condition as
+        // always-true and deaded the loop tail).
+        self.for_header_depth += 1;
+        self.run_range(events, bounds.init.clone(), match_of);
+        self.for_header_depth = self.for_header_depth.saturating_sub(1);
+        self.exprs.truncate(base);
         self.cjoin(&effects.written, &effects.captured);
         let checkpoint = self.reach.parent(self.current.reach);
         self.stack.push(Frame::While {
@@ -2374,10 +2415,6 @@ impl Interp<'_> {
             continue_model: None,
         });
         let frame = self.stack.len() - 1;
-        self.for_header_depth += 1;
-        self.run_range(events, bounds.init.clone(), match_of);
-        self.for_header_depth = self.for_header_depth.saturating_sub(1);
-        self.exprs.truncate(base);
         // The init→condition part boundary: header parts carry no statement
         // wrapper (the header parses a bare `parse_expression` list), so
         // this refresh is what lets the condition's wrapper anchor when the
@@ -2423,9 +2460,14 @@ impl Interp<'_> {
             self.flow_end_body(bounds.header_end);
         }
         // Updaters run on the back-edge state: join pending continues
-        // first (official `forStatement_updaterBegin`).
-        let continue_model = match &self.stack[frame] {
-            Frame::While { continue_model, .. } => continue_model.clone(),
+        // first (official `forStatement_updaterBegin`). The frame read is
+        // guarded: a recovery-shaped body can leave fewer frames on the
+        // stack than the loop pushed (the analyzer corpus reproducible —
+        // `stack[frame]` indexed past a truncated stack), and a missing
+        // frame degrades to no pending continues exactly like every other
+        // unbalanced-recovery read here.
+        let continue_model = match self.stack.get(frame) {
+            Some(Frame::While { continue_model, .. }) => continue_model.clone(),
             _ => None,
         };
         self.current = self.join(Some(self.current.clone()), continue_model);
@@ -2714,6 +2756,13 @@ impl Interp<'_> {
             Ev::ForBegin { span } => self.for_begin(*span, events, i, match_of),
             Ev::ForControlFlowBegin => self.collection_for_begin(events, i, match_of),
             Ev::ForInParts => {
+                // The `in` keyword ends the head pattern (official
+                // `patternForIn_end` fires before the iterable runs): close
+                // the head's standalone context so the zero-iteration state
+                // and the loop exit see the popped state, and no later `if`
+                // adopts the context (#2288: the leaked `Decl` deaded the
+                // else branch after a for-in object pattern).
+                self.close_standalone_pattern();
                 self.for_in_parts(events, i, match_of);
                 Control::Continue
             }

@@ -261,8 +261,17 @@ impl Interp<'_> {
                 // The `this` read: a promotable property receiver (official
                 // `thisExpression()`'s `_thisVersion` reference,
                 // `flow_analysis.dart:8149-8153`). The token anchors the
-                // property rows keyed at `this._b`'s expression start.
-                let mut expr = Expr::trivial(Ty::UNKNOWN);
+                // property rows keyed at `this._b`'s expression start. A
+                // staged type (#2292 — the extension/extension-type
+                // extended type the semantic layer resolved) replaces the
+                // unknown, so the `switch (this)` scrutinee and
+                // `this`-chained reads answer on the real type.
+                let ty = self
+                    .staged_this
+                    .get(&span.range.offset)
+                    .copied()
+                    .unwrap_or(Ty::UNKNOWN);
+                let mut expr = Expr::trivial(ty);
                 expr.this_recv = true;
                 expr.read_span = Some(*span);
                 self.exprs.push(expr);
@@ -478,6 +487,12 @@ impl Interp<'_> {
                     self.current = if_true.clone();
                     let mut expr = Expr::trivial(Ty::UNKNOWN);
                     expr.branches = Some((if_true, if_false));
+                    // The `&&`/`||` arms carry the left operand's
+                    // type-test split (the narrowed `current` stands in the
+                    // taken arm): a value consumer drops the result and
+                    // rejoins both arms, exactly like a bare test's value
+                    // context.
+                    expr.test_split = true;
                     self.exprs.push(expr);
                 }
                 BinOp::IfNull => {
@@ -579,8 +594,17 @@ impl Interp<'_> {
                     } else {
                         (matched, unmatched)
                     };
+                    // The split rides `Expr::branches` for the condition
+                    // consumers (`cond_split`) and `current` narrows to the
+                    // true arm for the guard machinery's contract
+                    // (`GuardBegin` snapshots the pre-guard state and the
+                    // guard-true arm IS this drift). A value consumer that
+                    // drops the expression rejoins both arms
+                    // ([`Interp::rejoin_value_split`]) — an `is` result
+                    // read as a plain value narrows nothing officially.
                     self.current = if_true.clone();
                     expr.branches = Some((if_true, if_false));
+                    expr.test_split = true;
                 } else {
                     let cur = self.current.clone();
                     expr.branches = Some((cur.clone(), cur));
@@ -693,6 +717,13 @@ impl Interp<'_> {
                 let base = self.consumer_base(2);
                 let rhs = self.pop_value();
                 let mut target = self.pop_value();
+                // A condition-valued plain `=` RHS (`v = a != null;`) is a
+                // plain value: its split rejoins (see
+                // [`Interp::rejoin_value_split`]). Compound operators and
+                // `??=` recombine inside their own folds.
+                if *plain {
+                    self.rejoin_value_split(&rhs);
+                }
                 // A constructor field initializer's write targets `this.f`
                 // (upstream `ConstructorFieldInitializer`): the LHS name is
                 // a field name, so a like-named local must take no write —
@@ -759,7 +790,20 @@ impl Interp<'_> {
                         if let Some(span) = target.read_span
                             && let Some(&staged) = self.staged_rhs.get(&span.range.offset)
                         {
-                            (staged, rhs_args)
+                            // The staged type is the resolution-level static
+                            // type of the RHS; a bare local read's fold type
+                            // is its flow type — the read's own promotion
+                            // included. When the staged face is exactly the
+                            // read's declared type while the fold already
+                            // narrowed it (`a = b` with `b` promoted by an
+                            // earlier `if (b == null) return;`), the
+                            // promotion is the oracle's write type: keep it.
+                            match rhs.reference.and_then(|var| self.vars.get(var as usize)) {
+                                Some(meta) if staged == meta.ty && rhs.ty != meta.ty => {
+                                    (rhs.ty, rhs_args)
+                                }
+                                _ => (staged, rhs_args),
+                            }
                         } else {
                             (rhs.ty, rhs_args)
                         }
@@ -842,6 +886,10 @@ impl Interp<'_> {
                 for var in std::mem::take(&mut self.pending_writes) {
                     self.write_var(var, rhs.ty, rhs.args, true, None);
                 }
+                // The assignment ends (official `patternAssignment_end`):
+                // the head pattern's context closes — no alternative clause
+                // falls through.
+                self.close_standalone_pattern();
             }
             Ev::CondBegin => {
                 // The condition ended: rejoin its open null-shorting
@@ -1415,6 +1463,23 @@ impl Interp<'_> {
             .unwrap_or_else(|| Expr::trivial(Ty::UNKNOWN))
     }
 
+    /// Rejoins a dropped condition-valued expression's split: the
+    /// is-check/equality folds narrow `self.current` to the true arm for
+    /// the condition machinery (guards read the drift — `GuardBegin`'s
+    /// contract), but a value context that consumes the result as a plain
+    /// value (`final b = a != null;`, `x is T;`, `v = a is int;`) leaves
+    /// the official state recombined — both arms reachable. Without the
+    /// rejoin the narrowed state poisoned later reads (a following
+    /// `a ?? g()` saw a promoted `a` and deaded `g()` — dio
+    /// `options.dart:629`).
+    pub(crate) fn rejoin_value_split(&mut self, expr: &Expr) {
+        if expr.test_split
+            && let Some((if_true, if_false)) = &expr.branches
+        {
+            self.current = self.join(Some(if_true.clone()), Some(if_false.clone()));
+        }
+    }
+
     /// Whether the expression stack's top entry is the innermost active
     /// cascade's target — the one receiver a selector must leave in place
     /// (the sections chain on it, and `CascadeEnd` truncates to keep it as
@@ -1681,7 +1746,10 @@ impl Interp<'_> {
                         self.names,
                     );
                     // `x == null`: the true-branch saw null; the
-                    // false-branch saw non-null. `!=` inverts.
+                    // false-branch saw non-null. `!=` inverts. `current`
+                    // narrows for the guard machinery's contract (see the
+                    // `IsEnd` arm); a value consumer rejoins both arms
+                    // ([`Interp::rejoin_value_split`]).
                     let (eq_true, eq_false) = (self.current.clone(), matched);
                     let (if_true, if_false) = if inverted {
                         (eq_false, eq_true)
@@ -1690,6 +1758,7 @@ impl Interp<'_> {
                     };
                     self.current = if_true.clone();
                     expr.branches = Some((if_true, if_false));
+                    expr.test_split = true;
                 }
             }
             // The property-check face (#1409): a null check on a
@@ -1731,6 +1800,7 @@ impl Interp<'_> {
                     };
                     self.current = if_true.clone();
                     expr.branches = Some((if_true, if_false));
+                    expr.test_split = true;
                 }
             } else {
                 // No null information: both sides reachable, no promotion.

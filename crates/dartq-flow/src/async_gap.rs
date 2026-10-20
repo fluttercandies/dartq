@@ -872,6 +872,7 @@ impl GapPass {
             | Ev::NoInitializer
             | Ev::InitializerBegin
             | Ev::PatternVarDeclStmt { .. }
+            | Ev::IfCaseCondition
             | Ev::Wildcard { .. }
             | Ev::WhileBodyEnd
             | Ev::DoBodyEnd

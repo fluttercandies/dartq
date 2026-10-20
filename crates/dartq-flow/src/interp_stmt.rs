@@ -56,7 +56,12 @@ impl Interp<'_> {
                 // artifact of the part's parsing: its value feeds the
                 // header replay, so it stays on the stack.
                 if self.for_header_depth == 0 {
-                    self.exprs.pop();
+                    let value = self.exprs.pop();
+                    // A dropped condition-valued statement expression
+                    // (`a != null;`) rejoins its split.
+                    if let Some(value) = &value {
+                        self.rejoin_value_split(value);
+                    }
                 }
             }
             Ev::StmtEnd { end } => {
@@ -78,24 +83,26 @@ impl Interp<'_> {
             Ev::ReturnBegin { span } | Ev::YieldBegin { span } => {
                 self.wrapper_dead_check(*span);
             }
+            Ev::IfCaseCondition => self.if_case_condition(),
             Ev::ThenBegin => {
-                // If-case: the pattern context holds the branch states.
-                if let Some(pattern) = self.pattern.as_mut() {
-                    if pattern.kind == PatternKind::Decl {
-                        // No declaration-statement event ended it: this is
-                        // an if-case pattern.
-                        pattern.kind = PatternKind::IfCase;
-                    }
-                    if pattern.kind == PatternKind::IfCase {
-                        self.if_case_then();
-                        return true;
-                    }
+                // If-case: the condition's own marker converted the open
+                // pattern context, and the pattern's matched state becomes
+                // the branch state.
+                if self.pattern.as_ref().map(|p| p.kind) == Some(PatternKind::IfCase) {
+                    self.if_case_then();
+                    return true;
                 }
-                let _ = &self.pattern;
                 // The condition ends: the null-shorting its own `?`
                 // opened rejoins before the branch split (official
                 // `finishNullShorting`).
                 self.flush_null_shorts_above(self.consumer_base(1));
+                // A standalone pattern context still open here belongs to a
+                // construct that missed its close (a declaration statement
+                // or assignment whose end event never arrived). It must not
+                // leak into this if: the official pushes one context per
+                // construct, and adopting the stale one deaded the else
+                // branch after a for-in pattern head (#2288).
+                self.close_standalone_pattern();
                 let cond = self.pop_value();
                 // The condition's own query (official
                 // `handle_ifStatement_conditionEnd`, type_analyzer.dart:1191).
@@ -125,6 +132,13 @@ impl Interp<'_> {
                 {
                     *slot = Some(after_then);
                     self.current = branch.clone();
+                }
+                // Entering the else branch adopts the pre-then state: when
+                // it is alive over a dead-from-exit current, the exit's
+                // anchoring duty ends with the then region ([`Interp::join`]'s
+                // retirement rule, without a join call here).
+                if self.reachable() {
+                    self.exit_at = None;
                 }
             }
             Ev::IfEnd { has_else } => {
@@ -455,6 +469,12 @@ impl Interp<'_> {
                     }
                 };
                 self.current = entry;
+                // A live exception-entry state over a dead-from-exit current
+                // ends the exit's anchoring duty (same retirement rule as
+                // [`Interp::join`] / `ElseBegin`).
+                if self.reachable() {
+                    self.exit_at = None;
+                }
             }
             Ev::CatchClauseEnd => {
                 // The catch body's end covers its intervals (official
@@ -1066,6 +1086,12 @@ impl Interp<'_> {
                 self.flush_null_shorts_above(self.consumer_base(1));
                 let var = self.pending_inits.pop();
                 let rhs = self.exprs.pop();
+                // A condition-valued initializer (`final b = a != null;`)
+                // consumed as a plain value rejoins its split: the
+                // narrowed state must not leak into the next statement.
+                if let Some(rhs) = &rhs {
+                    self.rejoin_value_split(rhs);
+                }
                 if let (Some(var), Some(rhs)) = (var, rhs) {
                     // The declared-type slot the written header left unknown
                     // adopts the initializer's inferred face (#2140): the
@@ -1154,7 +1180,13 @@ impl Interp<'_> {
                 };
                 self.declare_var(*name, meta, true);
             }
-            Ev::PatternVarDeclStmt { span } => self.header_dead_check(*span),
+            Ev::PatternVarDeclStmt { span } => {
+                self.header_dead_check(*span);
+                // The declaration ends (official
+                // `patternVariableDeclaration_end`) — `var (a, b) = ...;`
+                // has no alternative clause to fall through to.
+                self.close_standalone_pattern();
+            }
             Ev::Block { kind, span } => {
                 // An empty block directly inside an if branch anchors
                 // nothing: the branch body's traversal visits NODES

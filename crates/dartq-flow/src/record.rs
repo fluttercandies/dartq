@@ -79,6 +79,12 @@ pub struct Flow<'t> {
     /// face; a resolved RHS keeps its own type. Entries whose assignment
     /// never folds are inert (bounded by the unit's write count).
     staged_rhs: FxHashMap<u32, crate::ty::Ty>,
+    /// `this`-read types keyed on the `this` token's offset (#2292): the
+    /// semantic layer's resolved extended type for a `this` read inside an
+    /// extension/extension-type member, staged before the executable's
+    /// replay. Entries whose `this` never replays are inert (bounded by
+    /// the unit's `this`-read count).
+    staged_this: FxHashMap<u32, crate::ty::Ty>,
     /// The most recent label-reference identifier (a break/continue
     /// target's name, consumed by the next break/continue event).
     pending_label_ref: Option<u32>,
@@ -225,6 +231,7 @@ impl<'t> Flow<'t> {
             pending_type_args: crate::ty::EMPTY_ARGS,
             inferred_locals: FxHashMap::default(),
             staged_rhs: FxHashMap::default(),
+            staged_this: FxHashMap::default(),
             pending_label_ref: None,
             pending_labels: Vec::new(),
             pending_label_token: None,
@@ -618,6 +625,19 @@ impl<'t> Flow<'t> {
         self.staged_rhs.insert(target_offset, ty);
     }
 
+    /// Stages one `this` read's static type (#2292): the semantic layer's
+    /// resolved type for a `this` expression the event stream leaves
+    /// unknown — an extension or extension-type instance member's extended
+    /// type — keyed on the `this` token's offset. The fold adopts it at
+    /// `Ev::This` when its own answer is the unknown face, so the
+    /// `switch (this)` scrutinee (exhaustiveness) and `this`-chained
+    /// promotion reads answer on the real type. Shapes the flow lattice
+    /// cannot spell never arrive (the stager drops them, the unknown-read
+    /// face stands).
+    pub fn stage_this_type(&mut self, token_offset: u32, ty: crate::ty::Ty) {
+        self.staged_this.insert(token_offset, ty);
+    }
+
     /// Records the `handleExit` contract: a subexpression's static type is
     /// Never, so the flow state goes unreachable from the expression's end
     /// (official `FlowAnalysis.handleExit`, flow_analysis.dart:919-925).
@@ -713,6 +733,9 @@ impl<'t> Flow<'t> {
         // The staged assignment RHS types (#2174) — read-only here,
         // adopted at `Ev::Assign` when the fold's own answer is unknown.
         interp.staged_rhs = &self.staged_rhs;
+        // The staged `this` read types (#2292) — read-only here, adopted
+        // at `Ev::This` when the fold's own answer is unknown.
+        interp.staged_this = &self.staged_this;
         // The interned name lexemes: the send fold's class-head face reads
         // the callee's spelling (`x = C()` vs a lowercase function call).
         interp.names = &self.names_by_id;
@@ -1448,6 +1471,22 @@ impl ParserListener for Flow<'_> {
 
     fn begin_if_statement(&mut self, token: Token) {
         self.record(Ev::IfBegin { span: token });
+    }
+
+    /// `handle_parenthesized_condition(begin, case, when)` — delivered at
+    /// the condition's end. The `case` keyword exists only on the if-case
+    /// form, so it is the exact signal the standalone pattern context
+    /// opened inside this condition belongs to this if (an ordinary if
+    /// must never adopt one: see `ThenBegin`).
+    fn handle_parenthesized_condition(
+        &mut self,
+        _begin: Token,
+        case_kw: Option<Token>,
+        _when: Option<Token>,
+    ) {
+        if case_kw.is_some() {
+            self.record(Ev::IfCaseCondition);
+        }
     }
 
     fn begin_then_statement(&mut self, _token: Token) {
