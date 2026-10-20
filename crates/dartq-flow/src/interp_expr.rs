@@ -576,13 +576,72 @@ impl Interp<'_> {
                     // least_upper_bound.dart:55), and a nullable RHS widens
                     // a spelled LHS the same way `int? ?? int?` does.
                     result_ty = self.name_lub(result_ty, right.ty);
+                    // A literal right operand (collection, record, string)
+                    // is never null: the official analyzes it against the
+                    // if-null context and `LUB(NonNull(T1), T2)` keeps the
+                    // non-null form (`resolveIfNull`,
+                    // binary_expression_resolver.dart:69-109). The value
+                    // this layer carries for such a literal is the opaque
+                    // UNKNOWN marker, whose classification is
+                    // potentially-nullable — without the gate
+                    // `List<Object>? args; args = args ?? const []` would
+                    // widen back to nullable and demote `args` on the write.
+                    // The operand's last event is its own closer: any
+                    // wrapper (`(…)`, a send, a selector) records its own
+                    // event after it, so only a bare literal matches.
+                    let rhs_literal = matches!(
+                        events.get(i.wrapping_sub(1)),
+                        Some(
+                            Ev::ListLitEnd { .. }
+                                | Ev::RecordLitEnd { .. }
+                                | Ev::EndLiteralString { .. }
+                        )
+                    );
+                    // A `null` LHS promotes to Never, and the literal's own
+                    // face is unknowable here: keep the widened form rather
+                    // than stamping the LHS's bottom onto the result.
                     if !rhs_dead_entry
+                        && !(rhs_literal && result_ty != Ty::NEVER)
                         && self.classify(result_ty) == Classification::NonNullable
                         && self.classify(right.ty) != Classification::NonNullable
                     {
                         result_ty = result_ty.make_nullable();
                     }
+                    // The result's written arguments are the winning side's
+                    // (`#2204`-style pairing): the RHS's own tree when the
+                    // join lands on it, the LHS's non-null form's otherwise.
+                    // The left operand is long folded, but its read staged
+                    // its `(ty, args)` pair as the last read fact ahead of
+                    // the `??` operator — the read the non-null form
+                    // (`promote_to_non_null`) refines, so its arg tree is the
+                    // promoted result's. A composite LHS (`f() ?? d`, `a.b ??
+                    // d`, `(a ?? b) ?? d`) mismatches the head and falls back
+                    // to the empty tree — the same under-instantiated face an
+                    // unresolvable RHS already carries. Without it
+                    // `List<Object>? x; x = x ?? const []` wrote `List` with
+                    // no arguments and the type-of-interest promotion dropped
+                    // (`List<dynamic>` is not a subtype of `List<Object>`).
+                    let result_args = if result_ty == right.ty {
+                        right.args
+                    } else {
+                        op_span
+                            .and_then(|op| {
+                                self.facts.iter().rev().find_map(|fact| match fact {
+                                    FlowFact::ReadType { span, ty, args }
+                                    | FlowFact::PromotedRead { span, ty, args }
+                                        if span.range.end() <= op.range.offset
+                                            && self.promote_to_non_null(*ty, *args).0
+                                                == result_ty =>
+                                    {
+                                        Some(*args)
+                                    }
+                                    _ => None,
+                                })
+                            })
+                            .unwrap_or(crate::ty::EMPTY_ARGS)
+                    };
                     let mut expr = Expr::trivial(result_ty);
+                    expr.args = result_args;
                     expr.branches = Some((if_true, if_false));
                     self.exprs.push(expr);
                 }

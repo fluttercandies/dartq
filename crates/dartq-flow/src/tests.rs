@@ -7850,41 +7850,59 @@ fn if_null_inside_other_assign_touches_no_var() {
 /// chain (official `_handleNullTestPattern(matchesIfNull: false)`:
 /// `_unmatched = _join(_unmatched!, _current)` — the state *before* the
 /// promotion, still nullable on the null path). Joining the promoted state
-/// instead carried the non-null face into the next clause's entry and
-/// killed a later `case null:` arm (the riverpod `notifier_provider.dart`
-/// shape). At the flow layer this reads as: the `case null` arm stays
-/// reachable, so its body emits no dead-code row.
+/// instead carried the non-null face into the unmatched chain and out of
+/// the whole `if`-case statement, so a later read of the scrutinee saw a
+/// promotion the oracle does not grant (`Object z = x;` must report
+/// `invalid_assignment` — the official still types `x` as `Object?`).
 #[test]
 fn null_check_pattern_joins_the_pre_pattern_state() {
-    let source = "\
-void f(Object? x) {
-  switch (x) {
-    case final y?:
-      1;
-    case null:
-      2;
-  }
-}";
-    assert!(dead_snippets(source).is_empty(), "{source:?}");
+    let source = "void f(Object? x) {\n  if (x case final y?) {\n    print(y);\n  }\n  x;\n}";
+    let read = source.rfind("x;\n}").unwrap() as u32;
+    let (_, ty) = read_types_of(source)
+        .into_iter()
+        .find(|(offset, _)| *offset == read)
+        .expect("post-if read row present");
+    assert!(ty.nullable, "the unmatched path is still null: {ty:?}");
+    assert!(
+        promoted_tys(source).is_empty(),
+        "{:?}",
+        promoted_tys(source)
+    );
+}
+
+/// ③ boundary arm: a guarded `when` clause does not change the join order —
+/// the official still joins the pre-promotion state into `_unmatched`, so
+/// the post-`if` read stays nullable.
+#[test]
+fn null_check_pattern_with_a_guard_keeps_the_nullable_join() {
+    let source =
+        "void f(Object? x) {\n  if (x case final y? when y.hashCode > 0) {\n    print(y);\n  }\n  x;\n}";
+    let read = source.rfind("x;\n}").unwrap() as u32;
+    let (_, ty) = read_types_of(source)
+        .into_iter()
+        .find(|(offset, _)| *offset == read)
+        .expect("post-if read row present");
+    assert!(ty.nullable, "the unmatched path is still null: {ty:?}");
 }
 
 /// ③ boundary arm: a matched value already non-null makes `sub?` a
 /// guaranteed match — the official touches neither `_current` nor
-/// `_unmatched`, so a later arm's entry state is unchanged and no
-/// promotion is recorded.
+/// `_unmatched`, so the post-`if` read keeps its declared non-null face and
+/// no promotion is recorded.
 #[test]
 fn null_check_pattern_on_a_non_null_matched_value_is_a_no_op() {
-    let source = "\
-void f(Object x) {
-  switch (x) {
-    case final y?:
-      1;
-    case _:
-      2;
-  }
-}";
-    assert!(dead_snippets(source).is_empty(), "{source:?}");
-    assert!(promoted_tys(source).is_empty(), "{source:?}");
+    let source = "void f(Object x) {\n  if (x case final y?) {\n    print(y);\n  }\n  x;\n}";
+    let read = source.rfind("x;\n}").unwrap() as u32;
+    let (_, ty) = read_types_of(source)
+        .into_iter()
+        .find(|(offset, _)| *offset == read)
+        .expect("post-if read row present");
+    assert!(!ty.nullable, "{ty:?}");
+    assert!(
+        promoted_tys(source).is_empty(),
+        "{:?}",
+        promoted_tys(source)
+    );
 }
 
 /// ④ A `Function`-typed operand's `is` test against a function type: the
@@ -8005,16 +8023,4 @@ fn switch_expr_non_null_case_values_bind_no_nullable_face() {
         !receiver.1.nullable,
         "non-null join must not carry a nullable face: {rows:?}"
     );
-}
-
-#[test]
-fn tmp_probe_three_shapes() {
-    for source in [
-        "class A {}\nvoid f(A? a) {\n  switch (a) {\n    case final x?:\n      print(x);\n    case null:\n      print(0);\n  }\n}",
-        "typedef Build<T> = T Function(int x);\nvoid f(Build<int>? b) {\n  switch (b) {\n    case final override?:\n      print(override);\n    case null:\n      print(0);\n  }\n}",
-        "void f(Object? x) {\n  switch (x) {\n    case final y?:\n      print(y);\n    case null:\n      print(0);\n  }\n}",
-    ] {
-        println!("SRC {source:?}");
-        println!("  DEAD {:?}", dead_snippets(source));
-    }
 }

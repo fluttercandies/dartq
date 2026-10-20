@@ -207,8 +207,9 @@ impl Interp<'_> {
             }
             Ev::NullCheckPattern => {
                 // `sub?` at the top level: the matched arm promotes the
-                // matched value non-null (official `_handleNullCheckPattern`),
-                // the failure arm — the null path — joins `unmatched`.
+                // matched value non-null (official `_handleNullCheckPattern`
+                // → `_handleNullTestPattern(matchesIfNull: false)`), the
+                // failure arm — the null path — joins `unmatched`.
                 if self.pattern_depth != 1 {
                     return;
                 }
@@ -218,17 +219,33 @@ impl Interp<'_> {
                         self.promoted_type_of(var, &model),
                         self.promoted_args_of(var, &model),
                     );
+                    // A matched value already known non-null is guaranteed to
+                    // match: the official promotes nothing and leaves
+                    // `_unmatched` untouched (the arm cannot fall through).
+                    let guaranteed = self.classify(matched) == Classification::NonNullable;
                     let (non_null, non_null_args) =
                         self.promote_to_non_null(matched, matched_args);
-                    self.current = self.current.clone().finish_type_test(
-                        self.ops,
-                        &mut self.lists,
-                        var,
-                        None,
-                        Some((non_null, non_null_args)),
-                        self.args,
-                        self.names,
-                    );
+                    if !guaranteed {
+                        // Official order matters here: `_unmatched` joins the
+                        // state BEFORE the promotion (the matched value is
+                        // still nullable on the failure arm), and only then
+                        // does `_setCurrent(ifNotNull)` replace `current`.
+                        // Joining the promoted state instead would carry the
+                        // non-null face into the next clause's entry state and
+                        // kill a later `case null:` arm
+                        // (the riverpod `notifier_provider.dart` shape).
+                        let before = self.current.clone();
+                        self.current = self.current.clone().finish_type_test(
+                            self.ops,
+                            &mut self.lists,
+                            var,
+                            None,
+                            Some((non_null, non_null_args)),
+                            self.args,
+                            self.names,
+                        );
+                        self.join_unmatched(before);
+                    }
                     // The declared variable beside the null check (`case var
                     // x?`) is declared untyped (`NoType` leaves
                     // [`Ty::UNKNOWN`]) by the event that precedes this one;
@@ -236,7 +253,8 @@ impl Interp<'_> {
                     // sub-pattern the non-null matched type, and
                     // `DeclaredVariablePattern` declares the variable with
                     // it. An explicit annotation keeps its own type
-                    // (`declare` prefers the written one).
+                    // (`declare` prefers the written one). A guaranteed match
+                    // stores the matched type as it stands, already non-null.
                     if let Some((name, _)) = self
                         .pattern
                         .as_ref()
@@ -248,13 +266,12 @@ impl Interp<'_> {
                         meta.ty = non_null;
                         meta.args = non_null_args;
                     }
-                }
-                if let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) {
+                } else {
+                    // A non-variable scrutinee promotes no reference, but the
+                    // pattern can still fail: the live state joins the
+                    // failure arm unchanged.
                     let cur = self.current.clone();
-                    let joined = self.join(Some(chain), Some(cur));
-                    if let Some(pattern) = self.pattern.as_mut() {
-                        pattern.unmatched = joined;
-                    }
+                    self.join_unmatched(cur);
                 }
             }
             Ev::DeclaredVarPattern {
