@@ -395,7 +395,16 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
 
     /// The `(...)` branch of `computeType` (type_info.dart:239-261).
     fn compute_record_type_shape(&mut self, required: bool) -> TypeInfo {
-        let group_end = self.current_matching_end().expect("record group");
+        // Pairing-table drift guard: the group end comes from the scanner's
+        // bracket table, not a local witness — the entry guard
+        // (`peek_is_possible_record_type`) required it for the current
+        // entry path, but a future entry without that guard must degrade,
+        // not panic (`ensure_block` reads the same table as an `Option`).
+        // NoType consumes nothing and leaves the cursor to the caller's
+        // required/optional handling, like the other NoType exits.
+        let Some(group_end) = self.current_matching_end() else {
+            return TypeInfo::NoType;
+        };
         let mut after = group_end + 1;
         if self.kind_at(self.offset_of(after)) == TokenKind::Question {
             after += 1;

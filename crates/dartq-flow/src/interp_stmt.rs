@@ -1674,7 +1674,14 @@ impl Interp<'_> {
     /// Pattern-declared variables already live in the enclosing scope from
     /// their declaration events.
     fn if_case_then(&mut self) {
-        let pattern = self.pattern.take().expect("if-case pattern");
+        // Parser event-order drift guard: an IfCase-gated ThenBegin always
+        // follows its pattern events, so the context is live in a coherent
+        // stream. A missing context is a producer contract break — skip the
+        // branch instead of panicking inside the interpreter (async_gap's
+        // let-else return posture).
+        let Some(pattern) = self.pattern.take() else {
+            return;
+        };
         let mut matched = self.current.clone();
         if let Some(guard) = pattern.guard {
             let (if_true, _) = self.cond_split(&guard);

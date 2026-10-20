@@ -595,9 +595,13 @@ fn derive_unit(
             // official declaration-map miss contributes nothing.
             continue;
         }
-        let target = state
-            .capture(row.target_file)
-            .expect("universe member has a capture after analyze");
+        // Capture-residency drift guard: a universe member's capture can be
+        // evicted under fact-cache pressure between the universe build and
+        // this read. Like the SDK or synthetic target above, the row
+        // contributes nothing.
+        let Some(target) = state.capture(row.target_file) else {
+            continue;
+        };
         let decls = target.index.decls();
         let first = decls.partition_point(|decl| decl.name < row.target_name);
         let run = decls[first..].partition_point(|decl| decl.name == row.target_name);
