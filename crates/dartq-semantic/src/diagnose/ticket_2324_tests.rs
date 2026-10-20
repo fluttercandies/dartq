@@ -7,7 +7,10 @@
 //! #2282 companion: an extension body's bare read of an `on`-type field
 //! spares `unused_field` on the extended container (the revived
 //! `extension_this_read_spares_the_on_type_field` pin carries the named
-//! shape; the unnamed-extension spelling rides the same face).
+//! shape; the unnamed-extension spelling rides the same face). The #2338
+//! companion: a member selector whose spelling shadows a promoted local
+//! never adopts that local's promotion — the `!` verdict on the selector is
+//! the member's own declared nullability.
 
 use super::*;
 use crate::collector::collect;
@@ -71,6 +74,14 @@ fn has_code(report: &FileReport, code: &str) -> bool {
         .diagnostics
         .iter()
         .any(|d| d.code.name == code)
+}
+
+fn code_names(report: &FileReport) -> Vec<&'static str> {
+    report
+        .diagnostics
+        .iter()
+        .map(|d| d.code.name)
+        .collect::<Vec<_>>()
 }
 
 /// `region?.offset ?? 0` (the archive corpus's xz_decoder.dart shape): the
@@ -198,5 +209,100 @@ fn extension_own_field_read_still_marks_the_extension() {
         !has_code(&rep, "unused_field"),
         "{:?}",
         rep.diagnostics
+    );
+}
+
+// —— #2338: a member selector never adopts a shadowed local's promotion ——
+
+/// `dep.dependencies!` where the selector's spelling shadows a promoted
+/// local (the riverpod foundation.dart:162 shape): the selector is a member
+/// read on the receiver chain — its `!` verdict is the field's declared
+/// nullability (`POF?`), so the assertion is necessary and nothing reports.
+/// The local's promotion (`POF`, non-null, after the `== null` guard) is
+/// the local's own face; the name coincidence must not stage it at the
+/// selector's span (probed: `dart analyze` stays silent, pre-fix dartq
+/// fabricated `unnecessary_non_null_assertion` at the `!`).
+#[test]
+fn member_selector_shadow_of_promoted_local_stays_silent() {
+    let source = "class POF { POF? dependencies; } \
+                  void f(POF dep) { \
+                    POF? dependencies = null; \
+                    if (dependencies == null) return; \
+                    dep.dependencies!; \
+                  }";
+    let rep = report(source);
+    assert!(
+        rep.diagnostics.is_empty(),
+        "{:?}",
+        rep.diagnostics
+    );
+}
+
+/// The closure-captured variant: the shadowed local is captured by a
+/// closure after its promotion (the riverpod consumer shape). The capture
+/// changes nothing — the selector still reads the field, and the
+/// fabrication must stay dead. The closure variable itself stays unused in
+/// both engines (the only row the oracle reports here).
+#[test]
+fn captured_local_shadow_variant_stays_silent() {
+    let source = "class POF { POF? dependencies; } \
+                  void f(POF dep) { \
+                    POF? dependencies = null; \
+                    if (dependencies == null) return; \
+                    var g = () => dependencies; \
+                    dep.dependencies!; \
+                  }";
+    let rep = report(source);
+    assert_eq!(
+        code_names(&rep),
+        ["unused_local_variable"],
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// The staged `!` face itself stays alive: a bare local's own read —
+/// declared nullable, promoted non-null by the guard — stages at its own
+/// span and the teardown reports `unnecessary_non_null_assertion`. This is
+/// the arm the shadow gate preserves (the receiver-chain gate never
+/// touches a bare operand).
+#[test]
+fn local_assert_after_promotion_still_reports() {
+    let source = "class int {} \
+                  void f() { \
+                    int? x = null; \
+                    if (x == null) return; \
+                    x!; \
+                  }";
+    let rep = report(source);
+    assert_eq!(
+        code_names(&rep),
+        ["unnecessary_non_null_assertion"],
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// Boundary, no shadow: the member read's own nullability governs as
+/// usual — the necessary `!` on a `POF?` field stays silent, and the same
+/// read without the assertion reports the nullable dereference.
+#[test]
+fn member_nullability_without_shadow_unchanged() {
+    let asserted = "class POF { POF? dependencies; POF? first; } \
+                    void f(POF dep) { dep.dependencies!; }";
+    let rep = report(asserted);
+    assert!(
+        rep.diagnostics.is_empty(),
+        "{:?}",
+        rep.diagnostics
+    );
+    let bare = "class POF { POF? dependencies; POF? first; } \
+                void f(POF dep) { dep.dependencies.first; }";
+    let rep = report(bare);
+    assert_eq!(
+        code_names(&rep),
+        ["unchecked_use_of_nullable_value"],
+        "{:?}",
+        code_names(&rep)
     );
 }

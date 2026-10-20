@@ -1646,7 +1646,7 @@ impl<'a> Engine<'a> {
     /// assertion's own static type (`promoteToNonNull`): the downstream
     /// member merges read the promoted receiver through it.
     pub(crate) fn check_null_assert(&mut self, at: SourceRange) {
-        let (ty, read_span) = match self.rows.last() {
+        let (ty, read_span, qualified) = match self.rows.last() {
             Some(row) => {
                 // The implicit-this getter read's row type is the unknown
                 // face — `non_null_form(Unknown)` is a no-op and the
@@ -1665,6 +1665,7 @@ impl<'a> Engine<'a> {
                         ty
                     },
                     row.range,
+                    row.qualified,
                 )
             }
             None => return,
@@ -1673,7 +1674,23 @@ impl<'a> Engine<'a> {
             self.stage_usage(SemanticCode::NullCheckAlwaysFails, at, "");
         } else if ty.is_strictly_non_nullable() {
             self.stage_usage(SemanticCode::UnnecessaryNonNullAssertion, at, "");
-        } else if ty != Ty::Unknown && self.local_hits.contains_key(&read_span.offset) {
+        } else if ty != Ty::Unknown
+            && !qualified
+            && self.local_hits.contains_key(&read_span.offset)
+        {
+            // The staged re-decision reads the local promotion table at the
+            // operand's own span, so it keys the operand's OWN local read —
+            // a bare identifier. A receiver-chain row (`dep.dependencies!`)
+            // sits on a member selector: the selector's spelling coinciding
+            // with a captured local's name is not a reference to that local,
+            // and the promotion table can only hold that shadow's type at
+            // the selector span (the flow layer's name-keyed continuation
+            // read) — staging would fabricate
+            // `unnecessary_non_null_assertion` on a nullable member read
+            // (riverpod foundation.dart:162, #2338). The member read's own
+            // `!` verdict is its declared nullability; the field-promotion
+            // re-decision rides the property table elsewhere, never this
+            // one.
             self.null_assert_staged.push((read_span, at));
         }
         if let Some(row) = self.rows.last_mut() {
