@@ -1401,34 +1401,112 @@ pub fn fold_unit_with_ops<'t>(
         }
     }
     // The const-declaration initializer creations (deferred for the
-    // whole-file const-ctor set): the first invalid entry per initializer
-    // anchors `const_initialized_with_non_constant_value` (the oracle's
-    // one-row-per-initializer verdict at the deepest failing node), and
-    // every invalid creation whose constructor exists but is non-const
-    // adds the `const_with_non_const` twin at the creation.
+    // whole-file const-ctor set): each invalid entry's face keys on WHERE
+    // its creation sits in the initializer's evaluation — the variable
+    // face at a root creation or the root literal's first failing element,
+    // `invalid_constant` inside a resolved creation's arguments, silence
+    // past a wholesale rejection — and every invalid creation whose
+    // constructor exists but is non-const adds the `const_with_non_const`
+    // twin at the creation.
     {
+        // Closes push innermost-first (`Missing(Missing2())` stages the
+        // argument's entry before the call's own), so the per-initializer
+        // anchoring sorts the entries into source order — the oracle's
+        // evaluation walks outward and the first failure anchors.
+        let mut entries = std::mem::take(&mut engine.pending_const_creations);
+        entries.sort_by_key(|(_, span, _)| span.offset);
         let mut reported: FxHashSet<StringId> = FxHashSet::default();
-        for (init, span, kind) in std::mem::take(&mut engine.pending_const_creations) {
-            let invalid = match kind {
-                ConstCreationEntry::ArgFailure => true,
-                ConstCreationEntry::Creation { container } => {
-                    !engine.const_creation_valid(container, span)
+        // The collections whose variable-face twin already staged: a
+        // literal's evaluation aborts at its first failing element, so a
+        // later element's own error never surfaces (`[Missing(),
+        // Missing2()]` pairs the face with the first only).
+        let mut anchored: FxHashSet<u32> = FxHashSet::default();
+        for (init, span, kind) in entries {
+            match kind {
+                ConstCreationEntry::ArgFailure => {
+                    // A known non-constant LEAF argument (the failing span
+                    // is not call-shaped: `C(v)`, the `v` head of
+                    // `C(v + 1)`) pairs its already-emitted argument face
+                    // with the variable face at the same span — the
+                    // oracle's `_validateConstantArguments` twin. The
+                    // call-shaped entries are the unresolved creations,
+                    // keyed on the evaluation site below.
+                    if !engine.creation_span_is_call(span) {
+                        if reported.insert(init) {
+                            engine.stage_usage(
+                                SemanticCode::ConstInitializedWithNonConstantValue,
+                                span,
+                                "",
+                            );
+                        }
+                        continue;
+                    }
+                    match engine.creation_failure_site(span) {
+                        CreationFailureSite::Root => {
+                            // The root unresolved creation's variable face
+                            // rides the callee's own resolution row — a
+                            // resolved-but-unindexed container (an SDK
+                            // class without a const constructor) carries
+                            // none and stays silent.
+                            if engine.const_failure_row_at(span.offset) && reported.insert(init)
+                            {
+                                engine.stage_usage(
+                                    SemanticCode::ConstInitializedWithNonConstantValue,
+                                    span,
+                                    "",
+                                );
+                            }
+                        }
+                        CreationFailureSite::Collection { open } => {
+                            if engine.const_failure_row_between(open, span.offset)
+                                || !anchored.insert(open)
+                            {
+                                continue;
+                            }
+                            if reported.insert(init) {
+                                engine.stage_usage(
+                                    SemanticCode::ConstInitializedWithNonConstantValue,
+                                    span,
+                                    "",
+                                );
+                            }
+                        }
+                        CreationFailureSite::ConstCreation { open } => {
+                            // Each unresolved argument evaluates on its own
+                            // placeholder (`C(Missing(), Missing2())`
+                            // reports both) — unless an earlier argument's
+                            // known non-constant failure aborted the
+                            // evaluation first (`C(v, Missing())` stays
+                            // silent), or the containing argument already
+                            // anchored its own single error deeper-left
+                            // (`C(missing + Missing())` reports once, at
+                            // `missing`).
+                            if !engine.const_failure_row_between(open, span.offset)
+                                && !engine.const_arg_failure_anchored(span)
+                            {
+                                engine.stage_usage(SemanticCode::InvalidConstant, span, "");
+                            }
+                        }
+                        // A wholesale rejection above (`f(Missing())`'s
+                        // method-invocation fault) carries the subtree.
+                        CreationFailureSite::Other => {}
+                    }
                 }
-            };
-            if !invalid {
-                continue;
-            }
-            if reported.insert(init) {
-                engine.stage_usage(
-                    SemanticCode::ConstInitializedWithNonConstantValue,
-                    span,
-                    "",
-                );
-            }
-            if let ConstCreationEntry::Creation { container } = kind
-                && !engine.const_ctor_target(container)
-            {
-                engine.stage_usage(SemanticCode::ConstWithNonConst, span, "");
+                ConstCreationEntry::Creation { container } => {
+                    if !engine.const_creation_valid(container, span) {
+                        continue;
+                    }
+                    if reported.insert(init) {
+                        engine.stage_usage(
+                            SemanticCode::ConstInitializedWithNonConstantValue,
+                            span,
+                            "",
+                        );
+                    }
+                    if !engine.const_ctor_target(container) {
+                        engine.stage_usage(SemanticCode::ConstWithNonConst, span, "");
+                    }
+                }
             }
         }
     }
@@ -1723,45 +1801,62 @@ fn citation_matches(entry: &str, code: &str) -> bool {
 /// qualifies. Spans are byte ranges `[start, end)`, line comments ending
 /// before the line terminator (`\r` included — CRLF bodies keep the
 /// carriage return out of the citation walk).
+/// Collects `//`-comment spans in `[start, end)` of `bytes`, skipping the
+/// bodies of `/* */` block comments (nested). The `//` head may sit
+/// anywhere — a leading `//` inside a block comment never counts because
+/// the block arm consumes its whole span.
+fn scan_line_comment_gaps(
+    bytes: &[u8],
+    mut pos: usize,
+    end: usize,
+    spans: &mut Vec<(u32, u32)>,
+) -> usize {
+    while pos < end {
+        match bytes[pos] {
+            b'/' if bytes.get(pos + 1) == Some(&b'/') => {
+                let body = &bytes[pos + 2..end];
+                let comment_end = pos + 2
+                    + body
+                        .iter()
+                        .position(|&b| b == b'\n' || b == b'\r')
+                        .unwrap_or(body.len());
+                spans.push((pos as u32, comment_end as u32));
+                pos = comment_end;
+            }
+            b'/' if bytes.get(pos + 1) == Some(&b'*') => {
+                let mut depth = 1usize;
+                pos += 2;
+                while pos < end && depth > 0 {
+                    if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+                        depth += 1;
+                        pos += 2;
+                    } else if bytes[pos] == b'*' && bytes.get(pos + 1) == Some(&b'/') {
+                        depth -= 1;
+                        pos += 2;
+                    } else {
+                        pos += 1;
+                    }
+                }
+            }
+            _ => pos += 1,
+        }
+    }
+    pos
+}
+
 fn line_comments_of(source: &str, tokens: &TokenTable) -> Vec<(u32, u32)> {
     let bytes = source.as_bytes();
     let mut spans = Vec::new();
     let mut cursor = 0usize;
     for token in tokens.as_slice() {
         let gap_end = (token.byte_offset as usize).min(bytes.len());
-        let mut pos = cursor.min(gap_end);
-        while pos < gap_end {
-            match bytes[pos] {
-                b'/' if bytes.get(pos + 1) == Some(&b'/') => {
-                    let body = &bytes[pos + 2..gap_end];
-                    let end = pos + 2
-                        + body
-                            .iter()
-                            .position(|&b| b == b'\n' || b == b'\r')
-                            .unwrap_or(body.len());
-                    spans.push((pos as u32, end as u32));
-                    pos = end;
-                }
-                b'/' if bytes.get(pos + 1) == Some(&b'*') => {
-                    let mut depth = 1usize;
-                    pos += 2;
-                    while pos < gap_end && depth > 0 {
-                        if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'*') {
-                            depth += 1;
-                            pos += 2;
-                        } else if bytes[pos] == b'*' && bytes.get(pos + 1) == Some(&b'/') {
-                            depth -= 1;
-                            pos += 2;
-                        } else {
-                            pos += 1;
-                        }
-                    }
-                }
-                _ => pos += 1,
-            }
-        }
+        scan_line_comment_gaps(bytes, cursor.min(gap_end), gap_end, &mut spans);
         cursor = gap_end + token.byte_len as usize;
     }
+    // The tail gap after the last token: a trailing `// ignore:` /
+    // `ignore_for_file:` comment at end-of-file has no following token, so
+    // without this flush it was silently dropped from the table.
+    scan_line_comment_gaps(bytes, cursor.min(bytes.len()), bytes.len(), &mut spans);
     spans
 }
 
@@ -2886,6 +2981,21 @@ mod suppression_tests {
             canonical_diagnostic_name("invalid_null_aware_operator_after_short_circuit"),
             Some("invalid_null_aware_operator")
         );
+    }
+
+    /// A `// ignore:` comment in the tail gap after the LAST token still
+    /// joins the table — `line_comments_of` used to flush only inter-token
+    /// gaps and dropped a comment at end-of-file (upstream
+    /// `IgnoreInfo.forDart` reads the unit's whole comment list). A
+    /// trailing comment suppresses its own line; the `}` is the last token,
+    /// so the comment's gap is the post-token tail.
+    #[test]
+    fn tail_gap_comment_after_the_last_token_suppresses() {
+        let (face, line_of) =
+            parse_face("void f() {}\n// ignore: unused_local_variable\nvar x = 0;");
+        // `var x` sits on line 3; the alone-on-line `// ignore:` targets
+        // line 3 — which only registers once the tail gap is scanned.
+        assert!(face.suppresses(45, &line_of, "unused_local_variable", DiagnosticType::Hint));
     }
 }
 

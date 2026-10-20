@@ -617,10 +617,8 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
                 let e = fold(els, lookup, depth);
                 match (t, e) {
                     (Verdict::Fault(f, s), _) | (_, Verdict::Fault(f, s)) => Verdict::Fault(f, s),
-                    (Verdict::NotConstant(s) | Verdict::Unresolved(s), _)
-                    | (_, Verdict::NotConstant(s) | Verdict::Unresolved(s)) => {
-                        Verdict::NotConstant(s)
-                    }
+                    (other @ (Verdict::NotConstant(_) | Verdict::Unresolved(_)), _) => other,
+                    (_, other @ (Verdict::NotConstant(_) | Verdict::Unresolved(_))) => other,
                     _ => Verdict::Constant,
                 }
             }
@@ -635,10 +633,8 @@ fn fold(node: &Node, lookup: &dyn ConstLookup, depth: u32) -> Verdict {
                 let e = fold(els, lookup, depth);
                 match (t, e) {
                     (Verdict::Fault(f, s), _) | (_, Verdict::Fault(f, s)) => Verdict::Fault(f, s),
-                    (Verdict::NotConstant(s) | Verdict::Unresolved(s), _)
-                    | (_, Verdict::NotConstant(s) | Verdict::Unresolved(s)) => {
-                        Verdict::NotConstant(s)
-                    }
+                    (other @ (Verdict::NotConstant(_) | Verdict::Unresolved(_)), _) => other,
+                    (_, other @ (Verdict::NotConstant(_) | Verdict::Unresolved(_))) => other,
                     _ => Verdict::Constant,
                 }
             }
@@ -790,10 +786,9 @@ fn eval_binary(
                             Verdict::Value(ConstantValue::Bool(rb)) => {
                                 Verdict::Value(ConstantValue::Bool(rb))
                             }
-                            Verdict::Fault(f, s) => Verdict::Fault(f, s),
-                            Verdict::NotConstant(s) | Verdict::Unresolved(s) => {
-                                Verdict::NotConstant(s)
-                            }
+                            r @ (Verdict::Fault(..)
+                            | Verdict::NotConstant(_)
+                            | Verdict::Unresolved(_)) => r,
                             _ => Verdict::Constant,
                         }
                     }
@@ -814,9 +809,7 @@ fn eval_binary(
                         }
                         Verdict::Value(_) => Verdict::Fault(ConstFault::TypeBool, right.span),
                         Verdict::Fault(f, s) => Verdict::Fault(f, s),
-                        Verdict::NotConstant(s) | Verdict::Unresolved(s) => {
-                            Verdict::NotConstant(s)
-                        }
+                        r @ (Verdict::NotConstant(_) | Verdict::Unresolved(_)) => r,
                         Verdict::Constant => Verdict::Constant,
                     }
                 }
@@ -837,8 +830,15 @@ fn eval_binary(
             match (l, r) {
                 (Verdict::Value(a), Verdict::Value(b)) => binary_values(op, span, &a, &b),
                 (Verdict::Fault(f, s), _) | (_, Verdict::Fault(f, s)) => Verdict::Fault(f, s),
-                (Verdict::NotConstant(s) | Verdict::Unresolved(s), _)
-                | (_, Verdict::NotConstant(s) | Verdict::Unresolved(s)) => Verdict::NotConstant(s),
+                // A failed operand propagates with its own grade, left
+                // first (the oracle evaluates operands in order): a
+                // genuinely-known-invalid leaf and an unresolved leaf
+                // carry different faces at the argument check —
+                // `constWithNonConstantArgument` vs `invalidConstant`
+                // (upstream Dart SDK source, pkg/analyzer
+                // lib/src/dart/constant/value.dart `genericError`).
+                (other @ (Verdict::NotConstant(_) | Verdict::Unresolved(_)), _) => other,
+                (_, other @ (Verdict::NotConstant(_) | Verdict::Unresolved(_))) => other,
                 _ => Verdict::Constant,
             }
         }
@@ -1990,6 +1990,17 @@ impl ConstCapture {
             ctl_elements: 0,
             head: None,
         });
+    }
+
+    /// Whether the top window is an enum-constant element's capture: its
+    /// own argument list runs `_validateConstantArguments` upstream
+    /// (constant_verifier.dart — `constWithNonConstantArgument` is the
+    /// *default* code there), unlike a const ConstructorInvocation's args
+    /// whose failing leaf reports its own `genericError` code.
+    pub fn top_is_enum_element(&self) -> bool {
+        self.windows
+            .last()
+            .is_some_and(|w| w.kind == WindowKind::EnumElement)
     }
 
     /// Latches the creation head on the open ctor-invocation window (the

@@ -3167,6 +3167,11 @@ pub(crate) enum ConstBinding {
     /// The initializer currently being evaluated — a self-reference is a
     /// `recursive_compile_time_constant` cycle.
     InProgress,
+    /// The initializer failed its own evaluation: every later read folds
+    /// as a deferring constant and stays silent (the oracle's
+    /// `InvalidConstant.avoidReporting` — the error was reported at the
+    /// declaring initializer and never re-reports).
+    Failed,
 }
 
 /// The callee classification a closed bare-identifier call resolves to
@@ -3191,6 +3196,34 @@ pub(crate) enum ConstCreationEntry {
     /// A checked argument of a const creation evaluated non-constant —
     /// the initializer fails at the argument unconditionally.
     ArgFailure,
+}
+
+/// Where an unresolved-callee creation staged at its own span sits in its
+/// const initializer's evaluation — the oracle's failure-face site
+/// (upstream Dart SDK source, pkg/analyzer/lib/src/dart/constant/
+/// evaluation.dart `_valueOf`'s `isUnresolved` report path vs the
+/// variable-face substitution in constant_verifier.dart's
+/// `visitVariableDeclaration`).
+pub(crate) enum CreationFailureSite {
+    /// The creation is the initializer root: the evaluation error
+    /// propagates to the variable, whose default substitution reports
+    /// `const_initialized_with_non_constant_value` at the creation.
+    Root,
+    /// An element of the initializer's collection literal (`open` — the
+    /// literal's opening bracket, UTF-16): the element evaluation aborts
+    /// the literal, and the same variable face anchors at the first
+    /// failing element; later elements' errors stay silent.
+    Collection { open: u32 },
+    /// An argument operand of a resolved const creation (`open` — the
+    /// creation's `(`, UTF-16): the argument's evaluation reports each
+    /// unresolved creation directly (`invalid_constant`, value.dart
+    /// `genericError`), independent of sibling arguments.
+    ConstCreation { open: u32 },
+    /// An enclosing construct rejects the subtree wholesale (a non-const
+    /// method invocation faults `const_eval_method_invocation` at the
+    /// call without evaluating its arguments) — the creation's own error
+    /// never surfaces.
+    Other,
 }
 
 /// One formal's binding in the creation-time initializer walk (#1351): a

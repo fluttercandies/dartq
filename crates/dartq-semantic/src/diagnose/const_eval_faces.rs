@@ -46,6 +46,11 @@ impl ConstLookup for Engine<'_> {
             match scope.get(&name) {
                 Some(ConstBinding::Value(v)) => return IdentVerdict::Value(v.clone()),
                 Some(ConstBinding::InProgress) => return IdentVerdict::InProgress,
+                // A failed const binding never re-reports: the declaring
+                // initializer carried the error (`avoidReporting`), so a
+                // later read folds as a deferring constant (`const h =
+                // C(g)` over a failed `g` stays silent).
+                Some(ConstBinding::Failed) => return IdentVerdict::Constant,
                 None => {}
             }
         }
@@ -195,7 +200,25 @@ impl<'a> Engine<'a> {
         if let Some(scope) = self.const_scopes.last_mut() {
             scope.insert(name, ConstBinding::InProgress);
         }
-        self.pending_init_names.push(name);
+        // The pending slot keys the initializer's staged creation entries
+        // (`open_const_creations`/`pending_const_creations`'s `init`
+        // field): the oracle codes one row per *initializer* while the
+        // name alone collides for sibling `const event` declarations in
+        // different scopes, so the pushed id carries a per-declaration
+        // suffix (`{name}\u{1}{rows}:{diags}` — both counters grow over
+        // any entry-staging initializer, making the pair unique per
+        // declaration site). `finish_const_initializer` splits the real
+        // name back out for the binding faces; held push sites read
+        // `.last()` verbatim and propagate the keyed id into the entries
+        // the tail dedups on.
+        let site = format!(
+            "{}\u{1}{}:{}",
+            self.strings.resolve(name),
+            self.rows.len(),
+            self.report.diagnostics.len()
+        );
+        let keyed = self.intern(&site);
+        self.pending_init_names.push(keyed);
         self.const_capture.open_initializer();
     }
 
@@ -212,8 +235,16 @@ impl<'a> Engine<'a> {
     }
 
     pub(crate) fn finish_const_initializer(&mut self, local: bool) {
-        let Some(name) = self.pending_init_names.pop() else {
+        let Some(keyed) = self.pending_init_names.pop() else {
             return;
+        };
+        // The pending slot carries the site-keyed id (`{name}\u{1}…` —
+        // see `open_const_initializer`): the binding faces below need the
+        // declared name itself, not the dedup key.
+        let resolved = self.strings.resolve(keyed);
+        let name = match resolved.split_once('\u{1}') {
+            Some((real, _)) => self.intern(real),
+            None => keyed,
         };
         if !self.const_capture.open() {
             return;
@@ -299,8 +330,18 @@ impl<'a> Engine<'a> {
             if let Some(scope) = scope {
                 scope.insert(name, ConstBinding::Value(value.clone()));
             }
-        } else if let Some(scope) = self.const_scopes.last_mut() {
-            scope.remove(&name);
+        } else {
+            // The failed binding stays answerable as a deferring constant
+            // (never the frame-local `NotConstant` miss): a later read of
+            // a failed const is silent (`avoidReporting`).
+            let scope = if local || !self.frames.is_empty() {
+                self.const_scopes.last_mut()
+            } else {
+                self.const_scopes.first_mut()
+            };
+            if let Some(scope) = scope {
+                scope.insert(name, ConstBinding::Failed);
+            }
         }
     }
 
@@ -417,7 +458,7 @@ impl<'a> Engine<'a> {
     pub fn const_top_level_ty(&self, name: StringId) -> Option<Ty> {
         match self.const_scopes.first()?.get(&name)? {
             ConstBinding::Value(v) => Some(self.folded_ty(v)),
-            ConstBinding::InProgress => None,
+            ConstBinding::InProgress | ConstBinding::Failed => None,
         }
     }
 
@@ -861,11 +902,24 @@ impl<'a> Engine<'a> {
             // collects `invalid_constant` (value.dart `genericError`),
             // not the positional arm's argument face.
             let named = self.named_argument_value(arg.span.offset);
+            // `genericError`'s parent rule (upstream Dart SDK source,
+            // pkg/analyzer/lib/src/dart/constant/value.dart): the failing
+            // node's parent — skipping NamedArgument — must be the const
+            // ConstructorInvocation's ArgumentList to take
+            // `constWithNonConstantArgument`; every deeper or labeled
+            // position collects `invalidConstant`. A direct positional
+            // argument is exactly a bare identifier the evaluation leaf
+            // still spans whole — parens, member selectors, unary/binary
+            // operators and collection literals all nest under the arg's
+            // own node.
             let verdict = eval(arg, self);
             match verdict {
                 Verdict::Value(_) | Verdict::Constant => {}
                 Verdict::NotConstant(span) => {
-                    self.emit(SemanticCode::ConstWithNonConstantArgument, span, "", "");
+                    let code = self.const_arg_code(arg, span, named);
+                    if !self.const_arg_row_at(span) {
+                        self.emit(code, span, "", "");
+                    }
                     if let Some(init) = self.pending_init_names.last().copied() {
                         self.open_const_creations
                             .push((init, span, ConstCreationEntry::ArgFailure));
@@ -879,14 +933,10 @@ impl<'a> Engine<'a> {
                 // shorthand resolves against the context type upstream —
                 // under-report beside the declaration-root arm.
                 Verdict::Unresolved(span) => {
-                    if self.dot_shorthand_context(span.offset) {
+                    if self.dot_shorthand_context(span.offset) || self.const_arg_row_at(span) {
                         continue;
                     }
-                    let code = if named {
-                        SemanticCode::InvalidConstant
-                    } else {
-                        SemanticCode::ConstWithNonConstantArgument
-                    };
+                    let code = self.const_arg_code(arg, span, named);
                     self.emit(code, span, "", "");
                 }
                 Verdict::Fault(fault, span) => {
@@ -895,6 +945,68 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+    }
+
+    /// The `genericError` parent rule (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/constant/value.dart): a failing argument
+    /// takes `constWithNonConstantArgument` only when its node is a direct
+    /// child of the const constructor's `ArgumentList` — a bare identifier
+    /// whose own span still covers the whole argument. Named values,
+    /// parenthesized operands, member selectors (`missing.name`,
+    /// `DriftSqlType.dateTime`) and every composite (`missing + 1`,
+    /// `[missing]`, `!missing`, `missing?.name`) nest the leaf inside the
+    /// argument's own expression and collect `invalidConstant` at the
+    /// leaf instead. Enum-constant arguments run the
+    /// `_validateConstantArguments` path instead
+    /// (constant_verifier.dart): `constWithNonConstantArgument` is the
+    /// *default* code for every non-allow-listed leaf there, whatever the
+    /// argument's shape.
+    fn const_arg_code(
+        &self,
+        arg: &crate::const_eval::Node,
+        span: SourceRange,
+        named: bool,
+    ) -> SemanticCode {
+        if self.const_capture.top_is_enum_element()
+            || (!named
+                && matches!(arg.expr, Expr::Ident(_))
+                && arg.span == span
+                && !self.paren_wrapped_arg(span))
+        {
+            SemanticCode::ConstWithNonConstantArgument
+        } else {
+            SemanticCode::InvalidConstant
+        }
+    }
+
+    /// Whether the leaf at `span` sits inside an extra pair of written
+    /// parens the node span no longer shows (`C((missing))`): the byte
+    /// before the leaf is `(` whose own preceding byte cannot be a
+    /// receiver-end (identifier, `>`, `.`, `)`, `]`, literal quote, `!`)
+    /// — an arg list's or call's open — so the `(` is a wrapping paren,
+    /// the oracle's `ParenthesizedExpression` arm that takes
+    /// `invalidConstant`.
+    fn paren_wrapped_arg(&self, span: SourceRange) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut i = self.byte_of(span.offset);
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i == 0 || bytes[i - 1] != b'(' {
+            return false;
+        }
+        i -= 1;
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i == 0 {
+            return true;
+        }
+        !matches!(
+            bytes[i - 1],
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$' | b'.' | b'>' | b')' | b']'
+                | b'\'' | b'"' | b'!' | b'?'
+        )
     }
 
     /// Whether the argument value starting at `offset` carries a written
@@ -1544,6 +1656,163 @@ impl<'a> Engine<'a> {
             }
         }
         false
+    }
+
+    /// The evaluated construct that absorbs an unresolved-callee creation
+    /// staged at `span` (see [`CreationFailureSite`]). The walk reads the
+    /// source backwards from the creation head and stops at the first
+    /// bracket that encloses an evaluation of its own: a collection
+    /// literal, a call head (`Head(` / `Head.selector(`), or — past the
+    /// initializer's `=`, where every const declaration's expression
+    /// starts — nothing (the root). Grouping parens (`-(Missing())`, a
+    /// generic head's `<T>(`) enclose no evaluation and step out; an
+    /// identifier head without a const constructor is the wholesale
+    /// rejection (`f(Missing())`).
+    pub(crate) fn creation_failure_site(&self, span: SourceRange) -> CreationFailureSite {
+        let bytes = self.source.as_bytes();
+        let mut i = self.byte_of(span.offset);
+        let mut depth = 0usize;
+        while i > 0 {
+            let byte = bytes[i - 1];
+            i -= 1;
+            match byte {
+                b')' | b']' | b'}' => depth += 1,
+                b'=' => return CreationFailureSite::Root,
+                b'(' | b'[' | b'{' => {
+                    if depth > 0 {
+                        depth -= 1;
+                        continue;
+                    }
+                    let open = self.utf16_of(i);
+                    if byte != b'(' {
+                        return CreationFailureSite::Collection { open };
+                    }
+                    if self.ident_end_before(i).is_none() {
+                        // A grouping paren encloses no evaluation of its
+                        // own — the construct outside decides.
+                        continue;
+                    }
+                    if self.head_before_is_const_ctor(i) {
+                        return CreationFailureSite::ConstCreation { open };
+                    }
+                    return CreationFailureSite::Other;
+                }
+                b'\'' | b'"' => {
+                    // A string literal's interior: walk to its opening
+                    // quote so brackets inside never skew the depth.
+                    let quote = byte;
+                    while i > 0 {
+                        let previous = bytes[i - 1];
+                        i -= 1;
+                        if previous == quote && bytes.get(i.wrapping_sub(1)) != Some(&b'\\') {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        CreationFailureSite::Root
+    }
+
+    /// Whether a const-context failure row (`const_with_non_constant_
+    /// argument` — a known non-constant argument the creation's evaluation
+    /// aborted on — or `const_initialized_with_non_constant_value`) already
+    /// anchors strictly between the evaluated construct's opening bracket
+    /// (`open`, UTF-16) and `limit`: that failure stopped the oracle's
+    /// evaluation there (evaluation.dart returns the non-`isUnresolved`
+    /// error immediately), so a staged creation at `limit` was never
+    /// evaluated and its own error stays silent. An earlier
+    /// `invalid_constant` never stops the walk — unresolved creations
+    /// continue on their placeholder (`C(Missing(), Missing2())` reports
+    /// both).
+    pub(crate) fn const_failure_row_between(&self, open: u32, limit: u32) -> bool {
+        let infos = [
+            SemanticCode::ConstWithNonConstantArgument.code_info(),
+            SemanticCode::ConstInitializedWithNonConstantValue.code_info(),
+        ];
+        self.report
+            .diagnostics
+            .iter()
+            .any(|d| d.range.offset > open && d.range.offset < limit && infos.contains(&d.code))
+    }
+
+    /// Whether a staged failure span is call-shaped (ends in `)`): the
+    /// unresolved-creation entries (`Missing()`, the root
+    /// `Missing2<int>('x')`) span calls, while a known non-constant
+    /// argument's span is its failing leaf (`v`, the binary head of
+    /// `v + 1`). The leaf entries pair their argument face with the
+    /// variable face unconditionally; the call-shaped ones key on the
+    /// evaluation site.
+    pub(crate) fn creation_span_is_call(&self, span: SourceRange) -> bool {
+        let bytes = self.source.as_bytes();
+        self.byte_of(span.end())
+            .checked_sub(1)
+            .and_then(|i| bytes.get(i))
+            .copied()
+            == Some(b')')
+    }
+
+    /// Whether any diagnostic row anchors at `offset`: the root unresolved
+    /// creation's variable face rides the callee's own resolution row
+    /// (`undefined_function`, `invocation_of_non_function`). A creation of
+    /// a resolved-but-unindexed container (an SDK class without a const
+    /// constructor — `Utf8Decoder()`) carries no row and stays silent, the
+    /// oracle's resolved non-const posture.
+    pub(crate) fn const_failure_row_at(&self, offset: u32) -> bool {
+        self.report.diagnostics.iter().any(|d| d.range.offset == offset)
+    }
+
+    /// Whether the argument containing `span` already anchored a const
+    /// failure: the oracle evaluates one constant per argument and its
+    /// single error sits at the innermost first-failing sub-expression
+    /// (`C(missing + Missing())` anchors `invalid_constant` at `missing`
+    /// and the nested creation's own failure never surfaces). The bound is
+    /// the byte after the argument's `,`/opener at depth zero, walked back
+    /// from the staged span.
+    pub(crate) fn const_arg_failure_anchored(&self, span: SourceRange) -> bool {
+        let infos = [
+            SemanticCode::InvalidConstant.code_info(),
+            SemanticCode::ConstWithNonConstantArgument.code_info(),
+            SemanticCode::ConstInitializedWithNonConstantValue.code_info(),
+        ];
+        let anchored = |start: u32| {
+            self.report.diagnostics.iter().any(|d| {
+                d.range.offset >= start
+                    && d.range.offset < span.offset
+                    && infos.contains(&d.code)
+            })
+        };
+        let bytes = self.source.as_bytes();
+        let mut i = self.byte_of(span.offset);
+        let mut depth = 0usize;
+        while i > 0 {
+            let byte = bytes[i - 1];
+            i -= 1;
+            match byte {
+                b')' | b']' | b'}' => depth += 1,
+                b',' if depth == 0 => return anchored(self.utf16_of(i + 1)),
+                b'(' | b'[' | b'{' => {
+                    if depth > 0 {
+                        depth -= 1;
+                    } else {
+                        return anchored(self.utf16_of(i + 1));
+                    }
+                }
+                b'\'' | b'"' => {
+                    let quote = byte;
+                    while i > 0 {
+                        let previous = bytes[i - 1];
+                        i -= 1;
+                        if previous == quote && bytes.get(i.wrapping_sub(1)) != Some(&b'\\') {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        anchored(0)
     }
 
     /// Whether the identifier ending right before the bracket at byte
@@ -2393,6 +2662,284 @@ mod face_tests {
         assert_eq!(
             code_names(&rep),
             Vec::<&str>::new(),
+            "{:?}",
+            code_names(&rep)
+        );
+    }
+
+    /// #2289: `genericError`'s ArgumentList-parent rule (upstream Dart SDK
+    /// source, pkg/analyzer/lib/src/dart/constant/value.dart): only a
+    /// failing node that is a DIRECT child of the const constructor's
+    /// argument list takes `const_with_non_constant_argument` — a bare
+    /// identifier spanning the whole argument. Named values, member
+    /// selectors, parenthesized operands and composites collect
+    /// `invalid_constant` at the leaf instead. Enum-constant arguments
+    /// keep `const_with_non_constant_argument` for every non-allow-listed
+    /// leaf (constant_verifier.dart `_validateConstantArguments` passes it
+    /// as the default code).
+    #[test]
+    fn const_arg_code_parent_rule() {
+        // `C(missing)` — direct bare-ident arg keeps the argument face;
+        // `C(missing.name)` / `C(missing + 1)` / `C(!missing)` /
+        // `C((missing))` nest the leaf and take `invalid_constant`.
+        let rep = unit_report(
+            "class C { const C(Object? a); }\n\
+             const a = C(missing);\n\
+             const b = C(missing.name);\n\
+             const c = C(missing + 1);\n\
+             const d = C(!missing);\n\
+             const e = C((missing));",
+        );
+        let count = |name: &str| {
+            rep.diagnostics
+                .iter()
+                .filter(|d| d.code.name == name)
+                .count()
+        };
+        assert_eq!(count("const_with_non_constant_argument"), 1, "{:?}", code_names(&rep));
+        assert_eq!(count("invalid_constant"), 4, "{:?}", code_names(&rep));
+        // Every `missing` leaf reports exactly one resolution row (the
+        // oracle probe: five `UNDEFINED_IDENTIFIER`s — the prefixed head's
+        // `undefined_class`/`undefined_identifier` pick is the resolution
+        // lane's, owned by its own tests).
+        assert_eq!(
+            count("undefined_identifier") + count("undefined_class"),
+            5,
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(count("const_initialized_with_non_constant_value"), 0, "{:?}", code_names(&rep));
+        // A genuinely non-constant leaf: direct bare-ident keeps the
+        // argument face beside the declaration's `const_init`; composites
+        // flip to `invalid_constant` (the declaration verdict still fires
+        // — the leaf is known-invalid, not unknown).
+        let rep = unit_report(
+            "class C { const C(Object? a); }\n\
+             class D { const D({Object? name}); }\n\
+             void m() {\n\
+             var v = 2;\n\
+             const a = C(v);\n\
+             const b = C(v + 1);\n\
+             const c = D(name: v);\n\
+             }",
+        );
+        let count = |name: &str| {
+            rep.diagnostics
+                .iter()
+                .filter(|d| d.code.name == name)
+                .count()
+        };
+        assert_eq!(count("const_with_non_constant_argument"), 1, "{:?}", code_names(&rep));
+        assert_eq!(count("invalid_constant"), 2, "{:?}", code_names(&rep));
+        assert_eq!(count("const_initialized_with_non_constant_value"), 3, "{:?}", code_names(&rep));
+        // The drift shape: an unresolved prefixed member as a positional
+        // argument collects `invalid_constant`, not the argument face. The
+        // head's own resolution row (`UNDEFINED_IDENTIFIER` per the oracle
+        // probe) belongs to the resolution lane's tests.
+        let rep = unit_report(
+            "class C { const C(Object? a); }\n\
+             const x = C(DriftSqlType.dateTime);",
+        );
+        let count = |name: &str| {
+            rep.diagnostics
+                .iter()
+                .filter(|d| d.code.name == name)
+                .count()
+        };
+        assert_eq!(count("invalid_constant"), 1, "{:?}", code_names(&rep));
+        assert_eq!(count("const_with_non_constant_argument"), 0, "{:?}", code_names(&rep));
+        // Enum-constant arguments keep `const_with_non_constant_argument`
+        // for the same leaf shapes (`_validateConstantArguments`'s
+        // default code), including a member-selector leaf.
+        let rep = unit_report(
+            "enum E {\n\
+             a(Missing.name),\n\
+             b(missing);\n\
+             const E(Object? a);\n\
+             }",
+        );
+        let count = |name: &str| {
+            rep.diagnostics
+                .iter()
+                .filter(|d| d.code.name == name)
+                .count()
+        };
+        assert_eq!(count("const_with_non_constant_argument"), 2, "{:?}", code_names(&rep));
+        assert_eq!(count("invalid_constant"), 0, "{:?}", code_names(&rep));
+        assert_eq!(count("undefined_identifier"), 2, "{:?}", code_names(&rep));
+    }
+
+    /// #2289: one `const_initialized_with_non_constant_value` per
+    /// *initializer*, keyed by declaration site — two `const event`
+    /// declarations in sibling branches each report their own row (the
+    /// name alone collided them before). The callee's own resolution rows
+    /// (`undefined_*` family) belong to the resolution lane's tests.
+    #[test]
+    fn same_named_const_initializers_each_report() {
+        let rep = unit_report(
+            "class C {\n\
+             void start() {\n\
+             if (true) {\n\
+             const event = Missing<int>('connect');\n\
+             event;\n\
+             } else {\n\
+             const event = Missing<int>('message');\n\
+             event;\n\
+             }\n\
+             }\n\
+             }",
+        );
+        let inits = rep
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "const_initialized_with_non_constant_value")
+            .map(|d| d.range.offset)
+            .collect::<Vec<_>>();
+        assert_eq!(inits.len(), 2, "{:?}", code_names(&rep));
+        assert_ne!(inits[0], inits[1], "{:?}", rep.diagnostics);
+        // A single initializer still reports once: two failing creations
+        // (one unresolved callee per list element) collapse to the first
+        // row, anchored at the first failing node.
+        let rep = unit_report("const x = [Missing(), Missing2()];");
+        let inits = rep
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "const_initialized_with_non_constant_value")
+            .count();
+        assert_eq!(inits, 1, "{:?}", code_names(&rep));
+    }
+
+    /// #2289: an unresolved-callee creation's failure face keys on WHERE
+    /// it sits in its initializer's evaluation. Inside a resolved const
+    /// creation's arguments each such creation reports `invalid_constant`
+    /// at its own span (`C(Missing(), Missing2())` reports both — the
+    /// oracle's `_valueOf` reports every `isUnresolved` argument error);
+    /// a root creation and a root literal's first failing element take
+    /// the variable face instead; a failure that aborted the evaluation
+    /// first (`C(v, Missing())`'s known non-constant `v`) silences the
+    /// later creation; `Missing(Missing2())` anchors the variable face at
+    /// the whole root creation and leaves the argument silent.
+    #[test]
+    fn unresolved_creation_face_by_evaluation_site() {
+        let count = |rep: &FileReport, name: &str| -> usize {
+            rep.diagnostics
+                .iter()
+                .filter(|d| d.code.name == name)
+                .count()
+        };
+        // Each nested argument reports its own `invalid_constant`.
+        let rep = unit_report(
+            "class C { const C(Object? a, [Object? b]); }\n\
+             const x = C(Missing(), Missing2());",
+        );
+        assert_eq!(count(&rep, "invalid_constant"), 2, "{:?}", code_names(&rep));
+        assert_eq!(
+            count(&rep, "const_initialized_with_non_constant_value"),
+            0,
+            "{:?}",
+            code_names(&rep)
+        );
+        // A known non-constant argument aborts the evaluation first: the
+        // later unresolved creation stays silent.
+        let rep = unit_report(
+            "class C { const C(Object? a, [Object? b]); }\n\
+             void m() {\n\
+             var v = 2;\n\
+             const x = C(v, Missing());\n\
+             }",
+        );
+        assert_eq!(count(&rep, "invalid_constant"), 0, "{:?}", code_names(&rep));
+        assert_eq!(
+            count(&rep, "const_with_non_constant_argument"),
+            1,
+            "{:?}",
+            code_names(&rep)
+        );
+        // Grouping parens enclose no evaluation: the operand still reports
+        // inside the resolved creation.
+        let rep = unit_report(
+            "class C { const C(Object? a); }\n\
+             const x = C(-(Missing()));",
+        );
+        assert_eq!(count(&rep, "invalid_constant"), 1, "{:?}", code_names(&rep));
+        // Root literal: the variable face anchors at the first failing
+        // element only; a root creation anchors at its whole span and
+        // silences its argument.
+        let rep = unit_report("const x = [Missing(), Missing2()];");
+        assert_eq!(
+            count(&rep, "const_initialized_with_non_constant_value"),
+            1,
+            "{:?}",
+            code_names(&rep)
+        );
+        let first = rep
+            .diagnostics
+            .iter()
+            .find(|d| d.code.name == "const_initialized_with_non_constant_value")
+            .map(|d| d.range.offset);
+        assert_eq!(first, Some(11), "{:?}", rep.diagnostics);
+        let rep = unit_report("const x = Missing(Missing2());");
+        let roots: Vec<_> = rep
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "const_initialized_with_non_constant_value")
+            .map(|d| (d.range.offset, d.range.length))
+            .collect();
+        assert_eq!(roots, vec![(10, 19)], "{:?}", rep.diagnostics);
+    }
+
+    /// #2289: a known non-constant argument pairs its argument face with
+    /// the variable face at the same leaf (`C(v)` reports
+    /// `const_with_non_constant_argument` +
+    /// `const_initialized_with_non_constant_value`, both at `v`) and aborts
+    /// the evaluation — the later unresolved creation stays silent — while
+    /// a failed const's later read is silent (the oracle's
+    /// `avoidReporting`): `const h = C(g)` over a failed `g` reports
+    /// nothing at `h`.
+    #[test]
+    fn const_arg_failure_faces_by_leaf_shape() {
+        let count = |rep: &FileReport, name: &str| -> usize {
+            rep.diagnostics
+                .iter()
+                .filter(|d| d.code.name == name)
+                .count()
+        };
+        let rep = unit_report(
+            "class C { const C(Object? a, [Object? b]); }\n\
+             void m() {\n\
+             var v = 2;\n\
+             const x = C(v, Missing());\n\
+             }",
+        );
+        assert_eq!(count(&rep, "invalid_constant"), 0, "{:?}", code_names(&rep));
+        assert_eq!(
+            count(&rep, "const_with_non_constant_argument"),
+            1,
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(
+            count(&rep, "const_initialized_with_non_constant_value"),
+            1,
+            "{:?}",
+            code_names(&rep)
+        );
+        let rep = unit_report(
+            "class C { const C(Object? a); }\n\
+             const g = Missing2<int>('x');\n\
+             const h = C(g);",
+        );
+        assert_eq!(
+            count(&rep, "const_with_non_constant_argument"),
+            0,
+            "{:?}",
+            code_names(&rep)
+        );
+        assert_eq!(count(&rep, "invalid_constant"), 0, "{:?}", code_names(&rep));
+        // `g`'s own declaration still carries the variable face.
+        assert_eq!(
+            count(&rep, "const_initialized_with_non_constant_value"),
+            1,
             "{:?}",
             code_names(&rep)
         );
