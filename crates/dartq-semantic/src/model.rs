@@ -1426,25 +1426,30 @@ pub struct Container {
     /// `types/sealed.dart`).
     pub sealed: bool,
     /// The `with` mixin-application names as written (class/enum application
-    /// order; a named mixin application's `with` list included).
-    pub with_clause: Vec<StringId>,
-    /// The `implements` interface names as written (interface edges).
-    pub implements_clause: Vec<StringId>,
+    /// order; a named mixin application's `with` list included). Sealed at
+    /// the container's close (`into_boxed_slice`) — a finished container
+    /// never grows, so the `Vec` header's capacity field would be dead
+    /// weight per row (#2246).
+    pub with_clause: Box<[StringId]>,
+    /// The `implements` interface names as written (interface edges); sealed
+    /// at the container's close like every clause column.
+    pub implements_clause: Box<[StringId]>,
     /// The `on` constraint names of a mixin, as written (constraint checks,
     /// not supertype edges); empty for every other container kind.
-    pub on_clause: Vec<StringId>,
+    pub on_clause: Box<[StringId]>,
     /// Header-window type names no clause event claimed: the `extends`
     /// overflow types the oracle throws away (`ast_builder.dart:3972-3982`
     /// `handleClassExtends` "throw them away for now and pick the first
     /// one") and recovery residue. Never consulted as super-faces; hashed
     /// into the API signature so an L2-relevant edit cannot hide here.
-    pub header_residue: Vec<StringId>,
+    pub header_residue: Box<[StringId]>,
     /// An extension type's primary-constructor formals, in declaration
     /// order (the representation-field family's facts); empty elsewhere.
     pub primary_formals: Box<[RepFormal]>,
     /// An enum's constants in declaration order (the exhaustiveness
-    /// witness order follows it, `types/enum.dart`); empty elsewhere.
-    pub enum_constants: Vec<StringId>,
+    /// witness order follows it, `types/enum.dart`); empty elsewhere;
+    /// sealed at the container's close.
+    pub enum_constants: Box<[StringId]>,
     /// The named constructor selectors the container declares (`A.named`
     /// keeps `named`). Unnamed constructors and the implicit default are
     /// [`Container::has_unnamed_constructor`]'s business.
@@ -1584,14 +1589,19 @@ pub struct DuplicateDecl {
 ///
 /// Built by [`crate::collector::collect`]; queried per library through
 /// [`crate::library`].
+///
+/// Every column is exact-sized: the maps seal through [`NameMap::finish`]
+/// and the order/log columns move into boxed slices at the collector's
+/// finish seam, so a finished model carries no `Vec` growth slack for its
+/// remaining lifetime (`Arc<FileElements>` behind residency — #2246).
 #[derive(Clone, Debug, Default)]
 pub struct FileElements {
     pub(crate) decls: NameMap<TopDecl>,
     pub(crate) containers: NameMap<Container>,
-    pub(crate) container_order: Vec<StringId>,
-    pub(crate) extension_faces: Vec<ExtensionFace>,
-    pub(crate) duplicates: Vec<DuplicateDecl>,
-    pub(crate) arity_violations: Vec<ArityDecl>,
+    pub(crate) container_order: Box<[StringId]>,
+    pub(crate) extension_faces: Box<[ExtensionFace]>,
+    pub(crate) duplicates: Box<[DuplicateDecl]>,
+    pub(crate) arity_violations: Box<[ArityDecl]>,
     /// The unit's canonical argument pool: every [`Ty::Named`] slot of
     /// this model indexes into it. One pool per model universe — ids from
     /// another unit's pool are meaningless here.

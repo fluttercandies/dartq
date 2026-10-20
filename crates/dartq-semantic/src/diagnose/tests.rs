@@ -9342,7 +9342,7 @@
         let intern = |text: &str| strings.intern(text);
         let c = elements.container(intern("C")).expect("container C");
         assert_eq!(
-            c.implements_clause,
+            c.implements_clause.as_ref(),
             vec![intern("I")],
             "the interface edge must attribute to the implements clause"
         );

@@ -451,7 +451,7 @@ fn member_heap_bytes(member: &dartq_semantic::MemberEntry) -> usize {
 /// One [`FileElements`] model's enumerable heap bytes — the element
 /// models ride `Arc<FileElements>` behind residency and the facts cache
 /// and are the parse side's standing product. Exact over the enumerable
-/// columns (the `NameMap` rows, the clause vectors, the boxed slices);
+/// columns (the `NameMap` rows, the clause slices, the boxed slices);
 /// the `ArgPool` interning tables and the `Ty` enum's nested payloads are
 /// not enumerable from this crate, so the total under-reports by that
 /// residue — bounded by the interned-type count, not file size (the
@@ -470,12 +470,12 @@ fn element_heap_bytes(elements: &FileElements) -> usize {
     for (_, container) in elements.containers() {
         bytes += container.members.len()
             * (size_of::<StringId>() + size_of::<dartq_semantic::MemberEntry>())
-            + std::mem::size_of_val(container.with_clause.as_slice())
-            + std::mem::size_of_val(container.implements_clause.as_slice())
-            + std::mem::size_of_val(container.on_clause.as_slice())
-            + std::mem::size_of_val(container.header_residue.as_slice())
+            + std::mem::size_of_val(&*container.with_clause)
+            + std::mem::size_of_val(&*container.implements_clause)
+            + std::mem::size_of_val(&*container.on_clause)
+            + std::mem::size_of_val(&*container.header_residue)
             + std::mem::size_of_val(&*container.primary_formals)
-            + std::mem::size_of_val(container.enum_constants.as_slice())
+            + std::mem::size_of_val(&*container.enum_constants)
             + std::mem::size_of_val(&*container.constructors)
             + std::mem::size_of_val(&*container.annotations)
             + container.ctor_formals.len()
@@ -1397,6 +1397,14 @@ pub(crate) struct EngineState {
     /// Live files: content id + current facts. Removed files leave the map
     /// entirely (their `FileId`s stay interned in [`Self::files`]).
     pub residency: FxHashMap<FileId, Arc<UnitFacts>>,
+    /// The lazy dependency-interface cache (the `deps` module): pub-cache
+    /// files a live library's `package:` import resolved to but discovery
+    /// never made resident, loaded on demand at the graph build so the
+    /// workspace's own rows resolve their faces. Bounded by
+    /// [`crate::deps::DEP_FILE_CAP`]; never an engine library, so its
+    /// units report nothing. Session-stable by construction (the pub cache
+    /// does not rewrite under a running analysis), never persisted.
+    pub deps: crate::deps::DepIndex,
     /// Monotone residency-growth counter, the generation tag the
     /// nested-pubspec scan's turn gate compares against (the
     /// rust-analyzer incremental-invalidation posture: revision-tagged
@@ -1709,6 +1717,7 @@ impl EngineState {
             files: FileTable::new(),
             strings: StringTable::new(),
             residency: FxHashMap::default(),
+            deps: crate::deps::DepIndex::default(),
             residency_epoch: 0,
             canonical_uris: FxHashMap::default(),
             libraries: LibraryTable::default(),
@@ -2468,11 +2477,20 @@ impl EngineState {
     fn sweep_store(&mut self) {
         self.gc_debt = 0;
         let mut live: FxHashSet<ContentId> = FxHashSet::with_capacity_and_hasher(
-            self.residency.len() + self.facts_cache.len(),
+            self.residency.len() + self.facts_cache.len() + self.deps.units.len(),
             FxBuildHasher,
         );
         live.extend(self.residency.values().map(|facts| facts.content));
         live.extend(self.facts_cache.keys().map(|key| key.content));
+        // The dependency-interface units' sources stay live too: a swept dep
+        // content would break the clause-tree capture's store read (the
+        // under-report direction, but an avoidable one).
+        live.extend(
+            self.deps
+                .units
+                .values()
+                .map(|unit| unit.facts.content()),
+        );
         self.store
             .collect_garbage(&|id: ContentId| live.contains(&id));
     }

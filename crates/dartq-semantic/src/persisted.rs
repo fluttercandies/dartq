@@ -1061,10 +1061,10 @@ mod tests {
                     .collect(),
                 type_params: 2,
                 sealed: true,
-                with_clause: Vec::new(),
-                implements_clause: vec![name("I")],
-                on_clause: Vec::new(),
-                header_residue: vec![name("R")],
+                with_clause: Box::new([]),
+                implements_clause: Box::new([name("I")]),
+                on_clause: Box::new([]),
+                header_residue: Box::new([name("R")]),
                 primary_formals: Box::new([RepFormal {
                     formal: Formal {
                         name: name("rep"),
@@ -1075,7 +1075,7 @@ mod tests {
                     },
                     name_range: range,
                 }]),
-                enum_constants: Vec::new(),
+                enum_constants: Box::new([]),
                 constructors: Box::new([name("named")]),
                 has_unnamed_constructor: false,
                 has_const_constructor: false,
@@ -1100,27 +1100,27 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        elements.container_order.push(name("C"));
-        elements.extension_faces.push(ExtensionFace {
+        elements.container_order = Box::new([name("C")]);
+        elements.extension_faces = Box::new([ExtensionFace {
             name: Some(name("E")),
             on_type: Some(name("int")),
             on_type_nullable: false,
             on_ty: Ty::named(name("int")),
             type_param_names: Box::new([]),
             members: [(name("e"), member("e"))].into_iter().collect(),
-        });
-        elements.duplicates.push(DuplicateDecl {
+        }]);
+        elements.duplicates = Box::new([DuplicateDecl {
             name: name("d"),
             range,
-        });
-        elements.arity_violations.push(ArityDecl {
+        }]);
+        elements.arity_violations = Box::new([ArityDecl {
             violation: ArityViolation::Operator {
                 name: name("=="),
                 expected: 1,
                 found: 2,
             },
             range,
-        });
+        }]);
 
         let payload = PersistedElements::of(&elements, &strings);
         let bytes = serde_json::to_vec(&payload).expect("serialize");
@@ -1229,12 +1229,12 @@ mod tests {
                     .collect(),
                 type_params: 0,
                 sealed: false,
-                with_clause: Vec::new(),
-                implements_clause: Vec::new(),
-                on_clause: Vec::new(),
-                header_residue: Vec::new(),
+                with_clause: Box::new([]),
+                implements_clause: Box::new([]),
+                on_clause: Box::new([]),
+                header_residue: Box::new([]),
                 primary_formals: Box::new([]),
-                enum_constants: Vec::new(),
+                enum_constants: Box::new([]),
                 constructors: Box::new([]),
                 has_unnamed_constructor: true,
                 has_const_constructor: false,
@@ -1252,7 +1252,7 @@ mod tests {
         )]
         .into_iter()
         .collect();
-        elements.container_order.push(name("C"));
+        elements.container_order = Box::new([name("C")]);
 
         // The payload's name rows deliberately leave in the opposite of the
         // map's order: restore must normalize, not preserve.

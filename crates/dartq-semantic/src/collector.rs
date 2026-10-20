@@ -78,9 +78,9 @@
 
 use crate::capture::{TreeSink, TypeTree};
 use crate::model::{
-    Annotation, ArgListId, ArityDecl, ArityViolation, Container, ContainerKind, DuplicateDecl,
-    Entry, ExtensionFace, FileElements, Formal, Formals, MemberEntry, MemberKind, MicroKind,
-    NameMapBuilder, RepFormal, TopDecl, Ty,
+    Annotation, ArgListId, ArgPool, ArityDecl, ArityViolation, Container, ContainerKind,
+    DuplicateDecl, Entry, ExtensionFace, FileElements, Formal, Formals, MemberEntry, MemberKind,
+    MicroKind, NameMapBuilder, RepFormal, TopDecl, Ty,
 };
 use dartq_parser::{
     DeclarationKind, FormalParameterKind, IdentifierContext, Parser, ParserFeatures, ParserListener,
@@ -242,7 +242,9 @@ struct Builder<'src, 'tab> {
     source: &'src str,
     tokens: &'tab TokenTable,
     strings: &'src StringTable,
-    file: FileElements,
+    /// The unit's canonical argument pool (the only intern entry — see
+    /// [`FileElements::type_args_mut`]); moves into the finished model.
+    type_args: ArgPool,
     /// Top-level declarations captured so far; sealed into the model's
     /// `FileElements::decls` at [`Builder::finish`].
     decls: NameMapBuilder<TopDecl>,
@@ -251,6 +253,14 @@ struct Builder<'src, 'tab> {
     /// containers live on [`Builder::containers`]).
     named_containers: NameMapBuilder<Container>,
     containers: Vec<OpenContainer>,
+    /// Declaration-order container names and the unit's extension faces;
+    /// sealed into boxed slices at [`Builder::finish`].
+    container_order: Vec<StringId>,
+    extension_faces: Vec<ExtensionFace>,
+    /// Capture-time duplicate/arity logs; sealed into boxed slices at
+    /// [`Builder::finish`].
+    duplicates: Vec<DuplicateDecl>,
+    arity_violations: Vec<ArityDecl>,
     /// A class-family header is open (`with`/`implements` type names route
     /// to [`Builder::header_interfaces`]).
     in_class_header: bool,
@@ -396,10 +406,14 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             source,
             tokens,
             strings,
-            file: FileElements::default(),
+            type_args: ArgPool::default(),
             decls: NameMapBuilder::default(),
             named_containers: NameMapBuilder::default(),
             containers: Vec::new(),
+            container_order: Vec::new(),
+            extension_faces: Vec::new(),
+            duplicates: Vec::new(),
+            arity_violations: Vec::new(),
             in_class_header: false,
             header_interfaces: Vec::new(),
             header_residue: Vec::new(),
@@ -483,13 +497,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// Records a duplicate (second) declaration; the name maps keep the
     /// first entry, this log is the `duplicate_definition` surface.
     fn record_duplicate(&mut self, name: StringId, range: SourceRange) {
-        self.file.duplicates.push(DuplicateDecl { name, range });
+        self.duplicates.push(DuplicateDecl { name, range });
     }
 
     /// Records a declaration-arity violation.
     fn record_arity(&mut self, violation: ArityViolation, range: SourceRange) {
-        self.file
-            .arity_violations
+        self.arity_violations
             .push(ArityDecl { violation, range });
     }
 
@@ -550,7 +563,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// the recursion), then the outer list interns canonically.
     fn named_from_tree(&mut self, name: StringId, nullable: bool, tree: TypeTree) -> Ty {
         let args: Vec<Ty> = tree.args.into_iter().map(|arg| self.arg_ty(arg)).collect();
-        self.file.type_args_mut().named(name, nullable, &args)
+        self.type_args.named(name, nullable, &args)
     }
 
     /// Builds a record `Ty` from a captured record tree: each field tree
@@ -568,8 +581,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             .into_iter()
             .map(|(name, field)| (name, self.record_field_ty(field)))
             .collect();
-        self.file
-            .type_args_mut()
+        self.type_args
             .record(&positional, &named, tree.nullable)
     }
 
@@ -597,7 +609,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             .into_iter()
             .map(|(name, formal)| (name, self.arg_ty(formal)))
             .collect();
-        self.file.type_args_mut().function(
+        self.type_args.function(
             fn_tree.type_params,
             ret,
             &positional,
@@ -884,7 +896,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             // an honest name stays `None` — the face can never apply, so its
             // members only ever suppress (under-report, never
             // false-positive).
-            self.file.extension_faces.push(ExtensionFace {
+            self.extension_faces.push(ExtensionFace {
                 name: None,
                 on_type: extension_on_type,
                 on_type_nullable: self.extension_on_type_nullable,
@@ -897,7 +909,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         if open.kind == ContainerKind::Extension {
             // A named extension is both an application face and a
             // named container; the two hold the same member set.
-            self.file.extension_faces.push(ExtensionFace {
+            self.extension_faces.push(ExtensionFace {
                 name: open.name.map(|(name, _)| name),
                 on_type: extension_on_type,
                 on_type_nullable: self.extension_on_type_nullable,
@@ -907,7 +919,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             });
         }
         if let Some((name, _range)) = open.name {
-            self.file.container_order.push(name);
+            self.container_order.push(name);
             // The unnamed face: an unnamed constructor was declared, or
             // none was at all — the implicit default stands (a named-only
             // declaration kills it). Read before `ctor_named` moves into
@@ -925,12 +937,15 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 members: members.finish(),
                 type_params: open.type_params,
                 sealed: open.sealed,
-                with_clause: open.with_clause,
-                implements_clause: open.implements_clause,
-                on_clause: open.on_clause,
-                header_residue: open.header_residue,
+                // The clause columns seal at exact length here — the
+                // push-grown staging Vecs shed their growth slack by
+                // construction, and the finished container never grows.
+                with_clause: open.with_clause.into_boxed_slice(),
+                implements_clause: open.implements_clause.into_boxed_slice(),
+                on_clause: open.on_clause.into_boxed_slice(),
+                header_residue: open.header_residue.into_boxed_slice(),
                 primary_formals: open.primary_formals.into_boxed_slice(),
-                enum_constants: open.enum_constants,
+                enum_constants: open.enum_constants.into_boxed_slice(),
                 constructors: open.ctor_named.into_boxed_slice(),
                 has_unnamed_constructor,
                 has_const_constructor: open.ctor_const,
@@ -1253,15 +1268,17 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         while !self.containers.is_empty() {
             self.close_container();
         }
-        let file = self.file;
+        // The seal: every order/log column moves into a boxed slice at
+        // exact length — a finished model is immutable, so the staging
+        // Vecs' growth slack must not survive into residency (#2246).
         FileElements {
             decls: self.decls.finish(),
             containers: self.named_containers.finish(),
-            container_order: file.container_order,
-            extension_faces: file.extension_faces,
-            duplicates: file.duplicates,
-            arity_violations: file.arity_violations,
-            type_args: file.type_args,
+            container_order: self.container_order.into_boxed_slice(),
+            extension_faces: self.extension_faces.into_boxed_slice(),
+            duplicates: self.duplicates.into_boxed_slice(),
+            arity_violations: self.arity_violations.into_boxed_slice(),
+            type_args: self.type_args,
         }
     }
 }
@@ -3579,7 +3596,7 @@ mod tests {
         let c = elements.container(id(&strings, "C")).expect("C");
         assert_eq!(c.superclass, Some(id(&strings, "A")));
         assert!(c.implements_clause.is_empty(), "{:?}", c.implements_clause);
-        assert_eq!(c.header_residue, vec![id(&strings, "B")]);
+        assert_eq!(c.header_residue.as_ref(), vec![id(&strings, "B")]);
     }
 
     /// Clause names after their keyword attribute to their clause; the
@@ -3595,9 +3612,9 @@ mod tests {
         );
         let e = elements.container(id(&strings, "E")).expect("E");
         assert_eq!(e.superclass, Some(id(&strings, "A")));
-        assert_eq!(e.with_clause, vec![id(&strings, "C")]);
-        assert_eq!(e.implements_clause, vec![id(&strings, "D")]);
-        assert_eq!(e.header_residue, vec![id(&strings, "B")]);
+        assert_eq!(e.with_clause.as_ref(), vec![id(&strings, "C")]);
+        assert_eq!(e.implements_clause.as_ref(), vec![id(&strings, "D")]);
+        assert_eq!(e.header_residue.as_ref(), vec![id(&strings, "B")]);
     }
 
     /// Prefixed clause names keep the continuation (`implements p.A`
@@ -3619,16 +3636,16 @@ mod tests {
         );
         let c = elements.container(id(&strings, "C")).expect("C");
         assert_eq!(c.superclass, Some(id(&strings, "S")));
-        assert_eq!(c.implements_clause, vec![id(&strings, "A")]);
+        assert_eq!(c.implements_clause.as_ref(), vec![id(&strings, "A")]);
         let w = elements.container(id(&strings, "W")).expect("W");
-        assert_eq!(w.with_clause, vec![id(&strings, "M")]);
-        assert_eq!(w.implements_clause, vec![id(&strings, "A")]);
+        assert_eq!(w.with_clause.as_ref(), vec![id(&strings, "M")]);
+        assert_eq!(w.implements_clause.as_ref(), vec![id(&strings, "A")]);
         let n = elements.container(id(&strings, "N")).expect("N");
-        assert_eq!(n.on_clause, vec![id(&strings, "T")]);
-        assert_eq!(n.implements_clause, vec![id(&strings, "A")]);
+        assert_eq!(n.on_clause.as_ref(), vec![id(&strings, "T")]);
+        assert_eq!(n.implements_clause.as_ref(), vec![id(&strings, "A")]);
         let e = elements.container(id(&strings, "E")).expect("E");
-        assert_eq!(e.with_clause, vec![id(&strings, "M")]);
-        assert_eq!(e.implements_clause, vec![id(&strings, "A")]);
+        assert_eq!(e.with_clause.as_ref(), vec![id(&strings, "M")]);
+        assert_eq!(e.implements_clause.as_ref(), vec![id(&strings, "A")]);
     }
 
     /// A named mixin application's `with p.M` cannot steal the head's
@@ -3642,7 +3659,7 @@ mod tests {
         let elements = build("class S {} mixin M {} class C = S with p.M;", &strings);
         let c = elements.container(id(&strings, "C")).expect("C");
         assert_eq!(c.superclass, Some(id(&strings, "S")));
-        assert_eq!(c.with_clause, vec![id(&strings, "M")]);
+        assert_eq!(c.with_clause.as_ref(), vec![id(&strings, "M")]);
     }
 
     /// Generic clause types keep only their head names: identifiers inside
@@ -3661,13 +3678,13 @@ mod tests {
             &strings,
         );
         let c = elements.container(id(&strings, "C")).expect("C");
-        assert_eq!(c.implements_clause, vec![id(&strings, "List")]);
+        assert_eq!(c.implements_clause.as_ref(), vec![id(&strings, "List")]);
         assert!(c.header_residue.is_empty(), "{:?}", c.header_residue);
         let w = elements.container(id(&strings, "W")).expect("W");
-        assert_eq!(w.with_clause, vec![id(&strings, "M"), id(&strings, "N")]);
+        assert_eq!(w.with_clause.as_ref(), vec![id(&strings, "M"), id(&strings, "N")]);
         assert!(w.header_residue.is_empty(), "{:?}", w.header_residue);
         let mx = elements.container(id(&strings, "Mx")).expect("Mx");
-        assert_eq!(mx.on_clause, vec![id(&strings, "T")]);
+        assert_eq!(mx.on_clause.as_ref(), vec![id(&strings, "T")]);
         assert!(mx.header_residue.is_empty(), "{:?}", mx.header_residue);
     }
 

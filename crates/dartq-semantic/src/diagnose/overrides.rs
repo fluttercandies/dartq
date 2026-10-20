@@ -199,7 +199,7 @@ impl<'a> Engine<'a> {
             // interface includes them — but only on the mixin-super walk;
             // the extension-type `implements` walk leaves `on` untouched.
             let on_clause = if climb_on {
-                face_container.on_clause.as_slice()
+                &face_container.on_clause[..]
             } else {
                 &[]
             };
@@ -636,7 +636,7 @@ impl<'a> Engine<'a> {
         {
             return;
         }
-        let mut faces: Vec<StringId> = decl.with_clause.clone();
+        let mut faces: Vec<StringId> = decl.with_clause.to_vec();
         faces.extend(decl.superclass);
         let mut annotated_owner: Option<StringId> = None;
         let mut concrete = false;
