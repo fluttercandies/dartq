@@ -350,3 +350,145 @@ fn foreign_face_substitution_keeps_the_real_mismatch_reporting() {
         "add(String) does not override DelegatingList<int>.add: {names:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2366 pins: the inherited-signature free-parameter walk. The face walk
+// above instantiates the super face's written arguments; the member walk
+// must also reach the free container parameters nested inside the member's
+// own signature types (`void blast(Wrapper<T> w)` — `T` hides inside
+// `Wrapper<T>`). Missing them kept the signature unsubstituted and the
+// comparison undecidable (the under-report direction): a broken override in
+// the nested form stayed silent where the oracle reports `invalid_override`.
+// ---------------------------------------------------------------------------
+
+/// The nested parameter-position form the bare-head walk missed: `Box<T>`'s
+/// `blast(Wrapper<T> w)` inherited through `Sub<X> extends Box<X>`
+/// instantiates to `blast(Wrapper<X> w)` — both the parameter and the
+/// return position (`Wrapper<T> get first`) substitute, so the matching
+/// overrides compare equal instead of undecidable. Green at baseline by
+/// construction: the undecidable read suppressed rather than false-fired,
+/// so the substituted equality is observable only through the mismatch
+/// discriminator below.
+#[test]
+fn nested_member_parameter_position_substitutes_the_free_param() {
+    assert_clean(
+        "class Wrapper<T> {}\n\
+         class Box<T> {\n\
+         \x20 void blast(Wrapper<T> w) {}\n\
+         \x20 Wrapper<T> get first => throw '';\n\
+         }\n\
+         class Sub<X> extends Box<X> {\n\
+         \x20 void blast(Wrapper<X> w) {}\n\
+         \x20 Wrapper<X> get first => throw '';\n\
+         }\n",
+    );
+}
+
+/// The discriminating nested form: `Sub extends Box<int>` instantiates the
+/// inherited `blast(Wrapper<T> w)` to `blast(Wrapper<int> w)`, so the
+/// `Wrapper<String>` override concretely mismatches and the oracle reports
+/// `invalid_override`. The unsubstituted read compared `Wrapper<String>`
+/// against the raw `Wrapper<T>` and the free-parameter argument fell
+/// undecidable: silent, the under-report this fix closes (red before,
+/// green after). The mismatch is concrete (`String` vs `int`) so the
+/// verdict is decidable once `T` substitutes — a type-parameter argument
+/// (`Wrapper<X>` vs `Wrapper<int>`) stays undecidable in the name-level
+/// assignability and cannot discriminate.
+#[test]
+fn nested_member_parameter_position_reports_the_real_mismatch() {
+    let names = code_names(&report(
+        "class Wrapper<T> {}\n\
+         class Box<T> {\n\
+         \x20 void blast(Wrapper<T> w) {}\n\
+         }\n\
+         class Sub extends Box<int> {\n\
+         \x20 void blast(Wrapper<String> w) {}\n\
+         }\n",
+    ));
+    assert!(
+        names.contains(&"invalid_override"),
+        "blast(Wrapper<String>) does not override Box<int>.blast instantiated T to int: {names:?}"
+    );
+}
+
+/// The multi-level nested form: `T` sits two argument levels deep in
+/// `Outer<Inner<T>>` — the walk descends through both argument lists, so
+/// the matching override substitutes equal in the parameter and the
+/// return position. Green at baseline by construction, like the
+/// single-level clean form (suppression, not false positive); the
+/// substituted equality is observable through the mismatch discriminator
+/// below.
+#[test]
+fn deeply_nested_member_position_substitutes_the_free_param() {
+    assert_clean(
+        "class Inner<A> {}\n\
+         class Outer<B> {}\n\
+         class Box<T> {\n\
+         \x20 void blast(Outer<Inner<T>> w) {}\n\
+         \x20 Outer<Inner<T>> get first => throw '';\n\
+         }\n\
+         class Sub<X> extends Box<X> {\n\
+         \x20 void blast(Outer<Inner<X>> w) {}\n\
+         \x20 Outer<Inner<X>> get first => throw '';\n\
+         }\n",
+    );
+}
+
+/// The discriminating multi-level nested form: `Sub extends Box<int>`
+/// instantiates the inherited `Outer<Inner<T>>` to `Outer<Inner<int>>`, so
+/// the `Outer<Inner<String>>` override concretely mismatches two argument
+/// levels deep — the same under-report face as the single-level mismatch
+/// (red before, green after; the concrete `Inner<String>` vs `Inner<int>`
+/// argument decides where a parameter argument would fall undecidable).
+#[test]
+fn deeply_nested_member_position_reports_the_real_mismatch() {
+    let names = code_names(&report(
+        "class Inner<A> {}\n\
+         class Outer<B> {}\n\
+         class Box<T> {\n\
+         \x20 void blast(Outer<Inner<T>> w) {}\n\
+         }\n\
+         class Sub extends Box<int> {\n\
+         \x20 void blast(Outer<Inner<String>> w) {}\n\
+         }\n",
+    ));
+    assert!(
+        names.contains(&"invalid_override"),
+        "blast(Outer<Inner<String>>) does not override Box<int>.blast instantiated T to int: {names:?}"
+    );
+}
+
+/// The bare-head control the walk always collected: with `T` both as a
+/// bare head and nested in one signature, the matching override stays
+/// clean while the concrete nested mismatch still reports — the descent
+/// widens the set without disturbing the bare-head substitution. Green at
+/// baseline by construction: the bare `T head` already fed the
+/// substitution, and the shared environment substitutes the nested slot
+/// along with it — this pin guards the no-regression face, not the
+/// collection gap.
+#[test]
+fn bare_head_position_control_keeps_substituting() {
+    let rep = report(
+        "class Wrapper<T> {}\n\
+         class Box<T> {\n\
+         \x20 void both(T head, Wrapper<T> nested) {}\n\
+         }\n\
+         class Good<X> extends Box<X> {\n\
+         \x20 void both(X head, Wrapper<X> nested) {}\n\
+         }\n\
+         class Bad extends Box<int> {\n\
+         \x20 void both(int head, Wrapper<String> nested) {}\n\
+         }\n",
+    );
+    let overrides: Vec<_> = rep
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "invalid_override")
+        .collect();
+    assert_eq!(
+        overrides.len(),
+        1,
+        "only Bad's mismatch may report: {:?}",
+        rep.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}

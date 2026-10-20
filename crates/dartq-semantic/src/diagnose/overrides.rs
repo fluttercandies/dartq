@@ -3871,35 +3871,25 @@ impl<'a> Engine<'a> {
         dead.then_some(false)
     }
 
-    /// The inherited entry's bare type-parameter spellings that are free in
-    /// the diagnosing scope: not the entry's own generics (a generic
-    /// method's parameters shadow its container's), but declared as a type
+    /// The inherited entry's type-parameter spellings that are free in the
+    /// diagnosing scope: not the entry's own generics (a generic method's
+    /// parameters shadow its container's), but declared as a type
     /// parameter in the declaring file's declaration set — the
     /// unsubstituted container parameters the oracle never compares raw.
+    /// Bare heads AND nested type-argument slots (`void blast(Wrapper<T>
+    /// w)`'s `T`) both count — the walk is [`Self::free_params_in`], the
+    /// same descent the mixin-application environment uses, so the
+    /// substitution reaches parameter positions the bare-head walk
+    /// deliberately missed and the nested-form override instantiates
+    /// instead of comparing undecidable.
     fn super_free_params(&self, entry: &MemberEntry, scope_file: FileId) -> Vec<StringId> {
         let mut free: Vec<StringId> = Vec::new();
-        let push = |ty: Ty, free: &mut Vec<StringId>| {
-            if let Ty::Named {
-                name,
-                args: crate::model::ArgListId::EMPTY,
-                ..
-            } = ty
-                && !entry.type_param_names.contains(&name)
-                && !free.contains(&name)
-                && self
-                    .index
-                    .get(scope_file)
-                    .and_then(|f| f.decl(name))
-                    .is_some_and(|decl| decl.kind == crate::model::MicroKind::TypeParam)
-            {
-                free.push(name);
-            }
-        };
-        push(entry.var_ty, &mut free);
-        push(entry.return_ty, &mut free);
+        let mut collect = |ty: Ty| self.free_params_in(ty, entry, scope_file, &mut free);
+        collect(entry.var_ty);
+        collect(entry.return_ty);
         if let Some(formals) = entry.formals.as_deref() {
             for formal in formals.positional.iter().chain(formals.named.iter()) {
-                push(formal.ty, &mut free);
+                collect(formal.ty);
             }
         }
         free
