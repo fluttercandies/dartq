@@ -1060,10 +1060,19 @@ impl Interp<'_> {
                     // unknown slot: every null-check disjointness and
                     // promotion answer it produced would be new output the
                     // pre-#2243 fold never made, and no promotion hangs on
-                    // it. The unresolved-nullable marker adopts as the
-                    // opaque-nullable declared face — the null check's
-                    // marker step (#2243) keys on it, and every other
-                    // consumer reads it exactly like the unknown it was.
+                    // it. The unknown face adopts as the opaque-nullable
+                    // declared face — the null check's marker step (#2243)
+                    // keys on it, and every other consumer reads it exactly
+                    // like the unknown it was. The PLAIN unknown face adopts
+                    // it too (#2241): an initializer the fold can only type
+                    // as unknown (a call's return, a property chain whose
+                    // receiver is itself a property read — officially not a
+                    // promotable property target, so no slot face engages)
+                    // still has a definite static type the semantic layer
+                    // resolves; declaring it the plain unknown would refuse
+                    // every null-check refinement and leave the guarded
+                    // reads unpromoted where the official's
+                    // `_inferLocalVariable` typed them nullable.
                     if let Some(meta) = self.vars.get_mut(var as usize)
                         && meta.ty.base == crate::ty::Base::Unknown
                     {
@@ -1081,7 +1090,7 @@ impl Interp<'_> {
                         {
                             meta.ty = rhs.ty;
                             meta.args = rhs.args;
-                        } else if rhs.ty == Ty::UNKNOWN_NULLABLE {
+                        } else if rhs.ty.base == crate::ty::Base::Unknown {
                             meta.ty = Ty::UNKNOWN_NULLABLE;
                         }
                     }

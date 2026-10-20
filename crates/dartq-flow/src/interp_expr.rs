@@ -1640,23 +1640,11 @@ impl Interp<'_> {
             // The variable-check face (a promotable reference operand).
             if let Some(var) = operand.and_then(|e| e.reference) {
                 let operand = operand.expect("reference implies operand");
-                let (mut promoted, mut promoted_args) =
+                // The marker step lives in [`Interp::promote_to_non_null`]
+                // (the opaque-declared face's non-null form is the plain
+                // unknown, #2243/#2241).
+                let (promoted, promoted_args) =
                     self.promote_to_non_null(operand.ty, operand.args);
-                // The opaque-declared local's marker step (#2243): the
-                // declared face is the unresolved-nullable marker (a
-                // `var`-inferred local whose initializer type the flow
-                // lattice cannot spell — an unresolved field read), so
-                // `tryMarkNonNullable`'s non-null face is the plain
-                // unknown marker — the local mirror of the property-slot
-                // marker chain (#1409). The step always refines (the
-                // unpromoted marker is potentially nullable), and the
-                // consumer re-decides the promoted type from its own
-                // resolved static type (#2174's opaque-head arm strips
-                // the resolved type's `?`).
-                if promoted == operand.ty && operand.ty == Ty::UNKNOWN_NULLABLE {
-                    promoted = Ty::UNKNOWN;
-                    promoted_args = crate::ty::EMPTY_ARGS;
-                }
                 if promoted == operand.ty {
                     // Official `tryMarkNonNullable` bails on
                     // `isSameType` (flow_analysis.dart:4059-4068): the

@@ -1395,7 +1395,17 @@ impl<'o> Interp<'o> {
                 .target
                 .map_or((t, args), |(ty, target_args)| (ty, target_args));
         }
-        (self.ops.promote_to_non_null(t), args)
+        let promoted = self.ops.promote_to_non_null(t);
+        // The opaque-declared face's marker step (#2243, centralized from
+        // the equality path — every refinement site shares it): the
+        // non-null face of the unresolved-nullable marker is the plain
+        // unknown, so a `!`/`?.`-receiver/`??`-LHS refinement on a local
+        // whose declared type the fold adopted as the marker refines
+        // exactly like a null check does (#2241).
+        if promoted == t && t == Ty::UNKNOWN_NULLABLE {
+            return (Ty::UNKNOWN, crate::ty::EMPTY_ARGS);
+        }
+        (promoted, args)
     }
 
     /// Name-level least upper bound (official `typeOperations.join`): the

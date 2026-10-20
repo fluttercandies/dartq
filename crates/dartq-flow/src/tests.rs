@@ -1238,19 +1238,29 @@ fn boundary_table_scopes_to_one_top_level_declaration() {
 #[test]
 fn closure_parameter_type_does_not_leak_across_declaration_list() {
     // The leak discriminator: a leaked `String?` declared type on `c`
-    // makes the then-branch read after `c != null` emit the promotion row
-    // the oracle never emits (upstream `c` is non-nullable `int` — the
-    // check is trivial and promotes nothing).
+    // makes the then-branch read after `c != null` emit a NAMED promotion
+    // row (to the parameter's `String`) the oracle never emits (upstream
+    // `c` is non-nullable `int` — the check is trivial and promotes
+    // nothing). The unknown-face marker promotion (#2241 — the `1`
+    // initializer's unspellable face refining through the #2243 marker
+    // step) is not the leak: its consumer substitution re-decides from
+    // the resolved `int` and changes no row.
+    let leaked = |source: &str| {
+        promoted_tys(source)
+            .into_iter()
+            .filter(|ty| matches!(ty.base, crate::ty::Base::Name(_)))
+            .collect::<Vec<_>>()
+    };
     assert!(
-        promoted_tys("void f() { var a = (String? b) => b, c = 1; if (c != null) { int y = c; } }")
+        leaked("void f() { var a = (String? b) => b, c = 1; if (c != null) { int y = c; } }")
             .is_empty(),
         "the closure parameter's `String?` must not declare `c`"
     );
     // The leak reaches every later item of the list: mixed initializers
     // each declare from themselves (`c` from `1`, `d` from `'s'`), so no
-    // follow-up null check promotes anything.
+    // follow-up null check promotes anything to a named type.
     assert!(
-        promoted_tys(
+        leaked(
             "void f() { var a = (String? b) => b, c = 1, d = 's'; if (c != null) { int y = c; } if (d != null) { int z = d; } }"
         )
         .is_empty(),
@@ -1610,11 +1620,13 @@ fn shadowing_local_wins_over_the_top_level_face() {
     let source = "String a = '';\nvoid f() { var a = 1; var b = a; }\n";
     let rows = read_types_of(source);
     // `a` reads at offset 45 — the local's face, not the top-level
-    // `String`.
+    // `String`. The `1` initializer's unspellable face adopts the
+    // potentially-nullable unknown marker (#2241) — still the unknown
+    // base, never the top-level declared type.
     let row = rows.iter().find(|(offset, _)| *offset == 45);
     assert_eq!(
-        row.map(|(_, ty)| *ty),
-        Some(crate::ty::Ty::UNKNOWN),
+        row.map(|(_, ty)| ty.base),
+        Some(crate::ty::Base::Unknown),
         "{rows:?}"
     );
 }
@@ -6771,18 +6783,20 @@ fn initializer_closure_guarded_read_promotes_like_a_function_body() {
         "String? mk() => null;\n",
         "final f = () { final str = mk(); if (str == null) return; str.hashCode; };",
     );
-    // Two `str` reads (condition + guarded member), both promoted to the
-    // non-null face. The needles key at the `str` token offset.
+    // Two `str` reads: the condition read carries the potentially-nullable
+    // unknown marker (the `mk()` initializer's unspellable face — #2241's
+    // adoption), the guarded member read its promoted non-null face. The
+    // needles key at the `str` token offset.
     let expected: Vec<(u32, bool)> = ["str == null) return", "str.hashCode"]
         .iter()
         .map(|needle| {
-            (source_offset(control, needle), false)
+            (source_offset(control, needle), needle.starts_with("str =="))
         })
         .collect();
     assert_eq!(guarded_read_faces(control), expected, "{control:?}");
     let expected: Vec<(u32, bool)> = ["str == null) return", "str.hashCode"]
         .iter()
-        .map(|needle| (source_offset(closure, needle), false))
+        .map(|needle| (source_offset(closure, needle), needle.starts_with("str ==")))
         .collect();
     assert_eq!(guarded_read_faces(closure), expected, "{closure:?}");
 }
@@ -6799,7 +6813,14 @@ fn field_initializer_closure_guarded_read_promotes() {
     );
     let faces = guarded_read_faces(source);
     assert_eq!(faces.len(), 2, "{source:?}");
-    assert!(faces.iter().all(|&(_, nullable)| !nullable), "{faces:?}");
+    assert_eq!(
+        faces,
+        vec![
+            (source_offset(source, "str == null"), true),
+            (source_offset(source, "str.hashCode"), false),
+        ],
+        "{source:?}"
+    );
 }
 
 /// The promotion gates dead code inside the initializer closure: after
@@ -6840,4 +6861,267 @@ fn initializer_closure_guarded_argument_read_carries_non_null_face() {
 /// utf-16), the test corpus's addressing convention.
 fn source_offset(source: &str, needle: &str) -> u32 {
     source.find(needle).expect("needle present") as u32
+}
+
+// —— #2241 family B: the unknown-face initializer adoption ——
+// —— #2241 family B: the unknown-face initializer adoption ——
+// —— #2241 family B: the unknown-face initializer adoption ——
+// —— #2241 family B: the unknown-face initializer adoption ——
+// —— #2241 family B: the unknown-face initializer adoption ——
+
+
+
+
+
+
+
+/// Read-type rows whose source text starts with `needle`, as
+/// `(offset, nullable)` pairs sorted by offset (ASCII sources: byte ==
+/// utf-16, the test corpus's addressing convention).
+fn needle_faces(source: &str, needle: &str) -> Vec<(u32, bool)> {
+    let mut rows: Vec<(u32, bool)> = read_types_of(source)
+        .into_iter()
+        .filter(|(offset, _)| source[*offset as usize..].starts_with(needle))
+        .map(|(offset, ty)| (offset, ty.nullable))
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+/// The condition read of a null-checked local whose initializer the fold
+/// can only type as unknown carries the potentially-nullable marker, and
+/// the guarded read on the `||`'s short-circuit arm carries its promoted
+/// non-null face (the riverpod `final links = ref?._keepAliveLinks;` —
+/// `if (... || links.isEmpty)` shape). Before the fix the plain unknown
+/// declared face refused every null-check refinement, the guarded read
+/// rode unpromoted, and the semantic layer fired the oracle-clean
+/// UNCHECKED row.
+#[test]
+fn null_aware_property_local_promotes_through_null_check() {
+    let source = concat!(
+        "class Ref { List<String>? keepAliveLinks; }\n",
+        "class Provider {\n",
+        "  bool get isActive => false;\n",
+        "  Ref? get ref => null;\n",
+        "  void schedule() {}\n",
+        "}\n",
+        "void disposeSink(Provider c) {\n",
+        "  final links = c.ref?.keepAliveLinks;\n",
+        "  if (!c.isActive && (links == null || links.isEmpty)) {\n",
+        "    c.schedule();\n",
+        "  }\n",
+        "}",
+    );
+    let expected: Vec<(u32, bool)> = ["links == null", "links.isEmpty"]
+        .iter()
+        .map(|needle| (source_offset(source, needle), needle.ends_with("== null")))
+        .collect();
+    assert_eq!(needle_faces(source, "links"), expected, "{source:?}");
+}
+
+/// The same adoption for a call initializer (`final s = mkList();` — the
+/// fold types no returns): the then-branch read after `s != null` is
+/// promoted.
+#[test]
+fn unknown_call_initializer_local_promotes_in_then_branch() {
+    let source = concat!(
+        "List<String>? mkList() => null;\n",
+        "void f() {\n",
+        "  final s = mkList();\n",
+        "  if (s != null) {\n",
+        "    var n = s.isEmpty;\n",
+        "  }\n",
+        "}",
+    );
+    let expected: Vec<(u32, bool)> = [("s != null", true), ("s.isEmpty", false)]
+        .iter()
+        .map(|(needle, nullable)| (source_offset(source, needle), *nullable))
+        .collect();
+    assert_eq!(needle_faces(source, "s"), expected, "{source:?}");
+}
+
+/// A property chain whose receiver is itself a property read (officially
+/// not a promotable property target, so no slot face engages and the
+/// chain's flow face is the plain unknown) adopts the marker too.
+#[test]
+fn chained_property_local_promotes_through_null_check() {
+    let source = concat!(
+        "class Ref { List<String>? keepAliveLinks; }\n",
+        "class Provider { Ref? ref; }\n",
+        "void f(Provider c) {\n",
+        "  final links = c.ref.keepAliveLinks;\n",
+        "  if (links != null) {\n",
+        "    links.isEmpty;\n",
+        "  }\n",
+        "}",
+    );
+    let expected: Vec<(u32, bool)> = [("links != null", true), ("links.isEmpty", false)]
+        .iter()
+        .map(|(needle, nullable)| (source_offset(source, needle), *nullable))
+        .collect();
+    assert_eq!(needle_faces(source, "links"), expected, "{source:?}");
+}
+
+/// The promotion survives into a switch-case body's loop (the riverpod
+/// `element.dart` shape: the local declared inside a case alternative,
+/// null-checked, read in the loop condition).
+#[test]
+fn case_body_local_promotes_through_null_check() {
+    let source = concat!(
+        "class Ref { List<String>? listeners; }\n",
+        "class Res<T> {}\n",
+        "class ResData<T> extends Res<T> {}\n",
+        "class Holder<T> {\n",
+        "  Ref? get ref => null;\n",
+        "  void notify(Res<T> next) {\n",
+        "    switch (next) {\n",
+        "      case final ResData<T> newState:\n",
+        "        final subs = ref?.listeners;\n",
+        "        if (subs != null) {\n",
+        "          for (var i = 0; i < subs.length; i++) {\n",
+        "            newState.hashCode;\n",
+        "          }\n",
+        "        }\n",
+        "    }\n",
+        "  }\n",
+        "}",
+    );
+    let expected: Vec<(u32, bool)> = [
+        ("subs != null", true),
+        ("subs.length", false),
+    ]
+    .iter()
+    .map(|(needle, nullable)| (source_offset(source, needle), *nullable))
+    .collect();
+    assert_eq!(needle_faces(source, "subs"), expected, "{source:?}");
+}
+
+/// The `!` assertion refines the opaque-declared face too (the drift
+/// `wasm_setup.dart` shape: the local initialized by a null-aware property
+/// read, asserted inside a case body, read again two statements later).
+/// Before the marker step was centralized the assertion's non-null form
+/// left the unknown face unchanged, the later read rode unpromoted, and
+/// the oracle-clean UNCHECKED row fired.
+#[test]
+fn bang_assertion_promotes_unknown_local() {
+    let source = concat!(
+        "class W { int send = 0; int version = 0; }\n",
+        "class Opener { W? _sharedWorker; }\n",
+        "enum Impl { opfsShared, other }\n",
+        "class Msg { Msg(int send); }\n",
+        "void f(Opener opener, Impl implementation) {\n",
+        "  Msg message;\n",
+        "  final sharedWorker = opener._sharedWorker;\n",
+        "  switch (implementation) {\n",
+        "    case Impl.opfsShared:\n",
+        "      message = Msg(sharedWorker!.version);\n",
+        "      message.sendTo(sharedWorker.send);\n",
+        "    case Impl.other:\n",
+        "      break;\n",
+        "  }\n",
+        "}",
+    );
+    let expected: Vec<(u32, bool)> = [
+        ("sharedWorker!.version", true),
+        ("sharedWorker.send", false),
+    ]
+    .iter()
+    .map(|(needle, nullable)| (source_offset(source, needle), *nullable))
+    .collect();
+    assert_eq!(needle_faces(source, "sharedWorker"), expected, "{source:?}");
+}
+
+/// A switch-pattern-promoted scrutinee read carries the matched type
+/// (the riverpod `listenable.dart` shape: `case null: break;` then
+/// `case $ResultData<ValueT>():` — the member read on the promoted
+/// formal). The flow half of the seam: the promotion stands even where
+/// the member's name collides with an abstract getter on the declared
+/// base type.
+#[test]
+fn pattern_promoted_scrutinee_read_carries_matched_type() {
+    let source = concat!(
+        "sealed class Res<V> {\n",
+        "  V? get value;\n",
+        "  Object? get error;\n",
+        "}\n",
+        "class ResData<V> implements Res<V> {\n",
+        "  final V value;\n",
+        "  ResData(this.value);\n",
+        "}\n",
+        "class ResError<V> implements Res<V> {\n",
+        "  final Object error;\n",
+        "  ResError(this.error);\n",
+        "}\n",
+        "class Box<V> {\n",
+        "  void sink(V? x) {}\n",
+        "  void sink2(Object? x) {}\n",
+        "  set result(Res<V>? next) {\n",
+        "    switch (next) {\n",
+        "      case null:\n",
+        "        break;\n",
+        "      case ResData<V>():\n",
+        "        sink(next.value);\n",
+        "      case ResError<V>():\n",
+        "        sink2(next.error);\n",
+        "    }\n",
+        "  }\n",
+        "}",
+    );
+    // The scrutinee read anchors one past the `(` of `switch (next)`; the
+    // member reads anchor at their receiver token.
+    let scrutinee = source_offset(source, "(next) {") + 1;
+    let expected: Vec<(u32, bool)> = [
+        (scrutinee, true),
+        (source_offset(source, "next.value"), false),
+        (source_offset(source, "next.error"), false),
+    ]
+    .to_vec();
+    assert_eq!(needle_faces(source, "next"), expected, "{source:?}");
+}
+
+#[test]
+fn scratch_if_write_join() {
+    let source = concat!(
+        "class L {} ",
+        "L? mk() => null; ",
+        "int f(bool c) { L? v; if (c) { v = mk(); } return v?.hashCode ?? 0; }",
+    );
+    let result = dartq_scanner::scan(
+        source,
+        ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        },
+        dartq_source::FileTable::new().intern(std::path::Path::new("test.dart")),
+    );
+    assert!(result.diagnostics.is_empty(), "{source:?}");
+    let tokens: &'static TokenTable = Box::leak(Box::new(result.tokens));
+    let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+        LanguageVersion::new(3, 15),
+    ));
+    let mut flow = SharedFlow(std::rc::Rc::new(std::cell::RefCell::new(Flow::new(
+        tokens, source,
+    ))));
+    let target = source.find("v = mk").expect("target") as u32;
+    let l_id = flow.0.borrow_mut().intern_name("L");
+    flow.0
+        .borrow_mut()
+        .stage_assignment_rhs(target, crate::ty::Ty { base: crate::ty::Base::Name(l_id), nullable: true });
+    let mut parser = dartq_parser::Parser::new(source, tokens, features, &mut flow);
+    parser.parse_unit();
+    drop(parser);
+    let facts = flow.0.borrow_mut().take_facts();
+    let dead: Vec<_> = facts.iter().filter_map(|f| match f {
+        FlowFact::DeadCode { span } => Some(source[span.range.offset as usize
+            ..(span.range.offset + span.range.length) as usize]
+            .to_string()),
+        _ => None,
+    }).collect();
+    let promoted: Vec<_> = facts.iter().filter_map(|f| match f {
+        FlowFact::PromotedRead { span, ty, .. } => Some((source[span.range.offset as usize
+            ..span.range.end() as usize].to_string(), *ty)),
+        _ => None,
+    }).collect();
+    println!("dead: {dead:?}");
+    println!("promoted: {promoted:?}");
 }
