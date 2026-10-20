@@ -129,6 +129,13 @@ pub const ARGUMENT_TYPE_NOT_ASSIGNABLE: CodeInfo = CodeInfo::new(
     DiagnosticType::CompileTimeError,
     true,
 );
+/// `Refutable patterns can't be used in an irrefutable context.`
+pub const REFUTABLE_PATTERN_IN_IRREFUTABLE_CONTEXT: CodeInfo = CodeInfo::new(
+    "refutable_pattern_in_irrefutable_context",
+    "REFUTABLE_PATTERN_IN_IRREFUTABLE_CONTEXT",
+    DiagnosticType::CompileTimeError,
+    true,
+);
 
 // --- Static warnings ---
 
@@ -235,12 +242,13 @@ pub const DARTQ_SOURCE_REJECTED: CodeInfo = CodeInfo::new(
 
 /// The hand-written codes above: M0-measured families outside the generated
 /// table, plus the dartq-own namespace.
-const OWN_CODES: [CodeInfo; 17] = [
+const OWN_CODES: [CodeInfo; 18] = [
     DUPLICATE_DEFINITION,
     AWAIT_IN_WRONG_CONTEXT,
     URI_DOES_NOT_EXIST,
     UNDEFINED_IDENTIFIER,
     ARGUMENT_TYPE_NOT_ASSIGNABLE,
+    REFUTABLE_PATTERN_IN_IRREFUTABLE_CONTEXT,
     UNUSED_LOCAL_VARIABLE,
     DEAD_CODE,
     PREFER_SINGLE_QUOTES,

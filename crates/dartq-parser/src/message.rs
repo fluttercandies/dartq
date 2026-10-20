@@ -133,7 +133,8 @@ pub(crate) mod msg {
         MISSING_IDENTIFIER, MISSING_INITIALIZER, MULTIPLE_VARIANCE_MODIFIERS,
         NAMED_FUNCTION_EXPRESSION, NULL_AWARE_CASCADE_OUT_OF_ORDER,
         PATTERN_ASSIGNMENT_DECLARES_VARIABLE, RECORD_LITERAL_ONE_POSITIONAL_NO_TRAILING_COMMA,
-        RECORD_TYPE_ONE_POSITIONAL_NO_TRAILING_COMMA, STACK_OVERFLOW,
+        RECORD_TYPE_ONE_POSITIONAL_NO_TRAILING_COMMA, REFUTABLE_PATTERN_IN_IRREFUTABLE_CONTEXT,
+        STACK_OVERFLOW,
         SWITCH_HAS_CASE_AFTER_DEFAULT_CASE, SWITCH_HAS_MULTIPLE_DEFAULT_CASES, VAR_AND_TYPE,
         VARIABLE_PATTERN_KEYWORD_IN_DECLARATION_CONTEXT, VOID_WITH_TYPE_ARGUMENTS,
     };
@@ -258,6 +259,20 @@ pub(crate) mod msg {
         Message::new(
             INVALID_CONSTANT_CONST_PREFIX,
             "The expression can't be prefixed by 'const' to form a constant pattern.",
+        )
+    }
+
+    /// A constant pattern parsed in an irrefutable pattern context (a
+    /// pattern variable declaration or a pattern assignment) is refutable
+    /// and reports there; the correction mirrors the oracle's correction
+    /// message. The refutability itself is the pattern context the parser
+    /// already threads (`PatternContext::is_refutable`), so the face needs
+    /// no resolver pass.
+    pub(crate) fn refutable_pattern_in_irrefutable_context() -> Message {
+        Message::with_correction(
+            REFUTABLE_PATTERN_IN_IRREFUTABLE_CONTEXT,
+            "Refutable patterns can't be used in an irrefutable context.",
+            "Try using an if-case, a 'switch' statement, or a 'switch' expression instead.",
         )
     }
 

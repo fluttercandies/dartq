@@ -229,6 +229,41 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         }
     }
 
+    /// A constant pattern parsed in an irrefutable pattern context (a
+    /// pattern variable declaration or a pattern assignment) is refutable
+    /// and reports there at the pattern's own extent — from a leading
+    /// `const` keyword through the operand (`final (o.f) = v;` anchors at
+    /// `o.f`, `final (const c) = c;` at `const c`; the enclosing
+    /// parenthesized/list/record container adds no row of its own — oracle
+    /// probes, pinned in the semantic crate's ticket_2231 suite). Matching
+    /// contexts (switch cases, if-case) are refutable and stay silent.
+    fn report_refutable_constant_pattern(
+        &mut self,
+        context: PatternContext,
+        begin: TokenSpan,
+        end: TokenSpan,
+    ) {
+        if context.is_refutable() {
+            return;
+        }
+        // The row spans the whole pattern, not just its first token. Never
+        // below the begin token's own length, so a recovery end can yield
+        // no zero-width row.
+        let length = end
+            .range
+            .end()
+            .saturating_sub(begin.range.offset)
+            .max(begin.range.length);
+        let full = TokenSpan::new(
+            begin.id,
+            dartq_source::SourceRange {
+                offset: begin.range.offset,
+                length,
+            },
+        );
+        self.report_with_end(msg::refutable_pattern_in_irrefutable_context(), full, end);
+    }
+
     /// Official `parsePrimaryPattern` (`parser_impl.dart:11691`).
     #[allow(clippy::too_many_lines)] // mirrors the official branch structure
     fn parse_primary_pattern(&mut self, context: PatternContext) -> TokenSpan {
@@ -302,6 +337,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 self.cursor.advance();
                 let end = self.parse_constant_expression(ConstantPatternContext::Explicit);
                 self.listener.end_constant_pattern(Some(const_keyword));
+                self.report_refutable_constant_pattern(context, const_keyword, end);
                 self.is_last_pattern_allowed_inside_unary_pattern = true;
                 return end;
             }
@@ -379,6 +415,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             self.listener.begin_constant_pattern(None);
             let end = self.parse_constant_expression(ConstantPatternContext::Implicit);
             self.listener.end_constant_pattern(None);
+            self.report_refutable_constant_pattern(context, first_identifier, end);
             self.is_last_pattern_allowed_inside_unary_pattern = true;
             return end;
         }
@@ -389,8 +426,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         // expression engine (:11880-11897) and stay silent; any other
         // reserved word takes parse_send's ensure-identifier recovery.
         self.listener.begin_constant_pattern(None);
+        let constant_begin = self.peek_span();
         let end = self.parse_constant_expression(ConstantPatternContext::Implicit);
         self.listener.end_constant_pattern(None);
+        self.report_refutable_constant_pattern(context, constant_begin, end);
         self.is_last_pattern_allowed_inside_unary_pattern = true;
         end
     }
