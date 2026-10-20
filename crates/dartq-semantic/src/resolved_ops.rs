@@ -1572,7 +1572,15 @@ impl TypeOps for ResolvedTypeOps<'_> {
         self.observe_names(names);
         let f = self.map_scrutinee(from, from_args, arena, names);
         let w = self.map_scrutinee(what, what_args, arena, names);
-        if self.system.is_subtype(f, w) {
+        // The signature-less function pair (see `is_subtype_typed`) skips
+        // only the `Never` shortcut — no relation is provable between two
+        // unknown signatures. The nullability rule below still splits the
+        // `Null` half (`factor(Sig?, Sig2)` keeps `Sig?`), and its
+        // recursion re-enters past this point with the non-null face,
+        // keeping the unchanged `from` the official factor's fallthrough
+        // keeps.
+        let unsignatured_pair = from.base == Base::Function && what.base == Base::Function;
+        if !unsignatured_pair && self.system.is_subtype(f, w) {
             return FlowTy::NEVER;
         }
         // Rule 2 of factorType (factor_type.dart:25-31): `R?` factors as
@@ -1614,6 +1622,24 @@ impl TypeOps for ResolvedTypeOps<'_> {
         names: &[Box<str>],
     ) -> bool {
         self.observe_names(names);
+        // Two signature-less function spellings: the flow layer records
+        // every function type as the bare `Base::Function` head (no
+        // signature — ev.rs's `FunctionType` carries the nullability
+        // only), so the pair may spell two different signatures — a
+        // `FutureOr<R> Function(T)` operand tested `is R Function(T)`
+        // (drift async.dart) — between which no relation is provable.
+        // Mapping both to the bare `Function` class answers `true` on
+        // spelling identity: the vacuous-true that deads a live else
+        // branch and reports a false constant-true test. The official
+        // never sees this shape — its operands resolve to real signatures
+        // and subtype.dart's Function Type/Function rule decides
+        // (subtype.dart:502-510, return covariant / formals contravariant
+        // via `_isFunctionSubtypeOf`); a bare `Function` left side has no
+        // admitting arm at all. At this seam nothing is provable, so
+        // `false` keeps both branches live — the under-report direction.
+        if left.base == Base::Function && right.base == Base::Function {
+            return false;
+        }
         let l = self.map_scrutinee(left, left_args, arena, names);
         let r = self.map_scrutinee(right, right_args, arena, names);
         self.system.is_subtype(l, r)
@@ -2785,6 +2811,148 @@ mod tests {
         assert_eq!(
             ops.try_promote_to_typed(list, 2, list, 1, &arena, &names),
             None
+        );
+    }
+
+    /// The drift `async.dart` shape (#2355), hermetic form: an
+    /// `A Function(S)` operand tested `is R Function(S)` — two different
+    /// signatures the flow layer spells as the same signature-less
+    /// `Base::Function` head (`A <: R` fails on the return type, so the
+    /// official verdict is not constant and the oracle is silent). Before
+    /// the signature-less guard the mapped `Interface{Function}` pair
+    /// answered `true` on spelling identity: the else branch deaded
+    /// (`dead_code`) and the check reported a false constant-true
+    /// `unnecessary_type_check`. The flow face burns through the
+    /// signature-less guard; the check face splits because the formal's
+    /// captured shape and the body check's shapeless face
+    /// (`type_capture.rs` gates body captures out) key to different
+    /// sentinels.
+    #[test]
+    fn function_is_test_between_unrelated_signatures_stays_live() {
+        let codes = diagnose_codes(
+            "class R {}\nclass S {}\nclass A {}\n\
+             void t(A Function(S) p) {\n\
+             \x20 if (p is R Function(S)) {\n\
+             \x20   p;\n\
+             \x20 } else {\n\
+             \x20   p;\n\
+             \x20 }\n\
+             }",
+            |_| None,
+        );
+        assert!(codes.is_empty(), "{codes:?}");
+    }
+
+    /// The identical-spelling control: both sides of `f is F` fold the
+    /// alias to the same canonically-interned function shape, so the
+    /// constant-true `unnecessary_type_check` the oracle emits stays
+    /// reported — the shape-keyed sentinels keep the self-equality the
+    /// guard must not over-suppress, while the unrelated pin above splits
+    /// the two distinct shapes.
+    #[test]
+    fn identical_function_signature_test_stays_constant_true() {
+        let codes = diagnose_codes(
+            "class S {}\nclass A {}\n\
+             typedef F = A Function(S);\n\
+             void t(F f) {\n\
+             \x20 if (f is F) {\n\
+             \x20   f;\n\
+             \x20 }\n\
+             }",
+            |_| None,
+        );
+        assert_eq!(codes, ["unnecessary_type_check"], "{codes:?}");
+    }
+
+    /// The signature-less function pair claims no relation at the name
+    /// level: `is_subtype_typed` answers `false` on the pair and on
+    /// every function-vs-interface mix (the official's bare `Function`
+    /// face has no admitting arm toward a function type — upstream Dart
+    /// SDK source, pkg/analyzer/lib/src/dart/element/subtype.dart:502-510
+    /// — and two unknown signatures prove nothing), while a real edge
+    /// still answers directionally (`D <: B`, not the reverse) — the
+    /// swap-back controls prove the verdicts are decided, not vacuous.
+    /// `factor` keeps the operand instead of collapsing to `Never`, the
+    /// nullable face riding the nullability rule.
+    #[test]
+    fn signatureless_function_pair_claims_no_relation() {
+        let strings = StringTable::new();
+        let mut files = FileTable::new();
+        let elements = unit("class B {}\nclass D extends B {}", &strings, &mut files, "u.dart");
+        let file = files.try_file_id(Path::new("u.dart")).unwrap();
+        let mut builder = LibraryGraphBuilder::new(&strings);
+        let lib = builder.intern("package:t/u.dart");
+        builder.unit(lib, file);
+        let mut index = ElementIndex::default();
+        index.insert(file, elements.clone());
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+        let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
+        let ops = ResolvedTypeOps::new(&library_types, &strings);
+
+        let names: Vec<Box<str>> = vec!["B".into(), "D".into()];
+        let sup = Ty {
+            base: Base::Name(0),
+            nullable: false,
+        };
+        let sub = Ty {
+            base: Base::Name(1),
+            nullable: false,
+        };
+        let function = Ty {
+            base: Base::Function,
+            nullable: false,
+        };
+        let nullable_function = Ty {
+            base: Base::Function,
+            nullable: true,
+        };
+
+        // Non-vacuity control: the harness decides a one-directional
+        // relation (`D <: B` holds, the swap refuses).
+        assert!(ops.is_subtype_typed(sub, EMPTY_ARGS, sup, EMPTY_ARGS, &[], &names));
+        assert!(!ops.is_subtype_typed(sup, EMPTY_ARGS, sub, EMPTY_ARGS, &[], &names));
+        // The signature-less function pair: both directions refuse.
+        assert!(!ops.is_subtype_typed(
+            function, EMPTY_ARGS, function, EMPTY_ARGS, &[], &names
+        ));
+        assert!(!ops.is_subtype_typed(
+            nullable_function,
+            EMPTY_ARGS,
+            function,
+            EMPTY_ARGS,
+            &[],
+            &names
+        ));
+        // Function-vs-interface mixes refuse both ways.
+        assert!(!ops.is_subtype_typed(
+            function, EMPTY_ARGS, sup, EMPTY_ARGS, &[], &names
+        ));
+        assert!(!ops.is_subtype_typed(
+            sup, EMPTY_ARGS, function, EMPTY_ARGS, &[], &names
+        ));
+        // `factor(Sig, Sig2)` keeps the operand — never the `Never`
+        // collapse; `factor(Sig?, Sig2)` keeps the nullable face.
+        assert_eq!(
+            ops.factor_typed(function, EMPTY_ARGS, function, EMPTY_ARGS, &[], &names),
+            function
+        );
+        assert_eq!(
+            ops.factor_typed(
+                nullable_function,
+                EMPTY_ARGS,
+                function,
+                EMPTY_ARGS,
+                &[],
+                &names
+            ),
+            nullable_function
         );
     }
 

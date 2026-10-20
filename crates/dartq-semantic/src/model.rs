@@ -466,6 +466,11 @@ pub struct RecordShapeId(u32);
 impl RecordShapeId {
     /// The reserved empty record `()` — zero positional, zero named.
     pub const EMPTY: RecordShapeId = RecordShapeId(0);
+
+    /// The pool slot — canonical, equal written shapes share one id.
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
 }
 
 /// One interned record-type shape: the positional field types in source
@@ -493,6 +498,11 @@ impl FnShapeId {
     /// interned points at it; slot `0` keeps the pool's reserved-slot
     /// discipline).
     pub const EMPTY: FnShapeId = FnShapeId(0);
+
+    /// The pool slot — canonical, equal written shapes share one id.
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
 }
 
 /// One interned function-type shape: the type-parameter count, the return

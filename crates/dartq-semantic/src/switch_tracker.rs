@@ -529,7 +529,27 @@ impl NameTy {
             // The S0 side channel keeps its name-level shape; the argument
             // slot stays in the semantic lattice (`Ty`), not here.
             Ty::Named { name, nullable, .. } => NameTy::Named(name, nullable),
-            Ty::Record { .. } | Ty::Function { .. } => NameTy::Unknown(u64::MAX),
+            // Record and function types have no name-level decomposition
+            // (the columns live in the `Ty` shape, not here): a sentinel
+            // keyed by the canonically-interned shape id keeps equal
+            // spellings self-equal (`void Function()` covers itself)
+            // while different shapes land on different sentinels — the
+            // shared-unknown equality must not fire across two different
+            // types, where it reports a false constant-true
+            // `unnecessary_type_check` (a `FutureOr<R> Function(T)`
+            // operand checked `is R Function(T)` — drift async.dart).
+            // The tag separates the two shape-id pools and lifts the key
+            // above the fresh-`unknown()` counter's range, so a keyed
+            // sentinel never collides with a minted one. The nullability
+            // face rides the key: an `F`-vs-`F?` pair stays unprovable at
+            // this level (the under-report direction — never a false
+            // constant verdict).
+            Ty::Record { shape, nullable } => {
+                NameTy::Unknown((1 << 41) | (u64::from(shape.raw()) << 1) | u64::from(nullable))
+            }
+            Ty::Function { shape, nullable } => {
+                NameTy::Unknown((2 << 41) | (u64::from(shape.raw()) << 1) | u64::from(nullable))
+            }
         }
     }
 }
