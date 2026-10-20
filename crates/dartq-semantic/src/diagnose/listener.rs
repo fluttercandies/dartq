@@ -79,6 +79,10 @@ impl ParserListener for DiagnoseListener<'_> {
         // associate against the implicit `super()` face at the class's own
         // close.
         let primary_owner = engine.primary_ctor_site;
+        // The associated `super.` formals supply the super constructor's
+        // parameters — the givenness credit runs while the entries are
+        // still buffered (`drain_super_formals` consumes them).
+        engine.credit_super_formal_givens(primary_owner, None);
         engine.drain_super_formals(primary_owner, None);
         engine.primary_ctor_site = None;
     }
@@ -1157,6 +1161,8 @@ impl ParserListener for DiagnoseListener<'_> {
         // explicit-redirect case). Only this constructor's entries drain:
         // a primary constructor's `None`-owned buffer outlives it.
         let owner = engine.open_ctor_site;
+        // The givenness credit beside the drain (the entries die in it).
+        engine.credit_super_formal_givens(owner, None);
         engine.drain_super_formals(owner, None);
         // #1314 FAM7: recovery paths without a body event drop the rows.
         engine.drop_default_checks();
@@ -1486,8 +1492,18 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.armed_ty_unresolved = false;
         // #1314 FAM18: the group's modifier bits gate the
         // uninitialized-non-nullable latch (`late`/`final` declarations
-        // report through the parser-owned rows or stay silent).
-        engine.group_late = late_kw.is_some();
+        // report through the parser-owned rows or stay silent). The `late`
+        // bit never re-latches under an open field group: the group head
+        // consumed the keyword, so the variable event's `late_kw` is
+        // `None` there and a re-latch would clobber the group's bit —
+        // `field_initializer_binds_this` / the implicit-this face's
+        // `!group_late` leg read it later, inside the initializer (a
+        // `late` field's initializer binds `this`, upstream
+        // `variable_declaration_resolver.dart`'s `bindsThis`). Local
+        // groups (no field group open) own the event's keywords.
+        if !engine.field_group_open {
+            engine.group_late = late_kw.is_some();
+        }
         engine.group_final = var_final_or_const
             .and_then(|t| engine.text_of(t))
             .is_some_and(|text| text == "final");
@@ -1533,8 +1549,17 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some(check) = engine.pending_init_variables.last_mut() {
             check.initialized = true;
         }
-        engine.init_frame_depth = engine.frames.len();
+        // The initializer world arms for every variable initializer — a
+        // top-level one included: the faces that arm on the bit carry
+        // their own closure exclusion (`init_frame_depth == frames.len()`,
+        // so a body nested in the initializer never arms), and the
+        // implicit-this face arms only inside a member field group
+        // (`begin_fields` never opens the group for a top-level
+        // declaration), whose closures have no `this` either — the file
+        // scope stays silent (`EvParser(null).build()` / the xml accessor
+        // closure — probe2281).
         engine.in_initializer = true;
+        engine.init_frame_depth = engine.frames.len();
         engine.init_mark = Some(engine.rows.len());
         engine.open_const_initializer();
     }
@@ -2663,6 +2688,8 @@ impl ParserListener for DiagnoseListener<'_> {
         // carries the secondary constructor's site inside its `: ...` list
         // and the primary constructor's inside the `this : ...` body.
         let owner = engine.open_ctor_site;
+        // The givenness credit beside the drain (the entries die in it).
+        engine.credit_super_formal_givens(owner, super_target);
         engine.drain_super_formals(owner, super_target);
         for candidate in candidates {
             if candidate.invoked {
@@ -3820,6 +3847,35 @@ impl ParserListener for DiagnoseListener<'_> {
                 }
             } else {
                 engine.const_capture.opaque_leaf(closed.span);
+            }
+        }
+        // The annotation's own argument group joins the given-at-call index
+        // (`_addParametersForArguments` walks every Annotation's
+        // argumentList too): a metadata creation's invoke slot carries no
+        // callee link, so the generic close's registration never fires for
+        // it. The link's absence is the discriminator — a nested call
+        // inside an argument keeps its own link and skips; enum constants
+        // check theirs separately.
+        if let Some(level) = engine.arg_levels.last()
+            && engine.invokes.last().and_then(|slot| *slot).is_none()
+            && !level.enum_const
+            && let Some(annotation) = engine.pending_annotations.last().map(|a| a.name)
+        {
+            // The lookup spelling of the annotated constructor: the
+            // selector segment of a qualified annotation (`@A.named(...)`),
+            // the whole name otherwise.
+            let text = engine.strings.resolve(annotation);
+            let selector = text.rsplit('.').next().unwrap_or(text);
+            let key = engine.intern(selector);
+            for (given, ..) in &level.args {
+                if let Some(given) = given {
+                    engine.named_given.insert((key, *given));
+                }
+            }
+            let named = level.args.iter().filter(|(name, ..)| name.is_some()).count();
+            if let Ok(positional) = u16::try_from(count.saturating_sub(named)) {
+                let given = engine.positional_given.entry(key).or_default();
+                *given = (*given).max(positional);
             }
         }
         engine.close_arguments(u16::try_from(count).unwrap_or(u16::MAX), end.range);
@@ -5613,7 +5669,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_fields(
         &mut self,
-        _kind: DeclarationKind,
+        kind: DeclarationKind,
         _augment_kw: Option<Token>,
         _abstract_kw: Option<Token>,
         _external_kw: Option<Token>,
@@ -5627,8 +5683,15 @@ impl ParserListener for DiagnoseListener<'_> {
         // The member field group is open: its const initializers close on
         // the field face (`const_field_values`), not the local face. The
         // group's frame depth discriminates its own initializers from a
-        // closure-local inside one of them.
-        engine.field_group_open = true;
+        // closure-local inside one of them. A top-level variable group is
+        // not a field group: the instance context the implicit-this face
+        // arms on (`ThisContext.instanceFieldDeclaration`) exists only
+        // inside a class-family declaration, and `bindsThis`'s
+        // `!element.isStatic` answers false at file scope — the group's
+        // modifier bits arm regardless (top-level `late`/`final`/`const`
+        // latch through them), and the const close reads the file scope
+        // through `at_file_scope`.
+        engine.field_group_open = !matches!(kind, DeclarationKind::TopLevel);
         engine.field_group_depth = engine.frames.len();
         // The group's modifier bits gate the uninitialized latch at the name
         // events, which precede `begin_variables_declaration` for field
@@ -5893,6 +5956,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // `visitBlock` — the try/catch/finally kinds included; the switch
         // body carries no begin_block event, its members scope per case).
         self.engine.dup_scopes.push(FxHashMap::default());
+        // The block's own scope frame: its locals close at `end_block`, so
+        // a post-block read binds the outer declaration, never a dead inner
+        // one (the official visitBlock's scoped element walk). The catch
+        // clause's frame (pushed at `begin_catch_clause` for the parameters)
+        // nests this body frame inside it, and the parameters stay visible
+        // through the normal outer-scope climb.
+        self.engine.push_block_frame();
     }
 
     fn begin_block_function_body(&mut self, token: Token) {
@@ -6102,6 +6172,9 @@ impl ParserListener for DiagnoseListener<'_> {
         // right after the clause body's block ends, so the last block end
         // is its closing brace.
         self.engine.last_block_end = Some(end.range);
+        // The block frame's locals decide here (the block-scope unused face
+        // — `begin_block`'s pairing pop).
+        self.engine.pop_frame();
         self.engine.dup_scopes.pop();
     }
 

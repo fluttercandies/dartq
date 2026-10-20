@@ -24,8 +24,9 @@
 //! declaring name — the pool's `face.name == exported name` filter.
 //!
 //! Source fidelity: verbatim member surfaces from the upstream Dart SDK
-//! source, `sdk/lib/js_interop/js_interop.dart` (stable across the 3.13.1
-//! oracle of record and 3.15). The `@Since('3.14')` list-conversion
+//! source — `sdk/lib/js_interop/js_interop.dart` and
+//! `sdk/lib/js_interop_unsafe/js_interop_unsafe.dart` (stable across the
+//! 3.13.1 oracle of record and 3.15). The `@Since('3.14')` list-conversion
 //! extensions are absent there and stay out — the oracle does not resolve
 //! them. `NumToJSExtension.toJS` is a concrete getter upstream; the excerpt
 //! declares it `external` — the name-level model (name, kind, return type)
@@ -44,9 +45,10 @@ use dartq_semantic::{ElementIndex, collect};
 /// declaration excerpt)`. Only libraries whose corpus-visible surface
 /// includes implicit-application members join; the table is empty of
 /// libraries whose face is name-only complete.
-static SDK_EXTENSION_FACE_SOURCES: &[(&str, &str)] = &[(
-    "js_interop",
-    r#"extension ListToJSArray<T extends JSAny?> on List<T> {
+static SDK_EXTENSION_FACE_SOURCES: &[(&str, &str)] = &[
+    (
+        "js_interop",
+        r#"extension ListToJSArray<T extends JSAny?> on List<T> {
   external JSArray<T> get toJS;
   external JSArray<T> get toJSProxyOrRef;
 }
@@ -63,7 +65,35 @@ extension StringToJSString on String {
   external JSString get toJS;
 }
 "#,
-)];
+    ),
+    (
+        // Upstream Dart SDK source, sdk/lib/js_interop_unsafe/
+        // js_interop_unsafe.dart — the member surfaces verbatim. Concrete
+        // shorthand bodies (`has` => hasProperty(...)) declare `external`:
+        // the name-level model (name, kind, return type, formals) is
+        // identical either way and no body is captured. The private
+        // `_callMethod`/`_callAsConstructor` helpers stay out — they are
+        // library-private upstream and invisible to every user-visible
+        // resolution.
+        "js_interop_unsafe",
+        r#"extension JSObjectUnsafeUtilExtension on JSObject {
+  external bool has(String property);
+  external JSBoolean hasProperty(JSAny property);
+  external JSAny? operator [](String property);
+  external R getProperty<R extends JSAny?>(JSAny property);
+  external void operator []=(String property, JSAny? value);
+  external void setProperty(JSAny property, JSAny? value);
+  external R callMethod<R extends JSAny?>(JSAny method, [JSAny? arg1, JSAny? arg2, JSAny? arg3, JSAny? arg4]);
+  external R callMethodVarArgs<R extends JSAny?>(JSAny method, [List<JSAny?>? arguments]);
+  external JSBoolean delete(JSAny property);
+}
+extension JSFunctionUnsafeUtilExtension on JSFunction {
+  external R callAsConstructor<R>([JSAny? arg1, JSAny? arg2, JSAny? arg3, JSAny? arg4]);
+  external R callAsConstructorVarArgs<R extends JSObject>([List<JSAny?>? arguments]);
+}
+"#,
+    ),
+];
 
 /// Indexes every bundled excerpt's element model under its library's
 /// synthetic face file — the id the graph build interns for

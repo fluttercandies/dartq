@@ -853,6 +853,77 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The resolving-super-formal givenness feed (`visitSuperFormalParameter`,
+    /// upstream Dart SDK source, unused_local_elements_verifier.dart:377-387):
+    /// a `super.x` formal associated against the resolved super constructor
+    /// supplies that constructor's parameter at every invocation — the target
+    /// joins the given-at-call set exactly as an argument would
+    /// (`_addParametersForArguments`). Runs beside
+    /// [`Engine::drain_super_formals`] while the owner's entries are still
+    /// buffered: an associated named parameter credits the target's written
+    /// formal name, a positional one the prefix count the
+    /// `unused_element_parameter` face reads.
+    pub(crate) fn credit_super_formal_givens(
+        &mut self,
+        owner: Option<usize>,
+        target: Option<StringId>,
+    ) {
+        let entries: Vec<_> = self
+            .pending_super_formals
+            .iter()
+            .filter(|(entry_owner, ..)| *entry_owner == owner)
+            .cloned()
+            .collect();
+        for (_, super_index, named, name, _, container) in entries {
+            // The same resolved super-constructor face `check_super_formal`
+            // associates against: the superclass's formals under the drained
+            // target's spelling (the unnamed face keys on the superclass
+            // name).
+            let Some(superclass) = self
+                .index
+                .get(self.file)
+                .and_then(|f| f.container(container))
+                .and_then(|c| c.superclass)
+            else {
+                continue;
+            };
+            let spelling = target.unwrap_or(superclass);
+            let Some(formals) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                superclass,
+            )
+            .and_then(|(super_container, _)| {
+                super_container.ctor_formals.get(&spelling).map(Box::as_ref)
+            }) else {
+                continue;
+            };
+            if named {
+                // The associated lookup spells the public face
+                // (`correspondingPublicName`): a `super.x` forwarding the
+                // target's written `this._x` credits whichever spelling the
+                // target's formal carries.
+                let public = self.formal_public_name(name);
+                if let Some(matched) = formals
+                    .named
+                    .iter()
+                    .find(|f| f.name == name || f.name == public)
+                {
+                    self.named_given.insert((spelling, matched.name));
+                }
+            } else if let Ok(index) = usize::try_from(super_index)
+                && formals.positional.len() > index
+                && let Ok(count) = u16::try_from(super_index + 1)
+            {
+                let given = self.positional_given.entry(spelling).or_default();
+                *given = (*given).max(count);
+            }
+        }
+    }
+
     /// The `unused_element_parameter` pass over one executable's
     /// declaration site (`visitFormalParameterList` +
     /// `_isUsedElement`'s parameter arm,
@@ -1231,12 +1302,22 @@ impl<'a> Engine<'a> {
     /// `None` (their `ret` latch is unset by design). A local function's
     /// own body is covered by the open local-function stack.
     pub(crate) fn exec_self_name(&self) -> Option<StringId> {
-        if let Some((depth, name)) = self.local_fn_stack.last()
-            && *depth == self.frames.len().saturating_sub(1)
+        // The self-reference test keys on the innermost EXECUTABLE frame,
+        // not the innermost frame: statement blocks own their own frames
+        // (`begin_block`), so a self-reference inside a nested block must
+        // skip past them to the enclosing executable's slot.
+        let inner_exec = self
+            .frames
+            .iter()
+            .rev()
+            .position(|f| matches!(f.kind, FrameKind::Executable { .. }))
+            .map(|pos| self.frames.len() - 1 - pos);
+        if let Some((fn_depth, name)) = self.local_fn_stack.last()
+            && inner_exec.is_some_and(|frame_depth| frame_depth == *fn_depth)
         {
             return Some(*name);
         }
-        self.frames.last().and_then(|f| match &f.kind {
+        self.frames.iter().rev().find_map(|f| match &f.kind {
             FrameKind::Executable { ret: Some(ret), .. } => Some(ret.name),
             _ => None,
         })
@@ -2229,6 +2310,254 @@ mod pins {
         assert!(
             rows.iter().any(|(offset, _)| *offset == gone_at),
             "_gone not reported at {gone_at}: {rows:?} in {source:?}"
+        );
+    }
+
+    /// #2282: the index-merged read. `H._blOrder[0]` folds the member row
+    /// into `Intent::Operator("[]")` — the operand still reads the field's
+    /// implicit getter, so the static const is used and no `unused_field`
+    /// reports. The oracle reads `C.f[i]` as a getter access on `f`.
+    #[test]
+    fn static_const_index_read_spares_the_field() {
+        let source = "class H {\n\
+                      \x20 static const List<int> _blOrder = [3];\n\
+                      }\n\
+                      void f() {\n\
+                      \x20 print(H._blOrder[0]);\n\
+                      }\n";
+        assert_eq!(unused_field_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2282: the instance-field twin — `x._table[0]` reads the getter
+    /// before the `[]` application, so the private field is used.
+    #[test]
+    fn instance_index_read_spares_the_field() {
+        let source = "class H {\n\
+                      \x20 final List<int> _table = [1, 2];\n\
+                      }\n\
+                      void f(H h) {\n\
+                      \x20 print(h._table[0]);\n\
+                      }\n";
+        assert_eq!(unused_field_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2282: an inherited-field read through a subtype-typed receiver.
+    /// `s._inherited` where `s: Sub` reads `Base._inherited` — the join
+    /// walks the RECEIVER's supertype closure toward the declaration, so
+    /// the base field is used even though `Sub` never names it.
+    #[test]
+    fn subtype_receiver_read_spares_the_inherited_field() {
+        let source = "class Base {\n\
+                      \x20 int _inherited = 0;\n\
+                      }\n\
+                      class Sub extends Base {}\n\
+                      void f() {\n\
+                      \x20 var s = Sub();\n\
+                      \x20 print(s._inherited);\n\
+                      }\n";
+        assert_eq!(unused_field_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2282: an extension body's implicit-`this` read credits the `on`
+    /// type's member. `extension X on C { => _isOpen }` reads `C._isOpen`
+    /// — `this`'s static type inside the extension IS the extended type,
+    /// so the field is used. A same-named field on the extension itself
+    /// would not spare (the extension is not the owner).
+    #[test]
+    fn extension_this_read_spares_the_on_type_field() {
+        let source = "class C {\n\
+                      \x20 bool _isOpen = false;\n\
+                      }\n\
+                      extension X on C {\n\
+                      \x20 bool get open => _isOpen;\n\
+                      }\n\
+                      void f(C c) {\n\
+                      \x20 print(c.open);\n\
+                      }\n";
+        assert_eq!(unused_field_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2282 boundary: a same-spelled field on a SIBLING class never
+    /// spares — only the receiver's own supertype closure reaches the
+    /// declaration. `other._f` where `other: Other` (unrelated) reads
+    /// `Other._f`, leaving `C._f` unused.
+    #[test]
+    fn sibling_same_spelled_field_read_does_not_spare() {
+        let source = "class C {\n\
+                      \x20 int _f = 0;\n\
+                      }\n\
+                      class Other {\n\
+                      \x20 int _f = 1;\n\
+                      \x20 int get g => _f;\n\
+                      }\n";
+        let f_at = source.find("int _f = 0").unwrap() as u32 + 4;
+        let rows = unused_field_rows(source);
+        assert!(
+            rows.iter().any(|(offset, _)| *offset == f_at),
+            "C._f not reported at {f_at}: {rows:?} in {source:?}"
+        );
+    }
+
+    /// The code-filtered rows of `report`, as (offset, length) pairs in
+    /// source order — the shared lens for the #2286 unused-family pins.
+    fn rows_with_code(source: &str, code: &str) -> Vec<(u32, u32)> {
+        report(source)
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == code)
+            .map(|d| (d.range.offset, d.range.length))
+            .collect()
+    }
+
+    /// #2286-b: the block-scope local close (`begin_block`'s frame push).
+    /// The inner block's `expression` shadows the outer one and dies with
+    /// its block — the post-block read binds the OUTER declaration, so
+    /// both locals are used and nothing reports. Without the block frame
+    /// the read leaked to the dead inner binding and the outer local
+    /// reported (`probe2286/b`'s endCase shape).
+    #[test]
+    fn post_block_read_binds_the_outer_local() {
+        let source = "int pop() => 0;\n\
+                      void push(Object? x) {}\n\
+                      void endCase(bool c) {\n\
+                      \x20 var expression = pop();\n\
+                      \x20 if (c) {\n\
+                      \x20   var expression = pop();\n\
+                      \x20   push(expression);\n\
+                      \x20 }\n\
+                      \x20 push(expression);\n\
+                      }\n";
+        assert_eq!(unused_local_rows(source), vec![], "{source:?}");
+    }
+
+    /// #2286-b boundary: the inner declaration is still reported when only
+    /// its own block reads it — the block scope closes it there, never at
+    /// the enclosing function's end.
+    #[test]
+    fn inner_block_local_still_reports_when_unread() {
+        let source = "int pop() => 0;\n\
+                      void endCase(bool c) {\n\
+                      \x20 var outer = pop();\n\
+                      \x20 if (c) {\n\
+                      \x20   var inner = pop();\n\
+                      \x20 }\n\
+                      \x20 push2(outer);\n\
+                      }\n\
+                      void push2(int x) {}\n";
+        let inner_at = source.find("var inner").unwrap() as u32 + 4;
+        assert_eq!(
+            unused_local_rows(source),
+            vec![(inner_at, 5)],
+            "{source:?}"
+        );
+    }
+
+    /// #2286-d: a resolving `super.enc` formal supplies the super
+    /// constructor's parameter — the target counts as given, so the base
+    /// constructor's optional `enc` never reports. The derived formal
+    /// itself stays ungiven and still reports (the oracle's split, probed:
+    /// `class _D extends _B { _D({super.enc}); }` over `_B({this.enc})`).
+    #[test]
+    fn resolving_super_formal_spares_the_target_parameter() {
+        let source = "class _B {\n\
+                      \x20 int? enc;\n\
+                      \x20 _B({this.enc});\n\
+                      }\n\
+                      class _D extends _B {\n\
+                      \x20 _D({super.enc});\n\
+                      }\n\
+                      int f() => _D().enc ?? 0;\n";
+        let derived_enc = source.find("super.enc").unwrap() as u32 + 6;
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![(derived_enc, 3)],
+            "{source:?}"
+        );
+        // The super-formal association itself resolved — no
+        // without-associated row fires on either side.
+        assert!(
+            rows_with_code(source, "super_formal_parameter_without_associated_named").is_empty(),
+            "{source:?}"
+        );
+    }
+
+    /// #2286-e: an annotation's own argument group joins the given-at-call
+    /// index — `@_C('a', flag: true)` gives `flag`, so the optional named
+    /// formal never reports (`_addParametersForArguments` walks every
+    /// Annotation's argumentList; the group carries no callee row, which
+    /// used to starve the registration).
+    #[test]
+    fn annotation_named_argument_spares_the_parameter() {
+        let source = "class _C {\n\
+                      \x20 final String needle;\n\
+                      \x20 final bool flag;\n\
+                      \x20 const _C(this.needle, {this.flag = false});\n\
+                      }\n\
+                      @_C('a', flag: true)\n\
+                      int g = 0;\n\
+                      @_C('b')\n\
+                      int h = 0;\n";
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![],
+            "{source:?}"
+        );
+    }
+
+    /// #2286-f1: an invoked operand's operator resolves through the
+    /// extension pool — the send's declared return feeds the operator gate
+    /// (`isNotNull() & isNotNull()` inside a mixin `on` the operand's
+    /// container: the callee return answers through the on-face climb and
+    /// `operator &` applies from the extension). Without the feed the gate
+    /// read `Unknown` and `undefined_operator` fired where the oracle
+    /// stays silent (the drift column.dart shape).
+    #[test]
+    fn invoked_operand_resolves_the_extension_operator() {
+        let source = "class Expression<T extends Object> {\n\
+                      \x20 Expression<bool> isNotNull() => Expression<bool>();\n\
+                      }\n\
+                      extension BoolOps on Expression<bool> {\n\
+                      \x20 Expression<bool> operator &(Expression<bool> other) => this;\n\
+                      }\n\
+                      mixin Column<D extends Object> on Expression<D> {\n\
+                      \x20 Expression<bool> t() => isNotNull() & isNotNull();\n\
+                      }\n";
+        assert_eq!(
+            rows_with_code(source, "undefined_operator"),
+            vec![],
+            "{source:?}"
+        );
+    }
+
+    /// #2286-d second half: a preceding-line `// ignore:` citation spares
+    /// the `unused_element_parameter` row only when it NAMES the code (the
+    /// fold's [`IgnoreSuppression`] applies at the assembly point,
+    /// `IgnoredDiagnosticName._matches` — name or canonical uniqueName).
+    /// A `unused_element` citation is a different code: the row stands
+    /// (probe2286f/igp — the oracle spares `_b` and reports `_c`).
+    #[test]
+    fn preceding_line_ignore_spares_only_the_named_parameter_code() {
+        let source = "class _F {\n\
+                      \x20 final int a;\n\
+                      \x20 // ignore: unused_element_parameter\n\
+                      \x20 _F(this.a, [this._b]);\n\
+                      \x20 final int _b;\n\
+                      }\n\
+                      class _H {\n\
+                      \x20 final int a;\n\
+                      \x20 // ignore: unused_element\n\
+                      \x20 _H(this.a, [this._c]);\n\
+                      \x20 final int _c;\n\
+                      }\n\
+                      void main() {\n\
+                      \x20 _F(1)._b;\n\
+                      \x20 _H(1)._c;\n\
+                      }\n";
+        let c_at = source.find("this._c").unwrap() as u32 + 5;
+        assert_eq!(
+            rows_with_code(source, "unused_element_parameter"),
+            vec![(c_at, 2)],
+            "{source:?}"
         );
     }
 }
