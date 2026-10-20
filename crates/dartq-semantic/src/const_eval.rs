@@ -4779,7 +4779,7 @@ mod method_invocation_2194 {
         capture.open_initializer();
         // `x` receiver operand, `.m` selector callee, then `()`.
         capture.identifier(strings.intern("x"), span(0, 1));
-        capture.identifier(strings.intern("m"), span(2, 3));
+        capture.selector_identifier(strings.intern("m"), span(2, 3));
         capture.begin_arguments();
         let closed = capture
             .end_arguments(span(4, 5))

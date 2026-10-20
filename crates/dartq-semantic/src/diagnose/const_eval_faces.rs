@@ -614,6 +614,73 @@ impl<'a> Engine<'a> {
         decl.constructors.contains(&self.intern(selector))
     }
 
+    /// Whether the tail-pass's invalid creation resolves to a written
+    /// constructor that exists but is not const — the
+    /// `const_with_non_const` twin's condition. `container` is the staged
+    /// head (`C` for `C(...)`, the receiver `C` for `C.named(...)`'s
+    /// selector-staged entries the same — `const_creation_valid`'s
+    /// source-parse handles both spellings). A missing selector
+    /// (`C.named()` over `const C()`) reports the initializer row alone
+    /// (the oracle's `const_with_undefined_constructor` fixture): no
+    /// constructor exists to be non-const.
+    pub(crate) fn const_non_const_ctor_answered(
+        &self,
+        container: StringId,
+        span: SourceRange,
+    ) -> bool {
+        // The head + written selector the entry answers: `container` names
+        // the head directly when it resolves to a container; a selector
+        // name (`C.named(` closes with `named` as the callee) re-reads the
+        // written head at the span like `const_creation_valid` does.
+        let text = self
+            .source
+            .get(span.offset as usize..span.end() as usize)
+            .unwrap_or("");
+        let (head, selector) = if resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        )
+        .is_some()
+        {
+            let head = self.strings.resolve(container);
+            let selector = text
+                .strip_prefix(head)
+                .and_then(|rest| rest.strip_prefix('.'))
+                .map(|rest| {
+                    rest.split(['(', ' ', '?', '\n', '\t']).next().unwrap_or("")
+                })
+                .unwrap_or("");
+            (container, selector)
+        } else {
+            let head_text = text.split('(').next().unwrap_or("");
+            let Some((head_text, selector)) = head_text.split_once('.') else {
+                return false;
+            };
+            (self.intern(head_text), selector)
+        };
+        let Some((decl, _)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            head,
+        ) else {
+            return false;
+        };
+        if decl.has_const_constructor {
+            return false;
+        }
+        if selector.is_empty() || selector == "new" {
+            return decl.has_unnamed_constructor;
+        }
+        decl.constructors.contains(&self.intern(selector))
+    }
+
     /// The receiver row below the pending selector row (`recv.selector(`):
     /// the selector row must be QUALIFIED (`invokes.last()` indexes it,
     /// the receiver sits immediately below) — `None` for a bare callee,
@@ -1753,17 +1820,20 @@ impl<'a> Engine<'a> {
             == Some(b')')
     }
 
-    /// Whether any diagnostic row anchors at `offset`: the root unresolved
-    /// creation's variable face rides the callee's own resolution row
-    /// (`undefined_function`, `invocation_of_non_function`). A creation of
-    /// a resolved-but-unindexed container (an SDK class without a const
-    /// constructor — `Utf8Decoder()`) carries no row and stays silent, the
-    /// oracle's resolved non-const posture.
-    pub(crate) fn const_failure_row_at(&self, offset: u32) -> bool {
+    /// Whether any diagnostic row anchors inside `span` (`[offset, end)`):
+    /// the root unresolved creation's variable face rides the callee's own
+    /// resolution row (`undefined_function`, `invocation_of_non_function`,
+    /// `undefined_method`), which sits at the span's head for a bare callee
+    /// (`Gone(`) but at the selector for a qualified one (`C.named(` — the
+    /// oracle's `const_with_undefined_constructor` world). A creation of a
+    /// resolved-but-unindexed container (an SDK class without a const
+    /// constructor) carries no row and stays silent, the oracle's resolved
+    /// non-const posture.
+    pub(crate) fn const_failure_row_within(&self, span: SourceRange) -> bool {
         self.report
             .diagnostics
             .iter()
-            .any(|d| d.range.offset == offset)
+            .any(|d| d.range.offset >= span.offset && d.range.offset < span.end())
     }
 
     /// Whether the argument containing `span` already anchored a const
@@ -2431,6 +2501,16 @@ mod face_tests {
             }
             builder.declare(lib, name, file);
         }
+        // `dart:core` sits in every library's import namespace upstream —
+        // without the seed, a `const C(Object? a)` formals type reports a
+        // phantom `undefined_class` next to the rows under test (the engine
+        // driver's posture, ticket_2362's rig).
+        let core_file = files.intern(Path::new("<dart:core>"));
+        builder.seed_implicit_core(
+            lib,
+            core_file,
+            &["Object", "String", "int", "bool", "double", "num"],
+        );
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
         let mut index = ElementIndex::default();

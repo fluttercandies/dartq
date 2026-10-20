@@ -425,11 +425,10 @@ fn unresolved_callee_in_annotation_set_reports_element_face() {
 
 /// A known function invocation inside an annotation's literal: the
 /// element's fault IS the row (`const_eval_method_invocation` — probe
-/// paired) and the element-face code stays silent. The list element
-/// anchors at the invocation; the map value's row rides the shared
-/// call-span heuristic (the `'k'` string key two bytes before the callee
-/// reads as a receiver — the oracle anchors at `g()`, a span-only
-/// divergence outside the (severity, code, file) gate).
+/// paired) and the element-face code stays silent. Both anchors match
+/// the oracle: `g` is a bare callee in the list and the map value, so
+/// the row sits at `g()` (a selector callee would extend the span over
+/// its receiver; a map key string is no receiver).
 #[test]
 fn fault_element_in_annotation_literal_beats_element_face() {
     let list = "class T { const T(); }\nvoid g() {}\n@T([g()])\nclass C {}";
@@ -445,7 +444,7 @@ fn fault_element_in_annotation_literal_beats_element_face() {
     let rep = report(map);
     let got = rows(&rep, map);
     assert!(
-        got.contains(&("const_eval_method_invocation", "'k': g()")),
+        got.contains(&("const_eval_method_invocation", "g()")),
         "{got:?}"
     );
     assert_eq!(count(&got, "non_constant_map_value"), 0, "{got:?}");
@@ -741,3 +740,4 @@ fn valid_annotation_arguments_stay_silent() {
         assert_eq!(count(&rows, "non_constant_set_element"), 0, "{rows:?}");
     }
 }
+

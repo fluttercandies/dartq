@@ -1542,8 +1542,14 @@ pub fn fold_unit_with_ops<'t>(
                             // rides the callee's own resolution row — a
                             // resolved-but-unindexed container (an SDK
                             // class without a const constructor) carries
-                            // none and stays silent.
-                            if engine.const_failure_row_at(span.offset) && reported.insert(init) {
+                            // none and stays silent. The row sits inside
+                            // the creation span, not always at its head:
+                            // `Gone(`'s `undefined_function` anchors at the
+                            // bare callee (the span's start), `C.named(`'s
+                            // `undefined_method` anchors at the selector
+                            // (the oracle's
+                            // `const_with_undefined_constructor` world).
+                            if engine.const_failure_row_within(span) && reported.insert(init) {
                                 engine.stage_usage(
                                     SemanticCode::ConstInitializedWithNonConstantValue,
                                     span,
@@ -1587,7 +1593,12 @@ pub fn fold_unit_with_ops<'t>(
                     }
                 }
                 ConstCreationEntry::Creation { container } => {
-                    if !engine.const_creation_valid(container, span) {
+                    // A staged creation is the deferred candidate the
+                    // parse-time verdict could not settle: invalid once the
+                    // whole-file const-ctor set is known, it fails the
+                    // initializer (the oracle's creation-level row); a
+                    // valid creation reports nothing.
+                    if engine.const_creation_valid(container, span) {
                         continue;
                     }
                     if reported.insert(init) {
@@ -1597,7 +1608,7 @@ pub fn fold_unit_with_ops<'t>(
                             "",
                         );
                     }
-                    if !engine.const_ctor_target(container) {
+                    if engine.const_non_const_ctor_answered(container, span) {
                         engine.stage_usage(SemanticCode::ConstWithNonConst, span, "");
                     }
                 }
