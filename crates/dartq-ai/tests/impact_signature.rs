@@ -73,6 +73,7 @@ fn signature_change_ships_the_verdict_without_evidence() {
             before: snapshot(&strings, &[("fa", "int fa")]),
             after: snapshot(&strings, &[("fa", "int fa"), ("fb", "int fb")]),
         }],
+        |_| Vec::new(),
     );
     assert_eq!(
         report
@@ -120,6 +121,7 @@ fn signature_edit_under_a_stable_name_ships_the_verdict_row() {
                 after
             },
         }],
+        |_| Vec::new(),
     );
     assert_eq!(
         report
@@ -160,6 +162,7 @@ fn no_change_answers_the_empty_report() {
             before: same.clone(),
             after: same,
         }],
+        |_| Vec::new(),
     );
     assert_eq!(report.schema_version, IMPACT_SCHEMA_VERSION);
     assert!(report.changed.is_empty());

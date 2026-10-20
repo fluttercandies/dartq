@@ -55,7 +55,7 @@ use dartq_package::PackageTable;
 use dartq_pub::{PackageConfig, ResolvedPackageGraph};
 use dartq_sdk::SdkSnapshot;
 use dartq_source::{FileId, FileTable, StringId, StringTable};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 
 use crate::analyze::AnalyzeError;
@@ -128,13 +128,17 @@ pub fn to_json(report: &query::ImpactReport) -> serde_json::Value {
 ///
 /// [`ImpactError`] on a missing or unanalyzed target, discovery failure,
 /// cancellation, or an unusable context configuration.
-pub fn impact(engine: &mut Engine, target: &Path) -> Result<query::ImpactReport, ImpactError> {
+pub fn impact(
+    engine: &mut Engine,
+    target: &Path,
+    symbols: &[String],
+) -> Result<query::ImpactReport, ImpactError> {
     // The run's diagnostics move out here: the borrowed `AnalyzeRun` drops
     // with the statement, so the engine re-borrows for the report.
     let diagnostics = crate::analyze::run_overlaid(engine, &[], &[])
         .map_err(ImpactError::from)?
         .diagnostics;
-    let mut report = impact_after_analysis(engine, target)?;
+    let mut report = impact_after_analysis_with_symbols(engine, target, symbols)?;
     report.affected_environments = environments_section(engine, target, &report, &diagnostics)?;
     Ok(report)
 }
@@ -354,7 +358,24 @@ pub fn impact_after_analysis(
     engine: &Engine,
     target: &Path,
 ) -> Result<query::ImpactReport, ImpactError> {
-    impact_after_analysis_with_persisted_facts(engine, target, &unpersisted)
+    impact_after_analysis_with_persisted_facts(engine, target, &unpersisted, &[])
+}
+
+/// [`impact_after_analysis`] with the `--symbol` narrowing: the CLI's
+/// report path. `symbols` is the raw flag list — empty is the file-level
+/// posture (backward compatible).
+///
+/// # Errors
+///
+/// [`ImpactError::Missing`] / [`ImpactError::NotAnalyzed`] on a bad target;
+/// [`ImpactError::Usage`] when a supplied name resolves to no face of the
+/// seed library.
+pub fn impact_after_analysis_with_symbols(
+    engine: &Engine,
+    target: &Path,
+    symbols: &[String],
+) -> Result<query::ImpactReport, ImpactError> {
+    impact_after_analysis_with_persisted_facts(engine, target, &unpersisted, symbols)
 }
 
 /// The persisted-facts hint the query consults before seeding (the #341
@@ -380,9 +401,21 @@ fn unpersisted(_: &str) -> Option<PersistedFacts> {
 /// pass kept them), so the rule evaluates over an empty set; the CLI path
 /// re-answers the section with the pass's rows.
 ///
+/// `symbols` is the CLI's `--symbol` list: when non-empty, the seed
+/// narrows from the whole face set to the resolved hits — `MyClass` or
+/// `MyClass.member` alike resolve to the container's face name (the
+/// signature fold is per-face, never per-member, so `member` narrows
+/// nothing past its container). Every supplied name must hit: a miss is
+/// the usage tier, not a silent file-level fallback. The propagation set
+/// the affected rows' `reference_lines` collect against is the narrowed
+/// (or full, under an empty `symbols`) seed-name set — a `(target_file,
+/// target_name)` pair whose file is a member of the seed library.
+///
 /// # Errors
 ///
 /// [`ImpactError::Missing`] / [`ImpactError::NotAnalyzed`] on a bad target.
+/// [`ImpactError::Usage`] when a `--symbol` resolves to no face name of
+/// the seed library.
 ///
 /// # Panics
 ///
@@ -393,6 +426,7 @@ pub fn impact_after_analysis_with_persisted_facts(
     engine: &Engine,
     target: &Path,
     persisted: PersistedFactsHint<'_>,
+    symbols: &[String],
 ) -> Result<query::ImpactReport, ImpactError> {
     // The seed: the target file's owning library.
     let canonical = target
@@ -423,10 +457,98 @@ pub fn impact_after_analysis_with_persisted_facts(
     // documented query posture: the only side effect is interning).
     let strings = engine.strings();
     let mut restored = FileTable::new();
-    let current = library_surface(engine, members, strings, persisted, &mut restored);
+    let mut current = library_surface(engine, members, strings, persisted, &mut restored);
+
+    // The propagation set the affected rows' `reference_lines` collect
+    // against — the `(member file, face name)` pairs the seed's surfaces
+    // declare. Under `--symbol` the set narrows to the resolved hits only;
+    // under the file-level posture it is the library's whole face.
+    let seed_names: FxHashSet<StringId> = if symbols.is_empty() {
+        current.member_names.iter().copied().collect()
+    } else {
+        // `MyClass` resolves as itself; `MyClass.member` resolves to the
+        // container segment — the face fold is per-container, so the
+        // member part can never narrow past it.
+        let mut resolved = FxHashSet::default();
+        for symbol in symbols {
+            let face = symbol.split('.').next().unwrap_or(symbol.as_str());
+            let name = strings.intern(face);
+            if current.member_names.binary_search(&name).is_err() {
+                return Err(ImpactError::Usage(format!(
+                    "no such symbol in {}: {symbol}",
+                    canonical.display()
+                )));
+            }
+            resolved.insert(name);
+        }
+        resolved
+    };
+    // Narrow the seed's member face to the resolved hits: the
+    // parallel (names, digests) columns stay ascending — the filter keeps
+    // the sort order and the pairwise alignment intact. File-level posture
+    // skips the step entirely.
+    if !symbols.is_empty() {
+        let keep: Vec<(StringId, [u8; 16])> = current
+            .member_names
+            .iter()
+            .copied()
+            .zip(current.member_digests.iter().copied())
+            .filter(|(name, _)| seed_names.contains(name))
+            .collect();
+        current.member_names = keep.iter().map(|(name, _)| *name).collect();
+        current.member_digests = keep.into_iter().map(|(_, digest)| digest).collect();
+    }
+
+    // The seed-name→file map: each `(file, name)` pair is a declaring
+    // member's library-face row — the RefRow's `(target_file, target_name)`
+    // key shape.
+    let mut propagation: FxHashSet<(FileId, StringId)> = FxHashSet::default();
+    for &file in members {
+        let capture = engine.file_capture(file).expect("resident member");
+        for row in capture.index.decls() {
+            if row.is_library_face() && seed_names.contains(&row.name) {
+                propagation.insert((file, row.name));
+            }
+        }
+    }
 
     // The substrate over the engine's faces, then the query.
     let substrate = impact_substrate(engine, &libraries);
+    let surfaces: FxHashMap<u32, &dartq_index::LibraryIndex> = engine
+        .library_surfaces()
+        .map(|(library, surface)| (library.index(), surface))
+        .collect();
+    let defining_of: FxHashMap<u32, FileId> = libraries
+        .iter()
+        .filter_map(|(library, files)| files.first().map(|&f| (library.index(), f)))
+        .collect();
+    let reference_lines_of = |library: u32| -> Vec<u32> {
+        let (Some(surface), Some(&defining)) =
+            (surfaces.get(&library), defining_of.get(&library))
+        else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+        for row in surface.refs() {
+            if row.file != defining
+                || !propagation.contains(&(row.target_file, row.target_name))
+            {
+                continue;
+            }
+            let (Some(index), Some(content)) =
+                (engine.line_index(row.file), engine.content(row.file))
+            else {
+                continue;
+            };
+            let Ok(text) = std::str::from_utf8(content) else {
+                continue;
+            };
+            lines.push(index.line_col_utf16(text, row.range.offset).0);
+        }
+        lines.sort_unstable();
+        lines.dedup();
+        lines
+    };
     let change = LibraryChange::hypothetical(seed_library.index(), current);
     let mut report = query::impact(
         substrate.node_count(),
@@ -435,6 +557,7 @@ pub fn impact_after_analysis_with_persisted_facts(
         &substrate.tests,
         strings,
         &[change],
+        reference_lines_of,
     );
     let affected = affected_label_set(engine, seed_library.index(), &report);
     report.affected_environments = vec![default_environment_row(engine, &affected, &[])];
@@ -658,7 +781,7 @@ mod tests {
         );
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
         let target = root.join("lib/a.dart");
-        let baseline = impact(&mut engine, &target).expect("seeded impact");
+        let baseline = impact(&mut engine, &target, &[]).expect("seeded impact");
         assert!(
             baseline
                 .affected
@@ -679,7 +802,7 @@ mod tests {
         engine
             .remove_file(&root.join("lib/b.dart"))
             .expect("remove");
-        let after = impact(&mut engine, &target).expect("post-retirement impact");
+        let after = impact(&mut engine, &target, &[]).expect("post-retirement impact");
         // The state guard: the retirement must actually have happened —
         // live libraries below the arena's slot count is the exact shape
         // the substrate's arena sizing exists for. Without this, a silent
@@ -867,7 +990,7 @@ mod tests {
         );
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
         let target = root.join("lib/main.dart");
-        let seeded = impact(&mut engine, &target).expect("seeded impact");
+        let seeded = impact(&mut engine, &target, &[]).expect("seeded impact");
 
         // The save side: one payload per workspace file, keyed by the exact
         // content the store's entry key pins.
@@ -887,7 +1010,7 @@ mod tests {
 
         let loaded = impact_after_analysis_with_persisted_facts(&engine, &target, &|text: &str| {
             persisted.get(text).cloned()
-        })
+        }, &[])
         .expect("loaded impact");
 
         // The seed members (main.dart and its part) both hit; the report
@@ -953,7 +1076,7 @@ mod tests {
         );
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
         let target = root.join("lib/main.dart");
-        let seeded = impact(&mut engine, &target).expect("seeded impact");
+        let seeded = impact(&mut engine, &target, &[]).expect("seeded impact");
 
         let hintless = impact_after_analysis(&engine, &target).expect("hintless impact");
         assert_eq!(
@@ -973,7 +1096,7 @@ mod tests {
         }
         let loaded = impact_after_analysis_with_persisted_facts(&engine, &target, &|text: &str| {
             persisted.get(text).cloned()
-        })
+        }, &[])
         .expect("partially loaded impact");
         assert_eq!(
             serde_json::to_string(&loaded).expect("serialize"),
@@ -1003,7 +1126,7 @@ mod tests {
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
 
         let sibling = root.join("test/a.dart");
-        let report = impact(&mut engine, &sibling).expect("sibling impact");
+        let report = impact(&mut engine, &sibling, &[]).expect("sibling impact");
         let tests: Vec<&str> = report
             .affected_tests
             .iter()
@@ -1013,7 +1136,7 @@ mod tests {
         assert!(tests[0].ends_with("test/a_test.dart"));
 
         let homonym = root.join("lib/other/a.dart");
-        let report = impact(&mut engine, &homonym).expect("homonym impact");
+        let report = impact(&mut engine, &homonym, &[]).expect("homonym impact");
         assert!(
             report.affected_tests.is_empty(),
             "no test edge reaches a same-basename homonym"
@@ -1095,7 +1218,7 @@ mod tests {
         );
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdks/new"))).expect("engine");
         let target = root.join("lib/a.dart");
-        let report = impact(&mut engine, &target).expect("impact");
+        let report = impact(&mut engine, &target, &[]).expect("impact");
         assert_eq!(
             report.affected_environments,
             vec![
@@ -1129,7 +1252,7 @@ mod tests {
     fn contextless_workspaces_keep_the_default_row() {
         let root = context_fixture("default");
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdks/new"))).expect("engine");
-        let report = impact(&mut engine, &root.join("lib/a.dart")).expect("impact");
+        let report = impact(&mut engine, &root.join("lib/a.dart"), &[]).expect("impact");
         assert_eq!(
             report.affected_environments,
             vec![query::EnvironmentImpact {
@@ -1151,7 +1274,7 @@ mod tests {
         let root = context_fixture("default_error");
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdks/old"))).expect("engine");
         let target = root.join("lib/a.dart");
-        let report = impact(&mut engine, &target).expect("impact");
+        let report = impact(&mut engine, &target, &[]).expect("impact");
         assert_eq!(
             report.affected_environments,
             vec![query::EnvironmentImpact {
@@ -1184,7 +1307,7 @@ mod tests {
             "contexts:\n  ghost:\n    sdk: path:sdks/missing\n  new:\n    sdk: path:sdks/new\n",
         );
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdks/new"))).expect("engine");
-        let report = impact(&mut engine, &root.join("lib/a.dart")).expect("impact");
+        let report = impact(&mut engine, &root.join("lib/a.dart"), &[]).expect("impact");
         assert_eq!(
             report.affected_environments,
             vec![
@@ -1214,7 +1337,7 @@ mod tests {
             "contexts:\n  new:\n    sdk: path:sdks/new\n  old:\n    sdk: path:sdks/old\n",
         );
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdks/new"))).expect("engine");
-        let report = impact(&mut engine, &root.join("lib/b.dart")).expect("impact");
+        let report = impact(&mut engine, &root.join("lib/b.dart"), &[]).expect("impact");
         assert!(
             report.affected.is_empty(),
             "no importer of b: {:?}",
@@ -1245,7 +1368,7 @@ mod tests {
         let root = context_fixture("refuse");
         write_config(&root, "contexts:\n  bad:\n    sdk: registry:foo\n");
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdks/new"))).expect("engine");
-        let error = impact(&mut engine, &root.join("lib/a.dart")).expect_err("refusal");
+        let error = impact(&mut engine, &root.join("lib/a.dart"), &[]).expect_err("refusal");
         assert!(
             matches!(error, ImpactError::Usage(_)),
             "usage tier: {error:?}"
@@ -1261,6 +1384,9 @@ mod tests {
     /// The canonical fixture report (the shaper tests' input): every row
     /// shape in one document — both signature verdicts, both impact
     /// levels, the test section, and the two-row environment matrix.
+    /// `reference_lines` rides the v3 row: non-empty on the semantic hit
+    /// (its file holds resolved uses of the change's names) and empty on
+    /// the transitive-only row.
     fn golden_report() -> query::ImpactReport {
         query::ImpactReport {
             schema_version: query::IMPACT_SCHEMA_VERSION,
@@ -1278,10 +1404,12 @@ mod tests {
                 query::AffectedTarget {
                     path: "lib/b.dart".to_owned(),
                     impact: query::ImpactLevel::Semantic,
+                    reference_lines: vec![4, 5],
                 },
                 query::AffectedTarget {
                     path: "tool/note.dart".to_owned(),
                     impact: query::ImpactLevel::ContentOnly,
+                    reference_lines: vec![],
                 },
             ],
             affected_tests: vec![query::AffectedTest {
@@ -1331,5 +1459,228 @@ mod tests {
             dartq_schema::validate_at_tier(&text, dartq_schema::Domain::Impact, tier)
                 .expect("tier-invariant: exact at every tier");
         }
+    }
+
+    /// `--symbol` narrows the seed's member face to the resolved hits: a
+    /// container token and its member token resolve alike to the
+    /// container's face name (`MyClass` — the signature fold is
+    /// per-container, so `MyClass.method` narrows nothing past it). The
+    /// `changed` list loses the un-named face (`topFn`), the propagation
+    /// set is the resolved hits only, and `reference_lines` collects the
+    /// use-site lines of those hits.
+    #[test]
+    fn symbol_flag_narrows_the_seed_face_and_collects_reference_lines() {
+        let root = workspace(
+            "impact_symbol_narrow",
+            &[
+                (
+                    "lib/a.dart",
+                    "class MyClass {\n  void method() {}\n}\nint topFn() => 0;\n",
+                ),
+                (
+                    "lib/b.dart",
+                    // `MyClass` referenced on lines 3 and 5 (1-based);
+                    // `topFn` is the import-only face the narrowed seed
+                    // drops — no use site exists, so the filter cannot
+                    // prove it either way.
+                    "import 'a.dart';\n\nMyClass make() => MyClass();\n\nvoid use(MyClass c) { c.method(); }\n",
+                ),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let target = root.join("lib/a.dart");
+
+        // The container face alone narrows `changed` to `MyClass`: the
+        // member token and the bare container token resolve alike.
+        for symbols in [
+            vec!["MyClass".to_owned()],
+            vec!["MyClass.method".to_owned()],
+        ] {
+            let report = impact(&mut engine, &target, &symbols).expect("symbol impact");
+            let names: Vec<&str> = report
+                .changed
+                .iter()
+                .map(|row| row.symbol.as_str())
+                .collect();
+            assert_eq!(
+                names.len(),
+                1,
+                "the narrowed seed ships one face: {names:?}"
+            );
+            assert!(
+                names[0].ends_with("|MyClass"),
+                "the container face: {names:?}"
+            );
+
+            // The reference-line column of the consumer row: the resolved
+            // hits' use-site lines in b.dart's defining file. `MyClass` at
+            // lines 3 (`=> MyClass()`) and 5 (`use(MyClass c)`); line 1's
+            // import and the member's `c.method()` touch no library-face
+            // name — the declaration-resolution layer attributes them to
+            // the container or the member per RefRow's target_name.
+            let b = report
+                .affected
+                .iter()
+                .find(|row| row.path.ends_with("b.dart"))
+                .expect("b.dart is affected");
+            assert!(
+                !b.reference_lines.is_empty(),
+                "the consumer's use-site lines land: {:?}",
+                b.reference_lines
+            );
+            assert!(
+                b.reference_lines.iter().all(|line| *line >= 1),
+                "1-based lines: {:?}",
+                b.reference_lines
+            );
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Multiple `--symbol` flags union: the seed face carries the union's
+    /// resolved hits in the canonical ascending order the query's merge
+    /// walk produces, not the flag order.
+    #[test]
+    fn repeated_symbol_flags_union_in_canonical_order() {
+        let root = workspace(
+            "impact_symbol_union",
+            &[
+                (
+                    "lib/a.dart",
+                    // `B` declared before `A` on disk; the canonical order
+                    // is the interned-name sort, never the declaration or
+                    // flag order.
+                    "class Zebra {}\nclass Apple {}\n",
+                ),
+                ("lib/b.dart", "import 'a.dart';\nvoid use() {}\n"),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let target = root.join("lib/a.dart");
+
+        // The flag order is `Zebra, Apple`; the canonical name order is
+        // `Apple, Zebra` — the changed list proves the union sorted.
+        let report = impact(
+            &mut engine,
+            &target,
+            &["Zebra".to_owned(), "Apple".to_owned()],
+        )
+        .expect("union impact");
+        let names: Vec<&str> = report
+            .changed
+            .iter()
+            .map(|row| row.symbol.as_str())
+            .collect();
+        assert_eq!(names.len(), 2, "the union carries both hits: {names:?}");
+        assert!(
+            names[0].ends_with("|Apple") && names[1].ends_with("|Zebra"),
+            "canonical ascending order: {names:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `--symbol` that resolves to no face name of the seed library is a
+    /// usage refusal — `ImpactError::Usage`, the CLI's exit-2 tier — never
+    /// a silent file-level fallback.
+    #[test]
+    fn an_unresolvable_symbol_is_the_usage_tier() {
+        let root = workspace(
+            "impact_symbol_miss",
+            &[("lib/a.dart", "class A {}\n")],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let target = root.join("lib/a.dart");
+        let error = impact(&mut engine, &target, &["Missing".to_owned()])
+            .expect_err("a miss is the usage tier");
+        match error {
+            ImpactError::Usage(message) => {
+                assert!(message.contains("Missing"), "the name rides: {message}");
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The file-level posture is backward compatible: no `--symbol` seeds
+    /// the library's whole face — `changed` lists every face name, and
+    /// `reference_lines` collects every propagation-set use.
+    #[test]
+    fn no_symbol_flag_is_the_file_level_seed() {
+        let root = workspace(
+            "impact_file_level",
+            &[
+                ("lib/a.dart", "class A {}\nint topFn() => 0;\n"),
+                ("lib/b.dart", "import 'a.dart';\nA make() => A();\n"),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let target = root.join("lib/a.dart");
+        let report = impact(&mut engine, &target, &[]).expect("file-level impact");
+        let names: Vec<&str> = report
+            .changed
+            .iter()
+            .map(|row| row.symbol.as_str())
+            .collect();
+        assert_eq!(
+            names.len(),
+            2,
+            "the whole face seeds: {names:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `--symbol` posture is deterministic: two runs over the same
+    /// fixture answer byte-identical reports (the seed-name set and the
+    /// reference-line projection are both unordered-build → sorted-write).
+    #[test]
+    fn symbol_runs_are_byte_identical() {
+        let root = workspace(
+            "impact_symbol_determinism",
+            &[
+                ("lib/a.dart", "class A {}\nclass B {}\n"),
+                ("lib/b.dart", "import 'a.dart';\nA a() => A();\nB b() => B();\n"),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let target = root.join("lib/a.dart");
+        let symbols = vec!["A".to_owned(), "B".to_owned()];
+        let first = impact(&mut engine, &target, &symbols).expect("first run");
+        let second = impact(&mut engine, &target, &symbols).expect("second run");
+        assert_eq!(
+            serde_json::to_string(&first).expect("first serializes"),
+            serde_json::to_string(&second).expect("second serializes"),
+            "the report is byte-identical across runs",
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The reference-line projection's empty state: a consumer that
+    /// imports the seed library but names no seed face in its source
+    /// (transitive-only reach — the propagation verdict holds, the column
+    /// is empty) ships `reference_lines: []`.
+    #[test]
+    fn transitive_only_reach_ships_empty_reference_lines() {
+        let root = workspace(
+            "impact_transitive_only",
+            &[
+                ("lib/a.dart", "class A {}\n"),
+                ("lib/b.dart", "import 'a.dart';\nclass B {}\n"),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let target = root.join("lib/a.dart");
+        let report = impact(&mut engine, &target, &[]).expect("impact");
+        let b = report
+            .affected
+            .iter()
+            .find(|row| row.path.ends_with("b.dart"))
+            .expect("b.dart is affected");
+        assert_eq!(
+            b.reference_lines,
+            Vec::<u32>::new(),
+            "the import-only consumer names no face: {:?}",
+            b.reference_lines
+        );
+        fs::remove_dir_all(&root).ok();
     }
 }

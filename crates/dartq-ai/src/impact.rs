@@ -57,7 +57,11 @@ use crate::rev_import_graph::RevImportGraph;
 /// instead of the name-presence proxy — the field keeps its name but the
 /// meaning underneath it changed (a stable name whose member digest moved
 /// now ships a row), the freeze discipline's reuse-the-field major.
-pub const IMPACT_SCHEMA_VERSION: u32 = 2;
+/// v3: `affected[].reference_lines` joins the row — the 1-based source
+/// lines of that file's resolved references to the change's propagation
+/// set (sorted, deduplicated; empty under a transitive-only hit — the
+/// change reaches it through the import graph, not through its own uses).
+pub const IMPACT_SCHEMA_VERSION: u32 = 3;
 
 /// The content hash of one file's bytes — the identity [`FileSnapshot`]
 /// carries alongside the API signature. blake3: collision-resistant, fast,
@@ -190,6 +194,14 @@ pub struct AffectedTarget {
     pub path: String,
     /// How the change reaches this library.
     pub impact: ImpactLevel,
+    /// The 1-based source lines of this library's own resolved
+    /// references to the change's propagation set — the symbols whose
+    /// move seeded the report (the whole face set under the file-level
+    /// posture, the resolved `--symbol` hits under the narrowed one).
+    /// Sorted, deduplicated; the empty list marks the transitive case —
+    /// the change reaches the row through the import graph alone, none
+    /// of its own uses name a seed symbol.
+    pub reference_lines: Vec<u32>,
 }
 
 /// How a change reaches an affected library (content-only reach vs
@@ -337,6 +349,10 @@ fn semantic_flood<'a>(
 /// `imports_of(lib)` yields the resolved import targets of `lib` (the
 /// caller's id space, `0..library_count`); `label_of(lib)` yields the
 /// library's stable path text. Both borrow caller state through `'a`.
+/// `reference_lines_of(lib)` yields the 1-based source lines of `lib`'s
+/// resolved references to the report's propagation set — the caller reads
+/// its maintained index and returns them sorted and deduplicated (the
+/// query attaches the list verbatim, so the contract is the caller's).
 /// Duplicate entries for one library resolve last-wins: the last
 /// [`LibraryChange`] for a library is authoritative, earlier ones
 /// contribute nothing.
@@ -364,6 +380,7 @@ pub fn impact<'a>(
     tests: &TestGraph,
     strings: &StringTable,
     changes: &[LibraryChange],
+    reference_lines_of: impl Fn(u32) -> Vec<u32>,
 ) -> ImpactReport {
     // The verdicts are merge walks and binary searches over the snapshot
     // member arrays: an unsorted, duplicated, or non-parallel set would
@@ -458,6 +475,7 @@ pub fn impact<'a>(
             } else {
                 ImpactLevel::ContentOnly
             },
+            reference_lines: reference_lines_of(lib),
         })
         .collect();
     affected_rows.sort_by(|a, b| a.path.cmp(&b.path));
@@ -584,6 +602,7 @@ mod tests {
             &tests,
             &fx.strings,
             &changes,
+            |_| Vec::new(),
         );
         assert_eq!(report.schema_version, IMPACT_SCHEMA_VERSION);
         assert_eq!(
@@ -645,6 +664,7 @@ mod tests {
             &tests,
             &fx.strings,
             &changes,
+            |_| Vec::new(),
         );
         assert_eq!(
             report
@@ -687,6 +707,7 @@ mod tests {
             &tests,
             &fx.strings,
             &changes,
+            |_| Vec::new(),
         );
         assert_eq!(
             report
@@ -726,6 +747,7 @@ mod tests {
             &tests,
             &fx.strings,
             &changes,
+            |_| Vec::new(),
         );
         assert!(report.changed.is_empty(), "no name moved, no rows");
         assert_eq!(
@@ -789,6 +811,7 @@ mod tests {
             &tests,
             &fx.strings,
             &changes,
+            |_| Vec::new(),
         );
         assert!(report.changed.is_empty(), "no name moved, no rows");
         assert_eq!(report.affected.len(), 1);
@@ -815,6 +838,7 @@ mod tests {
             &tests,
             &fx.strings,
             &changes,
+            |_| Vec::new(),
         );
         assert_eq!(
             report
@@ -858,6 +882,7 @@ mod tests {
             &tests,
             &fx.strings,
             &changes,
+            |_| Vec::new(),
         );
         assert_eq!(
             report
@@ -892,6 +917,7 @@ mod tests {
             &tests,
             &fx.strings,
             &[change],
+            |_| Vec::new(),
         );
         assert_eq!(
             report
@@ -928,12 +954,13 @@ mod tests {
                 before: snapshot(&fx.strings, &[]),
                 after: snapshot(&fx.strings, &["fa"]),
             }],
+            |_| Vec::new(),
         );
         let text = serde_json::to_string(&report).expect("serialize");
         let back: ImpactReport = serde_json::from_str(&text).expect("deserialize");
         assert_eq!(back, report, "byte-stable round trip");
         let value: serde_json::Value = serde_json::from_str(&text).expect("json");
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], IMPACT_SCHEMA_VERSION);
         assert!(value["changed"].is_array());
         assert!(value["affected"].is_array());
         assert!(value["affected_tests"].is_array());
@@ -964,6 +991,7 @@ mod tests {
                 before: same.clone(),
                 after: same,
             }],
+            |_| Vec::new(),
         );
         assert!(report.changed.is_empty());
         assert!(report.affected.is_empty());
@@ -984,7 +1012,7 @@ mod tests {
             before: snapshot(&fx.strings, &["fa"]),
             after: snapshot(&fx.strings, &["fa", "fb"]),
         };
-        let _ = impact(1, imports_of, |_| "a.dart", &tests, &fx.strings, &[change]);
+        let _ = impact(1, imports_of, |_| "a.dart", &tests, &fx.strings, &[change], |_| Vec::new());
     }
 
     /// An `imports_of` target beyond the id space is a caller bug that
@@ -1004,6 +1032,7 @@ mod tests {
             &tests,
             &fx.strings,
             &[],
+            |_| Vec::new(),
         );
     }
 
@@ -1023,7 +1052,7 @@ mod tests {
             before: snapshot(&fx.strings, &["fa"]),
             after,
         };
-        let _ = impact(1, imports_of, |_| "a.dart", &tests, &fx.strings, &[change]);
+        let _ = impact(1, imports_of, |_| "a.dart", &tests, &fx.strings, &[change], |_| Vec::new());
     }
 
     /// A member array that is not positionally parallel to its digests is
@@ -1042,7 +1071,7 @@ mod tests {
             before: snapshot(&fx.strings, &["fa"]),
             after,
         };
-        let _ = impact(1, imports_of, |_| "a.dart", &tests, &fx.strings, &[change]);
+        let _ = impact(1, imports_of, |_| "a.dart", &tests, &fx.strings, &[change], |_| Vec::new());
     }
 
     /// The v2 verdict pin (#1561): a signature edit under a stable name —
@@ -1066,6 +1095,7 @@ mod tests {
             &tests,
             &fx.strings,
             &changes,
+            |_| Vec::new(),
         );
         assert_eq!(
             report
@@ -1100,6 +1130,7 @@ mod tests {
                 before,
                 after,
             }],
+            |_| Vec::new(),
         );
         assert!(
             report.changed.is_empty(),
@@ -1151,6 +1182,7 @@ mod tests {
                 before: snapshot(&fx.strings, &["fa"]),
                 after: snapshot(&fx.strings, &["fa", "fb"]),
             }],
+            |_| Vec::new(),
         );
         assert_eq!(
             report,
@@ -1163,6 +1195,7 @@ mod tests {
                 affected: vec![AffectedTarget {
                     path: "b.dart".to_string(),
                     impact: ImpactLevel::Semantic,
+                    reference_lines: vec![],
                 }],
                 affected_tests: vec![],
                 affected_environments: vec![],
@@ -1196,6 +1229,7 @@ mod tests {
             &tests,
             &fx.strings,
             &[adds_fb, body_only],
+            |_| Vec::new(),
         );
         assert!(
             report.changed.is_empty(),

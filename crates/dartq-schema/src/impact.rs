@@ -19,7 +19,10 @@ use crate::support::{
 /// consults the member-level signature digests instead of the v1
 /// name-presence proxy — the field keeps its shape and name, the meaning
 /// underneath changed (the freeze discipline's reuse-the-field major).
-pub const SCHEMA_VERSION_IMPACT: u32 = 2;
+/// v3: `affected[].reference_lines` joins the row — the 1-based source
+/// lines of that file's resolved references to the change's propagation
+/// set (sorted, deduplicated; empty under a transitive-only hit).
+pub const SCHEMA_VERSION_IMPACT: u32 = 3;
 
 /// The published impact report schema (JSON Schema draft-07 subset).
 #[must_use]
@@ -30,8 +33,8 @@ pub fn impact_schema() -> &'static Value {
 static IMPACT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
-        "$id": "dartq/schema/v2/impact-report.json",
-        "title": "dartq impact report (schema_version 2)",
+        "$id": "dartq/schema/v3/impact-report.json",
+        "title": "dartq impact report (schema_version 3)",
         "type": "object",
         "additionalProperties": false,
         "required": ["schema_version", "changed", "affected", "affected_tests", "affected_environments"],
@@ -49,10 +52,14 @@ static IMPACT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "affected": { "type": "array", "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["path", "impact"],
+                "required": ["path", "impact", "reference_lines"],
                 "properties": {
                     "path": { "type": "string" },
                     "impact": { "enum": ["content-only", "semantic"] },
+                    "reference_lines": {
+                        "type": "array",
+                        "items": { "type": "integer", "minimum": 1 },
+                    },
                 },
             }},
             "affected_tests": { "type": "array", "items": {
@@ -91,7 +98,7 @@ const IMPACT_TOP: &[&str] = &[
 ];
 const IMPACT_SESSION: &[&str] = &["symbols", "since"];
 const CHANGED_SYMBOL: &[&str] = &["symbol", "signature_changed"];
-const AFFECTED_TARGET: &[&str] = &["path", "impact"];
+const AFFECTED_TARGET: &[&str] = &["path", "impact", "reference_lines"];
 const AFFECTED_TEST: &[&str] = &["path"];
 const ENVIRONMENT_IMPACT: &[&str] = &["label", "compatible"];
 const IMPACT_LEVELS: &[&str] = &["content-only", "semantic"];
@@ -121,6 +128,31 @@ pub(crate) fn validate_impact(value: &Value) -> Result<(), SchemaViolation> {
             &join(&p, "impact"),
             IMPACT_LEVELS,
         )?;
+        let lines = field(obj, "reference_lines", &join(&p, "reference_lines"))?;
+        let Some(items) = lines.as_array() else {
+            return Err(SchemaViolation {
+                path: join(&p, "reference_lines"),
+                expected: "an array of 1-based line integers".to_owned(),
+                found: format!("{lines}"),
+            });
+        };
+        for (j, line) in items.iter().enumerate() {
+            let lp = join(&p, &format!("reference_lines[{j}]"));
+            let Some(n) = line.as_u64() else {
+                return Err(SchemaViolation {
+                    path: lp,
+                    expected: "an integer >= 1".to_owned(),
+                    found: format!("{line}"),
+                });
+            };
+            if n == 0 {
+                return Err(SchemaViolation {
+                    path: lp,
+                    expected: "an integer >= 1".to_owned(),
+                    found: format!("{line}"),
+                });
+            }
+        }
     }
     for (i, row) in rows(root, "affected_tests")? {
         let p = format!("affected_tests[{i}]");
@@ -149,7 +181,7 @@ mod tests {
         json!({
             "schema_version": SCHEMA_VERSION_IMPACT,
             "changed": [{"symbol": "a.dart|fb", "signature_changed": true}],
-            "affected": [{"path": "b.dart", "impact": "semantic"}],
+            "affected": [{"path": "b.dart", "impact": "semantic", "reference_lines": [3, 7]}],
             "affected_tests": [],
             "affected_environments": [],
         })
@@ -192,7 +224,7 @@ mod tests {
         bumped["schema_version"] = json!(SCHEMA_VERSION_IMPACT + 1);
         let violation = validate_impact(&bumped).expect_err("bumped version must violate");
         assert_eq!(violation.path, "schema_version");
-        assert_eq!(violation.expected, "the integer 2");
+        assert_eq!(violation.expected, "the integer 3");
     }
 
     #[test]

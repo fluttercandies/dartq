@@ -51,6 +51,15 @@ pub(crate) struct ImpactArgs {
     /// the same bytes; the default `compact` was already the only shape.
     #[arg(short = 'v', long, value_enum, default_value_t = Verbosity::Compact)]
     pub(crate) verbosity: Verbosity,
+    /// Narrow the hypothetical-change seed to a face of the target's owning
+    /// library — `MyClass` or `MyClass.member` alike resolve to the
+    /// container's face name (the signature fold is per-container, so the
+    /// member part narrows nothing past it). Repeatable; the union of the
+    /// resolved hits seeds the propagation set the `affected[].reference_lines`
+    /// collect against. Omitting the flag is the file-level posture: every
+    /// library-face name of the owning library seeds.
+    #[arg(long = "symbol", value_name = "NAME")]
+    pub(crate) symbols: Vec<String>,
 }
 
 /// Crash tier like the other engine faces: a panic aborts with exit 4 and
@@ -88,7 +97,7 @@ fn run(args: &ImpactArgs, out: &mut impl Write) -> u8 {
     } else {
         dir.join(&args.path)
     };
-    let report = match query_impact(&mut engine, &target) {
+    let report = match query_impact(&mut engine, &target, &args.symbols) {
         Ok(report) => report,
         // Target problems, plus the environments axis' unusable inputs (a
         // malformed config, an unresolvable context locator), are the usage
@@ -242,6 +251,7 @@ mod tests {
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
+            symbols: Vec::new(),
         };
         let mut out: Vec<u8> = Vec::new();
         let code = run(&args, &mut out);
@@ -327,6 +337,7 @@ mod tests {
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
+            symbols: Vec::new(),
         };
         let mut compact: Vec<u8> = Vec::new();
         assert_eq!(run(&base, &mut compact), exit::CLEAN);
@@ -336,6 +347,7 @@ mod tests {
                 path: base.path.clone(),
                 dir: base.dir.clone(),
                 sdk: base.sdk.clone(),
+                symbols: Vec::new(),
             };
             let mut out: Vec<u8> = Vec::new();
             assert_eq!(run(&args, &mut out), exit::CLEAN);
@@ -357,6 +369,7 @@ mod tests {
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
+            symbols: Vec::new(),
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
         fs::remove_dir_all(&root).ok();
@@ -374,6 +387,7 @@ mod tests {
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
+            symbols: Vec::new(),
         };
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(run(&args, &mut out), exit::CLEAN);
@@ -404,6 +418,7 @@ mod tests {
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
+            symbols: Vec::new(),
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
         fs::remove_dir_all(&root).ok();
@@ -419,6 +434,7 @@ mod tests {
             dir: root.clone(),
             sdk: Some(root.join("no-such-sdk")),
             verbosity: Verbosity::Compact,
+            symbols: Vec::new(),
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
         fs::remove_dir_all(&root).ok();
