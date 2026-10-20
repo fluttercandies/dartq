@@ -43,10 +43,12 @@ fn fixture_report() -> ImpactReport {
             AffectedTarget {
                 path: "b.dart".to_owned(),
                 impact: ImpactLevel::Semantic,
+                reference_lines: vec![3, 7],
             },
             AffectedTarget {
                 path: "c.dart".to_owned(),
                 impact: ImpactLevel::ContentOnly,
+                reference_lines: Vec::new(),
             },
         ],
         affected_tests: vec![AffectedTest {
@@ -134,7 +136,10 @@ fn wrong_schema_version_is_named() {
     value["schema_version"] = 1.into();
     let violation = violation_of(&value.to_string(), Domain::Impact);
     assert_eq!(violation.path, "schema_version");
-    assert_eq!(violation.expected, "the integer 2");
+    assert_eq!(
+        violation.expected,
+        format!("the integer {SCHEMA_VERSION_IMPACT}")
+    );
     assert_eq!(violation.found, "1");
 }
 
@@ -324,7 +329,10 @@ fn wrong_version_key_is_named() {
 fn schema_documents_carry_the_version_constants() {
     let impact = dartq_schema::impact_schema();
     assert_eq!(impact["$schema"], "http://json-schema.org/draft-07/schema#");
-    assert_eq!(impact["properties"]["schema_version"]["const"], 2);
+    assert_eq!(
+        impact["properties"]["schema_version"]["const"],
+        SCHEMA_VERSION_IMPACT
+    );
     let diagnostics = dartq_schema::diagnostics_schema();
     assert_eq!(
         diagnostics["$schema"],
