@@ -126,7 +126,12 @@ impl<'a> Engine<'a> {
     /// joins the `?`), as does any non-record receiver, a
     /// `$0`/out-of-range/non-numeric spelling, and an absent named field
     /// (the `Object` members stay unmodeled — under-report).
-    pub(crate) fn record_field_ty(&self, receiver: Ty, field: StringId, null_aware: bool) -> Option<Ty> {
+    pub(crate) fn record_field_ty(
+        &self,
+        receiver: Ty,
+        field: StringId,
+        null_aware: bool,
+    ) -> Option<Ty> {
         let Ty::Record { shape, nullable } = self.fold_alias_ty(receiver) else {
             return None;
         };
@@ -237,8 +242,7 @@ impl<'a> Engine<'a> {
                 return None;
             }
             let args = std::mem::take(&mut pending_args);
-            let subst_args: Vec<TypeTree> =
-                args.iter().map(|a| subst_tree(a, &subst)).collect();
+            let subst_args: Vec<TypeTree> = args.iter().map(|a| subst_tree(a, &subst)).collect();
             if let Some((params, ret, positional, named, required_positional)) =
                 self.bounds.alias_fn_shape(cur)
             {
@@ -281,10 +285,8 @@ impl<'a> Engine<'a> {
                 .iter()
                 .map(|tree| self.tree_ty(&subst_tree(tree, &subst)))
                 .collect(),
-            required_positional: u16::try_from(
-                required_positional.unwrap_or(positional.len()),
-            )
-            .unwrap_or(u16::MAX),
+            required_positional: u16::try_from(required_positional.unwrap_or(positional.len()))
+                .unwrap_or(u16::MAX),
             named: named
                 .iter()
                 .map(|(name, tree, required)| {
@@ -718,7 +720,11 @@ impl<'a> Engine<'a> {
     /// `fieldPromotionEnabled` comes from the *accessing* library's
     /// feature set (`ast_resolver.dart:139-140`), so a pre-3.2 unit never
     /// promotes — even a field declared in a 3.2 library.
-    pub(crate) fn promotable_field_entry(&self, entry: &Projected<'_, MemberEntry>, name: StringId) -> bool {
+    pub(crate) fn promotable_field_entry(
+        &self,
+        entry: &Projected<'_, MemberEntry>,
+        name: StringId,
+    ) -> bool {
         if !self.field_promotion_enabled {
             return false;
         }
@@ -1022,14 +1028,17 @@ impl<'a> Engine<'a> {
             let decidable_this = kind == ContainerKind::Extension
                 && matches!(
                     self.this_static_ty(container, kind),
-                    Ty::Record { nullable: false, .. } | Ty::Function { nullable: false, .. }
+                    Ty::Record {
+                        nullable: false,
+                        ..
+                    } | Ty::Function {
+                        nullable: false,
+                        ..
+                    }
                 );
             if decidable_this
-                && let Some(ty) = self.record_field_ty(
-                    self.this_static_ty(container, kind),
-                    name,
-                    false,
-                )
+                && let Some(ty) =
+                    self.record_field_ty(self.this_static_ty(container, kind), name, false)
             {
                 return (BareInfo::Plain { ty }, RefTarget::Opaque);
             }
@@ -1065,10 +1074,23 @@ impl<'a> Engine<'a> {
                 None if decidable_this => {
                     matches!(self.walk_members(container, name), Walk::Found(_))
                 }
-                None => !matches!(self.walk_members(container, name), Walk::Missing),
+                // Only a clean `Walk::Found` claims the member face. A
+                // broken chain (a supertype hop that resolved to a
+                // declaration the index cannot model) leaves the member
+                // question undecided in BOTH directions, so the name falls
+                // through to the ordinary scope lookup like a clean miss:
+                // a top-level/imported hit resolves there (the bare
+                // creation send `Thing()` inside a broken-chain class is
+                // the class's creation, never an implicit-this member —
+                // the drift corpus's 17 false `undefined_method` rows),
+                // and a full miss reports the `undefined_*` face against
+                // `this`'s static type exactly like the oracle's final
+                // member scope (the star corpus's silent o-only mirrors —
+                // the oracle's own interface ends at the resolved part of
+                // the chain and still answers the miss).
+                None => matches!(self.walk_members(container, name), Walk::Found(_)),
             };
             if member_found {
-                // Found, or a broken chain — both suppress.
                 return (
                     BareInfo::Plain {
                         ty: self.member_declared_ty(container, name),
@@ -1117,10 +1139,7 @@ impl<'a> Engine<'a> {
                         return (BareInfo::Plain { ty }, target);
                     }
                     Walk::ChainBroken => {
-                        return (
-                            BareInfo::Plain { ty: Ty::UNKNOWN },
-                            RefTarget::Opaque,
-                        );
+                        return (BareInfo::Plain { ty: Ty::UNKNOWN }, RefTarget::Opaque);
                     }
                     Walk::Missing => {}
                 }
@@ -1317,14 +1336,12 @@ impl<'a> Engine<'a> {
             reaches(receiver, on) && arg_applicable(face, file)
         };
         let unit_has = |file: FileId| -> bool {
-            self.index
-                .get(file)
-                .is_some_and(|elements| {
-                    elements
-                        .extension_faces()
-                        .iter()
-                        .any(|face| probe(face, file))
-                })
+            self.index.get(file).is_some_and(|elements| {
+                elements
+                    .extension_faces()
+                    .iter()
+                    .any(|face| probe(face, file))
+            })
         };
         if unit_has(self.file) {
             return true;
@@ -1370,7 +1387,12 @@ impl<'a> Engine<'a> {
     /// `ChainBroken` when a hop resolves to a declaration the index cannot
     /// model (its members could carry the name). Every other container
     /// kind answers `Missing`.
-    pub(crate) fn on_face_walk(&self, container: StringId, kind: ContainerKind, member: StringId) -> Walk<'a> {
+    pub(crate) fn on_face_walk(
+        &self,
+        container: StringId,
+        kind: ContainerKind,
+        member: StringId,
+    ) -> Walk<'a> {
         let mut seen: FxHashSet<StringId> = FxHashSet::default();
         seen.insert(container);
         match kind {
@@ -1519,10 +1541,7 @@ impl<'a> Engine<'a> {
             // (lexical_lookup.dart's fall-through).
             on_opaque: context.is_some_and(|(container, kind)| {
                 matches!(kind, ContainerKind::Mixin | ContainerKind::Extension)
-                    && matches!(
-                        self.on_face_walk(container, kind, name),
-                        Walk::ChainBroken
-                    )
+                    && matches!(self.on_face_walk(container, kind, name), Walk::ChainBroken)
             }),
         }
     }
@@ -1542,11 +1561,11 @@ impl<'a> Engine<'a> {
     fn extension_invoke_target(&self, container: StringId) -> Option<StringId> {
         match self.this_static_ty(container, ContainerKind::Extension) {
             Ty::Named {
-                name, nullable: false, ..
+                name,
+                nullable: false,
+                ..
             } => {
-                if self.type_params.contains(&name)
-                    || self.pending_type_params.contains(&name)
-                {
+                if self.type_params.contains(&name) || self.pending_type_params.contains(&name) {
                     None
                 } else {
                     match self.type_resolution(name).0 {
@@ -1573,7 +1592,11 @@ impl<'a> Engine<'a> {
         }
     }
 
-    pub(crate) fn bare_info_of_entry(&self, name: StringId, entry: NamespaceEntry) -> (BareInfo, RefTarget) {
+    pub(crate) fn bare_info_of_entry(
+        &self,
+        name: StringId,
+        entry: NamespaceEntry,
+    ) -> (BareInfo, RefTarget) {
         match entry {
             NamespaceEntry::Prefix => (BareInfo::Prefix { name }, RefTarget::Prefix),
             NamespaceEntry::Decl(file) => match self.index.get(file) {
@@ -2315,9 +2338,7 @@ impl<'a> Engine<'a> {
                 ),
                 _ => false,
             };
-            if satisfied
-                && let Some(site) = self.open_ctor_site
-            {
+            if satisfied && let Some(site) = self.open_ctor_site {
                 self.ctor_super_init.insert(site);
             }
         } else {
@@ -2335,12 +2356,7 @@ impl<'a> Engine<'a> {
             // bare `=` shape is the misfire.
             let next = self.skip_whitespace(token.range.end());
             if self.byte_at(next) == Some(b'=') {
-                self.emit(
-                    SemanticCode::InvalidReferenceToThis,
-                    token.range,
-                    "",
-                    "",
-                );
+                self.emit(SemanticCode::InvalidReferenceToThis, token.range, "", "");
                 // The empty-name field-initializer face — oracle's
                 // `_checkForInvalidField` walks `''` against the field set,
                 // misses, and reports `initializer_for_non_existent_field`
@@ -2589,7 +2605,6 @@ impl<'a> Engine<'a> {
         }
     }
 
-
     /// The type-position lookup's full answer for a bare type head — the
     /// official chain (`named_type_resolver.dart:129-131` `_lookupGetter
     /// (nameScope, …)` over the member's scope), keeping the element kind
@@ -2614,7 +2629,10 @@ impl<'a> Engine<'a> {
     /// resolution with the `not_a_type` context anchor — the resolved
     /// element's declaration (file, name span) when the face fires and the
     /// span is carried; `None` keeps the plain row.
-    pub(crate) fn type_resolution(&self, name: StringId) -> (TypeResolution, Option<(FileId, SourceRange)>) {
+    pub(crate) fn type_resolution(
+        &self,
+        name: StringId,
+    ) -> (TypeResolution, Option<(FileId, SourceRange)>) {
         if self.type_params.contains(&name)
             || self.pending_type_params.contains(&name)
             || self
