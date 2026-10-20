@@ -3557,6 +3557,12 @@ mod ticket_2297_tests;
 #[cfg(test)]
 mod ticket_2359_tests;
 
+/// The #2318 pins: the extension-member element-identity credit — a
+/// resolved implicit application spares its own member only, so
+/// same-spelled members of sibling extensions (and unresolved accesses)
+/// keep reporting.
+#[cfg(test)]
+mod ticket_2318_tests;
 
 /// The #2344 pins: the member-read gate on the nullable-condition join —
 /// a staged condition at a member token decides on the property face

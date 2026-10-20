@@ -160,6 +160,32 @@ fn staged_decl_name(
     strings.intern(text.get(start as usize..end as usize).unwrap_or_default())
 }
 
+/// The element key an `unused_element` row anchored on an extension member
+/// carries into the library close: the declaring file's `extension_faces()`
+/// position of the face whose member map holds the anchor's spelling.
+/// `MemberEntry.name_range` rides the member's written name token — the
+/// same UTF-16 span the per-file pass staged the row on — so the anchor
+/// maps back to exactly one (face, spelling) pair; a setter's map key keeps
+/// its `=` suffix, which the name-level staging loses.
+fn extension_member_key(
+    file: FileId,
+    index: &dartq_semantic::ElementIndex,
+    range: SourceRange,
+) -> Option<(FileId, u32, StringId)> {
+    index.get(file)?.extension_faces().iter().enumerate().find_map(
+        |(face_index, face)| {
+            face.members
+                .iter()
+                .find(|(_, entry)| entry.name_range == range)
+                .and_then(|(spelling, _)| {
+                    u32::try_from(face_index)
+                        .ok()
+                        .map(|face_index| (file, face_index, *spelling))
+                })
+        },
+    )
+}
+
 /// Releases the staged `unused_import` rows whose import the library's
 /// merged faces credit (#2251). The per-file pass fired each row against
 /// its own unit's use set only; the oracle's `ImportsTracking` is
@@ -618,6 +644,13 @@ pub(crate) struct MemberFold {
     content: ContentId,
     diagnostics: Arc<[Arc<Diagnostic>]>,
     unused: Arc<[(Arc<Diagnostic>, StringId)]>,
+    /// The `unused_element` rows anchored on extension members: each row's
+    /// `(declaring file, face index, lookup spelling)` element key — the
+    /// `usedElements.members` verdict the library close re-decides against
+    /// the merged `extension_members` set instead of the name pool (the
+    /// oracle's `_isUsedMember` element identity + `identical(library)`
+    /// gate).
+    unused_extension: Arc<[(Arc<Diagnostic>, (FileId, u32, StringId))]>,
     unused_fields: Arc<[(Arc<Diagnostic>, StringId)]>,
     unused_imports: Arc<[Arc<Diagnostic>]>,
     doc_refs: Box<[StringId]>,
@@ -644,6 +677,8 @@ impl MemberFold {
         size_of::<Self>()
             + self.diagnostics.len() * size_of::<Arc<Diagnostic>>()
             + self.unused.len() * size_of::<(Arc<Diagnostic>, StringId)>()
+            + self.unused_extension.len()
+                * size_of::<(Arc<Diagnostic>, (FileId, u32, StringId))>()
             + self.unused_fields.len() * size_of::<(Arc<Diagnostic>, StringId)>()
             + self.unused_imports.len() * size_of::<Arc<Diagnostic>>()
             + self.doc_refs.len() * size_of::<StringId>()
@@ -664,6 +699,7 @@ struct CompactUseFace {
     used: Box<[StringId]>,
     reads: Box<[StringId]>,
     annotations: Box<[StringId]>,
+    extension_members: Box<[(FileId, u32, StringId)]>,
     imports: Box<[(Option<StringId>, Box<[StringId]>)]>,
     exports: Box<[Box<[StringId]>]>,
 }
@@ -679,6 +715,12 @@ impl CompactUseFace {
             used: sorted(&face.used),
             reads: sorted(&face.reads),
             annotations: sorted(&face.annotations),
+            extension_members: {
+                let mut members: Vec<(FileId, u32, StringId)> =
+                    face.extension_members.iter().copied().collect();
+                members.sort_unstable();
+                members.into_boxed_slice()
+            },
             imports: face
                 .imports
                 .iter()
@@ -700,6 +742,7 @@ impl CompactUseFace {
             used: self.used.iter().copied().collect(),
             reads: self.reads.iter().copied().collect(),
             annotations: self.annotations.iter().copied().collect(),
+            extension_members: self.extension_members.iter().copied().collect(),
             imports: self
                 .imports
                 .iter()
@@ -721,6 +764,7 @@ impl CompactUseFace {
 
     fn heap_bytes(&self) -> usize {
         (self.used.len() + self.reads.len() + self.annotations.len()) * size_of::<StringId>()
+            + self.extension_members.len() * size_of::<(FileId, u32, StringId)>()
             + self
                 .imports
                 .iter()
@@ -790,6 +834,12 @@ impl SemanticDiagnoser for Diagnoser {
         // paths (fresh and memo-served — the split is part of the memoized
         // product), released after the close.
         let mut staged: Vec<(Arc<Diagnostic>, StringId)> = Vec::new();
+        // The extension-member arm of the family: rows anchored on an
+        // extension member carry the element key their per-file verdict
+        // tested, and the close releases them only against the merged
+        // `extension_members` set — a same-spelled name use never spares
+        // one (the oracle's `_isUsedMember` element-identity gate).
+        let mut staged_extension: Vec<(Arc<Diagnostic>, (FileId, u32, StringId))> = Vec::new();
         // The read-gated twin (#2286): `unused_field` rows with the field
         // names their verdicts tested, re-decided against the merged
         // `consumed.reads` at the close.
@@ -814,6 +864,11 @@ impl SemanticDiagnoser for Diagnoser {
                     fold.unused
                         .iter()
                         .map(|(row, name)| (Arc::clone(row), *name)),
+                );
+                staged_extension.extend(
+                    fold.unused_extension
+                        .iter()
+                        .map(|(row, key)| (Arc::clone(row), *key)),
                 );
                 staged_fields.extend(
                     fold.unused_fields
@@ -939,12 +994,32 @@ impl SemanticDiagnoser for Diagnoser {
             let doc_names = doc_reference_names(text, library.strings);
             doc_refs.extend(doc_names.iter().copied());
             out.extend(live.iter().cloned());
+            // The extension-member rows leave the name-keyed pool: their
+            // close gate is the element-keyed `extension_members` merge, not
+            // `consumed.used` (a same-spelled use elsewhere never releases
+            // them). Rows whose anchor maps to no extension member keep the
+            // name verdict.
+            let mut extension_candidates: Vec<(Arc<Diagnostic>, (FileId, u32, StringId))> =
+                Vec::new();
+            candidates.retain(|(row, _)| {
+                if let Some(key) = extension_member_key(row.file, library.index, row.range) {
+                    extension_candidates.push((Arc::clone(row), key));
+                    false
+                } else {
+                    true
+                }
+            });
             // The memo owns the rows; the staging holds refcount bumps
             // released at the close below.
             staged.extend(
                 candidates
                     .iter()
                     .map(|(row, name)| (Arc::clone(row), *name)),
+            );
+            staged_extension.extend(
+                extension_candidates
+                    .iter()
+                    .map(|(row, key)| (Arc::clone(row), *key)),
             );
             staged_fields.extend(
                 field_rows
@@ -963,6 +1038,7 @@ impl SemanticDiagnoser for Diagnoser {
                     content: facts.content,
                     diagnostics: live.into(),
                     unused: candidates.into(),
+                    unused_extension: extension_candidates.into(),
                     unused_fields: field_rows.into(),
                     unused_imports: import_rows.into(),
                     doc_refs: doc_names,
@@ -982,6 +1058,18 @@ impl SemanticDiagnoser for Diagnoser {
             staged
                 .into_iter()
                 .filter_map(|(row, name)| (!consumed.used(name)).then_some(row)),
+        );
+        // The extension-member arm (`_isUsedMember`'s element sets,
+        // unused_local_elements_verifier.dart:1127-1142): the row releases
+        // only when a unit of THIS library resolved an implicit application
+        // to that exact face — the `identical(element.library)` gate is
+        // free (the close folds only this library's faces), and a
+        // same-spelled use or an application binding a sibling extension's
+        // member never spares it.
+        out.extend(
+            staged_extension
+                .into_iter()
+                .filter_map(|(row, key)| (!consumed.extension_member_used(key)).then_some(row)),
         );
         // The `unused_field` twin: the official `readMembers` merge is
         // library-wide, so a read in any member file spares the declaring
@@ -1007,6 +1095,7 @@ pub fn diagnoser() -> Arc<dyn SemanticDiagnoser> {
 #[cfg(test)]
 mod compact_face_tests {
     use super::*;
+    use dartq_source::FileTable;
 
     /// The memo's compact face expands back to a face equal field by
     /// field — the sets as sets (the close only tests membership), the
@@ -1016,10 +1105,13 @@ mod compact_face_tests {
     fn compact_use_face_round_trips_every_field() {
         let strings = StringTable::new();
         let id = |text: &str| strings.intern(text);
+        let mut files = FileTable::new();
+        let owner = files.intern(std::path::Path::new("owner.dart"));
         let face = UnitUseFace {
             used: [id("a"), id("b"), id("c")].into_iter().collect(),
             reads: [id("b")].into_iter().collect(),
             annotations: [id("override")].into_iter().collect(),
+            extension_members: [(owner, 1, id("m"))].into_iter().collect(),
             imports: vec![
                 ImportUseFace {
                     prefix: Some(id("p")),
@@ -1040,6 +1132,7 @@ mod compact_face_tests {
         assert_eq!(back.used, face.used);
         assert_eq!(back.reads, face.reads);
         assert_eq!(back.annotations, face.annotations);
+        assert_eq!(back.extension_members, face.extension_members);
         assert_eq!(back.imports.len(), 2);
         assert_eq!(back.imports[0].prefix, Some(id("p")));
         assert_eq!(&*back.imports[0].shown, &[id("x"), id("y")]);
@@ -1052,6 +1145,7 @@ mod compact_face_tests {
         assert_eq!(
             compact.heap_bytes(),
             5 * ids
+                + size_of::<(FileId, u32, StringId)>()
                 + 2 * size_of::<(Option<StringId>, Box<[StringId]>)>()
                 + 2 * ids
                 + size_of::<Box<[StringId]>>()
@@ -2166,5 +2260,68 @@ mod tests {
         assert_eq!(elements.len(), 2, "host and orphan both report: {elements:?}");
         let imports = unused_import_rows(&engine, &out);
         assert_eq!(imports.len(), 1, "the import stays: no exported name is spelled");
+    }
+
+    /// The extension-member close gate (#2318): the staged member rows
+    /// release only against the merged element-keyed application credit,
+    /// so a resolved application in ONE part/file never spares a
+    /// same-spelled member of another extension in the same library — the
+    /// name-level pool the close used to read spared both. The control
+    /// (an application in a sibling file of the same library) spares,
+    /// exactly as the official `UsedLocalElements.merge` runs
+    /// library-wide.
+    #[test]
+    fn extension_member_close_is_element_keyed() {
+        let root = memo_workspace();
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "part 'p.dart';\n\nvoid main() {}\n",
+                ),
+                (
+                    "lib/p.dart",
+                    "part of 'main.dart';\n\nclass A {}\n\nclass B {}\n\n\
+                     extension on A {\n  int get g => 0;\n}\n\n\
+                     extension on B {\n  int get g => 1;\n}\n\n\
+                     void f(A a) {\n  a.g;\n}\n",
+                ),
+            ],
+        );
+        let elements = unused_rows(&engine, &out);
+        // Only B's `g` reports: A's twin was applied, B's never was.
+        assert_eq!(elements.len(), 1, "{elements:?}");
+        assert!(
+            elements[0].1.contains("'g'"),
+            "the reported member is B's g: {elements:?}"
+        );
+    }
+
+    /// The library-wide half of the same gate: the application lives in a
+    /// DIFFERENT file of the library than the declaration, so the merged
+    /// element set spares it — the `UsedLocalElements.merge` face the
+    /// close exists for.
+    #[test]
+    fn extension_member_close_spares_across_library_files() {
+        let root = memo_workspace();
+        let (engine, out) = analyze_files(
+            &root,
+            &[
+                (
+                    "lib/main.dart",
+                    "part 'p.dart';\n\nclass A {}\n\nvoid main() { _use(A()); }\n\nvoid _use(A a) {\n  a.g;\n}\n",
+                ),
+                (
+                    "lib/p.dart",
+                    "part of 'main.dart';\n\nextension on A {\n  int get g => 0;\n}\n",
+                ),
+            ],
+        );
+        let elements = unused_rows(&engine, &out);
+        assert!(
+            elements.is_empty(),
+            "the part-declared member is used from the host: {elements:?}"
+        );
     }
 }

@@ -6,7 +6,8 @@ use super::*;
 /// one of them is defined even where the SDK summary faces carry no
 /// top-level constants. The oracle resolves `@override` inside its own
 /// hosted sources (meta 1.19.0 `meta_meta.dart:202`) and reports nothing.
-pub(crate) const CORE_TOP_LEVEL_ANNOTATIONS: [&str; 4] = ["Deprecated", "deprecated", "override", "pragma"];
+pub(crate) const CORE_TOP_LEVEL_ANNOTATIONS: [&str; 4] =
+    ["Deprecated", "deprecated", "override", "pragma"];
 
 /// The external dart: type-parameter counts, keyed by the spellings the
 /// member face keeps ([`crate::member_face::CORE_TYPE_MEMBERS`]'s ten rows —
@@ -632,7 +633,8 @@ pub(crate) struct Boundary<'a> {
     /// `(owner file, owner slot) → local slot` — one deep copy per foreign
     /// argument list per diagnosis; foreign pools are frozen behind `Arc`,
     /// so a memo entry cannot go stale.
-    pub(crate) slots: RefCell<FxHashMap<(FileId, crate::model::ArgListId), crate::model::ArgListId>>,
+    pub(crate) slots:
+        RefCell<FxHashMap<(FileId, crate::model::ArgListId), crate::model::ArgListId>>,
     /// `(owner file, container, member) → projected entry` — one deep copy
     /// per foreign member, and the stable identity [`Projected::ptr`]
     /// compares.
@@ -822,7 +824,10 @@ impl<'a> Boundary<'a> {
     /// The defining file of one projected entry — the cross-file context
     /// rows' anchor origin (#1877). Total for every entry this boundary
     /// handed out: the registration runs at projection time.
-    pub(crate) fn member_origin(&self, entry: &Projected<'_, crate::model::MemberEntry>) -> Option<FileId> {
+    pub(crate) fn member_origin(
+        &self,
+        entry: &Projected<'_, crate::model::MemberEntry>,
+    ) -> Option<FileId> {
         self.origins.borrow().get(&entry.ptr()).copied()
     }
 
@@ -1722,7 +1727,8 @@ pub(crate) struct Engine<'a> {
     /// `this : super.named()` body (or the class's own close when no body
     /// exists). `indexIn` counts `SuperFormalParameter`s alone
     /// (element.dart:10779-10783).
-    pub(crate) pending_super_formals: Vec<(Option<usize>, u32, bool, StringId, SourceRange, StringId)>,
+    pub(crate) pending_super_formals:
+        Vec<(Option<usize>, u32, bool, StringId, SourceRange, StringId)>,
     /// The index of the current formal among the list's `super.`
     /// positionals — not among all positionals (`D(super.x, this.w,
     /// super.y)` associates `super.y` at index 1, never 2).
@@ -2294,11 +2300,16 @@ pub(crate) struct Engine<'a> {
     /// self-scope reference still consulted the namespace). The face reads
     /// `used_names ∪ import_used`.
     pub(crate) import_used: FxHashSet<StringId>,
-    /// Extension member spellings some implicit application resolved to
-    /// (the official `usedElements.members` face for extension members —
-    /// an applied member is used, unused members of an unnamed extension
-    /// report).
-    pub(crate) extension_member_used: FxHashSet<StringId>,
+    /// Extension members some implicit application resolved to (the
+    /// official `usedElements.members` face — an ELEMENT set keyed by the
+    /// applied extension: `(declaring file, index of the face in that
+    /// file's `extension_faces()`, member spelling)`). The element key is
+    /// what keeps the oracle's `identical(element.library)` gate and the
+    /// per-extension attribution: two same-spelled members of sibling
+    /// extensions never share a credit, and an extension member declared
+    /// in another library can join here without ever sparing the same
+    /// spelling in this library's faces.
+    pub(crate) extension_member_used: FxHashSet<(FileId, u32, StringId)>,
     /// The unit's `accessibleExtensions` face (scope.dart:473-488), built
     /// on first member-miss: every extension face declared in this library's
     /// units plus every extension the import edges' export scopes admit
@@ -3686,7 +3697,11 @@ pub(crate) struct DeferredModifierChecks {
 /// (the SDK synthetics carry no `@sealed`, and the oracle's file-scheme
 /// containment branch, pub.dart:556-559, keys a path containment the graph
 /// does not carry).
-pub(crate) fn same_workspace_package(graph: &LibraryGraph, candidate: LibraryId, own: LibraryId) -> bool {
+pub(crate) fn same_workspace_package(
+    graph: &LibraryGraph,
+    candidate: LibraryId,
+    own: LibraryId,
+) -> bool {
     let package = |lib: LibraryId| {
         graph
             .uri(lib)
@@ -3713,7 +3728,11 @@ pub(crate) struct ResolvedSuper {
 /// The clause event's trailing-count claim over the buffered header entries
 /// (the collector's `ClauseClaim::Trailing`): the last `count` entries join
 /// the claiming clause, the earlier ones stay buffered for the next claim.
-pub(crate) fn claim_trailing(claimed: &mut Vec<SourceRange>, buffered: &mut Vec<SourceRange>, count: usize) {
+pub(crate) fn claim_trailing(
+    claimed: &mut Vec<SourceRange>,
+    buffered: &mut Vec<SourceRange>,
+    count: usize,
+) {
     let at = buffered.len().saturating_sub(count);
     claimed.extend(buffered.drain(at..));
 }
@@ -3932,11 +3951,17 @@ impl<'a> Engine<'a> {
                 nullable: false,
                 args,
             },
-            Ty::Function { shape, nullable: true } => Ty::Function {
+            Ty::Function {
+                shape,
+                nullable: true,
+            } => Ty::Function {
                 shape,
                 nullable: false,
             },
-            Ty::Record { shape, nullable: true } => Ty::Record {
+            Ty::Record {
+                shape,
+                nullable: true,
+            } => Ty::Record {
                 shape,
                 nullable: false,
             },

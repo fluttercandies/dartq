@@ -26,7 +26,7 @@
 //! per-library maps, no unbounded growth.
 
 use dartq_resolution::LibraryId;
-use dartq_source::{SourceRange, StringId};
+use dartq_source::{FileId, SourceRange, StringId};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// One unit's observable uses (the per-file gather face).
@@ -46,6 +46,14 @@ pub struct UnitUseFace {
     /// `addElement` on metadata resolution; an unresolved annotation is an
     /// error of its own and never counts).
     pub annotations: FxHashSet<StringId>,
+    /// Extension members an implicit application resolved to (the official
+    /// `usedElements.members` — an ELEMENT set): `(declaring file, index of
+    /// the face in that file's `extension_faces()`, member spelling)`. The
+    /// element key keeps the oracle's `identical(element.library)` gate at
+    /// the library close: a resolved application credits the exact face it
+    /// bound to — same-spelled members of sibling extensions, or of an
+    /// extension in another library, never share the credit.
+    pub extension_members: FxHashSet<(FileId, u32, StringId)>,
     /// The unit's import directives: the written prefix and shown names,
     /// in written order — the per-import attribution face the official
     /// combinator semantics consumes (which import contributed a used
@@ -109,6 +117,10 @@ pub struct LibraryUseSet {
     pub used: FxHashSet<StringId>,
     /// The read-shaped subset.
     pub reads: FxHashSet<StringId>,
+    /// Every extension member some unit of the library resolved an
+    /// implicit application to (the element-keyed `usedElements.members`
+    /// merge — the library-close counterpart of the name pool).
+    pub extension_members: FxHashSet<(FileId, u32, StringId)>,
 }
 
 impl LibraryUseSet {
@@ -124,6 +136,14 @@ impl LibraryUseSet {
     #[must_use]
     pub fn read(&self, name: StringId) -> bool {
         self.reads.contains(&name)
+    }
+
+    /// Whether the extension member `key` (`declaring file`, `face index`,
+    /// `spelling`) was consumed by a resolved implicit application (the
+    /// `_isUsedMember` element-identity test).
+    #[must_use]
+    pub fn extension_member_used(&self, key: (FileId, u32, StringId)) -> bool {
+        self.extension_members.contains(&key)
     }
 }
 
@@ -159,6 +179,7 @@ impl LibraryUsages {
                 set.used.extend(&face.used);
                 set.reads.extend(&face.reads);
                 set.used.extend(&face.annotations);
+                set.extension_members.extend(&face.extension_members);
             }
         }
         set

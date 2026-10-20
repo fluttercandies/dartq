@@ -66,7 +66,8 @@ impl<'a> Engine<'a> {
             if !matches!(self.walk_members(head, getter), Walk::Missing)
                 || getter == self.intern("==")
                 || self.members.object_members.contains(&getter)
-                || (kind == ContainerKind::Enum && self.members.enum_synth_members.contains(&getter))
+                || (kind == ContainerKind::Enum
+                    && self.members.enum_synth_members.contains(&getter))
                 || !matches!(
                     self.extension_application(head, Ty::UNKNOWN, getter, false, false),
                     ExtensionApp::None
@@ -201,7 +202,11 @@ impl<'a> Engine<'a> {
     /// into, applied here exactly as `resolve_member_row` applied them.
     fn resolved_member_uses(&self) -> FxHashSet<StringId> {
         let mut resolved: FxHashSet<StringId> = FxHashSet::default();
-        resolved.extend(self.extension_member_used.iter().copied());
+        resolved.extend(
+            self.extension_member_used
+                .iter()
+                .map(|&(_, _, spelling)| spelling),
+        );
         resolved.extend(self.member_read_owners.keys().copied());
         for read in &self.member_reads {
             let recv = self.promoted_receiver(read.offset, read.recv);
@@ -215,9 +220,16 @@ impl<'a> Engine<'a> {
                 // carry the instance face; a bare `C`/`E`/`Ext` name the
                 // container's static face — the `members` map holds both.
                 Receiver::This { container, .. }
-                | Receiver::Typed { type_name: container, .. }
-                | Receiver::Created { name: container, .. }
-                | Receiver::Container { name: container, .. } => {
+                | Receiver::Typed {
+                    type_name: container,
+                    ..
+                }
+                | Receiver::Created {
+                    name: container, ..
+                }
+                | Receiver::Container {
+                    name: container, ..
+                } => {
                     self.member_found(container, read.name, false)
                         || self.ctor_found(container, read.name)
                 }
@@ -453,15 +465,17 @@ impl<'a> Engine<'a> {
                             .member_read_owners
                             .get(&bare)
                             .is_none_or(|owners| owners.is_empty());
-                    if self.member_was_read(container, &bare)
-                        || enum_values_read
-                        || unresolved_read
+                    if self.member_was_read(container, &bare) || enum_values_read || unresolved_read
                     {
                         continue;
                     }
                     self.stage_usage(SemanticCode::UnusedField, site.range, &name_text);
                 }
-                DeclKind::Member { container, is_static, .. } => {
+                DeclKind::Member {
+                    container,
+                    is_static,
+                    ..
+                } => {
                     // `_isUsedMember` for methods/getters/setters: the
                     // accessibility gate first, then indexed uses, then the
                     // override face (a member overriding a super-name is
@@ -487,17 +501,47 @@ impl<'a> Engine<'a> {
                     // `c.g` on a valid `C` with `extension _E on Missing`
                     // neither reports `undefined_getter` nor leaves `g`
                     // unused, so the credit alone decides.
-                    let is_extension_instance = !is_static
-                        && self
-                            .index
-                            .get(self.file)
-                            .and_then(|f| f.container(container))
-                            .is_some_and(|c| c.kind == ContainerKind::Extension);
-                    let member_used = if is_extension_instance {
-                        self.extension_member_used.contains(&site.name)
-                            || self.extension_member_used.contains(&bare)
-                    } else {
-                        element_used.contains(&bare)
+                    // The extension-member arm keys both verdicts on the
+                    // declaring face (the oracle's `usedElements.members` is
+                    // an element set — a same-spelled member of a sibling
+                    // extension never shares the credit). `container` is the
+                    // extension's written name for a named extension and the
+                    // empty spelling for an unnamed one (`container_context`
+                    // interns it); the unnamed face never reaches
+                    // `containers`, so the site maps back by member lookup —
+                    // the position in `extension_faces()` the resolve-side
+                    // credit keyed. A member no face claims keeps the
+                    // spelling arm.
+                    // An unnamed extension's members never reach this arm's
+                    // report path — the face loop below owns them (its
+                    // nameless faces carry no `containers` entry, so the
+                    // accessibility test's container-miss default spares
+                    // here; and the oracle agrees the whole face is
+                    // private: `ExtensionElement.isPrivate` answers
+                    // `name == null || name.isPrivateName`, element.dart:
+                    // 3264-3267, upstream Dart SDK source, so its members
+                    // report exactly once, from the face loop).
+                    let extension_face = self.index.get(self.file).and_then(|f| {
+                        f.extension_faces()
+                            .iter()
+                            .enumerate()
+                            .find(|(_, face)| {
+                                face.name.map_or_else(
+                                    || self.is_nameless(container),
+                                    |name| name == container,
+                                ) && face.members.contains_key(&site.name)
+                            })
+                            .map(|(index, _)| index)
+                    });
+                    let member_used = match extension_face {
+                        Some(index) if !is_static => u32::try_from(index).is_ok_and(|index| {
+                            self.extension_member_used
+                                .contains(&(self.file, index, site.name))
+                                || self
+                                    .extension_member_used
+                                    .contains(&(self.file, index, bare))
+                        }),
+                        _ => element_used.contains(&bare),
                     };
                     let spared = site.annotated
                         || (!self.is_nameless(site.name)
@@ -581,7 +625,8 @@ impl<'a> Engine<'a> {
                 let DeclKind::Constructor { container } = site.kind else {
                     return None;
                 };
-                site.const_ctor.then_some((container, site.name, site.range))
+                site.const_ctor
+                    .then_some((container, site.name, site.range))
             })
             .collect();
         for (container, name, range) in const_ctor_sites {
@@ -595,28 +640,31 @@ impl<'a> Engine<'a> {
             };
             let class_text = self.strings.resolve(container);
             let self_key = self.strings.resolve(name).to_string();
-            let depends_on_self = formals.positional.iter().chain(formals.named.iter()).any(
-                |formal| {
-                    formal
-                        .default_value
-                        .map(|d| self.strings.resolve(d))
-                        .is_some_and(|text| {
-                            let rest = text.trim_start();
-                            let Some(rest) = rest.strip_prefix("const ") else {
-                                return false;
-                            };
-                            let rest = rest.trim_start();
-                            let Some(head) = rest.strip_prefix(class_text) else {
-                                return false;
-                            };
-                            head.starts_with('(')
-                                || head
-                                    .strip_prefix('.')
-                                    .and_then(|sel| sel.trim_start().strip_prefix(&self_key))
-                                    .is_some_and(|tail| tail.starts_with('('))
-                        })
-                },
-            );
+            let depends_on_self =
+                formals
+                    .positional
+                    .iter()
+                    .chain(formals.named.iter())
+                    .any(|formal| {
+                        formal
+                            .default_value
+                            .map(|d| self.strings.resolve(d))
+                            .is_some_and(|text| {
+                                let rest = text.trim_start();
+                                let Some(rest) = rest.strip_prefix("const ") else {
+                                    return false;
+                                };
+                                let rest = rest.trim_start();
+                                let Some(head) = rest.strip_prefix(class_text) else {
+                                    return false;
+                                };
+                                head.starts_with('(')
+                                    || head
+                                        .strip_prefix('.')
+                                        .and_then(|sel| sel.trim_start().strip_prefix(&self_key))
+                                        .is_some_and(|tail| tail.starts_with('('))
+                            })
+                    });
             if depends_on_self {
                 self.stage_usage(SemanticCode::RecursiveConstantConstructor, range, &self_key);
             }
@@ -686,13 +734,11 @@ impl<'a> Engine<'a> {
         // spelling arm there), and its STATIC fields the `DeclKind::
         // Member` field arm — leaving this face the named-private
         // instance fields the site arms are ineligible for.
-        let mut extension_members: Vec<(StringId, SourceRange, MemberKind, bool, bool)> =
+        let mut extension_members: Vec<(u32, StringId, SourceRange, MemberKind, bool, bool)> =
             Vec::new();
         if let Some(elements) = self.index.get(self.file) {
-            for face in elements.extension_faces() {
-                let named_private = face
-                    .name
-                    .is_some_and(|name| self.is_private_name(name));
+            for (face_index, face) in elements.extension_faces().iter().enumerate() {
+                let named_private = face.name.is_some_and(|name| self.is_private_name(name));
                 if !named_private && face.name.is_some() {
                     continue;
                 }
@@ -700,7 +746,9 @@ impl<'a> Engine<'a> {
                     // A named extension's members are declaration sites —
                     // this face keeps only its public-named instance fields
                     // (the `DeclKind::Member` arms own the rest; unnamed
-                    // extensions declare no sites at all).
+                    // extensions declare no member sites — their `container`
+                    // is the empty spelling and the arm's face lookup owns
+                    // them).
                     let site_owned = named_private
                         && !(entry.kind == MemberKind::Field
                             && !entry.is_static
@@ -709,6 +757,7 @@ impl<'a> Engine<'a> {
                         continue;
                     }
                     extension_members.push((
+                        u32::try_from(face_index).unwrap_or(u32::MAX),
                         *spelling,
                         entry.name_range,
                         entry.kind,
@@ -718,17 +767,18 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        for (spelling, range, kind, is_static, annotated) in extension_members {
-            if range == MemberEntry::MISSING_NAME_RANGE {
+        for (face_index, spelling, range, kind, is_static, annotated) in extension_members {
+            if range == MemberEntry::MISSING_NAME_RANGE || face_index == u32::MAX {
                 continue;
             }
             let bare = self.bare_name(spelling);
             let spared = annotated
-                || self.extension_member_used.contains(&spelling)
+                || self
+                    .extension_member_used
+                    .contains(&(self.file, face_index, spelling))
                 || (is_static
                     && (element_used.contains(&bare)
-                        || (matches!(kind, MemberKind::Field)
-                            && self.read_names.contains(&bare))));
+                        || (matches!(kind, MemberKind::Field) && self.read_names.contains(&bare))));
             if !spared {
                 let code = if matches!(kind, MemberKind::Field) {
                     SemanticCode::UnusedField
@@ -778,8 +828,7 @@ impl<'a> Engine<'a> {
             }
             let byte = self.byte_of(row.range.offset).min(self.source.len());
             let start = self.source[..byte].rfind('\n').map_or(0, |at| at + 1);
-            let end = self
-                .source[start..]
+            let end = self.source[start..]
                 .find('\n')
                 .map_or(self.source.len(), |at| start + at);
             if self.line_has_trailing_ignore(&self.source[start..end]) {
@@ -1029,8 +1078,13 @@ impl<'a> Engine<'a> {
             let unnamed = site.name == container
                 || self.is_bare_new_head(site.name)
                 || site.name == self.intern("new");
-            if self.factory_redirect_targets.contains(&(container, site.name))
-                || (unnamed && self.factory_redirect_targets.contains(&(container, container)))
+            if self
+                .factory_redirect_targets
+                .contains(&(container, site.name))
+                || (unnamed
+                    && self
+                        .factory_redirect_targets
+                        .contains(&(container, container)))
             {
                 return;
             }
@@ -1342,11 +1396,7 @@ impl<'a> Engine<'a> {
                 if face.name != Some(export_name) {
                     continue;
                 }
-                if face
-                    .members
-                    .keys()
-                    .any(|member| used.contains(member))
-                {
+                if face.members.keys().any(|member| used.contains(member)) {
                     return true;
                 }
             }
@@ -1360,6 +1410,7 @@ impl<'a> Engine<'a> {
             used: std::mem::take(&mut self.used_names),
             reads: std::mem::take(&mut self.read_names),
             annotations: std::mem::take(&mut self.annotation_uses),
+            extension_members: std::mem::take(&mut self.extension_member_used),
             imports: self
                 .imports
                 .drain(..)
@@ -1487,7 +1538,12 @@ impl<'a> Engine<'a> {
 
     /// Pushes one library-level declaration site (the usage cluster's
     /// library-level side) and returns its index.
-    pub(crate) fn note_decl_site(&mut self, name: StringId, range: SourceRange, kind: DeclKind) -> usize {
+    pub(crate) fn note_decl_site(
+        &mut self,
+        name: StringId,
+        range: SourceRange,
+        kind: DeclKind,
+    ) -> usize {
         let pending = self.take_annotations();
         let annotated = !pending.is_empty();
         // The `@UseResult` face (`isUseResult`, element.dart:2014-2019):
@@ -1595,7 +1651,12 @@ impl<'a> Engine<'a> {
     /// Registers a creation fold: the official anchor spans the whole
     /// invocation (`nodeToAnnotate` — the `A()` shape), not just the head
     /// token.
-    pub(crate) fn ur_register_creation(&mut self, offset: u32, span: SourceRange, container: StringId) {
+    pub(crate) fn ur_register_creation(
+        &mut self,
+        offset: u32,
+        span: SourceRange,
+        container: StringId,
+    ) {
         self.ur_spans.insert(offset, span);
         self.ur_creations.push((offset, span, container));
         self.ur_pending.push(offset);
@@ -2075,7 +2136,12 @@ impl<'a> Engine<'a> {
     /// `@mustBeOverridden` lookups against the walk's ancestors). Sites
     /// exist for this file's declarations only — cross-file ancestors
     /// under-report.
-    pub(crate) fn site_annotation(&self, container: StringId, member: StringId, spelling: &str) -> bool {
+    pub(crate) fn site_annotation(
+        &self,
+        container: StringId,
+        member: StringId,
+        spelling: &str,
+    ) -> bool {
         self.decl_sites.iter().any(|site| {
             matches!(site.kind, DeclKind::Member { container: c, .. } if c == container)
                 && site.name == member
@@ -2380,11 +2446,7 @@ mod pins {
                       \x20 int _gone = 0;\n\
                       }\n";
         let gone_at = source.find("_gone").unwrap() as u32;
-        assert_eq!(
-            unused_field_rows(source),
-            vec![(gone_at, 5)],
-            "{source:?}"
-        );
+        assert_eq!(unused_field_rows(source), vec![(gone_at, 5)], "{source:?}");
     }
 
     /// `unused_element` rows with the diagnostic's message text — the
@@ -2621,11 +2683,7 @@ mod pins {
                       }\n\
                       void push2(int x) {}\n";
         let inner_at = source.find("var inner").unwrap() as u32 + 4;
-        assert_eq!(
-            unused_local_rows(source),
-            vec![(inner_at, 5)],
-            "{source:?}"
-        );
+        assert_eq!(unused_local_rows(source), vec![(inner_at, 5)], "{source:?}");
     }
 
     /// #2286-d: a resolving `super.enc` formal supplies the super

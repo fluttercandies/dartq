@@ -3312,9 +3312,28 @@ impl<'a> Engine<'a> {
         // candidate unreferenced — `unused_element` still fires on each).
         if candidates.len() == 1 && !unsafe_match {
             let (face, face_file, _) = candidates[0];
-            self.extension_member_used.insert(member);
-            if accept_setter {
-                self.extension_member_used.insert(setter);
+            // The element key: the face's position in its declaring file's
+            // `extension_faces()` pool (pointer identity IS element identity
+            // within an analysis — the pool is frozen before the walk). A
+            // face the index cannot see credits nothing rather than guessing
+            // a slot.
+            if let Some(face_index) = self
+                .index
+                .get(face_file)
+                .and_then(|elements| {
+                    elements
+                        .extension_faces()
+                        .iter()
+                        .position(|entry| std::ptr::eq(entry, face))
+                })
+                .and_then(|index| u32::try_from(index).ok())
+            {
+                self.extension_member_used
+                    .insert((face_file, face_index, member));
+                if accept_setter {
+                    self.extension_member_used
+                        .insert((face_file, face_index, setter));
+                }
             }
             self.credit_extension_import(face, face_file);
         }
