@@ -7845,6 +7845,168 @@ fn if_null_inside_other_assign_touches_no_var() {
     );
 }
 
+/// Parses `source` with one staged assignment RHS type mounted at the
+/// write-target token's offset (the semantic listener's two-pass form —
+/// scan, stage through [`Flow::stage_assignment_rhs`], then parse) and
+/// returns the taken facts.
+fn analyze_with_staged_rhs(
+    source: &str,
+    target: &str,
+    name: &str,
+    nullable: bool,
+) -> Vec<FlowFact> {
+    let target_offset = source.find(target).unwrap() as u32;
+    let result = dartq_scanner::scan(
+        source,
+        ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        },
+        dartq_source::FileTable::new().intern(std::path::Path::new("test.dart")),
+    );
+    assert!(result.diagnostics.is_empty(), "{source:?}");
+    let tokens: &'static TokenTable = Box::leak(Box::new(result.tokens));
+    let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+        LanguageVersion::new(3, 15),
+    ));
+    let mut flow = SharedFlow(std::rc::Rc::new(std::cell::RefCell::new(Flow::new(
+        tokens, source,
+    ))));
+    {
+        let mut record = flow.0.borrow_mut();
+        let id = record.intern_name(name);
+        record.stage_assignment_rhs(
+            target_offset,
+            crate::ty::Ty {
+                base: crate::ty::Base::Name(id),
+                nullable,
+            },
+        );
+    }
+    let mut parser = dartq_parser::Parser::new(source, tokens, features, &mut flow);
+    parser.parse_unit();
+    drop(parser);
+    flow.0.borrow_mut().take_facts()
+}
+
+/// The promoted-read face at `needle`'s last occurrence, when one stands.
+fn promoted_read_at_last(source: &str, facts: &[FlowFact], needle: &str) -> Option<crate::ty::Ty> {
+    let offset = source.rfind(needle).unwrap() as u32;
+    facts
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::PromotedRead { span, ty, .. } if span.range.offset == offset => Some(*ty),
+            _ => None,
+        })
+        .next()
+}
+
+// —— #2360: the `??=` write's staged-RHS discriminator ——————————————————
+// Oracle-pinned both directions at /tmp/probe2360 (gen.py, 2026-10-21):
+// a resolved nullable RHS reports `unchecked_use_of_nullable_value` at the
+// receiver read after the write; a resolved non-null RHS stays silent (the
+// write promotes); an invalid or dynamic RHS keeps firing (the official
+// assumes no promotion for an invalid written type). The pins assert the
+// flow face the semantic receiver verdict reads: promoted == silent,
+// unpromoted == the unchecked face.
+
+/// #2360 pin ① (`a_nullable_call`): `n ??= fetchNode()` with a resolved
+/// `Node?` call writes `LUB(NonNull(Node), Node?)` = `Node?` (official
+/// `_computeIfNullType`, assignment_expression_resolver.dart:869-906), so
+/// the receiver read after the write stays unpromoted — the nullable face
+/// the semantic verdict emits from. Honest swap-back note: HEAD-green by
+/// construction (the unstaged fold leaves the same unpromoted face); its
+/// force is against the staged join over-promoting through a nullable
+/// written type.
+#[test]
+fn if_null_staged_nullable_call_keeps_the_receiver_unpromoted() {
+    let source = "void f(Node? n) { n ??= fetchNode(); n; }";
+    let facts = analyze_with_staged_rhs(source, "n ??=", "Node", true);
+    assert!(
+        promoted_read_at_last(source, &facts, "n;").is_none(),
+        "{facts:?}"
+    );
+}
+
+/// #2360 pin ② (`b_nullable_getter`): `n ??= b.last` with a resolved
+/// `Node?` getter joins back to nullable — the same unpromoted-receiver
+/// face through a member RHS. HEAD-green by construction (pin ①'s guard).
+#[test]
+fn if_null_staged_nullable_getter_keeps_the_receiver_unpromoted() {
+    let source = "void f(Node? n, Bag b) { n ??= b.last; n; }";
+    let facts = analyze_with_staged_rhs(source, "n ??=", "Node", true);
+    assert!(
+        promoted_read_at_last(source, &facts, "n;").is_none(),
+        "{facts:?}"
+    );
+}
+
+/// #2360 pin ③ (`c_nonnull_ctor`, the silent direction): `n ??= Node()`
+/// with a resolved non-null RHS writes `LUB(NonNull(Node), Node)` =
+/// `Node`, and the write promotes through types-of-interest — the receiver
+/// read after the write carries the promotion, so the downstream member
+/// verdict stays silent (the oracle reports nothing). Honest swap-back
+/// note: HEAD-green by construction — the fold's implicit-creation face
+/// already types an `Ident()` send as the non-null named type (the
+/// `if_null_assignment_through_constructor_promotes` family), and the
+/// staged join lands on the same face; its force is against the staged
+/// consultation disagreeing with that native face.
+#[test]
+fn if_null_staged_non_null_ctor_promotes_the_receiver() {
+    let source = "void f(Node? n) { n ??= Node(); n; }";
+    let facts = analyze_with_staged_rhs(source, "n ??=", "Node", false);
+    let promoted =
+        promoted_read_at_last(source, &facts, "n;").expect("promotion expected: {facts:?}");
+    assert!(!promoted.nullable, "{promoted:?}");
+}
+
+/// #2360 pin ⑥ (the non-null call, the silent direction — `c_nonnull_ctor`'s
+/// call-shaped twin): `n ??= fetchNonNull()` with a resolved non-null
+/// return promotes through the staged face — the fold's own face for a
+/// non-constructor call is the unknown one, which never promotes on its
+/// own. Swap-back-sensitive: at HEAD the `??=` arm ignores the staged face
+/// and the pin goes red.
+#[test]
+fn if_null_staged_non_null_call_promotes_the_receiver() {
+    let source = "void f(Node? n) { n ??= fetchNonNull(); n; }";
+    let facts = analyze_with_staged_rhs(source, "n ??=", "Node", false);
+    let promoted =
+        promoted_read_at_last(source, &facts, "n;").expect("promotion expected: {facts:?}");
+    assert!(!promoted.nullable, "{promoted:?}");
+}
+
+/// #2360 pin ④ (`d_nonnull_getter`, the silent direction through a member
+/// RHS): `n ??= b.solid` with a resolved non-null `Node` getter promotes
+/// the same way. Swap-back-sensitive: red at HEAD, green with the staged
+/// join.
+#[test]
+fn if_null_staged_non_null_getter_promotes_the_receiver() {
+    let source = "void f(Node? n, Bag b) { n ??= b.solid; n; }";
+    let facts = analyze_with_staged_rhs(source, "n ??=", "Node", false);
+    let promoted =
+        promoted_read_at_last(source, &facts, "n;").expect("promotion expected: {facts:?}");
+    assert!(!promoted.nullable, "{promoted:?}");
+}
+
+/// #2360 pin ⑤ (`e_invalid_listlit_first`/`f_undefined_ident`): an RHS the
+/// resolution leaves invalid or dynamic writes the official's InvalidType
+/// face (`LUB(NonNull(T1), InvalidType)` is InvalidType — the supertype
+/// rule over `InvalidType <: X`, subtype.dart:274), and the official
+/// assumes no promotion for an invalid written type
+/// (flow_analysis.dart:4966-4969): the receiver stays unpromoted and the
+/// oracle itself still reports `unchecked_use_of_nullable_value` after it.
+/// No staging arrives for an unspellable RHS, so the fold's unknown face
+/// decides.
+#[test]
+fn if_null_invalid_rhs_keeps_the_receiver_unpromoted() {
+    let source = "void f(Node? n) { n ??= <Und>[].first; n; }";
+    let facts = facts_of(source);
+    assert!(
+        promoted_read_at_last(source, &facts, "n;").is_none(),
+        "{facts:?}"
+    );
+}
+
 /// ③ `case final v?:` on a possibly-null matched value promotes the matched
 /// arm non-null and joins the pre-pattern `current` into the unmatched
 /// chain (official `_handleNullTestPattern(matchesIfNull: false)`:
@@ -8183,3 +8345,4 @@ fn switch_expr_non_null_case_values_bind_no_nullable_face() {
         "non-null join must not carry a nullable face: {rows:?}"
     );
 }
+

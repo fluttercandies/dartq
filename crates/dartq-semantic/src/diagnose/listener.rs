@@ -2969,18 +2969,25 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_assignment_expression(&mut self, operator: Token, end: Token) {
-        // #2174: a plain `=` write's resolved RHS type stages into the flow
-        // layer before the assignment folds there — the name-level flow
+        // #2174/#2360: a spellable write's resolved RHS type stages into the
+        // flow layer before the assignment folds there — the name-level flow
         // walk reads an SDK static's return as unknown (`RangeError
         // .checkValidRange` is invisible to it), and the write would demote
-        // what the target had promoted. Single-row window, EMPTY-args named
-        // shapes only (the flow lattice cannot spell wider shapes; the
+        // what the target had promoted. The spellable writes are the plain
+        // `=` and the `??=` if-null combination (#2360 — the oracle's
+        // downstream verdict on a null-aware write discriminates on the
+        // resolved RHS type alone); the compound operators' read-modify-write
+        // face keeps the unknown written type. Single-row window, EMPTY-args
+        // named shapes only (the flow lattice cannot spell wider shapes; the
         // unknown-written demotion stands). The staging precedes the flow
         // forward: the fold inside the call adopts the staged type.
         let staged = || -> Option<(u32, String, bool)> {
             let engine = &mut self.engine;
             let text = engine.text_of(operator)?;
-            if text != "=" {
+            // The token text is exact: a `??` binary expression is never
+            // this event, and no other assignment spelling contains either
+            // lexeme (`??=` is one token; `?=` does not exist).
+            if text != "=" && text != "??=" {
                 return None;
             }
             let limit = operator.range.offset;
@@ -3027,15 +3034,19 @@ impl ParserListener for DiagnoseListener<'_> {
                 // The inference feed: the write target's name keys the
                 // resolved RHS type, so a `var`-inferred declarator whose
                 // initializer reads that name infers the promoted type (the
-                // oracle's flow-aware inference).
-                engine.staged_write_tys.insert(
-                    engine.rows[target].name,
-                    (
-                        engine.rows[target].range.offset,
-                        engine.frames.len(),
-                        from_ty,
-                    ),
-                );
+                // oracle's flow-aware inference). Plain `=` only: an if-null
+                // assignment's expression type is `LUB(NonNull(T1), T2)`,
+                // not the bare `T2` this feed carries.
+                if text == "=" {
+                    engine.staged_write_tys.insert(
+                        engine.rows[target].name,
+                        (
+                            engine.rows[target].range.offset,
+                            engine.frames.len(),
+                            from_ty,
+                        ),
+                    );
+                }
                 Some((
                     engine.rows[target].range.offset,
                     engine.strings.resolve(name).to_string(),

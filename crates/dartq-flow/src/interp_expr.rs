@@ -909,6 +909,30 @@ impl Interp<'_> {
                 } else {
                     crate::ty::EMPTY_ARGS
                 };
+                // The semantic layer's staged RHS type serves both spellable
+                // writes (the plain `=` write, #2174, and the `??=` if-null
+                // combination, #2360 — the oracle discriminates the null-aware
+                // write's downstream verdict on the resolved RHS type alone).
+                // The staged type is the resolution-level static type of the
+                // RHS; a bare local read's fold type is its flow type — the
+                // read's own promotion included. When the staged face is
+                // exactly the read's declared type while the fold already
+                // narrowed it (`a = b` with `b` promoted by an earlier
+                // `if (b == null) return;`), the promotion is the oracle's
+                // write type: keep it (the official read's static type IS the
+                // promoted one).
+                let staged_ty = if *plain || *if_null {
+                    target.read_span.and_then(|span| {
+                        let staged = *self.staged_rhs.get(&span.range.offset)?;
+                        match rhs.reference.and_then(|var| self.vars.get(var as usize)) {
+                            Some(meta) if staged == meta.ty && rhs.ty != meta.ty => Some(rhs.ty),
+                            _ => Some(staged),
+                        }
+                    })
+                } else {
+                    None
+                };
+                let rhs_ty = staged_ty.unwrap_or(rhs.ty);
                 // A plain assignment's target identifier is the write, not
                 // a read: retract its facts. Both read facts can coexist at
                 // this span — the target read may run under an active
@@ -955,26 +979,7 @@ impl Interp<'_> {
                     // therefore never demotes what the read had
                     // promoted).
                     let (written, written_args) = if *plain {
-                        if let Some(span) = target.read_span
-                            && let Some(&staged) = self.staged_rhs.get(&span.range.offset)
-                        {
-                            // The staged type is the resolution-level static
-                            // type of the RHS; a bare local read's fold type
-                            // is its flow type — the read's own promotion
-                            // included. When the staged face is exactly the
-                            // read's declared type while the fold already
-                            // narrowed it (`a = b` with `b` promoted by an
-                            // earlier `if (b == null) return;`), the
-                            // promotion is the oracle's write type: keep it.
-                            match rhs.reference.and_then(|var| self.vars.get(var as usize)) {
-                                Some(meta) if staged == meta.ty && rhs.ty != meta.ty => {
-                                    (rhs.ty, rhs_args)
-                                }
-                                _ => (staged, rhs_args),
-                            }
-                        } else {
-                            (rhs.ty, rhs_args)
-                        }
+                        (rhs_ty, rhs_args)
                     } else if *if_null {
                         // `LUB(NonNull(readType), rhsType)` — the boundary-
                         // aware non-null form first, then the name-level
@@ -983,10 +988,22 @@ impl Interp<'_> {
                         // An untyped RHS still leaves the lvalue non-null —
                         // `x ??= e` can never widen x back to nullable.
                         // The winning side's written arguments ride beside
-                        // the joined type (#2204 phase D).
+                        // the joined type (#2204 phase D). The staged face
+                        // rides the same join (#2360): a resolved nullable
+                        // RHS (`Node?`) joins back to nullable — the
+                        // receiver read after the write stays unpromoted,
+                        // the oracle's `unchecked_use_of_nullable_value`
+                        // face — and a resolved non-null RHS joins to the
+                        // non-null face the oracle promotes through (the
+                        // official write type is the assignment
+                        // expression's own `nodeType`,
+                        // assignment_expression_resolver.dart:698-701). An
+                        // invalid RHS face (the official's InvalidType)
+                        // assumes no promotion either way
+                        // (flow_analysis.dart:4966-4969).
                         let (lhs_nn, lhs_nn_args) =
                             self.promote_to_non_null(target.ty, target.args);
-                        if rhs.ty == Ty::UNKNOWN || rhs.ty == Ty::UNKNOWN_NULLABLE {
+                        if rhs_ty == Ty::UNKNOWN || rhs_ty == Ty::UNKNOWN_NULLABLE {
                             // An information-less RHS (an SDK static's return
                             // this layer cannot see; a tear-off of a
                             // top-level function the flow walk does not
@@ -997,8 +1014,8 @@ impl Interp<'_> {
                             // (the demotion arm's `covers` recovery, #2320).
                             (Ty::UNKNOWN, crate::ty::EMPTY_ARGS)
                         } else {
-                            let joined = self.name_lub(lhs_nn, rhs.ty);
-                            let joined_args = if joined == rhs.ty {
+                            let joined = self.name_lub(lhs_nn, rhs_ty);
+                            let joined_args = if joined == rhs_ty {
                                 rhs_args
                             } else {
                                 lhs_nn_args
