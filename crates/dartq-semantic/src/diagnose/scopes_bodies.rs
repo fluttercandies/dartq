@@ -14,6 +14,16 @@ use super::*;
 /// [`u16::MAX`]; deeper stacks stay untagged (the flat-frame under-report).
 const PATTERN_ARM_SCOPE_BASE: u32 = u32::MAX - u16::MAX as u32;
 
+/// One parameter slot of a formal table: a positional ordinal or a named
+/// spelling — the pairing the closure-literal inference walks on both sides
+/// (`_inferFormalParameters`'s positional iterators and its
+/// `namedParameterTypes` map).
+#[derive(Clone, Copy)]
+enum SchemaSlot {
+    Positional(usize),
+    Named(StringId),
+}
+
 impl<'a> Engine<'a> {
     /// A local variable declaration (`LocalVariableDeclaration`): the
     /// tracked local of the open frame, and the statement-list duplicate
@@ -854,12 +864,231 @@ impl<'a> Engine<'a> {
     /// Binds a formal or catch parameter's own declared type (one arm per
     /// parameter, not shared with a group). The bound type folds through a
     /// type alias first — the frame's declared types are the resolved
-    /// interface types every verdict reads.
+    /// interface types every verdict reads. An implicitly typed formal of an
+    /// open function literal infers downward from the enclosing invocation's
+    /// context type (`function_expression_resolver.dart`
+    /// `_inferFormalParameters`: the schema's corresponding parameter type
+    /// `K` runs `greatestClosure`; `T <: Null` — an unresolvable head, the
+    /// oracle's `InvalidType` — binds `Object?`, a genuinely nullable schema
+    /// type binds itself, `dynamic` stays `dynamic` and never infers). Only
+    /// a `FunctionType` context supplies any inference; every other slot
+    /// keeps `dynamic` — the suppress-everything face `Ty::UNKNOWN` already
+    /// carries.
     pub(crate) fn bind_parameter_type(&mut self, name: StringId) {
-        let ty = self.armed_ty.take().unwrap_or(Ty::UNKNOWN);
+        let ty = self
+            .armed_ty
+            .take()
+            .or_else(|| self.closure_param_context_ty(name))
+            .unwrap_or(Ty::UNKNOWN);
         let ty = self.fold_alias_ty(ty);
         if let Some(frame) = self.frames.last_mut() {
             frame.var_types.insert(name, ty);
+        }
+    }
+
+    /// The downward-inferred type of an implicitly typed formal inside an
+    /// open function literal's own formal list (`(e) => e.foo()` as an
+    /// argument): the callee's parameter type at the literal's argument
+    /// slot is the context schema; the formal's own schema entry decides
+    /// (the positional pair iterates in declaration order, a named formal
+    /// pairs by spelling). `None` answers the oracle's "no inference" — a
+    /// non-function context, a `dynamic` schema entry, or a callee the
+    /// element tables cannot see all leave the formal `dynamic`
+    /// (`Ty::UNKNOWN`). The schema-type walk itself is the oracle's
+    /// `InvalidType` test inverted: an unresolvable head or type argument
+    /// binds `Object?`, like the unindexed SDK receiver whose first type
+    /// argument is itself unresolvable (`List<Und>.map((e) => …)` — `E`
+    /// *is* that argument).
+    fn closure_param_context_ty(&mut self, name: StringId) -> Option<Ty> {
+        // The literal's own list: the innermost open capture belongs to
+        // this literal's frame and sits inside its own formal list (a
+        // function-typed formal's inner parameters report against their own
+        // depth and skip).
+        let capture = self.closure_caps.last()?;
+        if !capture.list_open
+            || capture.frame_depth != self.frames.len()
+            || capture.list_depth != self.formal_list_depth
+        {
+            return None;
+        }
+        // The formal's schema entry: a positional formal pairs by
+        // declaration order (the formals already bound in this frame ARE
+        // the ordinal — no local can precede a formal), a named one by its
+        // spelling.
+        let formal = if self.fn_formal_named_section {
+            SchemaSlot::Named(name)
+        } else {
+            SchemaSlot::Positional(self.frames.last()?.var_types.len())
+        };
+        // The literal's argument slot in the open invocation: completed
+        // positional arguments before it, or the pending named label.
+        let level = self.arg_levels.last()?;
+        let slot = match level.pending_name {
+            Some(label) => SchemaSlot::Named(label),
+            None => SchemaSlot::Positional(
+                level.args.iter().filter(|(label, ..)| label.is_none()).count(),
+            ),
+        };
+        let callee_row = level.callee_row?;
+        let callee = self.rows.get(callee_row)?;
+        // An unmerged member placeholder (`xs.map(…)`) classifies its
+        // receiver from the row directly below it — the same below-row read
+        // the argument check makes; a bare callee's own receiver is the
+        // top-level face.
+        let recv = if callee.qualified {
+            callee_row
+                .checked_sub(1)
+                .and_then(|below| self.rows.get(below))
+                .map_or(Receiver::Unknown, |below| self.argument_receiver(below))
+        } else {
+            Receiver::Unknown
+        };
+        // The callee's parameter type at the literal's slot is the context
+        // type the literal's own schema came from. The element formals
+        // answer first; a function-typed variable callee's captured
+        // signature closes.
+        let callee_name = callee.name;
+        let slot_ty = match slot {
+            SchemaSlot::Positional(index) => {
+                self.callee_formals(&recv, callee_name)
+                    .and_then(|f| f.positional.get(index).map(|f| f.ty))
+            }
+            SchemaSlot::Named(label) => self
+                .callee_formals(&recv, callee_name)
+                .and_then(|f| f.named_formal(label).map(|f| f.ty)),
+        }
+        .or_else(|| {
+            self.fn_var_sigs
+                .get(&callee_name)
+                .and_then(|sig| match slot {
+                    SchemaSlot::Positional(index) => sig.positional.get(index).copied(),
+                    SchemaSlot::Named(label) => sig
+                        .named
+                        .iter()
+                        .find(|(n, ..)| *n == label)
+                        .map(|(_, ty, _)| *ty),
+                })
+        });
+        // The schema function's own parameter entry: the formal's
+        // `greatestClosure` source. The written signature table answers a
+        // function-typed formal the element model poisoned (rule 0c); the
+        // element slot answers through its alias chain; the unindexed SDK
+        // receiver's own first type argument stands in when the callee's
+        // formal table is out of reach (`List<Und>.map((e) => …)` — `E`
+        // *is* that argument).
+        let written = match slot {
+            SchemaSlot::Positional(index) => self
+                .fn_formal_sigs
+                .get(&callee_name)
+                .and_then(|table| table.positional.get(index)),
+            SchemaSlot::Named(label) => self
+                .fn_formal_sigs
+                .get(&callee_name)
+                .and_then(|table| table.named.get(&label)),
+        };
+        let schema = match written {
+            Some(sig) => Self::schema_entry(sig, formal),
+            None => slot_ty
+                .and_then(|ty| self.closure_schema_sig(ty))
+                .and_then(|sig| Self::schema_entry(&sig, formal))
+                .or_else(|| match recv {
+                    Receiver::Typed { ty, .. } => self.receiver_first_type_arg(ty),
+                    _ => None,
+                }),
+        }?;
+        // `greatestClosure`'s nullable face: `T <: Null` binds `Object?`;
+        // an invalid type argument (`List<Und>`'s `E`) collapses to the
+        // same; a genuinely nullable schema type binds itself; `dynamic`
+        // never infers.
+        match schema {
+            Ty::Dynamic => None,
+            Ty::Unknown => Some(self.object_question()),
+            Ty::Null | Ty::Never => Some(self.object_question()),
+            Ty::Named {
+                name: head,
+                nullable,
+                args,
+            } => {
+                if nullable || !self.named_type_is_type(head) || !self.args_are_types(args) {
+                    Some(self.object_question())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The schema function's parameter entry under `slot` — the type the
+    /// oracle's `greatestClosure` consumes for one closure formal.
+    fn schema_entry(sig: &FnVarSig, slot: SchemaSlot) -> Option<Ty> {
+        match slot {
+            SchemaSlot::Positional(index) => sig.positional.get(index).copied(),
+            SchemaSlot::Named(label) => sig
+                .named
+                .iter()
+                .find(|(name, ..)| *name == label)
+                .map(|(_, ty, _)| *ty),
+        }
+    }
+
+    /// The `Object?` recovery type (`_typeSystem.objectQuestion`).
+    fn object_question(&mut self) -> Ty {
+        Ty::Named {
+            name: self.intern("Object"),
+            nullable: true,
+            args: ArgListId::EMPTY,
+        }
+    }
+
+    /// Every written type argument names a type — the oracle's argument
+    /// walk: one unresolvable head makes the whole written type
+    /// `InvalidType`.
+    fn args_are_types(&self, args: ArgListId) -> bool {
+        self.boundary.pool().get(args).iter().all(|arg| match *arg {
+            Ty::Named {
+                name,
+                nullable: _,
+                args,
+            } => self.named_type_is_type(name) && self.args_are_types(args),
+            _ => true,
+        })
+    }
+
+    /// The full formal table of a callee (an unmerged member placeholder's
+    /// receiver resolves the member face; a bare callee reads the
+    /// top-level declaration).
+    fn callee_formals(&self, recv: &Receiver, name: StringId) -> Option<Formals> {
+        match recv {
+            Receiver::Unknown | Receiver::Prefix { .. } => {
+                self.top_level_decl(name).and_then(|d| d.formals.as_deref().cloned())
+            }
+            _ => self.member_formals_full(recv, name).map(|f| f.into_owned()),
+        }
+    }
+
+    /// The written function shape of a type, aliases unfolded — the
+    /// argument-slot schema the closure-literal inference reads.
+    fn closure_schema_sig(&self, ty: Ty) -> Option<FnVarSig> {
+        match self.fold_alias_ty(ty) {
+            Ty::Function { shape, .. } => {
+                let pool = self.boundary.pool();
+                let shape = pool.function_shape(shape);
+                Some(FnVarSig {
+                    params: Box::default(),
+                    required_positional: u16::try_from(shape.positional.len())
+                        .unwrap_or(u16::MAX),
+                    positional: shape.positional.clone(),
+                    named: shape
+                        .named
+                        .iter()
+                        .map(|(name, ty)| (*name, *ty, false))
+                        .collect(),
+                    return_ty: shape.return_ty,
+                })
+            }
+            Ty::Named { name, .. } => self.alias_fn_sig(name).map(|sig| *sig),
+            _ => None,
         }
     }
 

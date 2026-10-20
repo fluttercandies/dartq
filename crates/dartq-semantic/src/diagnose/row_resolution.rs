@@ -1727,19 +1727,28 @@ impl<'a> Engine<'a> {
                 // a deeper hop the same as the plain member arm below: a
                 // carried member suppresses (its result type is beyond the
                 // name-level model — `check_operator_expr` reads `Unknown`),
-                // a decidable miss reports the getter read, a genuinely
-                // unindexed declaration keeps the under-report.
+                // a decidable miss reports the getter read — or the shared
+                // unchecked-access code on a merely-nullable receiver — and
+                // a genuinely unindexed declaration keeps the under-report.
                 Walk::ChainBroken => {
                     match self.frozen_member_verdict(container, row.name) {
                         FrozenFace::Absent => {
                             let name_text = self.strings.resolve(row.name);
-                            let type_text = self.strings.resolve(container).to_string();
-                            self.emit(
-                                SemanticCode::UndefinedGetter,
-                                row.range,
-                                name_text,
-                                &type_text,
-                            );
+                            if receiver_nullable {
+                                self.emit_corrected(
+                                    SemanticCode::UncheckedUseOfNullableValue,
+                                    row.range,
+                                    name_text,
+                                );
+                            } else {
+                                let type_text = self.strings.resolve(container).to_string();
+                                self.emit(
+                                    SemanticCode::UndefinedGetter,
+                                    row.range,
+                                    name_text,
+                                    &type_text,
+                                );
+                            }
                             self.record_miss(row.name, row.range, true, NameUse::Read);
                         }
                         FrozenFace::Defined | FrozenFace::Unknown => {}
@@ -1748,13 +1757,21 @@ impl<'a> Engine<'a> {
                 }
                 Walk::Missing => {
                     let name_text = self.strings.resolve(row.name);
-                    let type_text = self.strings.resolve(container).to_string();
-                    self.emit(
-                        SemanticCode::UndefinedGetter,
-                        row.range,
-                        name_text,
-                        &type_text,
-                    );
+                    if receiver_nullable {
+                        self.emit_corrected(
+                            SemanticCode::UncheckedUseOfNullableValue,
+                            row.range,
+                            name_text,
+                        );
+                    } else {
+                        let type_text = self.strings.resolve(container).to_string();
+                        self.emit(
+                            SemanticCode::UndefinedGetter,
+                            row.range,
+                            name_text,
+                            &type_text,
+                        );
+                    }
                     self.record_miss(row.name, row.range, true, NameUse::Read);
                     return;
                 }
@@ -1911,7 +1928,7 @@ impl<'a> Engine<'a> {
                         return;
                     }
                 }
-                if receiver_nullable && !matches!(row.intent, Intent::Invoke) {
+                if receiver_nullable {
                     let name_text = self.strings.resolve(row.name);
                     self.emit_corrected(
                         SemanticCode::UncheckedUseOfNullableValue,
@@ -1935,11 +1952,23 @@ impl<'a> Engine<'a> {
                 return;
             }
             // `member_defined` already ran the extension pool and the
-            // `Object`-member/`==` arms — a miss decidable through the
-            // frozen faces reports the access-intent trio like a walkable
-            // clean miss, per face: the read face answers the getter
-            // verdict, the write face the pair.
+            // `Object`-member/`==` arms. A miss through a merely-nullable
+            // receiver is the oracle's unchecked-access row (`type_property_
+            // resolver`'s `isNullable` tail never reaches `undefined_*` —
+            // the shared `unchecked_use_of_nullable_value` code stands for
+            // every variant); a non-nullable miss reports the access-intent
+            // trio like a walkable clean miss, per face: the read face
+            // answers the getter verdict, the write face the pair.
             let name_text = self.strings.resolve(row.name);
+            if receiver_nullable {
+                self.emit_corrected(
+                    SemanticCode::UncheckedUseOfNullableValue,
+                    row.range,
+                    name_text,
+                );
+                self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+                return;
+            }
             let type_text = self.strings.resolve(container).to_string();
             match row.intent {
                 Intent::Invoke => {
@@ -2058,6 +2087,21 @@ impl<'a> Engine<'a> {
             }
         }
         let name_text = self.strings.resolve(row.name);
+        // A decidable miss through a merely-nullable receiver is the
+        // oracle's unchecked-access row — `type_property_resolver`'s
+        // `isNullable` tail reports the shared
+        // `unchecked_use_of_nullable_value` code at the selector and never
+        // reaches the `undefined_*` family, whatever the member face the
+        // model decided the miss on.
+        if receiver_nullable {
+            self.emit_corrected(
+                SemanticCode::UncheckedUseOfNullableValue,
+                row.range,
+                name_text,
+            );
+            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+            return;
+        }
         let type_text = self.strings.resolve(report_on).to_string();
         match row.intent {
             Intent::Invoke => {
@@ -2624,13 +2668,8 @@ impl<'a> Engine<'a> {
             // selector. The oracle's Object-member reads (`s.hashCode`,
             // `s.toString()`, `s == other`) stay silent — the member face
             // answers without a dereference question — so the
-            // `==`/Object arm below keeps its under-report, and an
-            // invocation intent keeps the send face's ownership (the
-            // `member_defined` found-arm's split).
-            if receiver_nullable
-                && !matches!(row.intent, Intent::Invoke)
-                && !self.members.object_members.contains(&row.name)
-            {
+            // `==`/Object arm below keeps its under-report.
+            if receiver_nullable && !self.members.object_members.contains(&row.name) {
                 self.emit_corrected(
                     SemanticCode::UncheckedUseOfNullableValue,
                     row.range,
@@ -2640,6 +2679,19 @@ impl<'a> Engine<'a> {
             return;
         }
         if row.name == self.intern("==") || self.members.object_members.contains(&row.name) {
+            return;
+        }
+        // A table miss through a merely-nullable receiver is the oracle's
+        // unchecked-access row — the `isNullable` tail reports the shared
+        // `unchecked_use_of_nullable_value` code and never reaches the
+        // `undefined_*` family.
+        if receiver_nullable {
+            self.emit_corrected(
+                SemanticCode::UncheckedUseOfNullableValue,
+                row.range,
+                name_text,
+            );
+            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
         }
         let type_text = container_text.to_string();
@@ -2875,7 +2927,7 @@ impl<'a> Engine<'a> {
             // dereferences (the applicability test already accepted the
             // nullable type), and a `?.` access unwrapped the receiver —
             // both stay silent here.
-            if receiver_nullable && !matches!(row.intent, Intent::Invoke) {
+            if receiver_nullable {
                 let name_text = self.strings.resolve(row.name);
                 self.emit_corrected(
                     SemanticCode::UncheckedUseOfNullableValue,

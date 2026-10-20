@@ -10,7 +10,12 @@
 //! shape; the unnamed-extension spelling rides the same face). The #2338
 //! companion: a member selector whose spelling shadows a promoted local
 //! never adopts that local's promotion — the `!` verdict on the selector is
-//! the member's own declared nullability.
+//! the member's own declared nullability. The #2339 companion: the shared
+//! `unchecked_use_of_nullable_value` object face — an implicitly typed
+//! closure formal under an unresolvable context schema binds `Object?` and
+//! reports the unchecked code at member use, while a decidable member miss
+//! through a merely-nullable receiver emits the same code where the
+//! `undefined_*` trio used to fire.
 
 use super::*;
 use crate::collector::collect;
@@ -305,4 +310,218 @@ fn member_nullability_without_shadow_unchanged() {
         "{:?}",
         code_names(&rep)
     );
+}
+
+// —— #2339: the `unchecked_use_of_nullable_value` object face, both halves
+// of the predicate ————————————————————————————————————————————————————
+//
+// The inference half (`function_expression_resolver.dart`
+// `_inferFormalParameters`): an implicitly typed formal of an open
+// function literal infers its schema entry under `greatestClosure`, and a
+// schema entry that is `T <: Null` — the oracle's `InvalidType`, an
+// unresolvable head or type argument — binds `Object?`. A member use
+// inside the literal then reports the shared unchecked code at the
+// selector. Every receiver the oracle's `isDynamicBounded`/
+// `isInvalidBounded` arms bound first stays silent.
+//
+// The emission half (`type_property_resolver.dart`'s `isNullable` tail):
+// a decidable member miss through a merely-nullable receiver reports the
+// shared `unchecked_use_of_nullable_value` code at the selector — the
+// oracle's three variant templates all carry that one code name — and the
+// invoke intent joins the found-arm's nullable-deref gate.
+
+/// `take((s) => s.foo())` where `take`'s formal is `void Function(Und)` —
+/// the written signature table answers the schema (rule 0c poisons the
+/// element model's function-typed slot), `Und` fails `named_type_is_type`,
+/// and `T <: Null` collapses the formal to `Object?`: the member use
+/// inside the literal reports the shared unchecked code.
+#[test]
+fn closure_formal_under_invalid_schema_binds_object_question() {
+    let source = "void take(void Function(Und) f) {} \
+                  void main() { take((s) => s.foo()); }";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// The property-access face of the same collapse: `(s) => s.length`
+/// reports the same shared code at the selector (the oracle's property
+/// variant — one code name for all three shapes).
+#[test]
+fn closure_formal_property_access_reports_the_same_code() {
+    let source = "void take(void Function(Und) f) {} \
+                  void main() { take((s) => s.length); }";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// The aliased written signature answers through the same chain —
+/// `typedef F = void Function(Und)` unfolds at `closure_schema_sig`'s
+/// `alias_fn_sig` arm and still binds `Object?`.
+#[test]
+fn aliased_function_schema_still_collapses() {
+    let source = "typedef F = void Function(Und); \
+                  void take(F f) {} \
+                  void main() { take((s) => s.foo()); }";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// A resolvable schema never reaches `greatestClosure`'s collapse — under
+/// `List<String>` the literal's `e` keeps `dynamic` (no inference), and
+/// `e.length` stays silent exactly like the oracle's `String`-bound read.
+#[test]
+fn valid_context_schema_never_infers() {
+    let source = "class String { int get length => 0; } \
+                  class List<T> {} \
+                  void f(List<String> xs) { xs.map((e) => e.length); }";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// An annotated invalid formal is `InvalidType` itself — the
+/// `isInvalidBounded` arm answers before `isNullable` runs, so `x.foo()`
+/// stays silent. (`Und` still reports its own `undefined_class` face.)
+#[test]
+fn annotated_invalid_formal_stays_silent() {
+    let source = "void f(Und x) { x.foo(); }";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+    assert!(!has_code(&rep, "undefined_getter"), "{:?}", code_names(&rep));
+}
+
+/// A for-in variable over an invalid container binds `InvalidType` — the
+/// same bounded silence holds.
+#[test]
+fn for_in_over_invalid_container_stays_silent() {
+    let source = "class List<T> {} \
+                  void f(List<Und> xs) { for (final x in xs) { x.foo(); } }";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// A local initialized from an unresolved name binds `Unknown` — the
+/// suppress-everything face, never the nullable face.
+#[test]
+fn invalid_initializer_local_stays_silent() {
+    let source = "void f() { var x = Und; x.foo(); }";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// `List<Und>.first`'s declared type is `InvalidType` — the `.foo()` send
+/// on it stays silent.
+#[test]
+fn invalid_first_chain_stays_silent() {
+    let source = "class List<T> { T get first => throw 0; } \
+                  void f(List<Und> xs) { xs.first.foo(); }";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// The `isNullable` tail: a member miss on `Object?` reports the shared
+/// unchecked code at the selector — never `undefined_method` (upstream's
+/// miss path emits the unchecked variant, not the undefined family).
+#[test]
+fn nullable_receiver_miss_reports_unchecked_not_undefined() {
+    let source = "void f(Object? y) { y.runUpdate(1); }";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+    assert!(!has_code(&rep, "undefined_getter"), "{:?}", code_names(&rep));
+}
+
+/// The property face of the same tail (`y.length` on `Object?`) — the
+/// miss reports the shared code, not `undefined_getter`.
+#[test]
+fn nullable_receiver_property_miss_reports_unchecked() {
+    let source = "void f(Object? y) { y.length; }";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(!has_code(&rep, "undefined_getter"), "{:?}", code_names(&rep));
+}
+
+/// A member miss on a declared nullable class (`C? c; c.undef()`) — the
+/// `isNullable` tail again: unchecked, never `undefined_method`.
+#[test]
+fn nullable_class_miss_reports_unchecked() {
+    let source = "class C {} \
+                  void f(C? c) { c.undef(); }";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
+    assert!(!has_code(&rep, "undefined_getter"), "{:?}", code_names(&rep));
+}
+
+/// The invoke intent joins the found-arm gate: `C? c; c.m()` where `m`
+/// resolves on `C` still reads a possibly-null receiver — the oracle's
+/// unchecked row, which the old `!Intent::Invoke` carve-out dropped.
+#[test]
+fn nullable_receiver_invoke_reports_unchecked() {
+    let source = "class C { void m() {} } \
+                  void f(C? c) { c.m(); }";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// The non-nullable boundary: `Object y; y.runUpdate(1)` reports the
+/// `undefined_*` family — the unchecked tail needs a nullable receiver.
+#[test]
+fn non_nullable_miss_keeps_the_undefined_family() {
+    let source = "void f(Object y) { y.runUpdate(1); }";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
 }
