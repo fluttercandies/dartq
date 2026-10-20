@@ -9,9 +9,12 @@
 #      the dependency set (e.g. the plugin packages' `sdk: flutter`), a
 #      hand-written self-referential package_config.json that also exposes
 #      the four vendored zero-dep corpus packages (args/collection/meta/
-#      path) as siblings, plus a minimal pubspec.lock. The mode is recorded
-#      to $OUT/resolution.tsv. Configs that already exist (the legacy
-#      packages' tracked ones, previous runs' materialized ones) are kept.
+#      path) as siblings, plus a minimal pubspec.lock. Every entry carries
+#      `packageUri: lib/` (pub's reader contract — entries without it
+#      anchor `package:` imports at the package root, breaking them).
+#      The mode is recorded to $OUT/resolution.tsv. Existing configs are
+#      kept only when they carry `packageUri`; stale ones (pre-packageUri
+#      fallback configs) are re-materialized.
 #   2. diff — `harness run` per package: oracle `dart analyze` vs
 #      `dartq analyze --format=machine`, all severities judged, divergences
 #      persisted in the standard regression-case-v1 format under
@@ -89,8 +92,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "real-corpus-sweep: DRY RUN — planning only, no process is executed"
   for pkg in "${PACKAGES[@]}"; do
     dir="$CORPUS/$pkg"
-    if [ -f "$dir/.dart_tool/package_config.json" ]; then
+    config="$dir/.dart_tool/package_config.json"
+    if [ -f "$config" ] && grep -q '"packageUri"' "$config"; then
       echo "  [$pkg] resolution: keep existing .dart_tool/package_config.json"
+    elif [ -f "$config" ]; then
+      echo "  [$pkg] resolution: re-materialize (config lacks packageUri): dart pub get --offline, on failure hand-written fallback config (+ minimal pubspec.lock)"
     else
       echo "  [$pkg] resolution: dart pub get --offline, on failure hand-written fallback config (+ minimal pubspec.lock)"
     fi
@@ -134,15 +140,20 @@ printf 'package\tmode\tnote\n' >"$RESOLUTION"
 # harness preflight floor, overridden from the upstream bound like the
 # legacy packages) plus the vendored zero-dep corpus packages as siblings,
 # so their imports resolve offline and the cross-library face is exercised.
+# Every entry pins `packageUri: lib/` — pub always emits it; a config
+# without it resolves `package:` imports to the package root on both sides.
 write_fallback_config() {
-  local pkg="$1" dir="$CORPUS/$pkg"
+  # Two statements: expanding $pkg in the same `local` list only works when
+  # the caller happens to carry a same-named variable (set -u landmine).
+  local pkg="$1"
+  local dir="$CORPUS/$pkg"
   mkdir -p "$dir/.dart_tool"
   printf '{"configVersion": 2, "generator": "pub", "packages": [\n' >"$dir/.dart_tool/package_config.json"
-  printf ' {"name": "%s", "rootUri": "../", "languageVersion": "3.13"}' "$pkg" >>"$dir/.dart_tool/package_config.json"
-  [ -d "$CORPUS/args" ] && printf ',\n {"name": "args", "rootUri": "../../args", "languageVersion": "3.3"}' >>"$dir/.dart_tool/package_config.json"
-  [ -d "$CORPUS/collection" ] && printf ',\n {"name": "collection", "rootUri": "../../collection", "languageVersion": "3.4"}' >>"$dir/.dart_tool/package_config.json"
-  [ -d "$CORPUS/meta" ] && printf ',\n {"name": "meta", "rootUri": "../../meta", "languageVersion": "3.5"}' >>"$dir/.dart_tool/package_config.json"
-  [ -d "$CORPUS/path" ] && printf ',\n {"name": "path", "rootUri": "../../path", "languageVersion": "3.4"}' >>"$dir/.dart_tool/package_config.json"
+  printf ' {"name": "%s", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.13"}' "$pkg" >>"$dir/.dart_tool/package_config.json"
+  [ -d "$CORPUS/args" ] && printf ',\n {"name": "args", "rootUri": "../../args", "packageUri": "lib/", "languageVersion": "3.3"}' >>"$dir/.dart_tool/package_config.json"
+  [ -d "$CORPUS/collection" ] && printf ',\n {"name": "collection", "rootUri": "../../collection", "packageUri": "lib/", "languageVersion": "3.4"}' >>"$dir/.dart_tool/package_config.json"
+  [ -d "$CORPUS/meta" ] && printf ',\n {"name": "meta", "rootUri": "../../meta", "packageUri": "lib/", "languageVersion": "3.5"}' >>"$dir/.dart_tool/package_config.json"
+  [ -d "$CORPUS/path" ] && printf ',\n {"name": "path", "rootUri": "../../path", "packageUri": "lib/", "languageVersion": "3.4"}' >>"$dir/.dart_tool/package_config.json"
   printf ']\n}\n' >>"$dir/.dart_tool/package_config.json"
   printf 'packages: {}\nsdks:\n  dart: ">=3.13.0 <4.0.0"\n' >"$dir/pubspec.lock"
 }
@@ -150,11 +161,18 @@ write_fallback_config() {
 echo "real-corpus-sweep: face 1 — resolution"
 for pkg in "${PACKAGES[@]}"; do
   dir="$CORPUS/$pkg"
-  if [ -f "$dir/.dart_tool/package_config.json" ]; then
+  config="$dir/.dart_tool/package_config.json"
+  if [ -f "$config" ] && grep -q '"packageUri"' "$config"; then
     printf '%s\tkept\tpre-existing config\n' "$pkg" >>"$RESOLUTION"
     continue
   fi
   note="deps unresolvable offline; hand-written fallback (self + vendored zero-dep siblings)"
+  if [ -f "$config" ]; then
+    # A config without `packageUri` (pre-packageUri fallback output) breaks
+    # every `package:` import on both sides — re-materialize, never keep.
+    echo "real-corpus-sweep: [$pkg] config lacks packageUri — re-materializing" >&2
+    note="stale config without packageUri; $note"
+  fi
   if (cd "$dir" && dart pub get --offline >/dev/null 2>"$OUT/$pkg.pubget.err"); then
     printf '%s\tpub-offline\t%s\n' "$pkg" "dart pub get --offline resolved from the local cache" >>"$RESOLUTION"
   elif write_fallback_config "$pkg"; then

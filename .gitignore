@@ -10,6 +10,11 @@
 # hand-materialized resolution artifacts are load-bearing and tracked
 # (same principle as the plugin-validation package configs below)
 tests/corpus/*/.dart_tool/*
+# real-corpus sweep materialization (scripts/real-corpus-sweep.sh): one
+# .dart_tool per package under tests/corpus/real/, regenerated per run —
+# pub-get configs carry machine-specific absolute cache paths
+tests/corpus/real/*/.dart_tool/
+tests/corpus/real/*/pubspec.lock
 !tests/corpus/lints-new/.dart_tool/package_config.json
 !tests/corpus/nested-versions/.dart_tool/package_config.json
 !tests/corpus/nested-versions/.dart_tool/pub/
