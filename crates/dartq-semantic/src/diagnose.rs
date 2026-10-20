@@ -313,7 +313,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 
 use dartq_diagnostics::{
-    CodeInfo, ContextMessage, DARTQ_INTERNAL_ERROR, Diagnostic, Severity, SharedStr,
+    CodeInfo, ContextMessage, DARTQ_INTERNAL_ERROR, Diagnostic, DiagnosticType, Severity, SharedStr,
 };
 use dartq_flow::facts::{NonPromotionReason, PropertyNonPromotability};
 use dartq_flow::ty::{Base as FlowBase, Ty as FlowTy};
@@ -1200,7 +1200,7 @@ pub fn fold_unit_with_ops<'t>(
                         code.correction_message(""),
                     ));
                 }
-                unassigned.stage(span.range);
+                unassigned.stage(span.range, definitely_unassigned);
             }
             // The promoted-property spans (#1409): the offset-keyed rows
             // the staged families re-decide against — boolean rows, the
@@ -1549,7 +1549,7 @@ pub fn fold_unit_with_ops<'t>(
         }
     }
     diagnostics.append(&mut report.diagnostics);
-    apply_ignore_suppression(&mut diagnostics, source);
+    apply_ignore_suppression(&mut diagnostics, source, tokens);
     cap_diagnostics(&mut diagnostics, file);
     report.diagnostics = diagnostics;
     UnitFold {
@@ -1583,102 +1583,123 @@ pub(crate) const MAX_DIAGNOSTICS_PER_FILE: usize = 10_000;
 /// (`IgnoredDiagnosticName._matches`, `ignore_info.dart`:39-52 — the
 /// uniqueName leg resolves through [`canonical_diagnostic_name`]); ERROR
 /// rows never suppress (the official severity gate — only
-/// warnings/hints/lints are ignorable). The comment recognition covers
-/// standalone comment lines only — a line whose first non-whitespace
-/// characters are `//` (trailing comments stay a dartq-lints face); the
-/// under-report direction.
+/// warnings/hints/lints are ignorable). Comments are extracted from the
+/// inter-token gaps (string-safe — a `//` inside a literal lies inside a
+/// token's byte range), and a comment alone on its line suppresses the
+/// NEXT line while a trailing comment suppresses its own
+/// (`IgnoreInfo.forDart`'s line attribution, ignore_info.dart:118-141).
 pub(crate) struct IgnoreSuppression {
-    /// 1-based line -> lowercased names (`ignore:` entries).
-    pub(crate) on_line: FxHashMap<u32, Box<[String]>>,
-    /// Lowercased `ignore_for_file:` names.
-    pub(crate) for_file: Box<[String]>,
+    /// 1-based line -> entries (`ignore:` citations).
+    pub(crate) on_line: FxHashMap<u32, Box<[Entry]>>,
+    /// `ignore_for_file:` entries.
+    pub(crate) for_file: Box<[Entry]>,
 }
 
 impl IgnoreSuppression {
-    /// Parses the suppression table from `source`'s standalone comment
-    /// lines. The element walk follows the official grammar's skeleton
-    /// (`ignoredElements`, ignore_info.dart:292-472): a comma-separated
-    /// list of diagnostic names, terminated by the first character that
-    /// cannot continue one. A standalone ignore comment suppresses its
-    /// immediate next line — a later code/plain comment line consumes the
-    /// pending entry at its own (diagnostic-free) line, never beyond.
-    pub(crate) fn parse(source: &str) -> Self {
-        let mut on_line: FxHashMap<u32, Box<[String]>> = FxHashMap::default();
-        let mut for_file: Vec<String> = Vec::new();
-        let mut line_no: u32 = 0;
-        let mut pending: Option<Vec<String>> = None;
-        for line in source.lines() {
-            line_no += 1;
-            let trimmed = line.trim_start();
-            // `ignore:` tolerates extra leading slashes (`/// ignore:`);
-            // `ignore_for_file:` requires exactly two (ignore_info.dart
-            // :217-289 — the extra-slash loop is commented out upstream for
-            // the for-file form).
-            let entry = trimmed.strip_prefix("//").map(|rest| {
-                let bare = rest.trim_start_matches('/').trim_start();
-                // The for-file form requires exactly two slashes; the
-                // line form tolerates extra ones.
-                if bare.starts_with("ignore_for_file:") && !trimmed.starts_with("///") {
-                    Some((bare.strip_prefix("ignore_for_file:").unwrap_or(""), true))
-                } else {
-                    bare.strip_prefix("ignore:").map(|rest| (rest, false))
+    /// Parses the suppression table from `source`'s `//`-line comments,
+    /// extracted string-safely from the inter-token gaps of `tokens`. The
+    /// comment head follows `isIgnoreComment` / `isIgnoreForFileComment`
+    /// (ignore_info.dart:217-289): after `//`, the line form tolerates
+    /// extra slashes (doc comments) while the for-file form requires
+    /// exactly two, and both skip ASCII spaces only. A comment alone on
+    /// its line suppresses the next line; a trailing comment suppresses
+    /// its own (`IgnoreInfo.forDart`'s beforeMatch gate,
+    /// ignore_info.dart:118-141), so `return x; // ignore: dead_code`
+    /// carries its own suppression.
+    pub(crate) fn parse(source: &str, tokens: &TokenTable) -> Self {
+        let mut on_line: FxHashMap<u32, Vec<Entry>> = FxHashMap::default();
+        let mut for_file: Vec<Entry> = Vec::new();
+        // Comments come out in source order, so one amortized pass tracks
+        // the line cursor and whether the comment stands alone on its
+        // line (only whitespace between the line start and the `//`).
+        let mut cursor = 0usize;
+        let mut line = 1u32;
+        for (start, end) in line_comments_of(source, tokens) {
+            let gap = &source[cursor..start as usize];
+            let mut line_head = 0usize;
+            for (i, b) in gap.bytes().enumerate() {
+                if b == b'\n' {
+                    line += 1;
+                    line_head = i + 1;
                 }
-            });
-            match entry {
-                Some(Some((rest, for_file_form))) => {
-                    let names: Vec<String> = rest
-                        .split(',')
-                        .filter_map(|name| {
-                            let name = name.trim();
-                            // A name is letters/digits/underscore; the
-                            // first character outside that set terminates
-                            // the list (trailing prose is never a name).
-                            let end = name
-                                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                                .unwrap_or(name.len());
-                            (end > 0).then(|| name[..end].to_ascii_lowercase())
-                        })
-                        .collect();
-                    if for_file_form {
-                        for_file.extend(names);
-                    } else {
-                        pending = Some(names);
-                    }
-                }
-                _ => {
-                    if let Some(pending) = pending.take() {
-                        on_line.insert(line_no, pending.into_boxed_slice());
-                    }
-                }
+            }
+            let alone = gap[line_head..].trim().is_empty();
+            cursor = start as usize;
+            let lexeme = &source[start as usize..end as usize];
+            // The two heads (ignore_info.dart:217-289): the for-file form
+            // pins exactly two slashes and skips ASCII spaces only; the
+            // line form tolerates one extra-slash run first (`/// ignore:`).
+            let body = &lexeme[2..];
+            if let Some(rest) = body.trim_start_matches(' ').strip_prefix("ignore_for_file:") {
+                for_file.extend(ignored_elements(rest));
+                continue;
+            }
+            let head = body.trim_start_matches('/').trim_start_matches(' ');
+            if let Some(rest) = head.strip_prefix("ignore:") {
+                let target = if alone { line + 1 } else { line };
+                on_line
+                    .entry(target)
+                    .or_default()
+                    .extend(ignored_elements(rest));
             }
         }
         Self {
-            on_line,
+            on_line: on_line
+                .into_iter()
+                .map(|(line, names)| (line, names.into_boxed_slice()))
+                .collect(),
             for_file: for_file.into_boxed_slice(),
         }
     }
 
-    /// Whether `code` (the diagnostic's lowercased code name) is suppressed
-    /// at `offset` (UTF-16). A citation matches on the diagnostic's `name`
-    /// OR on its `uniqueName` (`IgnoredDiagnosticName._matches`,
-    /// `ignore_info.dart`:39-52): the entries are the comment's lowercased
-    /// spellings, so the second leg canonicalizes each spelling through
-    /// [`canonical_diagnostic_name`] — the name a `uniqueName` citation
-    /// resolves to — before comparing against `code` (a uniqueName
-    /// citation suppresses every diagnostic reported under the shared
-    /// name; the name-level join is the fold's resolution, the variant
-    /// split lives in the upstream constant, not in our `CodeInfo`).
-    pub(crate) fn suppresses(&self, offset: u32, line_of: impl Fn(u32) -> u32, code: &str) -> bool {
-        if self
-            .for_file
-            .iter()
-            .any(|name| citation_matches(name, code))
-        {
+    /// Whether `code` (the diagnostic's lowercased code name) or its
+    /// `dtype` family is suppressed at `offset` (UTF-16). A name citation
+    /// matches on the diagnostic's `name` OR on its `uniqueName`
+    /// (`IgnoredDiagnosticName._matches`, `ignore_info.dart`:39-52): the
+    /// entries are the comment's lowercased spellings, so the second leg
+    /// canonicalizes each spelling through [`canonical_diagnostic_name`]
+    /// (a uniqueName citation suppresses every diagnostic reported under
+    /// the shared name; the name-level join is the fold's resolution, the
+    /// variant split lives in the upstream constant, not in our
+    /// `CodeInfo`). A family citation matches only its own type
+    /// (`IgnoredDiagnosticType._matches`, ignore_info.dart:67-76).
+    pub(crate) fn suppresses(
+        &self,
+        offset: u32,
+        line_of: impl Fn(u32) -> u32,
+        code: &str,
+        dtype: DiagnosticType,
+    ) -> bool {
+        let hit = |entry: &Entry| entry_matches(entry, code, dtype);
+        if self.for_file.iter().any(hit) {
             return true;
         }
         self.on_line
             .get(&line_of(offset))
-            .is_some_and(|names| names.iter().any(|name| citation_matches(name, code)))
+            .is_some_and(|entries| entries.iter().any(hit))
+    }
+}
+
+/// One ignore-comment entry: a diagnostic-name citation or a diagnostic-
+/// family citation — the upstream `IgnoredDiagnosticName` /
+/// `IgnoredDiagnosticType` pair (ignore_info.dart:15-82).
+pub(crate) enum Entry {
+    /// The lowercased citation spelling.
+    Name(String),
+    /// The cited family; only the ignorable types parse into entries
+    /// (`IgnoredDiagnosticType._matches`'s switch — other families never
+    /// match, so their citations register nothing).
+    Type(DiagnosticType),
+}
+
+/// One entry vs a diagnostic: the `_matches` verdict of the upstream
+/// element it came from.
+fn entry_matches(entry: &Entry, code: &str, dtype: DiagnosticType) -> bool {
+    match entry {
+        Entry::Name(name) => {
+            citation_matches(name, code)
+        }
+        Entry::Type(family) => *family == dtype,
     }
 }
 
@@ -1692,6 +1713,159 @@ impl IgnoreSuppression {
 fn citation_matches(entry: &str, code: &str) -> bool {
     entry.eq_ignore_ascii_case(code)
         || canonical_diagnostic_name(entry).is_some_and(|c| c.eq_ignore_ascii_case(code))
+}
+
+/// The `//`-line comments of one unit, in source order — the inter-token
+/// gaps are trivia, so a `//` found there is exactly a comment (the
+/// scanner keeps comments out of the token table; a `//` inside a string
+/// literal lies inside a token's byte range and is never scanned). Block
+/// comments skip depth-counted, so a `//` inside `/* … */` never
+/// qualifies. Spans are byte ranges `[start, end)`, line comments ending
+/// before the line terminator (`\r` included — CRLF bodies keep the
+/// carriage return out of the citation walk).
+fn line_comments_of(source: &str, tokens: &TokenTable) -> Vec<(u32, u32)> {
+    let bytes = source.as_bytes();
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    for token in tokens.as_slice() {
+        let gap_end = (token.byte_offset as usize).min(bytes.len());
+        let mut pos = cursor.min(gap_end);
+        while pos < gap_end {
+            match bytes[pos] {
+                b'/' if bytes.get(pos + 1) == Some(&b'/') => {
+                    let body = &bytes[pos + 2..gap_end];
+                    let end = pos + 2
+                        + body
+                            .iter()
+                            .position(|&b| b == b'\n' || b == b'\r')
+                            .unwrap_or(body.len());
+                    spans.push((pos as u32, end as u32));
+                    pos = end;
+                }
+                b'/' if bytes.get(pos + 1) == Some(&b'*') => {
+                    let mut depth = 1usize;
+                    pos += 2;
+                    while pos < gap_end && depth > 0 {
+                        if bytes[pos] == b'/' && bytes.get(pos + 1) == Some(&b'*') {
+                            depth += 1;
+                            pos += 2;
+                        } else if bytes[pos] == b'*' && bytes.get(pos + 1) == Some(&b'/') {
+                            depth -= 1;
+                            pos += 2;
+                        } else {
+                            pos += 1;
+                        }
+                    }
+                }
+                _ => pos += 1,
+            }
+        }
+        cursor = gap_end + token.byte_len as usize;
+    }
+    spans
+}
+
+/// The entries after an `ignore:`/`ignore_for_file:` head — the upstream
+/// `ignoredElements` walk (ignore_info.dart:292-472): comma-separated
+/// words of letters/digits/underscores, each word complete only when the
+/// list continues correctly (end, space/tab, comma) — trailing prose
+/// (`http://x`, free text) ends the list. `type=hint|lint|warning` cites
+/// a family; a `plugin/name` word cites another plugin's diagnostics,
+/// which never match dartq's rows (the pluginName gate,
+/// ignore_info.dart:40-42), so the walk consumes it without registering.
+fn ignored_elements(rest: &str) -> Vec<Entry> {
+    // Upstream `isSpace` (string.dart:33) — a comment lexeme carries no
+    // line terminators, so the EOL faces never appear here.
+    const fn is_space(b: u8) -> bool {
+        b == b' ' || b == b'\t'
+    }
+    let bytes = rest.as_bytes();
+    let n = bytes.len();
+    let mut entries = Vec::new();
+    let mut o = 0usize;
+    loop {
+        while o < n && is_space(bytes[o]) {
+            o += 1;
+        }
+        if o == n {
+            return entries;
+        }
+        let word_start = o;
+        // A word starts with a letter or underscore and continues with
+        // letters, digits, underscores (upstream `readWord`).
+        if !(bytes[o].is_ascii_alphabetic() || bytes[o] == b'_') {
+            return entries;
+        }
+        o += 1;
+        while o < n && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_') {
+            o += 1;
+        }
+        let word = &rest[word_start..o];
+        if word.eq_ignore_ascii_case("type") {
+            // `type=<family>` (ignore_info.dart:349-397): the `=` is
+            // mandatory, the family word ends like a name.
+            while o < n && is_space(bytes[o]) {
+                o += 1;
+            }
+            if o == n || bytes[o] != b'=' {
+                return entries;
+            }
+            o += 1;
+            while o < n && is_space(bytes[o]) {
+                o += 1;
+            }
+            if o == n || !(bytes[o].is_ascii_alphabetic() || bytes[o] == b'_') {
+                return entries;
+            }
+            let family_start = o;
+            o += 1;
+            while o < n && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_') {
+                o += 1;
+            }
+            if o < n && !is_space(bytes[o]) && bytes[o] != b',' {
+                return entries;
+            }
+            match &rest[family_start..o].to_ascii_lowercase()[..] {
+                "hint" => entries.push(Entry::Type(DiagnosticType::Hint)),
+                "lint" => entries.push(Entry::Type(DiagnosticType::Lint)),
+                "warning" => entries.push(Entry::Type(DiagnosticType::StaticWarning)),
+                _ => {}
+            }
+        } else {
+            if o < n && bytes[o] == b'/' {
+                // `plugin/name` (ignore_info.dart:398-423): the citation
+                // binds to the named plugin's diagnostics only.
+                o += 1;
+                if o == n || !(bytes[o].is_ascii_alphabetic() || bytes[o] == b'_') {
+                    return entries;
+                }
+                o += 1;
+                while o < n && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_') {
+                    o += 1;
+                }
+            }
+            if o < n && !is_space(bytes[o]) && bytes[o] != b',' {
+                return entries;
+            }
+            entries.push(Entry::Name(word.to_ascii_lowercase()));
+        }
+        // The list continues only through a comma (ignore_info.dart
+        // :450-469): whitespace followed by anything else is unstructured
+        // comment text.
+        if o == n {
+            return entries;
+        }
+        while o < n && is_space(bytes[o]) {
+            o += 1;
+        }
+        if o == n || bytes[o] != b',' {
+            return entries;
+        }
+        o += 1;
+        if o == n {
+            return entries;
+        }
+    }
 }
 
 /// The registry `name` a lowercased `uniqueName` citation spelling resolves
@@ -2448,12 +2622,17 @@ const UNIQUE_NAME_ALIASES: &[(&str, &str)] = &[
 ];
 
 /// Applies the ignore-comment face to one file's assembled run: non-ERROR
-/// rows whose code a suppression entry names drop (`_filterIgnoredDiagnostics`
-/// — errors stay, warnings/hints/lints suppress). A table-less file pays one
-/// scan and exits; otherwise a single source walk resolves every row's line
-/// (the run is source-ordered, so the cursor only advances).
-pub(crate) fn apply_ignore_suppression(diagnostics: &mut Vec<Diagnostic>, source: &str) {
-    let face = IgnoreSuppression::parse(source);
+/// rows whose code a suppression entry names — or whose family a `type=`
+/// entry cites — drop (`_filterIgnoredDiagnostics` — errors stay,
+/// warnings/hints/lints suppress). A table-less file pays one scan and
+/// exits; otherwise a single source walk resolves every row's line (the
+/// run is source-ordered, so the cursor only advances).
+pub(crate) fn apply_ignore_suppression(
+    diagnostics: &mut Vec<Diagnostic>,
+    source: &str,
+    tokens: &TokenTable,
+) {
+    let face = IgnoreSuppression::parse(source, tokens);
     if face.on_line.is_empty() && face.for_file.is_empty() {
         return;
     }
@@ -2471,7 +2650,8 @@ pub(crate) fn apply_ignore_suppression(diagnostics: &mut Vec<Diagnostic>, source
     let line_of =
         |offset: u32| -> u32 { line_starts.partition_point(|start| *start <= offset) as u32 };
     diagnostics.retain(|d| {
-        d.severity == Severity::Error || !face.suppresses(d.range.offset, line_of, d.code.name)
+        d.severity == Severity::Error
+            || !face.suppresses(d.range.offset, line_of, d.code.name, d.code.dtype)
     });
 }
 
@@ -2510,10 +2690,13 @@ pub(crate) fn use_kind_of(intent: &Intent) -> NameUse {
 
 #[cfg(test)]
 mod suppression_tests {
-    //! The `IgnoreSuppression` join pins (#2137): the citation match is the
-    //! upstream `IgnoredDiagnosticName._matches` two-leg verdict
+    //! The `IgnoreSuppression` join pins (#2137, #2277): the citation match
+    //! is the upstream `IgnoredDiagnosticName._matches` two-leg verdict
     //! (`ignore_info.dart`:39-52) — a comment name suppresses a diagnostic
-    //! whose `name` OR `uniqueName` it equals.
+    //! whose `name` OR `uniqueName` it equals — beside the line-attribution
+    //! faces (`forDart`'s beforeMatch gate), the string-/block-safety of the
+    //! comment extraction, and the `ignoredElements` grammar (comma-only
+    //! continuation, `type=` families).
 
     use super::*;
 
@@ -2521,7 +2704,16 @@ mod suppression_tests {
     /// targets line 2, the `ignore_for_file:` covers every line. Offsets
     /// are UTF-16 — the corpus is ASCII, so byte offsets serve.
     fn parse_face(source: &str) -> (IgnoreSuppression, impl Fn(u32) -> u32 + '_) {
-        let face = IgnoreSuppression::parse(source);
+        let file = dartq_source::FileTable::new().intern(std::path::Path::new("t.dart"));
+        let scanned = dartq_scanner::scan(
+            source,
+            dartq_scanner::ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        let face = IgnoreSuppression::parse(source, &scanned.tokens);
         let starts: Vec<u32> = std::iter::once(0)
             .chain(source.match_indices('\n').map(|(i, _)| (i + 1) as u32))
             .collect();
@@ -2539,9 +2731,19 @@ mod suppression_tests {
         let (face, line_of) = parse_face(
             "// ignore: invalid_null_aware_operator_after_short_circuit\nvar x = a?.b ?? c;\n",
         );
-        assert!(face.suppresses(59, &line_of, "invalid_null_aware_operator"));
+        assert!(face.suppresses(
+            59,
+            &line_of,
+            "invalid_null_aware_operator",
+            DiagnosticType::StaticWarning
+        ));
         // The same citation never reaches an unrelated code on that line.
-        assert!(!face.suppresses(59, &line_of, "dead_code"));
+        assert!(!face.suppresses(
+            59,
+            &line_of,
+            "dead_code",
+            DiagnosticType::StaticWarning
+        ));
     }
 
     /// `ignore_for_file:` joins the same canonical leg file-wide.
@@ -2551,8 +2753,18 @@ mod suppression_tests {
             parse_face("// ignore_for_file: undefined_super_getter\nclass C {}\nvar x = 0;\n");
         // `undefined_super_getter` is the getter variant's uniqueName; the
         // row reports under `undefined_super_member`.
-        assert!(face.suppresses(43, &line_of, "undefined_super_member"));
-        assert!(face.suppresses(54, &line_of, "undefined_super_member"));
+        assert!(face.suppresses(
+            43,
+            &line_of,
+            "undefined_super_member",
+            DiagnosticType::CompileTimeError
+        ));
+        assert!(face.suppresses(
+            54,
+            &line_of,
+            "undefined_super_member",
+            DiagnosticType::CompileTimeError
+        ));
     }
 
     /// The name leg is unchanged: a `name` spelling still suppresses, a
@@ -2562,16 +2774,95 @@ mod suppression_tests {
     #[test]
     fn name_citation_still_suppresses_and_unknown_spellings_never_do() {
         let (face, line_of) = parse_face("// ignore: dead_code\nvar x = 0;\n");
-        assert!(face.suppresses(21, &line_of, "dead_code"));
-        assert!(face.suppresses(21, &line_of, "DEAD_CODE"));
-        assert!(!face.suppresses(21, &line_of, "unused_local_variable"));
+        assert!(face.suppresses(21, &line_of, "dead_code", DiagnosticType::StaticWarning));
+        assert!(face.suppresses(21, &line_of, "DEAD_CODE", DiagnosticType::StaticWarning));
+        assert!(!face.suppresses(
+            21,
+            &line_of,
+            "unused_local_variable",
+            DiagnosticType::Hint
+        ));
         // A uniqueName of a DIFFERENT code family never crosses.
         let (face, line_of) = parse_face("// ignore: undefined_super_setter\nvar x = 0;\n");
-        assert!(face.suppresses(34, &line_of, "undefined_super_member"));
-        assert!(!face.suppresses(34, &line_of, "undefined_method"));
+        assert!(face.suppresses(
+            34,
+            &line_of,
+            "undefined_super_member",
+            DiagnosticType::CompileTimeError
+        ));
+        assert!(!face.suppresses(
+            34,
+            &line_of,
+            "undefined_method",
+            DiagnosticType::CompileTimeError
+        ));
         // Registry-silent spellings resolve to nothing.
         assert_eq!(canonical_diagnostic_name("not_a_real_code"), None);
         assert_eq!(canonical_diagnostic_name("dead_code"), None);
+    }
+
+    /// The trailing-comment face (`forDart`'s beforeMatch gate,
+    /// ignore_info.dart:126-133): a comment after code suppresses its OWN
+    /// line — the archive bzip2 row's shape — never the next one.
+    #[test]
+    fn trailing_comment_suppresses_its_own_line() {
+        let (face, line_of) = parse_face("var x = 0; // ignore: dead_code\nvar y = 0;\n");
+        assert!(face.suppresses(0, &line_of, "dead_code", DiagnosticType::StaticWarning));
+        assert!(!face.suppresses(32, &line_of, "dead_code", DiagnosticType::StaticWarning));
+    }
+
+    /// String safety: an ignore citation inside a string literal lies in
+    /// the token's byte range, never in an inter-token gap — no entry.
+    #[test]
+    fn ignore_text_inside_a_string_literal_never_suppresses() {
+        let (face, line_of) = parse_face("var s = '// ignore: dead_code';\nvar x = 0;\n");
+        assert!(!face.suppresses(32, &line_of, "dead_code", DiagnosticType::StaticWarning));
+    }
+
+    /// A `//` inside a block comment is block body, not a line comment.
+    #[test]
+    fn ignore_text_inside_a_block_comment_never_suppresses() {
+        let (face, line_of) = parse_face("/* // ignore: dead_code */\nvar x = 0;\n");
+        assert!(!face.suppresses(27, &line_of, "dead_code", DiagnosticType::StaticWarning));
+    }
+
+    /// The list continues only through a comma (`ignoredElements`,
+    /// ignore_info.dart:450-467): whitespace-then-word is unstructured
+    /// prose, so `dead_code unused_local_variable` registers `dead_code`
+    /// alone.
+    #[test]
+    fn prose_after_a_name_never_joins_the_list() {
+        let (face, line_of) =
+            parse_face("// ignore: dead_code unused_local_variable\nvar x = 0;\n");
+        assert!(face.suppresses(43, &line_of, "dead_code", DiagnosticType::StaticWarning));
+        assert!(!face.suppresses(
+            43,
+            &line_of,
+            "unused_local_variable",
+            DiagnosticType::Hint
+        ));
+    }
+
+    /// The `type=` family face (`IgnoredDiagnosticType._matches`):
+    /// `type=warning` hits the STATIC_WARNING rows of the line, `type=lint`
+    /// the lints; hints and non-ignorable families stay.
+    #[test]
+    fn type_family_citations_match_their_family_only() {
+        let (face, line_of) = parse_face("// ignore: type=warning, type=lint\nvar x = 0;\n");
+        assert!(face.suppresses(35, &line_of, "dead_code", DiagnosticType::StaticWarning));
+        assert!(face.suppresses(35, &line_of, "some_lint_rule", DiagnosticType::Lint));
+        assert!(!face.suppresses(
+            35,
+            &line_of,
+            "unused_local_variable",
+            DiagnosticType::Hint
+        ));
+        assert!(!face.suppresses(
+            35,
+            &line_of,
+            "expected_semicolon",
+            DiagnosticType::SyntacticError
+        ));
     }
 
     /// The alias table walks upstream-clean: sorted by the `uniqueName`
