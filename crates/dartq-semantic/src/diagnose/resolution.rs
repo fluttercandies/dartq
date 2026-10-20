@@ -713,6 +713,25 @@ impl<'a> Engine<'a> {
         })
     }
 
+    /// The invocation-expression span of a send's callee row staged at
+    /// `callee`: the receiver's start (a member invocation's `c` of
+    /// `c.m(...)`) through the closing `)`. `None` when the offset recorded
+    /// no completed send — a non-call operand keeps its own span.
+    pub(crate) fn invocation_span(&self, callee: SourceRange) -> Option<SourceRange> {
+        let index = self
+            .call_ends
+            .binary_search_by_key(&callee.offset, |(offset, _)| *offset)
+            .ok()?;
+        let (_, end) = self.call_ends[index];
+        let start = self
+            .property_access_span(callee)
+            .map_or(callee.offset, |span| span.offset);
+        Some(SourceRange {
+            offset: start,
+            length: end.saturating_sub(start),
+        })
+    }
+
     /// The promotable-field verdict on one resolved member entry (the
     /// flags half of [`Engine::promotable_field_substitution`]'s contract).
     /// The language-version grant ANDs in first (the official
@@ -2058,17 +2077,17 @@ impl<'a> Engine<'a> {
     /// each field's type is the last row strictly inside its token span.
     /// An empty field (`(42, ,)`) carries [`Ty::Unknown`] — the recovery's
     /// `InvalidType` splice, the under-report direction. The named fields
-    /// are the trailing [`Self::record_literal_names`] entries of the
-    /// split. A field whose window rows disagree on one known type stays
-    /// undecided (`None`, the literal keeps its opaque value row). The
-    /// stacks pop either way — the literal's own `(` window never leaks
-    /// into the enclosing expression.
+    /// `names` are the trailing [`Self::record_literal_names`] entries of
+    /// the split. A field whose window rows disagree on one known type
+    /// stays undecided (`None`, the literal keeps its opaque value row).
+    /// The stacks pop either way — the literal's own `(` window never
+    /// leaks into the enclosing expression.
     pub(crate) fn record_field_tys(
         &mut self,
         count: usize,
+        names: Vec<StringId>,
     ) -> Option<(usize, Box<[Ty]>, Box<[(StringId, Ty)]>)> {
         let (mark, open) = self.record_marks.pop()?;
-        let names = self.record_literal_names.pop().unwrap_or_default();
         if count == 0 || mark > self.rows.len() {
             return None;
         }

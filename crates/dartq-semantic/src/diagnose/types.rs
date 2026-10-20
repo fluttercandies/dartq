@@ -2502,6 +2502,14 @@ pub(crate) struct Engine<'a> {
     /// the property-promotion substitution and the condition-face's
     /// property-access anchor both key on this record.
     pub(crate) member_reads: Vec<MemberRead>,
+    /// One record per completed send: the callee row's offset through the
+    /// closing `)` (offset-keyed, kept sorted — nested calls complete
+    /// inner-first, so pushes are not monotonic). The assignability emit
+    /// anchors a call-expression operand at the whole invocation span the
+    /// oracle's `FunctionExpressionInvocation`/`MethodInvocation` node
+    /// carries (`int x = f()` reports over `f()`, not `f`); the callee
+    /// row's own range stays name-only for the count faces' callee anchor.
+    pub(crate) call_ends: Vec<(u32, u32)>,
     /// The non-promotion substrate rows (#1877), keyed by the read's offset
     /// (the `WhyNotPromoted` read token, the `NonPromotedPropertyRead`
     /// member token, the `ThisNotPromoted` `this` token): the flow facts'

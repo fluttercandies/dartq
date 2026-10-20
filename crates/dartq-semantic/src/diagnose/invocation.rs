@@ -426,6 +426,12 @@ impl<'a> Engine<'a> {
                     && !self.in_cascade
                 {
                     let member_offset = member.range.offset;
+                    eprintln!(
+                        "P2401 latch member@{member_offset} recv_span@{}..{} popped={:?}",
+                        recv_span.offset,
+                        recv_span.end(),
+                        popped_shape
+                    );
                     if let Err(index) = self
                         .promoted_recv_reads
                         .binary_search_by(|(member, _)| member.cmp(&member_offset))
@@ -3694,23 +3700,60 @@ impl<'a> Engine<'a> {
                         })
                         .flatten()
                 });
-                // A local callee typed by a parameterized function-type
-                // alias (`Predicate<T> test` invoked as `test(item)`): the
-                // captured alias RHS is the signature the oracle's
-                // `resolveArgumentsToParameters` counts against — the
-                // element model never records it (the parameterized-alias
-                // substitution face is unmodeled), so the captured shape
-                // stands in.
-                let sig_formals = sig_formals.or_else(|| {
-                    let RowShape::Bare(BareInfo::Plain {
-                        ty: Ty::Named { name, .. },
-                    }) = &row.shape
-                    else {
-                        return None;
-                    };
-                    self.alias_fn_sig(*name)
-                        .map(|sig| Some((sig.formals(self.intern("")), sig)))
-                });
+                // A local callee typed by a function-type alias (`Predicate<T>
+                // test` / a folded `FailureJoiner joiner` invoked as
+                // `test(item)`): the oracle's `resolveArgumentsToParameters`
+                // counts against the alias's signature. The shadowed-local
+                // path above answers `Some(None)` — the member gate opened,
+                // the written-signature table had no entry — so the empty
+                // inner must flatten before the alias arm can run.
+                let sig_formals = sig_formals
+                    .filter(Option::is_some)
+                    .or_else(|| {
+                        let RowShape::Bare(BareInfo::Plain { ty }) = &row.shape else {
+                            return None;
+                        };
+                        match *ty {
+                            // A foreign alias's declared type already folded
+                            // to the alias's function RHS (`bind_parameter_type`
+                            // rewrites `FailureJoiner joiner` to the raw
+                            // `Ty::Function` — the element model's alias row
+                            // never reaches the callee): the pool shape is the
+                            // signature `resolveArgumentsToParameters` counts
+                            // against. Same shape the assignability face's
+                            // `function_shape_sig` reads.
+                            Ty::Function {
+                                shape,
+                                nullable: false,
+                            } => {
+                                let (return_ty, positional, named) = {
+                                    let pool = self.boundary.pool();
+                                    let shape = pool.function_shape(shape);
+                                    (
+                                        shape.return_ty,
+                                        shape.positional.to_vec(),
+                                        shape.named.to_vec(),
+                                    )
+                                };
+                                let sig = Box::new(FnVarSig {
+                                    params: Box::default(),
+                                    required_positional: u16::try_from(positional.len())
+                                        .unwrap_or(u16::MAX),
+                                    positional: positional.into(),
+                                    named: named
+                                        .iter()
+                                        .map(|(name, ty)| (*name, *ty, false))
+                                        .collect(),
+                                    return_ty,
+                                });
+                                Some(Some((sig.formals(self.intern("")), sig)))
+                            }
+                            Ty::Named { name, .. } => self
+                                .alias_fn_sig(name)
+                                .map(|sig| Some((sig.formals(self.intern("")), sig))),
+                            _ => None,
+                        }
+                    });
                 match (member, sig_formals) {
                     (Some(formals), _) => {
                         // The member's alias signature doubles as the
@@ -4759,14 +4802,28 @@ impl<'a> Engine<'a> {
             self.check_literal_ctor_invocation(callee, &args, span);
         }
         if let Some(row) = self.rows.get(callee) {
+            let callee_offset = row.range.offset;
             // The discarded-value machine: every completed send is a
             // candidate until its context seals it.
-            self.ur_register(row.range.offset);
+            self.ur_register(callee_offset);
             // The F-H displacement latch: the resolved send's member row
             // stays in-stack, so the next `.member` merge can re-anchor on
             // it when the argument window's recovery rows displaced the
             // geometry (single slot — the next send re-arms it).
             self.last_send_callee = Some((callee, end.range.end()));
+            // The invocation span record (callee offset → closing `)`): the
+            // staged-join anchors a call operand's assignability verdict at
+            // the whole invocation expression, the oracle's
+            // `FunctionExpressionInvocation` span — the callee row keeps
+            // its name-only range for the count faces. Nested sends
+            // complete inner-first, so the insert re-sorts rather than
+            // pushes.
+            if let Err(index) = self
+                .call_ends
+                .binary_search_by_key(&callee_offset, |(offset, _)| *offset)
+            {
+                self.call_ends.insert(index, (callee_offset, end.range.end()));
+            }
         } else {
             return None;
         }
