@@ -516,6 +516,58 @@ fn unnecessary_statements_faces() {
     }
 }
 
+/// The classic-`for` header faces (:209-217): the initialization and the
+/// updaters walk separately off the statement window (the parts leaf seals
+/// childless after the whole header), the header condition's wrapper row
+/// stays silent (upstream reads the initialization and the updaters only),
+/// and a non-block body statement still reports.
+#[test]
+fn unnecessary_statements_for_header_faces() {
+    // Both header expressions report, each at its own operand head.
+    let source = "void f(int i, bool b) {\n  for (1 + 2; b; 1 + 2) {\n    i = 1;\n  }\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 2, "{lints:?}");
+    let f = Fixture::parse(source);
+    for (lint, nth) in lints.iter().zip([0, 1]) {
+        let one = tok(source, &f.tokens, "1", nth);
+        assert_eq!(lint.range.start, utf16_at(&f, one), "operand {nth}");
+    }
+
+    // An updater write has a clear effect; the condition stays silent.
+    assert_eq!(
+        run_semantic(
+            "void f(int i) {\n  for (;; i = i + 1) {\n    i = 2;\n  }\n}\n",
+            "unnecessary_statements"
+        )
+        .len(),
+        0
+    );
+    assert_eq!(
+        run_semantic(
+            "void f(int i, bool b) {\n  for (; b; i = 1) {\n    i = 4;\n  }\n}\n",
+            "unnecessary_statements"
+        )
+        .len(),
+        0
+    );
+
+    // A non-effect updater binary reports at its operand head.
+    let source = "void f(int i, bool b) {\n  for (; b; i == 1) {\n    i = 3;\n  }\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    let i = tok(source, &f.tokens, "i", 1);
+    assert_eq!(lints[0].range.start, utf16_at(&f, i));
+
+    // The non-block body statement keeps its face.
+    let source = "void f(int i) {\n  for (;;) 1 + 2;\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    let one = tok(source, &f.tokens, "1", 0);
+    assert_eq!(lints[0].range.start, utf16_at(&f, one));
+}
+
 /// The cascade face: a bare method section is a tear-off and reports;
 /// an invocation section and a getter section stay silent.
 #[test]

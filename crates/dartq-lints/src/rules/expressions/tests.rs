@@ -2513,6 +2513,31 @@ fn unrelated_type_equality_same_file_names_report() {
     assert_eq!(lints[0].range.start, utf16_at(&f, eq));
 }
 
+/// The switch-member body faces: the `case` head row (the pattern and the
+/// guard seal inside it, before the member opens) tiles beside the body
+/// rows in the member window, so the operand run must cut past it — a body
+/// equality reads its left operand whole under guard-less and guarded
+/// heads alike. The guard's own equality keys at the when clause and the
+/// default member carries no head row; both already read clean and stay
+/// unchanged.
+#[test]
+fn unrelated_type_equality_reports_in_case_bodies() {
+    let f = Fixture::parse(
+        "void f(int x, int a, String s, bool b) {\n  switch (x) {\n    case 1:\n      a == s;\n      break;\n    case 2 when b:\n      a == s;\n      break;\n    case 3 when a == s:\n      break;\n    default:\n      a == s;\n      break;\n  }\n}\n",
+    );
+    let lints = f.run(&one_rule("unrelated_type_equality_checks"));
+    assert_eq!(lints.len(), 4, "{lints:?}");
+    // Guard-less body, guarded body, guard, default — in member order.
+    for (nth, lint) in lints.iter().enumerate() {
+        let eq = tok(&f.source, &f.tokens, "==", nth);
+        assert_eq!(lint.range.start, utf16_at(&f, eq), "== {nth}");
+        assert_eq!(
+            lint.message,
+            "The type of the right operand ('String') isn't a subtype or a supertype of the left operand ('int')."
+        );
+    }
+}
+
 /// Assigning a non-null scalar to a `void` (or `FutureOr<void>`)
 /// field reports; `null` is acceptable when expecting void (:57).
 #[test]

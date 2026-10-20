@@ -27,9 +27,13 @@ use crate::rules::{body_members, get_set_token, same_file_declaration, slice, ty
 /// its expression's piece run; the outermost-completing row is the
 /// expression root):
 ///
-/// - the C-style `for` face (:209-217) reads the [`NodeKind::ForParts`]
-///   rows between the separator payload tokens — the initialization run
-///   and each comma-delimited updater walk separately;
+/// - the C-style `for` face (:209-217) reads the statement window's rows
+///   byte-bounded by the [`NodeKind::ForParts`] separator payload tokens —
+///   the initialization run and each comma-delimited updater walk
+///   separately; the header condition's wrapper row (the parser parses the
+///   condition through the statement face) stays silent here and in the
+///   statement face — upstream visits the initialization and the updaters
+///   only;
 /// - the cascade face (:192-198) reads each [`NodeKind::CascadeAccess`]
 ///   section: a bare member-access section reports when the member's
 ///   static type is a function type (:194 — the `..method` tear-off);
@@ -74,6 +78,13 @@ fn check(c: &mut Check<'_>) {
     };
     match c.kind(c.node()) {
         NodeKind::ExpressionStatement => {
+            // The classic-`for` header condition parses through this face
+            // (its wrapper row shares the statement kind); the header reads
+            // belong to the `for` face, the condition to the Boolean-
+            // condition rules.
+            if for_header_condition(c, c.node()) {
+                return;
+            }
             let run = statement_run(c, c.node());
             walk(c, analysis, &run);
         }
@@ -455,13 +466,18 @@ fn enclosing_class(c: &Check<'_>, use_node: u32) -> Option<u32> {
     })
 }
 
-/// The C-style `for` face (:209-217): the initialization expression and
-/// every updater walk separately; a for-in header is not
-/// `ForPartsWithExpression` and passes.
+/// The classic-`for` header face (:209-217): the initialization expression
+/// and every updater walk separately; a for-in header is not
+/// `ForPartsWithExpression` and passes. The parts leaf seals after the
+/// whole header (childless — the fragments tile beside it in the statement
+/// window), so the runs split off the statement window's rows by the
+/// separator payload tokens; the updaters additionally bound at the parts
+/// row's own end to keep the body's rows out.
 fn check_for(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
-    let Some(parts) = c
-        .collect_direct(c.node())
-        .into_iter()
+    let fragments = c.collect_direct(c.node());
+    let Some(parts) = fragments
+        .iter()
+        .copied()
         .find(|&kid| c.kind(kid) == NodeKind::ForParts)
     else {
         return;
@@ -473,7 +489,10 @@ fn check_for(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
     let Some(&right_sep) = payload.get(2) else {
         return;
     };
-    let (Some(left_start), Some(right_end)) = (
+    // The official `rightSeparator` is the token read after the condition
+    // statement — the first updater's head when updaters exist, the `)`
+    // otherwise — so the updater bound is that token's start, not its end.
+    let (Some(left_start), Some(right_start)) = (
         c.unit
             .tokens
             .get(left_sep as usize)
@@ -481,26 +500,59 @@ fn check_for(c: &mut Check<'_>, analysis: &dartq_semantic::Analysis<'_>) {
         c.unit
             .tokens
             .get(right_sep as usize)
-            .map(|t| (t.byte_offset + t.byte_len) as usize),
+            .map(|t| t.byte_offset as usize),
     ) else {
         return;
     };
     // The initialization run: the pieces before the first separator.
-    let init: Vec<u32> = c
-        .collect_direct(parts)
-        .into_iter()
+    let init: Vec<u32> = fragments
+        .iter()
+        .copied()
         .filter(|&row| c.byte_span(row).end <= left_start)
         .collect();
     walk(c, analysis, &init);
     // Each comma-delimited updater walks separately (:212-215).
-    let updater_rows: Vec<u32> = c
-        .collect_direct(parts)
-        .into_iter()
-        .filter(|&row| c.byte_span(row).start >= right_end)
+    let parts_end = c.byte_span(parts).end;
+    let updater_rows: Vec<u32> = fragments
+        .iter()
+        .copied()
+        .filter(|&row| {
+            let span = c.byte_span(row);
+            span.start >= right_start && span.end <= parts_end
+        })
         .collect();
     for run in comma_groups(c, &updater_rows) {
         walk(c, analysis, &run);
     }
+}
+
+/// Whether `stmt` is the classic-`for` header condition's wrapper row: the
+/// header parses the condition through `parseExpressionStatement`, so the
+/// wrapper carries the statement kind and would dispatch like a real
+/// statement. It shares the for statement's window (a non-block body
+/// statement's wrapper does too) and closes at the parts' second separator;
+/// everything past that separator is the body.
+fn for_header_condition(c: &Check<'_>, stmt: u32) -> bool {
+    let Some(parent) = c.unit.ast.parent(stmt) else {
+        return false;
+    };
+    if c.kind(parent) != NodeKind::ForStatement {
+        return false;
+    }
+    let Some(parts) = c
+        .collect_direct(parent)
+        .into_iter()
+        .find(|&kid| c.kind(kid) == NodeKind::ForParts)
+    else {
+        return false;
+    };
+    let Some(&right_sep) = c.payload(parts).get(2) else {
+        return false;
+    };
+    let Some(token) = c.unit.tokens.get(right_sep as usize) else {
+        return false;
+    };
+    c.byte_span(stmt).end <= (token.byte_offset + token.byte_len) as usize
 }
 
 /// The maximal row groups whose spans stay within a comma-delimited

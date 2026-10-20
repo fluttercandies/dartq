@@ -68,17 +68,21 @@ pub(crate) fn statement_run(c: &Check<'_>, run: &[u32]) -> Vec<u32> {
 }
 
 /// The operand run bounded at the parent flow statement's body: under a
-/// non-block body (an `if` arm, a loop body) the header fragment rows (the
-/// condition group, the `ParenthesizedCondition`, the for-parts leaf) tile
-/// beside the body's rows in the owner window with no statement row to cut
-/// at, so the raw run would open at the header. The cut restarts the run
-/// after the last flow-header row; block, initializer, and argument parents
-/// hold none and keep the run intact.
+/// non-block body (an `if` arm, a loop body, a switch-member body) the
+/// header fragment rows (the condition group, the `ParenthesizedCondition`,
+/// the for-parts leaf, the `case` head row) tile beside the body's rows in
+/// the owner window with no statement row to cut at, so the raw run would
+/// open at the header. The cut restarts the run after the last flow-header
+/// row; block, initializer, and argument parents hold none and keep the run
+/// intact.
 fn flow_body_run<'a>(c: &Check<'_>, run: &'a [u32]) -> &'a [u32] {
     let cut = run.iter().rposition(|&row| {
         matches!(
             c.kind(row),
-            NodeKind::ParenthesizedCondition | NodeKind::ForParts | NodeKind::ForInParts
+            NodeKind::ParenthesizedCondition
+                | NodeKind::ForParts
+                | NodeKind::ForInParts
+                | NodeKind::CaseExpression
         )
     });
     match cut {
@@ -112,9 +116,10 @@ fn flow_body_run<'a>(c: &Check<'_>, run: &'a [u32]) -> &'a [u32] {
 /// siblings (argument lists), their subtree roots fall below the adopted
 /// window and would join the left run; a statement-run parent is bounded at
 /// its last statement row ([`statement_run`]), a flow parent (a non-block
-/// `if`/`while`/`for` arm) restarts after the header fragment rows
-/// ([`flow_body_run`]), and an initializer parent owns a single expression,
-/// so the run is exact there.
+/// `if`/`while`/`for` arm, a switch-member body) restarts after the header
+/// fragment rows ([`flow_body_run`]), a `for`/for-in header owner trims the
+/// run to the operator-adjacent tail, and an initializer parent owns a
+/// single expression, so the run is exact there.
 pub(crate) fn binary_operands(c: &Check<'_>) -> Option<(Vec<u32>, Vec<u32>)> {
     binary_operands_at(c, c.node())
 }
@@ -129,15 +134,30 @@ pub(crate) fn binary_operands_at(c: &Check<'_>, node: u32) -> Option<(Vec<u32>, 
     let window = c.children(node);
     let parent = c.unit.ast.parent(node)?;
     let kids = c.collect_direct(parent);
-    let below: Vec<u32> = match kids.iter().position(|&kid| kid == node) {
-        Some(pos) if pos > 0 => statement_run(c, flow_body_run(c, &kids[..pos])),
+    let owner_kids;
+    let raw: &[u32] = match kids.iter().position(|&kid| kid == node) {
+        Some(pos) if pos > 0 => &kids[..pos],
         _ => {
             let grand = c.unit.ast.parent(parent)?;
-            let owner_kids = c.collect_direct(grand);
+            owner_kids = c.collect_direct(grand);
             let container_pos = owner_kids.iter().position(|&kid| kid == parent)?;
-            statement_run(c, &owner_kids[..container_pos])
+            &owner_kids[..container_pos]
         }
     };
+    // A classic-`for`/for-in header owner: the parts leaf seals after the
+    // whole header, so it sorts after the fragments and never cuts the
+    // container's below slice — the fragments (an initializer, a condition)
+    // would join the left run. The run trims to the token-adjacent tail at
+    // the operator instead: the left operand's rows chain back to it, the
+    // fragments sit behind the separating `;`/`in` token. Other owners keep
+    // the standard bounds ([`flow_body_run`] + [`statement_run`]).
+    let bounded = statement_run(c, flow_body_run(c, raw));
+    let below: Vec<u32> =
+        if matches!(c.kind(parent), NodeKind::ForStatement | NodeKind::ForIn) {
+            contiguous_tail(c, &bounded, op_token).to_vec()
+        } else {
+            bounded
+        };
     let mut rows: Vec<u32> = below
         .into_iter()
         .filter(|&kid| kid < window.start)
@@ -729,6 +749,44 @@ pub(crate) mod no_self_assignments {
             assert_eq!(lints.len(), 1, "{lints:?}");
             let write = tok(&f.source, &f.tokens, "a", 2);
             assert_eq!(lints[0].range.start, utf16_at(&f, write));
+        }
+
+        /// The flow-body arms of the header-fragment cut: a self-assignment
+        /// write in a classic-`for` updater — with and without an
+        /// initializer preceding it in the header window (the parts leaf
+        /// sorts after the fragments, so the header owner drops them by
+        /// kind) — reads its operands whole.
+        #[test]
+        fn reports_in_classic_for_updater_writes() {
+            let f = Fixture::parse("void f(int i) {\n  for (;; i = i) {\n    i = 1;\n  }\n}");
+            let lints = f.run(&one_rule("no_self_assignments"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let write = tok(&f.source, &f.tokens, "i", 1);
+            assert_eq!(lints[0].range.start, utf16_at(&f, write));
+
+            let f =
+                Fixture::parse("void f(int i, bool b) {\n  for (i = 0; b; i = i) {\n    i = 2;\n  }\n}");
+            let lints = f.run(&one_rule("no_self_assignments"));
+            assert_eq!(lints.len(), 1, "{lints:?}");
+            let write = tok(&f.source, &f.tokens, "i", 2);
+            assert_eq!(lints[0].range.start, utf16_at(&f, write));
+        }
+
+        /// A switch-member body self-assignment reads whole under a
+        /// guard-less head, a guarded head, and `default`: the `case` head
+        /// row seals before the member opens and [`flow_body_run`] cuts it
+        /// from the operand run; `default` owns no head row.
+        #[test]
+        fn reports_in_case_member_bodies() {
+            let f = Fixture::parse(
+                "void f(int i, bool b) {\n  switch (i) {\n    case 1:\n      i = i;\n      break;\n    case 2 when b:\n      i = i;\n      break;\n    default:\n      i = i;\n      break;\n  }\n}",
+            );
+            let lints = f.run(&one_rule("no_self_assignments"));
+            assert_eq!(lints.len(), 3, "{lints:?}");
+            for (nth, lint) in lints.iter().enumerate() {
+                let write = tok(&f.source, &f.tokens, "i", 2 + nth * 2);
+                assert_eq!(lint.range.start, utf16_at(&f, write), "member {nth}");
+            }
         }
 
         /// `test/rules/no_self_assignments_test.dart` `test_withAssignment`.
