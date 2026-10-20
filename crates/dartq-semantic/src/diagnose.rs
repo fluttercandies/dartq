@@ -3675,3 +3675,13 @@ mod ticket_2419_tests;
 /// it. See the module for the upstream `resolve_container` owner contract.
 #[cfg(test)]
 mod ticket_2417_tests;
+
+/// The #2422 pins: the explicit-keyword unnamed creation (`const C(...)`,
+/// `new C(...)`) stacks its value row so a following member merge resolves
+/// against the class, the type-argumented unqualified invocation
+/// (`Undefined<X>(...)`) codes the method/function invocation face instead
+/// of `undefined_identifier`, and an invalid written type (a head that
+/// resolves to no type) asks no assignability question on the assignment,
+/// declaration-initializer, and return faces.
+#[cfg(test)]
+mod ticket_2422_tests;

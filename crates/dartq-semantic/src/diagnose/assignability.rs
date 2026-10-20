@@ -1175,6 +1175,27 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Whether `ty` is an invalid written type (upstream `InvalidType`):
+    /// a named head that resolves to no type, or a written argument tree
+    /// that carries one — the oracle's named-type walk poisons the whole
+    /// spelling (`named_type_resolver.dart` `_resolveToElement` plus the
+    /// argument recursion). An invalid side asks no assignability question
+    /// (`isAssignableTo` answers true the moment either side is invalid),
+    /// so every assignability face gates before its matrix.
+    fn written_ty_invalid(&self, ty: Ty) -> bool {
+        let Ty::Named { name, args, .. } = ty else {
+            return false;
+        };
+        if !self.named_type_is_type(name) {
+            return true;
+        }
+        self.boundary
+            .pool()
+            .get(args)
+            .iter()
+            .any(|arg| matches!(arg, Ty::Named { .. }) && self.written_ty_invalid(*arg))
+    }
+
     /// The assignment check (`invalid_assignment`,
     /// `assignment_expression_resolver.dart:795`): a single-row right-hand
     /// side whose type the M1 facts know (`Null` or a captured declared
@@ -1237,6 +1258,14 @@ impl<'a> Engine<'a> {
         let literal = Self::primitive_literal(&rhs_row, &self.members.primitive_ids);
         let target_row = self.rows[target].clone();
         let to = self.assignment_target_ty(&target_row);
+        // The invalid-side gate (upstream `InvalidType`): a written type
+        // whose head resolves to no type — the parameter's `AstNode?` over
+        // an undefined class — asks no assignability question (probed
+        // 3.47.1: `expression = parent` with `AstNode? parent` stays
+        // silent). The return check's own host gate shares the rule.
+        if self.written_ty_invalid(from) || self.written_ty_invalid(to) {
+            return;
+        }
         if self.assignable(from, to, literal) == Some(false) {
             if in_initializer {
                 let (from_text, to_text) = (self.ty_display(from), self.ty_display(to));
@@ -1279,6 +1308,14 @@ impl<'a> Engine<'a> {
         // A `?.`-merged initializer reads the short-circuit's nullable
         // result (`int x = a?.b` asks `B?` against `int`).
         let from = self.expression_row_ty(row);
+        // The invalid-side gate: a written head that resolves to no type
+        // poisons the whole spelling (upstream `InvalidType`) — probed
+        // 3.47.1: `int x = astNodeVal` over an undefined-class parameter
+        // stays silent.
+        if self.written_ty_invalid(from) || self.written_ty_invalid(to) {
+            self.init_mark = None;
+            return;
+        }
         if self.assignable(from, to, literal) == Some(false) {
             self.stage(StagedKind::Assignment, row.range, from, to, literal);
         }
@@ -1335,6 +1372,13 @@ impl<'a> Engine<'a> {
         if let Ty::Named { name: head, .. } = to
             && !self.named_type_is_type(head)
         {
+            return;
+        }
+        // The invalid-source twin: a written value type whose head resolves
+        // to no type is `InvalidType` — assignable to everything, so the
+        // return matrix never asks (probed 3.47.1: `return parent;` with
+        // `AstNode? parent` against an `int` host stays silent).
+        if self.written_ty_invalid(from) {
             return;
         }
         // The constructor face closes the nominal blind spot: a factory's

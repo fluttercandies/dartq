@@ -1596,6 +1596,33 @@ impl<'a> Engine<'a> {
         ))
     }
 
+    /// Whether the token ending just before `offset` (trivia skipped)
+    /// spells the `const`/`new` creation keyword: the explicit-keyword
+    /// posture the unnamed creation fold arms on (the keyword's
+    /// constructor-reference event resolves the head as a type use, the
+    /// callee transport drops it, and the value row is the fold's to push).
+    fn keyword_creation_head(&self, offset: u32) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(offset);
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        for keyword in ["const", "new"] {
+            let Some(start) = cursor.checked_sub(keyword.len()) else {
+                continue;
+            };
+            if bytes[start..cursor] != *keyword.as_bytes() {
+                continue;
+            }
+            // Whole word: no identifier character directly before.
+            if start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_')
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The creation argument group's open-paren offset: the first
     /// non-trivia byte at or after the selector's end (whitespace only —
     /// nothing else parses between a selector and its argument list). Every
@@ -1657,6 +1684,33 @@ impl<'a> Engine<'a> {
         // `1(x)`) arm the needs-getter face on the literal's own static
         // type.
         let top = self.callee_index().or_else(|| {
+            // The type-argumented send's head (`f<Missing>(...)`): the
+            // group's UNRESOLVED arguments are the `TypeUse` rows stacked
+            // between the head and the paren (a resolved argument pushes no
+            // row), so the plain top-row read misses the Bare head and the
+            // send links nothing — the callee keeps its read intent and
+            // pass 2 codes the bare-read face where the oracle's invocation
+            // rewrite reports the method/function face (probed:
+            // `Undefined<X>(...)` in an instance body is
+            // `undefined_method` of the enclosing type, at top level
+            // `undefined_function`). Only a live group registration arms
+            // the scan's candidate — `type_argumented` re-checks
+            // `deferred_args` below, so a stray type row above an
+            // unrelated head upgrades nothing.
+            if !matches!(self.rows.last()?.shape, RowShape::TypeUse(..)) {
+                return None;
+            }
+            let mut index = self.rows.len();
+            while index > 0 && matches!(self.rows[index - 1].shape, RowShape::TypeUse(..)) {
+                index -= 1;
+            }
+            let candidate = index.checked_sub(1)?;
+            matches!(
+                self.rows[candidate].shape,
+                RowShape::Bare(_) | RowShape::Member { .. }
+            )
+            .then_some(candidate)
+        }).or_else(|| {
             // Value and keyword-receiver heads arm the same invocation face:
             // the literal-invocation recovery shapes (`null(x)`, `true(x)`,
             // `1(x)`) read the literal's static type, and a bare
@@ -1801,34 +1855,72 @@ impl<'a> Engine<'a> {
         // carries its callee link here, and the reduced parser's event
         // order (the implicit-creation close can precede the argument
         // close) makes a `ctor_pos` read unreliable at this point.
+        //
+        // The explicit-keyword UNNAMED creation (`const C(...)`,
+        // `new C(...)`) shares the no-callee-row posture — the keyword's
+        // constructor-reference event resolves the head as a type use —
+        // but no selector precedes the paren, so the named arm's class
+        // walk never fires and no value row stacks. A following member
+        // merge then pops the stale row an earlier body left and resolves
+        // against it (`const HtmlEscape().convert(text)` reads the
+        // receiver as `String` — probed 3.47.1). The keyword face is the
+        // unnamed arm's discriminator: the head itself names the class,
+        // and the fold mirrors the named arm's drain + value row exactly.
         if self.pending_send.is_none()
             && !enum_const
-            && let Some((_, selector_range)) = bare_head
-            && let Some((class, class_offset)) = self.creation_class_before(selector_range)
-            && matches!(self.type_resolution(class).0, TypeResolution::Type)
+            && let Some((head, head_range)) = bare_head
         {
-            let open = self.creation_open_offset(selector_range.end());
-            let kept = self.rows.partition_point(|row| row.range.offset < open);
-            for row in self.rows.drain(kept..) {
-                self.deferred_miss_rows.push(row);
-            }
-            let range = SourceRange {
-                offset: class_offset,
-                length: close.end().saturating_sub(class_offset),
-            };
-            self.ur_register_creation(class_offset, range, class);
-            self.rows.push(Row {
-                name: class,
-                range,
-                qualified: false,
-                shape: RowShape::Receiver(Receiver::Created {
+            if let Some((class, class_offset)) = self.creation_class_before(head_range)
+                && matches!(self.type_resolution(class).0, TypeResolution::Type)
+            {
+                let open = self.creation_open_offset(head_range.end());
+                let kept = self.rows.partition_point(|row| row.range.offset < open);
+                for row in self.rows.drain(kept..) {
+                    self.deferred_miss_rows.push(row);
+                }
+                let range = SourceRange {
+                    offset: class_offset,
+                    length: close.end().saturating_sub(class_offset),
+                };
+                self.ur_register_creation(class_offset, range, class);
+                self.rows.push(Row {
                     name: class,
-                    kind: ContainerKind::Class,
-                }),
-                intent: Intent::Read,
-                write_op: None,
-                ty: Ty::named(class),
-            });
+                    range,
+                    qualified: false,
+                    shape: RowShape::Receiver(Receiver::Created {
+                        name: class,
+                        kind: ContainerKind::Class,
+                    }),
+                    intent: Intent::Read,
+                    write_op: None,
+                    ty: Ty::named(class),
+                });
+            } else if self.keyword_creation_head(head_range.offset)
+                && matches!(self.type_resolution(head).0, TypeResolution::Type)
+            {
+                let open = self.creation_open_offset(head_range.end());
+                let kept = self.rows.partition_point(|row| row.range.offset < open);
+                for row in self.rows.drain(kept..) {
+                    self.deferred_miss_rows.push(row);
+                }
+                let range = SourceRange {
+                    offset: head_range.offset,
+                    length: close.end().saturating_sub(head_range.offset),
+                };
+                self.ur_register_creation(head_range.offset, range, head);
+                self.rows.push(Row {
+                    name: head,
+                    range,
+                    qualified: false,
+                    shape: RowShape::Receiver(Receiver::Created {
+                        name: head,
+                        kind: ContainerKind::Class,
+                    }),
+                    intent: Intent::Read,
+                    write_op: None,
+                    ty: Ty::named(head),
+                });
+            }
         }
     }
 
