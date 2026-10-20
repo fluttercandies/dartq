@@ -54,6 +54,7 @@ impl Interp<'_> {
                                 crate::ty::EMPTY_ARGS,
                                 false,
                                 Some(token.range),
+                                false,
                             );
                         }
                     }
@@ -380,6 +381,7 @@ impl Interp<'_> {
                         declared_args,
                         false,
                         write_span,
+                        false,
                     );
                 }
                 self.exprs.push(Expr::trivial(Ty::UNKNOWN));
@@ -884,6 +886,7 @@ impl Interp<'_> {
             } => {
                 let base = self.consumer_base(2);
                 let rhs = self.pop_value();
+                let rhs_literal = rhs.literal;
                 let mut target = self.pop_value();
                 // A condition-valued plain `=` RHS (`v = a != null;`) is a
                 // plain value: its split rejoins (see
@@ -1007,7 +1010,22 @@ impl Interp<'_> {
                         // (flow_analysis.dart:4966-4969).
                         let (lhs_nn, lhs_nn_args) =
                             self.promote_to_non_null(target.ty, target.args);
-                        if rhs_ty == Ty::UNKNOWN || rhs_ty == Ty::UNKNOWN_NULLABLE {
+                        // A bare unresolved identifier reads the nullable
+                        // unknown face (the `None` arm of the read
+                        // dispatch): a function tear-off or a name this
+                        // layer carries no row for. On a function-typed
+                        // lvalue the oracle's RHS is the real signature
+                        // type, so `LUB(NonNull(T Function()), f)` is the
+                        // non-null declared form itself — the write leaves
+                        // the lvalue non-null instead of the invalid face
+                        // (#2401: `compare ??= defaultCompare` on
+                        // `int Function()? compare` promotes). Any other
+                        // lvalue keeps the invalid-unknown arm: the RHS
+                        // could be anything, and `LUB(T1, InvalidType)`
+                        // promotes nothing.
+                        if rhs_ty == Ty::UNKNOWN_NULLABLE && lhs_nn.base == Base::Function {
+                            (lhs_nn, lhs_nn_args)
+                        } else if rhs_ty == Ty::UNKNOWN || rhs_ty == Ty::UNKNOWN_NULLABLE {
                             // An information-less RHS (an SDK static's return
                             // this layer cannot see; a tear-off of a
                             // top-level function the flow walk does not
@@ -1051,6 +1069,7 @@ impl Interp<'_> {
                         written_args,
                         *plain || *if_null,
                         write_span,
+                        *plain && rhs_literal,
                     );
                     // The assignment expression carries no promotable
                     // reference: official `_write` hands one back only under
@@ -1086,7 +1105,7 @@ impl Interp<'_> {
                 // demotions carry no reason link and the history drops: the
                 // official's unreasoned-write shape.
                 for var in std::mem::take(&mut self.pending_writes) {
-                    self.write_var(var, rhs.ty, rhs.args, true, None);
+                    self.write_var(var, rhs.ty, rhs.args, true, None, false);
                 }
                 // The assignment ends (official `patternAssignment_end`):
                 // the head pattern's context closes — no alternative clause
@@ -1707,6 +1726,9 @@ impl Interp<'_> {
         } else {
             self.exprs.push(Expr::trivial(Ty::UNKNOWN));
         }
+        if let Some(head) = self.exprs.last_mut() {
+            head.literal = true;
+        }
     }
 
     /// The promoted type of a variable read (chain head or declared). A
@@ -1908,7 +1930,33 @@ impl Interp<'_> {
             self.names,
         );
         let unmatched = if self.ops.is_bottom(factored) {
-            self.current.clone().set_unreachable(&mut self.reach)
+            // The bottom-remainder arm is dead — `response is! T` on a
+            // `response` already proved `T` leaves nothing below. The
+            // official `_finishTypeTest` keeps `promotedTypes` untouched
+            // (typeIfFalse is null, flow_analysis.dart:4160-4163), so the
+            // chain still reads the pre-test promotion. The name-level
+            // deliberate-divergence boundary (#2204 C) wants the dead
+            // remainder's member reads to face the *declared* type — the
+            // receiver row's `read_type_at` override would otherwise
+            // resolve the promoted head's member and silence the miss
+            // (the pin `is_not_promotion_keeps_the_remainder_under_generic_
+            // tested`: `response.data` in the dead else reports
+            // `undefined_getter` on `Object`, not `Response`). Clearing
+            // just this var's `promoted` chain on the dead arm is enough —
+            // `promoted_type_of` falls back to `declared` and the
+            // downstream member walk sees the un-promoted receiver.
+            let mut dead = self.current.clone().set_unreachable(&mut self.reach);
+            let model = dead.model(var);
+            if model.promoted != crate::model::NIL {
+                dead = dead.with_model(
+                    var,
+                    crate::model::VarModel {
+                        promoted: crate::model::NIL,
+                        ..model
+                    },
+                );
+            }
+            dead
         } else {
             // Official `isValidPromotionStep`: the factor output is a
             // subtype of `previous` by construction, so the step is valid

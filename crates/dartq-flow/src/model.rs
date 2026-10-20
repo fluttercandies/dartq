@@ -323,7 +323,7 @@ impl State {
             .unwrap_or_else(VarModel::fresh)
     }
 
-    fn with_model(mut self, var: u32, model: VarModel) -> Self {
+    pub(crate) fn with_model(mut self, var: u32, model: VarModel) -> Self {
         let index = var as usize;
         if index >= self.models.len() {
             self.models.resize(index + 1, VarModel::fresh());
@@ -427,6 +427,7 @@ impl State {
         written: Ty,
         written_args: u32,
         promote_to_interest: bool,
+        literal_rhs: bool,
         write_span: Option<dartq_source::SourceRange>,
         arena: &[Vec<crate::ty::ArgTy>],
         names: &[Box<str>],
@@ -517,6 +518,54 @@ impl State {
                     names,
                     &mut candidates,
                 );
+                // A collection literal's name-level face is the unknown
+                // type, but the written value IS a `List`/`Set`/`Map` —
+                // a proper subtype of any declared non-null form the
+                // oracle compares against the literal's real static type
+                // (`o = <num>[]` on `Object? o` promotes `o` to `Object`,
+                // flow_analysis.dart:4955-5000's written-type gate
+                // answered on `List<num>`). The written-type leg of the
+                // gate is what the unknown face cannot answer; the
+                // step legs below still run over the declared pair.
+                let literal_admit = literal_rhs
+                    && written == Ty::UNKNOWN
+                    && !candidates.iter().any(|&(existing, _)| existing == declared_non_null)
+                    && ops.is_subtype_typed(
+                        declared_non_null,
+                        declared_args,
+                        current,
+                        current_args,
+                        arena,
+                        names,
+                    )
+                    && !ops.is_subtype_typed(
+                        current,
+                        current_args,
+                        declared_non_null,
+                        declared_args,
+                        arena,
+                        names,
+                    );
+                // A function-typed declared head's non-null form is the
+                // exact written type of an `x ??= f` write (the if-null
+                // combination lands on `LUB(NonNull(T Function()), f)` =
+                // `T Function()`), but the resolved seam cannot prove the
+                // signature-less `Function <: Function` face — the bare
+                // base carries no signature rows — so `consider` refuses
+                // it. The identity match is the proof upstream's
+                // `type == writtenType` arm takes
+                // (flow_analysis.dart:4987-4990); the valid-step
+                // question asks nullability alone, the only face the
+                // signature-less head has.
+                let function_admit = declared_non_null == written
+                    && declared_args == written_args
+                    && declared_non_null.base == Base::Function
+                    && current.base == Base::Function
+                    && current.nullable
+                    && !candidates.iter().any(|&(existing, _)| existing == declared_non_null);
+                if literal_admit || function_admit {
+                    candidates.push((declared_non_null, declared_args));
+                }
             }
             for (tested, args) in lists.iter_entries(model.tested) {
                 consider(
@@ -1057,9 +1106,10 @@ fn consider(
     // type (`isValidPromotionStep` — `candidate <: current` and not the
     // reverse), and the candidate must not already be in the running.
     // Every subtype question compares the instantiated spellings.
-    if ops.is_subtype_typed(written, written_args, candidate, args, arena, names)
-        && ops.is_subtype_typed(candidate, args, current, current_args, arena, names)
-        && !ops.is_subtype_typed(current, current_args, candidate, args, arena, names)
+    let a = ops.is_subtype_typed(written, written_args, candidate, args, arena, names);
+    let b = ops.is_subtype_typed(candidate, args, current, current_args, arena, names);
+    let c = ops.is_subtype_typed(current, current_args, candidate, args, arena, names);
+    if a && b && !c
         && !out.iter().any(|&(existing, _)| existing == candidate)
     {
         out.push((candidate, args));

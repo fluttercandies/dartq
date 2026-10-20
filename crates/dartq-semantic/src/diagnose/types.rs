@@ -3464,12 +3464,13 @@ impl PromotionStaging {
 
     /// The promoted type of the read at exactly `range`, when one staged.
     pub(crate) fn promoted(&self, range: SourceRange) -> Option<Ty> {
-        let index = self
-            .rows
+        self.rows
             .binary_search_by(|(r, _)| r.offset.cmp(&range.offset))
-            .ok()?;
-        let (staged, ty) = self.rows[index];
-        (staged == range).then_some(ty)
+            .ok()
+            .and_then(|index| {
+                let (staged, ty) = self.rows[index];
+                (staged == range).then_some(ty)
+            })
     }
 }
 

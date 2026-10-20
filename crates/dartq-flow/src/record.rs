@@ -1528,11 +1528,26 @@ impl ParserListener for Flow<'_> {
     fn end_record_type(
         &mut self,
         _left_paren: Token,
-        _question: Option<Token>,
+        question: Option<Token>,
         _count: usize,
         _has_named_fields: bool,
     ) {
         self.tv_in_record = false;
+        // The record spelling owns no head in this lattice (a record is
+        // neither a named nor a function base), so the type slot it feeds
+        // takes the unknown face — the written `?` still rides it, the way
+        // every unknown face keeps its nullability. Without this row the
+        // slot keeps the LAST FIELD's `Type` row (the fields sink through
+        // the same `Ev::Type` channel as any nested annotation), typing the
+        // declared variable as that field's type: `({String? alias}) r`
+        // typed `r` `String?`, and its member reads then resolved against
+        // `String`. The unknown face also keeps the test/cast sinks
+        // conservative — a record tested type certifies no dead branch.
+        self.record(Ev::Type {
+            base: crate::ty::Base::Unknown,
+            nullable: question.is_some(),
+            args: crate::ty::EMPTY_ARGS,
+        });
     }
 
     fn end_top_level_declaration(&mut self, _end: Token) {

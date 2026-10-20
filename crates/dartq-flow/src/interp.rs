@@ -404,6 +404,12 @@ pub(crate) struct Expr {
     /// the shorts opened by the consumed expression, all the way down its
     /// chain).
     pub chain_base: Option<usize>,
+    /// The value is a collection literal's collapsed head: the type the
+    /// name level answers is the unknown face, but the written value is a
+    /// real `List`/`Set`/`Map` instance — an assignment target's write
+    /// type is a proper subtype of any named declared non-null form, the
+    /// face the promotion's written-type gate admits (#2401).
+    pub literal: bool,
 }
 
 impl Expr {
@@ -420,6 +426,7 @@ impl Expr {
             read_span: None,
             name: None,
             chain_base: None,
+            literal: false,
         }
     }
 
@@ -436,6 +443,7 @@ impl Expr {
             read_span: None,
             name: None,
             chain_base: None,
+            literal: false,
         }
     }
 
@@ -1119,9 +1127,17 @@ impl<'o> Interp<'o> {
         written_args: u32,
         promote_to_interest: bool,
         write_span: Option<SourceRange>,
+        literal_rhs: bool,
     ) {
         self.record_write(var);
-        self.apply_write(var, written, written_args, promote_to_interest, write_span);
+        self.apply_write(
+            var,
+            written,
+            written_args,
+            promote_to_interest,
+            write_span,
+            literal_rhs,
+        );
     }
 
     /// The state half of [`Self::write_var`], without the
@@ -1140,6 +1156,7 @@ impl<'o> Interp<'o> {
         written_args: u32,
         promote_to_interest: bool,
         write_span: Option<SourceRange>,
+        literal_rhs: bool,
     ) {
         // A stale id (a collect rollback can strand effect-set entries and
         // scope bindings past their variable) degrades to the unknown
@@ -1158,6 +1175,7 @@ impl<'o> Interp<'o> {
             written,
             written_args,
             promote_to_interest,
+            literal_rhs,
             write_span,
             self.args,
             self.names,
@@ -2798,7 +2816,7 @@ impl Interp<'_> {
             // state moves without the write-site record.
             // (The searched names declared in this buffer always resolve
             // local — the top-level face never reaches this write.)
-            self.apply_write(var, element_ty.0, element_ty.1, false, None);
+            self.apply_write(var, element_ty.0, element_ty.1, false, None, false);
         }
         let body_start = (i..end).find(|&j| matches!(events[j], Ev::ForInBodyBegin));
         let body = match body_start {

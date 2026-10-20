@@ -93,6 +93,29 @@ impl Interp<'_> {
                     self.if_case_then();
                     return true;
                 }
+                // A `Decl` context still open at this point carrying a
+                // scrutinee is this if's own case clause: every non-clause
+                // owner (pattern variable declaration `PatternVarDeclStmt`,
+                // for-in head `ForInParts`, pattern assignment) seals its
+                // context at its own end event, and a bare `if (cond)`
+                // cannot open one — the condition is a plain expression.
+                // The recorded path's `IfCaseCondition` marker flips the
+                // kind a step early; a replay stream that never forwards
+                // `handle_parenthesized_condition` reaches here with the
+                // kind still `Decl` (#2401: the semantic listener drops
+                // `case_kw`), so the clause face must not hinge on the
+                // marker's arrival. Adopt it the same way — the unmatched
+                // chain carries the fall-through promotion the `case null`
+                // arm wrote there.
+                if self.pattern.as_ref().map(|p| p.kind) == Some(PatternKind::Decl)
+                    && self.pattern.as_ref().and_then(|p| p.scrutinee).is_some()
+                {
+                    if let Some(pattern) = self.pattern.as_mut() {
+                        pattern.kind = PatternKind::IfCase;
+                    }
+                    self.if_case_then();
+                    return true;
+                }
                 // The condition ends: the null-shorting its own `?`
                 // opened rejoins before the branch split (official
                 // `finishNullShorting`).
@@ -889,7 +912,7 @@ impl Interp<'_> {
                 let mut guard_false = None;
                 // The body value is the stack's top (the guard's value sits
                 // below it): its type feeds the block-end arm fold.
-                let mut case_value_ty = None;
+                let case_value_ty;
                 if *has_guard {
                     case_value_ty = self.exprs.pop().map(|e| e.ty);
                     let guard = self.exprs.pop();
@@ -1210,7 +1233,7 @@ impl Interp<'_> {
                     // demotion reason attaches (the official
                     // `declare`/`_initialize` carry no
                     // `nonPromotionReason`, `flow_analysis.dart:4914-4916`).
-                    self.apply_write(var, rhs.ty, rhs.args, true, None);
+                    self.apply_write(var, rhs.ty, rhs.args, true, None, false);
                 }
             }
             Ev::VarDeclEnd => {
