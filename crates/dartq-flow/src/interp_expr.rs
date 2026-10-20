@@ -702,6 +702,22 @@ impl Interp<'_> {
                     expr.test_split = true;
                 } else {
                     let cur = self.current.clone();
+                    // The non-reference guaranteed-fail face (official
+                    // `isExpression_end`'s first arm — upstream Dart SDK
+                    // source, pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+                    // flow_analysis.dart:7184-7189 — folded to
+                    // `booleanLiteral(isNot)`, decided before the reference
+                    // promotion and the guaranteed-succeed arm): a bottom
+                    // tested type (`Never`) or a nullability-disjoint pair
+                    // makes the test a constant `false` — `is` deads the
+                    // then branch, `is!` the else. `current` stays live
+                    // like the succeed face: the deadness rides the branch
+                    // pair, and a value consumer that drops the expression
+                    // never sees it.
+                    if self.is_test_guaranteed_fail(operand.ty, tested) {
+                        let dead = cur.clone().set_unreachable(&mut self.reach);
+                        expr.branches = Some(if is_not { (cur, dead) } else { (dead, cur) });
+                    }
                     // The non-reference guaranteed-succeed face (official
                     // `isExpression_end`'s
                     // `_isTypeCheckGuaranteedToSucceedWithSoundNullSafety`
@@ -715,7 +731,8 @@ impl Interp<'_> {
                     // (the official's `_current` is untouched): the
                     // deadness rides the branch pair, and a value consumer
                     // that drops the expression never sees it.
-                    if self.is_test_guaranteed(operand.ty, operand.args, tested, tested_args) {
+                    else if self.is_test_guaranteed(operand.ty, operand.args, tested, tested_args)
+                    {
                         let dead = cur.clone().set_unreachable(&mut self.reach);
                         expr.branches = Some(if is_not { (dead, cur) } else { (cur, dead) });
                     } else {
@@ -1717,6 +1734,31 @@ impl Interp<'_> {
             self.pending_ty = Some(ty);
             self.pending_ty_args = args;
         }
+    }
+
+    /// Whether a non-reference operand's type test is guaranteed to
+    /// fail (official `isExpression_end`'s first arm — upstream Dart
+    /// SDK source, pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+    /// flow_analysis.dart:7184-7189 — `isBottomType(checkedType)` or
+    /// `_isTypeCheckGuaranteedToFailWithSoundNullSafety`
+    /// (:9133-9140) over `_typesAreDisjointDueToNullability`
+    /// (:9496-9501), folded to `booleanLiteral(isNot)`, decided before
+    /// the guaranteed-succeed arm): a bottom tested type (`Never`) or
+    /// a nullability-disjoint pair — one side `Null`-or-equivalent
+    /// (`Null`, `Never?`), the other non-nullable — makes the test a
+    /// constant `false`. The same refusal trio as
+    /// [`Interp::is_test_guaranteed`] applies: an unknown/dynamic/void
+    /// face on either side is never a dead-branch producer (the
+    /// name-level lattice's optimism must not certify the mark).
+    fn is_test_guaranteed_fail(&self, operand_ty: Ty, tested: Ty) -> bool {
+        if matches!(
+            operand_ty.base,
+            Base::Unknown | Base::Dynamic | Base::Void
+        ) || matches!(tested.base, Base::Unknown | Base::Dynamic | Base::Void)
+        {
+            return false;
+        }
+        self.ops.is_bottom(tested) || self.disjoint_by_nullability(operand_ty, tested)
     }
 
     /// Whether a non-reference operand's type test is guaranteed to

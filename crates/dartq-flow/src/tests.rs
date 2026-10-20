@@ -7966,6 +7966,58 @@ fn is_dynamic_and_unknown_operand_never_guarantee() {
     assert!(dead_snippets(unknown_operand).is_empty());
 }
 
+/// #2356 pin ① (guaranteed-fail, bottom tested type): a bottom tested type
+/// folds the test to a constant `false` (official `isExpression_end`'s
+/// first arm — upstream Dart SDK source, pkg/_fe_analyzer_shared/lib/src/
+/// flow_analysis/flow_analysis.dart:7184-7189 — `booleanLiteral(isNot)`):
+/// `is` deads the then branch, whose body reports the whole-block dead row.
+#[test]
+fn is_never_tested_type_deads_the_then_arm() {
+    let source = "void f(Object? x) { if ((x as int) is Never) { x; } else {} }";
+    assert_eq!(dead_snippets(source), ["{ x; }"]);
+}
+
+/// #2356 pin ② (guaranteed-fail, flipped): `is! Never` folds to `true` —
+/// the then arm stays live and the else arm reports the dead row.
+#[test]
+fn is_bang_never_flips_the_dead_arm() {
+    let source = "void f(Object? x) { if ((x as int) is! Never) {} else { x; } }";
+    assert_eq!(dead_snippets(source), ["{ x; }"]);
+}
+
+/// #2356 pin ③ (guaranteed-fail, nullability-disjoint): one side
+/// `Null`-or-equivalent (`Null`, `Never?`), the other non-nullable —
+/// official `_typesAreDisjointDueToNullability` (upstream Dart SDK source,
+/// pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:9496-9501)
+/// over `classifyType` — folds the test to `false` and deads the then arm,
+/// while a potentially-nullable operand against `Null` is not disjoint and
+/// keeps both arms live.
+#[test]
+fn nullability_disjoint_test_deads_the_then_arm() {
+    let null_operand = "void f(Object? x) { if ((x as Null) is int) { x; } else {} }";
+    assert_eq!(dead_snippets(null_operand), ["{ x; }"]);
+    let null_equivalent_tested =
+        "void f(Object? x) { if ((x as int) is Never?) { x; } else {} }";
+    assert_eq!(dead_snippets(null_equivalent_tested), ["{ x; }"]);
+    let potentially_nullable_operand =
+        "void f(Object? x) { if ((x as int?) is Null) { x; } else { x; } }";
+    assert!(dead_snippets(potentially_nullable_operand).is_empty());
+}
+
+/// #2356 pin ④ (guaranteed-fail boundary): the unknown/dynamic/void faces
+/// refuse the fail guarantee — an unknowable operand face is never
+/// certified as a dead-branch producer even against a bottom tested type
+/// (the name-level lattice's optimism must not dead a branch; a resolved
+/// back-end re-decides through the real hierarchy). This pin binds the new
+/// mark's reach, not a swap-back proof: before the fix no fail-marking
+/// exists, so the empty result holds trivially on HEAD — its force is
+/// against the new helper over-firing.
+#[test]
+fn unknowable_operand_never_guaranteed_fail() {
+    let source = "void f() { if (g() is Never) { h(); } else {} }";
+    assert!(dead_snippets(source).is_empty());
+}
+
 /// #2346③: a switch expression's value carries the LUB join of its case
 /// values (upstream Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart
 /// `SwitchExpressionImpl.staticType`'s arm fold; the name-level join is
