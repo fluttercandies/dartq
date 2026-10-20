@@ -551,3 +551,40 @@
         let names = code_names(&report(source));
         assert!(!names.contains(&"undefined_identifier"), "{names:?}");
     }
+
+    // —— #2275: the extension-receiver InvalidType gate ————————————————
+
+    /// A callee's declared return carrying its OWN type parameters — the
+    /// `A`/`B` inside `seq2`'s `Parser<(A, B)>` — is not an `InvalidType`
+    /// receiver: those spellings are bound at the callee's declaration and
+    /// instantiate at the send, so the extension's `on` face applies.
+    /// Before the fix the name-level read treated them as unresolvable
+    /// heads and refused the application — `undefined_method` on `map2`
+    /// (petitparser `map2`/`map3`/… over `Parser<(T, …)>`).
+    #[test]
+    fn extension_applies_through_callee_type_param_record() {
+        let source = "class Parser<R> {}\n\
+                      extension Ext<T1, T2> on Parser<(T1, T2)> {\n  \
+                        Parser<R> map2<R>(R Function(T1, T2) f) => Parser<R>();\n}\n\
+                      Parser<(A, B)> seq2<A, B>(Parser<A> a, Parser<B> b) => Parser<(A, B)>();\n\
+                      Parser<String> letter() => Parser<String>();\n\
+                      Parser<String> build() {\n  \
+                        return seq2(letter(), letter()).map2((a, b) => a + b);\n}\n";
+        let names = code_names(&report(source));
+        assert!(!names.contains(&"undefined_method"), "{names:?}");
+        assert!(!names.contains(&"undefined_getter"), "{names:?}");
+    }
+
+    /// The resolved head still gates: `Missing x` is the oracle's
+    /// `InvalidType` receiver — the extension's member stays uncredited
+    /// and the access keeps its own miss rows (the head-level
+    /// `type_resolution` verdict is unchanged).
+    #[test]
+    fn extension_invalid_head_still_suppresses() {
+        let source = "extension _E on Missing { int get used => 0; }\n\
+                      void f(Missing x) { x.used; }\n";
+        let names = code_names(&report(source));
+        assert!(names.contains(&"undefined_class"), "{names:?}");
+        assert!(!names.contains(&"undefined_method"), "{names:?}");
+        assert!(!names.contains(&"undefined_getter"), "{names:?}");
+    }

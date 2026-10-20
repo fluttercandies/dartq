@@ -186,6 +186,7 @@ pub(crate) const CORE_TYPE_MEMBERS: [(&str, &[&str]); 13] = [
             "toStringAsPrecision",
             "clamp",
             "compareTo",
+            "remainder",
             "toString",
             "hashCode",
             "runtimeType",
