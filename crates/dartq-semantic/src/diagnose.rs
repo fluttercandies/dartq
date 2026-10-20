@@ -360,8 +360,8 @@ use crate::model::{
     Formal, Formals, MemberEntry, MemberKind, MicroKind, TopDecl, Ty,
 };
 use crate::switch_tracker::{
-    NameCase, NameScope, NameTy, NameWorld, ObjectField, PatternFrame, Restriction, SwitchTracker, case_space,
-    is_always_exhaustive, restriction_is_constant,
+    NameCase, NameScope, NameTy, NameWorld, ObjectField, PatternFrame, Restriction, SwitchTracker,
+    case_space, is_always_exhaustive, restriction_is_constant,
 };
 // The tests construct a `NameWorld` over the engine's interned core chain;
 // the lib build's only consumer is `MemberFace::new`, so this import is
@@ -385,7 +385,6 @@ mod scopes_bodies;
 mod type_capture;
 mod types;
 mod unused_finalization;
-
 
 /// The W7 `non_const_call_to_literal_constructor` producer tests (#749).
 /// Standalone module like the W6 rig: the firing face needs the vendored
@@ -518,6 +517,15 @@ mod ticket_const_family_tests;
 #[cfg(test)]
 mod ticket_2336_tests;
 
+/// The #2340 pins: the InvalidType-scrutinee coverage face over the switch
+/// dead-case rows — the oracle's vacuous-subtype absorption
+/// (subtype.dart:274-276) deads every clause after the first guard-free
+/// resolvable-typed case, while the twin over-report face
+/// (`pattern_never_matches_value_type`/`unreachable_switch_default` on an
+/// unresolved pattern type) stays silent.
+#[cfg(test)]
+mod ticket_2340_tests;
+
 /// The #2337 differential pins: the `super.name` formal's associated-type
 /// face — a positional forward reads the super constructor's parameter at
 /// its own index among the super formals (a field-formal parameter takes
@@ -532,9 +540,8 @@ mod ticket_2336_tests;
 #[cfg(test)]
 mod ticket_2337_tests;
 
-pub use types::{FileReport, NameRow, NameUse, RefTarget, UndefinedGuard, UnitRef};
 pub(crate) use types::*;
-
+pub use types::{FileReport, NameRow, NameUse, RefTarget, UndefinedGuard, UnitRef};
 
 /// Parses an int literal body: decimal or `0x` hex, `_` separators
 /// stripped; `None` when the value exceeds `i64` (an unobservable edge —
@@ -582,10 +589,7 @@ pub(crate) fn subst_tree(tree: &TypeTree, map: &FxHashMap<StringId, TypeTree>) -
     }
     if let Some(f) = &tree.function {
         out.function = Some(crate::capture::FnTree {
-            ret: f
-                .ret
-                .as_ref()
-                .map(|r| Box::new(subst_tree(r, map))),
+            ret: f.ret.as_ref().map(|r| Box::new(subst_tree(r, map))),
             type_params: f.type_params,
             positional: f.positional.iter().map(|p| subst_tree(p, map)).collect(),
             named: f
@@ -678,7 +682,10 @@ impl<'a> DiagnoseListener<'a> {
 
 /// Stably merges two source-ordered diagnostic lists by range offset
 /// (ties keep the base list's rows first).
-pub(crate) fn merge_source_ordered(base: Vec<Diagnostic>, extra: Vec<Diagnostic>) -> Vec<Diagnostic> {
+pub(crate) fn merge_source_ordered(
+    base: Vec<Diagnostic>,
+    extra: Vec<Diagnostic>,
+) -> Vec<Diagnostic> {
     let mut merged = Vec::with_capacity(base.len() + extra.len());
     let mut base = base.into_iter().peekable();
     let mut extra = extra.into_iter().peekable();
@@ -697,7 +704,6 @@ pub(crate) fn merge_source_ordered(base: Vec<Diagnostic>, extra: Vec<Diagnostic>
     }
     merged
 }
-
 
 /// The analyzer language-strictness scalars (`analysis_options.yaml`
 /// `analyzer.language.*`), consumed at the semantic verdict
@@ -1184,8 +1190,7 @@ pub fn fold_unit_with_ops<'t>(
                     .get(span.id as usize)
                     .is_some_and(|t| t.kind == dartq_scanner::TokenKind::QuestionQuestion)
                 {
-                    let dead_null_aware =
-                        SemanticCode::DeadNullAwareExpression.code_info().name;
+                    let dead_null_aware = SemanticCode::DeadNullAwareExpression.code_info().name;
                     if let Some(rhs_end) = engine
                         .report
                         .usage
@@ -1504,8 +1509,7 @@ pub fn fold_unit_with_ops<'t>(
                             // resolved-but-unindexed container (an SDK
                             // class without a const constructor) carries
                             // none and stays silent.
-                            if engine.const_failure_row_at(span.offset) && reported.insert(init)
-                            {
+                            if engine.const_failure_row_at(span.offset) && reported.insert(init) {
                                 engine.stage_usage(
                                     SemanticCode::ConstInitializedWithNonConstantValue,
                                     span,
@@ -1642,6 +1646,25 @@ pub fn fold_unit_with_ops<'t>(
         file,
         lib,
     );
+    // The #2340 InvalidType-scrutinee coverage face runs on the same joined
+    // list: an invalid-posture scrutinee makes the oracle's
+    // `promoteForPattern` absorb the match at the first guard-free
+    // resolvable-typed case (a vacuous subtype, subtype.dart:274-276), so
+    // every following clause keyword and its first body statement reports
+    // `dead_code` — rows dartq's unknown-face flow never produced.
+    let dead_cases = synthesize_invalid_scrutinee_dead_cases(
+        &report.diagnostics,
+        &engine.read_types,
+        tokens,
+        source,
+        strings,
+        graph,
+        namespaces,
+        index,
+        file,
+        lib,
+    );
+    report.diagnostics = merge_source_ordered(report.diagnostics, dead_cases);
     // `duplicate_definition`s lead the report, each pointing at the SECOND
     // declaration's name token (the analyzer's diagnose-at-second rule).
     // Setters live under `name=` in the model; the oracle's message names
@@ -1780,7 +1803,10 @@ impl IgnoreSuppression {
             // pins exactly two slashes and skips ASCII spaces only; the
             // line form tolerates one extra-slash run first (`/// ignore:`).
             let body = &lexeme[2..];
-            if let Some(rest) = body.trim_start_matches(' ').strip_prefix("ignore_for_file:") {
+            if let Some(rest) = body
+                .trim_start_matches(' ')
+                .strip_prefix("ignore_for_file:")
+            {
                 for_file.extend(ignored_elements(rest));
                 continue;
             }
@@ -1846,9 +1872,7 @@ pub(crate) enum Entry {
 /// element it came from.
 fn entry_matches(entry: &Entry, code: &str, dtype: DiagnosticType) -> bool {
     match entry {
-        Entry::Name(name) => {
-            citation_matches(name, code)
-        }
+        Entry::Name(name) => citation_matches(name, code),
         Entry::Type(family) => *family == dtype,
     }
 }
@@ -1887,7 +1911,8 @@ fn scan_line_comment_gaps(
         match bytes[pos] {
             b'/' if bytes.get(pos + 1) == Some(&b'/') => {
                 let body = &bytes[pos + 2..end];
-                let comment_end = pos + 2
+                let comment_end = pos
+                    + 2
                     + body
                         .iter()
                         .position(|&b| b == b'\n' || b == b'\r')
@@ -2844,8 +2869,6 @@ pub(crate) fn cap_diagnostics(diagnostics: &mut Vec<Diagnostic>, file: FileId) {
     ));
 }
 
-
-
 /// The names-table use kind of a row's finalized intent.
 pub(crate) fn use_kind_of(intent: &Intent) -> NameUse {
     match intent {
@@ -3008,6 +3031,279 @@ fn switch_scrutinee_head(offset: u32, tokens: &TokenTable) -> Option<u32> {
     (only.kind == dartq_scanner::TokenKind::Identifier).then_some(only.utf16_offset)
 }
 
+/// Synthesizes the switch dead-case rows the oracle's InvalidType coverage
+/// face owes (#2340).
+///
+/// Upstream `promoteForPattern` (flow_analysis.dart:7708-7768) marks the
+/// matched type covered when the scrutinee's static type is a subtype of
+/// the case's required type, and `InvalidType` is a vacuous subtype of
+/// everything (subtype.dart:274-276) — so the first guard-free case whose
+/// pattern names a resolvable type absorbs the match, the unmatched state
+/// goes unreachable, and every following clause reports `dead_code` at its
+/// keyword and at its first body statement (the dead-code verifier's
+/// `checkUnreachableNode`; probed against `dart analyze`: `case` keyword
+/// rows of length 4, `default` of length 7, one body row per clause, empty
+/// bodies contributing the head row only). dartq's flow records a
+/// broken-chain scrutinee as the unknown face, whose dynamic answer keeps
+/// every case live — the oracle's rows never appear.
+///
+/// The teardown re-decides under the oracle's own posture: a switch whose
+/// scrutinee is a bare identifier, or a `<id>.<id>` select's receiver
+/// identifier, whose latched `Ty::Named` head resolves nowhere through
+/// [`resolve_container`] (namespace-only — the same face the #2336 gate
+/// reads) is that `InvalidType`. The clause walk fails the whole switch
+/// open on every shape the verdict cannot mirror: a `default` or a
+/// constant/wildcard/`p.c`-pattern clause before the absorber, a `when`
+/// guard on it (the guard-false arm joins the unmatched state — probed:
+/// the oracle keeps the later clauses live), a dynamic-shaped scrutinee
+/// head (`var x; switch (x.y)` stays live), a switch expression, or an
+/// unattributable header. A synthesized row never lands on an offset the
+/// flow's own dead face already anchored.
+#[allow(clippy::too_many_arguments)] // the analysis context, one field each
+fn synthesize_invalid_scrutinee_dead_cases(
+    diagnostics: &[Diagnostic],
+    read_types: &[(SourceRange, Ty)],
+    tokens: &TokenTable,
+    source: &str,
+    strings: &StringTable,
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    file: FileId,
+    lib: LibraryId,
+) -> Vec<Diagnostic> {
+    let dead_code = SemanticCode::DeadCode;
+    let dead_name = dead_code.code_info().name;
+    let anchored: FxHashSet<u32> = diagnostics
+        .iter()
+        .filter(|d| d.code.name == dead_name)
+        .map(|d| d.range.offset)
+        .collect();
+    // One resolution per distinct head: a corpus unit carries many rows on
+    // the same broken name.
+    let mut resolvable: FxHashMap<StringId, bool> = FxHashMap::default();
+    let slice = tokens.as_slice();
+    let mut rows: Vec<Diagnostic> = Vec::new();
+    for (i, token) in slice.iter().enumerate() {
+        if token.kind != dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Switch) {
+            continue;
+        }
+        if !slice
+            .get(i + 1)
+            .is_some_and(|t| t.kind == dartq_scanner::TokenKind::OpenParen)
+        {
+            continue;
+        }
+        let Some(close) = tokens.matching_end(i + 1) else {
+            continue;
+        };
+        // The posture head: a bare identifier, or the receiver identifier
+        // of a `<id>.<id>` select — anything else (calls, prefixed chains,
+        // deeper selects) is not decidable at this face.
+        let head = match slice.get(i + 2..close) {
+            Some([only]) if only.kind == dartq_scanner::TokenKind::Identifier => only.utf16_offset,
+            Some([recv, dot, _member])
+                if recv.kind == dartq_scanner::TokenKind::Identifier
+                    && dot.kind == dartq_scanner::TokenKind::Period =>
+            {
+                recv.utf16_offset
+            }
+            _ => continue,
+        };
+        // The latched read row answers the head's as-written type (a dead
+        // read carries no row — fail open with it).
+        let Ok(join) = read_types.binary_search_by_key(&head, |(range, _)| range.offset) else {
+            continue;
+        };
+        let Ty::Named { name, .. } = read_types[join].1 else {
+            continue;
+        };
+        if *resolvable.entry(name).or_insert_with(|| {
+            resolve_container(graph, namespaces, index, lib, file, name).is_some()
+        }) {
+            continue;
+        }
+        if !slice
+            .get(close + 1)
+            .is_some_and(|t| t.kind == dartq_scanner::TokenKind::OpenCurly)
+        {
+            continue;
+        }
+        let Some(body_close) = tokens.matching_end(close + 1) else {
+            continue;
+        };
+        // The body's top-level clauses: `case`/`default` keywords at group
+        // depth 0, each keeping its header colon (the first depth-0 one).
+        let mut depth = 0i32;
+        let mut clauses: Vec<(usize, Option<usize>)> = Vec::new();
+        for j in close + 2..body_close {
+            depth += group_depth_step(slice[j].kind);
+            if depth != 0 {
+                continue;
+            }
+            match slice[j].kind {
+                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Case)
+                | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Default) => {
+                    clauses.push((j, None));
+                }
+                dartq_scanner::TokenKind::Colon => {
+                    if let Some(last) = clauses.last_mut().filter(|(_, colon)| colon.is_none()) {
+                        last.1 = Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // The absorbing case: the first guard-free clause whose pattern
+        // names a resolvable type. Any earlier clause shape the verdict
+        // cannot mirror abandons the switch; an unresolved pattern type
+        // merely does not absorb (the oracle joins it unmatched without a
+        // verdict and the scan continues).
+        let mut absorber: Option<usize> = None;
+        for (idx, &(kw, colon)) in clauses.iter().enumerate() {
+            let Some(colon) = colon else {
+                break;
+            };
+            if slice[kw].kind == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Default)
+            {
+                break;
+            }
+            let mut depth = 0i32;
+            let mut guarded = false;
+            for &t in &slice[kw + 1..colon] {
+                depth += group_depth_step(t.kind);
+                if depth == 0
+                    && t.kind == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::When)
+                {
+                    guarded = true;
+                    break;
+                }
+            }
+            if guarded {
+                break;
+            }
+            // The pattern head: `[final|var] Type (name | _ | ()`. A
+            // constant (`case foo:`), bare wildcard (`case _:`) or
+            // prefixed (`case p.c:`) pattern has no probed verdict here.
+            let mut p = kw + 1;
+            if matches!(
+                slice.get(p).map(|t| t.kind),
+                Some(
+                    dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Final)
+                        | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Var)
+                )
+            ) {
+                p += 1;
+            }
+            let typed = slice
+                .get(p)
+                .is_some_and(|t| t.kind == dartq_scanner::TokenKind::Identifier)
+                && slice.get(p + 1).is_some_and(|t| {
+                    matches!(
+                        t.kind,
+                        dartq_scanner::TokenKind::Identifier | dartq_scanner::TokenKind::OpenParen
+                    )
+                });
+            if !typed {
+                break;
+            }
+            let name = strings.intern(tokens.lexeme(source, p));
+            if *resolvable.entry(name).or_insert_with(|| {
+                resolve_container(graph, namespaces, index, lib, file, name).is_some()
+            }) {
+                absorber = Some(idx);
+                break;
+            }
+        }
+        let Some(absorber) = absorber else {
+            continue;
+        };
+        for (idx, &(kw, colon)) in clauses.iter().enumerate().skip(absorber + 1) {
+            let clause_end = clauses
+                .get(idx + 1)
+                .map_or(body_close, |&(next_kw, _)| next_kw);
+            let kw_token = &slice[kw];
+            if !anchored.contains(&kw_token.utf16_offset) {
+                rows.push(Diagnostic::new(
+                    dead_code.severity(),
+                    dead_code.code_info(),
+                    dead_code.message("", ""),
+                    file,
+                    SourceRange {
+                        offset: kw_token.utf16_offset,
+                        length: kw_token.byte_len,
+                    },
+                    dead_code.correction_message(""),
+                ));
+            }
+            // The first body node: past the header colon, over leading
+            // labels (`l:`) and stray `;`s; an empty body keeps only its
+            // head row.
+            let Some(colon) = colon else {
+                continue;
+            };
+            let mut b = colon + 1;
+            loop {
+                match slice.get(b).map(|t| t.kind) {
+                    Some(dartq_scanner::TokenKind::Identifier)
+                        if slice
+                            .get(b + 1)
+                            .is_some_and(|t| t.kind == dartq_scanner::TokenKind::Colon) =>
+                    {
+                        b += 2;
+                    }
+                    Some(dartq_scanner::TokenKind::Semicolon) => b += 1,
+                    _ => break,
+                }
+            }
+            if b >= clause_end || anchored.contains(&slice[b].utf16_offset) {
+                continue;
+            }
+            // The statement interval: to the depth-0 `;` (the row ends at
+            // its boundary), else to the clause's end.
+            let mut depth = 0i32;
+            let mut end_off = slice[clause_end].utf16_offset;
+            for k in b..clause_end {
+                depth += group_depth_step(slice[k].kind);
+                if depth == 0 && slice[k].kind == dartq_scanner::TokenKind::Semicolon {
+                    // The oracle's dead interval ends at the terminator
+                    // itself (probed: the body row's length covers the
+                    // statement through its `;`).
+                    end_off = slice[k].utf16_offset + slice[k].byte_len;
+                    break;
+                }
+            }
+            rows.push(Diagnostic::new(
+                dead_code.severity(),
+                dead_code.code_info(),
+                dead_code.message("", ""),
+                file,
+                SourceRange {
+                    offset: slice[b].utf16_offset,
+                    length: end_off - slice[b].utf16_offset,
+                },
+                dead_code.correction_message(""),
+            ));
+        }
+    }
+    rows
+}
+
+/// The forward group-depth step: openers descend a level, closers climb
+/// back, every other token is depth-neutral. (An interpolation expression
+/// is one self-contained token — its internal braces are its own.)
+fn group_depth_step(kind: dartq_scanner::TokenKind) -> i32 {
+    match kind {
+        dartq_scanner::TokenKind::OpenCurly
+        | dartq_scanner::TokenKind::OpenParen
+        | dartq_scanner::TokenKind::OpenSquare => 1,
+        dartq_scanner::TokenKind::CloseCurly
+        | dartq_scanner::TokenKind::CloseParen
+        | dartq_scanner::TokenKind::CloseSquare => -1,
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod suppression_tests {
     //! The `IgnoreSuppression` join pins (#2137, #2277): the citation match
@@ -3058,12 +3354,7 @@ mod suppression_tests {
             DiagnosticType::StaticWarning
         ));
         // The same citation never reaches an unrelated code on that line.
-        assert!(!face.suppresses(
-            59,
-            &line_of,
-            "dead_code",
-            DiagnosticType::StaticWarning
-        ));
+        assert!(!face.suppresses(59, &line_of, "dead_code", DiagnosticType::StaticWarning));
     }
 
     /// `ignore_for_file:` joins the same canonical leg file-wide.
@@ -3096,12 +3387,7 @@ mod suppression_tests {
         let (face, line_of) = parse_face("// ignore: dead_code\nvar x = 0;\n");
         assert!(face.suppresses(21, &line_of, "dead_code", DiagnosticType::StaticWarning));
         assert!(face.suppresses(21, &line_of, "DEAD_CODE", DiagnosticType::StaticWarning));
-        assert!(!face.suppresses(
-            21,
-            &line_of,
-            "unused_local_variable",
-            DiagnosticType::Hint
-        ));
+        assert!(!face.suppresses(21, &line_of, "unused_local_variable", DiagnosticType::Hint));
         // A uniqueName of a DIFFERENT code family never crosses.
         let (face, line_of) = parse_face("// ignore: undefined_super_setter\nvar x = 0;\n");
         assert!(face.suppresses(
@@ -3155,12 +3441,7 @@ mod suppression_tests {
         let (face, line_of) =
             parse_face("// ignore: dead_code unused_local_variable\nvar x = 0;\n");
         assert!(face.suppresses(43, &line_of, "dead_code", DiagnosticType::StaticWarning));
-        assert!(!face.suppresses(
-            43,
-            &line_of,
-            "unused_local_variable",
-            DiagnosticType::Hint
-        ));
+        assert!(!face.suppresses(43, &line_of, "unused_local_variable", DiagnosticType::Hint));
     }
 
     /// The `type=` family face (`IgnoredDiagnosticType._matches`):
@@ -3171,12 +3452,7 @@ mod suppression_tests {
         let (face, line_of) = parse_face("// ignore: type=warning, type=lint\nvar x = 0;\n");
         assert!(face.suppresses(35, &line_of, "dead_code", DiagnosticType::StaticWarning));
         assert!(face.suppresses(35, &line_of, "some_lint_rule", DiagnosticType::Lint));
-        assert!(!face.suppresses(
-            35,
-            &line_of,
-            "unused_local_variable",
-            DiagnosticType::Hint
-        ));
+        assert!(!face.suppresses(35, &line_of, "unused_local_variable", DiagnosticType::Hint));
         assert!(!face.suppresses(
             35,
             &line_of,
