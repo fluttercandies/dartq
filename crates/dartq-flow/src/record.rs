@@ -184,8 +184,14 @@ pub struct Flow<'t> {
     /// The recording [`Flow::begin_variable_initializer`] opened for a
     /// declaration outside any executable (a field or top-level
     /// initializer is its own executable — the official folds it):
-    /// [`Flow::end_variable_initializer`] closes it.
-    initializer_exec: bool,
+    /// [`Flow::end_variable_initializer`] closes it. The count, not a
+    /// flag, because initializers nest inside the world — a local
+    /// declared in a closure within the initializer opens its own
+    /// bracket, whose end must close only that bracket (#2241's
+    /// initializer-closure promotions died on the early close: the
+    /// local's end fired the world's `exec_end` mid-closure-body and the
+    /// replay popped the closure's frame and scope at the local's `=`).
+    initializer_world: u32,
     /// Buffer indices of open constructor initializer entries
     /// (`begin_initializer` pushes, `end_initializer` pops): the field
     /// write `f = e` (or `this.f = e`) parses as a plain expression whose
@@ -240,7 +246,7 @@ impl<'t> Flow<'t> {
             container_depth: 0,
             closed: crate::ty::ClosedNames::default(),
             ops: None,
-            initializer_exec: false,
+            initializer_world: 0,
             init_starts: Vec::new(),
             facts: Vec::new(),
         }
@@ -1188,23 +1194,31 @@ impl ParserListener for Flow<'_> {
         // its own executable (the official analyzes field and top-level
         // initializers): the buffer opens here, and reads of earlier
         // top-level declarations inside it publish their rows through the
-        // top-level read table.
+        // top-level read table. Initializers nested inside the open world
+        // (a closure body's locals) count as brackets, never worlds.
         if self.buffer.is_none() {
             self.exec_begin(false);
-            self.initializer_exec = true;
+            self.initializer_world = 1;
+        } else if self.initializer_world > 0 {
+            self.initializer_world += 1;
         }
         self.record(Ev::InitializerBegin);
     }
 
     fn end_variable_initializer(&mut self, token: Token) {
         self.record(Ev::InitializerEnd);
-        // The `=` token anchors the initializer's body-completion fact;
-        // the semantic layer stages completions by exact executable end
-        // span, so the initializer face's row (never staged) drops
-        // silently there.
-        if self.initializer_exec {
-            self.initializer_exec = false;
-            self.exec_end(false, token);
+        // Only the bracket that opened the world closes it: a nested
+        // bracket's end must not fire `exec_end` mid-body and desync the
+        // executable framing (see [`Flow::initializer_world`]).
+        if self.initializer_world > 0 {
+            self.initializer_world -= 1;
+            if self.initializer_world == 0 {
+                // The `=` token anchors the initializer's body-completion
+                // fact; the semantic layer stages completions by exact
+                // executable end span, so the initializer face's row
+                // (never staged) drops silently there.
+                self.exec_end(false, token);
+            }
         }
     }
 

@@ -6734,3 +6734,110 @@ fn if_null_assignment_through_raw_constructor_stays_unpromoted() {
     let (_, rows) = promoted_read_rows(source);
     assert!(rows.is_empty(), "{rows:?}");
 }
+
+// —— #2241 rider: promotions inside a top-level-variable-initializer closure ——
+
+/// The flow types at every `str` read of a guarded-read source: the
+/// null-check promotion must surface as a non-nullable `ReadType` row at
+/// both the condition read and the guarded member read.
+fn guarded_read_faces(source: &str) -> Vec<(u32, bool)> {
+    let mut rows: Vec<(u32, bool)> = read_types_of(source)
+        .into_iter()
+        .filter(|(offset, _)| {
+            let offset = *offset as usize;
+            source[offset..].starts_with("str")
+        })
+        .map(|(offset, ty)| (offset, ty.nullable))
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+/// A closure nested in a top-level variable initializer promotes its own
+/// locals exactly like a plain function body: the initializer world's
+/// executable framing must survive the local's own initializer bracket —
+/// the world's close belongs to the bracket that opened it. Before the
+/// fix the local's `end_variable_initializer` fired the world's
+/// `exec_end` at the local's `=`: the replay popped the closure's frame
+/// and scope mid-body, every later read of the local resolved to nothing
+/// (the implicit-`this` property face), and no promotion could form.
+#[test]
+fn initializer_closure_guarded_read_promotes_like_a_function_body() {
+    let control = concat!(
+        "String? mk() => null;\n",
+        "void f() { final str = mk(); if (str == null) return; str.hashCode; }",
+    );
+    let closure = concat!(
+        "String? mk() => null;\n",
+        "final f = () { final str = mk(); if (str == null) return; str.hashCode; };",
+    );
+    // Two `str` reads (condition + guarded member), both promoted to the
+    // non-null face. The needles key at the `str` token offset.
+    let expected: Vec<(u32, bool)> = ["str == null) return", "str.hashCode"]
+        .iter()
+        .map(|needle| {
+            (source_offset(control, needle), false)
+        })
+        .collect();
+    assert_eq!(guarded_read_faces(control), expected, "{control:?}");
+    let expected: Vec<(u32, bool)> = ["str == null) return", "str.hashCode"]
+        .iter()
+        .map(|needle| (source_offset(closure, needle), false))
+        .collect();
+    assert_eq!(guarded_read_faces(closure), expected, "{closure:?}");
+}
+
+/// The same world in a class field initializer: the closure body's
+/// promotions must survive there too.
+#[test]
+fn field_initializer_closure_guarded_read_promotes() {
+    let source = concat!(
+        "String? mk() => null;\n",
+        "class C {\n",
+        "  final f = () { final str = mk(); if (str == null) return; str.hashCode; };\n",
+        "}",
+    );
+    let faces = guarded_read_faces(source);
+    assert_eq!(faces.len(), 2, "{source:?}");
+    assert!(faces.iter().all(|&(_, nullable)| !nullable), "{faces:?}");
+}
+
+/// The promotion gates dead code inside the initializer closure: after
+/// the early-return guard the second `str == null` test is known-false,
+/// so its then-branch is dead — the oracle rows DEAD_CODE there (and in
+/// the plain-function control). Before the fix the closure emitted no
+/// row: the branch condition read rode the unresolved property face.
+#[test]
+fn initializer_closure_promotion_gates_dead_code() {
+    let body = "String? str = mk(); if (str == null) return; if (str == null) { mk(); }";
+    let control = format!("String? mk() => null;\nvoid f() {{ {body} }}");
+    let closure = format!("String? mk() => null;\nfinal f = () {{ {body} }};");
+    let control_dead = dead_snippets(&control);
+    assert_eq!(control_dead, vec!["{ mk(); }"], "{control:?}");
+    assert_eq!(dead_snippets(&closure), control_dead, "{closure:?}");
+}
+
+/// The guarded read as a call argument carries the non-null face — the
+/// staged-assignability consumer's row (the #2241 probe's `take(str)`
+/// false ARGUMENT_TYPE_NOT_ASSIGNABLE rode the missing fact).
+#[test]
+fn initializer_closure_guarded_argument_read_carries_non_null_face() {
+    let source = concat!(
+        "String? mk() => null;\n",
+        "void take(String s) {}\n",
+        "final f = (Object? arg) { final str = mk(); if (str == null) return 0; take(str); return 1; };",
+    );
+    let argument = source.rfind("take(str)").unwrap() as u32 + 5;
+    let rows = read_types_of(source);
+    let argument_row = rows
+        .iter()
+        .find(|(offset, _)| *offset == argument)
+        .unwrap_or_else(|| panic!("no ReadType at the argument read: {rows:?}"));
+    assert!(!argument_row.1.nullable, "{rows:?}");
+}
+
+/// UTF-16 offset of a needle's first occurrence (ASCII sources: byte ==
+/// utf-16), the test corpus's addressing convention.
+fn source_offset(source: &str, needle: &str) -> u32 {
+    source.find(needle).expect("needle present") as u32
+}
