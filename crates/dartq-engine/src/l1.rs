@@ -31,6 +31,22 @@ use crate::state::{
     UnitFacts,
 };
 
+/// The cross-phase pairing-miss faces (stability lane #2256): what the
+/// former `.expect` pairing sites record into the bounded degrade ledger
+/// when their invariant breaks — only-on-bug by construction, so a healthy
+/// run never emits the rows. `warm`: a staged warm-start entry vanished
+/// between classification and its claim (the group recomputes as cold
+/// misses). `facts`: a batch slot the classification pass routed but no
+/// fill pass covered (the file skips the batch product). `removed facts`:
+/// a removed file whose pre-removal facts the gate never captured (the
+/// file skips the face-delta retraction). `library keys`: an info-less
+/// live library no this-batch intern keyed (the library skips the identity
+/// recompute). All four salvage and continue — never a panic.
+const WARM_PAIRING_FACE: &str = "warm";
+const FACTS_PAIRING_FACE: &str = "facts";
+const REMOVED_FACTS_FACE: &str = "removed facts";
+const LIBRARY_KEYS_FACE: &str = "library keys";
+
 /// The outcome of one apply.
 #[derive(Debug, Default)]
 pub(crate) struct ApplyOutcome {
@@ -477,10 +493,23 @@ fn recompute_facts(
             by_key.entry(key).or_default().push(index);
         }
         for (key, slots) in by_key {
-            let payload = state
-                .warm_start
-                .remove(&snapshot_key(key))
-                .expect("warm key checked at classification");
+            let Some(payload) = state.warm_start.remove(&snapshot_key(key)) else {
+                // The classification pass checked this key into `warm` and
+                // the claim below is the staging map's only removal inside
+                // this function, so a miss is only-on-bug. Degrade (the
+                // pairing-lane posture): the group recomputes as cold
+                // misses — the fan-out below fills their slots — and the
+                // miss lands in the bounded ledger instead of panicking
+                // the apply.
+                state
+                    .residency_degrades
+                    .record(&[(changed[slots[0]].0, WARM_PAIRING_FACE)]);
+                misses.extend(slots.into_iter().map(|index| (index, key)));
+                continue;
+            };
+            // Same-statement dominating guard: `by_key.entry(key)` was
+            // created by `push(index)` three lines above and nothing drains
+            // it before this read, so the front element always exists.
             let mut slots = slots.into_iter();
             let first = slots.next().expect("grouped slots are non-empty");
             let (first_payload, rest) = if slots.len() > 0 {
@@ -699,9 +728,19 @@ fn recompute_facts(
     changed
         .iter()
         .zip(slots)
-        .map(|((file, _, _), slot)| {
-            let (facts, cache_hit, capture) = slot.expect("every changed file ends with facts");
-            (*file, facts, cache_hit, capture)
+        .filter_map(|((file, _, _), slot)| match slot {
+            Some((facts, cache_hit, capture)) => Some((*file, facts, cache_hit, capture)),
+            None => {
+                // The classification pass routed every index to exactly one
+                // bucket and every bucket's fill pass covers its own slots,
+                // so `None` is only-on-bug. Degrade: the file skips this
+                // batch's product (no residency admit, no revalidate event,
+                // no relink — a later edit recomputes it) and the miss
+                // lands in the bounded ledger instead of panicking the
+                // apply.
+                state.residency_degrades.record(&[(*file, FACTS_PAIRING_FACE)]);
+                None
+            }
         })
         .collect()
 }
@@ -2489,11 +2528,19 @@ fn maintain_and_close(
     }));
     let removed_faces: Vec<(FileId, UnitFace)> = removed
         .iter()
-        .map(|file| {
-            let facts = old_facts
-                .get(file)
-                .expect("a removed file's previous facts were captured at the gate");
-            (*file, UnitFace::of(facts))
+        .filter_map(|file| {
+            // The gate arm captured every removed file's previous facts
+            // before pushing it to `removed`, so a miss here is only-on-bug.
+            // Degrade: the file skips the face-delta retraction (its index
+            // rows stand until a later batch touches them) and the miss
+            // lands in the bounded ledger instead of panicking the apply —
+            // the same tolerant posture the edge-retarget pass below reads
+            // this map with.
+            let Some(facts) = old_facts.get(file) else {
+                state.residency_degrades.record(&[(*file, REMOVED_FACTS_FACE)]);
+                return None;
+            };
+            Some((*file, UnitFace::of(facts)))
         })
         .collect();
 
@@ -2908,11 +2955,25 @@ fn maintain_and_close(
         } else {
             // Formed this batch (a fresh intern or a recycled slot): no
             // previous identity to compare — everything about it is new,
-            // so it is dirty by construction.
-            let defining = library_keys
-                .get(library)
-                .copied()
-                .expect("an info-less live library was formed by this batch");
+            // so it is dirty by construction. Every info-less library in
+            // `affected` was interned this batch and every intern records
+            // its key file, so a miss here is only-on-bug. Degrade: the
+            // library stays info-less — the pre-recompute state every
+            // reader already handles — skips the dirty set, and the miss
+            // lands in the bounded ledger instead of panicking the apply.
+            let Some(defining) = library_keys.get(library).copied() else {
+                if let Some(member) = state
+                    .library_of_file
+                    .iter()
+                    .find(|&(_, owner)| *owner == *library)
+                    .map(|(file, _)| *file)
+                {
+                    state
+                        .residency_degrades
+                        .record(&[(member, LIBRARY_KEYS_FACE)]);
+                }
+                continue;
+            };
             let fresh = build_library_info(state, *library, defining);
             identity_moved.insert(*library);
             state.libraries.set_info(*library, fresh);
@@ -4954,6 +5015,76 @@ pub(crate) mod tests {
             state.warm_start.contains_key(&dead),
             "the unclaimable entry stands until shed"
         );
+    }
+
+    /// The cross-phase pairing degrades (stability lane #2256): the four
+    /// former `.expect` pairing sites — the warm-start claim, the batch
+    /// facts fill, the removed-file gate capture, the formation key — now
+    /// record into the bounded degrade ledger and salvage (cold recompute,
+    /// skip the unit) instead of panicking the apply. Their failure arms
+    /// are only-on-bug by construction, so the drivable pin is the surface
+    /// they share: rows recorded between applies drain once, at the next
+    /// apply's tail, as exact `ResidencyDegrade` JSONL lines — and a
+    /// healthy apply (no recorded rows) emits none, keeping the event
+    /// goldens byte-stable.
+    #[test]
+    fn pairing_degrade_rows_drain_through_the_apply_trace() {
+        let fixture = Fixture::new();
+        let mut state = fixture.state();
+        let lib = fixture.root.join("lib");
+        let a = set(&mut state, &lib.join("a.dart"), "int a() => 1;\n");
+
+        // A row recorded before any apply rides that apply's drain, with
+        // the exact wire shape the trace sink freezes (the per-face shape
+        // pins live in the event module).
+        state
+            .residency_degrades
+            .record(&[(a, WARM_PAIRING_FACE), (a, LIBRARY_KEYS_FACE)]);
+
+        let path = std::env::temp_dir().join(format!(
+            "dartq-engine-l1-pairing-degrade-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        state.trace = Some(crate::event::TraceSink::create(&path).expect("sink opens"));
+        apply(&mut state, &mut |_| {});
+        drop(state.trace.take());
+
+        let capture = std::fs::read_to_string(&path).expect("capture readable");
+        let uri = lib.join("a.dart").to_string_lossy().into_owned();
+        assert_eq!(
+            capture
+                .lines()
+                .filter(|line| line.contains("\"ResidencyDegrade\""))
+                .count(),
+            2,
+            "each recorded (file, face) pair drains once: {capture}"
+        );
+        assert!(
+            capture.contains(&format!(
+                "{{\"event\":\"ResidencyDegrade\",\"uri\":\"{uri}\",\"face\":\"warm\"}}"
+            )),
+            "the warm pairing row drains with its face: {capture}"
+        );
+        assert!(
+            capture.contains(&format!(
+                "{{\"event\":\"ResidencyDegrade\",\"uri\":\"{uri}\",\"face\":\"library keys\"}}"
+            )),
+            "the library-keys pairing row drains with its face: {capture}"
+        );
+
+        // The ledger's report set dedupes per engine: a second apply with a
+        // fresh batch (the same recorded pairs) re-emits nothing.
+        let _ = set(&mut state, &lib.join("b.dart"), "int b() => 2;\n");
+        state.trace = Some(crate::event::TraceSink::create(&path).expect("sink reopens"));
+        apply(&mut state, &mut |_| {});
+        drop(state.trace.take());
+        let capture = std::fs::read_to_string(&path).expect("capture readable");
+        assert!(
+            !capture.contains("\"ResidencyDegrade\""),
+            "already-reported pairs never re-fire: {capture}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The chunked cold-apply fan-out ([`APPLY_FANOUT_CHUNK`]): a batch
