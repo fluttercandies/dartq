@@ -89,7 +89,11 @@ const FIRST_OPAQUE_RAW: u32 = 0x4000_0000;
 /// `Comparable<String>, Pattern`, the collection roots reach
 /// `Iterable`), plus `bool` registered as a two-constant enum: its
 /// `true`/`false` constants close the exhaustiveness arm
-/// (`static_type.dart:67`'s closed-by-construction face). `FutureOr`
+/// (`static_type.dart:67`'s closed-by-construction face), plus `Record`
+/// and `Enum` — the two remaining dart:core classes an `is`-test
+/// routinely names: the oracle resolves them to plain classes, so
+/// `x is Record` promotes and keeps its else live where an `Invalid`
+/// read vacuously deads it (subtype.dart's 0c arm). `FutureOr`
 /// stays unregistered — it has a first-class [`TypeKind`] variant, not a
 /// declaration. A name absent here is invisible to the resolved walk; the
 /// adapter's `Invalid` fallback keeps the question open.
@@ -105,6 +109,8 @@ const BUILTINS: &[(&str, &[&str], &[&str])] = &[
     ("List", &["E"], &["Iterable<E>"]),
     ("Set", &["E"], &["Iterable<E>"]),
     ("Map", &["K", "V"], &[]),
+    ("Record", &[], &[]),
+    ("Enum", &[], &[]),
 ];
 
 /// The per-library resolved-type world: one interned [`TypeTable`] plus
@@ -252,11 +258,23 @@ impl LibraryTypes {
         let object = TypeDeclId::from_raw(OBJECT_RAW);
         let future = TypeDeclId::from_raw(FUTURE_RAW);
         let function = TypeDeclId::from_raw(FUNCTION_RAW);
+        // `Record`'s builtin decl — the raw id the loop below mints for
+        // the `"Record"` row, computed positionally so the table's order
+        // stays the single source. `CoreDecls.record` is what lets the
+        // record-class arms (`isDartCoreRecord`) answer over this
+        // snapshot instead of falling back to `None`.
+        let record = TypeDeclId::from_raw(
+            FIRST_BUILTIN_RAW
+                + BUILTINS
+                    .iter()
+                    .position(|&(name, ..)| name == "Record")
+                    .unwrap() as u32,
+        );
         let mut builder = TypeHierarchy::builder(CoreDecls {
             object,
             future,
             function,
-            record: None,
+            record: Some(record),
         })
         .decl(object, Vec::new())
         .decl(future, vec![TypeParamId::from_raw(1)])
@@ -1154,7 +1172,10 @@ impl<'a> ResolvedTypeOps<'a> {
     /// `instantiateToBounds` substitutes for an unconstrained parameter —
     /// so an unresolved nested name keeps the enclosing opaque
     /// `Interface` comparable instead of suppressing it through
-    /// `map_args`'s arity/`Invalid` veto. Without that substitution the
+    /// `map_args`'s arity veto. (Registered containers keep the `Invalid`
+    /// argument itself — [`ResolvedTypeOps::map_args`] —; the opaque face
+    /// has no real declaration behind it, so its instantiation has
+    /// nothing for the argument to sit in.) Without that substitution the
     /// residual `Stream<List<int>>` vs `Stream<Uint8List>` comparison
     /// would read both arguments as `Invalid` and answer "same type".
     fn opaque_args(
@@ -1242,8 +1263,8 @@ impl<'a> ResolvedTypeOps<'a> {
 
     /// Maps one `ArgTy` node (recursion for `FutureOr`); `names` and
     /// `arena` are the live faces `is_always_exhaustive` carries. A node
-    /// whose name resolves to nothing maps `invalid` — the enclosing
-    /// `Interface` arm suppresses through it.
+    /// whose name resolves to nothing maps `invalid` — the argument the
+    /// enclosing `Interface` arm carries in place of a resolvable type.
     fn map_node(&self, node: &ArgTy, arena: &[Vec<ArgTy>], names: &[Box<str>]) -> TypeId {
         match node.base {
             Base::Dynamic => self.dynamic,
@@ -1253,11 +1274,12 @@ impl<'a> ResolvedTypeOps<'a> {
                 .table
                 .intern(UninternedType::Never, node.nullable),
             Base::Null => self.null,
-            // As in `map_base`: the asymmetric top, not `Invalid` — an
-            // `Invalid` argument suppresses the enclosing `Interface`
-            // through `map_args`, where the unknown argument's true
-            // answer is `dynamic` (a `var`-inferred or unreduced
-            // argument reads as the top instantiation).
+            // As in `map_base`: the asymmetric top, not `Invalid` — the
+            // unknown argument's true answer is `dynamic` (a `var`-inferred
+            // or unreduced argument reads as the top instantiation), and a
+            // resolved `Invalid` argument would vacuum every subtype
+            // question the instantiated face enters (subtype.dart's 0c
+            // arm).
             Base::Unknown => self.dynamic,
             Base::Function => self
                 .snapshot
@@ -1301,7 +1323,11 @@ impl<'a> ResolvedTypeOps<'a> {
     /// — the official `instantiateToBounds` on a resolved element).
     /// `None` on arity mismatch (the written count disagrees with the
     /// declaration's) — the whole `Interface` suppresses through
-    /// `Invalid`.
+    /// `Invalid`. An `Invalid` argument is *not* a veto: it keeps its
+    /// position inside the instantiation, exactly the oracle's
+    /// `Response<InvalidType>` — still an `InterfaceType` carrying the
+    /// invalid argument, whose subtype questions answer through the 0c
+    /// arm instead of erasing the whole face.
     fn map_args(
         &self,
         args: u32,
@@ -1330,15 +1356,11 @@ impl<'a> ResolvedTypeOps<'a> {
         if row.len() != params.len() {
             return None;
         }
-        let mut mapped = Vec::with_capacity(row.len());
-        for arg in row {
-            let ty = self.map_node(arg, arena, names);
-            if matches!(self.snapshot.table.get(ty).kind(), TypeKind::Invalid) {
-                return None;
-            }
-            mapped.push(ty);
-        }
-        Some(mapped)
+        Some(
+            row.iter()
+                .map(|arg| self.map_node(arg, arena, names))
+                .collect(),
+        )
     }
 
     /// The scrutinee map `is_always_exhaustive` uses: `Base::Name`
@@ -3025,6 +3047,109 @@ mod tests {
         assert!(
             !codes.contains(&"dead_code"),
             "the var else branch must stay live: {codes:?}"
+        );
+    }
+
+    /// #2250: `Record` and `Enum` are plain dart:core classes, so
+    /// `x is Record` / `x is Enum` resolve to real interfaces — the true
+    /// branch promotes and the else branch stays live. The pre-fix face
+    /// had no declaration behind the spellings, mapped them `Invalid`,
+    /// and subtype.dart's 0c arm (`X <: InvalidType` vacuously true)
+    /// answered `factor(any, Invalid)` = `Never` — a false `dead_code`
+    /// row on every `x is Record` else branch (the oracle probe reports
+    /// nothing).
+    #[test]
+    fn ticket_2250_record_and_enum_tests_keep_the_else_live() {
+        let codes = diagnose_codes(
+            "void g() {} \
+             void f(dynamic x) { \
+               if (x is Record) { return; } \
+               g(); \
+               if (x is Enum) { return; } \
+               g(); \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"dead_code"),
+            "x is Record/Enum must keep the else branches live: {codes:?}"
+        );
+    }
+
+    /// #2250's object face: the same test on a typed receiver — `Object`
+    /// is not a `Record`, so the factor keeps `Object` instead of the
+    /// pre-fix `Invalid`-vacuous `Never`. Pins the exact question the
+    /// type-factor seam answers (`factor_typed`), independent of the
+    /// `dynamic`-scrutinee probe above.
+    #[test]
+    fn ticket_2250_record_test_on_object_keeps_the_remainder() {
+        let codes = diagnose_codes(
+            "void g() {} \
+             void f(Object x) { \
+               if (x is Record) { return; } \
+               g(); \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"dead_code"),
+            "x is Record on Object must keep the else branch live: {codes:?}"
+        );
+    }
+
+    /// #2252: an unresolved type argument keeps its position inside the
+    /// instantiation — the oracle's `Response<InvalidType>` is still an
+    /// `InterfaceType` carrying the invalid argument (the resolution pass
+    /// reports `non_type_as_type_argument` and the flow face stays live),
+    /// so neither branch of `x is Response<Missing>` deads. The pre-fix
+    /// face vetoed the whole instantiation to `Invalid`, and the 0c arm
+    /// made `factor(any, Invalid)` = `Never` — a false `dead_code` row
+    /// the oracle probe does not report.
+    #[test]
+    fn ticket_2252_invalid_argument_keeps_the_interface_face() {
+        let codes = diagnose_codes(
+            "class Response<T> { T? data; } \
+             void g() {} \
+             void f(dynamic x) { \
+               if (x is Response<Missing>) { return; } \
+               g(); \
+               if (x is! Response<Missing>) { return; } \
+               g(); \
+             }",
+            |_| None,
+        );
+        assert!(
+            !codes.contains(&"dead_code"),
+            "Response<Missing> must keep its Interface face: {codes:?}"
+        );
+    }
+
+    /// #2252's comparability face: the interface-with-invalid-argument
+    /// stays a first-class `Interface`, so it answers its own head's
+    /// question — after `x is Response`, `x is Response<Missing>` is
+    /// always true (`Response<dynamic> <: Response<Invalid>` through the
+    /// carried argument's 0c arm), the inner else deads, and the inner
+    /// `x.data` read resolves. The oracle probe reports exactly
+    /// `non_type_as_type_argument` + `unnecessary_type_check` +
+    /// `dead_code`; the pre-fix face collapsed the instantiation to bare
+    /// `Invalid` and the same rows fell out of the erased face instead.
+    #[test]
+    fn ticket_2252_invalid_argument_stays_comparable_to_its_head() {
+        let codes = diagnose_codes(
+            "class Response<T> { T? data; } \
+             void f(Object x) { \
+               if (x is Response) { \
+                 if (x is Response<Missing>) { x.data; } else { g(); } \
+               } \
+             } \
+             void g() {}",
+            |_| None,
+        );
+        assert!(
+            codes.contains(&"dead_code")
+                && !codes.contains(&"undefined_getter")
+                && !codes.contains(&"undefined_method"),
+            "the invalid-argument face must stay comparable and readable: {codes:?}"
         );
     }
 
