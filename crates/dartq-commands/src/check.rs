@@ -718,9 +718,12 @@ pub(crate) fn scan_file_at(
         // `.atOffset(versionToken.offset, versionToken.length)`; oracle
         // `dart analyze --format=machine` on a line-1 comment:
         // `1|1|15`).
+        // Contract-drift defense, not a reachable path: the scanner
+        // always records the comment span with an override — degrade
+        // to the (0,0) anchor rather than crash the check face.
         let span = result
             .language_version_override_span
-            .expect("scanner records the comment span with every override");
+            .unwrap_or(SourceRange { offset: 0, length: 0 });
         if override_version.is_above_latest() {
             let code = CodeRegistry::builtin()
                 .get("invalid_language_version_override")
