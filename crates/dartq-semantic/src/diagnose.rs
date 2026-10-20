@@ -3590,3 +3590,13 @@ mod ticket_2365_tests;
 /// `undefined_annotation` exactly where the 3.13.1 oracle reports.
 #[cfg(test)]
 mod ticket_2329_tests;
+
+/// The #2159 pins: the `unused_field` read-attribution faces of the
+/// census's reads-side family — the `?.` chain's nested private-field
+/// read, the private-field read inside a getter body, the const-list
+/// field's read, the enum constant's access — each locks the oracle's
+/// `readMembers`/`unresolvedReadMembers` sparing against regression. The
+/// cross-part close itself lives at `semdiag.rs`'s
+/// `part_file_unused_field_closes_library_wide` (#2286).
+#[cfg(test)]
+mod ticket_2159_tests;
