@@ -10,9 +10,12 @@
 //! front-end's pseudoSharedCode faces are NOT analyzer registry rows —
 //! `abstract_extension_field` is absent from the analyzer's diagnostic
 //! registry (probes surface `abstract_static_field` or
-//! `extension_declares_instance_field` instead) and `augment typedef`
-//! surfaces no `typedef_augmentation` row even with the experiment flag.
-//! These pins therefore nail dartq's own emission (the tripwire contract:
+//! `extension_declares_instance_field` instead). `augment typedef` is a
+//! version-caliber split: the 3.13.1 binary surfaces no
+//! `typedef_augmentation` row even with the experiment flag, while Dart
+//! 3.15 main (our semantic baseline) reports it — see
+//! [`local_pin_typedef_augmentation`] for the attribution. These pins
+//! therefore nail dartq's own emission (the tripwire contract:
 //! the emitter must not silently change), not oracle parity.
 
 use super::collector::setup;
@@ -41,19 +44,20 @@ fn local_pin_abstract_extension_field() {
 }
 
 /// `augment` heading a typedef (official `parseTypedef`'s augmentToken
-/// report, `parser_impl.dart:1473`).
+/// report, `parser_impl.dart:1473`; the typedef dispatch arms pass
+/// `context.augmentToken` through at `parser_impl.dart:774/:792` of the
+/// same upstream source).
 ///
-/// `#[ignore]`d: the emitter is currently unreachable — the typedef
-/// dispatch arms drop `mods.augment` and never set `pending_augment`
-/// (the enum arm's `self.pending_augment = mods.augment;` mirror is
-/// missing), so `augment typedef T = int;` parses clean and the probe
-/// got zero rows. The contract pin rides in the tree and flips active
-/// with the one-line dispatch fix; until then the silent-clean behavior
-/// is itself the recorded drift (oracle probe 3.13.1 surfaces no
-/// `typedef_augmentation` row on this shape either — with the experiment
-/// flag it recovers through `expected_token` instead).
+/// Version attribution (probed 2026-10-20): the pinned 3.13.1 oracle
+/// binary surfaces NO `typedef_augmentation` row on this shape even with
+/// `--enable-experiment=augmentations` — it recovers through
+/// `expected_token` + `missing_const_final_var_or_type` instead. Dart
+/// 3.15 main (our semantic baseline) wires the report at both typedef
+/// dispatch arms, so dartq's emission follows the baseline, not the
+/// 3.13.1 binary; the residual delta against the pinned oracle is
+/// oracle-side version drift on the augmentations experiment (pending
+/// the oracle-caliber census ruling).
 #[test]
-#[ignore = "typedef_augmentation emitter unreachable: typedef dispatch arms drop mods.augment (declarations.rs), pending the dispatch fix"]
 fn local_pin_typedef_augmentation() {
     assert_code_fires("augment typedef T = int;\n", "typedef_augmentation");
 }

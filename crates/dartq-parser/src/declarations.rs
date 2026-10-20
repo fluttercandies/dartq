@@ -259,6 +259,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                             if let Some(f) = mods.final_kw {
                                 self.report(msg::extraneous_modifier("final"), f);
                             }
+                            // `augment typedef <...> =` — the augment token
+                            // rides into `parseTypedef` (official
+                            // :774 wires `context.augmentToken`).
+                            self.pending_augment = mods.augment;
                             self.parse_typedef(keyword);
                             return;
                         }
@@ -275,6 +279,11 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
                             self.report(msg::extraneous_modifier("final"), f);
                         }
                         self.check_declaration();
+                        // `augment typedef ...` — the augment token rides
+                        // into `parseTypedef` (official :774/:792 wire
+                        // `context.augmentToken`; `parseTypedef` reports
+                        // `typedefAugmentation` on it).
+                        self.pending_augment = mods.augment;
                         self.parse_typedef(keyword);
                     }
                     TokenKind::Keyword(Keyword::Mixin) => {
