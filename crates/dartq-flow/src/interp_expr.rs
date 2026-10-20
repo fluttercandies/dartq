@@ -702,7 +702,25 @@ impl Interp<'_> {
                     expr.test_split = true;
                 } else {
                     let cur = self.current.clone();
-                    expr.branches = Some((cur.clone(), cur));
+                    // The non-reference guaranteed-succeed face (official
+                    // `isExpression_end`'s
+                    // `_isTypeCheckGuaranteedToSucceedWithSoundNullSafety`
+                    // arm — upstream Dart SDK source,
+                    // pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+                    // flow_analysis.dart:7201-7205 — folded to
+                    // `booleanLiteral(!isNot)`, :6544-6559): the operand's
+                    // static type is already the tested type's subtype, so
+                    // the test is a boolean literal — `is` deads the else
+                    // branch, `is!` the then branch. `current` stays live
+                    // (the official's `_current` is untouched): the
+                    // deadness rides the branch pair, and a value consumer
+                    // that drops the expression never sees it.
+                    if self.is_test_guaranteed(operand.ty, operand.args, tested, tested_args) {
+                        let dead = cur.clone().set_unreachable(&mut self.reach);
+                        expr.branches = Some(if is_not { (dead, cur) } else { (cur, dead) });
+                    } else {
+                        expr.branches = Some((cur.clone(), cur));
+                    }
                 }
                 self.exprs.push(expr);
             }
@@ -1699,6 +1717,42 @@ impl Interp<'_> {
             self.pending_ty = Some(ty);
             self.pending_ty_args = args;
         }
+    }
+
+    /// Whether a non-reference operand's type test is guaranteed to
+    /// succeed (official `_isTypeCheckGuaranteedToSucceedWithSoundNullSafety`
+    /// — upstream Dart SDK source,
+    /// pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart:9149-9155
+    /// — `isSubtypeOf(staticType, checkedType)` under sound flow). The
+    /// answer deads a branch, so the boundary refuses: a dynamic tested
+    /// spelling or an unknown/void operand face is never a dead-branch
+    /// producer (the name-level lattice's top-type optimism would
+    /// otherwise certify the mark — the same refusal trio
+    /// [`Interp::promotion_candidate`] applies). The named faces go
+    /// through [`TypeOps::is_subtype_typed`]; a resolved back-end
+    /// re-decides them through the real hierarchy.
+    fn is_test_guaranteed(
+        &self,
+        operand_ty: Ty,
+        operand_args: u32,
+        tested: Ty,
+        tested_args: u32,
+    ) -> bool {
+        if matches!(
+            operand_ty.base,
+            Base::Unknown | Base::Dynamic | Base::Void
+        ) || matches!(tested.base, Base::Unknown | Base::Dynamic | Base::Void)
+        {
+            return false;
+        }
+        self.ops.is_subtype_typed(
+            operand_ty,
+            operand_args,
+            tested,
+            tested_args,
+            self.args,
+            self.names,
+        )
     }
 
     /// A successful type test on `var`: returns (matched, unmatched)

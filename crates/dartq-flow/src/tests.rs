@@ -7926,6 +7926,46 @@ fn function_is_test_splits_the_arms() {
     assert_eq!(promoted[1].base, crate::ty::Base::Never, "{promoted:?}");
 }
 
+/// #2341 pin ① (guaranteed-succeed): a non-reference operand whose static
+/// type is already the tested type's subtype makes the test a boolean
+/// literal (official `isExpression_end`'s
+/// `_isTypeCheckGuaranteedToSucceedWithSoundNullSafety` arm — upstream Dart
+/// SDK source, pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+/// flow_analysis.dart:7201-7205 — folded to `booleanLiteral(!isNot)`,
+/// :6544-6559): `is` deads the else branch and its body reports the
+/// whole-block dead row (the probe-g5 shape).
+#[test]
+fn is_test_guaranteed_succeed_deads_the_else() {
+    let source = "void f(Object? x) { if ((x as int) is int) {} else { x; } }";
+    assert_eq!(dead_snippets(source), ["{ x; }"]);
+}
+
+/// #2341 pin ② (guaranteed-succeed boundary): a nullable operand is no
+/// subtype of the non-null tested type — the check can still fail, so
+/// both arms stay live (official `isSubtypeOf(int?, int)` is false and
+/// the nullability-disjoint fail arm does not fire on a potentially
+/// nullable face either).
+#[test]
+fn nullable_operand_keeps_both_is_test_arms_live() {
+    let source = "void f(Object? x) { if ((x as int?) is int) {} else { x; } }";
+    assert!(dead_snippets(source).is_empty());
+}
+
+/// #2341 pin ③ (guaranteed-succeed boundary): the dynamic/Unknown faces
+/// refuse the guarantee — a dynamic tested spelling and an unknown
+/// operand face are never certified as dead-branch producers (the
+/// name-level lattice's top-type optimism must not dead a branch over an
+/// unknowable face; a resolved back-end re-decides through the real
+/// hierarchy).
+#[test]
+fn is_dynamic_and_unknown_operand_never_guarantee() {
+    let tested_dynamic =
+        "void f(Object? x) { if ((x as int) is dynamic) {} else { x; } }";
+    assert!(dead_snippets(tested_dynamic).is_empty());
+    let unknown_operand = "void f() { if (g() is dynamic) {} else { h(); } }";
+    assert!(dead_snippets(unknown_operand).is_empty());
+}
+
 /// #2346③: a switch expression's value carries the LUB join of its case
 /// values (upstream Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart
 /// `SwitchExpressionImpl.staticType`'s arm fold; the name-level join is
