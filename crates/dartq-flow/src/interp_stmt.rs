@@ -730,6 +730,24 @@ impl Interp<'_> {
                     if let Frame::Switch { dead_default, .. } = &mut self.stack[frame_index] {
                         *dead_default = default_kw.map(|kw| (kw, reported));
                     }
+                    // A member carrying a `default` head exhausts the
+                    // unmatched chain the moment its clause ends: the
+                    // default's alternative matches everything the earlier
+                    // heads left (official `switch_endAlternative` of the
+                    // merged member's default head). A `default` stacked
+                    // after case heads (`case 3: default:`) folds into that
+                    // case-headed member (official
+                    // `getSwitchStatementMemberInfo`), so its `CaseBegin`
+                    // carries `expression_count > 0` — the group close ran
+                    // without the default's chain kill, and the clause end
+                    // is the latest observable point. For a default-headed
+                    // member the close already killed the chain; the kill
+                    // is idempotent there.
+                    if default_kw.is_some()
+                        && let Frame::Switch { unmatched, .. } = &mut self.stack[frame_index]
+                    {
+                        *unmatched = unmatched.clone().set_unreachable(&mut self.reach);
+                    }
                 }
             }
             Ev::SwitchBlockEnd => {
@@ -1324,6 +1342,27 @@ impl Interp<'_> {
         // re-stepped events would re-enter here for the same still-open
         // group and recurse without bound.
         if self.collect.is_some() {
+            return;
+        }
+        // A case head's own pattern region (between its `CaseExprBegin`
+        // and `CaseExprEnd`) must not close the previous head's still-open
+        // group: stacked heads (`case A: case B: <body>`) are ONE member
+        // sharing one body — official `getSwitchStatementMemberInfo` merges
+        // consecutive empty members' heads, and `switch_endAlternatives`
+        // runs only when the merged member's body begins. The
+        // `PatternKind::Switch` context opened at the head's
+        // `CaseExprBegin` is the region marker; `case_pattern_end` pops it
+        // at `CaseExprEnd`, so the body's first event closes the merged
+        // group with every head's matched state joined. Closing at the
+        // next head's first pattern event instead would treat the empty
+        // body between the heads as a completed member:
+        // `switch_after_case` would join its fall-through into the break
+        // model and an exhaustive switch would complete normally even
+        // when the shared body returns.
+        if matches!(
+            self.pattern.as_ref().map(|p| p.kind),
+            Some(PatternKind::Switch)
+        ) {
             return;
         }
         let Some(frame_index) = self.stack.iter().rposition(|f| {

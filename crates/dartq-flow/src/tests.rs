@@ -887,6 +887,96 @@ fn switch_all_cases_exit() {
     assert_eq!(dead_snippets(source), ["1;"]);
 }
 
+/// Stacked case heads (`case A: case B: <shared body>`) are one member
+/// sharing one body: the head chain contributes every head's matched state
+/// to the single close at the shared body's first event, and never
+/// completes a member of its own. With a `default` and a returning shared
+/// body the switch has no break model at all, so no completion fact emits.
+/// Closing the group at the next head's first pattern event (the #2271
+/// regression) treated the empty body between the heads as a completed
+/// member — `switch_after_case` joined its fall-through into the break
+/// model and the switch completed normally. The official driver runs one
+/// `switch_endAlternatives`/`switch_afterCase` pair per merged member
+/// (`getSwitchStatementMemberInfo` merges consecutive empty members'
+/// heads, type_analyzer.dart:2614-2623).
+#[test]
+fn switch_stacked_heads_with_default_and_returning_body_emit_no_completion() {
+    let source =
+        "int f(int x) { switch (x) { case 1: case 2: return 1; default: return 0; } }";
+    assert!(completion_offsets(source).is_empty());
+    // A three-head run sharing one body (petitparser whitespace.dart).
+    let source = concat!(
+        "int f(int x) { switch (x) { case 1: case 2: case 3: return 1;",
+        " default: return 0; } }"
+    );
+    assert!(completion_offsets(source).is_empty());
+    // An exhaustively covered scrutinee without `default` decides the
+    // same way (the unmatched chain must not join the exit either).
+    let source = "int f(bool b) { switch (b) { case true: case false: return 1; } }";
+    assert!(completion_offsets(source).is_empty());
+    // A guarded head inside the stack: the guard events run inside the
+    // head region and must not close the previous head's group either.
+    let source = concat!(
+        "int f(int x) { switch (x) { case 1: case 2 when x > 0: return 1;",
+        " default: return 0; } }"
+    );
+    assert!(completion_offsets(source).is_empty());
+    // A pattern-head stacked pair sharing one body (riverpod element.dart:
+    // `case AsyncLoading(…) when …:` over `case AsyncError(…):`).
+    let source = concat!(
+        "sealed class S {} class A extends S {} class B extends S {}",
+        " int f(S s) { switch (s) { case A _: case B _: return 0; default: return 1; } }"
+    );
+    assert!(completion_offsets(source).is_empty());
+}
+
+/// A `default` stacked after case heads (`case 3: default:`) folds into
+/// that case-headed member (official `getSwitchStatementMemberInfo`), so
+/// the member's close cannot see it — the chain kill lands at the
+/// member's `CaseEnd`. Without it the unmatched chain joins the exit and
+/// the switch completes normally although every body returns.
+#[test]
+fn switch_default_stacked_after_case_head_exhausts_the_chain() {
+    // dio compute_io.dart's shape.
+    let source =
+        "int f(int x) { switch (x) { case 1: return 1; case 3: default: return 0; } }";
+    assert!(completion_offsets(source).is_empty());
+    let source = "int f(int x) { switch (x) { case 1: case 2: default: return 0; } }";
+    assert!(completion_offsets(source).is_empty());
+}
+
+/// The twin: a stacked shape whose shared body falls through still
+/// completes — the shared close's split resurrects the body end for the
+/// implicit-break join (official `switch_afterCase` reads the LOCAL flag
+/// set by `switch_endAlternatives`'s split).
+#[test]
+fn switch_stacked_heads_shared_body_fall_through_completes() {
+    let source = "int f(int x) { switch (x) { case 1: case 2: default: x++; } 1; }";
+    assert_eq!(completion_offsets(source).len(), 1);
+}
+
+/// A trailing empty clause closes at the block's end: its fall-through
+/// joins the break model (the member's empty body completes normally),
+/// so the code after the switch stays live. The close the stacked-head
+/// skip defers must not be lost (both faces oracle-verified).
+#[test]
+fn switch_trailing_empty_clause_falls_through() {
+    // Exhaustive switch, trailing empty clause: `1;` is live.
+    let source = "void f(bool b) { switch (b) { case true: return; case false: } 1; }";
+    assert!(dead_snippets(source).is_empty());
+    // The twin with a returning last member: `1;` is dead.
+    let source = "void f(bool b) { switch (b) { case true: return; case false: return; } 1; }";
+    assert_eq!(dead_snippets(source), ["1;"]);
+    // The completion face: a stacked trailing empty member falls through
+    // and the enclosing body completes (the switch's block-end close).
+    let source = "int f(int x) { switch (x) { case 1: case 2: } }";
+    assert_eq!(completion_offsets(source), [46]);
+    // A trailing empty clause after a `default` (a parse-recovery shape):
+    // no completion either way.
+    let source = "int f(int x) { switch (x) { default: return 0; case 2: } }";
+    assert!(completion_offsets(source).is_empty());
+}
+
 /// official reachability/data/switch.dart `case_never_completes`: dead
 /// code inside a case body whose both branches return.
 #[test]
@@ -4249,31 +4339,61 @@ fn invalid_tested_type_never_promotes_and_deads_the_else_branch() {
     );
 }
 
-/// `??` types as the LHS's non-null form (official `ifNullExpression_end`,
+/// `??` types as `LUB(NonNull(lhs), rhs)` (official `ifNullExpression_end`,
 /// flow_analysis.dart:7071-7080, with the skip-path promotion mounted at
-/// `ifNullExpression_rightBegin`, :7086-7104). The old engine gave `??`
-/// no split and a typeless result.
+/// `ifNullExpression_rightBegin`, :7086-7104). Oracle-verified faces: a
+/// live nullable RHS makes the result nullable (`int? a ?? g()` assigns to
+/// `int?` only), a live non-nullable RHS keeps the LHS's non-null form
+/// (`int? a ?? 1` assigns to `int`), and a never-evaluated RHS (non-null
+/// LHS) leaves the LHS's own type — the flow face of the official
+/// `dead_null_aware_expression` row.
 #[test]
-fn if_null_types_as_the_lhs_non_null_form() {
+fn if_null_types_as_lub_of_lhs_non_null_and_rhs() {
     use crate::ev::Ev;
     use crate::ty::{Base, Ty};
     const INT: u32 = 102;
     const X: u32 = 7;
-    let events: Vec<Ev> = [
-        declared(X, named_ty(INT, true)),
-        vec![
-            read(X),
-            Ev::BinaryBegin {
-                op: crate::ev::BinOp::IfNull,
-                span: tspan(1),
-            },
-            read(X),
-            Ev::OtherExpr { span: tspan(2) },
-            Ev::BinaryEnd {
+    const Y: u32 = 8;
+    let if_null = |rhs: Vec<Ev>| {
+        [
+            vec![
+                read(X),
+                Ev::BinaryBegin {
+                    op: crate::ev::BinOp::IfNull,
+                    span: tspan(1),
+                },
+            ],
+            rhs,
+            vec![Ev::BinaryEnd {
                 op: crate::ev::BinOp::IfNull,
                 end: 3,
-            },
-        ],
+            }],
+        ]
+        .concat()
+    };
+    // A live RHS of unknown nullability keeps the nullable face.
+    let events = [
+        declared(X, named_ty(INT, true)),
+        if_null(vec![
+            Ev::OtherExpr { span: tspan(2) },
+        ]),
+    ]
+    .concat();
+    let interp = interp_of(&events);
+    let result = interp.exprs.last().expect("?? leaves its value");
+    assert_eq!(
+        result.ty,
+        Ty {
+            base: Base::Name(INT),
+            nullable: true
+        }
+    );
+    // A live non-nullable RHS: the LHS's non-null form.
+    let events = [
+        vec![Ev::ExecBegin { is_closure: false }],
+        decl_block(X, named_ty(INT, true)),
+        decl_block(Y, named_ty(INT, false)),
+        if_null(vec![read(Y)]),
     ]
     .concat();
     let interp = interp_of(&events);
@@ -4287,19 +4407,21 @@ fn if_null_types_as_the_lhs_non_null_form() {
     );
 }
 
-/// The `??` skip-path promotion feeds the write's types-of-interest pass:
-/// `int? x = g(); x = x ?? 0;` leaves `x` promoted to `int` (the written
-/// type is the LHS's non-null form). The RHS itself evaluates on the
-/// LHS-null path — unpromoted (official `ifNullExpression_rightBegin`,
-/// flow_analysis.dart:7086-7104).
+/// The `??` skip-path promotion feeds the write's types-of-interest pass::
+/// `int? x = g(); x = x ?? y;` with `int y` leaves `x` promoted to `int`
+/// (the written type is the `??` result's non-null form). The RHS itself
+/// evaluates on the LHS-null path — unpromoted (official
+/// `ifNullExpression_rightBegin`, flow_analysis.dart:7086-7104).
 #[test]
 fn if_null_write_repromotes_via_types_of_interest() {
     use crate::ev::Ev;
     use crate::ty::{Base, Ty};
     const INT: u32 = 102;
     const X: u32 = 7;
+    const Y: u32 = 8;
     let events: Vec<Ev> = [
         declared(X, named_ty(INT, true)),
+        decl_block(Y, named_ty(INT, false)),
         vec![
             read(X),
             Ev::BinaryBegin {
@@ -4307,7 +4429,7 @@ fn if_null_write_repromotes_via_types_of_interest() {
                 span: tspan(1),
             },
             read(X),
-            Ev::OtherExpr { span: tspan(2) },
+            read(Y),
             Ev::BinaryEnd {
                 op: crate::ev::BinOp::IfNull,
                 end: 3,
@@ -7080,48 +7202,50 @@ fn pattern_promoted_scrutinee_read_carries_matched_type() {
 }
 
 #[test]
-fn scratch_if_write_join() {
+fn if_write_leaves_the_variable_possibly_unassigned() {
+    // The archive-corpus dead-chain cascade's flow face (2026-10-19): a
+    // write inside an if's then branch leaves the variable *possibly*
+    // unassigned after the join — assigned on one path only. The wide
+    // `!isAssigned` row still fires (the potentially-unassigned join face
+    // reads it); the `definitely_unassigned` bit must stay false so the
+    // official definite-unassignment faces never fire on it.
     let source = concat!(
         "class L {} ",
         "L? mk() => null; ",
         "int f(bool c) { L? v; if (c) { v = mk(); } return v?.hashCode ?? 0; }",
     );
-    let result = dartq_scanner::scan(
-        source,
-        ScanConfig {
-            enable_triple_shift: true,
-            enable_augmentations: true,
-        },
-        dartq_source::FileTable::new().intern(std::path::Path::new("test.dart")),
-    );
-    assert!(result.diagnostics.is_empty(), "{source:?}");
-    let tokens: &'static TokenTable = Box::leak(Box::new(result.tokens));
-    let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
-        LanguageVersion::new(3, 15),
-    ));
-    let mut flow = SharedFlow(std::rc::Rc::new(std::cell::RefCell::new(Flow::new(
-        tokens, source,
-    ))));
-    let target = source.find("v = mk").expect("target") as u32;
-    let l_id = flow.0.borrow_mut().intern_name("L");
-    flow.0
-        .borrow_mut()
-        .stage_assignment_rhs(target, crate::ty::Ty { base: crate::ty::Base::Name(l_id), nullable: true });
-    let mut parser = dartq_parser::Parser::new(source, tokens, features, &mut flow);
-    parser.parse_unit();
-    drop(parser);
-    let facts = flow.0.borrow_mut().take_facts();
-    let dead: Vec<_> = facts.iter().filter_map(|f| match f {
-        FlowFact::DeadCode { span } => Some(source[span.range.offset as usize
-            ..(span.range.offset + span.range.length) as usize]
-            .to_string()),
-        _ => None,
-    }).collect();
-    let promoted: Vec<_> = facts.iter().filter_map(|f| match f {
-        FlowFact::PromotedRead { span, ty, .. } => Some((source[span.range.offset as usize
-            ..span.range.end() as usize].to_string(), *ty)),
-        _ => None,
-    }).collect();
-    println!("dead: {dead:?}");
-    println!("promoted: {promoted:?}");
+    let rows = facts_of(source);
+    let unassigned: Vec<_> = rows
+        .iter()
+        .filter_map(|fact| match fact {
+            FlowFact::UnassignedRead {
+                span,
+                definitely_unassigned,
+                ..
+            } => Some((
+                source[span.range.offset as usize..span.range.end() as usize].to_string(),
+                *definitely_unassigned,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(unassigned, [("v".to_string(), false)]);
+    assert!(dead_snippets(source).is_empty());
+}
+
+#[test]
+fn ifnull_chain_result_keeps_the_nullable_face() {
+    // `a ?? b` types `LUB(NonNull(a), b)` — with a nullable right side the
+    // result is nullable, so the next `??` arm stays live. Stamping the
+    // left's non-null form alone deaded every later arm of a chain.
+    let source = "int f(int? a, int? b) => a ?? b ?? 6;";
+    assert_eq!(dead_snippets(source), Vec::<String>::new());
+}
+
+#[test]
+fn ifnull_guaranteed_non_null_left_still_deads_the_right() {
+    // The guarantee path is untouched: a definitely non-null left side
+    // never evaluates the right (the oracle deads it too).
+    let source = "int f(int a) => a ?? 1;";
+    assert_eq!(dead_snippets(source), ["?? 1"]);
 }

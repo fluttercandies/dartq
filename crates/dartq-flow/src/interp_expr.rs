@@ -488,16 +488,18 @@ impl Interp<'_> {
                     // path to both branches (its truthiness is the LHS
                     // value's — unknowable at the name level), the same
                     // convention as the And/Or arms above.
-                    if let Some(Frame::Branch {
-                        op_span,
-                        rhs_dead_entry,
-                        ..
-                    }) = self.stack.last()
+                    let (op_span, rhs_dead_entry) = match self.stack.last() {
+                        Some(Frame::Branch {
+                            op_span,
+                            rhs_dead_entry,
+                            ..
+                        }) => (Some(*op_span), *rhs_dead_entry),
+                        _ => (None, false),
+                    };
+                    if rhs_dead_entry
+                        && let Some(op_span) = op_span
                     {
-                        let (op_span, rhs_dead_entry) = (*op_span, *rhs_dead_entry);
-                        if rhs_dead_entry {
-                            self.dead_expr_arm(op_span, *end);
-                        }
+                        self.dead_expr_arm(op_span, *end);
                     }
                     let right = self.pop_value();
                     let (right_if_true, right_if_false) = self.cond_split(&right);
@@ -515,7 +517,23 @@ impl Interp<'_> {
                     let if_true = self.join(Some(shortcut.clone()), Some(right_if_true));
                     let if_false = self.join(Some(shortcut), Some(right_if_false));
                     self.current = if_true.clone();
-                    let mut expr = Expr::trivial(ifnull_ty.unwrap_or(Ty::UNKNOWN));
+                    // The expression's type is `LUB(NonNull(lhs), rhs)` —
+                    // nullable exactly when the right side can run and is
+                    // itself nullable (the official types `int? ?? int?`
+                    // as `int?`). A guaranteed-non-null left side never
+                    // evaluates the right, so its result stays the left's
+                    // non-null form; a nullable right side makes the
+                    // nullable face observable down-chain (`(a ?? b) ?? c`
+                    // keeps `c` live), where stamping the left's non-null
+                    // form alone deads every later `??` arm.
+                    let mut result_ty = ifnull_ty.unwrap_or(Ty::UNKNOWN);
+                    if !rhs_dead_entry
+                        && self.classify(result_ty) == Classification::NonNullable
+                        && self.classify(right.ty) != Classification::NonNullable
+                    {
+                        result_ty = result_ty.make_nullable();
+                    }
+                    let mut expr = Expr::trivial(result_ty);
                     expr.branches = Some((if_true, if_false));
                     self.exprs.push(expr);
                 }
