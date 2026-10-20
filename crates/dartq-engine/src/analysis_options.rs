@@ -775,6 +775,10 @@ pub struct DeclarationGroup {
     /// The file's own `analyzer.errors` keys (`unrecognized_error_code`
     /// candidates, anchored in the included file's text).
     pub errors: Vec<DeclaredError>,
+    /// The file's own `analyzer.cannot-ignore` names, non-severity spellings
+    /// only (`unrecognized_error_code` candidates, anchored in the included
+    /// file's text).
+    pub cannot_ignore: Vec<DeclaredError>,
     /// This file's resolved include edges, in declaration order — the
     /// `incompatible_lint_included` walk's per-edge entries at this level
     /// (`reportIncompatibleIncluded`, linter_rule_options_validator.dart
@@ -874,6 +878,11 @@ pub struct AnalysisOptions {
     /// declaration order, original spellings (`unrecognized_error_code`
     /// candidates; validity is the caller's registry seam).
     pub declared_errors: Vec<DeclaredError>,
+    /// `analyzer.cannot-ignore` names the initial file's own list declares,
+    /// in declaration order, non-severity spellings only
+    /// (`unrecognized_error_code` candidates; validity is the caller's
+    /// registry seam).
+    pub declared_cannot_ignore: Vec<DeclaredError>,
     /// Per-included-file registry candidates, in walk order — the CLI face's
     /// `undefined_lint`/`unrecognized_error_code` candidates for the files
     /// whose rows wrap into `included_file_warning`.
@@ -1344,6 +1353,7 @@ struct MergeState {
     issues: Vec<OptionsIssue>,
     declared_rules: Vec<DeclaredRule>,
     declared_errors: Vec<DeclaredError>,
+    declared_cannot_ignore: Vec<DeclaredError>,
     included_groups: Vec<DeclarationGroup>,
     /// The initial file's resolved include edges — built into
     /// [`AnalysisOptions::included_edges`].
@@ -1644,6 +1654,7 @@ impl MergeState {
                 anchor_span: group_anchor,
                 rules: Vec::new(),
                 errors: Vec::new(),
+                cannot_ignore: Vec::new(),
                 includes: Vec::new(),
                 enabled_rules: Vec::new(),
                 disabled_rules: Vec::new(),
@@ -1711,11 +1722,15 @@ impl MergeState {
         if is_initial {
             self.issues.extend(local_issues(map, text));
             self.declared_errors.extend(declared_error_codes(map, text));
+            self.declared_cannot_ignore
+                .extend(declared_cannot_ignore_names(map, text));
         } else {
-            self.included_groups
+            let group = self
+                .included_groups
                 .last_mut()
-                .expect("the group registered above")
-                .errors = declared_error_codes(map, text);
+                .expect("the group registered above");
+            group.errors = declared_error_codes(map, text);
+            group.cannot_ignore = declared_cannot_ignore_names(map, text);
             for issue in local_issues(map, text) {
                 let inner_start = issue.offset;
                 let inner_end = inner_start.saturating_add(issue.length.saturating_sub(1));
@@ -1755,6 +1770,7 @@ impl MergeState {
             issues: self.issues,
             declared_rules: self.declared_rules,
             declared_errors: self.declared_errors,
+            declared_cannot_ignore: self.declared_cannot_ignore,
             included_groups: self.included_groups,
             included_edges: self.included_edges,
             plugins: self.plugins,
@@ -3650,6 +3666,46 @@ fn declared_error_codes(map: &serde_yaml::Mapping, text: &str) -> Vec<DeclaredEr
         });
     }
     codes
+}
+
+/// The `analyzer.cannot-ignore` string entries a file's own list declares
+/// (`_ParsedCannotIgnoreData.parse`, parse_model:346-405): string entries
+/// only, in declaration order, with the severity names dropped — the
+/// `error`/`info`/`warning` arms (case-sensitive, `severityMap` keys) skip
+/// the registry check upstream and can never report. The rest are
+/// `unrecognized_error_code` candidates, validity the caller's registry
+/// seam; non-string entries are `invalid_section_format` (reported by
+/// `local_issues`), never candidates.
+fn declared_cannot_ignore_names(map: &serde_yaml::Mapping, text: &str) -> Vec<DeclaredError> {
+    let mut names = Vec::new();
+    let Some(entries) = map
+        .get(Value::from("analyzer"))
+        .and_then(|analyzer| analyzer.as_mapping())
+        .and_then(|analyzer| analyzer.get(Value::from("cannot-ignore")))
+        .and_then(|entries| entries.as_sequence())
+    else {
+        return names;
+    };
+    // Per-occurrence anchoring like `declared_error_codes`: every string
+    // entry — recorded or severity-skipped — consumes its own occurrence, so
+    // a repeated name anchors at the occurrence being reported (every
+    // occurrence of an unknown name reports upstream).
+    let search_from = std::cell::Cell::new(text.find("cannot-ignore").unwrap_or(0));
+    for entry in entries {
+        let Some(name) = entry.as_str() else {
+            continue;
+        };
+        let (offset, length) = anchor_occurrence(text, "cannot-ignore", &search_from, name);
+        if severity_of_name(name).is_some() {
+            continue;
+        }
+        names.push(DeclaredError {
+            code: name.to_owned(),
+            offset,
+            length,
+        });
+    }
+    names
 }
 
 /// UTF-16 `(offset, length)` of `token`'s first occurrence in `text` — the

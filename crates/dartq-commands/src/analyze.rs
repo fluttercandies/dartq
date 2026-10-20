@@ -685,7 +685,11 @@ impl dartq_diagnostics::FileLayoutProvider for MergedRun<'_> {
 /// against the diagnostic universe plus the same lint universes
 /// (`unrecognized_error_code`; parse_model:558-585 — the check fires as the
 /// key is read, before the value is inspected, and a non-string scalar key
-/// reports unconditionally). The same `linter.rules` entries carry the value
+/// reports unconditionally), and the same two shapes' `analyzer.cannot-ignore`
+/// string entries — severity names (`error`/`info`/`warning`) skip the check
+/// upstream, every other spelling validates against the same universes
+/// (parse_model:346-405; the included files' rows wrap like every other
+/// inner row). The same `linter.rules` entries carry the value
 /// face and the enabled pass (`unsupported_value` / `incompatible_lint` /
 /// `duplicate_rule`; parse_model.dart:1272-1284, 1379-1408 — the value row
 /// is registry-gated like `undefined_lint`, and the pass walks the enabled
@@ -731,6 +735,14 @@ fn options_registry_rows(
                 }
             }
             for error in &group.errors {
+                if !analysis_options::is_known_diagnostic_code(&error.code)
+                    && !is_known_lint_name(&error.code)
+                {
+                    let inner = analysis_options::OptionsIssue::unrecognized_error_code(error);
+                    rows.push(group.wrap_row(&inner).to_diagnostic(file));
+                }
+            }
+            for error in &group.cannot_ignore {
                 if !analysis_options::is_known_diagnostic_code(&error.code)
                     && !is_known_lint_name(&error.code)
                 {
@@ -898,6 +910,16 @@ fn options_registry_rows(
             }
         }
         for error in &options.declared_errors {
+            if !analysis_options::is_known_diagnostic_code(&error.code)
+                && !is_known_lint_name(&error.code)
+            {
+                rows.push(
+                    analysis_options::OptionsIssue::unrecognized_error_code(error)
+                        .to_diagnostic(file),
+                );
+            }
+        }
+        for error in &options.declared_cannot_ignore {
             if !analysis_options::is_known_diagnostic_code(&error.code)
                 && !is_known_lint_name(&error.code)
             {
@@ -1771,6 +1793,86 @@ mod tests {
                 ),
             ],
             "only the unknown code name and the non-string scalar report: {rows:?}"
+        );
+        for row in run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unrecognized_error_code")
+        {
+            assert_eq!(row.code.machine, "UNRECOGNIZED_ERROR_CODE");
+            assert_eq!(row.code.dtype, DiagnosticType::StaticWarning);
+            assert_eq!(row.correction, None);
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `cannot-ignore` arm of the same face (#2387): a list entry that
+    /// is neither a severity name nor a known diagnostic/lint code reports
+    /// `unrecognized_error_code` at its entry anchor (parse_model:346-405 —
+    /// the check rides the uppercased form; the severity arm skips it).
+    /// Oracle-probed 3.15 main, 2026-10-20: initial-file rows raw, WARNING,
+    /// value-token span, declaration order. The severity arm (`error`), a
+    /// registered lint name (`prefer_final_locals`), and a known diagnostic
+    /// (`undefined_identifier`) stay silent.
+    #[test]
+    fn run_overlaid_reports_unrecognized_error_code_rows_for_cannot_ignore() {
+        let root = workspace(
+            "analyze_cannot_ignore_unknown",
+            &[("lib/ok.dart", "var ok = 1;\n")],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let options_text = concat!(
+            "analyzer:\n",
+            "  cannot-ignore:\n",
+            "    - not_a_real_code_name\n",
+            "    - error\n",
+            "    - prefer_final_locals\n",
+            "    - undefined_identifier\n",
+            "    - also_fake_code\n",
+        );
+        std::fs::write(root.join("analysis_options.yaml"), options_text).expect("options");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+
+        let expected_path = root
+            .join("analysis_options.yaml")
+            .to_string_lossy()
+            .into_owned();
+        let rows: Vec<(String, &str, Severity, u32, u32)> = run
+            .diagnostics
+            .iter()
+            .map(|d| {
+                (
+                    run.layout.file_path(d.file).to_string_lossy().into_owned(),
+                    d.message.as_ref(),
+                    d.severity,
+                    d.range.offset,
+                    d.range.length,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    expected_path.clone(),
+                    "'not_a_real_code_name' isn't a recognized diagnostic code.",
+                    Severity::Warning,
+                    u32::try_from(options_text.find("not_a_real_code_name").expect("anchor"))
+                        .expect("u32"),
+                    20,
+                ),
+                (
+                    expected_path,
+                    "'also_fake_code' isn't a recognized diagnostic code.",
+                    Severity::Warning,
+                    u32::try_from(options_text.find("also_fake_code").expect("anchor"))
+                        .expect("u32"),
+                    14,
+                ),
+            ],
+            "only the unknown names report, in declaration order: {rows:?}"
         );
         for row in run
             .diagnostics
@@ -2692,6 +2794,58 @@ mod tests {
                 u32::try_from(options.find("top.yaml").expect("anchor")).expect("u32"),
             )],
             "the included file's row wraps at the branch's first directive"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The wrapped face of the same `cannot-ignore` arm (#2387): an unknown
+    /// name inside an included file reports through that file's reporter,
+    /// wrapping into `included_file_warning` at the branch's first include
+    /// directive in the initial file — the message names the included file
+    /// and the inner span's inclusive end (the oracle probe pins the
+    /// `opts.yaml(33..52)` form verbatim, 3.15 main, 2026-10-20). Severity,
+    /// lint, and known-code entries in the included list stay silent.
+    #[test]
+    fn run_overlaid_wraps_unrecognized_error_code_rows_from_included_files() {
+        let root = workspace(
+            "analyze_cannot_ignore_wrapped",
+            &[("lib/ok.dart", "var ok = 1;\n")],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let inc = concat!(
+            "analyzer:\n",
+            "  cannot-ignore:\n",
+            "    - another_unknown_code\n",
+            "    - error\n",
+            "    - prefer_final_locals\n",
+        );
+        std::fs::write(root.join("inc.yaml"), inc).expect("inc.yaml");
+        let options = "include: inc.yaml\n";
+        std::fs::write(root.join("analysis_options.yaml"), options).expect("options");
+        let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = run_overlaid(&mut engine, &[], std::slice::from_ref(&root)).expect("run");
+
+        let wrapped: Vec<(String, u32)> = run
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "included_file_warning")
+            .map(|d| (d.message.clone().into_owned(), d.range.offset))
+            .collect();
+        let inc_path = root.join("inc.yaml").display().to_string();
+        let inner_start =
+            u32::try_from(inc.find("another_unknown_code").expect("anchor")).expect("u32");
+        let inner_end = inner_start + "another_unknown_code".len() as u32 - 1;
+        assert_eq!(
+            wrapped,
+            vec![(
+                format!(
+                    "Warning in the included options file {inc_path}({inner_start}..{inner_end}): \
+                     'another_unknown_code' isn't a recognized diagnostic code."
+                ),
+                u32::try_from(options.find("inc.yaml").expect("anchor")).expect("u32"),
+            )],
+            "the included file's unknown name wraps at the branch's first directive"
         );
         std::fs::remove_dir_all(&root).ok();
     }
