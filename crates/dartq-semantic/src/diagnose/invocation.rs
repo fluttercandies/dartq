@@ -467,7 +467,24 @@ impl<'a> Engine<'a> {
                                 kind: ContainerKind::Class,
                             }
                         }
-                        other => other,
+                        // The accessor-read fall-through (`sub.key`): a bare
+                        // getter/field read carries no push-time type
+                        // (`member_declared_ty` answers fields only), but
+                        // the read's static type IS the accessor's declared
+                        // return — `receiver_static_ty`'s accessor face
+                        // answers it above, and an information-less head
+                        // whose read type names a container resolves the
+                        // member on that container exactly like the chained
+                        // face below (`_androidParams.key`, webview
+                        // android_webview_controller.dart:1131). Every
+                        // other answer keeps the prior dispatch.
+                        other => match (other, &receiver_ty) {
+                            (Receiver::Unknown, Ty::Named { name, .. }) => Receiver::Typed {
+                                type_name: *name,
+                                ty: receiver_ty,
+                            },
+                            _ => other,
+                        },
                     },
                     RowShape::Receiver(recv) => *recv,
                     // The resolved-prefix container member (`io.Directory
@@ -1180,6 +1197,102 @@ impl<'a> Engine<'a> {
     /// Opens an argument group: the top row is its callee — unless the group
     /// belongs to a `new`/`const`/implicit-creation reference, whose class
     /// name resolves as a type use, never an invocation.
+    /// The named selector a dot-preceded creation head spells (`broadcast`
+    /// in `Ctr<int>.broadcast(`): the identifier immediately before the
+    /// open paren, required to sit after a `.` — the mirror of
+    /// [`Engine::bare_creation_head_before`] for the selector posture its
+    /// left-guard rejects. ASCII-only walk, the same identifier shape.
+    fn named_selector_head_before(&self, open: u32) -> Option<(StringId, SourceRange)> {
+        let bytes = self.source.as_bytes();
+        let mut end = self.byte_of(open);
+        while end > 0
+            && (bytes[end - 1].is_ascii_alphanumeric() || bytes[end - 1] == b'_')
+        {
+            end -= 1;
+        }
+        let start = end;
+        if start == self.byte_of(open)
+            || start == 0
+            || bytes[start - 1] != b'.'
+            || !(bytes[start].is_ascii_alphabetic() || bytes[start] == b'_')
+        {
+            return None;
+        }
+        Some((
+            self.intern(&self.source[start..end]),
+            SourceRange {
+                offset: self.utf16_of(start),
+                length: open - self.utf16_of(start),
+            },
+        ))
+    }
+
+    /// The class segment a named-selector creation head spells (`C.named(`,
+    /// `C<int>.named(`): the identifier before the selector's `.` — across a
+    /// balanced `<…>` type-argument group when one sits between. `None` when
+    /// no dot precedes the selector (an unnamed `C(` head folds through its
+    /// own bare container row) or no identifier answers. ASCII-only walk,
+    /// the same identifier shape [`Engine::bare_creation_head_name`]
+    /// accepts.
+    fn creation_class_before(&self, selector: SourceRange) -> Option<(StringId, u32)> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(selector.offset);
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor == 0 || bytes[cursor - 1] != b'.' {
+            return None;
+        }
+        cursor -= 1;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor > 0 && bytes[cursor - 1] == b'>' {
+            let mut depth = 0usize;
+            while cursor > 0 {
+                let byte = bytes[cursor - 1];
+                cursor -= 1;
+                if byte == b'>' {
+                    depth += 1;
+                } else if byte == b'<' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+            if cursor == 0 {
+                return None;
+            }
+            while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+                cursor -= 1;
+            }
+        }
+        let end = cursor;
+        while cursor > 0
+            && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_')
+        {
+            cursor -= 1;
+        }
+        if cursor == end {
+            return None;
+        }
+        Some((self.intern(&self.source[cursor..end]), self.utf16_of(cursor)))
+    }
+
+    /// The creation argument group's open-paren offset: the first
+    /// non-trivia byte at or after the selector's end (whitespace only —
+    /// nothing else parses between a selector and its argument list). Every
+    /// row the group pushed starts at or after this offset.
+    fn creation_open_offset(&self, from: u32) -> u32 {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(from);
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        self.utf16_of(cursor)
+    }
+
     pub(crate) fn open_arguments(&mut self, open_offset: u32) {
         // F-C: an argument group right after a folded `super.` selector arms
         // the same invocation flag the merge's source peek set — this rider
@@ -1280,9 +1393,15 @@ impl<'a> Engine<'a> {
         self.invokes.push(callee);
         // The source-spelled fallback head: only when the row transport
         // dropped the callee outright. Strict adjacency (no trivia skip) —
-        // the commented-head shape keeps the under-report posture.
+        // the commented-head shape keeps the under-report posture. A
+        // dot-preceded word (`Ctr<int>.broadcast(` — the type-argument
+        // group demotes the head row to a `TypeUse` shape the callee
+        // filter skips) arms the same latch as the named-selector head:
+        // the unnamed face re-derives the dot left-guard and skips it,
+        // the named-selector creation fold consumes it.
         let bare_head = if callee.is_none() {
             self.bare_creation_head_before(open_offset)
+                .or_else(|| self.named_selector_head_before(open_offset))
         } else {
             None
         };
@@ -1334,12 +1453,70 @@ impl<'a> Engine<'a> {
         self.flush_unclaimed();
         self.flush_argument();
         let levels = self.arg_levels.pop();
+        let enum_const = levels.as_ref().is_some_and(|level| level.enum_const);
+        let bare_head = self.pending_bare_creation;
         self.check_arguments(levels, positional, close);
         self.pending_send = self
             .invokes
             .pop()
             .flatten()
             .map(|index| (index, close.end()));
+        // The named-selector implicit creation's fold (`C.named(...)`,
+        // `C<T>.named(...)`): the constructor-reference posture pushes no
+        // callee row — a resolving head is a type use whose `(Type,
+        // _)` arm returns without a row (the constructor-reference dispatch
+        // owns its faces), and the selector pushes none — so no send ever
+        // consumes the group and the argument rows stand as the enclosing
+        // initializer's window: a `var` declarator binds the LAST
+        // ARGUMENT's static type and the assignment faces read it as the
+        // creation's (probed `final c = Ctr.broadcast(sync: true)` binds
+        // `bool`; the oracle answers `Ctr`). The oracle's
+        // InstanceCreationExpression folds here: drain the group's rows to
+        // their pass-2 obligations (consume_send's same transport) and
+        // stack the creation's value row over the whole written span — the
+        // var window binds the class, the member faces resolve through the
+        // frozen SDK tables for the unindexed heads (`StreamController`).
+        // An unresolved head keeps its own pushed miss row's posture (the
+        // oracle's error-recovery creation type is invalid — the window
+        // stays wide, every face under-reports), and a nested named
+        // creation keeps the prior shape (its inner close consumed the
+        // head latch). The gate is the group's own evidence — an
+        // unconsumed send link, a non-enum level, and a bare head whose
+        // dot-preceded class segment resolves as a type: an ordinary send
+        // carries its callee link here, and the reduced parser's event
+        // order (the implicit-creation close can precede the argument
+        // close) makes a `ctor_pos` read unreliable at this point.
+        if self.pending_send.is_none()
+            && !enum_const
+            && let Some((_, selector_range)) = bare_head
+            && let Some((class, class_offset)) = self.creation_class_before(selector_range)
+            && matches!(self.type_resolution(class).0, TypeResolution::Type)
+        {
+            let open = self.creation_open_offset(selector_range.end());
+            let kept = self
+                .rows
+                .partition_point(|row| row.range.offset < open);
+            for row in self.rows.drain(kept..) {
+                self.deferred_miss_rows.push(row);
+            }
+            let range = SourceRange {
+                offset: class_offset,
+                length: close.end().saturating_sub(class_offset),
+            };
+            self.ur_register_creation(class_offset, range, class);
+            self.rows.push(Row {
+                name: class,
+                range,
+                qualified: false,
+                shape: RowShape::Receiver(Receiver::Created {
+                    name: class,
+                    kind: ContainerKind::Class,
+                }),
+                intent: Intent::Read,
+                write_op: None,
+                ty: Ty::named(class),
+            });
+        }
     }
 
     /// Starts a new argument in the open argument list (the row window the
@@ -2145,6 +2322,404 @@ impl<'a> Engine<'a> {
     }
 
 
+    /// The closed group's explicit super-constructor invocation, when it is
+    /// one: `Some((enclosing container, selector, bare))` — the selector
+    /// shape (`: super.named(...)`) answers through the pending candidate
+    /// the member merge latched (the folded value row tops the group and
+    /// its offset keys the candidate), the bare shape (`: super(...)`)
+    /// through the keyword receiver row the group open latched as
+    /// `callee_row`. `bare` marks that third geometry: at label time the
+    /// named-membership face (`Walk::check_named_argument`) already reads
+    /// the same callee row, so this walk leaves the label miss to it
+    /// whenever the table resolved. `super.new(...)` normalizes to the
+    /// unnamed face (`None` selector). An assignment shape (`super.name =
+    /// v`) opens no group, so it never reaches here.
+    fn super_invocation_callee(
+        &self,
+        level: &ArgLevel,
+    ) -> Option<(StringId, Option<StringId>, bool)> {
+        // The selector shape at the group's close: the fast parser opens the
+        // argument group before the dot-access event merges `super.n`, so
+        // the pending candidate (and the merged value row) do not exist yet
+        // — the unmerged member placeholder tops the group and the bare
+        // `super` keyword receiver directly below it names the container.
+        let callee = self.invokes.last().and_then(|slot| *slot);
+        if let Some(index) = callee
+            && let Some(row) = self.rows.get(index)
+            && row.qualified
+            && let RowShape::Bare(BareInfo::Plain { .. }) = row.shape
+            && let Some(below) = index.checked_sub(1).and_then(|i| self.rows.get(i))
+            && let RowShape::Receiver(Receiver::Super { container, .. }) = below.shape
+            && below.name == self.intern("")
+        {
+            let selector = (row.name != self.intern("new")).then_some(row.name);
+            return Some((container, selector, false));
+        }
+        // The merged shape (the dot-access fold ran early — the
+        // scanner-synthesized rider): the pending candidate the merge
+        // latched answers through the folded value row's offset.
+        let selector_row = self
+            .invokes
+            .last()
+            .and_then(|slot| *slot)
+            .and_then(|index| self.rows.get(index))
+            .map(|row| row.range.offset);
+        if let Some(offset) = selector_row
+            && let Some(candidate) = self
+                .pending_init_super
+                .iter()
+                .rev()
+                .find(|candidate| candidate.invoked && candidate.selector_offset == offset)
+        {
+            let selector = (candidate.name != self.intern("new")).then_some(candidate.name);
+            return Some((candidate.container, selector, false));
+        }
+        let index = level.callee_row?;
+        let row = self.rows.get(index)?;
+        match &row.shape {
+            RowShape::Receiver(Receiver::Super { container, .. })
+                if row.name == self.intern("") =>
+            {
+                Some((*container, None, true))
+            }
+            _ => None,
+        }
+    }
+
+    /// The explicit super-constructor invocation's argument faces
+    /// (`constructor_invocation_resolver.dart` resolves the
+    /// `SuperConstructorInvocation`, then `resolveArgumentsToParameters`
+    /// pairs the arguments): the resolved super constructor's formals
+    /// decide the count faces (`extra_positional_arguments[_could_be_named]`
+    /// / `not_enough_positional_arguments`) and the per-argument
+    /// assignability face at the argument's own span. The named-coverage
+    /// face splits by geometry: the bare callee-row shape's label misses
+    /// belong to `Walk::check_named_argument` (it reads the same row at
+    /// label time — `bare && super_container.is_some()` suppresses the
+    /// emit here), every selector shape and every empty-table face
+    /// (unresolved superclass, no `extends`) reports at this walk. An
+    /// unresolvable superclass or selector keeps the under-report posture
+    /// (the selector existence face, `undefined_constructor_in_initializer`,
+    /// reports separately at the list's close). `super.new(...)` selects
+    /// the unnamed face, the same filter the super-formal drain applies.
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+    pub(crate) fn check_super_invocation_arguments(
+        &mut self,
+        level: &ArgLevel,
+        positional: u16,
+        close: SourceRange,
+        container: StringId,
+        selector: Option<StringId>,
+        bare: bool,
+    ) {
+        let superclass = self
+            .index
+            .get(self.file)
+            .and_then(|f| f.container(container))
+            .and_then(|c| c.superclass);
+        let (mut formals, super_container, resolved_super) = match superclass {
+            Some(superclass) => {
+                match resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    superclass,
+                ) {
+                    Some((super_container, _)) => {
+                        let key = selector
+                            .filter(|name| *name != self.intern("new"))
+                            .unwrap_or(superclass);
+                        let Some(formals) =
+                            super_container.ctor_formals.get(&key).map(|f| (**f).clone())
+                        else {
+                            // A resolved class without the selector: the
+                            // `undefined_constructor_in_initializer` face
+                            // reports at the list's close, and the oracle
+                            // pairs no arguments against it.
+                            return;
+                        };
+                        (formals, Some(super_container), Some(superclass))
+                    }
+                    // The dead-edge super face (`resolver.dart`'s null
+                    // element arm): an unresolvable superclass — the
+                    // `extends Missing` shape, `EXTENDS_NON_CLASS` both
+                    // sides — resolves no super constructor, and the
+                    // oracle's `resolveArgumentList` pairs the arguments
+                    // against an EMPTY formal table (every named argument
+                    // undefined, every surplus positional extra; probed).
+                    // Only the unnamed face: a written selector over the
+                    // dead edge resolves against the implicit `Object`
+                    // and misses it — the existence face
+                    // (`undefined_constructor_in_initializer`) reports
+                    // alone, with NO argument faces (probed:
+                    // `super.delegate(p, x: 1)` over `extends Missing`).
+                    None if selector.is_none()
+                        && self.supertype_hop_dead(superclass, self.lib, self.file) =>
+                    {
+                        (
+                            Formals {
+                                positional: Box::default(),
+                                named: Box::default(),
+                            },
+                            None,
+                            None,
+                        )
+                    }
+                    // A hop the index cannot model (the oracle's full
+                    // world could relate it) keeps the under-report
+                    // posture; a written selector over any dead hop
+                    // defers to the existence face the same way.
+                    None => return,
+                }
+            }
+            // No `extends`: the implicit `Object` face declares no formals
+            // for the unnamed face (probed: `class D { D() : super(1, x: 2);
+            // }` reports the surplus and the undefined named against the
+            // empty table). A written selector misses on `Object` and
+            // reports only the existence face, like every dead hop.
+            None if selector.is_none() => (
+                Formals {
+                    positional: Box::default(),
+                    named: Box::default(),
+                },
+                None,
+                None,
+            ),
+            None => return,
+        };
+        // An untyped field formal (`this.name`) takes its field's declared
+        // type — the field may be declared after the constructor, so the
+        // whole-file member table answers it (the enum-constant walk
+        // applies the same face).
+        if let Some(super_container) = super_container {
+            for formal in formals.positional.iter_mut().chain(formals.named.iter_mut()) {
+                if formal.ty == Ty::UNKNOWN
+                    && let Some(entry) = super_container.members.get(&formal.name)
+                    && entry.kind == MemberKind::Field
+                    && !entry.is_static
+                {
+                    formal.ty = entry.var_ty;
+                }
+            }
+        }
+        // The count decisions and the per-argument walk mirror
+        // [`Engine::check_arguments`]: the deficit anchors after the last
+        // positional argument (the closing paren at an empty or named-only
+        // tail), the surplus at the first extra positional, the unknown
+        // named parameter at its label, each type mismatch at the
+        // argument's own span.
+        let named = level
+            .args
+            .iter()
+            .filter(|(name, ..)| name.is_some())
+            .count() as u16;
+        let Some(given) = positional.checked_sub(named) else {
+            return;
+        };
+        let mut given = usize::from(given);
+        let required = formals.positional.iter().filter(|f| f.required).count();
+        let capacity = formals.positional.len();
+        if required == 0 && capacity == 0 {
+            // The empty-table face: the oracle counts the arguments its
+            // parse attributes — a compound operand (a ternary value)
+            // leaves an unattributed zero-length window here that is no
+            // argument of the oracle's list, so only attributed positional
+            // windows count toward the surplus.
+            given = level
+                .args
+                .iter()
+                .filter(|(name, .., range)| name.is_none() && range.length > 0)
+                .count();
+        }
+        // The enclosing constructor's `super.` formals forward into the
+        // invocation: the surplus count adds the forwarded positionals
+        // (probed: `G(super.x) : super(1, 2, 3)` against `B(int x, int y)`
+        // reports "2 expected, but 4 found"), and the deficit face stays
+        // silent whenever any super formal exists — the coverage question
+        // belongs to the `super_formal_parameter_without_associated_*`
+        // faces (probed: `D(super.x) : super(1)` against `B(int x, int y)`
+        // reports that face alone, and `D({required super.z}) :
+        // super.named()` against `B.named(int x)` no deficit).
+        let open_site = self.open_ctor_site;
+        let super_formals_here: Vec<bool> = self
+            .pending_super_formals
+            .iter()
+            .filter(|(owner, ..)| open_site.is_some() && *owner == open_site)
+            .map(|(_, _, named, ..)| *named)
+            .collect();
+        let has_super_formals = !super_formals_here.is_empty();
+        if has_super_formals {
+            given += super_formals_here.iter().filter(|named| !**named).count();
+        }
+        if given < required && !has_super_formals {
+            let anchor = level
+                .args
+                .iter()
+                .filter(|(name, .., range)| name.is_none() && range.length > 0)
+                .next_back()
+                .map(|(.., range)| SourceRange {
+                    offset: range.offset + range.length,
+                    length: 1,
+                })
+                .or(level.first_label)
+                .unwrap_or(close);
+            // The name face carries the super constructor's display
+            // (`'Base.new'` for the unnamed face, `'Base.named'` for the
+            // selector — the oracle's probed message).
+            let mut ctor_text = self
+                .strings
+                .resolve(resolved_super.unwrap_or(self.intern("Object")))
+                .to_string();
+            if let Some(selector) = selector {
+                ctor_text.push('.');
+                ctor_text.push_str(self.strings.resolve(selector));
+            } else {
+                ctor_text.push_str(".new");
+            }
+            let (shape, a0, a1) = if required == 1 {
+                (ArgCountShape::NameSingular, ctor_text.clone(), String::new())
+            } else {
+                (
+                    ArgCountShape::NamePlural,
+                    required.to_string(),
+                    given.to_string(),
+                )
+            };
+            let code = SemanticCode::NotEnoughPositionalArguments(shape);
+            let message = match shape {
+                ArgCountShape::NamePlural => code.message3(&a0, &a1, &ctor_text),
+                _ => code.message(&a0, &a1),
+            };
+            self.emit_message_with_correction(code, anchor, message);
+        } else if given > capacity {
+            // The could-be-named verdict: the super constructor declares
+            // more named parameters than the call's distinct named
+            // arguments.
+            let distinct = level
+                .args
+                .iter()
+                .filter_map(|(name, ..)| *name)
+                .collect::<rustc_hash::FxHashSet<_>>()
+                .len();
+            let code = if formals.named.len() > distinct {
+                SemanticCode::ExtraPositionalArgumentsCouldBeNamed
+            } else {
+                SemanticCode::ExtraPositionalArguments
+            };
+            let mut seen = 0usize;
+            let mut surplus = None;
+            for (name, .., range) in &level.args {
+                if name.is_some() {
+                    continue;
+                }
+                seen += 1;
+                // A compound operand's window stays unattributed (a
+                // zero-length range) — the anchor degrades to the closing
+                // paren, the documented span divergence, never to a
+                // synthetic zero span.
+                if seen == capacity + 1 && range.length > 0 {
+                    surplus = Some(*range);
+                }
+            }
+            let anchor = (seen == given).then_some(surplus).flatten().unwrap_or(close);
+            let message = code.message(&capacity.to_string(), &given.to_string());
+            self.emit_message_with_correction(code, anchor, message);
+        }
+        let mut positional_index = 0usize;
+        for (name, ty, literal, range) in &level.args {
+            let formal = if let Some(n) = name {
+                match self.named_formal_for(&formals, *n) {
+                    Some(formal) => formal,
+                    None => {
+                        // The bare callee-row geometry's label misses are
+                        // `Walk::check_named_argument`'s (it resolves the
+                        // same table at label time) — this walk reports the
+                        // miss only where that face cannot see the callee.
+                        if !(bare && super_container.is_some()) {
+                            let text = self.strings.resolve(*n).to_string();
+                            let label = level
+                                .named_labels
+                                .iter()
+                                .find(|(label, _)| label == n)
+                                .map(|(_, range)| *range)
+                                .unwrap_or(*range);
+                            self.emit(SemanticCode::UndefinedNamedParameter, label, &text, "");
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                let formal = formals.positional.get(positional_index);
+                positional_index += 1;
+                match formal {
+                    Some(formal) => formal,
+                    None => continue,
+                }
+            };
+            // The name lattice decides the plain in-file pair the matrix
+            // cannot ([`Engine::check_arguments`]'s fallback).
+            let rejects = match self.assignable(*ty, formal.ty, *literal) {
+                Some(verdict) => !verdict,
+                None => match (*ty, formal.ty) {
+                    (
+                        Ty::Named {
+                            name: from,
+                            args: from_args,
+                            ..
+                        },
+                        Ty::Named {
+                            name: to,
+                            args: to_args,
+                            ..
+                        },
+                    ) if from_args == ArgListId::EMPTY && to_args == ArgListId::EMPTY => {
+                        self.name_world().decide_subtype(from, to) == Some(false)
+                    }
+                    _ => false,
+                },
+            };
+            if rejects {
+                let from_text = self.ty_display(*ty);
+                let to_text = self.ty_display(formal.ty);
+                let message =
+                    SemanticCode::ArgumentTypeNotAssignable.message3(&from_text, &to_text, "");
+                self.emit_message_with_correction(
+                    SemanticCode::ArgumentTypeNotAssignable,
+                    *range,
+                    message,
+                );
+            }
+        }
+    }
+
+    /// An untyped constructor formal's declared type is its field's own
+    /// (`this.name` initializes the field — `FieldFormalParameterElement
+    /// .type` is the field's type): the captured formal stays `Unknown`
+    /// when no annotation precedes it, so the whole-file member table
+    /// answers it (the field may be declared after the constructor). The
+    /// enum-constant walk applies the same face to the enum's selected
+    /// constructor.
+    fn patch_field_formals(&self, container: StringId, formals: &mut Formals) {
+        let Some(entry) = self
+            .index
+            .get(self.file)
+            .and_then(|f| f.container(container))
+        else {
+            return;
+        };
+        for formal in formals.positional.iter_mut().chain(formals.named.iter_mut()) {
+            if formal.ty == Ty::UNKNOWN
+                && let Some(member) = entry.members.get(&formal.name)
+                && member.kind == MemberKind::Field
+                && !member.is_static
+            {
+                formal.ty = member.var_ty;
+            }
+        }
+    }
+
     /// Pairs the closed argument list against the callee's declared formals:
     /// positional by index, named by spelling. The count decisions precede
     /// the assignability walk (`extra_positional_arguments[_could_be_named]`
@@ -2165,8 +2740,32 @@ impl<'a> Engine<'a> {
             self.check_enum_const_arguments(&level, positional, close);
             return;
         }
+        // The explicit super-constructor invocation (`: super(...)`,
+        // `: super.named(...)`) has no callee row the send machinery can
+        // walk — its argument faces run against the resolved super
+        // constructor's formals here, and the generic walk below keeps its
+        // existing (silent) posture.
+        if self.initializer_depth > 0
+            && let Some((container, selector, bare)) = self.super_invocation_callee(&level)
+        {
+            self.check_super_invocation_arguments(
+                &level, positional, close, container, selector, bare,
+            );
+        }
         let Some(callee) = self.invokes.last().and_then(|slot| *slot) else {
-            self.report_bare_creation_miss();
+            // A dot-preceded latch head is a named selector (`C.named(`),
+            // not an unnamed head — the latch also arms for the
+            // named-selector creation fold, whose class-segment
+            // resolution owns the spelling; the unnamed face skips it.
+            let dot_preceded = self
+                .pending_bare_creation
+                .is_some_and(|(_, range)| {
+                    let start = self.byte_of(range.offset);
+                    start > 0 && self.source.as_bytes()[start - 1] == b'.'
+                });
+            if !dot_preceded {
+                self.report_bare_creation_miss();
+            }
             return;
         };
         // The null-argument face runs before the row borrow opens (it
@@ -2464,12 +3063,18 @@ impl<'a> Engine<'a> {
                         | Receiver::Container {
                             name,
                             kind: ContainerKind::Class,
-                        } => self
-                            .index
-                            .get(self.file)
-                            .and_then(|f| f.container(name))
-                            .and_then(|c| c.ctor_formals.get(&row.name))
-                            .map(|f| (**f).clone()),
+                        } => {
+                            let formals = self
+                                .index
+                                .get(self.file)
+                                .and_then(|f| f.container(name))
+                                .and_then(|c| c.ctor_formals.get(&row.name))
+                                .map(|f| (**f).clone());
+                            formals.map(|mut formals| {
+                                self.patch_field_formals(name, &mut formals);
+                                formals
+                            })
+                        }
                         _ => None,
                     },
                 }
@@ -2480,12 +3085,18 @@ impl<'a> Engine<'a> {
             RowShape::Bare(BareInfo::Container {
                 name,
                 kind: ContainerKind::Class,
-            }) if !row.qualified => self
-                .index
-                .get(self.file)
-                .and_then(|f| f.container(*name))
-                .and_then(|c| c.ctor_formals.get(name))
-                .map(|f| (**f).clone()),
+            }) if !row.qualified => {
+                let formals = self
+                    .index
+                    .get(self.file)
+                    .and_then(|f| f.container(*name))
+                    .and_then(|c| c.ctor_formals.get(name))
+                    .map(|f| (**f).clone());
+                formals.map(|mut formals| {
+                    self.patch_field_formals(*name, &mut formals);
+                    formals
+                })
+            }
             RowShape::Member { recv } => self
                 .member_formals_full(recv, row.name)
                 .map(std::borrow::Cow::into_owned),
@@ -2913,6 +3524,36 @@ impl<'a> Engine<'a> {
                         None => {}
                     }
                 } else {
+                    // A function-type alias formal (`typedef Pred = bool
+                    // Function(String)`): the alias RHS is the written
+                    // signature the oracle decides against
+                    // (`_isFunctionSubtypeOf` unfolds the alias), so the
+                    // tear-off decides on the two signatures — not on the
+                    // alias head. No captured RHS (or an undecidable pair)
+                    // falls through to the ordinary face below.
+                    if let Some(alias_sig) = match formal.ty {
+                        Ty::Named {
+                            name,
+                            args: ArgListId::EMPTY,
+                            ..
+                        } => self.alias_fn_sig(name),
+                        _ => None,
+                    } {
+                        match self.fn_sig_subtype(&arg_sig, &alias_sig) {
+                            Some(true) => continue,
+                            Some(false) => {
+                                let code = SemanticCode::ArgumentTypeNotAssignable;
+                                let from_text = self.fn_sig_display(&arg_sig);
+                                let to_text = self.ty_display(formal.ty);
+                                let message = code.message3(&from_text, &to_text, "");
+                                let index = self.report.diagnostics.len();
+                                self.emit_message_with_correction(code, *range, message);
+                                self.pending_non_promotion.push((index, range.offset));
+                                continue;
+                            }
+                            None => {}
+                        }
+                    }
                     // A tear-off against a formal with no written function
                     // signature: a function value is assignable only to the
                     // function supertypes (`dynamic`, `Object`, `Function`,
