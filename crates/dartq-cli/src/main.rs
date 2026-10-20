@@ -263,6 +263,10 @@ struct CheckArgs {
     /// Off by default (`--fatal-infos` sets it) — mirrors the oracle.
     #[arg(long)]
     fatal_infos: bool,
+    /// The dartdev global flags, accepted and ignored — see
+    /// [`DartdevGlobals`].
+    #[command(flatten)]
+    dartdev_globals: DartdevGlobals,
     /// Targets; empty resolves to the current directory.
     #[arg(default_value = ".")]
     paths: Vec<PathBuf>,
@@ -406,6 +410,10 @@ struct AnalyzeArgs {
         value_parser = dartq_engine::store::parse_size_limit
     )]
     cache_size_limit: Option<u64>,
+    /// The dartdev global flags, accepted and ignored — see
+    /// [`DartdevGlobals`].
+    #[command(flatten)]
+    dartdev_globals: DartdevGlobals,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -421,6 +429,48 @@ enum AnalyzeFormat {
     /// Diagnostics only: workspace advisories print as one line on stderr
     /// ahead of it.
     Json,
+}
+
+/// The dartdev global flags, accepted and ignored on the diagnostic faces
+/// (ticket #2385, the cli-compat Flag-face P2). Upstream declares them on
+/// the runner's global parser (`upstream Dart SDK source,
+/// pkg/dartdev/lib/src/utils.dart`, `globalDartdevOptionsParser`), and the
+/// global parse is merged past the command name, so they are accepted
+/// positioned *after* the subcommand — `dart analyze --suppress-analytics`
+/// is the standard CI incantation. dartq runs no analytics/telemetry layer
+/// and no verbose logger, so the flags change nothing. Hidden, matching
+/// the oracle's `analyze --help` face where the globals don't appear.
+/// Known upstream corner, not replicated: `--suppress-analytics` combined
+/// with `--enable-analytics`/`--disable-analytics` is an analytics-layer
+/// usage error (exit 254) upstream; dartq has no analytics layer to
+/// conflict with. The `-v` abbreviation upstream is not taken here — it
+/// stays dartq's `--verbosity` short (the `-v`/`--verbose` collision is a
+/// deferred compat-policy decision).
+#[derive(Args, Default)]
+#[expect(clippy::struct_excessive_bools)] // the bools are independent clap flags; an enum decomposition would obscure the mapping
+struct DartdevGlobals {
+    /// Upstream's global verbose logger (declared with the `-v`
+    /// abbreviation there; only the long spelling is accepted here).
+    #[arg(long, hide = true)]
+    verbose: bool,
+    /// Declared by the global parser but never read past command dispatch
+    /// upstream — no version print, no exit (dartq's version face is the
+    /// root-level `--version` / `version`, which this does not touch).
+    #[arg(long, hide = true)]
+    version: bool,
+    /// Upstream turns analytics on for this run.
+    #[arg(long, hide = true)]
+    enable_analytics: bool,
+    /// Upstream turns analytics off for this run.
+    #[arg(long, hide = true)]
+    disable_analytics: bool,
+    /// Upstream's tool diagnostic output switch.
+    #[arg(long, hide = true)]
+    diagnostics: bool,
+    /// Disallow analytics for this run without changing the analytics
+    /// configuration.
+    #[arg(long, hide = true)]
+    suppress_analytics: bool,
 }
 
 /// The machine rows' output volume (the token-cost sweep's tier axis); the
@@ -2306,6 +2356,92 @@ mod tests {
         assert!(!error.use_stderr());
     }
 
+    /// The dartdev global flags parse on both diagnostic faces and stay
+    /// no-ops (ticket #2385, the cli-compat Flag-face P2). Upstream
+    /// declares them on the global dartdev parser (`upstream Dart SDK
+    /// source, pkg/dartdev/lib/src/utils.dart`,
+    /// `globalDartdevOptionsParser`) and merges the global parse past the
+    /// command name, so the CI incantation `dart analyze
+    /// --suppress-analytics` runs to the diagnostic-tier exit; `--version`
+    /// is declared but never read past dispatch (no print, no exit). Each
+    /// flag lands on exactly its own ignored field and never disturbs the
+    /// positional targets; a genuinely unknown flag still takes the
+    /// exit-64 usage path.
+    #[test]
+    fn dartdev_globals_accepted_and_ignored() {
+        // Declaration order per `globalDartdevOptionsParser`.
+        const GLOBALS: [&str; 6] = [
+            "--verbose",
+            "--version",
+            "--enable-analytics",
+            "--disable-analytics",
+            "--diagnostics",
+            "--suppress-analytics",
+        ];
+        for (index, flag) in GLOBALS.iter().enumerate() {
+            let Command::Analyze(analyze) = parse_args_of(&["analyze", flag, "/pkg"])
+                .unwrap_or_else(|error| panic!("{flag} must parse on analyze: {error}"))
+                .expect("subcommand")
+            else {
+                panic!("expected analyze command")
+            };
+            let fields = [
+                analyze.dartdev_globals.verbose,
+                analyze.dartdev_globals.version,
+                analyze.dartdev_globals.enable_analytics,
+                analyze.dartdev_globals.disable_analytics,
+                analyze.dartdev_globals.diagnostics,
+                analyze.dartdev_globals.suppress_analytics,
+            ];
+            assert!(fields[index], "{flag} must land on its own no-op field");
+            assert_eq!(
+                fields.iter().filter(|set| **set).count(),
+                1,
+                "exactly the invoked flag is set"
+            );
+            assert_eq!(
+                analyze.targets,
+                vec![PathBuf::from("/pkg")],
+                "{flag} must not consume the target positional"
+            );
+
+            let check = check_args(&["check", flag, "/tmp/a"]);
+            assert_eq!(
+                check.paths,
+                vec![PathBuf::from("/tmp/a")],
+                "{flag} must not consume the target positional (check)"
+            );
+            let fields = [
+                check.dartdev_globals.verbose,
+                check.dartdev_globals.version,
+                check.dartdev_globals.enable_analytics,
+                check.dartdev_globals.disable_analytics,
+                check.dartdev_globals.diagnostics,
+                check.dartdev_globals.suppress_analytics,
+            ];
+            assert!(
+                fields[index],
+                "{flag} must land on its own no-op field (check)"
+            );
+            assert_eq!(
+                fields.iter().filter(|set| **set).count(),
+                1,
+                "exactly the invoked flag is set (check)"
+            );
+        }
+
+        // The acceptance is not a wildcard: a flag outside the oracle's
+        // global set still fails on the same faces (the exit-64 usage
+        // path).
+        for args in [
+            &["analyze", "--suppress-analytics", "--bogus", "/pkg"][..],
+            &["analyze", "--verbose", "-x", "/pkg"][..],
+            &["check", "--suppress-analytics", "--bogus", "/tmp/a"][..],
+        ] {
+            assert!(parse_args_of(args).is_err(), "must reject {args:?}");
+        }
+    }
+
     /// The compatibility face's `--context` flag: repeatable labels,
     /// `--sdk-root` unchanged alongside.
     #[test]
@@ -2414,6 +2550,7 @@ mod tests {
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
+            dartdev_globals: DartdevGlobals::default(),
             paths: vec![root.clone()],
         };
         assert_eq!(check(&args), exit::FATAL_WARNINGS);
@@ -2446,6 +2583,7 @@ mod tests {
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
+            dartdev_globals: DartdevGlobals::default(),
             paths: vec![root.clone()],
         };
         // broken.dart has one scanner/parsed syntax error → exit 3
@@ -2485,6 +2623,7 @@ mod tests {
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
+            dartdev_globals: DartdevGlobals::default(),
             paths: vec![root.clone()],
         };
         assert_eq!(check(&args), exit::ERRORS);
@@ -2584,6 +2723,7 @@ mod tests {
             fatal_warnings: false,
             no_fatal_warnings: false,
             fatal_infos: false,
+            dartdev_globals: DartdevGlobals::default(),
             paths: vec![root.join("notes.txt")],
         };
         assert_eq!(check(&args), exit::CLEAN);
@@ -2863,6 +3003,7 @@ mod tests {
             use_aot_snapshot: false,
             no_use_aot_snapshot: false,
             memory: false,
+            dartdev_globals: DartdevGlobals::default(),
         }
     }
 
