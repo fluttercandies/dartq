@@ -13,7 +13,9 @@
 use super::*;
 use crate::collector::collect;
 use dartq_language::{FeatureSet, LanguageVersion};
-use dartq_resolution::{Combinators, ImportEdge, LibraryClassModifiers, LibraryGraphBuilder, Namespaces};
+use dartq_resolution::{
+    Combinators, ImportEdge, LibraryClassModifiers, LibraryGraphBuilder, Namespaces,
+};
 use dartq_scanner::ScanConfig;
 use dartq_source::FileTable;
 use std::path::Path;
@@ -133,7 +135,11 @@ fn unimported_enum_scrutinee_suppresses_the_covering_row() {
         "enum K { a, b }",
         false,
     );
-    assert!(family_codes(&report).is_empty(), "{:?}", family_codes(&report));
+    assert!(
+        family_codes(&report).is_empty(),
+        "{:?}",
+        family_codes(&report)
+    );
 }
 
 /// The same shape with the import intact stays the ordinary verdict: a
@@ -163,7 +169,11 @@ fn imported_enum_full_coverage_stays_silent() {
         "enum K { a, b }",
         true,
     );
-    assert!(family_codes(&report).is_empty(), "{:?}", family_codes(&report));
+    assert!(
+        family_codes(&report).is_empty(),
+        "{:?}",
+        family_codes(&report)
+    );
 }
 
 /// The analyzer corpus' nullability face (the `var origin? => …, null => …`
@@ -179,22 +189,29 @@ fn unimported_nullable_scrutinee_suppresses_the_unreachable_row() {
         "class U {}",
         false,
     );
-    assert!(family_codes(&report).is_empty(), "{:?}", family_codes(&report));
+    assert!(
+        family_codes(&report).is_empty(),
+        "{:?}",
+        family_codes(&report)
+    );
 }
 
-/// The same nullable-scrutinee shape with the import intact: the promoted
-/// non-null half makes the `null` arm unreachable exactly as the oracle
-/// reports it — the gate keeps the row (the head resolves).
+/// The same nullable-scrutinee shape with the import intact: the
+/// null-check arm's space is the subpattern space ∩ nonNull — never
+/// `null` itself (official `createNullCheckSpace`, upstream Dart SDK
+/// source, pkg/_fe_analyzer_shared/lib/src/exhaustiveness/shared.dart:
+/// 780-786) — so `case null:` stays live and the switch reports no
+/// reachability row (#2354: the pre-fix nullable leaf false-positived
+/// exactly this row).
 #[test]
-fn imported_nullable_scrutinee_keeps_the_unreachable_row() {
+fn imported_nullable_scrutinee_keeps_the_switch_open() {
     let report = switch_report(
         "import 'kit.dart'; int g(U? u) { switch (u) { case var v?: return 1; case null: return 0; } }",
         "class U {}",
         true,
     );
-    assert_eq!(
-        family_codes(&report),
-        ["unreachable_switch_case"],
+    assert!(
+        family_codes(&report).is_empty(),
         "{:?}",
         family_codes(&report)
     );
@@ -209,7 +226,11 @@ fn unimported_enum_scrutinee_suppresses_the_expression_face() {
         "enum K { a, b }",
         false,
     );
-    assert!(family_codes(&report).is_empty(), "{:?}", family_codes(&report));
+    assert!(
+        family_codes(&report).is_empty(),
+        "{:?}",
+        family_codes(&report)
+    );
 }
 
 /// A resolved enum scrutinee with a missing constant on the expression
@@ -240,5 +261,9 @@ fn ordinary_class_scrutinee_keeps_the_silent_posture() {
         "class C {}",
         true,
     );
-    assert!(family_codes(&report).is_empty(), "{:?}", family_codes(&report));
+    assert!(
+        family_codes(&report).is_empty(),
+        "{:?}",
+        family_codes(&report)
+    );
 }

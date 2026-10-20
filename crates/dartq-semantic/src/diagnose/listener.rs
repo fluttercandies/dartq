@@ -4330,10 +4330,15 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn handle_null_assert_pattern(&mut self, bang: Token) {
-        // `p!` covers the non-null side of the context.
+        // `p!` promotes the matched arm non-null on the matched path.
         self.engine.pattern_bind_dirty = true;
         let engine = &mut self.engine;
         engine.check_null_pattern(bang.range, true);
+        // `p!` = the subpattern space ∩ nonNull, unioned with `null`
+        // (official `createNullAssertSpace`, upstream Dart SDK source,
+        // pkg/_fe_analyzer_shared/lib/src/exhaustiveness/shared.dart:790-797):
+        // the null side stays covered, so every case after a `p!` over a
+        // nullable scrutinee is unreachable.
         let leaf = match NameTy::from_semantic(
             engine
                 .switch
@@ -4341,7 +4346,9 @@ impl ParserListener for DiagnoseListener<'_> {
                 .last()
                 .map_or(Ty::Unknown, |c| c.scrutinee),
         ) {
-            NameTy::Named(name, _) => Restriction::Named(name, false),
+            NameTy::Named(name, _) => {
+                Restriction::Union(vec![Restriction::Named(name, false), Restriction::Null])
+            }
             _ => Restriction::Unknown,
         };
         engine.pattern_leaf(leaf);
@@ -4352,9 +4359,13 @@ impl ParserListener for DiagnoseListener<'_> {
         // matched arm non-null and joins the null arm into the unmatched
         // chain (official `_handleNullCheckPattern`).
         self.flow().handle_null_check_pattern(question);
-        // `p?` covers the context values plus `null` (`nullCheckToSpace`):
-        // a nullable context already covers null; a non-null context
-        // unions with it.
+        // `p?` = the subpattern space ∩ nonNull (official
+        // `createNullCheckSpace`, upstream Dart SDK source,
+        // pkg/_fe_analyzer_shared/lib/src/exhaustiveness/shared.dart:780-786;
+        // `_createStaticTypeWithContext` applies `.nonNullable` to the
+        // context type in both nullable and non-nullable contexts): null is
+        // NOT covered, so a later `case null:` stays live and this arm
+        // alone never exhausts the switch.
         let engine = &mut self.engine;
         engine.pattern_bind_dirty = true;
         engine.check_null_pattern(question.range, false);
@@ -4365,10 +4376,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 .last()
                 .map_or(Ty::Unknown, |c| c.scrutinee),
         ) {
-            NameTy::Named(name, true) => Restriction::Named(name, true),
-            NameTy::Named(name, false) => {
-                Restriction::Union(vec![Restriction::Named(name, false), Restriction::Null])
-            }
+            NameTy::Named(name, _) => Restriction::Named(name, false),
             _ => Restriction::Unknown,
         };
         engine.pattern_leaf(leaf);
