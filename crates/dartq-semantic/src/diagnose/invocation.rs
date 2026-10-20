@@ -1235,14 +1235,54 @@ impl<'a> Engine<'a> {
         else {
             return;
         };
-        let Some((super_container, _)) = resolve_container(
+        let resolved = resolve_container(
             self.graph,
             self.namespaces,
             self.index,
             self.lib,
             self.file,
             superclass,
-        ) else {
+        )
+        .or_else(|| {
+            // The container's superclass edge keeps the bare continuation
+            // name only (the collector's qualified-extends capture: `p.S`
+            // stores `S`), so a prefix-only import misses the bare lookup.
+            // The oracle resolves the same spelling qualified, so retry the
+            // library's registered prefixes — first hit wins — and run the
+            // ordinary membership face on it.
+            self.graph.import_edges(self.lib).iter().find_map(|edge| {
+                let prefix = edge.prefix?;
+                prefixed_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    prefix,
+                    superclass,
+                )
+            })
+        });
+        let Some((super_container, _)) = resolved else {
+            // The dead-edge Object fallback (upstream Dart SDK source,
+            // `error_verifier.dart`'s unresolved-superclass walk): a truly
+            // undefined superclass resolves no element, so the check walks
+            // the implicit Object supertype — the unnamed `super()` face is
+            // satisfied there, and a written named selector misses Object
+            // and reports. A merely unindexed declaration (the synthetic
+            // SDK face the oracle resolves for real) keeps the under-report
+            // posture.
+            if name != self.intern("new")
+                && self.supertype_hop_dead(superclass, self.lib, self.file)
+            {
+                let class_text = self.strings.resolve(superclass).to_string();
+                let name_text = self.strings.resolve(name).to_string();
+                self.emit(
+                    SemanticCode::UndefinedConstructorInInitializer,
+                    span,
+                    &class_text,
+                    &name_text,
+                );
+            }
             return;
         };
         if super_container.constructors.contains(&name) {
@@ -1868,6 +1908,7 @@ impl<'a> Engine<'a> {
             return;
         }
         let mark = level.mark;
+        let hi = self.rows.len();
         let name = level.pending_name;
         let hi = self.rows.len();
         let arg = if hi == mark {
@@ -2948,6 +2989,77 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The bare-invocation head that names a type alias the creation can
+    /// never build on (`typedef DioMediaType = MediaType;` with the RHS
+    /// unresolved — the head is a type, not a value, so the oracle's plain
+    /// method invocation reports `invocation_of_non_function` at the head,
+    /// element_resolver.dart's function-invocation face). `true` when the
+    /// row emitted and the miss handler must stay silent; `false` leaves
+    /// the latch to [`Engine::report_bare_creation_miss`].
+    pub(crate) fn report_alias_invocation_of_non_function(&mut self) -> bool {
+        let Some((name, range)) = self.pending_bare_creation else {
+            return false;
+        };
+        // The gate asks only about visible type aliases; every other head
+        // shape keeps its existing face.
+        if !matches!(
+            self.top_level_decl(name).as_deref(),
+            Some(decl) if decl.kind == MicroKind::TypeAlias
+        ) {
+            return false;
+        }
+        if self.alias_creation_grounded(name, 0) {
+            return false;
+        }
+        let name_text = self.strings.resolve(name).to_string();
+        self.emit(SemanticCode::InvocationOfNonFunction, range, &name_text, "");
+        true
+    }
+
+    /// Whether the bare creation `name(...)` can build on the alias chain:
+    /// the right-hand type grounds in a container (a class creation through
+    /// the alias), a dart:core primitive, or a non-alias declaration. The
+    /// walk rides the this-file captures only — a foreign alias's RHS is
+    /// invisible, the verdict stays undecided and the face keeps silent
+    /// (the creation faces' under-report posture); the ≤8-hop bound ends
+    /// recovered cycles.
+    fn alias_creation_grounded(&self, name: StringId, depth: u8) -> bool {
+        match self.bounds.alias_named_shape(name) {
+            // No named capture: a this-file function-shaped RHS is decided
+            // (`Binary(1, 2)` over `typedef Binary = int Function(int, int)`
+            // is the registry's own non-function example — emit), a foreign
+            // alias's invisible RHS is undecided (keep silent).
+            None => self.bounds.alias_fn_shape(name).is_none(),
+            Some((_, tree)) if depth < 8 => {
+                let head = tree.head;
+                if resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    head,
+                )
+                .is_some()
+                    || self.members.primitive_ids.contains(&head)
+                {
+                    return true;
+                }
+                match self.top_level_decl(head).as_deref() {
+                    // A visible non-alias declaration grounds the chain.
+                    Some(decl) if decl.kind != MicroKind::TypeAlias => true,
+                    // Another alias: keep hopping.
+                    Some(_) => self.alias_creation_grounded(head, depth + 1),
+                    // Nothing grounds the head: the alias names a type this
+                    // unit cannot build on.
+                    None => false,
+                }
+            }
+            // The hop bound hit first: undecided, keep silent.
+            Some(_) => true,
+        }
+    }
+
     /// Pairs the closed argument list against the callee's declared formals:
     /// positional by index, named by spelling. The count decisions precede
     /// the assignability walk (`extra_positional_arguments[_could_be_named]`
@@ -2991,7 +3103,7 @@ impl<'a> Engine<'a> {
                     let start = self.byte_of(range.offset);
                     start > 0 && self.source.as_bytes()[start - 1] == b'.'
                 });
-            if !dot_preceded {
+            if !dot_preceded && !self.report_alias_invocation_of_non_function() {
                 self.report_bare_creation_miss();
             }
             return;
@@ -4134,6 +4246,28 @@ impl<'a> Engine<'a> {
                 // A `Function`-typed value is the function-type supertype —
                 // callable.
                 if self.strings.resolve(*name) == "Function" {
+                    return;
+                }
+                // The callee that SPELLS a type alias (`DioMediaType(...)`)
+                // is a type used as a value: upstream resolves the
+                // identifier to the alias element and reports
+                // `invocation_of_non_function` at the spelling
+                // (element_resolver.dart's function-invocation face). The
+                // row's own type is already the alias EXPANSION head
+                // (`Named(MediaType)` under `typedef DioMediaType =
+                // MediaType;`), so the question rides the source spelling;
+                // every other callee shape (a variable, a member) keeps its
+                // spelling and the leg below never fires for it.
+                if let Some(spelled) = self.bare_creation_head_name(row.range)
+                    && matches!(
+                        self.top_level_decl(spelled).as_deref(),
+                        Some(decl) if decl.kind == MicroKind::TypeAlias
+                    )
+                    && !self.alias_creation_grounded(spelled, 0)
+                {
+                    let name_text = self.strings.resolve(spelled).to_string();
+                    let range = row.range;
+                    self.emit(SemanticCode::InvocationOfNonFunction, range, &name_text, "");
                     return;
                 }
                 // A parameterized function-type alias is callable the same

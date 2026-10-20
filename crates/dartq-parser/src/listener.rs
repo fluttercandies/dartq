@@ -226,6 +226,13 @@ pub enum IdentifierContext {
     NamedRecordFieldReference,
     /// `namedArgumentReference`.
     NamedArgumentReference,
+    /// An object-pattern field label (`guard` in `case Foo(guard: v)`) —
+    /// the official parser reuses `namedArgumentReference` for the parse
+    /// event (parser_impl.dart `parseObjectPatternRest`), but the label is
+    /// a pattern field name, not an argument: the analyzer's resolver
+    /// never opens an argument for it. This context is the diagnostic-tier
+    /// discriminator so the named-argument faces stay silent on labels.
+    PatternFieldName,
     /// `localVariableDeclaration`.
     LocalVariableDeclaration,
     /// `literalSymbol`: the first identifier of a literal symbol's dotted
@@ -318,6 +325,11 @@ impl IdentifierContext {
                 | Self::MetadataReference
                 | Self::MetadataContinuation
                 | Self::NamedArgumentReference
+                // The object-pattern field label rides the official
+                // `namedArgumentReference` event shape, whose
+                // `ensureIdentifier` runs the same await/yield check
+                // (identifier_context_impl.dart:1223).
+                | Self::PatternFieldName
                 | Self::NamedRecordFieldReference
         )
     }

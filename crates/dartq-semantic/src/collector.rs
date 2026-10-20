@@ -2687,7 +2687,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         self.end_function_type(token, question);
     }
 
-    fn begin_formal_parameters(&mut self, _token: Token, _kind: ParserMemberKind) {
+    fn begin_formal_parameters(&mut self, _token: Token, kind: ParserMemberKind) {
         let builder = &mut self.builder;
         // A formal list under a function-type level is the shape's own
         // formal region: everything before it is the written return type.
@@ -2696,7 +2696,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         {
             site.function_formals_begin();
         }
-        if builder.formal_depth == 0 {
+        // A depth-0 generalized-function-type group is a type shape, never
+        // the executable's own formals: `int Function() topFn(int x)` parses
+        // the return annotation's `()` before the name, and letting it run
+        // the depth-0 prep would attach its EMPTY formals first-wins and
+        // discard the real group that follows.
+        if builder.formal_depth == 0 && kind != ParserMemberKind::GeneralizedFunctionType {
             builder.positional_formals.clear();
             builder.named_formals.clear();
             // An operator declaration's name token is the operator spelling
@@ -2735,11 +2740,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         _count: usize,
         _begin: Token,
         _end: Token,
-        _kind: ParserMemberKind,
+        kind: ParserMemberKind,
     ) {
         let builder = &mut self.builder;
         builder.formal_depth -= 1;
-        if builder.formal_depth == 0 {
+        // Symmetric with the begin guard: a depth-0 function-type group
+        // leaves the executable's formals slot untouched for the real
+        // parameter list that follows it.
+        if builder.formal_depth == 0 && kind != ParserMemberKind::GeneralizedFunctionType {
             builder.attach_formals();
         }
     }
@@ -3480,6 +3488,56 @@ mod tests {
                 args: ArgListId::EMPTY,
             }
         );
+    }
+
+    /// A function-typed RETURN annotation must not consume the
+    /// executable's depth-0 formals attach: `int Function() topFn(int x)`
+    /// parses the annotation's empty `()` before the name, and the real
+    /// parameter list that follows keeps the slot (first-wins would
+    /// otherwise record zero formals and misreport every call's arity).
+    #[test]
+    fn fn_typed_return_annotation_keeps_real_formals() {
+        let strings = StringTable::new();
+        let elements = build(
+            "int Function() topFn(Task task, int sched) => f; \
+             void f() {} \
+             class Task {} \
+             class C { \
+               void Function() m(Task task, int sched) => f; \
+               int Function()? n([int opt = 1]) => null; \
+               int Function() field = f; \
+               void body() { \
+                 int Function(int inner) local = f; \
+               } \
+             }",
+            &strings,
+        );
+        let names = |formals: &Option<Box<Formals>>| -> Vec<String> {
+            formals
+                .as_ref()
+                .map(|f| {
+                    f.positional
+                        .iter()
+                        .chain(f.named.iter())
+                        .map(|formal| strings.resolve(formal.name).to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let top = elements.decl(id(&strings, "topFn")).expect("topFn");
+        assert_eq!(names(&top.formals), ["task", "sched"]);
+        let members = &elements
+            .container(id(&strings, "C"))
+            .unwrap()
+            .members;
+        let m = members.get(&id(&strings, "m")).expect("m");
+        assert_eq!(names(&m.formals), ["task", "sched"]);
+        let n = members.get(&id(&strings, "n")).expect("n");
+        assert_eq!(names(&n.formals), ["opt"]);
+        // Field and body-local function types leave no stale formals
+        // behind for the next executable's attach.
+        let body = members.get(&id(&strings, "body")).expect("body");
+        assert_eq!(names(&body.formals), Vec::<String>::new());
     }
 
     /// Declaration-arity violations: the operator parameter count table,

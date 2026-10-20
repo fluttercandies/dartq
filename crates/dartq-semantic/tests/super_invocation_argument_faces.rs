@@ -565,3 +565,210 @@ fn empty_table_counts_only_attributed_positional_windows() {
          named argument)"
     );
 }
+
+// --- the unresolved-superclass Object fallback (`undefined_constructor_in_initializer`) ---
+//
+// The superclass itself unresolvable (the `Missing` posture the sibling
+// fixtures share) suppresses the ordinary selector check, but the oracle
+// keeps walking: the implicit `super()` is satisfied by Object's unnamed
+// constructor, while a *written named* selector misses Object and reports
+// (upstream Dart SDK source, `error_verifier.dart`'s
+// unresolved-superclass walk feeding `visitSuperConstructorInvocation`).
+
+const UCII_NAMED_OVER_UNDEFINED: &str = "\
+class Host extends Missing {
+  Host() : super.named();
+}
+";
+
+#[test]
+fn named_super_selector_over_undefined_superclass_reports() {
+    let strings = StringTable::new();
+    let fold = unit_fold(UCII_NAMED_OVER_UNDEFINED, &strings);
+    let got = code_lines(
+        &fold.report,
+        UCII_NAMED_OVER_UNDEFINED,
+        &["undefined_constructor_in_initializer"],
+    );
+    assert_eq!(
+        got,
+        vec![(
+            "undefined_constructor_in_initializer".to_string(),
+            line_of_needle(UCII_NAMED_OVER_UNDEFINED, "super.named")
+        )],
+        "a written named selector over an undefined superclass falls through \
+         to Object and misses — the oracle reports at the initializer's span"
+    );
+}
+
+const UCII_UNNAMED_OVER_UNDEFINED: &str = "\
+class Host extends Missing {
+  Host() : super();
+}
+";
+
+#[test]
+fn unnamed_super_over_undefined_superclass_stays_silent() {
+    let strings = StringTable::new();
+    let fold = unit_fold(UCII_UNNAMED_OVER_UNDEFINED, &strings);
+    let got = code_lines(
+        &fold.report,
+        UCII_UNNAMED_OVER_UNDEFINED,
+        &["undefined_constructor_in_initializer"],
+    );
+    assert_eq!(
+        got, vec![],
+        "the implicit super() face is satisfied by Object's unnamed \
+         constructor — no report"
+    );
+}
+
+const UCII_NAMED_OVER_RESOLVED: &str = "\
+class Base {
+  Base.named();
+}
+
+class Host extends Base {
+  Host() : super.named();
+}
+";
+
+#[test]
+fn named_super_selector_over_resolved_superclass_stays_silent() {
+    let strings = StringTable::new();
+    let fold = unit_fold(UCII_NAMED_OVER_RESOLVED, &strings);
+    let got = code_lines(
+        &fold.report,
+        UCII_NAMED_OVER_RESOLVED,
+        &["undefined_constructor_in_initializer"],
+    );
+    assert_eq!(
+        got, vec![],
+        "the fallback arm only covers unresolvable superclasses — a resolved \
+         named constructor is the ordinary satisfied path"
+    );
+}
+
+/// The two-file rig for the prefixed-superclass posture: `B` lives in a
+/// sibling library imported under the `p` prefix, so the subclass's
+/// superclass edge (which keeps the bare continuation name) resolves no
+/// container through the bare lookup.
+fn unit_fold_prefixed(source: &str, other_source: &str, strings: &StringTable) -> UnitFold {
+    let mut files = FileTable::new();
+    let file = files.intern(Path::new("main.dart"));
+    let other_file = files.intern(Path::new("rel.dart"));
+    let set = FeatureSet::for_language_version(LanguageVersion::new(3, 13));
+    let scanned = scan(
+        source,
+        ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: set.is_enabled(dartq_language::Feature::Augmentations),
+        },
+        file,
+    );
+    assert!(
+        scanned.diagnostics.is_empty(),
+        "scanner diagnostics: {scanned:?}"
+    );
+    let other = scan(
+        other_source,
+        ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: set.is_enabled(dartq_language::Feature::Augmentations),
+        },
+        other_file,
+    );
+    assert!(
+        other.diagnostics.is_empty(),
+        "scanner diagnostics: {other:?}"
+    );
+    let features = dartq_parser::ParserFeatures::from_feature_set(set);
+    let elements = collect(source, &scanned.tokens, features, strings);
+    let other_elements = collect(other_source, &other.tokens, features, strings);
+    let mut builder = LibraryGraphBuilder::new(strings);
+    let lib = builder.intern("package:t/main.dart");
+    let other_lib = builder.intern("package:t/rel.dart");
+    let core_file = files.intern(Path::new("<dart:core>"));
+    let core = builder.intern("dart:core");
+    for name in CORE_FACE {
+        builder.declare(core, strings.intern(name), core_file);
+    }
+    for (name, decl) in other_elements.declarations() {
+        if decl.kind == MicroKind::TypeParam {
+            continue;
+        }
+        builder.declare(other_lib, name, other_file);
+    }
+    builder.import(
+        lib,
+        ImportEdge {
+            target: Some(other_lib),
+            prefix: Some(strings.intern("p")),
+            deferred: false,
+            combinators: Combinators::unfiltered(),
+        },
+    );
+    builder.import(
+        lib,
+        ImportEdge {
+            target: Some(core),
+            prefix: None,
+            deferred: false,
+            combinators: Combinators::unfiltered(),
+        },
+    );
+    for (name, decl) in elements.declarations() {
+        if decl.kind == MicroKind::TypeParam {
+            continue;
+        }
+        builder.declare(lib, name, file);
+    }
+    let graph = builder.finish();
+    let namespaces = Namespaces::build(&graph);
+    let mut index = ElementIndex::default();
+    index.insert(file, elements.clone());
+    index.insert(other_file, other_elements);
+    fold_unit(
+        source,
+        &scanned.tokens,
+        features,
+        strings,
+        file,
+        lib,
+        &graph,
+        &namespaces,
+        &index,
+        StrictModes::default(),
+        &dartq_resolution::LibraryClassModifiers::default(),
+        set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+    )
+}
+
+const UCII_PREFIXED_REACHABLE: &str = "\
+class Host extends p.B {
+  Host() : super.named();
+}
+";
+
+const PREFIXED_SIBLING: &str = "\
+class B {
+  B.named();
+}
+";
+
+#[test]
+fn named_super_selector_over_prefixed_but_reachable_superclass_stays_silent() {
+    let strings = StringTable::new();
+    let fold = unit_fold_prefixed(UCII_PREFIXED_REACHABLE, PREFIXED_SIBLING, &strings);
+    let got = code_lines(
+        &fold.report,
+        UCII_PREFIXED_REACHABLE,
+        &["undefined_constructor_in_initializer"],
+    );
+    assert_eq!(
+        got, vec![],
+        "a superclass reachable through a prefixed import resolves for the \
+         oracle — the Object fallback must not report through the bare \
+         continuation edge"
+    );
+}

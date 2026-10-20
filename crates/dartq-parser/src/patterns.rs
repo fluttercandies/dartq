@@ -832,7 +832,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 colon = Some(self.peek_span());
                 self.cursor.advance();
             } else if self.cursor.look_kind(1) == TokenKind::Colon {
-                let name = self.ensure_identifier(IdentifierContext::NamedArgumentReference);
+                // The field label is a pattern field name, not an argument:
+                // the official parser reuses `namedArgumentReference` for
+                // the event (:12279-12282), but the diagnostic tier must
+                // not open an argument per label — the dedicated context
+                // keeps the named-argument faces silent.
+                let name = self.ensure_identifier(IdentifierContext::PatternFieldName);
                 colon = Some(name);
                 self.cursor.advance();
             }
@@ -976,6 +981,40 @@ mod tests {
         let _ = p.parse_pattern_entry(PatternContext::Matching);
         // The token before the `:` is the object pattern's `(` at offset 3.
         assert_eq!(p.listener.no_names, vec![(3, 1)]);
+        assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
+    }
+
+    /// A local listener capturing identifier contexts, to pin the
+    /// object-pattern field label's own context.
+    #[derive(Default)]
+    struct ContextLog {
+        errors: Vec<String>,
+        idents: Vec<(u32, IdentifierContext)>,
+    }
+
+    impl crate::listener::ParserListener for ContextLog {
+        fn handle_recoverable_error(&mut self, message: Message, _: TokenSpan, _: TokenSpan) {
+            self.errors.push(message.code.name.to_owned());
+        }
+
+        fn handle_identifier(&mut self, token: Token, context: IdentifierContext) {
+            self.idents.push((token.range.offset, context));
+        }
+    }
+
+    #[test]
+    fn object_pattern_field_label_fires_pattern_field_name() {
+        // The label is a pattern field name, not an argument: the official
+        // parser reuses `namedArgumentReference` for the event
+        // (:12279-12282), but the diagnostic tier must not open an argument
+        // per label — the dedicated context keeps the named-argument faces
+        // silent while the await/yield identifier check rides along.
+        let mut p = parser("Foo(guard: 1)", ContextLog::default());
+        let _ = p.parse_pattern_entry(PatternContext::Matching);
+        assert_eq!(
+            p.listener.idents,
+            vec![(4, IdentifierContext::PatternFieldName)]
+        );
         assert!(p.listener.errors.is_empty(), "{:?}", p.listener.errors);
     }
 }

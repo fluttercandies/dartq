@@ -1130,6 +1130,12 @@ pub enum SemanticCode {
     /// function_expression_invocation_resolver.dart:137-140, at the callee
     /// expression).
     InvocationOfNonFunctionExpression,
+    /// `'{0}' isn't a function.` — a bare function invocation whose name
+    /// resolves to a type alias whose right-hand chain never grounds in a
+    /// constructor-callable or primitive type (`invocation_of_non_function`,
+    /// element_resolver.dart's function-invocation face; the alias name is
+    /// a type, not a value).
+    InvocationOfNonFunction,
     /// `Invalid reference to 'this' expression.` — `this` outside an
     /// instance member of a class-family container (`invalid_reference_to_this`,
     /// type_analyzer.dart:4608 `isThisAccessible` via
@@ -1821,6 +1827,10 @@ impl SemanticCode {
             Self::InvocationOfNonFunctionExpression => (
                 "invocation_of_non_function_expression",
                 "INVOCATION_OF_NON_FUNCTION_EXPRESSION",
+            ),
+            Self::InvocationOfNonFunction => (
+                "invocation_of_non_function",
+                "INVOCATION_OF_NON_FUNCTION",
             ),
             Self::InvalidReferenceToThis => {
                 ("invalid_reference_to_this", "INVALID_REFERENCE_TO_THIS")
@@ -2639,6 +2649,7 @@ impl SemanticCode {
                 "The expression doesn't evaluate to a function, so it can't be invoked."
                     .to_string()
             }
+            Self::InvocationOfNonFunction => format!("'{a0}' isn't a function."),
             Self::InvalidReferenceToThis => "Invalid reference to 'this' expression.".to_string(),
             Self::SuperInInvalidContext => "Invalid context for 'super' invocation.".to_string(),
             Self::RedirectToInvalidReturnType => format!(
@@ -4359,6 +4370,7 @@ mod tests {
             | SemanticCode::NonBoolNegationExpression
             | SemanticCode::InvalidUseOfNullValue
             | SemanticCode::InvocationOfNonFunctionExpression
+            | SemanticCode::InvocationOfNonFunction
             | SemanticCode::InvalidReferenceToThis
             | SemanticCode::SuperInInvalidContext
             | SemanticCode::RedirectToInvalidReturnType
