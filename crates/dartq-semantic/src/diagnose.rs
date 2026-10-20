@@ -3544,3 +3544,12 @@ mod ticket_2348_tests;
 /// reporting.
 #[cfg(test)]
 mod ticket_2362_tests;
+
+/// The #2344 pins: the member-condition shadow gate — a staged
+/// nullable condition anchored on a member read skips the local
+/// conditions/promotions tables (the official verifier reads the
+/// expression's own element, so a same-named local never enters the
+/// member's condition face), while local and member faces without the
+/// collision keep their existing verdicts.
+#[cfg(test)]
+mod ticket_2344_tests;

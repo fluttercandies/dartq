@@ -587,15 +587,41 @@ impl<'a> Engine<'a> {
                 // #2144) — so the parse-time type stands. Deciding
                 // `non_bool_condition` on the opaque marker would drop a
                 // known non-`bool` candidate the parse-time face answers.
-                let from = conditions
-                    .iter()
-                    .rev()
-                    .find(|(range, _)| range.offset == check.range.offset)
-                    .map(|(_, ty)| *ty)
-                    .or_else(|| promotions.promoted(check.range))
-                    .or_else(|| self.promotable_field_substitution(props, check.range, check.from))
-                    .filter(|ty| *ty != Ty::Unknown)
-                    .unwrap_or(check.from);
+                // The member-read gate (#2344): a staged condition anchored
+                // at a member token is a `receiver.member` read, and the
+                // local-variable tables must not answer it. Upstream reads
+                // the condition's resolved static type — the member access
+                // carries its own accessor element, so a same-named local
+                // never feeds its promotion into the member's condition face
+                // (upstream Dart SDK source,
+                // pkg/analyzer/lib/src/error/bool_expression_verifier.dart:44-73).
+                // The flow layer's by-name resolution can stage a shadow
+                // local's row at the selector span, so a hit in the
+                // offset-keyed `member_reads` index (the same index
+                // [`Engine::member_read_resolution`] binary-searches) skips
+                // the local condition/promotion lookups and decides on the
+                // property face alone.
+                let member_read = self
+                    .member_reads
+                    .binary_search_by(|row| row.offset.cmp(&check.range.offset))
+                    .is_ok();
+                let from = if member_read {
+                    self.promotable_field_substitution(props, check.range, check.from)
+                        .filter(|ty| *ty != Ty::Unknown)
+                        .unwrap_or(check.from)
+                } else {
+                    conditions
+                        .iter()
+                        .rev()
+                        .find(|(range, _)| range.offset == check.range.offset)
+                        .map(|(_, ty)| *ty)
+                        .or_else(|| promotions.promoted(check.range))
+                        .or_else(|| {
+                            self.promotable_field_substitution(props, check.range, check.from)
+                        })
+                        .filter(|ty| *ty != Ty::Unknown)
+                        .unwrap_or(check.from)
+                };
                 if self.nullable_bool_ty(from) {
                     let code = SemanticCode::UncheckedUseOfNullableValue;
                     // The row anchors at the condition expression: a
