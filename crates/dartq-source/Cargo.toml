@@ -18,6 +18,7 @@ blake3 = { workspace = true }
 hex = { workspace = true }
 memchr = { workspace = true }
 memmap2 = { workspace = true }
+parking_lot = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true, optional = true }
 simdutf8 = { workspace = true }

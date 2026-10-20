@@ -89,11 +89,13 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+use parking_lot::{Condvar, Mutex};
 
 use dartq_diagnostics::{
     DARTQ_PLUGIN_CRASHED, DARTQ_PLUGIN_TIMEOUT, Diagnostic, Severity as EngineSeverity, SourceRange,
@@ -382,7 +384,7 @@ impl PendingOutput {
     /// protocol violation — a plugin flooding output is torn down like any
     /// other contract break. `Err` carries the teardown reason.
     fn push(&self, diagnostic: PluginDiagnostic) -> Result<(), String> {
-        let mut queues = self.queues.lock().expect("pending output lock");
+        let mut queues = self.queues.lock();
         if queues.diagnostics.len() + queues.queries.len() >= MAX_PENDING_OUTPUT {
             return Err(format!(
                 "plugin exceeded the {MAX_PENDING_OUTPUT}-row pending cap"
@@ -399,7 +401,7 @@ impl PendingOutput {
     ///: the clock closes when diagnostics are produced.
     /// Shares the diagnostics fuse (see [`PendingOutput::push`]).
     fn push_query(&self, query: PendingQuery) -> Result<(), String> {
-        let mut queues = self.queues.lock().expect("pending output lock");
+        let mut queues = self.queues.lock();
         if queues.diagnostics.len() + queues.queries.len() >= MAX_PENDING_OUTPUT {
             return Err(format!(
                 "plugin exceeded the {MAX_PENDING_OUTPUT}-row pending cap"
@@ -412,22 +414,18 @@ impl PendingOutput {
 
     /// Takes every queued diagnostic (the diagnostics-only drain).
     fn take_all(&self) -> Vec<PluginDiagnostic> {
-        std::mem::take(&mut self.queues.lock().expect("pending output lock").diagnostics)
+        std::mem::take(&mut self.queues.lock().diagnostics)
     }
 
     /// How many reverse queries are queued (a peek — the queue is left for
     /// [`PendingOutput::take_queries`], `serve_queries`'s handle).
     fn queued_queries(&self) -> usize {
-        self.queues
-            .lock()
-            .expect("pending output lock")
-            .queries
-            .len()
+        self.queues.lock().queries.len()
     }
 
     /// Takes every queued reverse query, leaving diagnostics queued.
     fn take_queries(&self) -> Vec<PendingQuery> {
-        std::mem::take(&mut self.queues.lock().expect("pending output lock").queries)
+        std::mem::take(&mut self.queues.lock().queries)
     }
 
     /// Parks until diagnostics arrived and the reply burst settled, or a
@@ -439,16 +437,12 @@ impl PendingOutput {
     /// bounds the whole wait exactly — the settle window never extends past
     /// it.
     fn wait_for_output(&self, deadline: Instant) -> Option<(Vec<PluginDiagnostic>, usize)> {
-        let mut queues = self.queues.lock().expect("pending output lock");
+        let mut queues = self.queues.lock();
         while queues.diagnostics.is_empty() && queues.queries.is_empty() {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return None;
             };
-            let (woken, _) = self
-                .signal
-                .wait_timeout(queues, remaining)
-                .expect("pending output lock");
-            queues = woken;
+            self.signal.wait_for(&mut queues, remaining);
         }
         if queues.diagnostics.is_empty() {
             // Queries only: no burst to settle — hand the diagnostics over
@@ -469,11 +463,7 @@ impl PendingOutput {
                 break;
             }
             let seen = queues.diagnostics.len();
-            let (woken, timed_out) = self
-                .signal
-                .wait_timeout(queues, settle_end - now)
-                .expect("pending output lock");
-            queues = woken;
+            let timed_out = self.signal.wait_for(&mut queues, settle_end - now);
             if queues.diagnostics.len() > seen {
                 // More of the burst arrived (possibly while the notify was
                 // racing this wait): settle again from now.
@@ -525,7 +515,7 @@ impl StderrCapture {
         if !self.retain.load(Ordering::Relaxed) {
             return;
         }
-        let mut buf = self.buf.lock().expect("stderr capture lock");
+        let mut buf = self.buf.lock();
         buf.bytes.extend_from_slice(chunk);
         let excess = buf.bytes.len().saturating_sub(STDERR_CAPTURE_CAP);
         if excess > 0 {
@@ -541,7 +531,7 @@ impl StderrCapture {
     /// never block on a full one).
     fn seal(&self) {
         self.retain.store(false, Ordering::Relaxed);
-        let mut buf = self.buf.lock().expect("stderr capture lock");
+        let mut buf = self.buf.lock();
         buf.bytes.clear();
         buf.dropped_front = 0;
     }
@@ -549,7 +539,7 @@ impl StderrCapture {
     /// The captured text with a front-truncation marker when bytes were
     /// dropped; `None` when nothing was retained.
     fn take_text(&self) -> Option<String> {
-        let buf = self.buf.lock().expect("stderr capture lock");
+        let buf = self.buf.lock();
         if buf.bytes.is_empty() {
             return None;
         }
@@ -819,18 +809,9 @@ impl PluginRuntime {
     /// The plugin's registration census (the `initialize` reply's `rules`
     /// array), empty until the handshake completed. The caller resolves the
     /// per-cycle enablement against it ([`CyclePush`]).
-    ///
-    /// # Panics
-    ///
-    /// Panics when the session mutex is poisoned — a thread panicked while
-    /// holding it, a program bug, not a plugin failure.
     #[must_use]
     pub fn rule_census(&self) -> Vec<RuleCensus> {
-        self.session
-            .lock()
-            .expect("session lock")
-            .rule_census()
-            .to_vec()
+        self.session.lock().rule_census().to_vec()
     }
 
     /// Pushes one analyze cycle to the plugin: the resolved config as
@@ -905,11 +886,6 @@ impl PluginRuntime {
     /// # Errors
     ///
     /// Restart/transport failures, per [`RuntimeError`].
-    ///
-    /// # Panics
-    ///
-    /// Panics when the internal pending-output mutex is poisoned — a thread
-    /// panicked while holding it, a program bug, not a plugin failure.
     pub fn take_output(&mut self) -> Result<CycleDrain, RuntimeError> {
         self.ensure_alive()?;
         Ok(CycleDrain {
@@ -972,11 +948,6 @@ impl PluginRuntime {
     ///
     /// Transport failures per [`RuntimeError`]; the server's own failures
     /// ride the wire as error replies, not through this result.
-    ///
-    /// # Panics
-    ///
-    /// Panics when an internal mutex is poisoned — a thread panicked while
-    /// holding it, a program bug, not a plugin failure.
     pub fn serve_queries(&mut self, server: QueryServer<'_>) -> Result<usize, RuntimeError> {
         let queries = self.pending.take_queries();
         let count = queries.len();
@@ -1035,11 +1006,6 @@ impl PluginRuntime {
     /// the child dies or breaks the contract mid-request, session errors for
     /// a non-ready session or an unnegotiated `fix` capability, plus
     /// transport failures.
-    ///
-    /// # Panics
-    ///
-    /// Panics when an internal mutex is poisoned — a thread panicked while
-    /// holding it, a program bug, not a plugin failure.
     pub fn request_fixes(
         &mut self,
         file: &str,
@@ -1080,7 +1046,6 @@ impl PluginRuntime {
         let frame = self
             .session
             .lock()
-            .expect("session lock")
             .send_fixes_request(file, offset, length)?;
         let request_id = frame.id.expect("fixes requests carry an id");
         self.write_frame(&frame)?;
@@ -1140,7 +1105,7 @@ impl PluginRuntime {
                         "`request/fixes` was not answered within the {callback_ms} ms callback \
                          budget"
                     );
-                    *self.death.lock().expect("death lock") = Some(reason);
+                    *self.death.lock() = Some(reason);
                     self.kill_child();
                     self.ensure_alive()?;
                     return Err(RuntimeError::CallbackTimeout {
@@ -1184,11 +1149,6 @@ impl PluginRuntime {
     ///
     /// [`RuntimeError::ShutdownTimeout`] (child killed), [`RuntimeError::Crashed`]
     /// (dead or protocol-violating plugin), session/transport variants.
-    ///
-    /// # Panics
-    ///
-    /// Panics when an internal mutex is poisoned — a thread panicked while
-    /// holding it, a program bug, not a plugin failure.
     pub fn shutdown(mut self) -> Result<(), RuntimeError> {
         if self.evicted.load(Ordering::Relaxed) {
             // An evicted generation is already dead and reaped (the
@@ -1202,7 +1162,7 @@ impl PluginRuntime {
             self.reap_child();
             return Err(self.crash_error());
         }
-        let frame = self.session.lock().expect("session lock").send_shutdown()?;
+        let frame = self.session.lock().send_shutdown()?;
         self.write_frame(&frame)?;
 
         // One budget for the whole wait: a crossing query re-awaits within
@@ -1399,7 +1359,7 @@ impl PluginRuntime {
         self.last_interaction_ms = Arc::new(AtomicU64::new(elapsed_millis(self.created)));
         self.death = Arc::new(Mutex::new(None));
         self.negotiated = None;
-        *self.child.lock().expect("child lock") = Some(child);
+        *self.child.lock() = Some(child);
 
         // Startup stderr face: `Capture` pipes the host's stderr into the
         // bounded capture, drained by its own thread (the host can never
@@ -1449,11 +1409,7 @@ impl PluginRuntime {
         self.monitor = Some(monitor);
 
         // Handshake: one `initialize`, reply awaited under the request budget.
-        let init = self
-            .session
-            .lock()
-            .expect("session lock")
-            .send_initialize()?;
+        let init = self.session.lock().send_initialize()?;
         self.write_frame(&init)?;
         let handshake = match self.events.recv_timeout(
             self.request_deadline()
@@ -1561,21 +1517,21 @@ impl PluginRuntime {
         // produce diagnostics, and a stale-open clock must not outlive it.
         self.analyze_clock.close();
         self.alive.store(false, Ordering::Relaxed);
-        let child = self.child.lock().expect("child lock").take();
+        let child = self.child.lock().take();
         if let Some(mut child) = child {
             kill_and_reap(&mut child);
         }
     }
 
     fn reap_child(&mut self) {
-        let child = self.child.lock().expect("child lock").take();
+        let child = self.child.lock().take();
         if let Some(mut child) = child {
             let _ = child.wait();
         }
     }
 
     fn crash_error(&self) -> RuntimeError {
-        let death = self.death.lock().expect("death lock").clone();
+        let death = self.death.lock().clone();
         let mut reason = death.unwrap_or_else(|| "plugin process is no longer alive".to_owned());
         if self.restarts_used >= self.restart_budget {
             reason = format!(
@@ -1595,7 +1551,7 @@ impl PluginRuntime {
     /// like a plugin that will not start: one surfaced tool diagnostic,
     /// never an abort of the daemon.
     fn thread_spawn_failed(&mut self, thread: &str, source: std::io::Error) -> RuntimeError {
-        let mut slot = self.death.lock().expect("death lock");
+        let mut slot = self.death.lock();
         if slot.is_none() {
             *slot = Some(format!("{thread} thread could not be spawned: {source}"));
         }
@@ -1684,7 +1640,7 @@ impl PluginRuntime {
                      request budget)",
                     self.request_timeout.as_millis()
                 );
-                *self.death.lock().expect("death lock") = Some(reason);
+                *self.death.lock() = Some(reason);
                 self.kill_child();
                 Err(self.crash_error())
             }
@@ -1799,7 +1755,7 @@ fn spawn_reader(stdout: ChildStdout, h: GenerationHandles) -> std::io::Result<Jo
                 // EOF is only the downstream observation of that kill and
                 // must not clobber the authoritative record. A genuine
                 // plugin-initiated close still lands — no prior writer.
-                let mut slot = h.death.lock().expect("death lock");
+                let mut slot = h.death.lock();
                 if slot.is_none() {
                     *slot = Some(reason);
                 }
@@ -1836,8 +1792,7 @@ fn run_reader(
             if decoder.has_partial() {
                 return Err("stream ended mid-frame".to_owned());
             }
-            let terminated =
-                session.lock().expect("session lock").state() == SessionState::Terminated;
+            let terminated = session.lock().state() == SessionState::Terminated;
             return if terminated {
                 Ok(())
             } else {
@@ -1859,7 +1814,7 @@ fn run_reader(
         stdout.consume(chunk_len);
         for frame in frames {
             stats.frame_in();
-            let incoming = session.lock().expect("session lock").handle(frame);
+            let incoming = session.lock().handle(frame);
             match incoming {
                 Ok(Incoming::Initialized(caps)) => {
                     let _ = events.send(ProtocolEvent::Initialized(caps));
@@ -2051,17 +2006,7 @@ fn spawn_monitor(
                     // arm then only finishes the corpse (the kill below is a
                     // no-op reap) and must not re-attribute the death to the
                     // budget.
-                    // Lock-poison posture: `death` is a `std::sync::Mutex`,
-                    // and a panic elsewhere while it is held poisons it —
-                    // either `expect` in this loop (this arm and the RSS arm
-                    // below) would then kill the monitor thread and silently
-                    // lose both budget faces (the RSS row and the analyze
-                    // clock) for the rest of the generation. Accepted: every
-                    // writer holds the lock only across the plain slot
-                    // store, so a poison here already implies a panicking
-                    // peer, and this crate carries no parking_lot dependency
-                    // to swap in.
-                    let mut slot = h.death.lock().expect("death lock");
+                    let mut slot = h.death.lock();
                     if slot.is_none() {
                         *slot = Some(format!(
                             "no diagnostics were produced within the {} ms \
@@ -2071,7 +2016,7 @@ fn spawn_monitor(
                     }
                     drop(slot);
                     h.alive.store(false, Ordering::Relaxed);
-                    if let Some(mut child) = child.lock().expect("child lock").take() {
+                    if let Some(mut child) = child.lock().take() {
                         kill_and_reap(&mut child);
                     }
                     h.clock.close();
@@ -2097,12 +2042,12 @@ fn spawn_monitor(
                                 // the next interaction restarts instead of
                                 // writing into the dying pipe; the reader's EOF
                                 // turns this into the ordinary crash path.
-                                *h.death.lock().expect("death lock") = Some(format!(
+                                *h.death.lock() = Some(format!(
                                     "RSS sample {rss_bytes} exceeded the {memory_cap_bytes}-byte \
                                      memory budget"
                                 ));
                                 h.alive.store(false, Ordering::Relaxed);
-                                if let Some(mut child) = child.lock().expect("child lock").take() {
+                                if let Some(mut child) = child.lock().take() {
                                     kill_and_reap(&mut child);
                                 }
                                 break;
@@ -2144,7 +2089,7 @@ fn spawn_monitor(
                         h.evicted.store(true, Ordering::Relaxed);
                         h.stats.evict();
                         h.alive.store(false, Ordering::Relaxed);
-                        if let Some(mut child) = child.lock().expect("child lock").take() {
+                        if let Some(mut child) = child.lock().take() {
                             kill_and_reap(&mut child);
                         }
                         break;
@@ -2612,7 +2557,7 @@ mod tests {
             matches!(rx.try_recv(), Ok(ProtocolEvent::Initialized(_))),
             "the handshake reply was processed across the blank line"
         );
-        let drained = pending.queues.lock().expect("pending lock");
+        let drained = pending.queues.lock();
         assert_eq!(
             drained.diagnostics.len(),
             1,
@@ -2702,7 +2647,7 @@ mod tests {
             reason.contains(&MAX_PENDING_OUTPUT.to_string()),
             "the reason names the fuse: {reason}"
         );
-        let drained = pending.queues.lock().expect("pending lock");
+        let drained = pending.queues.lock();
         assert_eq!(
             drained.diagnostics.len(),
             MAX_PENDING_OUTPUT,

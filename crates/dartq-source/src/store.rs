@@ -1,8 +1,8 @@
 //! Content-addressed storage of source bytes.
 
 use std::path::Path;
-use std::sync::Mutex;
 
+use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use crate::content_id::{ContentId, content_hash};
@@ -223,18 +223,9 @@ impl ContentPool {
     }
 
     /// Distinct contents the pool holds — the deduplicated entry count.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the pool's mutex is poisoned (a store update panicked
-    /// while holding it) — the same posture as the intern table's lock.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("ContentPool mutex poisoned")
-            .entries
-            .len()
+        self.inner.lock().entries.len()
     }
 
     /// Whether the pool holds no content.
@@ -245,23 +236,15 @@ impl ContentPool {
 
     /// Total bytes the pool holds — the deduplicated footprint: each
     /// distinct content counted once, unlike a member store's view total.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the pool's mutex is poisoned (a store update panicked
-    /// while holding it) — the same posture as the intern table's lock.
     #[must_use]
     pub fn len_bytes(&self) -> u64 {
-        self.inner
-            .lock()
-            .expect("ContentPool mutex poisoned")
-            .total_bytes
+        self.inner.lock().total_bytes
     }
 
     /// The slot for `id`, inserting `bytes` under it when the pool has not
     /// seen the content yet. The caller guarantees `id == content_hash(bytes)`.
     fn get_or_insert(&self, id: ContentId, bytes: &[u8]) -> std::sync::Arc<[u8]> {
-        let mut inner = self.inner.lock().expect("ContentPool mutex poisoned");
+        let mut inner = self.inner.lock();
         if inner.new_since_sweep >= POOL_GC_THRESHOLD {
             // A slot held by no store is dead. Sweeping before the new
             // insertion lands keeps the just-stored content out of this
@@ -411,18 +394,9 @@ impl MappedContentPool {
     }
 
     /// Distinct contents the pool holds — the deduplicated entry count.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the pool's mutex is poisoned (a store update panicked
-    /// while holding it) — the same posture as the intern table's lock.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("MappedContentPool mutex poisoned")
-            .entries
-            .len()
+        self.inner.lock().entries.len()
     }
 
     /// Whether the pool holds no content.
@@ -432,41 +406,25 @@ impl MappedContentPool {
     }
 
     /// Total bytes the pool holds — the deduplicated footprint.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the pool's mutex is poisoned (a store update panicked
-    /// while holding it) — the same posture as the intern table's lock.
     #[must_use]
     pub fn len_bytes(&self) -> u64 {
-        self.inner
-            .lock()
-            .expect("MappedContentPool mutex poisoned")
-            .total_bytes
+        self.inner.lock().total_bytes
     }
 
     /// Bytes the pool holds in file-mapping slots — the evictable
     /// page-cache share of [`len_bytes`](MappedContentPool::len_bytes)
     /// (the resident-anonymous vs page-cache split the serial-phase PSS
     /// probe reads).
-    ///
-    /// # Panics
-    ///
-    /// Panics when the pool's mutex is poisoned (a store update panicked
-    /// while holding it) — the same posture as the intern table's lock.
     #[must_use]
     pub fn mapped_bytes(&self) -> u64 {
-        self.inner
-            .lock()
-            .expect("MappedContentPool mutex poisoned")
-            .mapped_bytes
+        self.inner.lock().mapped_bytes
     }
 
     /// The slot for `id`, inserting `bytes` under it when the pool has not
     /// seen the content yet. The caller guarantees `id == content_hash(bytes)`.
     /// A dedup hit costs no copy — the existing slot's handle is returned.
     fn get_or_insert(&self, id: ContentId, bytes: &[u8]) -> Slot {
-        let mut inner = self.inner.lock().expect("MappedContentPool mutex poisoned");
+        let mut inner = self.inner.lock();
         sweep_mapped_pool(&mut inner);
         if !inner.entries.contains_key(&id) {
             inner.total_bytes += bytes.len() as u64;
@@ -482,7 +440,7 @@ impl MappedContentPool {
     /// `bytes` moves into the slot without a second copy (`put_owned`'s
     /// path). The caller guarantees `id == content_hash(&bytes)`.
     fn get_or_insert_owned(&self, id: ContentId, bytes: std::sync::Arc<[u8]>) -> Slot {
-        let mut inner = self.inner.lock().expect("MappedContentPool mutex poisoned");
+        let mut inner = self.inner.lock();
         sweep_mapped_pool(&mut inner);
         if !inner.entries.contains_key(&id) {
             inner.total_bytes += bytes.len() as u64;
@@ -497,7 +455,7 @@ impl MappedContentPool {
     /// owned lease stays owned. The caller guarantees
     /// `id == text.content_id()`.
     fn get_or_insert_text(&self, id: ContentId, text: &SourceText) -> Slot {
-        let mut inner = self.inner.lock().expect("MappedContentPool mutex poisoned");
+        let mut inner = self.inner.lock();
         sweep_mapped_pool(&mut inner);
         if !inner.entries.contains_key(&id) {
             let slot = Slot::Text(text.inner().clone());

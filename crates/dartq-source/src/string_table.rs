@@ -1,9 +1,10 @@
 //! Strings interned to small stable integers.
 
 use std::hash::BuildHasher;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{OnceLock, RwLock};
 
+use parking_lot::RwLock;
 use rustc_hash::{FxBuildHasher, FxHashMap};
 
 /// A small stable integer naming one interned string.
@@ -188,8 +189,7 @@ impl StringTable {
     /// # Panics
     ///
     /// Panics when interning more than [`u32::MAX`] distinct strings, which
-    /// would exhaust the [`StringId`] space, or when a shard lock is
-    /// poisoned by a panic in an earlier call (both are program bugs).
+    /// would exhaust the [`StringId`] space (a program bug).
     #[must_use]
     pub fn intern(&self, s: &str) -> StringId {
         if let Some(id) = self.front_get(s) {
@@ -199,15 +199,11 @@ impl StringTable {
         // The high bits pick the shard: the map's own probe consumes the
         // low bits, so the two stay independent.
         let shard = &self.shards[(hash >> 58) as usize % SHARDS].0;
-        let hit = shard
-            .read()
-            .expect("StringTable lock poisoned")
-            .get_key_value(s)
-            .map(|(&text, &id)| (text, id));
+        let hit = shard.read().get_key_value(s).map(|(&text, &id)| (text, id));
         let (text, id) = match hit {
             Some(found) => found,
             None => {
-                let mut map = shard.write().expect("StringTable lock poisoned");
+                let mut map = shard.write();
                 if let Some((&text, &id)) = map.get_key_value(s) {
                     // A concurrent worker minted it while we upgraded.
                     (text, id)

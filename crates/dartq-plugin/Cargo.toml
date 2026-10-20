@@ -22,6 +22,7 @@ dartq-pub = { workspace = true }
 # inherited the child's pipes down with the child.
 libc = { workspace = true }
 memchr = { workspace = true }
+parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
