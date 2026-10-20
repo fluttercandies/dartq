@@ -1138,10 +1138,26 @@ impl<'a> Engine<'a> {
                         };
                         return (BareInfo::Plain { ty }, target);
                     }
-                    Walk::ChainBroken => {
+                    // The broken climb's blanket answer suppresses the
+                    // ordinary bare-name face (the member could live on the
+                    // unindexed hop), but never the annotation face: an
+                    // annotation name resolves through the scope lookup alone
+                    // (upstream Dart SDK source,
+                    // pkg/analyzer/lib/src/dart/resolver/
+                    // annotation_resolver.dart — the annotation expression is
+                    // resolved like any other constant-context expression,
+                    // and a lookup failure is reported by that resolution),
+                    // so the name falls through to the scoped lookup and its
+                    // miss reports `undefined_annotation` (the corpus's
+                    // `@useResult` inside an `on String` extension whose
+                    // climb ends at the unindexed core face). Annotation
+                    // arguments resolve in the merge pass after the metadata
+                    // window closes, so the window flags the annotation
+                    // name's own resolution only.
+                    Walk::ChainBroken if self.annotation_at.is_none() => {
                         return (BareInfo::Plain { ty: Ty::UNKNOWN }, RefTarget::Opaque);
                     }
-                    Walk::Missing => {}
+                    Walk::ChainBroken | Walk::Missing => {}
                 }
             }
             if kind == ContainerKind::Enum && self.members.enum_synth_members.contains(&name) {

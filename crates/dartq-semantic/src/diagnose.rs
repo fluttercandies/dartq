@@ -3511,3 +3511,13 @@ mod ticket_2297_tests;
 /// shape-keyed sentinels decide same-signature type checks.
 #[cfg(test)]
 mod ticket_2359_tests;
+
+/// The #2328 differential pins: the chain-broken member/on-face climb and
+/// the bare-name faces it must not own — the bare creation send resolves
+/// through the scoped lookup instead of masquerading as an implicit-`this`
+/// member, and an annotation name resolves through the scope alone, so its
+/// miss reports `undefined_annotation` instead of the broken climb's
+/// blanket suppression, while real member calls over chain-broken
+/// receivers keep reporting.
+#[cfg(test)]
+mod ticket_2328_tests;
