@@ -247,6 +247,12 @@ fn release_unused_imports(
         }
         // Unprefixed: any merged use or doc-reference spelling the target
         // exports under this directive's combinators credits the import.
+        // The `notifyExtensionUsed` leg (scope.dart:204-321): a used member
+        // of an extension the import provides credits it even when no
+        // top-level name resolves — the merged `consumed.used` holds the
+        // member spellings, and the target's export scope maps the
+        // extension's own name to its declaring file, so the join probes
+        // the exported faces' member tables against the combinator gate.
         let credited = consumed
             .used
             .iter()
@@ -256,12 +262,49 @@ fn release_unused_imports(
             .any(|name| {
                 edge.combinators.allows(name)
                     && library.graph.exported(target, name).is_some()
-            });
+            })
+            || extension_member_credit(library, edge, target, consumed);
         if credited {
             continue 'rows;
         }
         out.push(row);
     }
+}
+
+/// Whether `edge`'s target exports an extension whose member the library
+/// used — the `notifyExtensionUsed` leg of the import-use verdict
+/// (scope.dart:204-321). The oracle credits the contributing import when
+/// an implicit application resolves a member through it; the per-file
+/// pass's spelling-level member pool already folds the resolved set into
+/// `consumed.used`, so the join here probes the target's export-scope
+/// extension faces' member tables. The `show`/`hide` combinators gate the
+/// extension's own export name (a hidden extension contributes no face to
+/// the importing scope, matching the oracle's name-keyed `_elementImports`
+/// build); an unnamed extension exports nothing under any name and credits
+/// nothing — the same rule the per-file pass applies.
+fn extension_member_credit(
+    library: &LibraryView<'_>,
+    edge: &dartq_resolution::ImportEdge,
+    target: dartq_resolution::LibraryId,
+    consumed: &LibraryUseSet,
+) -> bool {
+    for (export_name, entry) in library.graph.export_scope(target) {
+        if !edge.combinators.allows(export_name) {
+            continue;
+        }
+        let Some(elements) = library.index.get(entry.file) else {
+            continue;
+        };
+        for face in elements.extension_faces() {
+            if face.name != Some(export_name) {
+                continue;
+            }
+            if face.members.keys().any(|member| consumed.used(*member)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The doc-comment reference spellings of one compilation unit (#2251):

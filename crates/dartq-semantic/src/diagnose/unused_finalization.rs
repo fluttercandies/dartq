@@ -178,6 +178,102 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The member-access spellings that resolved to a real element (the
+    /// oracle's `usedElements.members`/`elements` face at name granularity).
+    /// `used_names` credits every member access unconditionally — resolved
+    /// and unresolved alike (`resolve_member_row`'s spelling insert) — so a
+    /// `receiver._m` whose receiver the model cannot type (`Receiver::
+    /// Unknown`) still spares the member. The oracle's element sets join
+    /// only on a resolved access: an `InvalidType` receiver resolves no
+    /// member, so the declaration stays unused.
+    ///
+    /// `member_reads` holds every `receiver.member` access with its
+    /// parse-time receiver (read, invoke, write, operator — one record per
+    /// merged selector, surviving pass 2's stack take). Re-deciding each
+    /// receiver's member walk reproduces the resolve-time verdict read-only:
+    /// a `Typed`/`This`/`Super`/`Container`/`Created`/`PrefixedContainer`
+    /// receiver walks its container's member face (`member_found`), an
+    /// `Unknown`/`Prefix` receiver binds nothing in this model. Resolved
+    /// implicit extension applications ride `extension_member_used` already
+    /// (`extension_application` credited them at resolve); resolved reads
+    /// ride `member_read_owners`. The union is the oracle's resolved-member
+    /// pool — minus the promotions the flow layer refines a `Typed` receiver
+    /// into, applied here exactly as `resolve_member_row` applied them.
+    fn resolved_member_uses(&self) -> FxHashSet<StringId> {
+        let mut resolved: FxHashSet<StringId> = FxHashSet::default();
+        resolved.extend(self.extension_member_used.iter().copied());
+        resolved.extend(self.member_read_owners.keys().copied());
+        for read in &self.member_reads {
+            let recv = self.promoted_receiver(read.offset, read.recv);
+            let found = match recv {
+                // `This`/`Typed`/`Created`/`Container` receivers all name
+                // the container the member walk keys on — `member_found`
+                // resolves the spelling against this file's index (the same
+                // entry the resolve-time `check_instance_member`/
+                // `check_container_member` walked, `Receiver::Typed`'s
+                // `container = type_name` arm). `this` and a folded creation
+                // carry the instance face; a bare `C`/`E`/`Ext` name the
+                // container's static face — the `members` map holds both.
+                Receiver::This { container, .. }
+                | Receiver::Typed { type_name: container, .. }
+                | Receiver::Created { name: container, .. }
+                | Receiver::Container { name: container, .. } => {
+                    self.member_found(container, read.name, false)
+                        || self.ctor_found(container, read.name)
+                }
+                Receiver::Super { container, .. } => self.member_found(container, read.name, true),
+                // The prefix-resolved container (`io.Directory.gone`): the
+                // name lives behind the prefix table, so the bare-scope
+                // `member_found` cannot reach it — resolve through
+                // `prefixed_container` first, then probe its member face.
+                Receiver::PrefixedContainer { prefix, name, .. } => prefixed_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    prefix,
+                    name,
+                )
+                .is_some_and(|(container, _)| {
+                    container.members.contains_key(&read.name)
+                        || container.constructors.contains(&read.name)
+                }),
+                // An untyped receiver (`var m = …; m.x`) or a prefix
+                // namespace access carries no container the model can walk —
+                // the oracle's full inference may still resolve the member,
+                // so the access keeps the under-report (the suppression the
+                // raw `used_names` spelling already provided). Only a
+                // resolvable receiver's clean member miss poisons a
+                // declaration; these stay resolved.
+                Receiver::Prefix { .. } | Receiver::Unknown => true,
+            };
+            if found {
+                resolved.insert(read.name);
+            }
+        }
+        resolved
+    }
+
+    /// The constructor half of a resolved `C.sel` access (`_E._`,
+    /// `C.named`): the member walk keys on `members`, while constructors
+    /// live in the container's own `constructors` list (the official
+    /// `allowConstructors` cut — never inherited). `new` names the unnamed
+    /// head, flagged by `has_unnamed_constructor`.
+    fn ctor_found(&self, container: StringId, member: StringId) -> bool {
+        let Some((found, _)) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        ) else {
+            return false;
+        };
+        found.constructors.contains(&member)
+            || (self.strings.resolve(member) == "new" && found.has_unnamed_constructor)
+    }
+
     /// The usage cluster's library-level pass, after every use is indexed:
     /// the declaration sites of this file walk against the use index (the
     /// official `UnusedLocalElementsVerifier`), then the import directives
@@ -185,6 +281,40 @@ impl<'a> Engine<'a> {
     /// Each arm's gate mirrors the official `_isUsed*` split; every
     /// unmodelable corner suppresses (the under-report direction).
     pub(crate) fn finalize_usage(&mut self) {
+        // The element-attributed use pool: `used_names` minus the member
+        // spellings that only an unresolved access contributed (the
+        // `Receiver::Unknown`/`Prefix` rows — an `InvalidType` or `dynamic`
+        // receiver's `.m` resolves no element, so the oracle's
+        // `members`/`elements` never carry it). A member spelling that is
+        // also a non-member resolved use (a bare `RefTarget::Decl`/`Member`
+        // reference, a type-use position) stays — it resolves through a
+        // path that is not the member access.
+        let member_accessed: FxHashSet<StringId> =
+            self.member_reads.iter().map(|read| read.name).collect();
+        let resolved = self.resolved_member_uses();
+        let non_member_resolved: FxHashSet<StringId> = self
+            .refs
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.target,
+                    RefTarget::Decl { .. } | RefTarget::Member { .. } | RefTarget::TypeParam
+                )
+            })
+            .map(|r| r.name)
+            .chain(self.type_uses.iter().map(|(_, name)| *name))
+            .collect();
+        let unresolved_member_only: FxHashSet<StringId> = member_accessed
+            .difference(&resolved)
+            .filter(|name| !non_member_resolved.contains(name))
+            .copied()
+            .collect();
+        let element_used: FxHashSet<StringId> = self
+            .used_names
+            .iter()
+            .filter(|name| !unresolved_member_only.contains(*name))
+            .copied()
+            .collect();
         for site_index in 0..self.decl_sites.len() {
             let site = self.decl_sites[site_index].clone();
             let bare = self.bare_name(site.name);
@@ -224,7 +354,7 @@ impl<'a> Engine<'a> {
                     // otherwise any indexed use spares the declaration.
                     if !site.annotated
                         && (self.is_private_name(site.name) || self.is_nameless(site.name))
-                        && !self.used_names.contains(&bare)
+                        && !element_used.contains(&bare)
                     {
                         // A nameless recovery declaration anchors at the file
                         // start — the spliced synthetic name never reaches
@@ -245,7 +375,7 @@ impl<'a> Engine<'a> {
                     // same public/used gate.
                     if !site.annotated
                         && (self.is_private_name(site.name) || self.is_nameless(site.name))
-                        && !self.used_names.contains(&bare)
+                        && !element_used.contains(&bare)
                     {
                         self.stage_usage(SemanticCode::UnusedElement, site.range, &name_text);
                     }
@@ -339,7 +469,7 @@ impl<'a> Engine<'a> {
                         self.extension_member_used.contains(&site.name)
                             || self.extension_member_used.contains(&bare)
                     } else {
-                        self.used_names.contains(&bare)
+                        element_used.contains(&bare)
                     };
                     let spared = site.annotated
                         || (!self.is_nameless(site.name)
@@ -388,7 +518,7 @@ impl<'a> Engine<'a> {
                             || site.annotated
                             || (!self.is_nameless(site.name)
                                 && self.is_publicly_accessible(site.name, site.kind))
-                            || self.used_names.contains(&bare)
+                            || element_used.contains(&bare)
                             || matches!(self.walk_super(container, site.name), Walk::Found(_));
                         if !spared {
                             // The element's displayName qualifies the selector
@@ -568,7 +698,7 @@ impl<'a> Engine<'a> {
             let spared = annotated
                 || self.extension_member_used.contains(&spelling)
                 || (is_static
-                    && (self.used_names.contains(&bare)
+                    && (element_used.contains(&bare)
                         || (matches!(kind, MemberKind::Field)
                             && self.read_names.contains(&bare))));
             if !spared {
@@ -581,6 +711,15 @@ impl<'a> Engine<'a> {
                 self.stage_usage(code, range, &name_text);
             }
         }
+        // The element-attributed pool replaces the raw spelling set for the
+        // downstream consumers that read `used_names` after this point —
+        // `report_unused_imports` credits an import only through a resolved
+        // use (the same `exported(target, n)` join), and `take_use_face`
+        // publishes it as the library-close `consumed.used` the staged
+        // `unused_*` rows re-decide against. The raw pool's unresolved
+        // member spellings would over-credit both — an `InvalidType`
+        // receiver's access resolving nothing still released the row.
+        self.used_names = element_used;
         self.suppress_same_line_ignored_usage();
         self.report_unused_imports();
     }
@@ -919,6 +1058,7 @@ impl<'a> Engine<'a> {
                         || used.iter().any(|&n| {
                             edge.combinators.allows(n) && self.graph.exported(target, n).is_some()
                         })
+                        || self.import_credits_extension_member(edge, target, &used)
                 }
             };
             if !is_used {
@@ -950,13 +1090,54 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The `notifyExtensionUsed` credit at the import site (scope.dart
+    /// :204-321): a used member of an extension this import provides marks
+    /// the import used even when no top-level name from it resolves —
+    /// `x.m`/`m` on a receiver the extension covers resolves through
+    /// implicit application, and the oracle credits the import that
+    /// contributed the extension. The name-level model cannot re-run
+    /// applicability at the directive gate (the receiver's static type is
+    /// gone by the usage pass), so the credit joins the import's exported
+    /// extension faces' member spellings against the unit's used set — the
+    /// same granularity the top-level `exported(target, n)` arm keeps, and
+    /// the under-report direction the resolved-only `import_used` credit
+    /// (`credit_extension_import`) leaves behind.
+    ///
+    /// The `show` combinator gates the extension's own export name — a
+    /// `hide Ext` import contributes the face to no scope upstream, so its
+    /// members credit nothing here either. An unnamed extension carries no
+    /// export entry (names only), matching the oracle's `_elementImports`
+    /// build which keys on names.
+    fn import_credits_extension_member(
+        &self,
+        edge: &dartq_resolution::ImportEdge,
+        target: dartq_resolution::LibraryId,
+        used: &[StringId],
+    ) -> bool {
+        for (export_name, entry) in self.graph.export_scope(target) {
+            if !edge.combinators.allows(export_name) {
+                continue;
+            }
+            let Some(elements) = self.index.get(entry.file) else {
+                continue;
+            };
+            for face in elements.extension_faces() {
+                if face.name != Some(export_name) {
+                    continue;
+                }
+                if face
+                    .members
+                    .keys()
+                    .any(|member| used.contains(member))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Moves the pass's accumulated use sets into the unit's use-face
-    /// (the M3 U1 substrate, `use_face` module). Runs after
-    /// [`Self::finalize_usage`] — the per-file consumers above have read
-    /// the sets by then — so the hot path pays nothing: the face re-homes
-    /// the sets the diagnosis already kept. The directive faces map the
-    /// diagnostic-side import sites (spans dropped: the face is the use
-    /// index, not the report).
     pub(crate) fn take_use_face(&mut self) -> UnitUseFace {
         UnitUseFace {
             used: std::mem::take(&mut self.used_names),
@@ -1946,6 +2127,108 @@ mod pins {
             unused_field_rows(source),
             vec![(gone_at, 5)],
             "{source:?}"
+        );
+    }
+
+    /// `unused_element` rows with the diagnostic's message text — the
+    /// ctor-selector face asserts on `C._`/`C.make`-shaped display names.
+    fn unused_element_rows(source: &str) -> Vec<(u32, String)> {
+        report(source)
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "unused_element")
+            .map(|d| (d.range.offset, d.message.to_string()))
+            .collect()
+    }
+
+    /// The element-attributed pool (B): a private named constructor called
+    /// through `C.named(...)` keeps the declaration — the selector lives in
+    /// the container's `constructors` list, not the member map, so the
+    /// resolved-member probe must reach it through `ctor_found` (the corpus
+    /// `_ParsedAnalyzerData._` regression). Without the constructor half
+    /// the element-level subtraction poisons the ctor and reports.
+    #[test]
+    fn private_named_constructor_used_via_qualified_call_is_spared() {
+        let source = "class _C {\n\
+                      \x20 _C.named();\n\
+                      }\n\
+                      void f() {\n\
+                      \x20 _C.named();\n\
+                      }\n";
+        // The private class itself reports (nothing references `_C` as a
+        // type — the ctor call is the only use), but its `named` ctor does
+        // not join the report.
+        let rows = unused_element_rows(source);
+        assert!(
+            !rows.iter().any(|(_, text)| text.contains("_C.named")),
+            "ctor reported: {rows:?} in {source:?}"
+        );
+    }
+
+    /// The unnamed-selector half: a factory's `=> _E._()` body resolves the
+    /// `_` constructor through the container's `constructors` list — the
+    /// oracle's `allowConstructors` cut (`_E._` at 2:6 on the corpus's
+    /// `FileUriProperties` family stayed an oracle-only miss before the
+    /// ctor probe). The bare `_` spelling must reach `element_used`.
+    #[test]
+    fn private_unnamed_selector_constructor_used_via_factory_is_spared() {
+        let source = "class _E {\n\
+                      \x20 _E._();\n\
+                      \x20 factory _E.make() => _E._();\n\
+                      }\n";
+        let rows = unused_element_rows(source);
+        // `_` is never a separate reported element — the unnamed-ctor gate
+        // keeps it out entirely; the pin is that `_E._` never appears in
+        // the message text.
+        assert!(
+            !rows.iter().any(|(_, text)| text.contains("_E._")),
+            "unnamed ctor reported: {rows:?} in {source:?}"
+        );
+    }
+
+    /// An untyped (`var`-inferred) receiver keeps the under-report: the
+    /// oracle's full inference may still resolve `m._x()` to a member
+    /// `Receiver::Unknown` cannot name, so the access stays resolved in the
+    /// element pool and `_x` spares — the raw `used_names` posture the
+    /// subtraction preserves. A resolved-receiver miss is what poisons a
+    /// declaration, never an unnameable one.
+    #[test]
+    fn inferred_receiver_access_spares_private_member() {
+        let source = "class C {\n\
+                      \x20 void _x() {}\n\
+                      }\n\
+                      void f() {\n\
+                      \x20 var m = C();\n\
+                      \x20 m._x();\n\
+                      }\n";
+        let rows = unused_element_rows(source);
+        assert!(
+            !rows.iter().any(|(_, text)| text.contains("_x")),
+            "member reported: {rows:?} in {source:?}"
+        );
+    }
+
+    /// The poison direction (B): a private method read only through a
+    /// receiver the member walk settles against (`this` on a second,
+    /// unrelated container) misses the declaring container's face — the
+    /// access never resolved the member, so `used_names`' spelling credit
+    /// is revoked and the declaration reports, matching the oracle's
+    /// element-level `_isUsedMember`.
+    #[test]
+    fn this_typed_miss_reports_private_member() {
+        let source = "class A {\n\
+                      \x20 void _gone() {}\n\
+                      }\n\
+                      class B {\n\
+                      \x20 void f() {\n\
+                      \x20   this._gone();\n\
+                      \x20 }\n\
+                      }\n";
+        let gone_at = source.find("_gone").unwrap() as u32;
+        let rows = unused_element_rows(source);
+        assert!(
+            rows.iter().any(|(offset, _)| *offset == gone_at),
+            "_gone not reported at {gone_at}: {rows:?} in {source:?}"
         );
     }
 }
