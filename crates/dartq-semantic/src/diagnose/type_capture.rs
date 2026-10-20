@@ -765,12 +765,25 @@ impl<'a> Engine<'a> {
     /// return latches through [`Engine::fn_capture_type`] as its
     /// completions arrive.
     pub(crate) fn fn_capture_begin(&mut self) {
-        if self.var_header.is_some()
-            || (self.formal_list_depth == 0
-                && !self
-                    .frames
-                    .iter()
-                    .all(|f| matches!(f.kind, FrameKind::Container { .. })))
+        if self.var_header.is_some() {
+            return;
+        }
+        // #2359: inside an executable's block body the written function
+        // type is the body-position annotation face (`x is void
+        // Function(int)`, a local's annotation) — it captures and composes
+        // into a real interned shape, so the shape-keyed sentinels
+        // (`NameTy::from_semantic`) decide same-signature checks. The rest
+        // of an executable's interior stays out: the return annotation (and
+        // an arrow body, an initializer list) parses with the frame open but
+        // the body brace unlatched, and its shapeless degradation is the
+        // pinned under-report of the assignability context face
+        // (`direct_function_typed_return_spelling_stays_silent`).
+        if self.formal_list_depth == 0
+            && !self.in_block_body()
+            && !self
+                .frames
+                .iter()
+                .all(|f| matches!(f.kind, FrameKind::Container { .. }))
         {
             return;
         }
@@ -780,6 +793,22 @@ impl<'a> Engine<'a> {
                 self.fn_type_capture.push(FnTypeCapture::default());
             }
         }
+    }
+
+    /// Whether the position sits inside the innermost executable's latched
+    /// block body (`begin_block_function_body`'s brace): the
+    /// body-position annotation face. Statement blocks, catch clauses, and
+    /// for-loops push [`FrameKind::Block`] frames over the executable, so
+    /// the walk reads the innermost *executable* frame's latch.
+    fn in_block_body(&self) -> bool {
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|f| match &f.kind {
+                FrameKind::Executable { body_brace, .. } => Some(body_brace.is_some()),
+                _ => None,
+            })
+            == Some(true)
     }
 
     /// `end_function_type`: the frame closes into a stashed signature —
@@ -830,7 +859,12 @@ impl<'a> Engine<'a> {
         self.armed_ty = Some(fn_ty);
         self.armed_ty_unresolved = false;
         self.fn_capture_type(fn_ty, StringId::NONE, 0);
-        if capture.poisoned {
+        // A body-position capture (#2359) arms its shape for the
+        // annotation/test faces but claims no variable-signature stash: the
+        // claim sites are formals and container-level groups, and a stash
+        // surviving into the body would be stolen by the next closure
+        // formal's claim (the stale-attribution direction).
+        if capture.poisoned || self.in_block_body() {
             return;
         }
         self.fn_type_stash = Some(Box::new(FnVarSig {

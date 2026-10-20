@@ -3505,3 +3505,9 @@ mod ticket_2231_tests;
 
 #[cfg(test)]
 mod ticket_2297_tests;
+
+/// The #2359 pins: the body-position function-type capture — written
+/// function types inside block bodies intern real shapes so the
+/// shape-keyed sentinels decide same-signature type checks.
+#[cfg(test)]
+mod ticket_2359_tests;
