@@ -127,6 +127,20 @@ fn unused_import_name() -> &'static str {
         .name
 }
 
+/// The `unused_field` code name — the read-gated family the library-wide
+/// close re-decides (see [`MemberFold::unused_fields`]); its primary-
+/// constructor twin shares the gate.
+fn unused_field_names() -> [&'static str; 2] {
+    [
+        dartq_semantic::codes::SemanticCode::UnusedField
+            .code_info()
+            .name,
+        dartq_semantic::codes::SemanticCode::UnusedFieldFromPrimaryConstructor
+            .code_info()
+            .name,
+    ]
+}
+
 /// The declaration name an `unused_element` row's verdict tested: the
 /// written spelling at the row's anchor — the declaration-name token the
 /// per-file pass anchored on (a named constructor's rewritten selector, a
@@ -589,11 +603,22 @@ pub(crate) struct FoldInputs {
 /// library scope and spares the import that provides `Name`. The rows
 /// ride the fold and the library close re-decides them against the
 /// merged library pool.
+///
+/// The `unused_field` split is the read pool's close (#2286): the
+/// per-file pass fires against its own unit's read set, but the
+/// official `readMembers`/`unresolvedReadMembers` merge across the
+/// library — a read in a `part of` file spares the declaring file's
+/// field. The rows ride the fold beside `unused`'s used-gated
+/// candidates and release against the merged `consumed.reads` —
+/// the read-only twin of the used-set verdict (`unused_field` never
+/// spares on a write, and the primary-constructor face shares the
+/// gate).
 pub(crate) struct MemberFold {
     inputs: FoldInputs,
     content: ContentId,
     diagnostics: Arc<[Arc<Diagnostic>]>,
     unused: Arc<[(Arc<Diagnostic>, StringId)]>,
+    unused_fields: Arc<[(Arc<Diagnostic>, StringId)]>,
     unused_imports: Arc<[Arc<Diagnostic>]>,
     doc_refs: Box<[StringId]>,
     face: CompactUseFace,
@@ -619,6 +644,7 @@ impl MemberFold {
         size_of::<Self>()
             + self.diagnostics.len() * size_of::<Arc<Diagnostic>>()
             + self.unused.len() * size_of::<(Arc<Diagnostic>, StringId)>()
+            + self.unused_fields.len() * size_of::<(Arc<Diagnostic>, StringId)>()
             + self.unused_imports.len() * size_of::<Arc<Diagnostic>>()
             + self.doc_refs.len() * size_of::<StringId>()
             + self.face.heap_bytes()
@@ -747,6 +773,7 @@ impl SemanticDiagnoser for Diagnoser {
     fn diagnose_library(&self, library: LibraryView<'_>, out: &mut Vec<Arc<Diagnostic>>) {
         let duplicate = duplicate_definition_name();
         let unused = unused_element_name();
+        let unused_fields = unused_field_names();
         // The M3 U1 use-face substrate (#767): every fold emits its unit's
         // face alongside the report, and the library's faces close into the
         // per-library consumed set once the member loop ends — the
@@ -762,6 +789,10 @@ impl SemanticDiagnoser for Diagnoser {
         // paths (fresh and memo-served — the split is part of the memoized
         // product), released after the close.
         let mut staged: Vec<(Arc<Diagnostic>, StringId)> = Vec::new();
+        // The read-gated twin (#2286): `unused_field` rows with the field
+        // names their verdicts tested, re-decided against the merged
+        // `consumed.reads` at the close.
+        let mut staged_fields: Vec<(Arc<Diagnostic>, StringId)> = Vec::new();
         // The import-credit staging (#2251) plus the per-unit doc-reference
         // names: the close's credit pool re-decides the staged
         // `unused_import` rows against the library-merged use set and every
@@ -780,6 +811,11 @@ impl SemanticDiagnoser for Diagnoser {
                 out.extend(fold.diagnostics.iter().cloned());
                 staged.extend(
                     fold.unused
+                        .iter()
+                        .map(|(row, name)| (Arc::clone(row), *name)),
+                );
+                staged_fields.extend(
+                    fold.unused_fields
                         .iter()
                         .map(|(row, name)| (Arc::clone(row), *name)),
                 );
@@ -866,6 +902,7 @@ impl SemanticDiagnoser for Diagnoser {
             // clone, never fresh bytes.
             let mut live: Vec<Arc<Diagnostic>> = Vec::new();
             let mut candidates: Vec<(Arc<Diagnostic>, StringId)> = Vec::new();
+            let mut field_rows: Vec<(Arc<Diagnostic>, StringId)> = Vec::new();
             let mut import_rows: Vec<Arc<Diagnostic>> = Vec::new();
             for diagnostic in report.diagnostics {
                 if diagnostic.code.name == duplicate {
@@ -880,6 +917,14 @@ impl SemanticDiagnoser for Diagnoser {
                         library.strings,
                     );
                     candidates.push((row, name));
+                } else if unused_fields.contains(&row.code.name) {
+                    let name = staged_decl_name(
+                        text,
+                        &facts.line_index,
+                        row.range,
+                        library.strings,
+                    );
+                    field_rows.push((row, name));
                 } else if row.code.name == unused_import {
                     import_rows.push(row);
                 } else {
@@ -900,6 +945,11 @@ impl SemanticDiagnoser for Diagnoser {
                     .iter()
                     .map(|(row, name)| (Arc::clone(row), *name)),
             );
+            staged_fields.extend(
+                field_rows
+                    .iter()
+                    .map(|(row, name)| (Arc::clone(row), *name)),
+            );
             staged_imports.extend(import_rows.iter().cloned());
             // The memo keeps the compact form; the live face moves into the
             // substrate as-is (no clone on the fresh path).
@@ -912,6 +962,7 @@ impl SemanticDiagnoser for Diagnoser {
                     content: facts.content,
                     diagnostics: live.into(),
                     unused: candidates.into(),
+                    unused_fields: field_rows.into(),
                     unused_imports: import_rows.into(),
                     doc_refs: doc_names,
                     face: compact,
@@ -930,6 +981,17 @@ impl SemanticDiagnoser for Diagnoser {
             staged
                 .into_iter()
                 .filter_map(|(row, name)| (!consumed.used(name)).then_some(row)),
+        );
+        // The `unused_field` twin: the official `readMembers` merge is
+        // library-wide, so a read in any member file spares the declaring
+        // file's field. The name-level read pool under-credits the
+        // element-scoped join the per-file pass ran — a same-spelled field
+        // in an unrelated container of the same library reads as used —
+        // the documented under-report direction.
+        out.extend(
+            staged_fields
+                .into_iter()
+                .filter_map(|(row, name)| (!consumed.read(name)).then_some(row)),
         );
         release_unused_imports(&library, staged_imports, &doc_refs, &consumed, out);
     }
@@ -1720,6 +1782,98 @@ mod tests {
         );
         assert_matches_wholesale(&root, &engine, &current, &out);
         assert_eq!(unused_rows(&engine, &out), unused, "served == fresh");
+    }
+
+    /// The `unused_field` rows of one analyze output: (path, message) pairs
+    /// in emission order.
+    fn unused_field_rows(
+        engine: &Engine,
+        rows: &[Diagnostic],
+    ) -> Vec<(String, String)> {
+        rows.iter()
+            .filter(|row| {
+                unused_field_names().contains(&row.code.name)
+            })
+            .map(|row| {
+                (
+                    engine
+                        .file_table()
+                        .path(row.file)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                    row.message.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The part-file unused-field close (#2286): the per-file pass fires
+    /// `unused_field` against its own unit's read set, but the oracle's
+    /// `readMembers` merge is library-wide — a read in the host spares the
+    /// part-declared field and a read in a sibling part spares it too. A
+    /// write-only field stays reported (writes never spare a field), a
+    /// genuinely unread one likewise, and an enum constant of a private
+    /// enum reads through its member face the same way. A trailing host
+    /// comment then salvages the part's fold (#1384) and the memo-served
+    /// staging releases byte-identically to the wholesale recompute.
+    #[test]
+    fn part_file_unused_field_closes_library_wide() {
+        let root = memo_workspace();
+        let mut engine = memo_engine(&root);
+        let main_base = "part 'p.dart';\npart 'q.dart';\n\nvoid main() {\n  final t = _makeT();\n  t._read;\n  t._written = 1;\n  _useQ();\n}\n";
+        let p_base = "part of 'main.dart';\n\nclass _T {\n  int _read = 0;\n  int _written = 0;\n  int _orphan = 0;\n  void use() {}\n}\n\n_T _makeT() => _T();\n\nenum _Op {\n  and,\n  or,\n}\n";
+        let q_base = "part of 'main.dart';\n\nvoid _useQ() {\n  _Op.or;\n}\n";
+        let other_base = "class _Shadow {\n  int _f = 0;\n}\n\nvoid useOwn() {\n  _Shadow()._f;\n}\n";
+        let mut current: Vec<(String, String)> = vec![
+            ("lib/main.dart".into(), main_base.into()),
+            ("lib/p.dart".into(), p_base.into()),
+            ("lib/q.dart".into(), q_base.into()),
+            ("lib/other.dart".into(), other_base.into()),
+        ];
+        for (relative, content) in &current {
+            engine.set_content(&root.join(relative), content.as_bytes());
+        }
+        let out = engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        assert_matches_wholesale(&root, &engine, &current, &out);
+        let fields = unused_field_rows(&engine, &out);
+        // Only the genuinely unread members report: `_read` is read in the
+        // host, `_Op.or` in the sibling part, `other`'s `_f` in its own
+        // file — `_written` was only assigned and `_orphan` never touched.
+        assert_eq!(
+            fields,
+            vec![
+                (
+                    root.join("lib/p.dart").display().to_string(),
+                    "The value of the field '_written' isn't used.".into()
+                ),
+                (
+                    root.join("lib/p.dart").display().to_string(),
+                    "The value of the field '_orphan' isn't used.".into()
+                ),
+                (
+                    root.join("lib/p.dart").display().to_string(),
+                    "The value of the field 'and' isn't used.".into()
+                ),
+            ],
+            "cross-part reads must spare, write-only and orphans must stay: {fields:?}"
+        );
+
+        // A trailing host comment churns only the host's bytes: the parts'
+        // folds are memo-served, and their staged rows re-release
+        // identically against the merged read pool.
+        current[0].1 = format!("{main_base}// churn\n");
+        engine.set_content(&root.join("lib/main.dart"), current[0].1.as_bytes());
+        let out = engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        assert!(
+            memo_serves(&engine) >= 1,
+            "at least the standing parts must serve byte-identical folds"
+        );
+        assert_matches_wholesale(&root, &engine, &current, &out);
+        assert_eq!(unused_field_rows(&engine, &out), fields, "served == fresh");
     }
 
     /// The unused-import rows of one analyze output: (path, message) pairs
