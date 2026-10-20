@@ -16,6 +16,12 @@ use super::*;
 /// never pay the build). The answer's evidence vec is path-sorted, the
 /// machine face's deterministic order.
 ///
+/// The import-synthesis family rides the same pass a third way: its
+/// candidates need the maintained index ([`dartq_engine::Engine::query_symbols`])
+/// and the directive facts, both engine-resident, so the harvest runs
+/// here into per-file [`ImportContext`]s the per-file loop consults —
+/// zero extra analysis, zero re-scanning.
+///
 /// Best-effort by contract: an assembly or analysis failure prints one
 /// stderr note and yields an empty map — the fix run answers from the
 /// other sources, never fails on the engine faces' account.
@@ -23,15 +29,23 @@ pub(crate) fn semantic_fix_diagnostics(
     files: &std::collections::BTreeSet<PathBuf>,
     sdk: Option<&Path>,
     fuse: &PlannerFuse,
-) -> (FxHashMap<PathBuf, Vec<Diagnostic>>, Vec<FileEvidence>) {
+) -> (
+    FxHashMap<PathBuf, Vec<Diagnostic>>,
+    Vec<FileEvidence>,
+    FxHashMap<PathBuf, ImportContext>,
+) {
     let mut rows = FxHashMap::default();
     // The synthesis arm's codes are by definition outside the mechanical
     // table (the table never claims them), so they group separately — the
     // evidence face's input.
     let mut synthesis_rows: FxHashMap<PathBuf, Vec<Diagnostic>> = FxHashMap::default();
+    // The import arm's rows group the same way — the harvest's per-file
+    // input (the miss names the candidates resolve from).
+    let mut import_rows: FxHashMap<PathBuf, Vec<Diagnostic>> = FxHashMap::default();
     let mut evidence = Vec::new();
+    let mut imports: FxHashMap<PathBuf, ImportContext> = FxHashMap::default();
     let Some(seed) = files.iter().next().and_then(|first| first.parent()) else {
-        return (rows, evidence);
+        return (rows, evidence, imports);
     };
     // The advisory-taking opener, not [`crate::workspace::open_engine`]:
     // the query-family opener disarms the semantic diagnoser (`semdiag:
@@ -40,13 +54,13 @@ pub(crate) fn semantic_fix_diagnostics(
     // missing config) is the assembly's stderr note below, not a row.
     let Ok((mut engine, _, _)) = crate::workspace::open_engine_with_advisory(seed, sdk) else {
         eprintln!("dartq: semantic fix pass unavailable: no usable workspace or SDK");
-        return (rows, evidence);
+        return (rows, evidence, imports);
     };
     let run = match crate::analyze::run_overlaid(&mut engine, &[], &[]) {
         Ok(run) => run,
         Err(error) => {
             eprintln!("dartq: semantic fix pass unavailable: {error}");
-            return (rows, evidence);
+            return (rows, evidence, imports);
         }
     };
     // The owned diagnostics out of the run — its layout borrows the
@@ -63,7 +77,7 @@ pub(crate) fn semantic_fix_diagnostics(
         }
     }
     if targets.is_empty() {
-        return (rows, evidence);
+        return (rows, evidence, imports);
     }
     'grouping: for diagnostic in diagnostics {
         if !fuse.step() {
@@ -79,6 +93,12 @@ pub(crate) fn semantic_fix_diagnostics(
         }
         if crate::fix_table::synthesis_arm(diagnostic.code.name).is_some() {
             synthesis_rows
+                .entry(path.clone())
+                .or_insert_with(Vec::new)
+                .push(diagnostic.clone());
+        }
+        if import_arm(diagnostic.code.name).is_some() {
+            import_rows
                 .entry(path.clone())
                 .or_insert_with(Vec::new)
                 .push(diagnostic);
@@ -100,7 +120,24 @@ pub(crate) fn semantic_fix_diagnostics(
         }
     }
     evidence.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    (rows, evidence)
+    // The import-synthesis harvest — engine-alive, per target file: the
+    // arm rows' miss names resolve to candidate libraries through the
+    // maintained index and the SDK faces.
+    'imports: for (file, path) in &targets {
+        if !fuse.step() {
+            break 'imports;
+        }
+        let Some(file_rows) = import_rows.get(path) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if let Some(context) = import_contexts(&engine, *file, file_rows, &text, fuse) {
+            imports.insert(path.clone(), context);
+        }
+    }
+    (rows, evidence, imports)
 }
 
 // ---------------------------------------------------------------------------

@@ -8233,3 +8233,231 @@
         drop("import 'a.dart' 'b.dart';\n", "a.dart", 7, 18);
         drop("part of 'a.dart';\n", "a.dart", 8, 8);
     }
+
+    // -----------------------------------------------------------------------
+    // T9: the import-synthesis family — from_imports over hand-built
+    // ImportContexts (the fixture SDK carries no engine rows, so the
+    // producer's pure half — placement + candidate ordering — pins here;
+    // the engine-alive harvest stays structurally covered).
+    // -----------------------------------------------------------------------
+
+    /// One import-arm diagnostic over the miss name at `offset`.
+    fn import_row(code: &'static str, offset: u32, name: &str) -> Diagnostic {
+        sem_row(code, "STATIC_WARNING", offset, name.len() as u32)
+    }
+
+    /// One-file context: `name` → `uris` in candidate order (the
+    /// harvest's priority ordering is its own concern — the stage reads
+    /// the order as-given).
+    fn import_context(name: &str, uris: &[&str]) -> ImportContext {
+        let mut context = ImportContext::default();
+        context.names.insert(
+            name.into(),
+            uris.iter()
+                .map(|uri| ImportCandidate {
+                    uri: (*uri).to_owned(),
+                    sdk: uri.starts_with("dart:"),
+                })
+                .collect(),
+        );
+        context
+    }
+
+    /// The fixes of `code`'s miss name under `context`, parsed and
+    /// produced the production way.
+    fn import_fixes(
+        code: &'static str,
+        name: &str,
+        source: &str,
+        context: &ImportContext,
+    ) -> Vec<RuleFix> {
+        let parsed = parse_unit(source, Features::default());
+        from_imports(
+            &[import_row(code, at(source, name), name)],
+            Some(context),
+            source,
+            &parsed.tokens,
+            &parsed.lines,
+            &walk_fuse(),
+        )
+    }
+
+    /// The single-candidate shape: an `undefined_identifier` miss with
+    /// one offering library produces one `builtin-semantic` row whose
+    /// application inserts the import and leaves the rest of the file
+    /// verbatim.
+    #[test]
+    fn import_single_candidate_inserts() {
+        let source = "void f() { helper(); }\n";
+        let context = import_context("helper", &["package:app/util.dart"]);
+        let fixes = import_fixes("undefined_identifier", "helper", source, &context);
+        assert_eq!(fixes.len(), 1, "one candidate, one row");
+        assert_eq!(fixes[0].rule, "undefined_identifier");
+        assert_eq!(fixes[0].source, BUILTIN_SEMANTIC_SOURCE);
+        assert_eq!(fixes[0].message, "Add 'import' of 'package:app/util.dart'");
+        let (patched, outcomes) = apply(source, std::slice::from_ref(&fixes[0].edit));
+        assert_eq!(outcomes, &[EditOutcome::Applied]);
+        assert_eq!(
+            patched,
+            "import 'package:app/util.dart';\n\nvoid f() { helper(); }\n"
+        );
+    }
+
+    /// The upstream fix-kind order pins first: a `dart:` candidate sorts
+    /// ahead of `package:` and `file:` rows however the harvest listed
+    /// them — the producer emits the context's given order, and the
+    /// context carries the sorted order.
+    #[test]
+    fn import_dart_candidate_sorts_first() {
+        let source = "void f() { print(x); }\n";
+        // Harvest-order input (package first) — the stage does not re-sort;
+        // the pinned order is the context's. The sort itself is pinned in
+        // the harvest; this pins the stage's fidelity to it.
+        let context = import_context(
+            "print",
+            &["dart:core", "package:app/a.dart", "file:///abs/b.dart"],
+        );
+        let fixes = import_fixes("undefined_identifier", "print", source, &context);
+        // dart: first by construction of the context.
+        assert_eq!(fixes.len(), 3);
+        assert!(fixes[0].message.contains("dart:core"));
+        assert!(fixes[1].message.contains("package:app/a.dart"));
+        assert!(fixes[2].message.contains("file:///abs/b.dart"));
+    }
+
+    /// Multiple candidates of one miss each emit a row — upstream's
+    /// one-fix-per-candidate shape (`libraryProject1..4`); identical
+    /// (offset, uri) pairs across two diagnostics collapse.
+    #[test]
+    fn import_multi_candidate_all_options() {
+        let source = "void f() { Foo x = null; }\n";
+        let context = import_context("Foo", &["package:a/foo.dart", "package:b/foo.dart"]);
+        let fixes = import_fixes("undefined_class", "Foo", source, &context);
+        assert_eq!(fixes.len(), 2, "one row per candidate");
+        assert!(
+            fixes.iter().all(|fix| fix.source == BUILTIN_SEMANTIC_SOURCE),
+            "provenance on every row"
+        );
+        // Each edit inserts the same position with its own URI; the two
+        // rows are distinct options, not a double-apply.
+        assert_ne!(
+            fixes[0].edit.replacement, fixes[1].edit.replacement,
+            "each candidate its own URI"
+        );
+        assert_eq!(fixes[0].edit.offset, fixes[1].edit.offset);
+    }
+
+    /// A miss with no candidates produces no rows — upstream's silent
+    /// no-fix posture (the producer's `forEach` over an empty set).
+    #[test]
+    fn import_zero_candidates_silent() {
+        let source = "void f() { helper(); }\n";
+        let context = ImportContext::default();
+        let fixes = import_fixes("undefined_identifier", "helper", source, &context);
+        assert!(fixes.is_empty(), "no candidates, no rows");
+
+        // A non-arm code under the same context: nothing.
+        let parsed = parse_unit(source, Features::default());
+        let rows = from_imports(
+            &[sem_row(
+                "unused_import",
+                "UNUSED_IMPORT",
+                at(source, "helper"),
+                6,
+            )],
+            Some(&import_context("helper", &["package:app/util.dart"])),
+            source,
+            &parsed.tokens,
+            &parsed.lines,
+            &walk_fuse(),
+        );
+        assert!(rows.is_empty(), "non-arm codes never reach the stage");
+    }
+
+    /// The machine face: a produced import row passes the published
+    /// FixPatch schema through `patch_json`, provenance and anchor intact.
+    #[test]
+    fn import_rows_pass_the_fixpatch_schema() {
+        let source = "void f() { helper(); }\n";
+        let context = import_context("helper", &["package:app/util.dart"]);
+        let fixes = import_fixes("undefined_identifier", "helper", source, &context);
+        assert_eq!(fixes.len(), 1);
+        let set = FileFixSet {
+            path: "lib/t.dart".to_owned(),
+            fixes,
+            plugin: Vec::new(),
+        };
+        let doc = patch_json(&set, Verbosity::Compact);
+        let text = doc.to_string();
+        dartq_schema::validate(&text, dartq_schema::Domain::FixPatch).expect("schema-valid");
+        assert_eq!(doc["edits"][0]["source"], BUILTIN_SEMANTIC_SOURCE);
+        assert_eq!(
+            doc["edits"][0]["replacement"],
+            "import 'package:app/util.dart';\n\n"
+        );
+    }
+
+    /// A `part of` unit never produces an import (upstream exits on
+    /// `partOfDirective` — a library part cannot carry imports). The
+    /// token-driven `import_edit` refuses it directly.
+    #[test]
+    fn import_part_of_unit_produces_nothing() {
+        let source = "part of 'lib.dart';\n\nvoid f() { helper(); }\n";
+        let parsed = parse_unit(source, Features::default());
+        assert!(
+            import_edit(source, &parsed.tokens, "package:app/util.dart").is_none(),
+            "a part file cannot import"
+        );
+    }
+
+    /// The directive-region insertions: sorted within each group, group
+    /// boundaries blank-lined — `dart:` before `package:` before other;
+    /// a `dart:` inserted into a package group carries the separator;
+    /// appended past the tail takes the group's blank line.
+    #[test]
+    fn import_placement_groups_and_orders() {
+        let parse = |source: &str| parse_unit(source, Features::default());
+        let edit = |source: &str, uri: &str| {
+            let parsed = parse(source);
+            import_edit(source, &parsed.tokens, uri).expect("edit")
+        };
+
+        // dart: into the dart group, sorted.
+        let source = "import 'dart:b';\nimport 'dart:d';\n\nvoid f() {}\n";
+        let (offset, length, replacement) = edit(source, "dart:c");
+        assert_eq!(length, 0);
+        let at = utf16_offset_to_byte(source, offset);
+        assert_eq!(replacement, "import 'dart:c';\n");
+        assert_eq!(&source[at..], "import 'dart:d';\n\nvoid f() {}\n");
+
+        // A dart: newcomer against a package group: insert before it with
+        // the group-separator blank line.
+        let source = "import 'package:a/a.dart';\n\nvoid f() {}\n";
+        let (_, _, replacement) = edit(source, "dart:core");
+        assert_eq!(replacement, "import 'dart:core';\n\n");
+
+        // A package newcomer into the same package group sorts; into a
+        // relative group it carries the separator.
+        let source = "import 'package:b.dart';\n\nvoid f() {}\n";
+        let (_, _, replacement) = edit(source, "package:a.dart");
+        assert_eq!(replacement, "import 'package:a.dart';\n");
+
+        // Appended after a dart tail: the package takes the blank line.
+        // The anchor is the directive end (the `;`), matching upstream's
+        // `directive.end` — the newline stays on the tail side.
+        let source = "import 'dart:async';\n\nvoid f() {}\n";
+        let (offset, _, replacement) = edit(source, "package:a/a.dart");
+        let at = utf16_offset_to_byte(source, offset);
+        assert_eq!(replacement, "\n\nimport 'package:a/a.dart';");
+        assert_eq!(&source[..at], "import 'dart:async';");
+
+        // After `library`, no imports.
+        let source = "library mine;\n\nvoid f() {}\n";
+        let (_, _, replacement) = edit(source, "package:a/a.dart");
+        assert_eq!(replacement, "\n\nimport 'package:a/a.dart';");
+
+        // Before the first declaration, blank line after.
+        let source = "void f() {}\n";
+        let (_, _, replacement) = edit(source, "dart:core");
+        assert_eq!(replacement, "import 'dart:core';\n\n");
+    }

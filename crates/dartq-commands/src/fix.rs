@@ -391,6 +391,7 @@ pub enum EditOutcome {
 mod assists;
 mod evidence;
 mod ignore;
+mod import;
 mod pipeline;
 mod plugin_host;
 mod rewrite_decl;
@@ -405,6 +406,7 @@ mod scan;
 pub(crate) use assists::*;
 pub(crate) use evidence::*;
 pub(crate) use ignore::*;
+pub(crate) use import::*;
 // Test-only resolution rides this glob (`from_lints`/`from_semantic`/
 // `from_parser`/`collect_set_with_evidence` have no non-test callers outside
 // `pipeline`), so the lint fires only in non-test builds.

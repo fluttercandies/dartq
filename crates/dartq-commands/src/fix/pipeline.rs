@@ -104,8 +104,9 @@ pub fn collect_set_with_evidence(
         eprintln!("dartq: {}: {}", advisory.code().name, advisory.message());
     }
     // The semantic source's engine check pass, before the per-file loop;
-    // the synthesis evidence face rides the same pass.
-    let (semantic, evidence) = semantic_fix_diagnostics(&files, sdk, &fuse);
+    // the synthesis evidence face and the import-synthesis harvest ride
+    // the same pass.
+    let (semantic, evidence, import_contexts) = semantic_fix_diagnostics(&files, sdk, &fuse);
     // The ignore-diagnostic face's dedup sets (one line row per line and
     // code, one file row per code) and the per-options-file codes the
     // third producer groups into its own file sets after the walk.
@@ -192,6 +193,14 @@ pub fn collect_set_with_evidence(
             break 'files;
         }
         applied.extend(from_semantic(semantic_rows, &text, &parsed.lines, path, &fuse));
+        applied.extend(from_imports(
+            semantic_rows,
+            import_contexts.get(path),
+            &text,
+            &parsed.tokens,
+            &parsed.lines,
+            &fuse,
+        ));
         applied.extend(from_parser(semantic_rows, &text, &parsed.lines, path, &fuse));
         if fuse.tripped() {
             break 'files;
