@@ -14482,7 +14482,7 @@
              void useRequiredNamed(void Function({required int x}) f) => f(x: 1); \
              void onlyInt(int x) {} \
              void fromNum(num n) {} \
-             void justInt() => 1; \
+             int justInt() => 1; \
              int? maybeInt() => null; \
              void requiredNamedX({required int x}) {} \
              void optionalNamedX({int x}) {} \

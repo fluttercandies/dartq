@@ -1434,6 +1434,13 @@ impl<'a> Engine<'a> {
     /// and the declared `T` (`reportTypeError`, :155-205) — the
     /// projections are verdict-side only.
     pub(crate) fn async_return_verdict(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
+        // Right Bottom: a `throw` expression's `Never` assigns into every
+        // declared shape — `Future<void> f() async => throw 'x';` is clean
+        // through the subtype leg before the flatten projections ask their
+        // own questions (the flatten ok-sets name no `Never` arm).
+        if from == Ty::Never {
+            return Some(true);
+        }
         let t_v = future_value_ty(self.strings, &self.boundary.pool(), to);
         let flatten_s = flatten_ty(self.strings, &self.boundary.pool(), from);
         if t_v == Ty::Void {
@@ -1943,9 +1950,54 @@ impl<'a> Engine<'a> {
     /// facts; every type question routes through [`Engine::assignable`],
     /// and one undecidable slot suppresses the whole (`None` — the
     /// under-report direction).
+    /// The strict subtype ask the function-shape and covariant-interface
+    /// rules run on every slot (`subtype.dart`'s function and interface
+    /// cases): real subtyping, never the assignability face. The
+    /// downcast leniencies the assignable face grants (`dynamic → C`,
+    /// `Null → C?`) are expression-position casts — inside a type's shape
+    /// (`XPathNode Function(XmlNode)` against
+    /// `XPathItem Function(dynamic)`) the contravariant leg asks
+    /// `dynamic <: XmlNode`, which is false, and the generic-argument
+    /// covariance asks `dynamic <: ValueT` the same way.
+    pub(crate) fn slot_subtype(&self, sub: Ty, sup: Ty) -> Option<bool> {
+        if sub == Ty::Unknown || sup == Ty::Unknown {
+            return None;
+        }
+        if sub == Ty::Never {
+            return Some(true);
+        }
+        if sub == Ty::Dynamic || sub == Ty::Void {
+            // A top source subtypes only the top faces (the nullable
+            // projections included) — never a concrete named head.
+            return Some(matches!(
+                sup,
+                Ty::Dynamic
+                    | Ty::Void
+                    | Ty::Named { nullable: true, .. }
+                    | Ty::Record { nullable: true, .. }
+                    | Ty::Function { nullable: true, .. }
+            ));
+        }
+        if sub == Ty::Null {
+            return Some(matches!(
+                sup,
+                Ty::Null
+                    | Ty::Dynamic
+                    | Ty::Void
+                    | Ty::Named { nullable: true, .. }
+                    | Ty::Record { nullable: true, .. }
+                    | Ty::Function { nullable: true, .. }
+            ));
+        }
+        if sup == Ty::Null {
+            return Some(false);
+        }
+        self.assignable(sub, sup, false)
+    }
+
     pub(crate) fn fn_sig_subtype(&self, from: &FnVarSig, to: &FnVarSig) -> Option<bool> {
         if to.return_ty != Ty::Void {
-            match self.assignable(from.return_ty, to.return_ty, false) {
+            match self.slot_subtype(from.return_ty, to.return_ty) {
                 Some(false) => return Some(false),
                 Some(true) => {}
                 None => return None,
@@ -1958,7 +2010,7 @@ impl<'a> Engine<'a> {
             return Some(false);
         }
         for (index, to_ty) in to.positional.iter().enumerate() {
-            match self.assignable(*to_ty, from.positional[index], false) {
+            match self.slot_subtype(*to_ty, from.positional[index]) {
                 Some(false) => return Some(false),
                 Some(true) => {}
                 None => return None,
@@ -1971,7 +2023,7 @@ impl<'a> Engine<'a> {
             if *from_required && !to_required {
                 return Some(false);
             }
-            match self.assignable(*to_ty, *from_ty, false) {
+            match self.slot_subtype(*to_ty, *from_ty) {
                 Some(false) => return Some(false),
                 Some(true) => {}
                 None => return None,
@@ -2039,6 +2091,46 @@ impl<'a> Engine<'a> {
     /// through the boundary pool ([`Engine::covariant_args`]). `None`
     /// suppresses (under-report).
     pub(crate) fn assignable(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
+        // The `FutureOr<T>` union rule (`subtype.dart`'s FutureOr case):
+        // `S <: FutureOr<T>` iff `S <: Future<T>` or `S <: T` — a nominal
+        // head question the matrix cannot ask (Future and FutureOr are
+        // unrelated heads). `Null <: FutureOr<ResponsePayload?>` rides the
+        // value leg (`Null <: ResponsePayload?`); `Future<X>` rides the
+        // future leg.
+        if let Ty::Named {
+            name,
+            nullable: false,
+            args,
+        } = to
+            && name == self.intern("FutureOr")
+        {
+            // The written-argument-less `FutureOr` face is
+            // `FutureOr<dynamic>` (`futureValueType`'s raw-head arm) — the
+            // value leg is `dynamic` and accepts everything.
+            let value_ty = self
+                .boundary
+                .pool()
+                .get(args)
+                .first()
+                .copied()
+                .unwrap_or(Ty::Dynamic);
+            if from == Ty::Unknown || value_ty == Ty::Unknown {
+                return None;
+            }
+            let future_ty = Ty::Named {
+                name: self.intern("Future"),
+                nullable: false,
+                args,
+            };
+            return match (
+                self.assignable(from, future_ty, from_literal),
+                self.assignable(from, value_ty, from_literal),
+            ) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            };
+        }
         if let Some(verdict) = to.assignable_from(from) {
             // The strict-casts overlay (`type_system.dart:891-930`: with
             // `strict-casts: true`, "the option disables all downcasts,
@@ -2076,13 +2168,20 @@ impl<'a> Engine<'a> {
                 return Some(false);
             }
             let mut unknown = false;
+            // An `InvalidType` field poisons the whole-record question, and
+            // the poison outranks every field verdict: a record literal's
+            // inference is decided as a unit, so a recovered-comma-hole
+            // field (`(FeatureSet?, InvalidType)` against
+            // `(FeatureSet, Version)`) leaves no assignable ask at all —
+            // the oracle's splice stays silent on the other fields'
+            // nullable-vs-non-nullable mismatches too. The scan runs over
+            // the whole shape before any field decides.
+            if from.positional.iter().chain(from.named.iter().map(|(_, f)| f)).any(|f| *f == Ty::Unknown)
+                || to.positional.iter().chain(to.named.iter().map(|(_, t)| t)).any(|t| *t == Ty::Unknown)
+            {
+                return None;
+            }
             for (&f, &t) in from.positional.iter().zip(to.positional.iter()) {
-                // A recovered comma hole is an `InvalidType` field — the
-                // oracle's splice assigns in both directions, so the pair
-                // passes without deciding the rest of the shape.
-                if f == Ty::Unknown || t == Ty::Unknown {
-                    continue;
-                }
                 match self.assignable(f, t, from_literal) {
                     Some(false) => return Some(false),
                     Some(true) => {}
@@ -2094,9 +2193,6 @@ impl<'a> Engine<'a> {
             for ((fn_, f), (tn, t)) in from.named.iter().zip(to.named.iter()) {
                 if fn_ != tn {
                     return Some(false);
-                }
-                if *f == Ty::Unknown || *t == Ty::Unknown {
-                    continue;
                 }
                 match self.assignable(*f, *t, from_literal) {
                     Some(false) => return Some(false),
@@ -2206,7 +2302,11 @@ impl<'a> Engine<'a> {
         }
         let mut unknown = false;
         for (&f, &t) in from.iter().zip(to.iter()) {
-            match self.assignable(f, t, false) {
+            // The covariant-interface element rule is the subtype question
+            // (`Ctrl<dynamic>` does not fit `Ctrl<int>`: `dynamic <: int`
+            // is false — the expression-position downcast leniency never
+            // enters a type's argument shape).
+            match self.slot_subtype(f, t) {
                 Some(false) => return Some(false),
                 Some(true) => {}
                 None => unknown = true,
