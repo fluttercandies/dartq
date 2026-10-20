@@ -306,6 +306,24 @@ impl LibraryTypes {
         let bool_decl = registry[&strings.intern("bool")];
         builder = builder.enumeration(bool_decl, 2);
 
+        // The `CoreDecls` spellings: `Object`, `Function` and `Future` are
+        // declared in the hierarchy but were never keyed into `registry`,
+        // so a spelled `Object`/`Function`/`Future` (a declared parameter
+        // type, an `is`-tested name) read `Invalid` where the oracle
+        // resolves the dart:core class. With `Invalid` now answering
+        // through `TypeSystem::is_subtype` — the oracle's own 0c arm —
+        // an unregistered `Object` receiver made every `factor` vacuous
+        // and deaded every `is` arm (the `Object x` regression the
+        // pre-mount `is_invalid` bail had masked). `decl_params` rides
+        // beside so `instantiate_to_bounds` answers `Object`/`Function`
+        // (arity 0) and `Future<dynamic>` (the unbounded default).
+        registry.insert(strings.intern("Object"), object);
+        decl_params.insert(object, Vec::new());
+        registry.insert(strings.intern("Function"), function);
+        decl_params.insert(function, Vec::new());
+        registry.insert(strings.intern("Future"), future);
+        decl_params.insert(future, vec![TypeParamId::from_raw(1)]);
+
         // —— the reachable containers ————————————————————————————————
         // `Registry` carries the mutable build state; `register_file`
         // collects the decl actions (plain/sealed/enum) into `actions`
@@ -328,6 +346,7 @@ impl LibraryTypes {
                 builder = action.apply(builder);
             }
         }
+
 
         // The import reachability sweep: BFS over import edges from
         // `lib`, each target's export scope contributing the names the
@@ -979,19 +998,55 @@ impl<'a> ResolvedTypeOps<'a> {
                         };
                         Some((decl, args))
                     })
-                    .map_or((self.invalid, self.invalid), |(decl, args)| {
-                        let non_null = self.snapshot.table.intern(
-                            UninternedType::Interface { decl, args: args.clone() },
-                            false,
-                        );
-                        let nullable = self.snapshot.table.intern(
-                            UninternedType::Interface { decl, args },
-                            true,
-                        );
-                        (non_null, nullable)
-                    })
+                    .map_or_else(
+                        || {
+                            self.builtin_spelling(lexeme, false).map_or(
+                                (self.invalid, self.invalid),
+                                |non_null| {
+                                    (
+                                        non_null,
+                                        self.builtin_spelling(lexeme, true)
+                                            .unwrap_or(non_null),
+                                    )
+                                },
+                            )
+                        },
+                        |(decl, args)| {
+                            let non_null = self.snapshot.table.intern(
+                                UninternedType::Interface {
+                                    decl,
+                                    args: args.clone(),
+                                },
+                                false,
+                            );
+                            let nullable = self.snapshot.table.intern(
+                                UninternedType::Interface { decl, args },
+                                true,
+                            );
+                            (non_null, nullable)
+                        },
+                    )
             };
             cache.push(pair);
+        }
+    }
+
+    /// `Null` and `Never` spelled as types: kind-level spellings the
+    /// registry cannot carry (they are not declarations) but the oracle's
+    /// scope chain resolves from dart:core — `x is Null` keeps its else
+    /// (`T <: Null` only for `Null`), where an `Invalid` read would
+    /// vacuously dead it under the 0c arm. A user-declared `class Null`
+    /// still shadows: the caller asks only on a registry miss, the same
+    /// precedence `bounds.rs`'s `shadowed` check keeps.
+    fn builtin_spelling(&self, lexeme: &str, nullable: bool) -> Option<TypeId> {
+        match lexeme {
+            "Null" => Some(self.null),
+            "Never" => Some(
+                self.snapshot
+                    .table
+                    .intern(UninternedType::Never, nullable),
+            ),
+            _ => None,
         }
     }
 
@@ -1089,7 +1144,9 @@ impl<'a> ResolvedTypeOps<'a> {
                     .get(&name)
                     .filter(|_| !self.snapshot.non_containers.contains(&name))
                 else {
-                    return self.invalid;
+                    return self
+                        .builtin_spelling(lexeme, node.nullable)
+                        .unwrap_or(self.invalid);
                 };
                 let Some(args) = self.map_args(node.args, arena, names, decl) else {
                     return self.invalid;
@@ -1197,7 +1254,9 @@ impl<'a> ResolvedTypeOps<'a> {
                     .get(&name)
                     .filter(|_| !self.snapshot.non_containers.contains(&name))
                 else {
-                    return self.invalid;
+                    return self
+                        .builtin_spelling(lexeme, ty.nullable)
+                        .unwrap_or(self.invalid);
                 };
                 let Some(mapped_args) = self.map_args(args, arena, names, decl) else {
                     return self.invalid;
@@ -1371,9 +1430,14 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// remainder verdict answers through [`TypeSystem::is_subtype`] —
     /// `factor(Response, Response<T>)` keeps `Response` where the bare
     /// `Ty`s' name equality would answer `Never` and dead the else
-    /// branch (#2186 S4-C). An unmappable arm — an unresolved head, an
-    /// arity mismatch, an `Invalid` face — falls back to the name-level
-    /// answer verbatim.
+    /// branch (#2186 S4-C). An `Invalid` side answers through
+    /// `TypeSystem::is_subtype` like every other kind — the oracle's 0c
+    /// arm (subtype.dart:274-276) makes `X <: InvalidType` and
+    /// `InvalidType <: X` vacuously true, so `factor(T, InvalidType)` is
+    /// `Never` and the `x is Missing` else branch deads exactly as the
+    /// analyzer reports it (the broken-import corpus's dominant
+    /// dead_code root); a name the registry misses IS the oracle's
+    /// `InvalidType`, not an unanswerable question.
     fn factor_typed(
         &self,
         from: FlowTy,
@@ -1386,13 +1450,6 @@ impl TypeOps for ResolvedTypeOps<'_> {
         self.observe_names(names);
         let f = self.map_scrutinee(from, from_args, arena, names);
         let w = self.map_scrutinee(what, what_args, arena, names);
-        if matches!(
-            self.snapshot.table.get(w).kind(),
-            TypeKind::Invalid
-        ) || matches!(self.snapshot.table.get(f).kind(), TypeKind::Invalid)
-        {
-            return NameTypeOps.factor(from, what);
-        }
         if self.system.is_subtype(f, w) {
             return FlowTy::NEVER;
         }
@@ -1420,11 +1477,11 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// through `map_scrutinee` (the written-argument face — `List<int>`
     /// reads `Interface{List, [int]}`, a bare `List` its to-bounds
     /// instantiation) and the verdict answers through
-    /// [`TypeSystem::is_subtype`]. An unmappable arm — an unresolved
-    /// head, an arity mismatch — falls back to the name-level typed
-    /// answer verbatim (the under-report direction: the default's
-    /// covariant tree-compare is strictly weaker than the resolved
-    /// hierarchy, never stronger where it cannot see).
+    /// [`TypeSystem::is_subtype`]. An `Invalid` arm (an unresolved head,
+    /// an arity mismatch) answers through the same call — subtype.dart's
+    /// 0c arm makes it a vacuous `true` in both directions, the oracle's
+    /// own `InvalidType` verdict, so the resolved face reports exactly
+    /// what the analyzer reports for a name it cannot resolve.
     fn is_subtype_typed(
         &self,
         left: FlowTy,
@@ -1437,11 +1494,6 @@ impl TypeOps for ResolvedTypeOps<'_> {
         self.observe_names(names);
         let l = self.map_scrutinee(left, left_args, arena, names);
         let r = self.map_scrutinee(right, right_args, arena, names);
-        if self.is_invalid(l) || self.is_invalid(r) {
-            return NameTypeOps.is_subtype_typed(
-                left, left_args, right, right_args, arena, names,
-            );
-        }
         self.system.is_subtype(l, r)
     }
 
@@ -1451,9 +1503,11 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// with their written arguments, so a strict narrowing
     /// (`x is Response<T>` after `x is Response` — `Response<T> <:
     /// Response<dynamic>` holds) promotes, where the bare-`Ty` coverage
-    /// test would veto it. An unmappable arm falls back to the
-    /// name-level posture (optimistic promotion on the undecidable
-    /// cross-base question, the same-base argument refuse kept).
+    /// test would veto it. An `Invalid` arm (an unresolved head, an
+    /// arity mismatch) answers through the same gate — subtype.dart's
+    /// 0c arm makes both directions vacuously true, so the strict gate
+    /// refuses the step exactly as the oracle's `isValidPromotionStep`
+    /// refuses an `InvalidType` promotion (mutual subtypes are no step).
     fn try_promote_to_typed(
         &self,
         to: FlowTy,
@@ -1466,11 +1520,6 @@ impl TypeOps for ResolvedTypeOps<'_> {
         self.observe_names(names);
         let t = self.map_scrutinee(to, to_args, arena, names);
         let f = self.map_scrutinee(from, from_args, arena, names);
-        if self.is_invalid(t) || self.is_invalid(f) {
-            return NameTypeOps.try_promote_to_typed(
-                to, to_args, from, from_args, arena, names,
-            );
-        }
         // The strict-subtype gate (`isValidPromotionStep`,
         // flow_analysis.dart:7229-7247): `to <: from` is required, and a
         // `to` the current type already satisfies (`from <: to` —
@@ -1480,16 +1529,6 @@ impl TypeOps for ResolvedTypeOps<'_> {
         } else {
             None
         }
-    }
-}
-
-impl ResolvedTypeOps<'_> {
-    /// Whether `ty` mapped to the suppress face: an unresolved head, an
-    /// arity mismatch, or a `Name` the registry refuses — the typed ops
-    /// fall back to `NameTypeOps` through it, the same posture
-    /// `factor_typed` keeps.
-    fn is_invalid(&self, ty: TypeId) -> bool {
-        matches!(self.snapshot.table.get(ty).kind(), TypeKind::Invalid)
     }
 }
 

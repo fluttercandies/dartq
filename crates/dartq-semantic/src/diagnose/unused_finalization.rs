@@ -267,7 +267,38 @@ impl<'a> Engine<'a> {
                     let eligible = !site.annotated
                         && (self.is_private_name(site.name)
                             || (self.is_private_name(container) && is_static));
-                    if !eligible || self.member_was_read(container, &bare) {
+                    if !eligible {
+                        continue;
+                    }
+                    // `_recordEnumValuesUse`
+                    // (unused_local_elements_verifier.dart:442-455): reading
+                    // an enum's `values` getter credits every constant's
+                    // getter at once — `E.values` and any `E`-typed
+                    // receiver's `.values` read both spare the whole
+                    // constant set (the element.dart corpus family).
+                    let enum_values_read = self
+                        .index
+                        .get(self.file)
+                        .and_then(|f| f.container(container))
+                        .is_some_and(|c| c.enum_constants.contains(&site.name))
+                        && self.member_was_read(container, &self.intern("values"));
+                    // `unresolvedReadMembers`
+                    // (unused_local_elements_verifier.dart:1030-1055): a
+                    // read-shaped access whose resolution bound no element
+                    // (`f._x` on a `dynamic`/invalid receiver) still spares
+                    // the field by spelling — `read_names` carries the
+                    // spelling for every read row, while a resolved read
+                    // also records its owner; a spelling that never
+                    // resolved an owner is the oracle's unresolved set.
+                    let unresolved_read = self.read_names.contains(&bare)
+                        && self
+                            .member_read_owners
+                            .get(&bare)
+                            .is_none_or(|owners| owners.is_empty());
+                    if self.member_was_read(container, &bare)
+                        || enum_values_read
+                        || unresolved_read
+                    {
                         continue;
                     }
                     self.stage_usage(SemanticCode::UnusedField, site.range, &name_text);
@@ -297,8 +328,25 @@ impl<'a> Engine<'a> {
                             .and_then(|f| f.container(container))
                             .is_some_and(|c| c.kind == ContainerKind::Extension);
                     let member_used = if is_extension_instance {
-                        self.extension_member_used.contains(&site.name)
-                            || self.extension_member_used.contains(&bare)
+                        // The credit is oracle-faithful only when the
+                        // extension can apply at all: an `on` type that
+                        // resolves to no container (`extension _E on
+                        // Missing`) leaves every access unbound in the
+                        // oracle (`applicableTo` never reaches the member
+                        // probe), so `usedElements.members` gains nothing
+                        // — the name-level `extension_application` credit
+                        // counts only when the declaring `on` head
+                        // resolves in this unit's scope.
+                        let on_resolves = self
+                            .index
+                            .get(self.file)
+                            .into_iter()
+                            .flat_map(|f| f.extension_faces())
+                            .filter(|face| face.name == Some(container))
+                            .all(|face| self.extension_on_resolves(face));
+                        on_resolves
+                            && (self.extension_member_used.contains(&site.name)
+                                || self.extension_member_used.contains(&bare))
                     } else {
                         self.used_names.contains(&bare)
                     };
@@ -433,7 +481,18 @@ impl<'a> Engine<'a> {
         // anchor is the parameter's name token.
         for field in std::mem::take(&mut self.primary_fields) {
             let bare = self.bare_name(field.name);
-            if !self.is_private_name(field.name) || self.member_was_read(field.container, &bare) {
+            // The `unresolvedReadMembers` name fallback the `DeclKind::
+            // Member` field arm carries: a read that bound no element
+            // still spares by spelling.
+            let unresolved_read = self.read_names.contains(&bare)
+                && self
+                    .member_read_owners
+                    .get(&bare)
+                    .is_none_or(|owners| owners.is_empty());
+            if !self.is_private_name(field.name)
+                || self.member_was_read(field.container, &bare)
+                || unresolved_read
+            {
                 continue;
             }
             let code = SemanticCode::UnusedFieldFromPrimaryConstructor;
@@ -475,7 +534,8 @@ impl<'a> Engine<'a> {
         // spelling arm there), and its STATIC fields the `DeclKind::
         // Member` field arm — leaving this face the named-private
         // instance fields the site arms are ineligible for.
-        let mut extension_members: Vec<(StringId, SourceRange, MemberKind, bool, bool)> = Vec::new();
+        let mut extension_members: Vec<(StringId, SourceRange, MemberKind, bool, bool, bool)> =
+            Vec::new();
         if let Some(elements) = self.index.get(self.file) {
             for face in elements.extension_faces() {
                 let named_private = face
@@ -484,6 +544,13 @@ impl<'a> Engine<'a> {
                 if !named_private && face.name.is_some() {
                     continue;
                 }
+                // The `extension_member_used` credit below is oracle-bound:
+                // an `on` type that resolves to no container can never
+                // apply (`applicableTo` short-circuits on the InvalidType
+                // before the member probe), so no access credits the face's
+                // members in the oracle — the name-level application row's
+                // insert must not spare them.
+                let on_resolves = self.extension_on_resolves(face);
                 for (spelling, entry) in &face.members {
                     // A named extension's members are declaration sites —
                     // this face keeps only its public-named instance fields
@@ -502,17 +569,18 @@ impl<'a> Engine<'a> {
                         entry.kind,
                         entry.is_static,
                         !entry.annotations.is_empty(),
+                        on_resolves,
                     ));
                 }
             }
         }
-        for (spelling, range, kind, is_static, annotated) in extension_members {
+        for (spelling, range, kind, is_static, annotated, on_resolves) in extension_members {
             if range == MemberEntry::MISSING_NAME_RANGE {
                 continue;
             }
             let bare = self.bare_name(spelling);
             let spared = annotated
-                || self.extension_member_used.contains(&spelling)
+                || (on_resolves && self.extension_member_used.contains(&spelling))
                 || (is_static
                     && (self.used_names.contains(&bare)
                         || (matches!(kind, MemberKind::Field)
@@ -529,6 +597,64 @@ impl<'a> Engine<'a> {
         }
         self.suppress_same_line_ignored_locals();
         self.report_unused_imports();
+    }
+
+    /// Whether an extension face can apply at all — the oracle-bound gate
+    /// on the `extension_member_used` credit (the broken-import corpus's
+    /// `unused_element` family): `applicableTo` short-circuits on an
+    /// `InvalidType` `extendedType` before the member probe, so an `on`
+    /// type that never resolves credits nothing — `usedElements.members`
+    /// gains the member only through a resolved application. A bare `on`
+    /// head resolves through `resolve_container`; a generic `on` spells
+    /// its validity through the argument list too (`on List<Missing>` is
+    /// an `InvalidType` whole — the head alone does not rescue it), and
+    /// the extension's own type parameters skip the check (they bind at
+    /// the application, never the scope). A non-named `on` shape — a
+    /// record or function type — needs no name resolution at all; a
+    /// missing/`Unknown` shape never applies (the model's `on_type`
+    /// comment: "the face can never apply").
+    fn extension_on_resolves(&self, face: &ExtensionFace) -> bool {
+        let resolves = |name| {
+            resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                name,
+            )
+            .is_some()
+        };
+        match face.on_ty {
+            Ty::Named { args, .. } => {
+                let Some(on) = face.on_type else {
+                    // A named head with no honest name: recovery-shaped —
+                    // never applies.
+                    return false;
+                };
+                if !resolves(on) {
+                    return false;
+                }
+                let Some(elements) = self.index.get(self.file) else {
+                    return true;
+                };
+                elements
+                    .type_args()
+                    .get(args)
+                    .iter()
+                    .all(|arg| match arg {
+                        Ty::Named { name, .. } => {
+                            face.type_param_names.contains(name) || resolves(*name)
+                        }
+                        _ => true,
+                    })
+            }
+            // Record and function shapes resolve by construction — a
+            // `Missing` leaf inside them is invisible to this model's
+            // flat arg read (the under-report direction).
+            Ty::Record { .. } | Ty::Function { .. } => true,
+            _ => face.on_type.is_some_and(resolves),
+        }
     }
 
     /// The trailing same-line `// ignore:` face over the local-variable
