@@ -200,10 +200,14 @@ fn chained_super_formals_climb_to_the_root_field_type() {
     );
 }
 
-/// The unassociated forward: `super.nope` over a single-parameter super
-/// constructor associates to nothing — its parameter reads `InvalidType`
-/// upstream, every question it touches suppresses, and the declaration's
-/// own without-associated face is the only row.
+/// Positional `super.nope` over `A(this.s)` associates to positional
+/// slot 0 — the name `nope` is only the formal's local spelling, not a
+/// named lookup key. Oracle-verified on fvm 3.13.1 (#2408): the
+/// declaration itself is silent and `E(maybe)` reports
+/// `argument_type_not_assignable` (`Txt?` vs the associated `Txt` slot).
+/// The earlier pin's "unassociated → InvalidType suppression" reading
+/// was mistaken — `nope` associates positionally, never falls to
+/// `InvalidType`, and the without-associated face never fires.
 #[test]
 fn unassociated_super_formal_suppresses_the_argument_face() {
     let source = "class Txt { Txt(); } \
@@ -212,12 +216,12 @@ fn unassociated_super_formal_suppresses_the_argument_face() {
                   void f(Txt? maybe) { E(maybe); }";
     let rep = report(source);
     assert!(
-        !has_code(&rep, "argument_type_not_assignable"),
+        has_code(&rep, "argument_type_not_assignable"),
         "{:?}",
         rep.diagnostics
     );
     assert!(
-        has_code(&rep, "super_formal_parameter_without_associated_positional"),
+        !has_code(&rep, "super_formal_parameter_without_associated_positional"),
         "{:?}",
         rep.diagnostics
     );

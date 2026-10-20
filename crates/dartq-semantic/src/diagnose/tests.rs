@@ -10266,11 +10266,14 @@ fn override_check_reports_the_stacked_winner() {
         "{:?}",
         code_names(&report)
     );
-    // The stacked face's report names the interface winner.
+    // The stacked face's report names the interface winner. The
+    // mixin-application verdict `'M2.m' isn't a valid override of 'M1.m'`
+    // also contains `M2.m`, so the filter additionally requires the
+    // `C.m` subject.
     let stacked = report
         .diagnostics
         .iter()
-        .find(|d| d.message.contains("M2.m"))
+        .find(|d| d.message.starts_with("'C.m'") && d.message.contains("'M2.m'"))
         .expect("the stacked winner's report");
     assert!(
         stacked

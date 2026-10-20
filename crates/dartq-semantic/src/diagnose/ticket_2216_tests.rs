@@ -189,11 +189,13 @@ fn as_operand_arg_miss_reports_arg_code() {
 
 // —— #2216 S5: invalid_implementation_override, the final-class face —
 
-/// The analyzer `DirectiveUri` shape: a concrete `final` class whose
-/// inherited implementation (`Source?` from the sealed root) loses
-/// against the interface map's narrowed abstract member (`Source` from
-/// the sealed intermediate) reports `invalid_implementation_override`
-/// at the class name.
+/// A concrete `final` class that overrides the inherited abstract
+/// `Source get source` (from the sealed intermediate) with its own
+/// `FileSource get source` is a valid implementation: the own declared
+/// member seats `interface.map[name]` (upstream `_getTypeMembers`,
+/// `inheritance_manager3.dart:1336-1352`), so the inherited concrete
+/// implementation from `Root` never becomes the comparison target.
+/// Oracle-verified on fvm 3.13.1 (#2408): zero diagnostics.
 #[test]
 fn final_class_inherited_concrete_loses_to_interface() {
     let source = "class Source {}\n\
@@ -203,9 +205,10 @@ fn final_class_inherited_concrete_loses_to_interface() {
                       final class Leaf extends Mid { FileSource get source => FileSource(); }\n";
     let names = code_names(&report(source));
     assert!(
-        names.contains(&"invalid_implementation_override"),
+        !names.contains(&"invalid_implementation_override"),
         "{names:?}"
     );
+    assert!(names.is_empty(), "{names:?}");
 }
 
 // —— #2217 S6: the unnamed-extension `this` type —————————————————————
