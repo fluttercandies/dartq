@@ -105,21 +105,12 @@ impl PackageConfig {
             .and_then(serde_json::Value::as_array)
             .ok_or_else(|| invalid("packages must be a list".into()))?;
         let mut packages = Vec::with_capacity(packages_raw.len());
-        let mut seen_names = BTreeSet::new();
         for entry in packages_raw {
-            let entry = parse_entry(entry)?;
-            // The effective config holds one entry per name: a repeated name
-            // skips the later entry, first wins — package_config's
-            // package-table builder (`package_config_impl.dart:86-92`; same
-            // skip in package_config-3.0.0 `package_config.dart:624-634`).
-            // The oracle never surfaces a repeated name as a diagnostic (its
-            // packages.dart:28-37 face turns parse errors into a silent
-            // `Packages.empty` floor and keeps analyzing), and pub's writer
-            // cannot produce one, so dedup-first-wins keeps the config
-            // usable as written instead of refusing the resolution.
-            if seen_names.insert(entry.name.clone()) {
-                packages.push(entry);
-            }
+            // Entries are kept exactly as written: the upstream reader parses
+            // every entry and leaves the repeated-name verdict to the
+            // constructor stage (`package_config_impl.dart:81-89`), which
+            // [`Self::resolve`] and [`crate::graph::build_graph`] carry here.
+            packages.push(parse_entry(entry)?);
         }
 
         let generator = match root.get("generator") {
@@ -160,8 +151,9 @@ impl PackageConfig {
 
     /// Looks an entry up by package name.
     ///
-    /// Names are unique: [`Self::parse`] dedups repeated names to their
-    /// first entry, so the lookup answers with the one effective entry.
+    /// The config holds entries as written, so this answers with the first
+    /// entry under `name`; a config with repeated names is rejected by
+    /// [`Self::resolve`] before any table consumes it.
     #[must_use]
     pub fn entry(&self, name: &str) -> Option<&PackageConfigEntry> {
         self.packages.iter().find(|entry| entry.name == name)
@@ -281,8 +273,11 @@ impl PackageConfig {
     ///   normalization a `../lib` spelling escapes and is rejected loudly
     ///   instead of silently mis-resolving.
     ///
-    /// Names are already unique here: [`Self::parse`] dedups repeated names
-    /// to their first entry, so a later duplicate cannot reach the table.
+    /// - **Repeated names are a hard error** — `Duplicate name ... in
+    ///   generated package config`, the constructor-stage check
+    ///   (package_config-3.0.0 `package_config.dart:626-636`, whose loader
+    ///   default throws per `package_config.dart:30`), run before any entry
+    ///   resolves.
     ///
     /// `config_dir` must be absolute — the engine's assembly step passes the
     /// absolute `.dart_tool/` directory, and a relative one would silently
@@ -290,9 +285,9 @@ impl PackageConfig {
     ///
     /// # Errors
     ///
-    /// [`PubError::PackageConfig`] for a relative `config_dir`, a name
-    /// outside the reader grammar, an unresolvable `rootUri`, or a
-    /// `packageUri` directory escaping its root.
+    /// [`PubError::PackageConfig`] for a relative `config_dir`, a repeated
+    /// package name, a name outside the reader grammar, an unresolvable
+    /// `rootUri`, or a `packageUri` directory escaping its root.
     pub fn resolve(&self, config_dir: &Path) -> Result<Vec<ResolvedPackage>, PubError> {
         if !config_dir.is_absolute() {
             return Err(PubError::PackageConfig(format!(
@@ -300,6 +295,7 @@ impl PackageConfig {
                 config_dir.display()
             )));
         }
+        self.ensure_unique_names()?;
         let mut resolved = Vec::with_capacity(self.packages.len());
         for entry in &self.packages {
             if !is_valid_config_name(&entry.name) {
@@ -335,6 +331,27 @@ impl PackageConfig {
             });
         }
         Ok(resolved)
+    }
+
+    /// Rejects a config carrying the same package name twice — the
+    /// constructor-stage sanity check upstream applies when turning parsed
+    /// entries into a usable config (package_config-3.0.0
+    /// `package_config.dart:626-636`, whose loader default throws per
+    /// `package_config.dart:30`; `package_config-2.2.0`
+    /// `package_config_impl.dart:81-89`). Both config consumers
+    /// ([`Self::resolve`] and [`crate::graph::build_graph`]) run it before
+    /// any dependency lookup, so a repeated name never resolves or assembles.
+    pub(crate) fn ensure_unique_names(&self) -> Result<(), PubError> {
+        let mut seen = BTreeSet::new();
+        for entry in &self.packages {
+            if !seen.insert(entry.name.as_str()) {
+                return Err(PubError::PackageConfig(format!(
+                    "Duplicate name {name} in generated package config",
+                    name = entry.name
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -743,26 +760,27 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_names_keep_the_first_entry() {
-        // A repeated name skips the later entry, first wins: the effective
-        // config holds one entry per name (package_config's package-table
-        // builder, package_config_impl.dart:86-92), and the oracle never
-        // surfaces a repeated name as a diagnostic (its packages.dart:28-37
-        // face degrades parse errors silently).
+    fn duplicate_names_are_a_hard_error_at_resolve() {
+        // A repeated name is the constructor-stage hard error, checked
+        // before any entry resolves (package_config-3.0.0
+        // `package_config.dart:626-636`; the loader's default handler
+        // throws). Parse keeps the entries as written — the verdict belongs
+        // to the config layer, not the JSON reader.
         let duplicated = r#"{"configVersion": 2, "packages": [
             {"name": "app", "rootUri": "../"},
             {"name": "app", "rootUri": "../other"}]}"#;
-        let config = PackageConfig::parse(duplicated).expect("parse tolerates duplicates");
-        assert_eq!(config.packages.len(), 1, "the later duplicate is skipped");
-        assert_eq!(config.packages[0].root_uri, "../", "first wins");
+        let config = PackageConfig::parse(duplicated).expect("entries are kept as written");
+        assert_eq!(config.packages.len(), 2, "as written, not deduped");
 
-        // The deduped entry set resolves like any other — the corpus shape
-        // (self entry `../` plus a second spelling) stays usable.
-        let resolved = config
+        let error = config
             .resolve(Path::new("/proj/.dart_tool"))
-            .expect("deduped config resolves");
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].root, PathBuf::from("/proj"));
+            .expect_err("duplicate name");
+        assert!(
+            error
+                .to_string()
+                .contains("Duplicate name app in generated package config"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

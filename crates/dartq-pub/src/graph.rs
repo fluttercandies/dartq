@@ -153,6 +153,8 @@ pub fn build_graph(
     workspace_members: Option<&[String]>,
     config_dir: &Path,
 ) -> Result<ResolvedPackageGraph, PubError> {
+    config.ensure_unique_names()?;
+
     let mut membership_findings = Vec::new();
     if config.entry(&root.name).is_none() {
         membership_findings.push(StaleReason::RootMissingFromConfig {
@@ -163,8 +165,9 @@ pub fn build_graph(
     let mut instances = Vec::new();
     let mut names = BTreeSet::new();
     for entry in &config.packages {
-        // Parse dedups by name (first entry wins); the set feeds edge
-        // collection and the membership lookup below.
+        // Names are unique (`ensure_unique_names` rejects otherwise at
+        // entry); the set feeds edge collection and the membership lookup
+        // below.
         names.insert(entry.name.clone());
         let (source, source_ref, version) = match lock.packages.get(&entry.name) {
             Some(locked) => (
@@ -726,11 +729,11 @@ dependency_overrides:
     }
 
     #[test]
-    fn duplicate_names_build_from_the_first_entry() {
-        // Parse dedups by name (first entry wins), so the corpus shape — a
-        // self entry plus a second spelling of the same name — assembles
-        // into one instance instead of refusing the resolution. The oracle
-        // emits no diagnostic for a repeated name (packages.dart:28-37).
+    fn duplicate_names_are_rejected_before_assembly() {
+        // The constructor-stage duplicate check precedes any dependency
+        // lookup (package_config-3.0.0 `package_config.dart:626-636`) — a
+        // repeated name never resolves a lock entry or assembles into
+        // instances.
         let config = config_from(
             r#"{
               "configVersion": 2,
@@ -742,7 +745,7 @@ dependency_overrides:
             }"#,
         );
         let lock = lock_from(LOCK);
-        let graph = build_graph(
+        let error = build_graph(
             &config,
             &lock,
             &root_pubspec(),
@@ -750,16 +753,12 @@ dependency_overrides:
             None,
             Path::new("/proj/.dart_tool"),
         )
-        .expect("first entry wins, no hard error");
-        assert_eq!(
-            graph
-                .instances
-                .iter()
-                .filter(|instance| instance.name == "app")
-                .count(),
-            1,
-            "one instance per name"
+        .expect_err("duplicate name is a hard error");
+        assert!(
+            error
+                .to_string()
+                .contains("Duplicate name app in generated package config"),
+            "unexpected error: {error}"
         );
-        assert_eq!(graph.root, PackageInstanceId("app".into()));
     }
 }
