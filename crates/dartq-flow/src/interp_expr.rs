@@ -305,6 +305,28 @@ impl Interp<'_> {
                         self.args,
                         self.names,
                     );
+                } else if let Some(slot) = operand.prop {
+                    // Official `nonNullAssert_end` marks whatever reference
+                    // the operand read carries non-nullable
+                    // (`tryMarkNonNullable`, flow_analysis.dart:7384-7404)
+                    // — the property face included: `sharedWorker!` promotes
+                    // the `(receiver, member)` slot, so the reads that
+                    // follow in the block are non-null. The eligibility
+                    // faces are the same ones the property null check uses:
+                    // a captured receiver or slot leaves the slot alone.
+                    let receiver = self.props[slot as usize].0;
+                    if !self.prop_target_captured(receiver)
+                        && !self.current.prop(slot).captured()
+                    {
+                        self.current = self.current.clone().promote_prop_non_null(
+                            self.ops,
+                            &mut self.lists,
+                            slot,
+                            Ty::UNKNOWN,
+                            self.args,
+                            self.names,
+                        );
+                    }
                 }
                 self.exprs.push(Expr::trivial(promoted));
             }
@@ -860,8 +882,18 @@ impl Interp<'_> {
                         *plain || *if_null,
                         write_span,
                     );
-                    // The assignment expression reads back the variable.
-                    self.exprs.push(Expr::of_reference(var, written, rhs_args));
+                    // The assignment expression carries no promotable
+                    // reference: official `_write` hands one back only under
+                    // the experimental `inferenceUpdate4` feature
+                    // (flow_analysis.dart:9552), so a stable-language flow
+                    // never promotes through the assignment's own value —
+                    // `(x = e) != null`, `(x = e)!` and `(x = e).f` test the
+                    // value, not `x`. The write above still promotes the
+                    // target through its assigned type.
+                    self.exprs.push(Expr {
+                        args: rhs_args,
+                        ..Expr::trivial(written)
+                    });
                 } else {
                     self.exprs
                         .push(Expr::trivial(if *plain { rhs.ty } else { Ty::UNKNOWN }));

@@ -7543,3 +7543,74 @@ void f(int? a, int? b) {
     assert_eq!(promoted.len(), 1, "{facts:?}");
     assert!(!promoted[0].nullable);
 }
+
+// —— T3 nullability faces (#2312) ——————————————————————————————————————
+
+/// The assignment expression's own value carries no promotable reference:
+/// official `_write` returns one only under the experimental
+/// `inferenceUpdate4` feature, so `(x = e) != null` tests the assigned
+/// *value* and leaves `x` unpromoted — the read after the test keeps its
+/// declared nullable face.
+#[test]
+fn assignment_value_test_leaves_the_target_unpromoted() {
+    let source = "void f(int? p) { int? x; if ((x = p) != null) { x; } }";
+    let body = (source.find("{ x; }").unwrap() + 2) as u32;
+    assert_eq!(needle_faces(source, "x;"), [(body, true)], "{source:?}");
+}
+
+/// The property non-null assertion promotes the tested slot: official
+/// `nonNullAssert_end` marks whatever reference the operand read carries
+/// non-nullable, the property reference included. The read that follows
+/// `c._b!` is the promoted one — exactly one promotion row, anchored at the
+/// member name.
+#[test]
+fn non_null_assert_promotes_the_property_slot() {
+    let source = concat!(
+        "class C { final bool? _b; }\n",
+        "void f(C c) { c._b!; c._b; }",
+    );
+    assert_eq!(promoted_property_snippets(source), ["_b"], "{source:?}");
+}
+
+/// The slot key includes the receiver: `a._b!` promotes only `a`'s slot —
+/// `b._b` stays unpromoted.
+#[test]
+fn non_null_assert_promotes_only_its_receiver() {
+    let source = concat!(
+        "class C { final bool? _b; }\n",
+        "void f(C a, C b) { a._b!; b._b; }",
+    );
+    assert!(promoted_property_snippets(source).is_empty(), "{source:?}");
+}
+
+/// The variable beside a null-check pattern is declared with the non-null
+/// matched type (official `_handleNullCheckPattern` hands the sub-pattern
+/// the non-null type, and `DeclaredVariablePattern` declares with it), so
+/// the read in the matched arm is non-null instead of the untyped
+/// [`crate::ty::Ty::UNKNOWN`] the `NoType` annotation leaves behind.
+#[test]
+fn null_check_pattern_retypes_its_variable() {
+    let source = "void f(Object? v) { switch (v) { case var x?: x; } }";
+    let read = source.find("x; }").unwrap() as u32;
+    let ty = read_types_of(source)
+        .into_iter()
+        .find(|(offset, _)| *offset == read)
+        .map(|(_, ty)| ty)
+        .expect("read row present");
+    assert_ne!(ty, crate::ty::Ty::UNKNOWN, "{source:?}");
+    assert!(!ty.nullable, "{source:?}");
+}
+
+/// The plain declaration pattern keeps its untyped face: only the `?`
+/// suffix narrows the declared variable.
+#[test]
+fn plain_variable_pattern_keeps_the_untyped_face() {
+    let source = "void f(Object? v) { switch (v) { case var x: x; } }";
+    let read = source.find("x; }").unwrap() as u32;
+    let ty = read_types_of(source)
+        .into_iter()
+        .find(|(offset, _)| *offset == read)
+        .map(|(_, ty)| ty)
+        .expect("read row present");
+    assert_eq!(ty, crate::ty::Ty::UNKNOWN, "{source:?}");
+}

@@ -332,6 +332,28 @@ pub trait TypeOps {
         }
         Some(to)
     }
+
+    /// The object pattern's downward-inferred required type (official
+    /// `analyzeObjectPattern`'s inference — shared type_analyzer.dart
+    /// :1749-1772 — with the matched value's static type as the context):
+    /// a RAW pattern spelling's own type parameters solve along its
+    /// superclass chain, so `case AL():` over an `AV<int>` scrutinee tests
+    /// and promotes `AL<int>`, not the raw face. `Some` carries the
+    /// inferred spelling beside its written-argument arena index;
+    /// `None` keeps the un-inferred posture. The name-level default is
+    /// `None` — there is no hierarchy to climb.
+    fn downcast_infer(
+        &self,
+        tested: Ty,
+        tested_args: u32,
+        from: Ty,
+        from_args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> Option<(Ty, u32)> {
+        let _ = (tested, tested_args, from, from_args, arena, names);
+        None
+    }
 }
 
 /// The name-level argument-subtype question: element-wise covariance over

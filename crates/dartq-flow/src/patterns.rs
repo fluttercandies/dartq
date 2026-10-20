@@ -229,6 +229,25 @@ impl Interp<'_> {
                         self.args,
                         self.names,
                     );
+                    // The declared variable beside the null check (`case var
+                    // x?`) is declared untyped (`NoType` leaves
+                    // [`Ty::UNKNOWN`]) by the event that precedes this one;
+                    // official `_handleNullCheckPattern` hands the
+                    // sub-pattern the non-null matched type, and
+                    // `DeclaredVariablePattern` declares the variable with
+                    // it. An explicit annotation keeps its own type
+                    // (`declare` prefers the written one).
+                    if let Some((name, _)) = self
+                        .pattern
+                        .as_ref()
+                        .and_then(|p| p.pending_decls.last().copied())
+                        && let Some(Resolved::Local(child)) = self.resolve(name)
+                        && let Some(meta) = self.vars.get_mut(child as usize)
+                        && meta.ty == Ty::UNKNOWN
+                    {
+                        meta.ty = non_null;
+                        meta.args = non_null_args;
+                    }
                 }
                 if let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) {
                     let cur = self.current.clone();
@@ -413,6 +432,19 @@ impl Interp<'_> {
             self.promoted_type_of(var, &model),
             self.promoted_args_of(var, &model),
         );
+        // The downward-inferred required type: a raw pattern spelling
+        // solves its own parameters against the matched type along the
+        // superclass chain (`case AL():` over `AV<int>` reads `AL<int>`,
+        // the spelling the official feeds `promoteForPattern`). A written
+        // argument list already spells the required type — inference is
+        // the raw face only.
+        let (known, args) = if args == crate::ty::EMPTY_ARGS {
+            self.ops
+                .downcast_infer(known, args, matched, matched_args, self.args, self.names)
+                .unwrap_or((known, args))
+        } else {
+            (known, args)
+        };
         let candidate = self.pattern_promotion_candidate(var, known, args);
         let (matched_arm, unmatched_arm) = self.branch_type_test(var, known, args, candidate);
         self.current = matched_arm;
