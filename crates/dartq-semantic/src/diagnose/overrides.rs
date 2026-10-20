@@ -322,9 +322,11 @@ impl<'a> Engine<'a> {
             if !seen.insert(face) {
                 continue;
             }
-            let face_lib = self
-                .owner_library_of(face_owner, face)
-                .unwrap_or(scope_lib);
+            // The seed's spelling is written in `face_owner`'s file and
+            // resolves through that file's library — not a probe keyed on the
+            // face declaring there (a queued `implements` face usually
+            // declares elsewhere, #2313).
+            let face_lib = self.graph.library_of_file(face_owner).unwrap_or(scope_lib);
             let Some((face_container, face_container_owner)) = resolve_container(
                 self.graph,
                 self.namespaces,
@@ -754,8 +756,10 @@ impl<'a> Engine<'a> {
         // Same pending queue [`Self::face_member`] drains: a resolved hop's
         // `implements`/`on` faces keep the frozen climb alive when the linear
         // `extends`/`with` chain ends (`UnmodifiableSetMixin implements Set`
-        // reaching `Set`'s frozen members).
-        let mut pending: VecDeque<(StringId, FileId)> = VecDeque::new();
+        // reaching `Set`'s frozen members). Each entry carries the writer
+        // hop's library — the queued spelling resolves through it, whatever
+        // other hops the drain climbs in between (#2313).
+        let mut pending: VecDeque<(StringId, FileId, LibraryId)> = VecDeque::new();
         loop {
             if !seen.insert(name) {
                 return false;
@@ -773,11 +777,12 @@ impl<'a> Engine<'a> {
                 if frozen_hit(self.strings.resolve(name)) {
                     return true;
                 }
-                let Some((next, next_owner)) = pending.pop_front() else {
+                let Some((next, next_owner, next_lib)) = pending.pop_front() else {
                     return false;
                 };
                 name = next;
                 owner = next_owner;
+                scope_lib = next_lib;
                 continue;
             };
             if let Some(entry) = found.members.get(&spelling)
@@ -823,7 +828,7 @@ impl<'a> Engine<'a> {
                 .iter()
                 .chain(found.on_clause.iter())
             {
-                pending.push_back((*super_face, found_owner));
+                pending.push_back((*super_face, found_owner, owner_lib));
             }
             match found.superclass {
                 Some(superclass) => {
@@ -832,12 +837,12 @@ impl<'a> Engine<'a> {
                     owner = found_owner;
                 }
                 None => {
-                    let Some((next, next_owner)) = pending.pop_front() else {
+                    let Some((next, next_owner, next_lib)) = pending.pop_front() else {
                         return false;
                     };
                     name = next;
                     owner = next_owner;
-                    scope_lib = owner_lib;
+                    scope_lib = next_lib;
                 }
             }
         }
@@ -3178,8 +3183,11 @@ impl<'a> Engine<'a> {
         // (no superclass), the interface faces keep the climb alive in
         // declaration order (the oracle's `getOverridden` covers every
         // superinterface, `UnmodifiableSetMixin implements Set` reaching
-        // `Set`'s frozen/interface members).
-        let mut pending: VecDeque<(StringId, FileId)> = VecDeque::new();
+        // `Set`'s frozen/interface members). Each entry carries the writer
+        // hop's library: a queued face's spelling is written in the writer's
+        // file and resolves through that library, whatever other hops the
+        // drain climbs in between (#2313).
+        let mut pending: VecDeque<(StringId, FileId, LibraryId)> = VecDeque::new();
         loop {
             if !seen.insert(name) {
                 return None;
@@ -3194,11 +3202,12 @@ impl<'a> Engine<'a> {
             ) {
                 Some(pair) => pair,
                 None => {
-                    let Some((next, next_owner)) = pending.pop_front() else {
+                    let Some((next, next_owner, next_lib)) = pending.pop_front() else {
                         return None;
                     };
                     name = next;
                     owner = next_owner;
+                    scope_lib = next_lib;
                     continue;
                 }
             };
@@ -3256,7 +3265,7 @@ impl<'a> Engine<'a> {
                 .iter()
                 .chain(found.on_clause.iter())
             {
-                pending.push_back((*super_face, found_owner));
+                pending.push_back((*super_face, found_owner, owner_lib));
             }
             match found.superclass {
                 Some(superclass) => {
@@ -3265,12 +3274,12 @@ impl<'a> Engine<'a> {
                     owner = found_owner;
                 }
                 None => {
-                    let Some((next, next_owner)) = pending.pop_front() else {
+                    let Some((next, next_owner, next_lib)) = pending.pop_front() else {
                         return None;
                     };
                     name = next;
                     owner = next_owner;
-                    scope_lib = owner_lib;
+                    scope_lib = next_lib;
                 }
             }
         }

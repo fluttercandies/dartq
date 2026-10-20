@@ -474,7 +474,11 @@ pub(crate) fn member_lookup_defining<'a>(
         if !seen.insert(face) {
             continue;
         }
-        let face_lib = owner_library(graph, lib, face_owner, face).unwrap_or(scope_lib);
+        // The queued face's spelling is written in `face_owner`'s file and
+        // resolves through that file's library (#2313) — not a probe keyed on
+        // the face declaring there (an `implements` face usually declares
+        // elsewhere).
+        let face_lib = graph.library_of_file(face_owner).unwrap_or(scope_lib);
         let Some((face_container, face_container_owner)) =
             resolve_container(graph, namespaces, index, face_lib, face_owner, face)
         else {

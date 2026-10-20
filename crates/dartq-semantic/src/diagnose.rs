@@ -348,8 +348,8 @@ use crate::const_eval::{
 };
 use crate::const_tracker::ConstTracker;
 use crate::library::{
-    ElementIndex, ScopedHit, implements_interface, lookup_scoped, owner_library,
-    prefixed_container, resolve_container, supertype_hop_dead,
+    ElementIndex, ScopedHit, implements_interface, lookup_scoped, member_lookup_defining,
+    owner_library, prefixed_container, resolve_container, supertype_hop_dead,
 };
 use crate::member_face::{
     COLLECTION_INTERFACE_ALIASES, CORE_CONST_CTOR, CORE_INTERFACE_MEMBERS, CORE_STATIC_RETURNS,
@@ -427,6 +427,13 @@ mod ticket_1351_tests;
 /// shared `tests` rig stays untouched while its lane is in flight.
 #[cfg(test)]
 mod ticket_undefined_family_tests;
+
+/// The #2313 queued-interface-face pins: a supertype climb drains its
+/// pending `implements` faces through each face's writer library —
+/// `implements A, B` keeps both faces across multi-hop drains, and the
+/// `@override entityName` sibling (drift `versioned_schema.dart`) spares.
+#[cfg(test)]
+mod ticket_2313_tests;
 
 /// The dead/unused-family differential pins: the `InvalidType` checked
 /// type's `factor` remainder (the losing `is`/`is!` arm's `dead_code`),
