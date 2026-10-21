@@ -127,6 +127,19 @@ impl<A: ParserListener, B: ParserListener> ParserListener for MultiplexListener<
         self.b.begin_type_variable(token);
     }
 
+    fn end_type_variable(
+        &mut self,
+        token: Token,
+        index: usize,
+        extends_or_super: Option<Token>,
+        variance: Option<Token>,
+    ) {
+        self.a
+            .end_type_variable(token, index, extends_or_super, variance);
+        self.b
+            .end_type_variable(token, index, extends_or_super, variance);
+    }
+
     fn begin_record_type(&mut self, left_paren: Token) {
         self.a.begin_record_type(left_paren);
         self.b.begin_record_type(left_paren);
@@ -305,6 +318,20 @@ impl<A: ParserListener, B: ParserListener> ParserListener for MultiplexListener<
     fn handle_no_formal_parameters(&mut self, token: Token, kind: MemberKind) {
         self.a.handle_no_formal_parameters(token, kind);
         self.b.handle_no_formal_parameters(token, kind);
+    }
+
+    fn begin_formal_parameter_default_value_expression(&mut self, token: Token) {
+        self.a
+            .begin_formal_parameter_default_value_expression(token);
+        self.b
+            .begin_formal_parameter_default_value_expression(token);
+    }
+
+    fn end_formal_parameter_default_value_expression(&mut self, token: Token) {
+        self.a
+            .end_formal_parameter_default_value_expression(token);
+        self.b
+            .end_formal_parameter_default_value_expression(token);
     }
 
     fn begin_top_level_method(
@@ -984,6 +1011,7 @@ const FORWARDED_METHODS: &[&str] = &[
     "begin_extension_type_declaration",
     "begin_factory",
     "begin_fields",
+    "begin_formal_parameter_default_value_expression",
     "begin_formal_parameters",
     "begin_function_type",
     "begin_function_typed_formal_parameter",
@@ -1015,6 +1043,7 @@ const FORWARDED_METHODS: &[&str] = &[
     "end_factory",
     "end_fields",
     "end_formal_parameter",
+    "end_formal_parameter_default_value_expression",
     "end_formal_parameters",
     "end_function_type",
     "end_function_typed_formal_parameter",
@@ -1030,6 +1059,7 @@ const FORWARDED_METHODS: &[&str] = &[
     "end_top_level_fields",
     "end_top_level_method",
     "end_type_arguments",
+    "end_type_variable",
     "end_type_variables",
     "end_typedef",
     "handle_assignment_expression",
@@ -1101,6 +1131,7 @@ mod tests {
         "begin_extension_type_declaration",
         "begin_factory",
         "begin_fields",
+        "begin_formal_parameter_default_value_expression",
         "begin_formal_parameters",
         "begin_function_type",
         "begin_function_typed_formal_parameter",
@@ -1127,6 +1158,7 @@ mod tests {
         "end_factory",
         "end_fields",
         "end_formal_parameter",
+        "end_formal_parameter_default_value_expression",
         "end_formal_parameters",
         "end_function_type",
         "end_function_typed_formal_parameter",
@@ -1142,6 +1174,7 @@ mod tests {
         "end_top_level_fields",
         "end_top_level_method",
         "end_type_arguments",
+        "end_type_variable",
         "end_type_variables",
         "end_typedef",
         "handle_async_modifier",
@@ -1187,6 +1220,7 @@ mod tests {
         "begin_extension_type_declaration",
         "begin_factory",
         "begin_fields",
+        "begin_formal_parameter_default_value_expression",
         "begin_formal_parameters",
         "begin_function_type",
         "begin_function_typed_formal_parameter",
@@ -1213,6 +1247,7 @@ mod tests {
         "end_factory",
         "end_fields",
         "end_formal_parameter",
+        "end_formal_parameter_default_value_expression",
         "end_formal_parameters",
         "end_function_type",
         "end_function_typed_formal_parameter",
@@ -1228,6 +1263,7 @@ mod tests {
         "end_top_level_fields",
         "end_top_level_method",
         "end_type_arguments",
+        "end_type_variable",
         "end_type_variables",
         "end_typedef",
         "handle_async_modifier",
