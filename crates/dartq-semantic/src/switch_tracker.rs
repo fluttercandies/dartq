@@ -923,7 +923,11 @@ impl<'a> NameWorld<'a> {
     /// a core primitive (whose chain [`CORE_SUPERTYPES`] carries). An
     /// unknown head leaves every mutual-exclusion question about it
     /// undecided — the conservative default, never a proven disjoint pair.
-    fn is_known_head(&self, name: StringId) -> bool {
+    /// The constant-verdict's matched face reads the same test
+    /// ([`crate::diagnose::Engine::constant_never_matches`]): an unknown
+    /// head there is the official's boundless-type-parameter/invalid
+    /// value, unprovable disjointness.
+    pub(crate) fn is_known_head(&self, name: StringId) -> bool {
         name == self.enum_id
             || name == self.object_id
             || self.primitive_ids.contains(&name)

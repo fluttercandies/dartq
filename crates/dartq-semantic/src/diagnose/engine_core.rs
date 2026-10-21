@@ -2645,6 +2645,16 @@ impl<'a> Engine<'a> {
     /// "possible" — disjointness unprovable. A parameter bound to a
     /// concrete type before the comparison (the solved-call substitution)
     /// no longer spells a parameter here and decides ordinarily.
+    ///
+    /// A matched head no declared face resolves answers "possible" too:
+    /// an out-of-scope parameter spelling (an unsolved generic call's
+    /// residual `T`, its bound living at the declaring executable, not
+    /// this scope) and an unresolved type name are the official's
+    /// boundless-TypeParameterType/InvalidType value faces, which fall to
+    /// the unsupported `return true` (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/constant/constant_verifier.dart:577-596).
+    /// `is_known_head` is the same declared-face test the mutual-exclusion
+    /// relation's opaque-right arm reads.
     pub(crate) fn constant_never_matches(&self, constant: Ty, matched: Ty) -> bool {
         let matched = match &matched {
             Ty::Named { name, nullable, .. } if self.is_scope_param(*name) => {
@@ -2661,6 +2671,11 @@ impl<'a> Engine<'a> {
             }
             _ => matched,
         };
+        if let Ty::Named { name, .. } = &matched
+            && !self.name_world().is_known_head(*name)
+        {
+            return false;
+        }
         if let Ty::Named {
             name,
             nullable: false,

@@ -3838,3 +3838,12 @@ mod ticket_2441_tests;
 /// constant over a `Null`-typed scrutinee).
 #[cfg(test)]
 mod ticket_2444_tests;
+
+/// The #2445 pins: the constant-pattern verdict over an unsolved generic
+/// call's residual type-parameter scrutinee — a matched head no declared
+/// face resolves (the out-of-scope method parameter's `T`, an undefined
+/// name) is unprovable disjointness and stays silent, while a bound
+/// visible in scope still substitutes and decides and a declared
+/// unrelated scrutinee still reports.
+#[cfg(test)]
+mod ticket_2445_tests;
