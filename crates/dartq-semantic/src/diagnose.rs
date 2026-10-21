@@ -3800,3 +3800,16 @@ mod ticket_2440_tests;
 /// `non_exhaustive` witness over the root is `Enum()` itself).
 #[cfg(test)]
 mod ticket_2439_tests;
+/// The #2441 pins: one argument verdict — [`Engine::argument_verdict`] —
+/// behind every argument face (the two operator folds, the two
+/// const/enum-constructor walks, the fn-signature faces, and the staged
+/// teardown's standing rejection). The relation gates a projection scar
+/// (a source head spelling an import prefix — the parser armed the
+/// `ast.AstNode?` continuation's prefix as the `Ty` head, so a verdict
+/// over it is fiction), runs the assignability matrix (where the
+/// three-hop `implements` chain of a narrowed argument already proves
+/// through `implements_interface`), and falls through to
+/// [`NameWorld::decide_subtype`] on the matrix's bare-named `None` cut —
+/// the same declared-edge lattice the switch tracker walks.
+#[cfg(test)]
+mod ticket_2441_tests;

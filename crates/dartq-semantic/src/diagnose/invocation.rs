@@ -2746,6 +2746,124 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The argument face's verdict — the single relation every argument walk
+    /// and the staged teardown share (`arg: T` checked against a formal `T`).
+    ///
+    /// The composition, in order:
+    ///
+    /// 1. A source head spelling an import prefix is a **broken projection**,
+    ///    never a type: the parser hands `handle_type` the prefix token of a
+    ///    prefixed annotation (`ast.AstNode?`), so the continuation name is
+    ///    lost and the armed `Ty` carries the prefix as its head (the type's
+    ///    own decliners live in the parser/collector seam, not here — this
+    ///    gate only stops the verdicts the broken head would fabricate).
+    ///    Every verdict over such a head is fiction: the nullability rule
+    ///    answers `Some(false)` for the `?` alone, so a narrowed read (`if
+    ///    (node is ClassDeclaration) take(node)` over an `ast.AstNode?`
+    ///    parameter) reports `argument_type_not_assignable` with `ast?` in
+    ///    the message. The oracle resolves the annotation and stays silent,
+    ///    so the relation must stay undecided here (the under-report
+    ///    direction).
+    /// 2. The assignability matrix ([`Engine::assignable`]) decides
+    ///    everything it can resolve — literals, nullability, generics,
+    ///    function shapes, and the declared supertype graph
+    ///    (`implements_interface`), which is where the three-hop
+    ///    `implements` chain of a narrowed argument is already proven.
+    /// 3. On the matrix's `None` cut between two bare named heads, the
+    ///    declared-edge name lattice ([`NameWorld::decide_subtype`]) decides
+    ///    the plain in-file pair over the same edges the switch tracker
+    ///    walks: the superclass/`with`/`implements`/`on` chain plus the core
+    ///    edges. This is the consistency leg — one relation for every
+    ///    argument site, never a second hierarchy.
+    ///
+    /// `None` means undecided: neither a rejection to report nor a proof of
+    /// compatibility. Callers reject only on `Some(false)`.
+    pub(crate) fn argument_verdict(&self, from: Ty, to: Ty, literal: bool) -> Option<bool> {
+        if self.prefix_head_ty(from) {
+            return None;
+        }
+        match self.assignable(from, to, literal) {
+            Some(verdict) => Some(verdict),
+            None => match (from, to) {
+                (
+                    Ty::Named {
+                        name: sub,
+                        args: sub_args,
+                        ..
+                    },
+                    Ty::Named {
+                        name: sup,
+                        args: sup_args,
+                        ..
+                    },
+                ) if sub_args == ArgListId::EMPTY && sup_args == ArgListId::EMPTY => {
+                    self.name_world().decide_subtype(sub, sup)
+                }
+                _ => None,
+            },
+        }
+    }
+
+    /// Whether `ty`'s head is an import prefix rather than a type — the
+    /// signature of a mis-projected prefixed annotation
+    /// ([`Engine::argument_verdict`]).
+    ///
+    /// Two lookup faces cover the two ways the broken head reaches an
+    /// argument check: the diagnosing library's own `as` spelling (the
+    /// annotation is written in this file), and — for a foreign-origin type
+    /// the boundary projected (`getLinkingNode` returns `ast.AstNode?` over
+    /// in `link.dart`; the local `node` it feeds carries the prefix head
+    /// into `simply_bounded.dart`, which registers no `ast` prefix at all)
+    /// — a graph-wide prefix registration whose name resolves to nothing
+    /// the ordinary face could name. The second face requires the bare
+    /// name to be unresolvable here: a declaration, core spelling, or
+    /// import the diagnosing file actually sees still takes its ordinary
+    /// verdict (a user-typed `ast` local, a `dart:core` name, an imported
+    /// declaration) — only a head that is simultaneously a registered
+    /// prefix somewhere and no nameable type here is the projection scar.
+    pub(crate) fn prefix_head_ty(&self, ty: Ty) -> bool {
+        let Ty::Named { name, .. } = ty else {
+            return false;
+        };
+        if matches!(
+            self.namespaces.lookup(self.graph, self.lib, name),
+            dartq_resolution::Lookup::Found(NamespaceEntry::Prefix)
+        ) {
+            return true;
+        }
+        if self.name_resolvable(name) {
+            return false;
+        }
+        self.graph.libraries().any(|lib| {
+            self.graph
+                .import_edges(lib)
+                .iter()
+                .any(|edge| edge.prefix == Some(name))
+        })
+    }
+
+    /// Whether `name` denotes any type the diagnosing file can spell: a
+    /// container in this file or an import its namespace reaches (the
+    /// ordinary bare-name resolution [`resolve_container`] runs), a core
+    /// primitive, or the implicit `Object`/`Enum` heads the name lattice
+    /// grants every unit. The [`Engine::prefix_head_ty`] graph-wide face
+    /// skips these — a foreign projection never claims a head the file
+    /// itself could name.
+    fn name_resolvable(&self, name: StringId) -> bool {
+        name == self.intern("Object")
+            || name == self.intern("Enum")
+            || self.members.primitive_ids.contains(&name)
+            || resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                name,
+            )
+            .is_some()
+    }
+
     /// The enum constant's implicit constructor invocation (`low(1)` over
     /// `const Level5(this.describe)`): the constant's argument list checks
     /// against the enclosing enum's selected constructor's formals — the
@@ -2919,30 +3037,10 @@ impl<'a> Engine<'a> {
                     None => continue,
                 }
             };
-            // The matrix answers `None` between two plain in-file classes
-            // (`int` literal into an in-file `String` formal): the declared
-            // name lattice decides there, as the operator folds do —
-            // unrelated heads with no edge reject.
-            let rejects = match self.assignable(*ty, formal.ty, *literal) {
-                Some(verdict) => !verdict,
-                None => match (*ty, formal.ty) {
-                    (
-                        Ty::Named {
-                            name: from,
-                            args: from_args,
-                            ..
-                        },
-                        Ty::Named {
-                            name: to,
-                            args: to_args,
-                            ..
-                        },
-                    ) if from_args == ArgListId::EMPTY && to_args == ArgListId::EMPTY => {
-                        self.name_world().decide_subtype(from, to) == Some(false)
-                    }
-                    _ => false,
-                },
-            };
+            // [`Engine::argument_verdict`]: the matrix, the prefix-projection
+            // gate, and the declared name lattice on the matrix's `None` cut
+            // (unrelated in-file heads with no edge reject).
+            let rejects = self.argument_verdict(*ty, formal.ty, *literal) == Some(false);
             if rejects {
                 let from_text = self.ty_display(*ty);
                 let to_text = self.ty_display(formal.ty);
@@ -3389,28 +3487,9 @@ impl<'a> Engine<'a> {
                     None => continue,
                 }
             };
-            // The name lattice decides the plain in-file pair the matrix
-            // cannot ([`Engine::check_arguments`]'s fallback).
-            let rejects = match self.assignable(*ty, formal.ty, *literal) {
-                Some(verdict) => !verdict,
-                None => match (*ty, formal.ty) {
-                    (
-                        Ty::Named {
-                            name: from,
-                            args: from_args,
-                            ..
-                        },
-                        Ty::Named {
-                            name: to,
-                            args: to_args,
-                            ..
-                        },
-                    ) if from_args == ArgListId::EMPTY && to_args == ArgListId::EMPTY => {
-                        self.name_world().decide_subtype(from, to) == Some(false)
-                    }
-                    _ => false,
-                },
-            };
+            // [`Engine::argument_verdict`] — the same relation the enum
+            // constant's walk and the staged teardown consult.
+            let rejects = self.argument_verdict(*ty, formal.ty, *literal) == Some(false);
             if rejects {
                 let from_text = self.ty_display(*ty);
                 let to_text = self.ty_display(formal.ty);
@@ -4869,7 +4948,7 @@ impl<'a> Engine<'a> {
                     .unwrap_or(formal.ty),
                 _ => formal.ty,
             };
-            if self.assignable(*ty, formal_ty, *literal) == Some(false) {
+            if self.argument_verdict(*ty, formal_ty, *literal) == Some(false) {
                 // The raw-generic face (#2172's `_base.equals(e1, e2)`): a
                 // member-invocation formal leaf that spells the declaring
                 // container's own type parameter (`Equality` used raw

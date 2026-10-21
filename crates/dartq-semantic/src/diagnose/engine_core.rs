@@ -725,8 +725,14 @@ impl<'a> Engine<'a> {
                 // No promotion stood at the operand: the parse-time
                 // rejection stands — re-deciding with the matrix alone
                 // would drop every name-level-only rejection (`String`
-                // into an in-file `M` formal answers `None` there).
-                StagedKind::Argument if from == check.from => Some(false),
+                // into an in-file `M` formal answers `None` there). The one
+                // face the standing verdict may not cover is the broken
+                // projection: a source head spelling an import prefix is
+                // not a type, so no verdict over it is the oracle's
+                // ([`Self::prefix_head_ty`]).
+                StagedKind::Argument if from == check.from => {
+                    (!self.prefix_head_ty(from)).then_some(false)
+                }
                 _ => self.assignable(from, check.to, check.literal),
             };
             if verdict != Some(false) {
