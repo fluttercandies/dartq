@@ -3702,6 +3702,14 @@ mod ticket_2422_tests;
 #[cfg(test)]
 mod ticket_2425_tests;
 
+/// The #2423 pins: the extension-pool family — the specificity step reads
+/// the applicable faces' full `on` types argument-wise (a non-nullable or
+/// subtype argument dominates its twin, so a single applicable face
+/// resolves instead of reading ambiguous), the genuine equal-`on`-type
+/// ambiguity stays, and a nested index-assignment target's index argument
+/// keeps its local read credit.
+#[cfg(test)]
+mod ticket_2423_tests;
 
 /// The #2420 pins: the supertype member walk survives the dead supertype
 /// hop — `extends Dead implements Live` still merges the live interface's

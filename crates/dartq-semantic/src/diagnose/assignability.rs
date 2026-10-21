@@ -1013,72 +1013,132 @@ impl<'a> Engine<'a> {
         } else {
             None
         };
-        for row in self.rows.iter_mut().rev() {
-            if row.range.end() > limit {
-                continue;
-            }
-            if matches!(row.shape, RowShape::Value) {
-                continue;
-            }
-            match &row.intent {
-                Intent::Read => {
-                    // A write alone never uses its target local (the
-                    // official `_useAssignmentTargetElement` early return)
-                    // — and only a bare row IS that local. A member row's
-                    // hit is the RECEIVER's occurrence credit: `v.m = 1`
-                    // reads `v`, and the official `_visitNameExpression`
-                    // spares it through the lexical resolution regardless
-                    // of the member access resolving (#2189-b — the
-                    // receiver-write census rows).
-                    if !compound
-                        && matches!(row.shape, RowShape::Bare(_))
-                        && let Some(hit) = self.local_hits.remove(&row.range.offset)
-                    {
-                        self.locals[hit as usize].uses -= 1;
-                    }
-                    row.intent = if compound {
-                        Intent::ReadWrite
-                    } else {
-                        Intent::Write
-                    };
-                    // FAM18: a constructor initializer list's plain
-                    // assignment marks the field initialized
-                    // (`updateWithInitializers`,
-                    // constructor_fields_verifier.dart) — the container's
-                    // flush consults the set. Only the this-face spellings
-                    // count: the bare LHS, the still-unmerged `this` row,
-                    // and the merged `this.b` member (`ConstructorField-
-                    // Initializer`'s `this.b` prefix resolves the same
-                    // field; a `super.b` write initializes the superclass's
-                    // field, never ours), and only the plain `=` (the
-                    // official face is a `ConstructorFieldInitializer`
-                    // node).
-                    if !compound
-                        && let Some(site) = init_ctor_site
-                        && init_container.is_some()
-                        && matches!(
-                            row.shape,
-                            RowShape::Bare(_)
-                                | RowShape::Receiver(Receiver::This { .. })
-                                | RowShape::Member {
-                                    recv: Receiver::This { .. }
-                                }
-                        )
-                    {
-                        self.ctor_init_writes.insert((site, row.name));
-                    }
-                }
-                Intent::Operator(op, _) if *op == index_op => {
-                    row.write_op = Some(if compound {
-                        OpWrite::Compound
-                    } else {
-                        OpWrite::Assign
-                    });
-                }
-                _ => {}
-            }
+        // The candidate target row: the closest row wholly before the
+        // operator, skipping folded value rows (index results, groups).
+        let Some(index) = self
+            .rows
+            .iter()
+            .rposition(|row| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))
+        else {
             return;
+        };
+        // An unfolded index target keeps its index arguments as plain read
+        // rows ABOVE the receiver's folded value stand-in (`t[0][c] = v`'s
+        // receiver `t[0]` folds — its result is a value stand-in just below
+        // `c` — so the outer bracket never folds and `c`'s row stays on the
+        // stack). The official walk visits an index target's subexpressions
+        // normally (`_visitIndexExpression`: only the target's own element
+        // skips the read), so `c` is a use: the candidate yields to the
+        // index-operator row carrying the stand-in's bracket and its read
+        // credit stands. The guard needs the stand-in's own `[` right
+        // before the candidate — a leftover value row from an earlier
+        // statement is separated by that statement's trailing tokens, never
+        // a bare bracket.
+        let index = if matches!(self.rows[index].intent, Intent::Read)
+            && index > 0
+            && {
+                let below = &self.rows[index - 1];
+                matches!(below.shape, RowShape::Value)
+                    && self.is_open_bracket_between(below.range.end(), self.rows[index].range.offset)
+            }
+        {
+            let stand_in = &self.rows[index - 1];
+            let (in_offset, in_end) = (stand_in.range.offset, stand_in.range.end());
+            // The receiver chain's row carries the bracket span its fold
+            // produced — the row whose `[]` bracket contains the stand-in
+            // is the write's true target.
+            match self.rows[..index - 1].iter().rposition(|row| match &row.intent {
+                Intent::Operator(op, bracket) => {
+                    *op == index_op && bracket.offset <= in_offset && in_end <= bracket.end()
+                }
+                _ => false,
+            }) {
+                Some(head) => head,
+                // A receiver whose own resolution left no operator row (a
+                // call result): nothing to convert — the index argument's
+                // read credit stands either way.
+                None => return,
+            }
+        } else {
+            index
+        };
+        let row = &mut self.rows[index];
+        match &row.intent {
+            Intent::Read => {
+                // A write alone never uses its target local (the
+                // official `_useAssignmentTargetElement` early return)
+                // — and only a bare row IS that local. A member row's
+                // hit is the RECEIVER's occurrence credit: `v.m = 1`
+                // reads `v`, and the official `_visitNameExpression`
+                // spares it through the lexical resolution regardless
+                // of the member access resolving (#2189-b — the
+                // receiver-write census rows).
+                if !compound
+                    && matches!(row.shape, RowShape::Bare(_))
+                    && let Some(hit) = self.local_hits.remove(&row.range.offset)
+                {
+                    self.locals[hit as usize].uses -= 1;
+                }
+                row.intent = if compound {
+                    Intent::ReadWrite
+                } else {
+                    Intent::Write
+                };
+                // FAM18: a constructor initializer list's plain
+                // assignment marks the field initialized
+                // (`updateWithInitializers`,
+                // constructor_fields_verifier.dart) — the container's
+                // flush consults the set. Only the this-face spellings
+                // count: the bare LHS, the still-unmerged `this` row,
+                // and the merged `this.b` member (`ConstructorField-
+                // Initializer`'s `this.b` prefix resolves the same
+                // field; a `super.b` write initializes the superclass's
+                // field, never ours), and only the plain `=` (the
+                // official face is a `ConstructorFieldInitializer`
+                // node).
+                if !compound
+                    && let Some(site) = init_ctor_site
+                    && init_container.is_some()
+                    && matches!(
+                        row.shape,
+                        RowShape::Bare(_)
+                            | RowShape::Receiver(Receiver::This { .. })
+                            | RowShape::Member {
+                                recv: Receiver::This { .. }
+                            }
+                    )
+                {
+                    self.ctor_init_writes.insert((site, row.name));
+                }
+            }
+            Intent::Operator(op, _) if *op == index_op => {
+                row.write_op = Some(if compound {
+                    OpWrite::Compound
+                } else {
+                    OpWrite::Assign
+                });
+            }
+            _ => {}
         }
+    }
+
+    /// Whether the source between two UTF-16 offsets is exactly the `[`
+    /// token (whitespace carries no token): the unfolded-index signature
+    /// the [`Engine::mark_assignment`] index-argument guard reads.
+    fn is_open_bracket_between(&self, from: u32, to: u32) -> bool {
+        if from >= to {
+            return false;
+        }
+        let tokens = self.tokens.as_slice();
+        let lo = tokens.partition_point(|token| token.utf16_offset < from);
+        let mut text = String::new();
+        for token in &tokens[lo..] {
+            if token.utf16_offset >= to {
+                break;
+            }
+            text.push_str(&self.source[token.byte_range()]);
+        }
+        text == "["
     }
 
     /// Marks an operator operand: the closest row wholly before `op`, when it

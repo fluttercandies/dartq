@@ -3283,7 +3283,7 @@ impl<'a> Engine<'a> {
             } else {
                 self.extension_receiver_resolves(receiver_ty)
             };
-        let mut applicable: Vec<(&ExtensionFace, StringId, FileId)> = Vec::new();
+        let mut applicable: Vec<(&ExtensionFace, Ty, FileId)> = Vec::new();
         if receiver_valid {
             for &(face, face_file) in faces {
                 let Some(on) = face.on_type else { continue };
@@ -3295,22 +3295,97 @@ impl<'a> Engine<'a> {
                 if !reaches(receiver, on) || !arg_applicable(face, face_file) {
                     continue;
                 }
-                applicable.push((face, on, face_file));
+                // The full `on` type rides the candidate for the
+                // specificity comparison below (the head gate above stays
+                // name-level); the boundary projects a foreign face's
+                // interned type into this pool exactly as the argument
+                // gate did.
+                let on_ty = boundary.ty(face_file, face.on_ty);
+                applicable.push((face, on_ty, face_file));
             }
         }
-        // `_isMoreSpecific` steps 3-4 at the name level: a face whose `on`
-        // type is a strict subtype of another applicable face's dominates
-        // it. Equal (or unrelated) `on` types stay mutually unordered —
-        // the ambiguity the caller reports.
-        let dominated = |on: StringId| {
-            applicable
-                .iter()
-                .any(|&(_, other, _)| other != on && reaches(other, on) && !reaches(on, other))
+        // `_isMoreSpecific` steps 3-4 at the name level: a face whose
+        // instantiated `on` type is a strict subtype of another applicable
+        // face's dominates it (`extension_member_resolver.dart:467-491`).
+        // The name-level subtype reads the two `on` types' shape: equal
+        // heads compare covariant argument-wise — a non-nullable argument
+        // subtypes its nullable twin (`List<ManifestNode>` vs
+        // `List<ManifestNode?>`), a subtype argument subtypes its
+        // supertype (`Map<K, FieldItem>` vs `Map<K, ManifestItem>`) — and
+        // unequal heads ride the declared supertype walk. A shape the
+        // name level cannot order (an own type parameter, nested argument
+        // lists, unknowns) answers compatible, and step 5's
+        // instantiate-to-bounds tail needs the extension's declared bounds,
+        // which the face does not carry — those pairs stay mutually
+        // unordered and the access stays ambiguous (the oracle's
+        // `IterableComparableExtension`-vs-`IterableExtension` shape).
+        let on_subtype = |sub: Ty, sup: Ty| -> bool {
+            let (
+                Ty::Named {
+                    name: sub_head,
+                    nullable: sub_nullable,
+                    args: sub_args,
+                },
+                Ty::Named {
+                    name: sup_head,
+                    nullable: sup_nullable,
+                    args: sup_args,
+                },
+            ) = (sub, sup)
+            else {
+                return true;
+            };
+            if sub_nullable && !sup_nullable {
+                return false;
+            }
+            if sub_head != sup_head {
+                return reaches(sub_head, sup_head);
+            }
+            if sub_args == ArgListId::EMPTY || sup_args == ArgListId::EMPTY {
+                return true;
+            }
+            // The pools are cold-path reads (ambiguity resolution only);
+            // the argument gate's same to_vec copy sidesteps the temporary
+            // borrow.
+            let sub_args = boundary.pool().get(sub_args).to_vec();
+            let sup_args = boundary.pool().get(sup_args).to_vec();
+            if sub_args.len() != sup_args.len() {
+                return true;
+            }
+            sub_args.iter().zip(sup_args.iter()).all(|(&a, &b)| {
+                let (
+                    Ty::Named {
+                        name: a_head,
+                        nullable: a_nullable,
+                        args: a_args,
+                    },
+                    Ty::Named {
+                        name: b_head,
+                        nullable: b_nullable,
+                        args: b_args,
+                    },
+                ) = (a, b)
+                else {
+                    return true;
+                };
+                if a_nullable && !b_nullable {
+                    return false;
+                }
+                if a_args != ArgListId::EMPTY || b_args != ArgListId::EMPTY {
+                    return true;
+                }
+                a_head == b_head || reaches(a_head, b_head)
+            })
         };
         let mut specific: Vec<(&ExtensionFace, FileId, (String, String))> = Vec::new();
         let mut nullable: Vec<(&ExtensionFace, FileId, (String, String))> = Vec::new();
-        for &(face, on, face_file) in &applicable {
-            if dominated(on) {
+        for (index, &(face, on_ty, face_file)) in applicable.iter().enumerate() {
+            let dominated = applicable.iter().enumerate().any(|(other, _)| {
+                other != index
+                    && on_subtype(applicable[other].1, on_ty)
+                    && !on_subtype(on_ty, applicable[other].1)
+            });
+            if dominated {
                 continue;
             }
             let display = self.extension_display(face);
