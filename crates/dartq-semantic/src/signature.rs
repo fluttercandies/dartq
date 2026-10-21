@@ -76,8 +76,15 @@ use crate::model::{
 /// instead of capturing `Unknown`, so a function-shape-only edit is an
 /// element-face edit. v8: the container's const-constructor bit (a
 /// `const`-only constructor edit flips the cross-file const-creation
-/// faces of every dependent).
-pub const SIGNATURE_VERSION: u32 = 8;
+/// faces of every dependent). v9: the extension face's type-parameter
+/// bounds, parallel to the names in declaration order (#2495) — a
+/// bound-only edit changes the face's applicability set (the gate drops
+/// or admits arguments on it), so it must flip the L2 gate. The fold also
+/// closes the #2431 gap: that train added the bounds columns to the model
+/// and the persisted payload without moving this version, so a snapshot
+/// captured with bounds-empty faces carried a signature indistinguishable
+/// from the bounds-full truth.
+pub const SIGNATURE_VERSION: u32 = 9;
 
 /// The 128-bit blake3 digest of a file's canonical element face — the same
 /// width family as [`dartq_source::ContentId`].
@@ -639,6 +646,16 @@ impl<'a> Face<'a> {
             for param in &face.type_param_names {
                 self.name(*param);
             }
+            // The bounds, parallel to the names in declaration order: a
+            // bound-only edit (`T extends Num` → bare `T`) changes the
+            // face's applicability set — the gate drops or admits arguments
+            // on the bound (#2495) — so the signature reads it. `Dynamic`
+            // (the absent-bound reading) folds as its own type, so the
+            // bounds-empty shape a starved capture produces can never share
+            // a signature with the bounds-full truth.
+            for bound in &face.type_param_bounds {
+                self.ty(*bound);
+            }
             Self::sorted(self.strings, &mut self.inner, face.members.keys().copied());
             for j in 0..self.inner.len() {
                 let member_name = self.inner[j];
@@ -829,6 +846,51 @@ mod tests {
         assert_ne!(
             base.api_signature(&strings),
             reshaped.api_signature(&strings)
+        );
+    }
+
+    /// A bounds-only edit flips the signature (the v9 face, #2495): two
+    /// extension faces identical except for the type-parameter bound —
+    /// `T extends int` vs bare `T` — must hash differently. The bare form
+    /// is exactly the bounds-empty shape a starved capture produces (the
+    /// collector latches `Dynamic` for an absent bound), so the pin also
+    /// forbids that stale shape from sharing a signature with the
+    /// bounds-full truth.
+    #[test]
+    fn extension_bound_edit_flips_the_signature() {
+        let strings = StringTable::new();
+        let bounded = elements_of(
+            "extension E<T extends int> on List<T> { int get probe => 1; }\n",
+            &strings,
+        );
+        let unbounded =
+            elements_of("extension E<T> on List<T> { int get probe => 1; }\n", &strings);
+        let [bounded_face] = &bounded.extension_faces[..] else {
+            panic!("the bounded source collects one extension face");
+        };
+        let [unbounded_face] = &unbounded.extension_faces[..] else {
+            panic!("the unbounded source collects one extension face");
+        };
+        assert_eq!(
+            bounded_face.type_param_bounds.len(),
+            unbounded_face.type_param_names.len(),
+            "the captured bound column is parallel to the names"
+        );
+        assert!(
+            matches!(
+                bounded_face.type_param_bounds[0],
+                Ty::Named { name, .. } if strings.resolve(name) == "int"
+            ),
+            "the declared bound is captured as a real type"
+        );
+        assert!(
+            matches!(unbounded_face.type_param_bounds[0], Ty::Dynamic),
+            "the absent bound reads Dynamic — the starved-capture shape"
+        );
+        assert_ne!(
+            bounded.api_signature(&strings),
+            unbounded.api_signature(&strings),
+            "a bound-only edit must flip the signature"
         );
     }
 

@@ -112,6 +112,22 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// payload restores doc-import-less, so a warm start would drop every
 /// `uri_does_not_exist_in_doc_import` row and mis-slice the URI
 /// diagnostic tail (the tail counts coded doc-import rows too).
+/// v15: the extension-face mirror carries the type-parameter bounds
+/// (`PersistedExtensionFace::type_param_bounds`, #2431's additive
+/// column). The column landed WITHOUT its bump — the shape probes both
+/// rode `extension_faces` empty, so the guard saw zero bytes move — and
+/// the `serde(default)` decode is not the safe direction its field doc
+/// claimed: a pre-column payload restores bounds-empty and the bound
+/// gate reads past-the-end as `Dynamic`, so a warm start over-admits
+/// every bound-excluded face (#2470's forensic bug class). This entry is
+/// the record of when the column entered the tree and the retroactive
+/// bump that forks the pre-column generations; the populated-elements
+/// probe now carries a bounds-carrying face, so the next layout edit in
+/// that subtree moves bytes again. The same ticket restored the guard
+/// itself: the typedef-RHS train left the probe's `PersistedTopDecl`
+/// initializer without that train's `type_param_names` field, so the
+/// lib-test module — both shape pins with it — had been uncompilable and
+/// the structural guard unrunnable ever since.
 ///
 /// # Bump contract (structural guard)
 ///
@@ -130,7 +146,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// version too.) The bump lane also forks on capture-behavior changes with
 /// no layout delta: a payload the old producer wrote must not be served to
 /// a producer whose capture output diverges from it.
-const FACTS_SHAPE_VERSION: u32 = 14;
+const FACTS_SHAPE_VERSION: u32 = 15;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component of
 /// `EngineSemanticVersion`): the engine facts shape folded with

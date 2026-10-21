@@ -820,9 +820,9 @@ mod tests {
     use crate::{CancellationToken, Engine, EngineConfig, EngineEvent, memory_store};
     use dartq_pub::{LockFile, PackageConfig, Pubspec, build_graph};
     use dartq_semantic::persisted::{
-        PersistedAnnotation, PersistedContainer, PersistedContainerKind, PersistedFormal,
-        PersistedFormals, PersistedMemberEntry, PersistedMemberKind, PersistedMicroKind,
-        PersistedTopDecl, PersistedTy,
+        PersistedAnnotation, PersistedContainer, PersistedContainerKind,
+        PersistedExtensionFace, PersistedFormal, PersistedFormals, PersistedMemberEntry,
+        PersistedMemberKind, PersistedMicroKind, PersistedTopDecl, PersistedTy,
     };
     use dartq_snapshot::{SnapshotConfig, SnapshotStore};
     use dartq_source::SourceRange;
@@ -1036,40 +1036,49 @@ mod tests {
     /// [`Self::populated_elements_shape_is_pinned`] fails — the same
     /// bump-the-version-and-re-pin contract as the main pin.
     const FACTS_SHAPE_ELEMENTS_JSON_PIN: &str = concat!(
-        r#"{"strings":["C","m","x","y","int","0","f","z","Deprecated","('v')","String"],"decls":[[6,"#,
-        r#"{"kind":"TopLevelFn","type_params":0,"var_ty":"Unknown","return_ty":"Void","#,
-        r#""formals":{"positional":[{"name":7,"ty":{"Function":{"nullable":true,"type_params":0,"#,
-        r#""return_ty":{"Named":{"name":10,"nullable":false,"args":[]}},"positional":[{"Named":{"name":4,"#,
-        r#""nullable":false,"args":[]}}],"named":[]}},"required":true,"covariant":false,"#,
-        r#""default_value":null}],"named":[]}}]],"containers":[[0,{"kind":"Class","is_abstract":false,"#,
-        r#""is_base":false,"is_final":false,"is_interface":false,"is_mixin_class":false,"superclass":null,"#,
-        r#""members":[[1,{"kind":"Method","is_static":false,"is_abstract":false,"is_external":false,"#,
-        r#""is_final":false,"type_params":0,"type_param_names":[],"var_ty":"Unknown","return_ty":"Void","#,
-        r#""formals":{"positional":[{"name":2,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"#,
-        r#""required":true,"covariant":false,"default_value":null}],"named":[{"name":3,"#,
-        r#""ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":false,"covariant":true,"#,
-        r#""default_value":5}]},"annotations":[{"name":8,"offset":0,"length":16,"args_text":9}],"#,
-        r#""name_range":[34,1]}]],"type_params":0,"sealed":false,"with_clause":[],"implements_clause":[],"#,
-        r#""on_clause":[],"header_residue":[],"primary_formals":[],"enum_constants":[],"constructors":[],"#,
-        r#""has_unnamed_constructor":false,"has_const_constructor":false,"ctor_formals":[],"annotations":[]}]],"#,
-        r#""container_order":[0],"#,
-        r#""extension_faces":[],"duplicates":[],"arity_violations":[]}"#,
+        r#"{"strings":["C","m","x","y","int","0","f","z","Deprecated","('v')","String","E","T","List","#,
+        r#""probe"],"decls":[[6,{"kind":"TopLevelFn","type_params":0,"type_param_names":[],"#,
+        r#""var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":7,"#,
+        r#""ty":{"Function":{"nullable":true,"type_params":0,"return_ty":{"Named":{"name":10,"#,
+        r#""nullable":false,"args":[]}},"positional":[{"Named":{"name":4,"nullable":false,"args":[]}}],"#,
+        r#""named":[]}},"required":true,"covariant":false,"default_value":null}],"named":[]}}]],"#,
+        r#""containers":[[0,{"kind":"Class","is_abstract":false,"is_base":false,"is_final":false,"#,
+        r#""is_interface":false,"is_mixin_class":false,"superclass":null,"members":[[1,{"kind":"Method","#,
+        r#""is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"type_params":0,"#,
+        r#""type_param_names":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":2,"#,
+        r#""ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":true,"covariant":false,"#,
+        r#""default_value":null}],"named":[{"name":3,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"#,
+        r#""required":false,"covariant":true,"default_value":5}]},"annotations":[{"name":8,"offset":0,"#,
+        r#""length":16,"args_text":9}],"name_range":[34,1]}]],"type_params":0,"sealed":false,"#,
+        r#""with_clause":[],"implements_clause":[],"on_clause":[],"header_residue":[],"primary_formals":[],"#,
+        r#""enum_constants":[],"constructors":[],"has_unnamed_constructor":false,"#,
+        r#""has_const_constructor":false,"ctor_formals":[],"annotations":[]}]],"container_order":[0],"#,
+        r#""extension_faces":[{"name":11,"on_type":13,"on_type_nullable":false,"on_ty":{"Named":{"name":13,"#,
+        r#""nullable":false,"args":[{"Named":{"name":12,"nullable":false,"args":[]}}]}},"#,
+        r#""type_param_names":[12],"type_param_bounds":[{"Named":{"name":4,"nullable":false,"args":[]}}],"#,
+        r#""members":[[14,{"kind":"Getter","is_static":false,"is_abstract":false,"is_external":false,"#,
+        r#""is_final":false,"type_params":0,"type_param_names":[],"var_ty":"Unknown","#,
+        r#""return_ty":{"Named":{"name":4,"nullable":false,"args":[]}},"formals":null,"annotations":[],"#,
+        r#""name_range":null}]]}],"duplicates":[],"arity_violations":[]}"#,
     );
 
     /// The element rows the main probe rides past empty, modeled on the
     /// source `@Deprecated('v') class C { void m(int x, {covariant int y =
-    /// 0}) {} } void f(String Function(int)? z) {}`: one top-level
-    /// function row, one container row with one annotated method member,
-    /// and the empty columns (container order, extension faces,
-    /// duplicates, arity). The mirror columns are populated where they
-    /// earn their keep: the named formal carries the covariant bit and a
-    /// default-value text (the #1637 columns), the member carries an
-    /// annotation star with its argument-group text (#1083) and its
-    /// name-token anchor (#1867), and the top-level function's formal
-    /// carries a function-typed declared type (the function-shape
-    /// columns) — so a layout edit in any of those subtrees moves the
-    /// pinned bytes and forces the `FACTS_SHAPE_VERSION` bump the
-    /// state.rs contract requires.
+    /// 0}) {} } void f(String Function(int)? z) {} extension E<T extends
+    /// int> on List<T> { int get probe => 1; }`: one top-level function
+    /// row, one container row with one annotated method member, one
+    /// extension face carrying a bounded type parameter, and the empty
+    /// columns (container order, duplicates, arity). The mirror columns
+    /// are populated where they earn their keep: the named formal carries
+    /// the covariant bit and a default-value text (the #1637 columns), the
+    /// member carries an annotation star with its argument-group text
+    /// (#1083) and its name-token anchor (#1867), the top-level function's
+    /// formal carries a function-typed declared type (the function-shape
+    /// columns), and the extension face carries its `on` type, type
+    /// parameters, and bounds (#2431/#2495 — the subtree whose columns
+    /// first entered the tree unobserved) — so a layout edit in any of
+    /// those subtrees moves the pinned bytes and forces the
+    /// `FACTS_SHAPE_VERSION` bump the state.rs contract requires.
     fn populated_elements_probe() -> PersistedElements {
         PersistedElements {
             strings: vec![
@@ -1084,12 +1093,17 @@ mod tests {
                 "Deprecated".to_owned(),
                 "('v')".to_owned(),
                 "String".to_owned(),
+                "E".to_owned(),
+                "T".to_owned(),
+                "List".to_owned(),
+                "probe".to_owned(),
             ],
             decls: vec![(
                 6,
                 PersistedTopDecl {
                     kind: PersistedMicroKind::TopLevelFn,
                     type_params: 0,
+                    type_param_names: Vec::new(),
                     var_ty: PersistedTy::Unknown,
                     return_ty: PersistedTy::Void,
                     formals: Some(Box::new(PersistedFormals {
@@ -1192,7 +1206,51 @@ mod tests {
                 },
             )],
             container_order: vec![0],
-            extension_faces: Vec::new(),
+            // `extension E<T extends int> on List<T> { int get probe => 1;
+            // }` — the face's name, `on` type, nullable bit, full `on` type
+            // (`List<T>` keeps its argument), type-parameter names, bounds
+            // (`int`, parallel to the names), and members.
+            extension_faces: vec![PersistedExtensionFace {
+                name: Some(11),
+                on_type: Some(13),
+                on_type_nullable: false,
+                on_ty: PersistedTy::Named {
+                    name: 13,
+                    nullable: false,
+                    args: vec![PersistedTy::Named {
+                        name: 12,
+                        nullable: false,
+                        args: Vec::new(),
+                    }],
+                },
+                type_param_names: vec![12],
+                type_param_bounds: vec![PersistedTy::Named {
+                    name: 4,
+                    nullable: false,
+                    args: Vec::new(),
+                }],
+                members: vec![(
+                    14,
+                    PersistedMemberEntry {
+                        kind: PersistedMemberKind::Getter,
+                        is_static: false,
+                        is_abstract: false,
+                        is_external: false,
+                        is_final: false,
+                        type_params: 0,
+                        type_param_names: Vec::new(),
+                        var_ty: PersistedTy::Unknown,
+                        return_ty: PersistedTy::Named {
+                            name: 4,
+                            nullable: false,
+                            args: Vec::new(),
+                        },
+                        formals: None,
+                        annotations: Vec::new(),
+                        name_range: None,
+                    },
+                )],
+            }],
             duplicates: Vec::new(),
             arity_violations: Vec::new(),
         }
