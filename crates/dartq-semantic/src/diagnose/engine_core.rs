@@ -34,6 +34,7 @@ impl<'a> Engine<'a> {
             source,
             tokens,
             wide_chars: std::cell::OnceCell::new(),
+            numeric_shadow_memo: std::array::from_fn(|_| std::cell::Cell::new(None)),
             file,
             lib,
             guard,
@@ -2258,29 +2259,49 @@ impl<'a> Engine<'a> {
         // answers the declared return unrefined; a declared
         // `class int extends num` hierarchy keeps the refinement (the
         // declared lattice answers the gate truthfully).
-        if let Ty::Named { name, .. } = left_ty
-            && matches!(self.strings.resolve(name), "int" | "double" | "num")
-            && resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                self.lib,
-                self.file,
-                name,
-            )
-            .is_some()
-            && (name == num
-                || resolve_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    self.lib,
-                    self.file,
-                    num,
-                )
-                .is_none())
-        {
-            return declared;
+        // The verdict is memoized per head (`numeric_shadow_memo`, one
+        // slot per core spelling): arithmetic on core-numeric receivers
+        // is the most frequent typed expression shape, the probes are
+        // run-stable, and the slot match admits exactly the three heads
+        // the guard can ever fire on.
+        if let Ty::Named { name, .. } = left_ty {
+            let shadow_slot = match self.strings.resolve(name) {
+                "int" => Some(0),
+                "double" => Some(1),
+                "num" => Some(2),
+                _ => None,
+            };
+            if let Some(slot) = shadow_slot {
+                let shadowed = match self.numeric_shadow_memo[slot].get() {
+                    Some(shadowed) => shadowed,
+                    None => {
+                        let shadowed = resolve_container(
+                            self.graph,
+                            self.namespaces,
+                            self.index,
+                            self.lib,
+                            self.file,
+                            name,
+                        )
+                        .is_some()
+                            && (name == num
+                                || resolve_container(
+                                    self.graph,
+                                    self.namespaces,
+                                    self.index,
+                                    self.lib,
+                                    self.file,
+                                    num,
+                                )
+                                .is_none());
+                        self.numeric_shadow_memo[slot].set(Some(shadowed));
+                        shadowed
+                    }
+                };
+                if shadowed {
+                    return declared;
+                }
+            }
         }
         // The gate is the receiver's own bound — a user `extends num` class
         // refines identically — so the call is unconditional on the

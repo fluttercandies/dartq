@@ -4420,3 +4420,23 @@ mod ticket_2477_tests;
 /// nullability gate keeps its verdict.
 #[cfg(test)]
 mod ticket_2462_tests;
+
+/// The #2485 pins: behavior guards over the member-read credit loop's
+/// clone removal and the numeric shadow-guard's per-head verdict memo —
+/// the unshadowed core-numeric head keeps refining across repeated
+/// sends, a shadowing container declaration keeps the declared return,
+/// and a many-member-read file's extension-use adjudication is
+/// unchanged.
+#[cfg(test)]
+mod ticket_2485_tests;
+
+/// The #2472 pins: instance-creation typing from the constructor's return
+/// (census families G4+G9) — an explicit-keyword creation with written
+/// type arguments folds to a receiver typed by the instantiated
+/// constructor return (`const ListEquality<Attr>().equals/hash(...)`
+/// resolves on `ListEquality<Attr>`, oracle-silent at every census site),
+/// a genuine miss on the created type still reports naming the
+/// constructor's type, and the initializing formal's named slot takes the
+/// field's declared type while the neighboring `absoluteFilePath:` slot
+/// keeps enforcing `String`.
+#[cfg(test)]

@@ -390,7 +390,15 @@ impl<'a> Engine<'a> {
                 *declarers.entry(*spelling).or_default() += 1;
             }
         }
-        for read in self.member_reads.clone() {
+        // Index iteration over a snapshot length (the clone's exact
+        // semantics): the loop body mutates the engine (the credit set,
+        // the import credits), so a shared iterator would hold the borrow
+        // across the mutations. The reads are `Copy` and `member_reads`
+        // is never written here, so each item re-borrows for the one
+        // copy-out — no whole-list clone per file.
+        let read_count = self.member_reads.len();
+        for read_index in 0..read_count {
+            let read = self.member_reads[read_index];
             let (head, ty) = match self.promoted_receiver(read.offset, read.recv) {
                 Receiver::Typed { type_name, ty, .. } => (type_name, ty),
                 Receiver::Created { name, .. } | Receiver::Container { name, .. } => {

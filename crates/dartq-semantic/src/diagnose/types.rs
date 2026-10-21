@@ -1385,6 +1385,13 @@ pub(crate) struct Engine<'a> {
     /// char, built on first use; empty for an ASCII file (the rust-analyzer
     /// wide-char layout).
     pub(crate) wide_chars: std::cell::OnceCell<Vec<(u32, u32)>>,
+    /// The `refine_numeric_binary` shadow-guard verdicts, one slot per
+    /// core numeric head (`int`/`double`/`num` — the only heads the guard
+    /// admits). The guard's `resolve_container` probes answer run-stable
+    /// (the element index and namespaces are built before the fold), so
+    /// the first arithmetic send on a core-numeric receiver pays them and
+    /// every later send on the same head reads the cached verdict.
+    pub(crate) numeric_shadow_memo: [std::cell::Cell<Option<bool>>; 3],
     pub(crate) file: FileId,
     pub(crate) lib: LibraryId,
     pub(crate) guard: UndefinedGuard<'a>,
