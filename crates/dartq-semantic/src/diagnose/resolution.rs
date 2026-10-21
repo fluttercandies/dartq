@@ -252,10 +252,13 @@ impl<'a> Engine<'a> {
                 nullable,
                 args,
             } => {
-                let substituted: Vec<Ty> = self
-                    .boundary
-                    .pool()
-                    .get(args)
+                // Snapshot the argument list out of the pool before
+                // recursing: `pool()` holds a `Ref` on `args`, and the
+                // recursive substitution re-borrows the same `RefCell`
+                // mutably to intern the rewritten list — iterating the
+                // slice while it is borrowed panics.
+                let arg_list: Vec<Ty> = self.boundary.pool().get(args).to_vec();
+                let substituted: Vec<Ty> = arg_list
                     .iter()
                     .map(|&arg| self.substitute_alias_rhs(arg, subst))
                     .collect();
