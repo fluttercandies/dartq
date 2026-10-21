@@ -1553,6 +1553,40 @@ impl<'a> Engine<'a> {
         None
     }
 
+    /// The enclosing const constructor's formal names while ITS initializer
+    /// list is open (`initializer_depth`/`in_const_ctor`), empty everywhere
+    /// else: the site the constructor parse armed (`open_ctor_site`) names
+    /// the constructor whose formals are in scope (the site name rewritten
+    /// to the selector — the collector's own table key), and its table
+    /// carries the initializing formals under their reference spelling too.
+    fn ctor_init_formals(&self) -> Vec<StringId> {
+        if self.initializer_depth == 0 || !self.in_const_ctor {
+            return Vec::new();
+        }
+        self.open_ctor_site
+            .and_then(|site| self.decl_sites.get(site))
+            .and_then(|site| match &site.kind {
+                DeclKind::Constructor { container } => Some((*container, site.name)),
+                _ => None,
+            })
+            .and_then(|(container, ctor_name)| {
+                self.index
+                    .get(self.file)
+                    .and_then(|f| f.container(container))?
+                    .ctor_formals
+                    .get(&ctor_name)
+                    .map(|formals| {
+                        formals
+                            .positional
+                            .iter()
+                            .chain(formals.named.iter())
+                            .map(|formal| formal.name)
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
+    }
+
     pub fn check_const_elements(
         &mut self,
         code: SemanticCode,
@@ -1574,9 +1608,36 @@ impl<'a> Engine<'a> {
         {
             return None;
         }
+        // The const constructor's own initializer list is the
+        // potentially-constant context (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/dart/constant/constant_verifier.dart
+        // `_validateConstructorInitializers` +
+        // pkg/analyzer/lib/src/dart/constant/potentially_constant.dart
+        // `_nameExpression`): a formal-parameter reference of the
+        // enclosing const constructor inside a constructor initializer is
+        // potentially constant, so the element faces must not fault it —
+        // the `const L({num? progress}) : rec = (progress: progress);`
+        // riverpod shape stays silent. The verdicts evaluate with the
+        // formals bound as opaque (potentially-constant) names; every
+        // other leaf classifies exactly as before, so a genuinely
+        // non-constant element still reports through the same face.
+        let formals = self.ctor_init_formals();
+        let verdicts: Vec<Verdict> = if formals.is_empty() {
+            parts.iter().map(|part| eval(part, self)).collect()
+        } else {
+            let mut env: FxHashMap<StringId, CtorBinding> = FxHashMap::default();
+            for name in formals {
+                env.insert(name, CtorBinding::Opaque);
+            }
+            let scope = CtorScope {
+                engine: self,
+                env: &env,
+            };
+            parts.iter().map(|part| eval(part, &scope)).collect()
+        };
         let mut failed = None;
-        for part in parts {
-            let failed_at = match eval(part, self) {
+        for (part, verdict) in parts.iter().zip(verdicts) {
+            let failed_at = match verdict {
                 // An element folding clean but closing an unresolved
                 // callee's invocation (`[Undefined()]`): the oracle's
                 // evaluation is known-invalid at the invocation

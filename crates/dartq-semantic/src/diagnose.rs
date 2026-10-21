@@ -4368,3 +4368,16 @@ mod ticket_2450_tests;
 #[cfg(test)]
 mod ticket_2465_tests;
 
+/// The #2478 pins: the const constructor's record initializer fields ride
+/// the potentially-constant gate — a formal-parameter reference of the
+/// enclosing const constructor is potentially constant, so the riverpod
+/// `async_value.dart` `const L({num? progress}) : rec = (progress:
+/// progress);` shape stays silent (the element verdicts evaluate with the
+/// constructor's formals bound as potentially-constant names, the
+/// initializing formal included) while a genuinely non-constant field in
+/// a true const declaration context keeps its `non_constant_record_field`
+/// row, and a genuine discarded `@useResult` top-level invocation keeps
+/// its `unused_result` row (the honesty guard for the discarded-value
+/// verifier's shadowing fix in its owning lane).
+#[cfg(test)]
+mod ticket_2478_tests;
