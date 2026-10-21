@@ -3735,3 +3735,10 @@ mod ticket_2429_tests;
 /// static type of `this` closing an exhaustive `switch (this)` body.
 #[cfg(test)]
 mod ticket_2426_tests;
+/// The #2433 pins (LAW A phase A3): a member face read through a
+/// parameterized receiver substitutes the receiver's WRITTEN type
+/// arguments — `Box<int> b; b.set(v)` checks `v` against `int`. Bare-head
+/// receivers keep the declared face, and nested instantiations substitute
+/// one level deep.
+#[cfg(test)]
+mod ticket_2433_tests;

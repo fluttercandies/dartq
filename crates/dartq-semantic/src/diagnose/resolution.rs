@@ -823,7 +823,7 @@ impl<'a> Engine<'a> {
         recv: &Receiver,
         name: StringId,
     ) -> Option<std::borrow::Cow<'a, Formals>> {
-        let (container, super_walk) = match *recv {
+        let (container, super_walk, recv_ty) = match *recv {
             // An extension body's `this` resolves its member through the
             // extended type's face as well (`ExtensionMemberScope` — the
             // member may live on the `on` type rather than the extension's
@@ -850,16 +850,20 @@ impl<'a> Engine<'a> {
                     _ => None,
                 };
             }
-            Receiver::This { container, .. } => (container, false),
-            Receiver::Super { container, .. } => (container, true),
-            Receiver::Typed { type_name, .. } => (type_name, false),
+            Receiver::This { container, .. } => (container, false, None),
+            Receiver::Super { container, .. } => (container, true, None),
+            // A declaration-typed receiver's written type arguments
+            // instantiate the member face (`Box<int> b; b.set(v)` checks
+            // `v` against `int`, never the `T` the member declares) — the
+            // environment composes at the find below.
+            Receiver::Typed { type_name, ty } => (type_name, false, Some(ty)),
             // A folded creation (`C().m(...)`): the instance face — the
             // constructor-argument membership check walks the superclass
             // chain like a declaration-typed receiver. The table is not
             // name-level only: `check_arguments` stages and renders formal
             // types against it, and those renders stay single-pool because
             // the walks below route every find through the boundary.
-            Receiver::Created { name, .. } => (name, false),
+            Receiver::Created { name, .. } => (name, false, None),
             Receiver::Container {
                 name: container, ..
             } => {
@@ -955,17 +959,157 @@ impl<'a> Engine<'a> {
             self.walk_members(container, name)
         };
         match walk {
-            Walk::Found(entry) if entry.kind == MemberKind::Method => Some(match entry {
-                Projected::Own(e) => match e.formals.as_deref() {
-                    Some(formals) => std::borrow::Cow::Borrowed(formals),
-                    None => return None,
-                },
-                Projected::Foreign(e) => match e.formals.as_deref() {
-                    Some(formals) => std::borrow::Cow::Owned(formals.to_owned()),
-                    None => return None,
-                },
-            }),
+            Walk::Found(entry) if entry.kind == MemberKind::Method => {
+                // The receiver-instantiation environment (#2433): a
+                // `Receiver::Typed`'s written arguments substitute the
+                // container parameters the member's formals spell. `None`
+                // keeps the declared table byte-identical.
+                let env =
+                    recv_ty.and_then(|ty| self.member_recv_env(ty, container, &entry));
+                if let Some(env) = env {
+                    return match entry.formals.as_deref() {
+                        Some(formals) => Some(std::borrow::Cow::Owned(
+                            self.substitute_formals(formals, &env),
+                        )),
+                        None => None,
+                    };
+                }
+                match entry {
+                    Projected::Own(e) => match e.formals.as_deref() {
+                        Some(formals) => Some(std::borrow::Cow::Borrowed(formals)),
+                        None => None,
+                    },
+                    Projected::Foreign(e) => match e.formals.as_deref() {
+                        Some(formals) => Some(std::borrow::Cow::Owned(formals.to_owned())),
+                        None => None,
+                    },
+                }
+            }
             _ => None,
+        }
+    }
+
+    /// The receiver-instantiation environment of a `Receiver::Typed` member
+    /// face: the written type arguments of the receiver's own type zipped
+    /// onto the declaring container's parameters — `Box<int> b` hands
+    /// `b.set`'s formal the `int` face the oracle's instantiated member
+    /// reads (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/property_element_resolver.dart —
+    /// the member lookup runs on the receiver's resolved type, whose type
+    /// arguments instantiate the result's signature). `None` keeps the
+    /// declared face: a bare head writes no arguments, an arity-mismatched
+    /// spelling is the InvalidType recovery's face to keep raw, and a
+    /// foreign container exposes only a parameter count — the name-forced
+    /// rule the super-face instantiation keeps (one declared parameter, one
+    /// written argument, one free parameter spelling in the member's
+    /// signature). The member's own type parameters are bound in its
+    /// signature and never substitute — `m<M>(M x)` shadows any same-spelled
+    /// container key.
+    fn member_recv_env(
+        &self,
+        recv_ty: Ty,
+        container: StringId,
+        entry: &MemberEntry,
+    ) -> Option<Vec<(StringId, Ty)>> {
+        let Ty::Named { name, args, .. } = recv_ty else {
+            return None;
+        };
+        if name != container || args == ArgListId::EMPTY {
+            return None;
+        }
+        let written: Vec<Ty> = self.boundary.args.borrow().get(args).to_vec();
+        let mut map: Vec<(StringId, Ty)> = if let Some(params) =
+            self.bounds.container_params(container)
+        {
+            let names: Vec<StringId> = params.iter().map(|(param, ..)| *param).collect();
+            if names.len() != written.len() {
+                return None;
+            }
+            names.into_iter().zip(written).collect()
+        } else {
+            // A foreign container's parameters spell nowhere in this unit —
+            // the name-forced rule alone binds: exactly one declared
+            // parameter, one written argument, one free parameter spelling
+            // in the member's signature (the declaring file's TypeParam tag
+            // separates a parameter from a real type at the name level).
+            let (found, owner) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                container,
+            )?;
+            if found.type_params != 1 || written.len() != 1 {
+                return None;
+            }
+            let mut free: Vec<StringId> = Vec::new();
+            let mut collect = |ty: Ty| {
+                self.member_free_params(ty, entry, owner, &mut free);
+            };
+            collect(entry.var_ty);
+            collect(entry.return_ty);
+            if let Some(formals) = entry.formals.as_deref() {
+                for formal in formals.positional.iter().chain(formals.named.iter()) {
+                    collect(formal.ty);
+                }
+            }
+            if free.len() != 1 {
+                return None;
+            }
+            vec![(free[0], written[0])]
+        };
+        map.retain(|(param, _)| !entry.type_param_names.contains(param));
+        (!map.is_empty()).then_some(map)
+    }
+
+    /// One type's free container-parameter spellings: a bare `Named` head
+    /// records when the member's own type parameters do not bind it and the
+    /// declaring file's index tags it `TypeParam` (the same decl-kind probe
+    /// the super-face instantiation's free-parameter walk reads); a
+    /// parameterized head descends into its argument list. First-seen order,
+    /// deduplicated.
+    fn member_free_params(
+        &self,
+        ty: Ty,
+        member: &MemberEntry,
+        scope_file: FileId,
+        free: &mut Vec<StringId>,
+    ) {
+        let Ty::Named { name, args, .. } = ty else {
+            return;
+        };
+        let is_type_param = !member.type_param_names.contains(&name)
+            && self
+                .index
+                .get(scope_file)
+                .and_then(|f| f.decl(name))
+                .is_some_and(|decl| decl.kind == crate::model::MicroKind::TypeParam);
+        if is_type_param && !free.contains(&name) {
+            free.push(name);
+        }
+        if args == ArgListId::EMPTY {
+            return;
+        }
+        let list: Vec<Ty> = self.boundary.args.borrow().get(args).to_vec();
+        for arg in list {
+            self.member_free_params(arg, member, scope_file, free);
+        }
+    }
+
+    /// The formal table under a receiver-instantiation environment: every
+    /// bare container-parameter spelling becomes its written argument
+    /// ([`Engine::subst_params`]'s rewrite — records, function types, and
+    /// nullable parameter occurrences pass through unrewritten, so the
+    /// unrewritten formal keeps its declared face).
+    fn substitute_formals(&self, formals: &Formals, env: &[(StringId, Ty)]) -> Formals {
+        let subst = |formal: &crate::model::Formal| crate::model::Formal {
+            ty: self.subst_params(formal.ty, env).unwrap_or(formal.ty),
+            ..*formal
+        };
+        Formals {
+            positional: formals.positional.iter().map(subst).collect(),
+            named: formals.named.iter().map(subst).collect(),
         }
     }
 
