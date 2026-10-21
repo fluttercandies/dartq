@@ -84,13 +84,11 @@ fn code_names(report: &FileReport) -> Vec<&'static str> {
 /// no `first`, so the oracle fires `undefined_getter` on the read alone;
 /// the unbounded parameter's implicit `Object?` bound violates
 /// `T extends Enum` and `byName` reports `undefined_method` beside it.
-/// KNOWN DIVERGENCE (1 corpus row, analyzer): the SDK face table also
-/// spells an `EnumByName on Iterable<T extends Enum>` whose
-/// spelling-level applicability cannot see that the receiver's head is
-/// the LOCAL `Iterable`, so dartq adds an
-/// `ambiguous_extension_member_access` row beside the oracle's set — the
-/// full equality re-arms when the SDK faces gain a receiver-container
-/// provenance gate.
+/// The #2504 receiver-container provenance gate keeps the SDK's
+/// `EnumByName on Iterable` off every local `Iterable` receiver (the
+/// on-head resolves to the SDK face file, the receiver's head to the user
+/// file), so the analyzer corpus's `ambiguous_extension_member_access`
+/// false positive on this shape is gone and the CLI universe matches.
 #[test]
 fn same_head_parameter_bound_decides() {
     let bounded = report(
@@ -116,16 +114,14 @@ fn same_head_parameter_bound_decides() {
     );
 }
 
-/// The subtype hop in the no-core rig universe: the fiat collection edge
-/// (`List<E> implements Iterable<E>`) carries the bound check when the
-/// parameter satisfies it (`byName` silent) and the local `List`'s own
-/// missing `first` reports alone; the unbounded parameter's bound
-/// violation reports `byName` beside it. KNOWN UNIVERSE SPLIT: under the
-/// live oracle (dart:core auto-imported) the fixture's LOCAL `List`
-/// declares no edge to its LOCAL `Iterable`, so `byName` reports
-/// `undefined_method` in BOTH polarities — the CLI run matches that; the
-/// receiver-container provenance gate that reconciles the two universes
-/// is the same parked face as the same-head divergence above.
+/// The subtype hop in the no-core rig universe: the local `List` declares
+/// no written clause to its local `Iterable`, so the #2504 provenance
+/// walk finds no path from the receiver's declaration to the face's
+/// `on`-head file — the extension never applies and `byName` reports
+/// `undefined_method` in BOTH polarities (the clause-less local `List`'s
+/// `first` reports `undefined_getter` beside it). This matches the live
+/// oracle's universe, where the local `List` has no relation to any
+/// `Iterable` the face names — the rig/CLI universe split is healed.
 #[test]
 fn subtype_hop_parameter_bound_decides() {
     let bounded = report(
@@ -135,7 +131,7 @@ fn subtype_hop_parameter_bound_decides() {
     );
     assert_eq!(
         code_names(&bounded),
-        ["undefined_getter"],
+        ["undefined_method", "undefined_getter"],
         "{:?}",
         code_names(&bounded)
     );

@@ -457,13 +457,19 @@ class C {
 /// #2285 item 4: the `dart:collection` alias entries reach their
 /// declared interfaces — `HashMap <: Map` through the alias table (the
 /// stub declarations the declared-lattice walk cannot see). The
-/// extension on `Map<K, V>` applies to a `HashMap` receiver.
+/// extension on `Map<K, V>` applies to a `HashMap` receiver. The rig
+/// spells the stub's own written edge (`implements Map<K, V>`, the
+/// bundled `dart:collection` excerpt's declaration): the #2504
+/// receiver-container provenance gate engages for a face whose `on`
+/// head is declared in its own file, and a clause-less local `HashMap`
+/// stand-in would have no written path to the local `Map` — exactly the
+/// relation the live oracle also denies it.
 #[test]
 fn pin_collection_alias_reaches_its_interface() {
     let source = "\
 class int {}
 class Map<K, V> {}
-class HashMap<K, V> {}
+class HashMap<K, V> implements Map<K, V> {}
 extension MapSize<K, V> on Map<K, V> {
   int get size => 0;
 }

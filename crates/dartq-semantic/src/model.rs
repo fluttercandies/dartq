@@ -1477,6 +1477,14 @@ pub struct Container {
     /// The container's own type-parameter count (`class C<T, U>`); 0 when
     /// non-generic. The wrong-number-of-type-arguments decisions read it.
     pub type_params: u16,
+    /// The container's own type-parameter spellings, in declaration order
+    /// (`class C<T, U>` keeps `[T, U]`; empty when non-generic or decoded
+    /// from a pre-field persisted payload — the additive-default posture).
+    /// A receiver's written type arguments pair with THIS order (the
+    /// oracle instantiates the member's signature through the receiver's
+    /// resolved type), so cross-file member faces substitute exactly
+    /// instead of by the order a signature happens to spell the names.
+    pub type_param_names: Box<[StringId]>,
     /// The `sealed` modifier was present (the exhaustiveness splitter,
     /// `types/sealed.dart`).
     pub sealed: bool,

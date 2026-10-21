@@ -3604,6 +3604,30 @@ impl<'a> Engine<'a> {
                         *alias == strings.resolve(sub) && roots.contains(&strings.resolve(sup))
                     })
         };
+        // A head the index resolves to a user-declared container carries a
+        // complete written-clause model, so the name-level walk over it is
+        // exact and a miss is a real miss — an `extension type LookupName`
+        // with no `implements` reaches nothing. An SDK builtin head
+        // (`String`, `int` — no container anywhere) or an excerpt-declared
+        // one answers nothing here: its real supertypes (`String implements
+        // Comparable<String>`) are not modeled, so the gates below keep
+        // the face (the under-report direction). An owner the graph never
+        // registered (the single-file rigs) is in-file, hence user.
+        let user_container = |head: StringId| -> bool {
+            resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                head,
+            )
+            .is_some_and(|(_, owner)| {
+                self.graph
+                    .library_of_file(owner)
+                    .is_none_or(|lib| !self.graph.uri(lib).starts_with("dart:"))
+            })
+        };
         // The instantiated argument's verdict against a face parameter's
         // declared bound (`applicableTo`'s `tryChooseFinalTypes` bound
         // check): `arg <: bound`. An in-scope type parameter answers
@@ -3676,9 +3700,20 @@ impl<'a> Engine<'a> {
                     },
                 ) => {
                     // A bound carrying its own arguments (the recursive
-                    // `T extends Comparable<T>`) stays unmodeled at the
-                    // name level — the face stays applicable
-                    // (under-report).
+                    // `T extends Comparable<T>`) decides at the head level
+                    // when the bare argument head is a user container —
+                    // `extension type LookupName` never satisfies
+                    // `Comparable<T>` (the oracle's `applicableTo` fails
+                    // the inference and the face never applies), while a
+                    // user `implements Comparable<Self>` passes. A nested
+                    // argument or an unmodeled argument head keeps the
+                    // face (under-report).
+                    if arg_args == ArgListId::EMPTY && bound_args != ArgListId::EMPTY {
+                        return (!arg_nullable || bound_nullable)
+                            && (!user_container(arg_head)
+                                || arg_head == bound_head
+                                || reaches(arg_head, bound_head));
+                    }
                     if arg_args != ArgListId::EMPTY || bound_args != ArgListId::EMPTY {
                         return true;
                     }
@@ -3689,6 +3724,27 @@ impl<'a> Engine<'a> {
                 // instantiation, a record or function bound) keeps the
                 // face.
                 _ => true,
+            }
+        };
+        // A nullable `on` argument position (`on Iterable<T?>`) binds the
+        // parameter to the receiver argument's non-nullable core — the
+        // inferrer matches `Iterable<L?>` against `Iterable<T?>` as
+        // `T := L` — so the bound check reads the core, never the
+        // receiver's own `?` (`NullableIterableExtensions<T extends
+        // Object>.nonNulls` applies to every `Iterable<X?>`, the face's
+        // whole purpose).
+        let bind_through_nullable = |on_nullable: bool, receiver_arg: Ty| -> Ty {
+            match receiver_arg {
+                Ty::Named {
+                    name,
+                    nullable: true,
+                    args,
+                } if on_nullable => Ty::Named {
+                    name,
+                    nullable: false,
+                    args,
+                },
+                other => other,
             }
         };
         // The `on` clause's argument list gates beside the head
@@ -3772,10 +3828,15 @@ impl<'a> Engine<'a> {
                 // fails the inference when the instantiation violates the
                 // parameter's declared bound (`Iterable<String>` never
                 // applies `EnumByName<T extends Enum>`; an unbounded `T`
-                // receiver fails the same way, #2497). Positions whose
-                // `on` argument is concrete, parameterized, or
-                // arity-mismatched stay unmodeled (the under-report
-                // direction).
+                // receiver fails the same way, #2497). A concrete `on`
+                // argument gates the receiver's argument covariantly under
+                // the same identity projection, decidable only when the
+                // receiver argument head is a user container
+                // (`on Iterable<BaseName>` never applies to
+                // `Set<LookupName>`). Positions whose receiver argument is
+                // unmodeled, nested, or raw-defaulted, or whose `on`
+                // argument is parameterized or arity-mismatched, stay
+                // unmodeled (the under-report direction).
                 if receiver_args.len() != on_args.len() {
                     return true;
                 }
@@ -3783,8 +3844,8 @@ impl<'a> Engine<'a> {
                     |(&receiver_arg, &on_arg)| {
                         let Ty::Named {
                             name: arg_name,
+                            nullable: on_nullable,
                             args,
-                            ..
                         } = on_arg
                         else {
                             return true;
@@ -3795,7 +3856,17 @@ impl<'a> Engine<'a> {
                         let Some(param_index) =
                             face.type_param_names.iter().position(|&n| n == arg_name)
                         else {
-                            return true;
+                            let Ty::Named {
+                                name: receiver_arg_head,
+                                args: receiver_arg_args,
+                                ..
+                            } = receiver_arg
+                            else {
+                                return true;
+                            };
+                            return receiver_arg_args != ArgListId::EMPTY
+                                || !user_container(receiver_arg_head)
+                                || reaches(receiver_arg_head, arg_name);
                         };
                         let bound = face
                             .type_param_bounds
@@ -3806,7 +3877,7 @@ impl<'a> Engine<'a> {
                         if matches!(bound, Ty::Dynamic) {
                             return true;
                         }
-                        satisfies_bound(receiver_arg, bound)
+                        satisfies_bound(bind_through_nullable(on_nullable, receiver_arg), bound)
                     },
                 );
             }
@@ -3832,8 +3903,8 @@ impl<'a> Engine<'a> {
                     // there (probed, /tmp/probe2431/lib/b.dart:38).
                     if let Ty::Named {
                         name: arg_name,
+                        nullable: on_nullable,
                         args,
-                        ..
                     } = on_arg
                         && args == ArgListId::EMPTY
                         && let Some(param_index) =
@@ -3848,7 +3919,10 @@ impl<'a> Engine<'a> {
                         if matches!(bound, Ty::Dynamic) {
                             return true;
                         }
-                        return satisfies_bound(receiver_arg, bound);
+                        return satisfies_bound(
+                            bind_through_nullable(on_nullable, receiver_arg),
+                            bound,
+                        );
                     }
                     // Covariant positions: the receiver's argument must be
                     // a subtype of the `on` argument. Only a bare concrete
@@ -3889,6 +3963,91 @@ impl<'a> Engine<'a> {
                     reaches(receiver_head, arg_head)
                 })
         };
+        // The receiver-container provenance gate (#2504): the oracle's
+        // `applicableTo` runs the extended type against the receiver's
+        // RESOLVED type, so a face applies only when the receiver's
+        // declaration — or a written supertype of it, each resolved in its
+        // own declaring scope — IS the declaration the face's `on` head
+        // names. The name-level `reaches` walk cannot tell a local
+        // `class Iterable<T>` from `dart:core`'s, and its fiat collection
+        // edges (`List`/`Set` → `Iterable`, the alias table) are facts
+        // about the SDK's own containers alone — a local `List` with no
+        // written clause never reaches the SDK's `Iterable`, and a local
+        // `Iterable` shadow must not attract the SDK's `EnumByName`. The
+        // gate engages only when the face's `on` head is declared in the
+        // face's own file (the bundled SDK excerpts and every
+        // self-contained user face); a face whose `on` head imports from
+        // elsewhere keeps the ungated posture (nothing in-file to compare
+        // against). The walk accepts only a step that lands ON the `on`
+        // head's own declaration (same name, same file) — the receiver
+        // itself or a WRITTEN clause hop (`extends`/`with`/`implements`, a
+        // mixin's `on` constraints), each resolved in its owner's own
+        // scope so a shadow in the diagnosing unit never reaches a
+        // foreign declaration's clause. An unresolvable receiver head or
+        // clause hop keeps the face (the under-report direction); the
+        // walk stays bounded by its visited set with a visit cap.
+        let provenance_ok =
+            |face_file: FileId, receiver_head: StringId, on_head: StringId| -> bool {
+                if self
+                    .index
+                    .get(face_file)
+                    .and_then(|elements| elements.container(on_head))
+                    .is_none()
+                {
+                    return true;
+                }
+                let mut queue: Vec<(StringId, LibraryId, FileId)> =
+                    vec![(receiver_head, self.lib, self.file)];
+                let mut seen: Vec<(FileId, StringId)> = Vec::new();
+                let mut unresolved = false;
+                let mut visits = 0usize;
+                while let Some((name, scope_lib, scope_file)) = queue.pop() {
+                    visits += 1;
+                    if visits > 256 {
+                        return true;
+                    }
+                    let Some((decl, owner)) = resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        scope_lib,
+                        scope_file,
+                        name,
+                    )
+                    else {
+                        unresolved = true;
+                        continue;
+                    };
+                    if !seen.contains(&(owner, name)) {
+                        seen.push((owner, name));
+                    } else {
+                        continue;
+                    }
+                    if name == on_head && owner == face_file {
+                        return true;
+                    }
+                    // The clause names resolve in the owner's own library;
+                    // an owner the graph never registered as a unit (the
+                    // single-file rigs) falls back to the scope that
+                    // resolved this hop — for an in-file owner that IS its
+                    // library (the under-report direction for a foreign
+                    // one).
+                    let owner_lib = self.graph.library_of_file(owner).unwrap_or(scope_lib);
+                    for sup in decl
+                        .superclass
+                        .iter()
+                        .chain(decl.with_clause.iter())
+                        .chain(decl.implements_clause.iter())
+                        .chain(decl.on_clause.iter())
+                    {
+                        queue.push((*sup, owner_lib, owner));
+                    }
+                }
+                // The walk exhausted without landing on the on-head's own
+                // declaration: inapplicable, unless a hop it could not
+                // resolve may have hidden the path (keep the face).
+                unresolved
+            };
         // The oracle's applicability test instantiates the extended type
         // against the receiver's RESOLVED type — an `InvalidType` receiver
         // never applies an extension (`applicableTo` returns no
@@ -3916,7 +4075,10 @@ impl<'a> Engine<'a> {
                 {
                     continue;
                 }
-                if !reaches(receiver, on) || !arg_applicable(face, face_file) {
+                if !reaches(receiver, on)
+                    || !provenance_ok(face_file, receiver, on)
+                    || !arg_applicable(face, face_file)
+                {
                     continue;
                 }
                 // The full `on` type rides the candidate for the
@@ -4143,6 +4305,25 @@ impl<'a> Engine<'a> {
                 false
             })
         };
+        // The oracle's specificity order opens with provenance, not types
+        // (`extension_member_resolver.dart:470-479`): a non-SDK extension is
+        // unconditionally more specific than an SDK one, so a user-space
+        // twin silently wins over the platform's own face (package:
+        // collection's `IterableExtension` over dart:core's
+        // `IterableExtensions`) before any subtype comparison runs — the
+        // oracle never reports the pair ambiguous. A face file the graph
+        // never registered answers non-SDK (the under-report direction:
+        // the twin pair stays unordered). Only the synthetic face files
+        // carry `dart:` library URIs — real source libraries are
+        // `package:`/path URIs.
+        let sdk_origin: Vec<bool> = applicable
+            .iter()
+            .map(|&(_, _, face_file)| {
+                self.graph
+                    .library_of_file(face_file)
+                    .is_some_and(|lib| self.graph.uri(lib).starts_with("dart:"))
+            })
+            .collect();
         let mut specific: Vec<(&ExtensionFace, FileId, (String, String))> = Vec::new();
         let mut nullable: Vec<(&ExtensionFace, FileId, (String, String))> = Vec::new();
         for (index, &(face, on_ty, face_file)) in applicable.iter().enumerate() {
@@ -4151,6 +4332,11 @@ impl<'a> Engine<'a> {
                     return false;
                 }
                 let (other_face, other_on_ty, other_file) = applicable[other];
+                // Steps 1-2: the SDK-precedence order decides before the
+                // subtype steps; same-origin pairs fall through to them.
+                if sdk_origin[other] != sdk_origin[index] {
+                    return !sdk_origin[other];
+                }
                 if on_subtype(other_on_ty, on_ty) {
                     if !on_subtype(on_ty, other_on_ty) {
                         // Steps 3-4: the instantiated `on` types order.

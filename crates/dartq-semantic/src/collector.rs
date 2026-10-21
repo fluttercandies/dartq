@@ -124,6 +124,10 @@ struct OpenContainer {
     /// finished [`Container::members`] at the close).
     members: NameMapBuilder<MemberEntry>,
     type_params: u16,
+    /// The header's type-parameter spellings in declaration order (the
+    /// container-open take of the buffered group; empty when the header
+    /// parsed none — the `header_type_params` count keys the take).
+    type_param_names: Vec<StringId>,
     /// The `sealed` modifier was present on the class header.
     sealed: bool,
     /// The header's clause type names, per clause family and in written
@@ -293,16 +297,13 @@ struct Builder<'src, 'tab> {
     /// the on-type is always the last completed type of an extension
     /// header. `None` until the body-open (or no-body) event takes it.
     extension_on_ty: Option<Ty>,
-    /// The extension's own type-parameter spellings (`extension E<T> on
-    /// List<T>` keeps `[T]`): the type-var group survives the container's
-    /// count-only attach so the application face can tell an `on`-argument
-    /// that names a type parameter (instantiable) from a concrete one.
-    extension_type_param_names: Vec<StringId>,
-    /// The extension's type-parameter bounds, parallel to
-    /// [`Builder::extension_type_param_names`] (`Ty::Dynamic` for an absent
+    /// The extension's type-parameter bounds (`Ty::Dynamic` for an absent
     /// bound — the Dart reading of unbounded); taken from the type-var
     /// group's own bounds buffer at the container's open and consumed into
-    /// the [`ExtensionFace`] at the close.
+    /// the [`ExtensionFace`] at the close. The parallel spellings live on
+    /// the open container ([`OpenContainer::type_param_names`]) — every
+    /// container kind keeps them for the receiver-instantiation pairing,
+    /// the extension close hands them to the application face.
     extension_type_param_bounds: Vec<Ty>,
     /// The open field group's `abstract`/`external` modifiers (`begin_fields`
     /// latches, `end_fields` clears).
@@ -453,7 +454,6 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             extension_on_type: None,
             extension_on_type_nullable: false,
             extension_on_ty: None,
-            extension_type_param_names: Vec::new(),
             extension_type_param_bounds: Vec::new(),
             field_abstract: false,
             field_external: false,
@@ -878,21 +878,23 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.extension_on_type = None;
         self.extension_on_type_nullable = false;
         self.extension_on_ty = None;
-        // An extension's own type-parameter spellings feed its application
-        // face (an `on`-argument naming one instantiates against the
-        // receiver rather than comparing concretely). The header's type
-        // variables closed before this open (official event order), so the
-        // still-buffered `type_var_group` is the extension's list — but
-        // only when the header actually parsed one: `header_type_params`
-        // carries a count only from a real group, which also keys the take
-        // (a parameterless `extension E` after `class C<T>` must not
-        // inherit C's still-buffered names).
-        self.extension_type_param_names =
-            if kind == ContainerKind::Extension && header_type_params > 0 {
-                std::mem::take(&mut self.type_var_group)
-            } else {
-                Vec::new()
-            };
+        // The header's type-variable spellings — every container kind's
+        // receiver-instantiation pairing reads them in declaration order
+        // (a member face's container parameters substitute against the
+        // receiver's written arguments zipped onto THIS list), and an
+        // extension's application face additionally treats an `on`
+        // argument naming one as instantiable against the receiver. The
+        // header's type variables closed before this open (official event
+        // order), so the still-buffered `type_var_group` is the
+        // container's list — but only when the header actually parsed one:
+        // `header_type_params` carries a count only from a real group,
+        // which also keys the take (a parameterless `extension E` after
+        // `class C<T>` must not inherit C's still-buffered names).
+        let type_param_names = if header_type_params > 0 {
+            std::mem::take(&mut self.type_var_group)
+        } else {
+            Vec::new()
+        };
         // The bounds ride the same window (their buffer mutated in lockstep
         // with the names); an absent bound stays at its `Dynamic`
         // placeholder.
@@ -913,6 +915,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             is_mixin_class: false,
             members: NameMapBuilder::default(),
             type_params: header_type_params,
+            type_param_names,
             sealed: false,
             with_clause: Vec::new(),
             implements_clause: Vec::new(),
@@ -948,14 +951,13 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.field_annotations.clear();
         let extension_on_type = self.extension_on_type.take();
         let extension_on_ty = self.extension_on_ty.take().unwrap_or(Ty::Unknown);
-        let extension_type_param_names =
-            std::mem::take(&mut self.extension_type_param_names).into_boxed_slice();
         let extension_type_param_bounds =
             std::mem::take(&mut self.extension_type_param_bounds).into_boxed_slice();
-        let Some(open) = self.containers.pop() else {
+        let Some(mut open) = self.containers.pop() else {
             return;
         };
         let members = open.members;
+        let type_param_names = std::mem::take(&mut open.type_param_names).into_boxed_slice();
         if open.kind == ContainerKind::Extension && open.name.is_none() {
             // An unnamed extension has no container entry: its application
             // face owns the members outright. An on-type that never produced
@@ -967,7 +969,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 on_type: extension_on_type,
                 on_type_nullable: self.extension_on_type_nullable,
                 on_ty: extension_on_ty,
-                type_param_names: extension_type_param_names,
+                type_param_names: type_param_names,
                 type_param_bounds: extension_type_param_bounds,
                 members: members.finish(),
             });
@@ -975,13 +977,15 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         }
         if open.kind == ContainerKind::Extension {
             // A named extension is both an application face and a
-            // named container; the two hold the same member set.
+            // named container; the two hold the same member set (and the
+            // same type-parameter spellings — the container's own pairing
+            // keeps its boxed copy).
             self.extension_faces.push(ExtensionFace {
                 name: open.name.map(|(name, _)| name),
                 on_type: extension_on_type,
                 on_type_nullable: self.extension_on_type_nullable,
                 on_ty: extension_on_ty,
-                type_param_names: extension_type_param_names,
+                type_param_names: type_param_names.clone(),
                 type_param_bounds: extension_type_param_bounds,
                 members: members.clone().finish(),
             });
@@ -1004,6 +1008,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 superclass: open.superclass,
                 members: members.finish(),
                 type_params: open.type_params,
+                type_param_names,
                 sealed: open.sealed,
                 // The clause columns seal at exact length here — the
                 // push-grown staging Vecs shed their growth slack by

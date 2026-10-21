@@ -128,6 +128,15 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// initializer without that train's `type_param_names` field, so the
 /// lib-test module — both shape pins with it — had been uncompilable and
 /// the structural guard unrunnable ever since.
+/// v16: containers carry their type-parameter spellings
+/// (`PersistedContainer::type_param_names`, #2502's additive column in
+/// declaration order). The `serde(default)` decode IS the safe direction
+/// here, unlike v15's bounds: a pre-column payload restores spellings-empty
+/// and the consumer's receiver-instantiation pairing falls back to its
+/// legacy name-forced rule (an under-report posture, never an over-report
+/// face). The same train raised `dartq_semantic::SIGNATURE_VERSION` to 10
+/// (the spellings hash into the element face, so a respelling-only edit
+/// flips the L2 gate).
 ///
 /// # Bump contract (structural guard)
 ///
@@ -146,7 +155,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// version too.) The bump lane also forks on capture-behavior changes with
 /// no layout delta: a payload the old producer wrote must not be served to
 /// a producer whose capture output diverges from it.
-const FACTS_SHAPE_VERSION: u32 = 15;
+const FACTS_SHAPE_VERSION: u32 = 16;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component of
 /// `EngineSemanticVersion`): the engine facts shape folded with

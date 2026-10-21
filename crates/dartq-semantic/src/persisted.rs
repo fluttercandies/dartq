@@ -218,6 +218,12 @@ pub struct PersistedContainer {
     pub superclass: Option<u32>,
     pub members: Vec<(u32, PersistedMemberEntry)>,
     pub type_params: u16,
+    /// The container's type-parameter spellings in declaration order.
+    /// Additive after the format shipped: `default` so payloads persisted
+    /// before the field existed decode with no spellings (the consumer's
+    /// exact-pairing face falls back to its legacy name-forced rule).
+    #[serde(default)]
+    pub type_param_names: Vec<u32>,
     pub sealed: bool,
     pub with_clause: Vec<u32>,
     pub implements_clause: Vec<u32>,
@@ -770,6 +776,7 @@ impl PersistedContainer {
                 .map(|(name, entry)| (s.id(*name), s.member(entry)))
                 .collect(),
             type_params: container.type_params,
+            type_param_names: s.ids(&container.type_param_names),
             sealed: container.sealed,
             with_clause: s.ids(&container.with_clause),
             implements_clause: s.ids(&container.implements_clause),
@@ -822,6 +829,11 @@ impl PersistedContainer {
                 .map(|(at, entry)| (ids[at as usize], entry.into_member_entry(ids, pool)))
                 .collect(),
             type_params: self.type_params,
+            type_param_names: self
+                .type_param_names
+                .iter()
+                .map(|&at| ids[at as usize])
+                .collect(),
             sealed: self.sealed,
             with_clause: self
                 .with_clause
@@ -1096,6 +1108,7 @@ mod tests {
                     .map(|n| (n, member(strings.resolve(n))))
                     .collect(),
                 type_params: 2,
+                type_param_names: Box::new([name("K"), name("V")]),
                 sealed: true,
                 with_clause: Box::new([]),
                 implements_clause: Box::new([name("I")]),
@@ -1265,6 +1278,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 type_params: 0,
+                type_param_names: Box::new([]),
                 sealed: false,
                 with_clause: Box::new([]),
                 implements_clause: Box::new([]),

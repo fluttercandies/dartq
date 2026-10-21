@@ -83,8 +83,12 @@ use crate::model::{
 /// closes the #2431 gap: that train added the bounds columns to the model
 /// and the persisted payload without moving this version, so a snapshot
 /// captured with bounds-empty faces carried a signature indistinguishable
-/// from the bounds-full truth.
-pub const SIGNATURE_VERSION: u32 = 9;
+/// from the bounds-full truth. v10: the container's type-parameter
+/// spellings in declaration order (#2502) — a parameter-respelling-only
+/// edit changes every dependent's cross-file receiver-instantiation
+/// pairing (the member faces substitute by the declared name order), so
+/// it must flip the L2 gate.
+pub const SIGNATURE_VERSION: u32 = 10;
 
 /// The 128-bit blake3 digest of a file's canonical element face — the same
 /// width family as [`dartq_source::ContentId`].
@@ -498,6 +502,7 @@ impl<'a> Face<'a> {
             superclass,
             members,
             type_params,
+            type_param_names,
             sealed,
             with_clause,
             implements_clause,
@@ -521,6 +526,13 @@ impl<'a> Face<'a> {
             ContainerKind::ExtensionType => "extensionType",
         });
         self.uint(u64::from(*type_params));
+        // The parameter spellings in declaration order: the cross-file
+        // receiver-instantiation pairing reads them, so a respelled
+        // parameter list is an L2-relevant edit even at a stable count.
+        self.usize(type_param_names.len());
+        for param in type_param_names {
+            self.name(*param);
+        }
         self.field(if *is_abstract { "abstract" } else { "concrete" });
         self.field(if *sealed { "sealed" } else { "unsealed" });
         // The declared class-modifier facts: a modifier-only edit moves

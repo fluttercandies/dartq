@@ -192,6 +192,27 @@ final class MapEntry<K, V> {
   external final K key;
   external final V value;
 }
+// Upstream Dart SDK source, sdk/lib/collection/iterable.dart:22-104 — the
+// `firstOrNull` family, re-exported by dart:core (core.dart:182 `export
+// "dart:collection" show NullableIterableExtensions, IterableExtensions`),
+// so the implicit dart:core import carries both faces to every file. They
+// join under the `core` excerpt alone: a `dart:collection` importer reaches
+// them through its own implicit core edge, and a second copy under the
+// `collection` face file would double the pool's same-named faces (the
+// ambiguity face the library-disjointness contract pins). Bodies spell
+// `external` (the name-level model is identical and no body is captured
+// either way). The extensions' `on` heads resolve against the excerpt's
+// own `Iterable` stub above.
+extension NullableIterableExtensions<T extends Object> on Iterable<T?> {
+  external Iterable<T> get nonNulls;
+}
+extension IterableExtensions<T> on Iterable<T> {
+  external Iterable<(int, T)> get indexed;
+  external T? get firstOrNull;
+  external T? get lastOrNull;
+  external T? get singleOrNull;
+  external T? elementAtOrNull(int index);
+}
 // sdk/lib/collection/hash_map.dart, linked_hash_map.dart, splay_tree.dart,
 // hash_set.dart, queue.dart, collections.dart — the `dart:collection`
 // containers the corpus receivers name. Each declares only the `implements`

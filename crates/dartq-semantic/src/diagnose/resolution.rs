@@ -1295,13 +1295,14 @@ impl<'a> Engine<'a> {
             }
             names.into_iter().zip(written).collect()
         } else {
-            // A foreign container's parameters spell nowhere in this unit —
-            // the name-forced rule binds when the member's own signature
-            // spells exactly the declaring parameter set, in declaration
-            // order (`Map<K,V>`'s `forEach(action(K,V))` spells `K`/`V`
-            // once each; `Iterable<E>`'s `fold` spells `E` in `combine`).
-            // A count mismatch — the member never names every parameter —
-            // keeps the under-report (the written arguments cannot pair).
+            // A foreign container's parameters spell nowhere in this unit.
+            // The owner's element model carries the spellings in
+            // declaration order (`Container::type_param_names`, #2502) —
+            // freshly collected SDK faces and current persisted payloads
+            // zip the receiver's written arguments onto them directly, the
+            // exact pairing the oracle's receiver-type instantiation reads
+            // (`V putIfAbsent(K key, ...)` substitutes by the declaration
+            // `[K, V]`, never by the order the signature spells them).
             let (found, owner) = resolve_container(
                 self.graph,
                 self.namespaces,
@@ -1310,21 +1311,36 @@ impl<'a> Engine<'a> {
                 self.file,
                 container,
             )?;
-            let mut free: Vec<StringId> = Vec::new();
-            let mut collect = |ty: Ty| {
-                self.member_free_params(ty, entry, owner, &mut free);
-            };
-            collect(entry.var_ty);
-            collect(entry.return_ty);
-            if let Some(formals) = entry.formals.as_deref() {
-                for formal in formals.positional.iter().chain(formals.named.iter()) {
-                    collect(formal.ty);
+            if !found.type_param_names.is_empty() {
+                if found.type_param_names.len() != written.len() {
+                    return None;
                 }
+                found.type_param_names.iter().copied().zip(written).collect()
+            } else {
+                // A pre-field persisted payload spells none — the legacy
+                // name-forced rule binds when the member's own signature
+                // spells exactly the declaring parameter set, in first-seen
+                // order (`Map<K,V>`'s `forEach(action(K,V))` spells `K`/`V`
+                // once each; `Iterable<E>`'s `fold` spells `E` in
+                // `combine`). A count mismatch — the member never names
+                // every parameter — keeps the under-report (the written
+                // arguments cannot pair).
+                let mut free: Vec<StringId> = Vec::new();
+                let mut collect = |ty: Ty| {
+                    self.member_free_params(ty, entry, owner, &mut free);
+                };
+                collect(entry.var_ty);
+                collect(entry.return_ty);
+                if let Some(formals) = entry.formals.as_deref() {
+                    for formal in formals.positional.iter().chain(formals.named.iter()) {
+                        collect(formal.ty);
+                    }
+                }
+                if usize::from(found.type_params) != free.len() || free.len() != written.len() {
+                    return None;
+                }
+                free.into_iter().zip(written).collect()
             }
-            if usize::from(found.type_params) != free.len() || free.len() != written.len() {
-                return None;
-            }
-            free.into_iter().zip(written).collect()
         };
         map.retain(|(param, _)| !entry.type_param_names.contains(param));
         (!map.is_empty()).then_some(map)
