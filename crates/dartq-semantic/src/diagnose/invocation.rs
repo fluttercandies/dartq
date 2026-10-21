@@ -424,6 +424,13 @@ impl<'a> Engine<'a> {
                 // the latched cascade target (type_analyzer.dart:611-618).
                 if matches!(popped_shape, RowShape::Bare(BareInfo::Plain { .. }))
                     && !self.in_cascade
+                    // The invoked callee's span describes the callee VALUE's
+                    // declared type in the flow table, never the send result
+                    // — a promotion re-decision there would un-type the
+                    // implicit-`call` chain back to the callee's own class
+                    // (`body(ctx).m` re-read from `body`'s field type,
+                    // census A4).
+                    && popped.intent != Intent::Invoke
                 {
                     let member_offset = member.range.offset;
                     if let Err(index) = self
@@ -525,68 +532,90 @@ impl<'a> Engine<'a> {
                     // `Typed` receiver when it names the same container —
                     // `command!.subcommands` resolves on `C`, not `C?`
                     // (#2161).
-                    RowShape::Bare(info) => match Engine::receiver_of_bare(*info) {
-                        Receiver::Typed { type_name, .. }
-                            if matches!(
-                                receiver_ty,
-                                Ty::Named { name, .. } if name == type_name
-                            ) =>
-                        {
-                            Receiver::Typed {
-                                type_name,
-                                ty: receiver_ty,
-                            }
-                        }
-                        // An information-less bare head whose spelling
-                        // resolves to an SDK declaration is a class-static
-                        // face on an unindexed (SDK synthetic) container
-                        // (`RangeError.checkValidRange(...)`): arm the
-                        // container so the member's send types against the
-                        // declared static table instead of the Unknown
-                        // dispatch — whose positional recovery cannot serve
-                        // the merged row (the receiver row is folded away
-                        // here, and the send tiles the merged row's range
-                        // past it). SDK-only: a user-declared spelling
-                        // (a top-level function head, a same-spelled class)
-                        // keeps the Unknown dispatch whose resolve arm the
-                        // cascade/unused-result faces consult, and a local
-                        // read never arms (the local shadows any
-                        // same-spelled declaration). An unresolved spelling
-                        // keeps Unknown too — its own miss row already
-                        // reports.
-                        Receiver::Unknown
-                            if !was_local
-                                && matches!(
-                                    self.namespaces.lookup(self.graph, self.lib, popped.name),
-                                    Lookup::Found(NamespaceEntry::Decl(owner))
-                                    if self.graph.library_of_file(owner).is_some_and(
-                                        |lib| self.graph.uri(lib).starts_with("dart:"),
-                                    )
+                    //
+                    // The invoked callee (`body(ctx).m`) is the completed
+                    // send's anchor, so its receiver face is the SEND's
+                    // static type — `receiver_static_ty`'s row.ty-first
+                    // answer, where the implicit-`call` retype wrote the
+                    // call method's return — never the bare payload, which
+                    // spells the callee VALUE's own class and would resolve
+                    // `.m` there (census A4). A result-less send keeps the
+                    // value-face dispatch.
+                    RowShape::Bare(info) if popped.intent != Intent::Invoke => {
+                        match Engine::receiver_of_bare(*info) {
+                            Receiver::Typed { type_name, .. }
+                                if matches!(
+                                    receiver_ty,
+                                    Ty::Named { name, .. } if name == type_name
                                 ) =>
-                        {
-                            Receiver::Container {
-                                name: popped.name,
-                                kind: ContainerKind::Class,
+                            {
+                                Receiver::Typed {
+                                    type_name,
+                                    ty: receiver_ty,
+                                }
                             }
-                        }
-                        // The accessor-read fall-through (`sub.key`): a bare
-                        // getter/field read carries no push-time type
-                        // (`member_declared_ty` answers fields only), but
-                        // the read's static type IS the accessor's declared
-                        // return — `receiver_static_ty`'s accessor face
-                        // answers it above, and an information-less head
-                        // whose read type names a container resolves the
-                        // member on that container exactly like the chained
-                        // face below (`_androidParams.key`, webview
-                        // android_webview_controller.dart:1131). Every
-                        // other answer keeps the prior dispatch.
-                        other => match (other, &receiver_ty) {
-                            (Receiver::Unknown, Ty::Named { name, .. }) => Receiver::Typed {
-                                type_name: *name,
-                                ty: receiver_ty,
+                            // An information-less bare head whose spelling
+                            // resolves to an SDK declaration is a class-static
+                            // face on an unindexed (SDK synthetic) container
+                            // (`RangeError.checkValidRange(...)`): arm the
+                            // container so the member's send types against the
+                            // declared static table instead of the Unknown
+                            // dispatch — whose positional recovery cannot serve
+                            // the merged row (the receiver row is folded away
+                            // here, and the send tiles the merged row's range
+                            // past it). SDK-only: a user-declared spelling
+                            // (a top-level function head, a same-spelled class)
+                            // keeps the Unknown dispatch whose resolve arm the
+                            // cascade/unused-result faces consult, and a local
+                            // read never arms (the local shadows any
+                            // same-spelled declaration). An unresolved spelling
+                            // keeps Unknown too — its own miss row already
+                            // reports.
+                            Receiver::Unknown
+                                if !was_local
+                                    && matches!(
+                                        self.namespaces.lookup(self.graph, self.lib, popped.name),
+                                        Lookup::Found(NamespaceEntry::Decl(owner))
+                                        if self.graph.library_of_file(owner).is_some_and(
+                                            |lib| self.graph.uri(lib).starts_with("dart:"),
+                                        )
+                                    ) =>
+                            {
+                                Receiver::Container {
+                                    name: popped.name,
+                                    kind: ContainerKind::Class,
+                                }
+                            }
+                            // The accessor-read fall-through (`sub.key`): a bare
+                            // getter/field read carries no push-time type
+                            // (`member_declared_ty` answers fields only), but
+                            // the read's static type IS the accessor's declared
+                            // return — `receiver_static_ty`'s accessor face
+                            // answers it above, and an information-less head
+                            // whose read type names a container resolves the
+                            // member on that container exactly like the chained
+                            // face below (`_androidParams.key`, webview
+                            // android_webview_controller.dart:1131). Every
+                            // other answer keeps the prior dispatch.
+                            other => match (other, &receiver_ty) {
+                                (Receiver::Unknown, Ty::Named { name, .. }) => Receiver::Typed {
+                                    type_name: *name,
+                                    ty: receiver_ty,
+                                },
+                                _ => other,
                             },
-                            _ => other,
+                        }
+                    }
+                    // The invoked bare callee's chain face: the send result
+                    // types the next receiver (`body(ctx).m` resolves `.m`
+                    // on `Expr.call`'s return, census A4) — a non-named
+                    // verdict keeps the Unknown dispatch.
+                    RowShape::Bare(_) => match receiver_ty {
+                        Ty::Named { name, .. } => Receiver::Typed {
+                            type_name: name,
+                            ty: receiver_ty,
                         },
+                        _ => Receiver::Unknown,
                     },
                     RowShape::Receiver(recv) => *recv,
                     // The resolved-prefix container member (`io.Directory
@@ -813,8 +842,7 @@ impl<'a> Engine<'a> {
                 // field getter's type is the shape's own field type (records
                 // carry no interface members besides `Object`'s, which stay
                 // `Unknown`); a `?.` read joins the null-aware `?`.
-                _ => match self.record_field_ty(merged_receiver_ty, member.name, is_null_aware)
-                {
+                _ => match self.record_field_ty(merged_receiver_ty, member.name, is_null_aware) {
                     Some(field) if is_null_aware => Self::nullable_form(field),
                     Some(field) => field,
                     None => Ty::UNKNOWN,
@@ -1755,10 +1783,26 @@ impl<'a> Engine<'a> {
             });
         let type_argumented =
             top.is_some_and(|i| self.deferred_args.iter().any(|(row, _, _)| *row == i));
+        let bang_at = |offset: u32| self.source.as_bytes().get(self.byte_of(offset)) == Some(&b'!');
         let abuts = top.is_some_and(|i| {
-            self.rows
-                .get(i)
-                .is_some_and(|row| self.trivia_between(row.range.end(), open_offset))
+            self.rows.get(i).is_some_and(|row| {
+                let end = row.range.end();
+                if self.trivia_between(end, open_offset) {
+                    return true;
+                }
+                // A postfix `!` between the callee and the group keeps the
+                // head: the null-assert belongs to the invoked expression
+                // (`key!(ctx)` — the oracle's FunctionExpressionInvocation
+                // over the `!` rewrite), so the adjacency read spans one
+                // `!` (multi-bang sends keep the under-report posture)
+                // still surrounded by trivia on both sides.
+                end < open_offset
+                    && (end..open_offset).any(|bang| {
+                        bang_at(bang)
+                            && self.trivia_between(end, bang)
+                            && self.trivia_between(bang + 1, open_offset)
+                    })
+            })
         });
         let callee = if self.ctor_pos > 0 {
             // The creation head's callee row must abut the `(`. A member
@@ -4300,7 +4344,16 @@ impl<'a> Engine<'a> {
         let mut implicit_call: Option<(Ty, Box<[StringId]>)> = None;
         let formals = formals.or_else(|| {
             let row = self.rows.get(callee)?;
-            let (formals, ret, params) = self.implicit_call_face(row.ty)?;
+            // The callee VALUE's static type: `receiver_static_ty` composes
+            // the row's postfix-upgraded face (`key!`'s rewrite) and the
+            // bare read's push-time payload (`Plain{ty}` — a field/local's
+            // declared type; `row.ty` alone is the information-less face a
+            // push leaves, which silenced the whole bare spelling). The
+            // getter's declared return answers through the accessor face
+            // and a top-level *function* keeps the gated tear-off unknown —
+            // the same answers the merge-time member face reads.
+            let ty = self.receiver_static_ty(row);
+            let (formals, ret, params) = self.implicit_call_face(ty)?;
             implicit_call = Some((ret, params));
             Some(formals)
         });

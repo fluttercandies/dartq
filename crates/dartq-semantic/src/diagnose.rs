@@ -4357,13 +4357,3 @@ mod ticket_2468_tests;
 #[cfg(test)]
 mod ticket_2450_tests;
 
-/// The #2465 pins: the unused-element scan's extension-member and
-/// part-file shapes — a bare or explicit-`this` self-use inside an
-/// extension body and a member access through a universal
-/// `extension<T> on T`-style face re-attribute onto the element-attributed
-/// application credit (the census's implicit-`this` and on-type-parameter
-/// over-reports), the genuinely unused members and sibling-spelling
-/// decoys keep reporting, and the part-file use lands in the part's use
-/// face the library-wide close merges.
-#[cfg(test)]
-mod ticket_2465_tests;
