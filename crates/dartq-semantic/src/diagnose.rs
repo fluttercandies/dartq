@@ -3908,4 +3908,22 @@ mod ticket_2448_tests;
 #[cfg(test)]
 mod ticket_2451_tests;
 
+/// The #2460 pins: the flow-promotion batch A2 — the two faces already
+/// oracle-exact (a `!` narrows the member receiver, a written non-nullable
+/// field reads non-null) ride active, and the four divergent faces
+/// (generator-yield staging, the `e!` assignment stager, the
+/// `staged_write_tys` inference-feed leak, the assert-message
+/// negated-condition state) ride `#[ignore]`d with their semantic fix
+/// sites named — the flow-side promotion facts are pinned green in
+/// `dartq-flow`'s own `ticket_2460_tests`.
+#[cfg(test)]
 mod ticket_2460_tests;
+
+/// The #2468 pins: the constant-pattern machinery arms for class static
+/// consts — `case A.a:` types the constant from the member's captured
+/// value and reports the never-match row the enum-only tail
+/// classification swallowed, a matching scrutinee stays silent, the enum
+/// form keeps its row, and the `const`-prefixed spelling anchors at the
+/// keyword the ConstantPattern node starts at.
+#[cfg(test)]
+mod ticket_2468_tests;

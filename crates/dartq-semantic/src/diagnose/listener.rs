@@ -4576,10 +4576,12 @@ impl ParserListener for DiagnoseListener<'_> {
         // The literal-armed type and anchor, else the enum-tail
         // classification's (its constant's type is its enum;
         // `visitConstantPattern`'s `_canBeEqual` inputs,
-        // constant_verifier.dart:140-165).
+        // constant_verifier.dart:140-165), else the class-static-const
+        // tail's folded value type (#2468 — the same faces, the class
+        // container answers from the member's captured constant value).
         let constant = engine.const_fold.take_ty().or_else(|| match leaf {
             Restriction::EnumValue(enum_name, _) => Some(Ty::named(enum_name)),
-            _ => None,
+            _ => engine.class_static_const_tail_ty(),
         });
         // The capture closes first so the never-match anchor is the FULL
         // constant node: upstream anchors `constantPatternNeverMatchesValueType`
@@ -4592,11 +4594,23 @@ impl ParserListener for DiagnoseListener<'_> {
         // literal forms keep their old anchors; the recovery fallbacks
         // below hold the pre-capture chain for windows that never opened.
         let capture = engine.const_capture.close_constant_pattern();
-        let at = capture
+        let mut at = capture
             .as_ref()
             .map(|node| node.span)
             .or_else(|| engine.const_fold.take_at())
             .or_else(|| engine.rows.last().map(|row| row.range));
+        // The `const`-prefixed spelling anchors at the keyword: the
+        // ConstantPattern node spans `const` through the expression
+        // (upstream Dart SDK source, pkg/analyzer/lib/src/dart/constant/
+        // constant_verifier.dart, visitConstantPattern's `.at(node)` —
+        // `case const A.a:` reports at the keyword column), while the
+        // capture root only spans the parsed expression after it.
+        if let (Some(kw), Some(span)) = (const_keyword, at.as_mut())
+            && kw.range.offset < span.offset
+        {
+            span.length += span.offset - kw.range.offset;
+            span.offset = kw.range.offset;
+        }
         engine.check_constant_pattern(constant, at);
         // `visitConstantPattern`'s `_evaluateAndReportError`: the
         // expression's own verdict — a fault overrides the site default,

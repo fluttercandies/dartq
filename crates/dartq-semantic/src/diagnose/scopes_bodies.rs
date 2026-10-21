@@ -758,6 +758,48 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The class-static-constant tail's own type: `case A.a:` over a class
+    /// container names a static const member, and the constant's static
+    /// type is the folded value's (upstream `visitConstantPattern`
+    /// evaluates the reference and reads `value.type` — upstream Dart SDK
+    /// source, pkg/analyzer/lib/src/dart/constant/constant_verifier.dart).
+    /// Answered only for in-file statics whose value already folded to a
+    /// shape the oracle's `hasPrimitiveEquality` accepts unconditionally —
+    /// the primitive literals and enum values, the arming set the literal
+    /// and enum-tail faces already own: a user-class value's primitive
+    /// equality hinges on `==`/`hashCode` overrides the name level cannot
+    /// survey faithfully (an inherited SDK override such as `Duration`'s
+    /// stays silent upstream), so the `Created` and collection shapes keep
+    /// the documented under-report. Static non-consts (`static final`)
+    /// carry no folded value and stay silent — the oracle's
+    /// `constant_pattern_with_non_constant_expression` there is the eval
+    /// face's row, not this one.
+    pub(crate) fn class_static_const_tail_ty(&self) -> Option<Ty> {
+        // The member push replaces the qualifier row, so `A` survives only
+        // as the member row's container receiver (the same shape
+        // [`Self::classify_constant_tail`] reads for the enum tail).
+        let last = self.rows.last()?;
+        let RowShape::Member {
+            recv:
+                Receiver::Container {
+                    name,
+                    kind: ContainerKind::Class,
+                },
+        } = &last.shape
+        else {
+            return None;
+        };
+        let value = self.const_field_values.get(&(*name, last.name))?;
+        // `Created` folds to the container's own type like an enum value
+        // does, but its primitive equality is undecidable here — excluded
+        // before the fold.
+        if matches!(value, ConstantValue::Created(_)) {
+            return None;
+        }
+        let ty = self.folded_ty(value);
+        (ty != Ty::UNKNOWN).then_some(ty)
+    }
+
     /// A pattern variable declared outside every frame (the top-level
     /// variable-initializer world) still binds for the enclosing clause's
     /// reads: the guard and case body of a switch/if-case expression in
