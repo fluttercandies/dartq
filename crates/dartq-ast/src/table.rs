@@ -1,10 +1,10 @@
 //! The immutable arena: one flat `Vec` of 24-byte node headers plus the
-//! shared `u32` payload pool.
+//! shared `u32` payload pool and one `u32` parent-pointer column.
 //!
-//! Parents are not stored: the parent of node `i` is the first `j > i` whose
-//! child range covers `i` — a forward walk that is short in practice because
-//! post-order completion puts a node's parent right after its subtree
-//!.
+//! The parent of node `i` is the first `j > i` whose child range covers `i`
+//! — "first coverer in arena order". That answer is backfilled into the
+//! parent column in one pass at freeze ([`SyntaxTable::from_parts`]), so
+//! [`SyntaxTable::parent`] is an indexed read.
 
 #![allow(clippy::cast_possible_truncation)] // ids are u32 by design
 
@@ -14,6 +14,10 @@ use crate::kind::{NodeKind, flags, payload_len};
 
 /// Pool index sentinel: the node has no payload words.
 pub(crate) const DATA_NONE: u32 = u32::MAX;
+
+/// Parent-column sentinel: the row is a root (no later row's child window
+/// covers it).
+pub(crate) const PARENT_NONE: u32 = u32::MAX;
 
 /// One arena row: 24 bytes, align 4, `repr(C)` with all fields at most 4-byte
 /// aligned, so there is no padding.
@@ -43,17 +47,26 @@ pub(crate) struct NodeHeader {
 pub struct SyntaxTable {
     nodes: Vec<NodeHeader>,
     pool: Vec<u32>,
+    /// Per-row parent ([`Self::parent`]), backfilled once at freeze. One
+    /// `u32` per row; `PARENT_NONE` for the root.
+    parents: Vec<u32>,
 }
 
 impl SyntaxTable {
     /// Assembles a table from its parts, compacting both vectors — the
     /// table is frozen from here on, so the len-based
     /// [`Self::memory_footprint`] reports the exact allocation. Only the
-    /// builder calls this.
+    /// builder calls this. The parent column is derived here in one pass
+    /// ([`build_parents`]).
     pub(crate) fn from_parts(mut nodes: Vec<NodeHeader>, mut pool: Vec<u32>) -> Self {
         nodes.shrink_to_fit();
         pool.shrink_to_fit();
-        Self { nodes, pool }
+        let parents = build_parents(&nodes);
+        Self {
+            nodes,
+            pool,
+            parents,
+        }
     }
 
     /// Number of nodes.
@@ -126,21 +139,20 @@ impl SyntaxTable {
         h.first_child..h.end_child
     }
 
-    /// The parent of `i`: the first node completed after `i` whose child
-    /// window covers `i` (window and adoption conventions:
-    /// [`Self::children`]). "First coverer in arena order" is what makes an
-    /// adopted row resolve to the node that semantically owns it — the
-    /// borrower's window starts later than the rows it adopts but is the
-    /// first range laid over them. `None` for the root. Worst-case cost is
-    /// a forward walk to the root's end, but the parent is typically the
-    /// next node completed after `i`'s subtree.
+    /// The parent of `i`: the node semantically owning `i`'s row — the first
+    /// node completed after `i` whose child window covers `i` (window and
+    /// adoption conventions: [`Self::children`]). "First coverer in arena
+    /// order" is what makes an adopted row resolve to the node that
+    /// semantically owns it — the borrower's window starts later than the
+    /// rows it adopts but is the first range laid over them. `None` for the
+    /// root.
+    ///
+    /// O(1): the answer is the parent column backfilled at freeze
+    /// ([`build_parents`]), not a walk.
     #[must_use]
     pub fn parent(&self, id: u32) -> Option<u32> {
-        let i = id as usize;
-        self.nodes[i + 1..]
-            .iter()
-            .position(|h| h.first_child <= id && id < h.end_child)
-            .map(|off| (i + 1 + off) as u32)
+        let parent = self.parents[id as usize];
+        (parent != PARENT_NONE).then_some(parent)
     }
 
     /// The node's shared-pool payload words (empty for span-only and
@@ -160,12 +172,54 @@ impl SyntaxTable {
         &self.pool[start..start + payload_len(h.kind) as usize]
     }
 
-    /// Bytes held by the arena itself: headers plus pool words. The engine's
-    /// AST-cache accounting uses this (the density targets are
-    /// asserted against it). Both vectors are `shrink_to_fit` at freeze
-    /// (`Self::from_parts`), so len-based accounting is exact.
+    /// Bytes held by the arena itself: headers, pool words, and the parent
+    /// column. The engine's AST-cache accounting uses this (the density
+    /// targets are asserted against it). All vectors are `shrink_to_fit` at
+    /// freeze (`Self::from_parts`), so len-based accounting is exact.
     #[must_use]
     pub fn memory_footprint(&self) -> usize {
-        self.nodes.len() * size_of::<NodeHeader>() + self.pool.len() * size_of::<u32>()
+        self.nodes.len() * size_of::<NodeHeader>()
+            + self.pool.len() * size_of::<u32>()
+            + self.parents.len() * size_of::<u32>()
     }
+}
+
+/// The parent column, backfilled in one pass at freeze: for each row the
+/// first later row whose child window covers it — [`SyntaxTable::parent`]'s
+/// definition, mirrored exactly. Windows are scanned in row (completion)
+/// order and a row is claimed by the first window covering it, which is the
+/// same "first coverer in arena order" the per-row forward scan answered.
+///
+/// A skip-pointer array (path-halving find) jumps the already-claimed rows,
+/// so the pass costs one visit per window plus O(α(n)) per claimed row —
+/// each row is written exactly once, O(n α(n)) overall, no per-row scans.
+fn build_parents(nodes: &[NodeHeader]) -> Vec<u32> {
+    let len = nodes.len() as u32;
+    let mut parents = vec![PARENT_NONE; nodes.len()];
+    // next_free[r]: the first unclaimed row >= r (`len` = none left).
+    let mut next_free: Vec<u32> = (0..=len).collect();
+    for (row, header) in nodes.iter().enumerate() {
+        // The `.min(len)` guards a window tail past the arena (hand-built
+        // tables); rows past the tail do not exist, and the definition's
+        // scan could not answer them either.
+        let window_end = header.end_child.min(len);
+        let mut candidate = find_free(&mut next_free, header.first_child.min(window_end));
+        while candidate < window_end {
+            parents[candidate as usize] = row as u32;
+            next_free[candidate as usize] = candidate + 1;
+            candidate = find_free(&mut next_free, candidate + 1);
+        }
+    }
+    parents
+}
+
+/// Path-halving find over the skip pointers: the first unclaimed row `>=
+/// start`.
+fn find_free(next_free: &mut [u32], mut start: u32) -> u32 {
+    while next_free[start as usize] != start {
+        let jump = next_free[start as usize];
+        next_free[start as usize] = next_free[jump as usize];
+        start = next_free[start as usize];
+    }
+    start
 }

@@ -1019,8 +1019,8 @@ fn rollback_truncates_nodes_pool_and_error_bits() {
     assert!(ast.payload(2).is_empty(), "block is span-only");
     assert_eq!(
         ast.memory_footprint(),
-        4 * 24,
-        "arena and pool fully truncated to the committed prefix (token leaves store no pool word)"
+        4 * (24 + 4),
+        "arena and pool fully truncated to the committed prefix (token leaves store no pool word; the parent column is one u32 per surviving row)"
     );
 }
 
@@ -1134,8 +1134,8 @@ fn unmaterialized_narrow_seal_allocates_no_pool_words() {
     assert!(ast.payload(1).is_empty(), "narrow seal to the width-0 end");
     assert_eq!(
         ast.memory_footprint(),
-        ast.len() * 24,
-        "headers only: no pool word was ever allocated for the slot"
+        ast.len() * (24 + 4),
+        "headers plus the parent column: no pool word was ever allocated for the slot"
     );
 }
 
@@ -1158,8 +1158,8 @@ fn top_level_fields_seal_allocates_no_pool_words() {
     assert!(ast.payload(1).is_empty(), "width-0 seal, no dead word");
     assert_eq!(
         ast.memory_footprint(),
-        ast.len() * 24,
-        "headers only: no pool word for the member-kind word"
+        ast.len() * (24 + 4),
+        "headers plus the parent column: no pool word for the member-kind word"
     );
 }
 
@@ -1474,4 +1474,108 @@ fn last_node_accessors_read_the_arena_tail() {
     assert_eq!(b.last_end_token(), Some(2));
     assert_eq!(b.last_subtree_start(), Some(b.len() as u32 - 2));
     b.end(NodeKind::CompilationUnit, 2);
+}
+
+// —— parent column (#2467) ——————————————————————————————————————————————
+//
+// The parent answer is a column backfilled once at freeze; these pins hold
+// it to its definition: the first later row whose child window covers the
+// row ("first coverer in arena order" — the pre-column forward scan).
+
+/// The parent definition as a scan — the pre-#2467 `parent` body over the
+/// public windows, kept here as the oracle.
+fn parent_by_scan(ast: &SyntaxTable, id: u32) -> Option<u32> {
+    ((id as usize + 1)..ast.len())
+        .find(|&j| ast.children(j as u32).contains(&id))
+        .map(|j| j as u32)
+}
+
+/// Every row's stored parent equals the first-coverer scan.
+fn assert_parent_column_matches_scan(ast: &SyntaxTable) {
+    for row in 0..ast.len() as u32 {
+        assert_eq!(ast.parent(row), parent_by_scan(ast, row), "row {row}");
+    }
+}
+
+#[test]
+fn parent_column_matches_the_scan_over_sibling_and_nested_shapes() {
+    // unit [ blockA [leaf leaf] blockB [leaf] ] — rows 0..5, unit last.
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::Block, 1);
+    b.leaf(NodeKind::LiteralInt, 1);
+    b.leaf(NodeKind::LiteralInt, 2);
+    b.end(NodeKind::Block, 3);
+    b.begin(NodeKind::Block, 4);
+    b.leaf(NodeKind::LiteralInt, 4);
+    b.end(NodeKind::Block, 5);
+    b.end(NodeKind::CompilationUnit, 6);
+    let ast = b.finish();
+
+    // Sibling roots parent to the unit, leaves to their own block.
+    assert_eq!(ast.parent(0), Some(2));
+    assert_eq!(ast.parent(1), Some(2));
+    assert_eq!(ast.parent(2), Some(5));
+    assert_eq!(ast.parent(3), Some(4));
+    assert_eq!(ast.parent(4), Some(5));
+    assert_eq!(ast.parent(5), None, "root has no parent");
+    assert_parent_column_matches_scan(&ast);
+    assert_parent_column_matches_scan(&sample_unit());
+}
+
+#[test]
+fn parent_column_survives_deep_nesting() {
+    // A 1000-deep block chain: row i's parent is i + 1 up to the root —
+    // the shape where the replaced forward walk degenerated to O(N) per
+    // read. The column answers the same ids.
+    const DEPTH: u32 = 1000;
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    for token in 1..=DEPTH {
+        b.begin(NodeKind::Block, token);
+    }
+    b.leaf(NodeKind::LiteralInt, DEPTH + 1);
+    for extra in 0..DEPTH {
+        b.end(NodeKind::Block, DEPTH + 2 + extra);
+    }
+    b.end(NodeKind::CompilationUnit, DEPTH * 2 + 2);
+    let ast = b.finish();
+
+    assert_eq!(ast.len(), DEPTH as usize + 2);
+    for row in 0..ast.len() as u32 - 1 {
+        assert_eq!(ast.parent(row), Some(row + 1), "row {row}");
+    }
+    assert_eq!(ast.parent(ast.len() as u32 - 1), None);
+    assert_parent_column_matches_scan(&ast);
+}
+
+#[test]
+fn parent_column_adoption_resolves_to_the_first_coverer() {
+    // The adoption contract: a row completed before the borrower began
+    // parents to the borrower (the first window laid over it), not to the
+    // node that was open at its completion.
+    //
+    // unit [ leaf0 body [adopted=leaf0, leaf2] ] — rows: leaf 0, leaf 1,
+    // body 2, unit 3; the body's window is laid back over row 0.
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.leaf(NodeKind::LiteralInt, 1); // row 0: completed while only the unit was open
+    b.begin_adopting(NodeKind::Block, 2, 1); // borrows row 0
+    b.leaf(NodeKind::LiteralInt, 3); // row 1
+    b.end(NodeKind::Block, 4); // row 2: window [0, 2)
+    b.end(NodeKind::CompilationUnit, 5); // row 3: window [0, 3)
+    let ast = b.finish();
+
+    assert_eq!(ast.parent(0), Some(2), "adopted row parents to the borrower");
+    assert_eq!(ast.parent(1), Some(2));
+    assert_eq!(ast.parent(2), Some(3));
+    assert_eq!(ast.parent(3), None);
+    assert_parent_column_matches_scan(&ast);
+}
+
+#[test]
+fn parent_column_counts_in_the_footprint() {
+    let ast = sample_unit();
+    // 24 B headers + one parent word per row + pool words (empty here).
+    assert_eq!(ast.memory_footprint(), ast.len() * (24 + 4));
 }

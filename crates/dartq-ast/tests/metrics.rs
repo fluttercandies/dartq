@@ -26,7 +26,9 @@
 //! 0/1/0/2/0/0/0/0 pool words over its 9-node chunks — 3 words per 9 nodes
 //! — so the arithmetic expectation is 24 + 12/9 ≈ **25.33 B/node**
 //! steady-state and ≈ 0.40 × 25.33 / 8.0 ≈ **1.27 MB/MB** at the budget's
-//! definition point — confirmed by the serial-phase metrics run.
+//! definition point — confirmed by the serial-phase metrics run. The #2467
+//! parent-pointer column adds one `u32` per row: **29.33 B/node** and
+//! ≈ **1.47 MB/MB** expected — both still under their caps.
 
 #![allow(clippy::cast_possible_truncation)] // ids/offsets are u32 by design
 #![allow(clippy::cast_precision_loss)] // measurement math only

@@ -7,15 +7,19 @@
 //!
 //! One flat `Vec<NodeHeader>` of uniform 24-byte rows (kind, flags — error
 //! bit + modifier bits — token pair, contiguous child range, payload index)
-//! plus one shared append-only `u32` payload pool addressed by that index.
+//! plus one shared append-only `u32` payload pool addressed by that index,
+//! and one `u32` parent-pointer column (one entry per row, backfilled in one
+//! pass at freeze so `parent` is an indexed read — #2467; the O(N) forward
+//! walk it replaced dominated lint rule dispatch).
 //! Every node pays only for the payload width its kind declares; words
 //! derivable from the row's own tokens (span head, closing `;`/bracket,
 //! head-when-present keyword, nullable `?`, `ModSet` first token) are not
 //! stored at all — the derived-field accessors recompute them (#151 +
-//! #174). Parents are not stored but derived by a short forward walk.
+//! #174).
 //! Targets pinned by the spec and asserted at compile time and by the corpus
-//! metrics test: 24 B header, ≤30 B average per node, ≤1.5 MB of AST per MB
-//! of source.
+//! metrics test: 24 B header, ≤30 B average per node (the parent column
+//! rides the budget: model 24 + 12/9 + 4 ≈ 29.33 B/node), ≤1.5 MB of AST
+//! per MB of source.
 //!
 //! # Faces
 //!

@@ -374,6 +374,12 @@ pub(crate) struct RunCaches {
     /// provisional-insert cycle guard. Read by the `unsafe_variance`
     /// argument mapping.
     pub(crate) alias_variances: core::cell::RefCell<crate::rules::types::AliasVariances>,
+    /// Row owner -> its child rows, ascending — the whole-arena parent
+    /// grouping [`crate::rules::rows_with_parent`] reads, built once per run
+    /// on first query (`None`-guarded like [`Self::decls`]) so the per-owner
+    /// queries cost one lookup instead of one arena pass each (#2467: every
+    /// query filtered the whole arena).
+    pub(crate) owner_rows: core::cell::RefCell<Option<rustc_hash::FxHashMap<u32, Vec<u32>>>>,
 }
 
 /// Runs the enabled rules over one unit. Output is in traversal order:
@@ -484,6 +490,7 @@ pub fn run_breaking_version_annotations(
         body_member_rows: core::cell::RefCell::new(FxHashMap::default()),
         class_hierarchy: core::cell::RefCell::new(None),
         alias_variances: core::cell::RefCell::new(crate::rules::types::AliasVariances::default()),
+        owner_rows: core::cell::RefCell::new(None),
     };
     let direct = core::cell::RefCell::new(Vec::new());
     let path = [root];
@@ -571,6 +578,7 @@ fn run_semantics(
         body_member_rows: core::cell::RefCell::new(FxHashMap::default()),
         class_hierarchy: core::cell::RefCell::new(None),
         alias_variances: core::cell::RefCell::new(crate::rules::types::AliasVariances::default()),
+        owner_rows: core::cell::RefCell::new(None),
     };
     dispatch(
         unit,

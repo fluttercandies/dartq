@@ -66,19 +66,38 @@ pub(crate) fn last_child(c: &Check<'_>, id: u32) -> Option<u32> {
     (window.start < window.end).then(|| window.end - 1)
 }
 
-/// The rows whose parent pointer is `owner` — the full child set when the
-/// container's completion window opens after earlier members filled (the
-/// production `DeclarationBody` begins at the first non-field member, so a
-/// leading field's rows predate its window and the parent pointer is the
+/// The rows whose parent pointer is `owner`, ascending — the full child set
+/// when the container's completion window opens after earlier members filled
+/// (the production `DeclarationBody` begins at the first non-field member, so
+/// a leading field's rows predate its window and the parent pointer is the
 /// only link back).
+///
+/// Backed by the run's whole-arena owner grouping
+/// ([`RunCaches`][crate::engine::RunCaches] `owner_rows`): one linear pass on
+/// first query, then one lookup per owner (#2467: each query filtered the
+/// whole arena, one parent walk per row).
 #[expect(
     clippy::cast_possible_truncation,
     reason = "arena row space is u32 by the AST table's payload width"
 )]
 pub(crate) fn rows_with_parent(c: &Check<'_>, owner: u32) -> Vec<u32> {
-    (0..c.unit.ast.len() as u32)
-        .filter(|&row| c.unit.ast.parent(row) == Some(owner))
-        .collect()
+    if c.caches.owner_rows.borrow().is_none() {
+        let mut index: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        for row in 0..c.unit.ast.len() as u32 {
+            if let Some(parent) = c.unit.ast.parent(row) {
+                index.entry(parent).or_default().push(row);
+            }
+        }
+        *c.caches.owner_rows.borrow_mut() = Some(index);
+    }
+    c.caches
+        .owner_rows
+        .borrow()
+        .as_ref()
+        .expect("owner index built above")
+        .get(&owner)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Whether a block-window row delimits its statement (the flat tiling
@@ -1238,4 +1257,46 @@ pub(crate) fn token_seq_equal(c: &Check<'_>, a: u32, b: u32) -> bool {
     }
     ra.zip(rb)
         .all(|(ta, tb)| ta == tb || c.lexeme(ta) == c.lexeme(tb))
+}
+
+#[cfg(test)]
+mod ticket_2467_tests {
+    //! #2467 behavior pins: the rule faces that read the arena through
+    //! [`rows_with_parent`] (the run's owner index over the O(1) parent
+    //! column) answer the same verdicts on production-parse shapes.
+
+    use crate::testsupport::{Fixture, one_rule};
+
+    /// `prefer_final_fields` derives its candidates through
+    /// `body_members` -> `rows_with_parent`: a private non-final field
+    /// initialized at its declaration and never mutated reports.
+    #[test]
+    fn ticket_2467_prefer_final_fields_reports_the_unmutated_field() {
+        let f = Fixture::parse("class C { int _x = 0; }");
+        let lints = f.run(&one_rule("prefer_final_fields"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(lints[0].message, "The private field _x could be 'final'.");
+    }
+
+    /// The mutated twin stays silent — the write scan (the per-node
+    /// `parent` readers the O(1) column serves) still sees the mutation.
+    #[test]
+    fn ticket_2467_prefer_final_fields_stays_silent_when_mutated() {
+        let f = Fixture::parse("class C { int _x = 0; void m() { _x = 1; } }");
+        let lints = f.run(&one_rule("prefer_final_fields"));
+        assert!(lints.is_empty(), "unexpected lints: {lints:?}");
+    }
+
+    /// The override family reads the same owner index through
+    /// `body_members`: a same-file override without `@override` reports.
+    #[test]
+    fn ticket_2467_annotate_overrides_reports_the_missing_annotation() {
+        let f = Fixture::parse("class A { void m() {} } class B extends A { void m() {} }");
+        let lints = f.run(&one_rule("annotate_overrides"));
+        assert_eq!(lints.len(), 1);
+        assert_eq!(
+            lints[0].message,
+            "The member 'm' overrides an inherited member but isn't annotated with '@override'."
+        );
+    }
 }
