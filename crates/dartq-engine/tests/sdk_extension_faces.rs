@@ -102,29 +102,14 @@ fn bounded_enum_by_name_resolves() {
 }
 
 /// The oracle-parity control the #2488 activation exposed as a
-/// diagnose-side gap: `pickUnbounded`'s `List<T>` receiver has no
-/// `T extends Enum` bound, the oracle rejects `EnumByName`'s application
-/// and reports `undefined_method` (probed: Dart SDK 3.13.1,
-/// `lib/g2c.dart` in the probe rig), but dartq's extension applicability
-/// (`row_resolution` extension application) does not check the applied
-/// face's type-parameter bound, so the access resolves. The face data is
-/// upstream-verbatim; the check belongs to the diagnose lane that owns
-/// `row_resolution.rs` — this witness flips on when that lane lands the
-/// bound check.
-/// The oracle-parity control the #2488 activation exposed as a
-/// diagnose-side gap: `pickUnbounded`'s `List<T>` receiver has no
-/// `T extends Enum` bound, the oracle rejects `EnumByName`'s application
-/// and reports `undefined_method` (probed: Dart SDK 3.13.1, the
-/// `pickUnbounded` row of the #2488 probe rig), but dartq's extension
-/// applicability (`row_resolution` extension application) does not check
-/// the applied face's type-parameter bound, so the access resolves. The
-/// face data is upstream-verbatim; the check belongs to the diagnose lane
-/// that owns `row_resolution.rs` — this witness flips on when that lane
-/// lands the bound check.
-#[ignore = "diagnose-side handback (#2488): extension applicability does not \
-            check the applied face's type-parameter bound, so the unbounded \
-            receiver resolves EnumByName silently; flip on when \
-            row_resolution lands the bound check"]
+/// diagnose-side gap, closed by #2497: `pickUnbounded`'s `List<T>`
+/// receiver has no `T extends Enum` bound, the oracle rejects
+/// `EnumByName`'s application and reports `undefined_method` (probed:
+/// Dart SDK 3.13.1, the `pickUnbounded` row of the #2488 probe rig).
+/// `row_resolution`'s extension applicability now checks the applied
+/// face's type-parameter bound — an in-scope parameter argument answers
+/// through its own declared bound, so the unbounded `T` reads `Object?`
+/// and the `Enum` bound rejects it.
 #[test]
 fn unbounded_type_argument_violates_the_by_name_face() {
     let (engine, diagnostics) = analyze(&[(

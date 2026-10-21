@@ -3604,6 +3604,93 @@ impl<'a> Engine<'a> {
                         *alias == strings.resolve(sub) && roots.contains(&strings.resolve(sup))
                     })
         };
+        // The instantiated argument's verdict against a face parameter's
+        // declared bound (`applicableTo`'s `tryChooseFinalTypes` bound
+        // check): `arg <: bound`. An in-scope type parameter answers
+        // through its own declared bound — the oracle's
+        // `TypeParameterType` subtypes a bound exactly when its own bound
+        // does (`subtype.dart:306-317`), so `T extends Enum` satisfies
+        // `Enum` while the unbounded `T` reads `Object?` and a concrete
+        // bound rejects it (the #2497 `values.byName` row over
+        // `List<T>`/`Iterable<T>`). A bound written in terms of a
+        // parameter (`T extends S`) chains through `S`'s bound; the hop
+        // count caps the recovered cycle (`T extends T`). A shape the
+        // name level cannot order keeps the face (the under-report
+        // direction).
+        let satisfies_bound = |receiver_arg: Ty, bound: Ty| -> bool {
+            let mut arg = receiver_arg;
+            let mut hops = 0u8;
+            while let Ty::Named {
+                name,
+                nullable,
+                args: ArgListId::EMPTY,
+            } = arg
+            {
+                // The scope walk has finished by the time the row runs
+                // (`frames`/`type_params` are already torn down), so the
+                // in-scope test can't see `T`. Its bound survives only in
+                // the per-executable/container captures — `param_bound_of`
+                // answers the written bound (or the implicit `Object?`)
+                // for a name a capture actually declares, `None` for a
+                // concrete head (`String`/`Color`), which stays put.
+                let Some(declared) = self.param_bound_of(name) else {
+                    break;
+                };
+                // The argument's own `?` survives the substitution: a
+                // `T?` instantiation never satisfies a non-nullable
+                // bound even when `T`'s declared bound does.
+                arg = if nullable {
+                    match declared {
+                        Ty::Named { name, args, .. } => Ty::Named {
+                            name,
+                            nullable: true,
+                            args,
+                        },
+                        other => other,
+                    }
+                } else {
+                    declared
+                };
+                hops += 1;
+                if hops >= 8 {
+                    break;
+                }
+            }
+            match (arg, bound) {
+                // `dynamic <: Object` and `dynamic <: Object?` — the only
+                // tops a `dynamic` instantiation satisfies; any concrete
+                // bound rejects it.
+                (Ty::Dynamic, Ty::Named { name, args, .. }) => {
+                    args == ArgListId::EMPTY && name == object
+                }
+                (
+                    Ty::Named {
+                        name: arg_head,
+                        nullable: arg_nullable,
+                        args: arg_args,
+                    },
+                    Ty::Named {
+                        name: bound_head,
+                        nullable: bound_nullable,
+                        args: bound_args,
+                    },
+                ) => {
+                    // A bound carrying its own arguments (the recursive
+                    // `T extends Comparable<T>`) stays unmodeled at the
+                    // name level — the face stays applicable
+                    // (under-report).
+                    if arg_args != ArgListId::EMPTY || bound_args != ArgListId::EMPTY {
+                        return true;
+                    }
+                    (!arg_nullable || bound_nullable)
+                        && (arg_head == bound_head || reaches(arg_head, bound_head))
+                }
+                // A shape the name level cannot order (an unknown
+                // instantiation, a record or function bound) keeps the
+                // face.
+                _ => true,
+            }
+        };
         // The `on` clause's argument list gates beside the head
         // (`applicable_extensions.dart:205-281` `applicableTo`: the oracle
         // infers the extended type's fresh parameters against the receiver
@@ -3635,9 +3722,6 @@ impl<'a> Engine<'a> {
             else {
                 return true;
             };
-            if receiver_head != on_head {
-                return true;
-            }
             let receiver_args = boundary.pool().get(receiver_args).to_vec();
             let on_args = boundary.pool().get(on_args).to_vec();
             // A raw-head receiver (`Map x`) instantiates to bounds — the
@@ -3649,6 +3733,54 @@ impl<'a> Engine<'a> {
             } else {
                 receiver_args
             };
+            if receiver_head != on_head {
+                // The subtype hop's argument projection is unmodeled; the
+                // one decision still decidable across it is the applied
+                // face's parameter bounds. `applicableTo` instantiates
+                // each `on` parameter to the receiver's corresponding
+                // argument — the identity mapping every SDK collection
+                // edge writes (`List<E> implements Iterable<E>`) — then
+                // fails the inference when the instantiation violates the
+                // parameter's declared bound (`Iterable<String>` never
+                // applies `EnumByName<T extends Enum>`; an unbounded `T`
+                // receiver fails the same way, #2497). Positions whose
+                // `on` argument is concrete, parameterized, or
+                // arity-mismatched stay unmodeled (the under-report
+                // direction).
+                if receiver_args.len() != on_args.len() {
+                    return true;
+                }
+                return receiver_args.iter().zip(on_args.iter()).all(
+                    |(&receiver_arg, &on_arg)| {
+                        let Ty::Named {
+                            name: arg_name,
+                            args,
+                            ..
+                        } = on_arg
+                        else {
+                            return true;
+                        };
+                        if args != ArgListId::EMPTY {
+                            return true;
+                        }
+                        let Some(param_index) =
+                            face.type_param_names.iter().position(|&n| n == arg_name)
+                        else {
+                            return true;
+                        };
+                        let bound = face
+                            .type_param_bounds
+                            .get(param_index)
+                            .copied()
+                            .unwrap_or(Ty::Dynamic);
+                        let bound = boundary.ty(face_file, bound);
+                        if matches!(bound, Ty::Dynamic) {
+                            return true;
+                        }
+                        satisfies_bound(receiver_arg, bound)
+                    },
+                );
+            }
             if receiver_args.len() != on_args.len() {
                 return true;
             }
@@ -3687,40 +3819,7 @@ impl<'a> Engine<'a> {
                         if matches!(bound, Ty::Dynamic) {
                             return true;
                         }
-                        return match (receiver_arg, bound) {
-                            // `dynamic <: Object` and `dynamic <: Object?`
-                            // — the only tops a `dynamic` instantiation
-                            // satisfies; any concrete bound rejects it.
-                            (Ty::Dynamic, Ty::Named { name, args, .. }) => {
-                                args == ArgListId::EMPTY && name == object
-                            }
-                            (
-                                Ty::Named {
-                                    name: arg_head,
-                                    nullable: arg_nullable,
-                                    args: arg_args,
-                                },
-                                Ty::Named {
-                                    name: bound_head,
-                                    nullable: bound_nullable,
-                                    args: bound_args,
-                                },
-                            ) => {
-                                // A bound carrying its own arguments (the
-                                // recursive `T extends Comparable<T>`)
-                                // stays unmodeled at the name level — the
-                                // face stays applicable (under-report).
-                                if arg_args != ArgListId::EMPTY || bound_args != ArgListId::EMPTY {
-                                    return true;
-                                }
-                                (!arg_nullable || bound_nullable)
-                                    && (arg_head == bound_head || reaches(arg_head, bound_head))
-                            }
-                            // A shape the name level cannot order (an
-                            // unknown instantiation, a record or function
-                            // bound) keeps the face.
-                            _ => true,
-                        };
+                        return satisfies_bound(receiver_arg, bound);
                     }
                     // Covariant positions: the receiver's argument must be
                     // a subtype of the `on` argument. Only a bare concrete

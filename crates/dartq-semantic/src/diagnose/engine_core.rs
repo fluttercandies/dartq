@@ -1932,6 +1932,40 @@ impl<'a> Engine<'a> {
         Some(self.tree_ty(&tree))
     }
 
+    /// The post-walk counterpart of [`Engine::param_bound`]: the bound of
+    /// the parameter `name` when the scope frames are already torn down
+    /// (the extension-applicability row resolves a receiver argument
+    /// spelled `T` long after `type_params`/`frames` emptied). The bound
+    /// survives only in the per-executable captures — a top-level/generic
+    /// function's `exec_bounds` window or a method's `method_exec_bounds`
+    /// window — so the lookup scans every captured window for one that
+    /// declares `name`. Returns `Some(bound)` when a capture declares
+    /// `name` (the implicit `Object?` when its slot is empty), `None`
+    /// when no window does — i.e. `name` is a concrete head (`String`,
+    /// `Color`), never a scope parameter. A class-generic `class C<T>`
+    /// receiver stays unmodeled (`container_params` needs the container
+    /// name the post-walk caller no longer holds — the under-report
+    /// direction).
+    pub(crate) fn param_bound_of(&self, name: StringId) -> Option<Ty> {
+        let implicit_object = || {
+            Ty::Named {
+                name: self.intern("Object"),
+                nullable: true,
+                args: ArgListId::EMPTY,
+            }
+        };
+        for window in self
+            .exec_bounds
+            .values()
+            .chain(self.method_exec_bounds.values())
+        {
+            if let Some((_, bound)) = window.iter().find(|(param, _)| *param == name) {
+                return Some(bound.unwrap_or_else(implicit_object));
+            }
+        }
+        None
+    }
+
     /// Whether `ty` mentions an in-scope parameter anywhere in its shape
     /// (the official's `hasTypeParameterReference` gate over a bound: a
     /// bound that references a parameter — `T extends S` — proves no
