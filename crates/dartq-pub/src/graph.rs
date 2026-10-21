@@ -153,8 +153,6 @@ pub fn build_graph(
     workspace_members: Option<&[String]>,
     config_dir: &Path,
 ) -> Result<ResolvedPackageGraph, PubError> {
-    config.ensure_unique_names()?;
-
     let mut membership_findings = Vec::new();
     if config.entry(&root.name).is_none() {
         membership_findings.push(StaleReason::RootMissingFromConfig {
@@ -165,7 +163,7 @@ pub fn build_graph(
     let mut instances = Vec::new();
     let mut names = BTreeSet::new();
     for entry in &config.packages {
-        // Names are unique (`ensure_unique_names` rejects otherwise at
+        // Names are unique (parse folds repeated names to their first
         // entry); the set feeds edge collection and the membership lookup
         // below.
         names.insert(entry.name.clone());
@@ -729,11 +727,12 @@ dependency_overrides:
     }
 
     #[test]
-    fn duplicate_names_are_rejected_before_assembly() {
-        // The constructor-stage duplicate check precedes any dependency
-        // lookup (package_config-3.0.0 `package_config.dart:626-636`) — a
-        // repeated name never resolves a lock entry or assembles into
-        // instances.
+    fn duplicate_names_fold_to_the_first_entry_before_assembly() {
+        // A repeated name never reaches assembly as a second entry: parse
+        // folds it to the first, so the graph carries one instance rooted
+        // at the first entry's directory (package_config-3.0.0
+        // `package_config.dart:624-633`; the oracle never surfaces a
+        // repeated name as a diagnostic).
         let config = config_from(
             r#"{
               "configVersion": 2,
@@ -744,8 +743,9 @@ dependency_overrides:
               "generator": "pub"
             }"#,
         );
+        assert_eq!(config.packages.len(), 1, "folded at parse");
         let lock = lock_from(LOCK);
-        let error = build_graph(
+        let graph = build_graph(
             &config,
             &lock,
             &root_pubspec(),
@@ -753,12 +753,19 @@ dependency_overrides:
             None,
             Path::new("/proj/.dart_tool"),
         )
-        .expect_err("duplicate name is a hard error");
-        assert!(
-            error
-                .to_string()
-                .contains("Duplicate name app in generated package config"),
-            "unexpected error: {error}"
+        .expect("the folded config assembles");
+        let apps: Vec<_> = graph
+            .instances
+            .iter()
+            .filter(|i| i.name == "app")
+            .collect();
+        assert_eq!(apps.len(), 1, "one instance per folded name");
+        assert_eq!(
+            apps[0].source_ref,
+            SourceRef::Path {
+                path: Path::new("/proj").to_path_buf()
+            },
+            "the first entry's root wins"
         );
     }
 }

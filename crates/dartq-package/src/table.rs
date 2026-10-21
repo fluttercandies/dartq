@@ -766,11 +766,14 @@ sdks:
     }
 
     #[test]
-    fn invalid_and_duplicate_names_are_rejected() {
-        // Both policies are the shared dartq-pub face now: a name outside
-        // even the reader's loose charset, and a duplicate name — pub's
-        // constructor sanity check (`package_config.dart:44-51`) — are hard
-        // errors, never a silent last-wins.
+    fn invalid_names_are_rejected_and_duplicates_fold() {
+        // An invalid name is the shared dartq-pub face's hard error: a name
+        // outside even the reader's loose charset — pub's constructor
+        // sanity check (`package_config.dart:44-51`). A duplicate name
+        // folds to its first entry instead (package_config-3.0.0
+        // `package_config.dart:624-633`): the oracle never surfaces a
+        // repeated name as a diagnostic, and pub's writer cannot produce
+        // one.
         let invalid = PackageConfig::parse(
             r#"{"configVersion": 2, "packages": [{"name": "foo bar", "rootUri": "../"}]}"#,
         )
@@ -788,14 +791,18 @@ sdks:
                 {"name": "app", "rootUri": "../"},
                 {"name": "app", "rootUri": "../"}]}"#,
         )
-        .expect("parses fine at the config layer");
-        let error = PackageTable::build(&duplicated, &graph, Path::new("/proj/.dart_tool"))
-            .expect_err("duplicate name");
-        assert!(
-            error
-                .to_string()
-                .contains("Duplicate name app in generated package config"),
-            "unexpected error: {error}"
+        .expect("parses with the fold");
+        assert_eq!(
+            duplicated.packages.len(),
+            1,
+            "the later duplicate is skipped"
+        );
+        let table =
+            PackageTable::build(&duplicated, &graph_for(&duplicated), Path::new("/proj/.dart_tool"))
+                .expect("the folded config builds");
+        assert_eq!(
+            table.get("app").expect("app entry").root,
+            PathBuf::from("/proj")
         );
     }
 
