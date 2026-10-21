@@ -685,7 +685,14 @@ impl<'a> Engine<'a> {
         };
         match &row.shape {
             RowShape::Bare(BareInfo::Plain { .. }) if !row.qualified => {
-                match self.resolve_bare(row.name) {
+                let resolved = self.resolve_bare(row.name);
+                eprintln!(
+                    "accessor_read_ty name={:?} target={:?} decl={:?}",
+                    self.strings.resolve(row.name),
+                    resolved.1,
+                    self.top_level_decl(row.name).map(|d| (d.kind, d.formals.is_some(), d.return_ty))
+                );
+                match resolved {
                     (_, RefTarget::Member { container }) => {
                         match self.walk_members(container, row.name) {
                             Walk::Found(entry)
@@ -696,14 +703,45 @@ impl<'a> Engine<'a> {
                             _ => Ty::UNKNOWN,
                         }
                     }
+                    // The top-level getter face (#2449 F1): `Plain get g`
+                    // captured as a `TopLevelFn` carries its static type on
+                    // `return_ty` while `var_ty` stays `Unknown`, so the
+                    // push-time `BareInfo::Plain` is information-less and
+                    // every downstream member/null-aware check on the read
+                    // silently skipped. The read's static type IS the
+                    // getter's declared return — the official
+                    // `PropertyAccess`/`Identifier.staticType` resolves the
+                    // accessor element and reads its return. A top-level
+                    // *function* (a formal list stands — `formals.is_some()`)
+                    // read as a value is a tear-off whose static type is the
+                    // function signature the name-level model does not
+                    // render, so it keeps the unknown face rather than
+                    // answering the return type (that would resolve the next
+                    // member against the callee's result, not the function
+                    // type).
+                    (_, RefTarget::Decl { .. }) => match self.top_level_decl(row.name) {
+                        Some(decl)
+                            if decl.kind == MicroKind::TopLevelFn && decl.formals.is_none() =>
+                        {
+                            self.fold_alias_ty(decl.return_ty)
+                        }
+                        _ => Ty::UNKNOWN,
+                    },
                     _ => Ty::UNKNOWN,
                 }
             }
             RowShape::Member { recv } => {
+                // A `Created` receiver (`Holder().field`) names the created
+                // container exactly like the typed/this faces — the member
+                // read resolves on the creation's class, so the leaf
+                // accessor type answers (`field`'s declared `Plain?`).
                 let container = match recv {
                     Receiver::This { container, .. }
                     | Receiver::Super { container, .. }
                     | Receiver::Container {
+                        name: container, ..
+                    }
+                    | Receiver::Created {
                         name: container, ..
                     }
                     | Receiver::Typed {
@@ -1259,8 +1297,9 @@ impl<'a> Engine<'a> {
     /// The assignment check (`invalid_assignment`,
     /// `assignment_expression_resolver.dart:795`): a single-row right-hand
     /// side whose type the M1 facts know (`Null` or a captured declared
-    /// type) against the target's declared type. Plain `=` only — compound
-    /// operators carry their own read semantics (under-report).
+    /// type) against the target's declared type. Compound operators ride
+    /// [`Self::check_compound_assignment`] (the augmented operator's
+    /// result type against the same target).
     pub(crate) fn check_assignment(&mut self, operator: Token) {
         // F-C: a constructor-initializer list owns its assignments — the
         // field-initializer assignability question codes through the
@@ -1272,6 +1311,7 @@ impl<'a> Engine<'a> {
             return;
         };
         if op_text != "=" {
+            self.check_compound_assignment(op_text, operator);
             return;
         }
         let limit = operator.range.offset;
@@ -1350,6 +1390,81 @@ impl<'a> Engine<'a> {
             } else {
                 self.stage(StagedKind::Assignment, range, from, to, literal);
             }
+        }
+    }
+
+    /// The compound-assignment face (`invalid_assignment`,
+    /// assignment_expression_resolver.dart:308-313): `x op= e` asks the
+    /// augmented operator's result type against the target's write type —
+    /// `_computeCompoundOperatorResultType` types the read `x + e` through
+    /// the same numeric refinement the binary fold runs, so
+    /// `int total; total += <invalid receiver read>` answers `double` and
+    /// reports "A value of type 'double' can't be assigned to a variable
+    /// of type 'int'" (probed 3.13.1, the manifest_ast.dart census row).
+    /// The target's read type resolves the operator; a `dynamic` or
+    /// unknown read, an operator that does not resolve, an invalid
+    /// computed type, and `void` sides stay silent. `??=` is the if-null
+    /// face (upstream answers `InvalidType` — no operator element) and is
+    /// excluded here; the RHS's own argument face is the under-report
+    /// direction.
+    fn check_compound_assignment(&mut self, op_text: &str, operator: Token) {
+        let Some(op) = op_text.strip_suffix('=') else {
+            return;
+        };
+        if !USER_OPERATORS.contains(&op) {
+            return;
+        }
+        let limit = operator.range.offset;
+        // The target: the closest row wholly before the operator, skipping
+        // folded value rows (the same scan [`Self::check_assignment`] runs).
+        let Some(target) = self
+            .rows
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, row)| row.range.end() <= limit && !matches!(row.shape, RowShape::Value))
+            .map(|(index, _)| index)
+        else {
+            return;
+        };
+        // `c[i] op= e` writes through `[]=`: no assignability face here
+        // (the plain face's rule).
+        if matches!(self.rows[target].intent, Intent::Operator(..)) {
+            return;
+        }
+        // The right-hand side: exactly one row strictly after the operator
+        // (the plain face's single-row window).
+        let rhs_row = {
+            let mut rhs = self.rows[target + 1..]
+                .iter()
+                .filter(|row| row.range.offset > limit);
+            let Some(row) = rhs.next() else {
+                return;
+            };
+            if rhs.next().is_some() {
+                return;
+            }
+            row.clone()
+        };
+        let target_row = self.rows[target].clone();
+        let read_ty = self.receiver_static_ty(&target_row);
+        let to = self.assignment_target_ty(&target_row);
+        if matches!(read_ty, Ty::Unknown | Ty::Void) || matches!(to, Ty::Unknown | Ty::Void) {
+            return;
+        }
+        let Some((_, declared)) = self.binary_operator_sig(op, &target_row) else {
+            return;
+        };
+        let right_ty = self.equality_operand_ty(&rhs_row);
+        let from = self.refine_numeric_binary(op, read_ty, right_ty, declared);
+        if matches!(from, Ty::Unknown | Ty::Void | Ty::Dynamic) || self.written_ty_invalid(from) {
+            return;
+        }
+        let literal = Self::primitive_literal(&rhs_row, &self.members.primitive_ids);
+        if self.assignable(from, to, literal) == Some(false) {
+            // The oracle anchors at the whole right-hand expression
+            // (`.at(right)`).
+            self.stage(StagedKind::Assignment, rhs_row.range, from, to, literal);
         }
     }
 

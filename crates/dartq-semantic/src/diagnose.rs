@@ -3861,3 +3861,11 @@ mod ticket_2447_tests;
 /// reports `_both` with its trailing comment intact.
 #[cfg(test)]
 mod ticket_2458_tests;
+/// The #2453 pins: the num-fallback binary-operator typing over an
+/// invalid/dynamic operand (census F5) — the resolved-left arithmetic
+/// fold refines through the `S <: double?` branch instead of degrading
+/// (`int - <invalid>` answers `double` and the downstream assignability
+/// faces fire), the non-refined operators keep the declared return, and
+/// the compound-assignment face types the augmented read the same way.
+#[cfg(test)]
+mod ticket_2453_tests;

@@ -2123,12 +2123,14 @@ impl<'a> Engine<'a> {
     /// `(param type, result type)` pair the oracle's resolved element
     /// declares (`_resolveUserDefinableType`,
     /// binary_expression_resolver.dart:479-515 reads
-    /// `element.returnType`). A primitive receiver's signature answers
-    /// from [`CORE_BINARY_OPERATORS`] (the SDK declarations are external,
-    /// unreachable by the member walk); an indexed container's resolves
-    /// through the ordinary member face. Unresolved receivers, absent
-    /// operators (`undefined_operator` reports its own row), `dynamic`,
-    /// and `Never` answer `None` — the under-report direction.
+    /// `element.returnType`). The arm order mirrors the oracle's property
+    /// resolution: an exact SDK row (`int.&`, `String.+`) first, then the
+    /// user container's declared operator, then the `num`-inheritance
+    /// fiction for the undeclared real-core `int`/`double` receivers (the
+    /// SDK declarations are external, unreachable by the member walk).
+    /// Unresolved receivers, absent operators (`undefined_operator`
+    /// reports its own row), `dynamic`, and `Never` answer `None` — the
+    /// under-report direction.
     pub(crate) fn binary_operator_sig(&self, op: &str, left: &Row) -> Option<(Ty, Ty)> {
         let left_ty = self.equality_operand_ty(left);
         let Ty::Named { name, .. } = left_ty else {
@@ -2142,37 +2144,53 @@ impl<'a> Engine<'a> {
             return None;
         }
         let recv_text = self.strings.resolve(name);
-        // `int`/`double` inherit `num`'s arithmetic and relational face;
-        // their own rows (`int.&`, `double.+`) shadow it in the table.
-        let num_family = recv_text == "int" || recv_text == "double";
         if let Some((_, _, param, ret)) = CORE_BINARY_OPERATORS
             .iter()
             .find(|(recv, o, ..)| *o == op && *recv == recv_text)
-            // `int`/`double` inherit `num`'s arithmetic and relational face
-            // where their own rows stay silent (the `num.+` signature
-            // answers `1 + x` on `int` receivers too); `String`/`bool` are
-            // not `num` receivers and never take this fallback.
-            .or_else(|| {
-                num_family
-                    .then(|| {
-                        CORE_BINARY_OPERATORS
-                            .iter()
-                            .find(|(recv, o, ..)| *o == op && *recv == "num")
-                    })
-                    .flatten()
-            })
         {
             return Some((Ty::named(self.intern(*param)), Ty::named(self.intern(*ret))));
         }
-        // The indexed-container arm: the user operator's declared formals
-        // and return type (`Money operator +(Money)`).
-        let entry = self.resolved_member(name, self.intern(op))?;
-        if entry.kind != MemberKind::Method {
-            return None;
+        // The resolved-operator arm: the user operator's declared formals
+        // and return type (`Money operator +(Money)`). The oracle resolves
+        // the property on the receiver type FIRST
+        // (binary_expression_resolver.dart:451-459) — a unit-declared
+        // `class int` with its own `operator +` answers its declared
+        // signature, never the core fallback below.
+        if let Some(entry) = self.resolved_member(name, self.intern(op)) {
+            if entry.kind != MemberKind::Method {
+                return None;
+            }
+            let formals = entry.formals.as_deref()?;
+            let formal = formals.positional.first()?;
+            return Some((formal.ty, entry.return_ty));
         }
-        let formals = entry.formals.as_deref()?;
-        let formal = formals.positional.first()?;
-        Some((formal.ty, entry.return_ty))
+        // The core-fiction arm: `int`/`double` inherit `num`'s arithmetic
+        // and relational face (the SDK declarations are external,
+        // unreachable by the member walk — the `num.+` signature answers
+        // `1 + x` on `int` receivers too); `String`/`bool` are not `num`
+        // receivers and never take this fallback. A head shadowed by an
+        // in-scope container declaration skips the fiction — upstream's
+        // property resolution on the shadowed type misses and the node
+        // answers invalid, so the fold stays silent.
+        if (recv_text == "int" || recv_text == "double")
+            && resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                name,
+            )
+            .is_none()
+        {
+            if let Some((_, _, param, ret)) = CORE_BINARY_OPERATORS
+                .iter()
+                .find(|(recv, o, ..)| *o == op && *recv == "num")
+            {
+                return Some((Ty::named(self.intern(*param)), Ty::named(self.intern(*ret))));
+            }
+        }
+        None
     }
 
     /// The `+`/`-`/`*`/`%` numeric refinement
@@ -2194,16 +2212,6 @@ impl<'a> Engine<'a> {
         if !matches!(op, "+" | "-" | "*" | "%") {
             return declared;
         }
-        // An unresolved operand keeps the node unresolved (upstream's
-        // `_refineNumericInvocationTypeNullSafe` reads both operands'
-        // static types; an `InvalidType` side skips the refinement and the
-        // node answers dynamic — the suppress-everything sentinel here).
-        // Answering the declared `num` over an unknown right operand made
-        // every resolved-left fold over-report downstream
-        // (`return_of_invalid_type` num->int, #2172's `_writeToList`).
-        if right_ty == Ty::UNKNOWN {
-            return Ty::UNKNOWN;
-        }
         let (int, double, num) = (
             self.members.primitive_ids[0],
             self.members.primitive_ids[1],
@@ -2214,13 +2222,73 @@ impl<'a> Engine<'a> {
             nullable: true,
             args: ArgListId::EMPTY,
         };
+        // The shadow guard: a container declaration shadowing a core
+        // numeric name owns the operator face when no `num` is declared
+        // for it to inherit — the fiction edges ([`CORE_SUPERTYPES`]'s
+        // `int <: num`, the `num` signature fallback in
+        // [`Self::binary_operator_sig`]) serve the undeclared real-core
+        // names only. In the oracle's shadowed world the core `num` face
+        // is gone (`class int {}` subtypes nothing numeric), so the node
+        // answers the declared return unrefined; a declared
+        // `class int extends num` hierarchy keeps the refinement (the
+        // declared lattice answers the gate truthfully).
+        if let Ty::Named { name, .. } = left_ty
+            && matches!(self.strings.resolve(name), "int" | "double" | "num")
+            && resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                name,
+            )
+            .is_some()
+            && (name == num
+                || resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    num,
+                )
+                .is_none())
+        {
+            return declared;
+        }
+        // The gate is the receiver's own bound — a user `extends num` class
+        // refines identically — so the call is unconditional on the
+        // resolved signature; non-`num` receivers and the other operators
+        // keep the declared return.
         if !self.name_subtype(left_ty, named_q(num)) {
             return declared;
         }
+        // `_refineNumericInvocationTypeNullSafe`'s branch ladder
+        // (type_system.dart:2093-2118). The invalid/unknown and `dynamic`
+        // faces read as subtype-of-everything in the recovery lattice
+        // (`NameTy::from_semantic`'s nullable top), so a right operand the
+        // engine cannot type still decides the branch — `int - <invalid>`
+        // answers `double` and the downstream assignability faces fire
+        // (probed 3.13.1: `g(length: node.end - operator.offset)` with
+        // `Token` undefined — import-broken or bare — reports the
+        // `double`-against-`int` argument row; `int - dynamic` likewise).
+        // An unresolvable `Named` head is that same `InvalidType` face
+        // (upstream types the undefined annotation `InvalidType`, a
+        // subtype of everything): a head no declared face resolves
+        // ([`NameWorld::is_known_head`]) rides the branch too.
+        // `Never` stays excluded (the upstream `!s.isBottom` cut) and
+        // falls to `num`.
         if self.name_subtype(left_ty, named_q(double)) {
             return Ty::named(double);
         }
-        if right_ty != Ty::Never && self.name_subtype(right_ty, named_q(double)) {
+        let right_top = match right_ty {
+            Ty::Unknown | Ty::Dynamic => true,
+            Ty::Named { name, .. } => !self.name_world().is_known_head(name),
+            _ => false,
+        };
+        if right_ty != Ty::Never
+            && (right_top || self.name_subtype(right_ty, named_q(double)))
+        {
             return Ty::named(double);
         }
         if right_ty != Ty::Never
