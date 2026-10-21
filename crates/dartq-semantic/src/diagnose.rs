@@ -3773,3 +3773,14 @@ mod ticket_2432_tests;
 /// concrete-type mismatch keeps its row.
 #[cfg(test)]
 mod ticket_2436_tests;
+/// The #2440 pins (LAW A phase A2): a closure literal passed where a
+/// `Function(...)`-typed formal is expected binds its implicit parameters
+/// from that formal's schema, instantiating the callee's own inference
+/// parameters through this call's solution (explicit type arguments, the
+/// receiver's written instantiation, and the upward unification of the
+/// arguments already typed). Cross-file callees are the census shape: their
+/// parameter names prove nothing at the call site, so the unresolvable-schema
+/// recovery left every callback parameter `Object?` (339
+/// `unchecked_use_of_nullable_value` rows).
+#[cfg(test)]
+mod ticket_2440_tests;

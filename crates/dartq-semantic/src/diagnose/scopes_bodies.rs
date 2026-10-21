@@ -1037,6 +1037,19 @@ impl<'a> Engine<'a> {
                     _ => None,
                 }),
         }?;
+        // A schema entry spelling the callee's own inference parameters
+        // (`forCorrespondingPairs`'s `T1`/`T2`, `writeList`'s `T`) is not a
+        // type the caller's scope can name — the instantiation substitutes
+        // the call's solution: explicit type arguments first, then the
+        // receiver's written instantiation (a `Box<int>` member's `T`), then
+        // the upward unification of the arguments already typed (the
+        // send-close solver's inputs, run here at bind time). Only names the
+        // callee actually declares as inference parameters can bind — a
+        // misspelt head collects no binding and keeps the unresolvable
+        // fallback below.
+        let schema = self
+            .closure_schema_instantiate(schema, &recv, callee_name, callee_row)
+            .unwrap_or(schema);
         // `greatestClosure`'s nullable face: `T <: Null` binds `Object?`;
         // an invalid type argument (`List<Und>`'s `E`) collapses to the
         // same; a genuinely nullable schema type binds itself; `dynamic`
@@ -1089,6 +1102,393 @@ impl<'a> Engine<'a> {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// The schema entry with the callee's inference parameters replaced by
+    /// this call's solution (`None` = no binding formed — the caller keeps
+    /// the unsubstituted schema and its unresolvable-head recovery). The
+    /// solver mirrors the send-close inference faces in declaration order:
+    /// explicit type arguments fix first, the receiver's written
+    /// instantiation seeds the declaring container's own parameters, and the
+    /// already-typed positional/named arguments unify upward for the
+    /// still-open slots — a parameter solved from exactly one decidable
+    /// position (or several agreeing ones) binds; disagreement poisons. The
+    /// substituted schema must itself stay decidable in the caller's scope
+    /// ([`Self::schema_type_is_decidable`]), else no substitution forms.
+    fn closure_schema_instantiate(
+        &self,
+        ty: Ty,
+        recv: &Receiver,
+        callee_name: StringId,
+        callee_row: usize,
+    ) -> Option<Ty> {
+        let (params, seeds, ordered) = self.closure_callee_params(recv, callee_name)?;
+        if params.is_empty() {
+            return None;
+        }
+        let param_index = |name: StringId| params.iter().position(|(param, _)| *param == name);
+        let mut solutions: Vec<Option<Ty>> = vec![None; params.len()];
+        // Explicit type arguments fix first — peeked, not consumed (the
+        // send-close face owns the slot). A positional list pairs against
+        // the declaration's parameter order, which the foreign-declaration
+        // recovery cannot vouch for, so those solutions stay open.
+        if ordered
+            && let Some((_, explicit)) = self
+                .call_type_args
+                .iter()
+                .find(|(row, _)| *row == callee_row)
+        {
+            for (slot, ty) in solutions.iter_mut().zip(explicit.iter()) {
+                *slot = Some(*ty);
+            }
+        }
+        for (name, ty) in &seeds {
+            if let Some(index) = param_index(*name)
+                && solutions[index].is_none()
+            {
+                solutions[index] = Some(*ty);
+            }
+        }
+        // Upward face: the arguments already typed at bind time unify
+        // against the callee's formals for the still-open slots.
+        let formals = self.callee_formals(recv, callee_name)?;
+        let level = self.arg_levels.last()?;
+        let mut candidates: Vec<(StringId, Ty)> = Vec::new();
+        let mut positional_index = 0usize;
+        for (name, ty, _literal, _range) in &level.args {
+            let formal = match name {
+                Some(n) => formals.named_formal(*n),
+                None => {
+                    let formal = formals.positional.get(positional_index);
+                    positional_index += 1;
+                    formal
+                }
+            };
+            if let Some(formal) = formal
+                && *ty != Ty::Unknown
+            {
+                self.closure_unify_upward(formal.ty, *ty, &params, &mut candidates);
+            }
+        }
+        let mut poisoned: FxHashSet<usize> = FxHashSet::default();
+        for (param, ty) in candidates {
+            let Some(index) = param_index(param) else {
+                continue;
+            };
+            if poisoned.contains(&index) {
+                continue;
+            }
+            match solutions[index] {
+                None => solutions[index] = Some(ty),
+                Some(kept) if kept == ty => {}
+                Some(_) => {
+                    poisoned.insert(index);
+                    solutions[index] = None;
+                }
+            }
+        }
+        let map: Vec<(StringId, Ty)> = params
+            .iter()
+            .zip(solutions.iter())
+            .filter_map(|((param, _), solution)| solution.map(|ty| (*param, ty)))
+            .collect();
+        if map.is_empty() {
+            return None;
+        }
+        let out = self.subst_params(ty, &map)?;
+        // A solution that is itself unresolvable (an invalid written type
+        // argument, a receiver element the file cannot name) must not
+        // become the formal's type: the substituted head would land in the
+        // unresolvable-schema recovery and emit the very row the
+        // unsubstituted schema never did (`Bag<Und>`'s `T` is a provable
+        // same-file type parameter, `Und` is not). Rejection keeps the
+        // schema untouched — exactly the pre-existing route.
+        (out != ty && self.schema_type_is_decidable(out)).then_some(out)
+    }
+
+    /// Whether a substituted schema entry is a type the caller's scope can
+    /// name: `dynamic` never infers, and a named type is decidable only
+    /// when its head and every written type argument prove as types. Every
+    /// other shape (an unresolvable head, an invalid argument, the
+    /// bottom/`void` faces) refuses the substitution — the under-report
+    /// posture: no invented types.
+    fn schema_type_is_decidable(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::Dynamic => true,
+            Ty::Named { name, args, .. } => {
+                self.named_type_is_type(name) && self.args_are_types(args)
+            }
+            _ => false,
+        }
+    }
+
+    /// The callee's inference parameters and receiver-side seeds at bind
+    /// time — the bind-time view of the send-close solver's parameter set.
+    /// A member send answers the found method's own type-parameter names
+    /// plus the declaring container's captured parameters (seeded by the
+    /// receiver's written instantiation for an own member); a same-file
+    /// executable reads its `exec_bounds` capture; a function-typed
+    /// variable callee reads its written signature's parameters. A foreign
+    /// top-level function carries no parameter-name table — its declared
+    /// arity gates a leaf-collecting walk over the formal and return types
+    /// (bare leaves the caller's scope cannot prove are types, in written
+    /// order, capped at the declared count).
+    ///
+    /// The third element reports whether the returned order is the
+    /// declaration's type-parameter order — a positional explicit
+    /// type-argument list pairs against it. A foreign top-level
+    /// declaration only carries an arity, so its recovered spellings are
+    /// written order, not declaration order, and the list pairs against
+    /// nothing.
+    fn closure_callee_params(
+        &self,
+        recv: &Receiver,
+        callee_name: StringId,
+    ) -> Option<(Vec<(StringId, Option<Ty>)>, Vec<(StringId, Ty)>, bool)> {
+        // The member send's parameters (mirrors the send-close solver):
+        // method type-parameter names are authoritative; the declaring
+        // container's own parameters join only for the receiver's own
+        // member, seeded by the receiver's written instantiation.
+        if !matches!(recv, Receiver::Unknown | Receiver::Prefix { .. }) {
+            let (container, recv_ty) = match *recv {
+                Receiver::Typed { type_name, ty } => (type_name, Some(ty)),
+                Receiver::This { container, .. } => (container, None),
+                _ => return None,
+            };
+            if let Walk::Found(entry) = self.walk_members(container, callee_name)
+                && entry.kind == MemberKind::Method
+            {
+                let own_member = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    container,
+                )
+                .is_some_and(|(c, _)| c.members.get(&callee_name).is_some());
+                let mut params: Vec<(StringId, Option<Ty>)> = entry
+                    .type_param_names
+                    .iter()
+                    .map(|name| (*name, None))
+                    .collect();
+                let container_params = if own_member {
+                    self.bounds.container_params(container).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let mut seeds: Vec<(StringId, Ty)> = Vec::new();
+                if own_member
+                    && let Some(Ty::Named { args, .. }) = recv_ty
+                {
+                    let pool = self.boundary.pool();
+                    let args = pool.get(args);
+                    if args.len() == container_params.len() {
+                        for ((param, _, _), ty) in container_params.iter().zip(args.iter()) {
+                            seeds.push((*param, *ty));
+                        }
+                    }
+                }
+                params.extend(
+                    container_params
+                        .iter()
+                        .map(|(param, bound, _)| (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))),
+                );
+                return Some((params, seeds, true));
+            }
+            return None;
+        }
+        // A same-file executable's captured bounds.
+        if let Some(params) = self.exec_bounds.get(&callee_name)
+            && !params.is_empty()
+        {
+            return Some((params.to_vec(), Vec::new(), true));
+        }
+        // A function-typed variable callee's written signature.
+        if let Some(sig) = self.fn_var_sigs.get(&callee_name)
+            && !sig.params.is_empty()
+        {
+            return Some((sig.params.to_vec(), Vec::new(), true));
+        }
+        // A foreign top-level function: `type_params` is a bare count, so
+        // the parameter names recover from the declaration's own types —
+        // every bare leaf the caller's scope cannot prove is a type, in
+        // written order, capped at the declared arity.
+        let decl = self.top_level_decl(callee_name)?;
+        if decl.kind != MicroKind::TopLevelFn || decl.type_params == 0 {
+            return None;
+        }
+        let arity = usize::from(decl.type_params);
+        let mut names: Vec<StringId> = Vec::new();
+        if let Some(formals) = decl.formals.as_deref() {
+            for formal in formals.positional.iter().chain(formals.named.iter()) {
+                self.unprovable_leaves(formal.ty, &mut names, arity);
+            }
+        }
+        self.unprovable_leaves(decl.return_ty, &mut names, arity);
+        if names.is_empty() {
+            return None;
+        }
+        Some((
+            names.into_iter().map(|name| (name, None)).collect(),
+            Vec::new(),
+            false,
+        ))
+    }
+
+    /// Every bare leaf of `ty` the caller's scope cannot prove is a type —
+    /// the candidate inference-parameter spellings of a foreign generic
+    /// declaration — appended in written order until `cap` names collect.
+    /// A misspelt head inside a foreign generic's own types is a real risk
+    /// the arity cap contains.
+    fn unprovable_leaves(&self, ty: Ty, out: &mut Vec<StringId>, cap: usize) {
+        if out.len() >= cap {
+            return;
+        }
+        match ty {
+            Ty::Named { name, args, .. } => {
+                if args == ArgListId::EMPTY {
+                    if !self.named_type_is_type(name) && !out.contains(&name) {
+                        out.push(name);
+                    }
+                    return;
+                }
+                for arg in self.boundary.pool().get(args) {
+                    self.unprovable_leaves(*arg, out, cap);
+                }
+            }
+            Ty::Function { shape, .. } => {
+                let pool = self.boundary.pool();
+                let shape = pool.function_shape(shape);
+                let (positional, named, return_ty) =
+                    (shape.positional.clone(), shape.named.clone(), shape.return_ty);
+                drop(pool);
+                for ty in positional {
+                    self.unprovable_leaves(ty, out, cap);
+                }
+                for (_, ty) in named {
+                    self.unprovable_leaves(ty, out, cap);
+                }
+                self.unprovable_leaves(return_ty, out, cap);
+            }
+            Ty::Record { shape, .. } => {
+                let pool = self.boundary.pool();
+                let shape = pool.record_shape(shape);
+                let (positional, named) = (shape.positional.clone(), shape.named.clone());
+                drop(pool);
+                for ty in positional {
+                    self.unprovable_leaves(ty, out, cap);
+                }
+                for (_, ty) in named {
+                    self.unprovable_leaves(ty, out, cap);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The upward-constraint collector for the bind-time solve — the
+    /// send-close unifier's structural walk: a bare leaf belonging to the
+    /// parameter set binds the whole argument type; a same-head generic
+    /// pair binds pairwise through the argument lists; the
+    /// `List`/`Set` → `Iterable` builtins edge crosses the one head hop
+    /// `Iterable<T>` formals need; `Function` and `Record` pairs bind
+    /// positionally. Everything else binds nothing.
+    fn closure_unify_upward(
+        &self,
+        formal: Ty,
+        arg: Ty,
+        params: &[(StringId, Option<Ty>)],
+        out: &mut Vec<(StringId, Ty)>,
+    ) {
+        match (formal, arg) {
+            (
+                Ty::Named {
+                    name,
+                    nullable: false,
+                    args,
+                },
+                _,
+            ) if args == ArgListId::EMPTY => {
+                if params.iter().any(|(param, _)| *param == name) {
+                    out.push((name, arg));
+                }
+            }
+            (
+                Ty::Named {
+                    name,
+                    nullable: false,
+                    args: formal_args,
+                },
+                Ty::Named {
+                    name: arg_head,
+                    args: arg_args,
+                    ..
+                },
+            ) if formal_args != ArgListId::EMPTY => {
+                let pool = self.boundary.args.borrow();
+                let (formal_args, arg_args) = (pool.get(formal_args), pool.get(arg_args));
+                if name == arg_head && formal_args.len() == arg_args.len() {
+                    for (f, a) in formal_args.iter().zip(arg_args.iter()) {
+                        self.closure_unify_upward(*f, *a, params, out);
+                    }
+                    return;
+                }
+                let iterable = self.intern("Iterable");
+                if name == iterable && formal_args.len() == 1 && arg_args.len() == 1 {
+                    let head = self.strings.resolve(arg_head);
+                    if head == "List" || head == "Set" {
+                        self.closure_unify_upward(formal_args[0], arg_args[0], params, out);
+                    }
+                }
+            }
+            (
+                Ty::Function {
+                    shape: formal_shape,
+                    nullable: false,
+                },
+                Ty::Function {
+                    shape: arg_shape, ..
+                },
+            ) => {
+                let pool = self.boundary.pool();
+                let (formal_shape, arg_shape) = (
+                    pool.function_shape(formal_shape),
+                    pool.function_shape(arg_shape),
+                );
+                for (f, a) in formal_shape
+                    .positional
+                    .iter()
+                    .zip(arg_shape.positional.iter())
+                {
+                    self.closure_unify_upward(*f, *a, params, out);
+                }
+                self.closure_unify_upward(formal_shape.return_ty, arg_shape.return_ty, params, out);
+            }
+            (
+                Ty::Record {
+                    shape: formal_shape,
+                    nullable: false,
+                },
+                Ty::Record {
+                    shape: arg_shape, ..
+                },
+            ) => {
+                let pool = self.boundary.pool();
+                let (formal_shape, arg_shape) = (
+                    pool.record_shape(formal_shape),
+                    pool.record_shape(arg_shape),
+                );
+                for (f, a) in formal_shape
+                    .positional
+                    .iter()
+                    .zip(arg_shape.positional.iter())
+                {
+                    self.closure_unify_upward(*f, *a, params, out);
+                }
+            }
+            _ => {}
         }
     }
 
