@@ -84,6 +84,7 @@ use crate::model::{
 };
 use dartq_parser::{
     DeclarationKind, FormalParameterKind, IdentifierContext, Parser, ParserFeatures, ParserListener,
+    TokenId,
 };
 use dartq_parser::{MemberKind as ParserMemberKind, TokenSpan as Token};
 use dartq_resolution::{ClassModifiers, DeclKind};
@@ -391,6 +392,16 @@ struct Builder<'src, 'tab> {
     /// armed at the `TypeReference` identifier and consumed at
     /// `begin_type_arguments` or the head's own completion.
     pending_type_head: Option<(StringId, SourceRange)>,
+    /// The prefixed annotation head awaiting its completing `handle_type`
+    /// (`ast` and `AstNode` of `ast.AstNode?`): the prefix latches at the
+    /// `PrefixedTypeReference` identifier, the continuation fills in at
+    /// `TypeReferenceContinuation`. The completion carries the prefix
+    /// token as its head — [`Builder::join_qualified`] rewrites the armed
+    /// spelling to the dot-joined qualified name, the intern table's
+    /// one-head form (`note_annotation_segment`'s idiom; upstream resolves
+    /// `prefix.Name` through the import namespace as one node — upstream
+    /// Dart SDK source, pkg/analyzer/lib/src/dart/ast/ast.dart).
+    pending_qualified: Option<(TokenId, StringId, StringId)>,
     /// The latched declared type of the open field group.
     field_group_ty: Option<Ty>,
     /// The metadata star of the declaration that opens next, in written
@@ -464,6 +475,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             capture: None,
             record_entry_mark: 0,
             pending_type_head: None,
+            pending_qualified: None,
             field_group_ty: None,
             pending_annotations: Vec::new(),
             field_annotations: Vec::new(),
@@ -536,6 +548,33 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.tokens
             .get(token.id as usize)
             .map(|t| self.strings.intern(&self.source[t.byte_range()]))
+    }
+
+    /// The prefixed annotation's one-head spelling: the completing
+    /// `handle_type` carries the PREFIX token as its head, so the armed
+    /// `Ty` would read `ast` and drop the continuation — the projection
+    /// scar commit 87c65d96 gated downstream. When the completion's token
+    /// is the latched prefix, the armed spelling becomes the dot-joined
+    /// qualified name (`ast.AstNode`) instead — the intern table's
+    /// one-head form (`note_annotation_segment`'s idiom). A synthetic
+    /// continuation (recovery fired no honest name) keeps the prefix-only
+    /// spelling, the under-report direction. A non-matching completion (a
+    /// type argument's head completing inside the qualified type's own
+    /// `<...>`) leaves the latch for the outer head.
+    fn join_qualified(&mut self, name: Token) -> Option<StringId> {
+        let (prefix_id, prefix, cont) = self.pending_qualified?;
+        if prefix_id != name.id {
+            return None;
+        }
+        self.pending_qualified = None;
+        (cont != StringId::NONE).then(|| {
+            let joined = format!(
+                "{}.{}",
+                self.strings.resolve(prefix),
+                self.strings.resolve(cont)
+            );
+            self.strings.intern(&joined)
+        })
     }
 
     fn setter_spelling(&self, name: StringId) -> StringId {
@@ -1684,8 +1723,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // would otherwise hand assignability faces an as-written `Named`
         // where the canonical `Ty` is the observable contract (the
         // strict-casts overlay's source/target predicates, the nullability
-        // faces). Every other name stays as written.
-        let spelling = builder.name_of(name);
+        // faces). Every other name stays as written. A prefixed
+        // annotation's completion joins to the qualified spelling first —
+        // the head is `ast.AstNode`, never the bare prefix token.
+        let spelling = builder
+            .join_qualified(name)
+            .or_else(|| builder.name_of(name));
         // The head's own group (if any) closed before this completion;
         // the slot is consumed either way.
         builder.pending_type_head = None;
@@ -1920,7 +1963,27 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 if context == IdentifierContext::TypeReference {
                     builder.pending_type_head = name_with_range;
                 }
+                // The qualified head's continuation fills the open latch
+                // (`ast` latched at `PrefixedTypeReference`, `AstNode`
+                // joins it here); a synthetic continuation carries no
+                // honest name and leaves the slot empty.
+                if context == IdentifierContext::TypeReferenceContinuation
+                    && let Some(entry) = &mut builder.pending_qualified
+                    && entry.2 == StringId::NONE
+                    && let Some(name) = name
+                {
+                    entry.2 = name;
+                }
                 builder.note_header_reference(context, name, offset);
+            }
+            IdentifierContext::PrefixedTypeReference => {
+                // The prefix token of a `p.T` annotation: the same token
+                // completes the type at `handle_type`, where
+                // `join_qualified` matches it by id — a fresh reference
+                // overwrites any stale latch, a synthetic prefix (no
+                // honest name) clears it.
+                builder.pending_qualified = name_with_range
+                    .map(|(name, _)| (token.id, name, StringId::NONE));
             }
             IdentifierContext::TopLevelFunctionDeclaration => {
                 // The return type parsed between the begin event and the

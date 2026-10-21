@@ -3847,3 +3847,10 @@ mod ticket_2444_tests;
 /// unrelated scrutinee still reports.
 #[cfg(test)]
 mod ticket_2445_tests;
+/// The #2447 pins: a prefixed annotation arms its full qualified name —
+/// the collector's `handle_type` join rewrites the prefix-token head to
+/// the dot-joined spelling (`ast.AstNode`), so the projected `Ty` crosses
+/// file boundaries truthfully and the #2441 prefix-head gate goes inert
+/// for this shape (defense in depth kept).
+#[cfg(test)]
+mod ticket_2447_tests;
