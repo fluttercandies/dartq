@@ -3847,6 +3847,7 @@ mod ticket_2444_tests;
 /// unrelated scrutinee still reports.
 #[cfg(test)]
 mod ticket_2445_tests;
+
 /// The #2447 pins: a prefixed annotation arms its full qualified name —
 /// the collector's `handle_type` join rewrites the prefix-token head to
 /// the dot-joined spelling (`ast.AstNode`), so the projected `Ty` crosses
@@ -3854,6 +3855,16 @@ mod ticket_2445_tests;
 /// for this shape (defense in depth kept).
 #[cfg(test)]
 mod ticket_2447_tests;
+
+/// The #2449 pins: receiver static types for top-level-getter references
+/// and compound receiver chains (census F1) — the getter's declared
+/// return types the member and null-aware faces (`g.missing()`,
+/// `g?.missing()`, the null-aware verdicts), a creation receiver's field
+/// read composes the same way (`Holder().field?.m()`), and a top-level
+/// function read keeps the unknown tear-off face.
+#[cfg(test)]
+mod ticket_2449_tests;
+
 /// The #2458 pins: comment trivia between the last literal element and
 /// the closing `}` is no element — a comment-only leaf segment no longer
 /// flips a context-less all-entry literal to
@@ -3861,6 +3872,7 @@ mod ticket_2447_tests;
 /// reports `_both` with its trailing comment intact.
 #[cfg(test)]
 mod ticket_2458_tests;
+
 /// The #2453 pins: the num-fallback binary-operator typing over an
 /// invalid/dynamic operand (census F5) — the resolved-left arithmetic
 /// fold refines through the `S <: double?` branch instead of degrading

@@ -686,12 +686,6 @@ impl<'a> Engine<'a> {
         match &row.shape {
             RowShape::Bare(BareInfo::Plain { .. }) if !row.qualified => {
                 let resolved = self.resolve_bare(row.name);
-                eprintln!(
-                    "accessor_read_ty name={:?} target={:?} decl={:?}",
-                    self.strings.resolve(row.name),
-                    resolved.1,
-                    self.top_level_decl(row.name).map(|d| (d.kind, d.formals.is_some(), d.return_ty))
-                );
                 match resolved {
                     (_, RefTarget::Member { container }) => {
                         match self.walk_members(container, row.name) {
