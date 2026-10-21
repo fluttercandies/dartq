@@ -230,6 +230,20 @@ pub(crate) fn restriction_is_constant(space: &Restriction) -> bool {
     }
 }
 
+/// Whether every leaf of the case's root pattern is the `null` constant.
+/// The body-death companion of [`restriction_is_constant`]: the flow's
+/// known-false equality (`_typesAreDisjointDueToNullability`) needs the
+/// whole union null — a mixed `null || true` keeps its body live through
+/// the non-null leaf (oracle 3.13.1, probe2444 pg: the two never-match
+/// warnings report, no `dead_code`).
+pub(crate) fn restriction_is_null_only(space: &Restriction) -> bool {
+    match space {
+        Restriction::Null => true,
+        Restriction::Union(parts) => parts.iter().all(restriction_is_null_only),
+        _ => false,
+    }
+}
+
 /// Whether the case space can hold no value of the matched type: every
 /// leaf's single type must be unable to inhabit `matched`
 /// ([`NameWorld::can_be_subtype_of`], the mutual-exclusion companion of

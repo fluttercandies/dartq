@@ -2174,30 +2174,53 @@ impl<'a> Engine<'a> {
                     Exhaustiveness::Exhaustive
                 )
             };
-            // The never-match face: the case's every single type can never
-            // be a subtype of the matched value's type — the disjointness
-            // gate ([`crate::switch_tracker::restriction_disjoint_from`]).
-            // Only constant roots qualify (the equality-check face — see
-            // [`restriction_is_constant`]): `case null` over a
-            // non-nullable type kills its body, a disjoint type test does
-            // not. Witness-set equality alone never answers here: the
-            // space model drops a row it cannot express ("the `Enum` root
+            // The never-match WARNING face — the case's every single type
+            // can never be a subtype of the matched value's type — is the
+            // disjointness gate
+            // ([`crate::switch_tracker::restriction_disjoint_from`])
+            // over constant roots ([`restriction_is_constant`]); it
+            // decides the `constant_pattern_never_matches_value_type` row
+            // at the constant (the pattern-checking faces) and never
+            // kills a body. The flow's body-death rides ONLY the
+            // nullability-disjoint face: `_equalityCheck`'s known-false
+            // arm is `_typesAreDisjointDueToNullability` (upstream Dart
+            // SDK source, pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+            // flow_analysis.dart:9496-9501, fed into
+            // `_handleEqualityCheckPattern`'s known-false arm :8930-8948)
+            // — one operand the `Null` type, the other non-nullable. A
+            // merely value-disjoint constant (`case true` over an `int`
+            // scrutinee, another enum's constant over an enum) falls to
+            // `_NoEqualityInformation`: the warning reports but the body
+            // stays reachable (oracle 3.13.1, probe2444 pa/pb/ph). Two
+            // dead faces:
+            //   - every leaf `null` against a non-nullable matched type
+            //     (`case null` over `int` — a union needs all leaves null,
+            //     [`crate::switch_tracker::restriction_is_null_only`]);
+            //   - a non-null constant root against a `Null`-typed
+            //     scrutinee (`case true` over `Null` — probe2444 pf; a
+            //     `null` leaf there is the known-TRUE equality and its
+            //     body stays live).
+            // Witness-set equality alone never answers here: the space
+            // model drops a row it cannot express ("the `Enum` root
             // minus one constant") and regenerates the bare scrutinee
             // witness, which would mark a case whose constant may overlap
             // the matched type (`AstNodeTag.a` over an `Enum`-typed
             // scrutinee) dead. A guarded case never qualifies: `compute`
             // keeps its row out of the covering set (the guard may fail),
-            // so its body stays live. The upstream anchor is the flow's
-            // `_handleEqualityCheckPattern` known-false arm making the case
-            // body unreachable (upstream Dart SDK source,
-            // pkg/_fe_analyzer_shared/lib/src/flow_analysis/
-            // flow_analysis.dart:8884-8917, fed by `_equalityCheck`).
-            let never_matches = |index: usize| {
-                crate::switch_tracker::restriction_disjoint_from(
-                    &world,
-                    &ctx.cases[index].space,
-                    value,
-                )
+            // so its body stays live.
+            let body_dies = |index: usize| {
+                let space = &ctx.cases[index].space;
+                if crate::switch_tracker::restriction_is_null_only(space) {
+                    !world.can_be_subtype_of(&NameTy::Null, &value)
+                } else {
+                    matches!(value, NameTy::Null)
+                        && restriction_is_constant(space)
+                        && crate::switch_tracker::restriction_disjoint_from(
+                            &world,
+                            space,
+                            value,
+                        )
+                }
             };
             let chain_start = (0..ctx.cases.len())
                 .find(|&index| !ctx.cases[index].guarded && total(index))
@@ -2205,11 +2228,8 @@ impl<'a> Engine<'a> {
             let chain_end = ctx.default_pos.unwrap_or(ctx.cases.len());
             for (index, case) in ctx.cases.iter().enumerate() {
                 let in_chain = index >= chain_start && index < chain_end;
-                let never = !in_chain
-                    && !case.guarded
-                    && restriction_is_constant(&ctx.cases[index].space)
-                    && never_matches(index);
-                if !in_chain && !never {
+                let body_dead = !in_chain && !case.guarded && body_dies(index);
+                if !in_chain && !body_dead {
                     continue;
                 }
                 if in_chain {

@@ -3826,3 +3826,15 @@ mod ticket_2410_tests;
 /// the same declared-edge lattice the switch tracker walks.
 #[cfg(test)]
 mod ticket_2441_tests;
+
+/// The #2444 pins: the switch body-death cut narrowed to the
+/// nullability-disjoint face — a genuinely value-disjoint constant root
+/// (`case true` over an `int`, another enum's constant over an enum, a
+/// mixed `null || true` union) reports the
+/// `constant_pattern_never_matches_value_type` warning alone and its body
+/// stays reachable (the flow's `_equalityCheck` known-false arm is
+/// `_typesAreDisjointDueToNullability` only), while the two null faces
+/// keep dying (`case null` over a non-nullable scrutinee; a non-null
+/// constant over a `Null`-typed scrutinee).
+#[cfg(test)]
+mod ticket_2444_tests;
