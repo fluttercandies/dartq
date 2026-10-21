@@ -3735,13 +3735,7 @@ mod ticket_2429_tests;
 /// static type of `this` closing an exhaustive `switch (this)` body.
 #[cfg(test)]
 mod ticket_2426_tests;
-/// The #2433 pins (LAW A phase A3): a member face read through a
-/// parameterized receiver substitutes the receiver's WRITTEN type
-/// arguments — `Box<int> b; b.set(v)` checks `v` against `int`. Bare-head
-/// receivers keep the declared face, and nested instantiations substitute
-/// one level deep.
-#[cfg(test)]
-mod ticket_2433_tests;
+
 /// The #2430 pins: the parameter-bound materialization at the
 /// nullability and never-match gates — a written bound (`T extends
 /// AstNodeImpl?`) decides the `?.`/`!`/null-comparison/null-check faces
@@ -3750,6 +3744,15 @@ mod ticket_2433_tests;
 /// parameter-mentioning bound suppresses.
 #[cfg(test)]
 mod ticket_2430_tests;
+
+/// The #2433 pins (LAW A phase A3): a member face read through a
+/// parameterized receiver substitutes the receiver's WRITTEN type
+/// arguments — `Box<int> b; b.set(v)` checks `v` against `int`. Bare-head
+/// receivers keep the declared face, and nested instantiations substitute
+/// one level deep.
+#[cfg(test)]
+mod ticket_2433_tests;
+
 /// The #2431 pins: the extension face's type-parameter bounds — the
 /// applicability gate drops a face whose bound rejects the receiver's
 /// argument (the raw-`List` receiver's `dynamic` instantiation fails every
@@ -3758,6 +3761,7 @@ mod ticket_2430_tests;
 /// twins stay ambiguous.
 #[cfg(test)]
 mod ticket_2431_tests;
+
 /// The #2432 pins: invocation-level generic type-argument inference — the
 /// member-send/top-level upward unification materializes the call's solved
 /// bindings into the return face, ambiguous candidates poison instead of
@@ -3765,6 +3769,7 @@ mod ticket_2431_tests;
 /// against the prefix scope's element.
 #[cfg(test)]
 mod ticket_2432_tests;
+
 /// The #2436 pins: the concrete-implementation completeness loop skips the
 /// signature comparison when either compared side carries its declaring
 /// container's free type parameters (the unsubstituted read — clause type
@@ -3773,6 +3778,7 @@ mod ticket_2432_tests;
 /// concrete-type mismatch keeps its row.
 #[cfg(test)]
 mod ticket_2436_tests;
+
 /// The #2440 pins (LAW A phase A2): a closure literal passed where a
 /// `Function(...)`-typed formal is expected binds its implicit parameters
 /// from that formal's schema, instantiating the callee's own inference
@@ -3784,3 +3790,13 @@ mod ticket_2436_tests;
 /// `unchecked_use_of_nullable_value` rows).
 #[cfg(test)]
 mod ticket_2440_tests;
+
+/// The #2439 pins: the constant-pattern never-match verdict is the
+/// disjointness gate (`can_be_subtype_of` per single) instead of
+/// witness-set equality — an enum constant over an `Enum`-root or
+/// `T extends Enum` scrutinee may overlap the matched type, so its case
+/// body stays live — and the `Enum` root's covering face decides without
+/// enumerating enum declarations as coverable subtypes (the oracle's
+/// `non_exhaustive` witness over the root is `Enum()` itself).
+#[cfg(test)]
+mod ticket_2439_tests;

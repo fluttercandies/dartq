@@ -230,6 +230,43 @@ pub(crate) fn restriction_is_constant(space: &Restriction) -> bool {
     }
 }
 
+/// Whether the case space can hold no value of the matched type: every
+/// leaf's single type must be unable to inhabit `matched`
+/// ([`NameWorld::can_be_subtype_of`], the mutual-exclusion companion of
+/// the covering walk's subtype filter). A leaf that may overlap — an enum
+/// constant against the `Enum` root its declaration implicitly implements,
+/// a constant against the scrutinee's own enum — keeps the case live no
+/// matter what the covering witnesses say: the space model drops such a
+/// row (`is_subtype_of(matched, constant)` fails toward the value) and
+/// regenerates the bare scrutinee witness, so witness-set equality alone
+/// cannot see the overlap and must never produce a never-match here. The
+/// leaf set mirrors [`collect_singles`]'s lowering (each leaf *is* the
+/// single the case space carries); a logical-or never matches only when
+/// both alternatives do.
+pub(crate) fn restriction_disjoint_from(
+    world: &NameWorld<'_>,
+    space: &Restriction,
+    matched: NameTy,
+) -> bool {
+    match space {
+        Restriction::Union(parts) => parts
+            .iter()
+            .all(|part| restriction_disjoint_from(world, part, matched)),
+        // The unknown space and the context leaf match by construction —
+        // the engine under-reports instead of mis-answering.
+        Restriction::Unknown | Restriction::NamedContext => false,
+        Restriction::Null => !world.can_be_subtype_of(&NameTy::Null, &matched),
+        Restriction::Named(name, nullable) => {
+            !world.can_be_subtype_of(&NameTy::Named(*name, *nullable), &matched)
+        }
+        Restriction::BoolValue(value) => {
+            !world.can_be_subtype_of(&NameTy::BoolValue(*value), &matched)
+        }
+        Restriction::EnumValue(enum_name, constant) => !world
+            .can_be_subtype_of(&NameTy::EnumValue(*enum_name, *constant), &matched),
+    }
+}
+
 /// `isAlwaysExhaustive` (type_system.dart:846-887) at name level:
 /// `bool`, `Null`, enums, and sealed classes split completely; nothing
 /// else does. The official check reads the scrutinee type's *element*
@@ -756,6 +793,16 @@ impl<'a> NameWorld<'a> {
             // arguments to disagree over.
             return true;
         }
+        // An opaque right head (a raw type-parameter spelling, an
+        // unresolvable name) is the world's blind spot: whether the left
+        // family can inhabit it is undecidable at name level, and the
+        // closed-set scans below would read the missing edges as a mutual
+        // exclusion. The official answers through the parameter's bound
+        // (`T extends Enum` admits every enum), falling to the
+        // conservative `true` without one (type_system.dart:324).
+        if !self.is_known_head(right_name) {
+            return true;
+        }
         let left_non_null = NameTy::Named(left_name, false);
         // The enum's instances are exactly its constants, typed by the
         // enum (type_system.dart:229-241's this-type scan).
@@ -855,6 +902,19 @@ impl<'a> NameWorld<'a> {
             NameTy::BoolValue(_) | NameTy::BoolOrNull(_) => Some(self.bool_id),
             _ => None,
         }
+    }
+
+    /// Whether the world decides `name`'s subtype face: a resolvable
+    /// container, a core sealed type, the `Enum` root, the top `Object`, or
+    /// a core primitive (whose chain [`CORE_SUPERTYPES`] carries). An
+    /// unknown head leaves every mutual-exclusion question about it
+    /// undecided — the conservative default, never a proven disjoint pair.
+    fn is_known_head(&self, name: StringId) -> bool {
+        name == self.enum_id
+            || name == self.object_id
+            || self.primitive_ids.contains(&name)
+            || self.container(name).is_some()
+            || self.is_sealed_name(name)
     }
 
     /// `_canBeEqual` (constant_verifier.dart:561-596, the
@@ -1210,12 +1270,16 @@ impl<'a> NameWorld<'a> {
 
     /// Whether the world decides `name`'s sealedness and subclass set:
     /// the name resolves to a container (this unit's, or one the library
-    /// graph reaches — [`Self::locate`]), or it is a core sealed type
-    /// (`bool`). An unresolvable name is opaque — its sealed classes and
+    /// graph reaches — [`Self::locate`]), it is a core sealed type
+    /// (`bool`), or it is dart:core's `Enum` root — no unit ever declares
+    /// that container, yet its exhaustiveness face is fully decided here
+    /// (not sealed, no coverable subtypes — [`Self::name_subtypes`]), so
+    /// the covering verdict over it is the world's answer, not a blind
+    /// spot. An unresolvable name is opaque — its sealed classes and
     /// enum constants are invisible, so a non-exhaustive verdict over it
     /// may be false and the expression-face covering emit suppresses.
     pub(crate) fn name_resolvable(&self, name: StringId) -> bool {
-        self.container(name).is_some() || self.is_sealed_name(name)
+        name == self.enum_id || self.container(name).is_some() || self.is_sealed_name(name)
     }
 
     /// The closed subtype set of a sealed class or enum, in declaration
@@ -1223,6 +1287,16 @@ impl<'a> NameWorld<'a> {
     fn name_subtypes(&self, name: StringId) -> Vec<NameTy> {
         if name == self.bool_id {
             return vec![NameTy::BoolValue(true), NameTy::BoolValue(false)];
+        }
+        if name == self.enum_id {
+            // The dart:core `Enum` root's split is empty: the root is no
+            // exhaustiveness-closed set (every library may declare more
+            // enums), so its member declarations never enumerate as
+            // coverable subtypes. Constant patterns over an `Enum`-typed
+            // scrutinee leave the root's own space as the witness
+            // (`Enum()`, the oracle's `non_exhaustive` witness text), never
+            // an enumeration of the visible enum declarations.
+            return Vec::new();
         }
         let Some(container) = self.container(name) else {
             return Vec::new();

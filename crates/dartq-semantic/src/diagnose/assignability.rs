@@ -2174,32 +2174,30 @@ impl<'a> Engine<'a> {
                     Exhaustiveness::Exhaustive
                 )
             };
-            // The never-match face: the case's witness set equals the bare
-            // scrutinee's — its space removes nothing, so no scrutinee
-            // value can enter the body. Only constant roots qualify (the
-            // equality-check face — see
+            // The never-match face: the case's every single type can never
+            // be a subtype of the matched value's type — the disjointness
+            // gate ([`crate::switch_tracker::restriction_disjoint_from`]).
+            // Only constant roots qualify (the equality-check face — see
             // [`restriction_is_constant`]): `case null` over a
             // non-nullable type kills its body, a disjoint type test does
-            // not. A guarded case never qualifies: `compute` keeps its row
-            // out of the covering set (the guard may fail), so witness
-            // equality there says nothing about the pattern's space — its
-            // body stays live.
-            let whole = compute(&world, &value, &[]);
+            // not. Witness-set equality alone never answers here: the
+            // space model drops a row it cannot express ("the `Enum` root
+            // minus one constant") and regenerates the bare scrutinee
+            // witness, which would mark a case whose constant may overlap
+            // the matched type (`AstNodeTag.a` over an `Enum`-typed
+            // scrutinee) dead. A guarded case never qualifies: `compute`
+            // keeps its row out of the covering set (the guard may fail),
+            // so its body stays live. The upstream anchor is the flow's
+            // `_handleEqualityCheckPattern` known-false arm making the case
+            // body unreachable (upstream Dart SDK source,
+            // pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+            // flow_analysis.dart:8884-8917, fed by `_equalityCheck`).
             let never_matches = |index: usize| {
-                let without = compute(&world, &value, std::slice::from_ref(&cases[index]));
-                match (&whole.exhaustiveness, &without.exhaustiveness) {
-                    (
-                        Exhaustiveness::NonExhaustive(whole_witnesses),
-                        Exhaustiveness::NonExhaustive(case_witnesses),
-                    ) => {
-                        whole_witnesses.len() == case_witnesses.len()
-                            && whole_witnesses
-                                .iter()
-                                .zip(case_witnesses.iter())
-                                .all(|(w, c)| w.as_witness(&world) == c.as_witness(&world))
-                    }
-                    _ => false,
-                }
+                crate::switch_tracker::restriction_disjoint_from(
+                    &world,
+                    &ctx.cases[index].space,
+                    value,
+                )
             };
             let chain_start = (0..ctx.cases.len())
                 .find(|&index| !ctx.cases[index].guarded && total(index))
