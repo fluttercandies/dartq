@@ -3854,3 +3854,10 @@ mod ticket_2445_tests;
 /// for this shape (defense in depth kept).
 #[cfg(test)]
 mod ticket_2447_tests;
+/// The #2458 pins: comment trivia between the last literal element and
+/// the closing `}` is no element — a comment-only leaf segment no longer
+/// flips a context-less all-entry literal to
+/// `ambiguous_set_or_map_literal_both`, while a genuine mix still
+/// reports `_both` with its trailing comment intact.
+#[cfg(test)]
+mod ticket_2458_tests;

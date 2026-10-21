@@ -7496,6 +7496,23 @@ fn trim_ws(bytes: &[u8], mut start: usize, end: usize) -> usize {
     start
 }
 
+/// The first significant byte at or after `start`: whitespace and both
+/// comment forms walk forward. [`preceding_position`]'s forward twin, for
+/// the literal element census — upstream reads elements from the AST,
+/// where comments do not exist, so a segment that is only trivia (a
+/// comment trailing the last element ahead of the `}`) is no element.
+fn trim_trivia(bytes: &[u8], mut start: usize, end: usize) -> usize {
+    loop {
+        while start < end && bytes[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        match comment_end(bytes, start, end) {
+            Some(after) => start = after,
+            None => return start,
+        }
+    }
+}
+
 /// The source position one past the last significant byte before `cursor`:
 /// whitespace and both comment forms walk back over. The direct-position
 /// gate's scanner.
@@ -8215,7 +8232,12 @@ impl Engine<'_> {
         let mut leaves = Vec::new();
         let mut work: Vec<(usize, usize)> = literal_comma_segments(bytes, start, end);
         while let Some((s, e)) = work.pop() {
-            let s = trim_ws(bytes, s, e);
+            // Trivia is not an element (upstream census walks the AST's
+            // element list): a comment-only segment — a line/doc/block
+            // comment trailing the last element ahead of the `}` — yields
+            // no leaf, and a comment-led segment starts at its first
+            // significant byte (#2458).
+            let s = trim_trivia(bytes, s, e);
             if s >= e {
                 continue;
             }
