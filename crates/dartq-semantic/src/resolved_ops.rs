@@ -1286,7 +1286,29 @@ impl<'a> ResolvedTypeOps<'a> {
             .filter(|_| !self.snapshot.non_containers.contains(&name));
         if let Some(&decl) = registered {
             let Some(mapped_args) = self.map_args(args, arena, names, decl) else {
-                return self.invalid;
+                // The arity veto recovers instead of erasing: the official
+                // `_buildTypeArguments` (upstream Dart SDK source,
+                // `pkg/analyzer/lib/src/dart/resolver/named_type_resolver.dart`)
+                // reports `wrong_number_of_type_arguments` and fills
+                // `InvalidType` into every parameter position, so the
+                // annotation reads `Response<InvalidType>` — still an
+                // `InterfaceType`, not the whole-face `Invalid` whose 0c
+                // arm vacuums every subtype question (the oracle keeps
+                // `Response<int, int> x is Missing` dead-else but decidable
+                // against a resolved head, probed 3.47.1). The tested side
+                // carries the same recovery ([`Self::map_tested`]).
+                let params = self
+                    .snapshot
+                    .decl_params
+                    .get(&decl)
+                    .map_or(&[][..], Vec::as_slice);
+                return self.snapshot.table.intern(
+                    UninternedType::Interface {
+                        decl,
+                        args: vec![self.invalid; params.len()],
+                    },
+                    nullable,
+                );
             };
             return self
                 .snapshot
@@ -3598,27 +3620,31 @@ mod tests {
     /// #2380 face 2: the RECEIVER's own wrong-arity annotation recovers
     /// to the same `Response<Invalid>` interface, so `x is String`
     /// answers a decidable false — the is-test face stays silent, only
-    /// the arity error reports (`recv_self_arity.dart` probe).
+    /// the arity error reports (`recv_self_arity.dart` probe reports only
+    /// `wrong_number_of_type_arguments`; the `is!` polarity likewise,
+    /// probed 3.47.1). The oracle's liveness rides the tested head
+    /// RESOLVING — dart:core's `String` — so the rig declares it through
+    /// the unmodeled import, the exact face a `dart:` SDK class outside
+    /// the builtin table presents in the real pipeline. An UNRESOLVED
+    /// head over the same receiver keeps the oracle's dead else
+    /// (`Missing` probe: `type_test_with_undefined_name` + `dead_code`)
+    /// — the 0c arm the recovery must not paper over.
     #[test]
     fn ticket_2380_wrong_arity_receiver_is_string_stays_silent() {
-        let codes = diagnose_codes(
-            "class Response<T> { T? data; } \
+        let source = "class Response<T> { T? data; } \
              void f(Response<int, int> x) { \
                if (x is String) { 1; } else { 2; } \
-             }",
-            |_| None,
-        );
+             }";
+        let codes = diagnose_codes_unmodeled(source, &["String"]);
         assert!(
             !codes.contains(&"unnecessary_type_check") && !codes.contains(&"dead_code"),
             "a wrong-arity receiver's is String must stay silent: {codes:?}"
         );
-        let codes = diagnose_codes(
-            "class Response<T> { T? data; } \
+        let source = "class Response<T> { T? data; } \
              void f(Response<int, int> x) { \
                if (x is! String) { 1; } else { 2; } \
-             }",
-            |_| None,
-        );
+             }";
+        let codes = diagnose_codes_unmodeled(source, &["String"]);
         assert!(
             !codes.contains(&"unnecessary_type_check") && !codes.contains(&"dead_code"),
             "a wrong-arity receiver's is! String must stay silent: {codes:?}"
