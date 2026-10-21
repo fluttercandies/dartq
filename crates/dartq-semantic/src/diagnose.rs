@@ -4454,5 +4454,15 @@ mod ticket_2472_tests;
 #[cfg(test)]
 mod ticket_2484_tests;
 
+/// The #2489 pins: `unnecessary_type_check` reads the operand's resolved
+/// face — `FutureOr<UndefinedNav> rv; rv is Future<UndefinedNav>` folds
+/// constant-true through rule 6's legs plus the 0c `InvalidType`
+/// vacuity, while the `InvalidType` operand/checked gates keep an
+/// undefined head's own spelling silent (`type_test_with_undefined_name`
+/// owns that report), and the well-typed/`dynamic` operands keep both
+/// branches live.
+#[cfg(test)]
+mod ticket_2489_tests;
+
 #[cfg(test)]
 mod probe2471_tests;

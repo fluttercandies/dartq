@@ -1170,6 +1170,111 @@ impl<'a> Engine<'a> {
             .is_subtype_of(&NameTy::from_semantic(sub), &NameTy::from_semantic(sup))
     }
 
+    /// The resolved `InvalidType` face at the top level of a semantic
+    /// type (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/subtype.dart:274-276 — the 0c
+    /// rule, an `InvalidType` on either side answers `true`): the
+    /// parser's recovered-`Invalid` splice [`Ty::Unknown`], or a `Named`
+    /// head the type-position resolution answers as `Missing`/`NonType`
+    /// (`UndefinedNav`, a variable or prefix in a type position — the
+    /// resolver substitutes `InvalidType` on both). An in-scope type
+    /// parameter keeps its own lattice face (`type_resolution` answers
+    /// `Type`), a real declaration or alias the same, and a
+    /// multiply-defined head is `InvalidType` with no report —
+    /// `type_resolution` folds it under `Type` (the silent face), so
+    /// the scoped hit re-asks. Heads nested inside type arguments do
+    /// not reach this test at the top level; the recursive asks that
+    /// surface them (the `FutureOr` legs, the covariant slot walk)
+    /// re-enter through [`Self::resolved_subtype`] and read the same
+    /// face there.
+    pub(crate) fn is_invalid_ty(&self, ty: Ty) -> bool {
+        let Ty::Named { name, .. } = ty else {
+            return ty == Ty::Unknown;
+        };
+        // A compiler-known head answers before the scoped walk: the
+        // declared-face test (`Object`, the primitives, the indexed
+        // containers, [`NameWorld::is_known_head`]) and the in-scope
+        // type parameters are real interface types whether or not this
+        // unit's graph declares them. `Future`/`FutureOr` are NOT here
+        // on purpose — they are `dart:async` faces, not `dart:core`'s,
+        // so an unimported spelling is the oracle's `InvalidType`
+        // (the type-position miss reports `undefined_class` beside it).
+        if self.is_scope_param(name) || self.name_world().is_known_head(name) {
+            return false;
+        }
+        match self.type_resolution(name).0 {
+            TypeResolution::Missing | TypeResolution::NonType => true,
+            TypeResolution::Type => matches!(
+                lookup_scoped(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    name,
+                ),
+                ScopedHit::Ambiguous(_)
+            ),
+        }
+    }
+
+    /// The strict subtype verdict over the resolved operand faces
+    /// (`subtype.dart`'s `isSubtypeOf`): [`Engine::slot_subtype`] plus
+    /// the three upstream rules the slot cannot ask at `Ty` level —
+    /// 0c `InvalidType` (an unresolvable head is a subtype of
+    /// everything and vice-versa, [`Self::is_invalid_ty`]), rule 6
+    /// Left `FutureOr` (`FutureOr<S> <: T` iff `S <: T` and
+    /// `Future<S> <: T`, subtype.dart:372-385) and rule 10 Right
+    /// `FutureOr` (`S <: FutureOr<T>` iff `S <: Future<T>` or
+    /// `S <: T`, subtype.dart:418-449 — the assignable face's own
+    /// `FutureOr` arm answers the looser question, this ask needs the
+    /// strict one). A `FutureOr` with no written argument reads
+    /// `FutureOr<dynamic>` — the same raw-head face
+    /// [`Engine::assignable`]'s Right-`FutureOr` arm applies. `true`
+    /// is the proven-constant answer only; every undecidable shape
+    /// answers `false` — the under-report direction every consumer of
+    /// the fold already takes.
+    pub(crate) fn resolved_subtype(&self, sub: Ty, sup: Ty) -> bool {
+        if self.is_invalid_ty(sub) || self.is_invalid_ty(sup) {
+            return true;
+        }
+        let future_or_parts = |ty: Ty| -> Option<(Ty, ArgListId)> {
+            let Ty::Named {
+                name,
+                nullable: false,
+                args,
+            } = ty
+            else {
+                return None;
+            };
+            if name != self.intern("FutureOr") {
+                return None;
+            }
+            let value = {
+                let pool = self.boundary.pool();
+                pool.get(args).first().copied().unwrap_or(Ty::Dynamic)
+            };
+            Some((value, args))
+        };
+        if let Some((value, args)) = future_or_parts(sub) {
+            let future = Ty::Named {
+                name: self.intern("Future"),
+                nullable: false,
+                args,
+            };
+            return self.resolved_subtype(value, sup) && self.resolved_subtype(future, sup);
+        }
+        if let Some((value, args)) = future_or_parts(sup) {
+            let future = Ty::Named {
+                name: self.intern("Future"),
+                nullable: false,
+                args,
+            };
+            return self.resolved_subtype(sub, future) || self.resolved_subtype(sub, value);
+        }
+        self.slot_subtype(sub, sup) == Some(true)
+    }
+
     /// The name-level `canBeSubtypeOf`
     /// ([`NameWorld::can_be_subtype_of`], the mutual-exclusion companion).
     pub(crate) fn name_can_be_subtype(&self, sub: Ty, sup: Ty) -> bool {
@@ -1193,6 +1298,31 @@ impl<'a> Engine<'a> {
             index = index.checked_sub(1)?;
         }
         self.rows.get(index)
+    }
+
+    /// The `is`/`is!` operand's resolved static type
+    /// (`leftNode.typeOrThrow`, best_practices_verifier.dart:1011): the
+    /// nearest operand row's push-time snapshot, or — a bare local's —
+    /// the declared/inferred type the frame bound (`var self = this`
+    /// reads `self`'s inferred `this` type, not the row's `Unknown` —
+    /// mutation plays no part in the verdict). [`Ty::Unknown`] when no
+    /// operand row exists or the frame binds nothing — the every-check
+    /// suppresses sentinel the callers gate on.
+    pub(crate) fn type_check_operand_ty(&self) -> Ty {
+        let Some(operand) = self.operand_row() else {
+            return Ty::Unknown;
+        };
+        if operand.ty != Ty::Unknown {
+            operand.ty
+        } else if let RowShape::Bare(BareInfo::Plain { ty }) = &operand.shape {
+            if *ty != Ty::UNKNOWN {
+                *ty
+            } else {
+                self.typed_local(operand.name).unwrap_or(Ty::Unknown)
+            }
+        } else {
+            Ty::Unknown
+        }
     }
 
     /// `unnecessary_cast` on the expression form (`_isUnnecessaryCast`,
@@ -1365,9 +1495,23 @@ impl<'a> Engine<'a> {
                 args: ArgListId::EMPTY,
             };
         }
+        // `TypeSystem::type_check_verdict`'s first gate — an
+        // `InvalidType` operand is informative before every other arm
+        // (`subtype.dart`'s 0c vacuity never reaches the verdict), so
+        // `Missing rv is dynamic` reports nothing. The `p.T`-prefixed
+        // operand is the same silence (the prefix answers no subtype
+        // question — the under-report direction every unresolved side
+        // already takes).
+        let operand_ty = self.type_check_operand_ty();
+        if operand_ty == Ty::Unknown
+            || matches!(operand_ty, Ty::Named { name, .. } if matches!(self.resolve_bare(name).1, RefTarget::Prefix))
+            || self.is_invalid_ty(operand_ty)
+        {
+            return;
+        }
         let verdict = if checked == Ty::Dynamic {
             Some(true)
-        } else if checked == Ty::Unknown {
+        } else if checked == Ty::Unknown || self.is_invalid_ty(checked) {
             None
         } else if checked == Ty::Null {
             // The `is Null` family (`_checkAllTypeChecks`'s `Null` arm)
@@ -1385,41 +1529,19 @@ impl<'a> Engine<'a> {
                 return;
             }
         } else {
-            let Some(operand) = self.operand_row() else {
-                return;
-            };
-            // The operand's RESOLVED static type decides
-            // (`leftNode.typeOrThrow`, best_practices_verifier.dart:1011):
-            // the row's push-time snapshot, or — a bare local's — the
-            // declared/inferred type the frame bound (`var self = this`
-            // reads `self`'s inferred `this` type, not the row's
-            // `Unknown` — mutation plays no part in the verdict).
-            let operand_ty = if operand.ty != Ty::Unknown {
-                operand.ty
-            } else if let RowShape::Bare(BareInfo::Plain { ty }) = &operand.shape {
-                if *ty != Ty::UNKNOWN {
-                    *ty
-                } else {
-                    self.typed_local(operand.name).unwrap_or(Ty::Unknown)
-                }
-            } else {
-                Ty::Unknown
-            };
-            // A `p.T`-declared operand binds `Named{p}` (the same prefixed
-            // completion head): the prefix answers no subtype question, and
-            // the member the annotation really wrote is unrecoverable at
-            // this layer — the verdict stays silent (the under-report
-            // direction every unresolved side already takes).
-            if operand_ty == Ty::Unknown
-                || matches!(operand_ty, Ty::Named { name, .. } if matches!(self.resolve_bare(name).1, RefTarget::Prefix))
-            {
-                return;
-            }
             // A non-matching pair is informative — the official order has
             // no subtype-negative verdict (`TypeSystem::type_check_verdict`'s
             // doc): only the constant-true answer reports here, with `is!`
-            // mapping to the 'false' row below.
-            if !self.name_subtype(operand_ty, checked) {
+            // mapping to the 'false' row below. The name-level lattice
+            // answers first; pairs it cannot pose (a `FutureOr` source —
+            // `FutureOr<S> <: T` needs rule 6's legs — or an
+            // `InvalidType` nested inside the arguments, which only the
+            // resolved face reads as 0c-vacuous) re-ask through
+            // [`Self::resolved_subtype`], the same strict-subtype
+            // question over the operand's full face.
+            if !self.name_subtype(operand_ty, checked)
+                && !self.resolved_subtype(operand_ty, checked)
+            {
                 return;
             }
             Some(true)
