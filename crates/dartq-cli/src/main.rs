@@ -486,6 +486,20 @@ struct DartdevGlobals {
     /// configuration.
     #[arg(long, hide = true)]
     suppress_analytics: bool,
+    /// Upstream opts this run out of telemetry (hidden, positive-only —
+    /// the global parser declares it non-negatable). dartq sends no
+    /// telemetry; the flag parses and is a no-op.
+    #[arg(long, hide = true)]
+    disable_telemetry: bool,
+    /// Upstream's deprecated analytics switch (defaults on, negatable —
+    /// `--[no-]analytics`; both spellings parse and the last wins —
+    /// deprecated upstream in favor of `--suppress-analytics`). dartq
+    /// sends no analytics; the flag parses and is a no-op.
+    #[arg(long, hide = true, overrides_with = "no_analytics")]
+    analytics: bool,
+    /// The `--[no-]analytics` negative spelling — see `analytics`.
+    #[arg(long, hide = true, overrides_with = "analytics")]
+    no_analytics: bool,
 }
 
 /// The machine rows' output volume (the token-cost sweep's tier axis); the
@@ -2482,9 +2496,10 @@ mod tests {
     }
 
     /// The dartdev global flags parse on both diagnostic faces and stay
-    /// no-ops (ticket #2385, the cli-compat Flag-face P2). Upstream
-    /// declares them on the global dartdev parser (`upstream Dart SDK
-    /// source, pkg/dartdev/lib/src/utils.dart`,
+    /// no-ops (ticket #2385, the cli-compat Flag-face P2; #2390 adds the
+    /// hidden `--disable-telemetry` and the deprecated `--[no-]analytics`
+    /// pair). Upstream declares them on the global dartdev parser
+    /// (`upstream Dart SDK source, pkg/dartdev/lib/src/utils.dart`,
     /// `globalDartdevOptionsParser`) and merges the global parse past the
     /// command name, so the CI incantation `dart analyze
     /// --suppress-analytics` runs to the diagnostic-tier exit; `--version`
@@ -2495,12 +2510,14 @@ mod tests {
     #[test]
     fn dartdev_globals_accepted_and_ignored() {
         // Declaration order per `globalDartdevOptionsParser`.
-        const GLOBALS: [&str; 6] = [
+        const GLOBALS: [&str; 8] = [
             "--verbose",
             "--version",
             "--enable-analytics",
             "--disable-analytics",
+            "--disable-telemetry",
             "--diagnostics",
+            "--analytics",
             "--suppress-analytics",
         ];
         for (index, flag) in GLOBALS.iter().enumerate() {
@@ -2515,7 +2532,9 @@ mod tests {
                 analyze.dartdev_globals.version,
                 analyze.dartdev_globals.enable_analytics,
                 analyze.dartdev_globals.disable_analytics,
+                analyze.dartdev_globals.disable_telemetry,
                 analyze.dartdev_globals.diagnostics,
+                analyze.dartdev_globals.analytics,
                 analyze.dartdev_globals.suppress_analytics,
             ];
             assert!(fields[index], "{flag} must land on its own no-op field");
@@ -2541,7 +2560,9 @@ mod tests {
                 check.dartdev_globals.version,
                 check.dartdev_globals.enable_analytics,
                 check.dartdev_globals.disable_analytics,
+                check.dartdev_globals.disable_telemetry,
                 check.dartdev_globals.diagnostics,
+                check.dartdev_globals.analytics,
                 check.dartdev_globals.suppress_analytics,
             ];
             assert!(
@@ -2553,6 +2574,24 @@ mod tests {
                 1,
                 "exactly the invoked flag is set (check)"
             );
+        }
+
+        // The deprecated `--[no-]analytics` negation: the negative
+        // spelling lands on the same pair, the last spelling wins.
+        for args in [
+            &["analyze", "--no-analytics", "/pkg"][..],
+            &["check", "--no-analytics", "/tmp/a"][..],
+        ] {
+            let parsed = parse_args_of(args)
+                .unwrap_or_else(|error| panic!("{args:?} must parse: {error}"))
+                .expect("subcommand");
+            let globals = match parsed {
+                Command::Analyze(analyze) => analyze.dartdev_globals,
+                Command::Check(check) => check.dartdev_globals,
+                _ => panic!("expected analyze or check"),
+            };
+            assert!(!globals.analytics, "the negative spelling clears it");
+            assert!(globals.no_analytics, "the negative spelling is set");
         }
 
         // The acceptance is not a wildcard: a flag outside the oracle's
