@@ -358,6 +358,28 @@ pub struct FileFixSet {
     pub plugin: Vec<PluginFix>,
 }
 
+/// The `--code` selection face (upstream `dart fix --code`,
+/// `BulkFixProcessor._codesToFix` — upstream Dart SDK source,
+/// pkg/analysis_server/lib/src/services/correction/bulk_fix_processor.dart):
+/// the requested codes lower-case into a set and every row whose
+/// diagnostic code matches exactly (case-insensitively) stays — no code,
+/// no filter; unknown codes simply select nothing. The plugin proposals
+/// are not diagnostic-code-addressable and drop with the filter.
+pub fn select_by_codes(per_file: Vec<FileFixSet>, codes: &[String]) -> Vec<FileFixSet> {
+    if codes.is_empty() {
+        return per_file;
+    }
+    let wanted: FxHashSet<String> = codes.iter().map(|code| code.to_lowercase()).collect();
+    let mut per_file = per_file;
+    for set in &mut per_file {
+        set.fixes
+            .retain(|fix| wanted.contains(&fix.rule.to_lowercase()));
+        set.plugin.clear();
+    }
+    per_file.retain(|set| !set.fixes.is_empty());
+    per_file
+}
+
 /// A plugin's terminal failure for this run (spawn refusal, or the first
 /// surfaced runtime error — the isolation contract ends the plugin's
 /// session). Surfaced in the answer's `errors` list, never silently.
@@ -389,6 +411,7 @@ pub enum EditOutcome {
 // module root). Glob re-exports keep every historical `crate::fix::<name>`
 // path — including fix_table's registry imports — resolving unchanged.
 mod assists;
+mod convert_family;
 mod evidence;
 mod ignore;
 mod import;
@@ -405,6 +428,7 @@ mod scan;
 mod switch_cases;
 
 pub(crate) use assists::*;
+pub(crate) use convert_family::*;
 pub(crate) use evidence::*;
 pub(crate) use ignore::*;
 pub(crate) use import::*;

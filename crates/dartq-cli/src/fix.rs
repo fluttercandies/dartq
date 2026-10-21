@@ -49,6 +49,11 @@ pub(crate) struct FixArgs {
     pub(crate) dry_run: bool,
     #[arg(long, value_enum, default_value_t = FixFormat::Default)]
     pub(crate) format: FixFormat,
+    /// Apply only the fixes whose diagnostic code matches one of these
+    /// (comma-separated; case-insensitive exact match — the upstream
+    /// `dart fix --code` selection).
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) code: Vec<String>,
     /// Targets; empty resolves to the current directory.
     #[arg(default_value = ".")]
     pub(crate) paths: Vec<PathBuf>,
@@ -328,6 +333,7 @@ fn run(args: &FixArgs, out: &mut impl Write) -> u8 {
     };
     report_errors(&mut hosts);
     hosts.shutdown();
+    let per_file = fix::select_by_codes(per_file, &args.code);
     apply_and_report(&per_file, args.dry_run, args.format, out)
 }
 

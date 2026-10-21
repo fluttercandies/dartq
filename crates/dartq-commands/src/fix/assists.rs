@@ -12,6 +12,14 @@ pub struct AssistContext<'a> {
     pub selection: core::ops::Range<u32>,
     pub tokens: &'a TokenTable,
     pub ast: &'a SyntaxTable,
+    /// The unit's effective feature set (the parse's own posture): the
+    /// language-version gates the official producers read through
+    /// `isEnabled(Feature.…)` (`patterns` and friends).
+    pub features: Features,
+    /// The unit's path — the identity the import/part-uri producers read
+    /// (`packageToRelativeImport`'s package attribution). The engine-free
+    /// dispatch passes the request path through unchanged.
+    pub path: &'a Path,
     /// The unit's semantic query face — mounted by the resolved transport
     /// (the `run_with_semantics` arm; the rust-analyzer assist precedent
     /// of consuming sema), `None` under the engine-free dispatch. A
@@ -310,6 +318,89 @@ pub(crate) static ASSIST_TABLE: &[AssistSpec] = &[
         priority: 36,
         produce: surround_with_while,
     },
+    // The convert-family wave (#2400): twelve of the census's 23 missing
+    // convert kinds, each mirroring its official producer's guard and edit
+    // shape (upstream Dart SDK source,
+    // pkg/analysis_server/lib/src/services/correction/dart/convert_*.dart).
+    // The eleven facts-blocked kinds (classToEnum, classToMixin,
+    // partOfToPartUri, relativeToPackageImport, switchExpression,
+    // toDeclaringParameter, toDotShorthand, toInBodyConstructor,
+    // toInitializingFormal, toPrimaryConstructor, toSuperParameters) stay
+    // out — their producers read resolved element/type identities this
+    // substrate does not model (the flutter-family posture: facts-blocked,
+    // not a divergence). Each row's module doc names the absent face.
+    AssistSpec {
+        kind: "dart.assist.convert.toIfElement",
+        title: "Convert to 'if' element",
+        priority: 30,
+        produce: convert_to_if_element,
+    },
+    AssistSpec {
+        kind: "dart.assist.convert.toSpread",
+        title: "Convert to spread",
+        priority: 30,
+        produce: convert_to_spread,
+    },
+    AssistSpec {
+        kind: "dart.assist.convert.toMapLiteral",
+        title: "Convert to map literal",
+        priority: 30,
+        produce: convert_to_map_literal,
+    },
+    AssistSpec {
+        kind: "dart.assist.convert.toSetLiteral",
+        title: "Convert to set literal",
+        priority: 30,
+        produce: convert_to_set_literal,
+    },
+    AssistSpec {
+        kind: "dart.assist.convert.toForElement",
+        title: "Convert to 'for' element",
+        priority: 30,
+        produce: convert_to_for_element,
+    },
+    AssistSpec {
+        kind: "dart.assist.convert.getterToFinalField",
+        title: "Convert to final field",
+        priority: 30,
+        produce: getter_to_final_field,
+    },
+    AssistSpec {
+        kind: "dart.assist.convert.ifCaseStatementChain",
+        title: "Convert to 'if-case' statement chain",
+        priority: 30,
+        produce: if_case_statement_chain,
+    },
+    AssistSpec {
+        kind: "dart.assist.convert.fieldFormalToNormal",
+        title: "Convert to normal parameter",
+        priority: 30,
+        produce: field_formal_to_normal,
+    },
+    AssistSpec {
+        kind: "dart.assist.convert.ifCaseStatement",
+        title: "Convert to 'if-case' statement",
+        priority: 30,
+        produce: if_case_statement,
+    },
+    AssistSpec {
+        kind: "dart.assist.convert.forEachToForIndex",
+        title: "Convert to for-index loop",
+        priority: 30,
+        produce: for_each_to_for_index,
+    },
+    AssistSpec {
+        kind: "dart.assist.convert.switchStatement",
+        title: "Convert to switch statement",
+        priority: 30,
+        produce: convert_to_switch_statement,
+    },
+    AssistSpec {
+        kind: "dart.assist.convert.packageToRelativeImport",
+        title: "Convert to relative import",
+        priority: 30,
+        produce: package_to_relative_import,
+    },
 ];
 
 /// The built-in assist rows for one selection: every producer runs (the
@@ -347,12 +438,15 @@ pub(crate) fn builtin_assists_with(
     else {
         return Vec::new();
     };
-    let parsed = parse_unit(text, unit_features(None, path));
+    let features = unit_features(None, path);
+    let parsed = parse_unit(text, features);
     let context = AssistContext {
         text,
         selection: offset..end,
         tokens: &parsed.tokens,
         ast: &parsed.ast,
+        features,
+        path,
         semantics,
     };
     let mut rows: Vec<(i32, &'static str, PluginFix)> = ASSIST_TABLE
@@ -1496,12 +1590,12 @@ pub(crate) fn dot_access_parts(
 /// whether a `case` clause sits inside the parens (if-case).
 pub(crate) struct IfParts {
     pub(crate) condition: u32,
-    condition_span: core::ops::Range<u32>,
-    rparen16: u32,
-    then_id: u32,
+    pub(crate) condition_span: core::ops::Range<u32>,
+    pub(crate) rparen16: u32,
+    pub(crate) then_id: u32,
     else_keyword: Option<core::ops::Range<u32>>,
-    else_id: Option<u32>,
-    has_case: bool,
+    pub(crate) else_id: Option<u32>,
+    pub(crate) has_case: bool,
 }
 
 pub(crate) fn if_parts(context: &AssistContext<'_>, id: u32) -> Option<IfParts> {
@@ -4218,7 +4312,7 @@ pub(crate) fn join_variable_declaration(context: &AssistContext<'_>) -> Option<V
         })
         .unwrap_or(statements.len());
     let statement_index = index.saturating_sub(1);
-    let statement = statements[statement_index];
+    let statement = *statements.get(statement_index)?;
     let (declaration, assigned, _) = match context.ast.kind(statement) {
         // The assignment face: the payload row before the span-only
         // statement, and the official previous-element check — the

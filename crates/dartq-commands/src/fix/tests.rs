@@ -176,6 +176,18 @@
                 "dart.assist.surround.tryCatch",
                 "dart.assist.surround.tryFinally",
                 "dart.assist.surround.while",
+                "dart.assist.convert.toIfElement",
+                "dart.assist.convert.toSpread",
+                "dart.assist.convert.toMapLiteral",
+                "dart.assist.convert.toSetLiteral",
+                "dart.assist.convert.toForElement",
+                "dart.assist.convert.getterToFinalField",
+                "dart.assist.convert.ifCaseStatementChain",
+                "dart.assist.convert.fieldFormalToNormal",
+                "dart.assist.convert.ifCaseStatement",
+                "dart.assist.convert.forEachToForIndex",
+                "dart.assist.convert.switchStatement",
+                "dart.assist.convert.packageToRelativeImport",
             ]
         );
     }
@@ -8675,4 +8687,473 @@
     fn invalid_constant_without_const_produces_nothing() {
         let source = "void f() {\n  var x = C();\n}\n";
         assert_sem_no_fix("invalid_constant", "", source, at(source, "C()"), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // The convert family (#2400): the engine-free goldens
+    // -----------------------------------------------------------------------
+
+    /// No assist row titled `title` for the selection.
+    fn assert_no_assist(source: &str, at: usize, title: &str) {
+        let rows = assist_rows(source, at);
+        assert!(
+            rows.iter().all(|row| row.message != title),
+            "{title} offered on {source:?}: {:?}",
+            rows.iter().map(|r| r.message.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The switch-chain golden: three groups, the trailing `break` drops,
+    /// bodies re-indent one level.
+    #[test]
+    fn assist_if_case_statement_chain_groups() {
+        let source = "void f(Object? x) {\n  switch (x) {\n    case int():\n      0;\n      break;\n    case double():\n      1;\n    default:\n      2;\n  }\n}\n";
+        let expected = "void f(Object? x) {\n  if (x case int()) {\n    0;\n  } else if (x case double()) {\n    1;\n  } else {\n    2;\n  }\n}\n";
+        assert_assist(
+            source,
+            at(source, "switch") as usize,
+            "Convert to 'if-case' statement chain",
+            expected,
+        );
+    }
+
+    /// The shared-body face: statement-less members join into the `||`
+    /// pattern.
+    #[test]
+    fn assist_if_case_statement_chain_joins_shared_body() {
+        let source = "void f(Object? x) {\n  switch (x) {\n    case int():\n    case double():\n      0;\n  }\n}\n";
+        let expected = "void f(Object? x) {\n  if (x case int() || double()) {\n    0;\n  }\n}\n";
+        assert_assist(
+            source,
+            at(source, "switch") as usize,
+            "Convert to 'if-case' statement chain",
+            expected,
+        );
+    }
+
+    /// The chain declines when a `default` shares its group (the
+    /// shared-body `case double(): default:` face).
+    #[test]
+    fn assist_if_case_statement_chain_declines_shared_default() {
+        let source = "void f(Object? x) {\n  switch (x) {\n    case int():\n      0;\n    case double():\n    default:\n      1;\n  }\n}\n";
+        assert_no_assist(
+            source,
+            at(source, "switch") as usize,
+            "Convert to 'if-case' statement chain",
+        );
+    }
+
+    /// The if-case chain rewrites to the switch statement (labels, body
+    /// re-indent, the `default` else block).
+    #[test]
+    fn assist_switch_statement_from_if_case_chain() {
+        let source = "void f(Object? x) {\n  if (x case int()) {\n    0;\n  } else if (x case double()) {\n    1;\n  } else {\n    2;\n  }\n}\n";
+        let expected = "void f(Object? x) {\n  switch (x) {\n    case int():\n      0;\n    case double():\n      1;\n    default:\n      2;\n  }\n}\n";
+        assert_assist(
+            source,
+            at(source, "if (x") as usize,
+            "Convert to switch statement",
+            expected,
+        );
+    }
+
+    /// The empty non-last branch carries `break;` (the switch member's
+    /// fall-through shape).
+    #[test]
+    fn assist_switch_statement_breaks_empty_branch() {
+        let source = "void f(Object? x) {\n  if (x case int()) {\n  } else if (x case double()) {\n    1;\n  }\n}\n";
+        let expected = "void f(Object? x) {\n  switch (x) {\n    case int():\n      break;\n    case double():\n      1;\n  }\n}\n";
+        assert_assist(
+            source,
+            at(source, "if (x") as usize,
+            "Convert to switch statement",
+            expected,
+        );
+    }
+
+    /// The bool-condition faces: `x != null` reads as `_?`.
+    #[test]
+    fn assist_switch_statement_from_not_eq_null() {
+        let source = "void f(int? x) {\n  if (x != null) {\n    0;\n  }\n}\n";
+        let expected = "void f(int? x) {\n  switch (x) {\n    case _?:\n      0;\n  }\n}\n";
+        assert_assist(
+            source,
+            at(source, "if (") as usize,
+            "Convert to switch statement",
+            expected,
+        );
+    }
+
+    /// The switch-expression return face: the `return ` prefix deletes,
+    /// each case gains the label and the re-indented `return` line, the
+    /// trailing comma becomes `;`, the statement's `;` deletes.
+    #[test]
+    fn assist_switch_statement_from_switch_expression_return() {
+        let source = "int f(int x) {\n  return switch (x) {\n    0 => 0,\n    _ => 1,\n  };\n}\n";
+        let expected = "int f(int x) {\n  switch (x) {\n    case 0:\n      return 0;\n    default:\n      return 1;\n  }\n}\n";
+        assert_assist_edits(
+            source,
+            at(source, "switch") as usize,
+            "Convert to switch statement",
+            expected,
+        );
+    }
+
+    /// The typed single-variable declaration face: the declaration
+    /// splits, each case writes `v = …;`.
+    #[test]
+    fn assist_switch_statement_from_variable_declaration() {
+        let source = "void f(int x) {\n  int v = switch (x) {\n    0 => 0,\n    _ => 1,\n  };\n}\n";
+        let expected = "void f(int x) {\n  int v;\n  switch (x) {\n    case 0:\n      v = 0;\n    default:\n      v = 1;\n  }\n}\n";
+        assert_assist_edits(
+            source,
+            at(source, "switch") as usize,
+            "Convert to switch statement",
+            expected,
+        );
+    }
+
+    /// The untyped `var`/`final` declaration declines — the writeType
+    /// inference face is absent (fewer assists, never an approximated
+    /// one).
+    #[test]
+    fn assist_switch_statement_untyped_declaration_declines() {
+        let source = "void f(int x) {\n  var v = switch (x) {\n    0 => 0,\n  };\n}\n";
+        assert_no_assist(
+            source,
+            at(source, "switch") as usize,
+            "Convert to switch statement",
+        );
+    }
+
+    /// The typed wildcard `X _ =>` keeps the `case ` prefix (upstream
+    /// `isPureUntypedWildcard` requires the absent type; the insertion
+    /// rides `guardedPattern.offset`, ahead of the written type).
+    #[test]
+    fn assist_switch_statement_typed_wildcard_keeps_case_prefix() {
+        let source = "int f(int x) {\n  return switch (x) {\n    int _ => 1,\n  };\n}\n";
+        let expected = "int f(int x) {\n  switch (x) {\n    case int _:\n      return 1;\n  }\n}\n";
+        assert_assist_edits(
+            source,
+            at(source, "switch") as usize,
+            "Convert to switch statement",
+            expected,
+        );
+    }
+
+    /// A guarded case keeps its `when` text: the `=>`-region rewrite
+    /// anchors at the guarded pattern's end (upstream
+    /// `range.endStart(guardedPattern, case_.expression)`).
+    #[test]
+    fn assist_switch_statement_keeps_when_clause() {
+        let source =
+            "int f(int x) {\n  return switch (x) {\n    0 when x > 0 => 1,\n  };\n}\n";
+        let expected =
+            "int f(int x) {\n  switch (x) {\n    case 0 when x > 0:\n      return 1;\n  }\n}\n";
+        assert_assist_edits(
+            source,
+            at(source, "switch") as usize,
+            "Convert to switch statement",
+            expected,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The convert family: the `--code` selection
+    // -----------------------------------------------------------------------
+
+    /// Two real lint rows (one per file) plus a plugin proposal, through
+    /// the materialization face (the filter's input shape).
+    fn code_selection_set() -> Vec<FileFixSet> {
+        let first = one_fix("new A();", &[row("unnecessary_new", 0..3)]);
+        let second = one_fix("new B();", &[row("unnecessary_new", 0..3)]);
+        vec![
+            FileFixSet {
+                path: "a.dart".to_owned(),
+                fixes: vec![first],
+                plugin: vec![PluginFix {
+                    plugin: "sample".to_owned(),
+                    message: "proposed".to_owned(),
+                    priority: 0,
+                    edits: Vec::new(),
+                }],
+            },
+            FileFixSet {
+                path: "b.dart".to_owned(),
+                fixes: vec![second],
+                plugin: Vec::new(),
+            },
+        ]
+    }
+
+    /// The filter keeps the code-matching rows case-insensitively and
+    /// drops the plugin proposals (the diagnostic-code space only).
+    #[test]
+    fn code_selection_filters_exact_case_insensitive() {
+        let filtered = select_by_codes(code_selection_set(), &["UNNECESSARY_NEW".to_owned()]);
+        assert_eq!(filtered.len(), 2, "both files keep their matching row");
+        for set in &filtered {
+            assert_eq!(set.fixes.len(), 1);
+            assert_eq!(set.fixes[0].rule, "unnecessary_new");
+            assert!(set.plugin.is_empty(), "plugin rows are not code-addressable");
+        }
+    }
+
+    /// An unknown code selects nothing (no error, the empty answer).
+    #[test]
+    fn code_selection_unknown_code_selects_nothing() {
+        let filtered = select_by_codes(code_selection_set(), &["no_such_code".to_owned()]);
+        assert!(filtered.is_empty());
+    }
+
+    /// No codes: the identity (plugin rows included).
+    #[test]
+    fn code_selection_empty_is_identity() {
+        let sets = code_selection_set();
+        let kept = select_by_codes(sets.clone(), &[]);
+        assert_eq!(kept.len(), sets.len());
+        assert_eq!(kept[0].plugin.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // The convert family: the resolved-light goldens (the semantic face
+    // mounted — dartq-semantic's own test-harness shape rebuilt over the
+    // public API)
+    // -----------------------------------------------------------------------
+
+    /// The assist rows for `source` with the semantic face mounted: the
+    /// sole analyzed file of the library at `own` (the URI the
+    /// relative-import producer attributes through). The context tables
+    /// leak — the tests are one-shot processes.
+    fn semantic_assist_rows(source: &str, own: &str, at: usize) -> Vec<PluginFix> {
+        use dartq_language::{FeatureSet, LanguageVersion};
+        use dartq_parser::ParserFeatures;
+        use dartq_resolution::{LibraryClassModifiers, LibraryGraphBuilder, Namespaces};
+        use dartq_scanner::ScanConfig;
+        use dartq_semantic::diagnose::StrictModes;
+        use dartq_semantic::library::ElementIndex;
+        use dartq_semantic::model::MicroKind;
+        use dartq_semantic::{analyze_unit, collect};
+
+        let strings: &'static dartq_source::StringTable =
+            Box::leak(Box::new(dartq_source::StringTable::new()));
+        let mut files = dartq_source::FileTable::new();
+        let file = files.intern(Path::new("main.dart"));
+        let features = ParserFeatures::from_feature_set(FeatureSet::for_language_version(
+            LanguageVersion::new(3, 15),
+        ));
+        let scanned = dartq_scanner::scan(
+            source,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(
+            scanned.diagnostics.is_empty(),
+            "scanner diagnostics: {source:?}"
+        );
+        let tokens: &'static dartq_scanner::TokenTable = Box::leak(Box::new(scanned.tokens));
+        let elements = collect(source, tokens, features, strings);
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib = builder.intern(own);
+        builder.unit(lib, file);
+        for (name, decl) in elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(lib, name, file);
+        }
+        let mut index = ElementIndex::default();
+        index.insert(file, elements);
+        let graph: &'static _ = Box::leak(Box::new(builder.finish()));
+        let namespaces: &'static _ = Box::leak(Box::new(Namespaces::build(graph)));
+        let index: &'static _ = Box::leak(Box::new(index));
+        let analysis = analyze_unit(
+            source,
+            tokens,
+            features,
+            strings,
+            file,
+            lib,
+            graph,
+            namespaces,
+            index,
+            StrictModes::default(),
+            &LibraryClassModifiers::default(),
+        );
+        builtin_assists_with(
+            source,
+            Path::new("unit.dart"),
+            at as u64,
+            0,
+            Some(&analysis),
+            &walk_fuse(),
+        )
+    }
+
+    /// The semantic-face golden: exactly one row titled `title`, whose
+    /// edits apply together and rewrite `source` into `expected`.
+    fn assert_sem_assist(source: &str, own: &str, at: usize, title: &str, expected: &str) {
+        let rows = semantic_assist_rows(source, own, at);
+        let row = rows
+            .iter()
+            .find(|row| row.message == title)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `{title}` row for {source:?}: {:?}",
+                    rows.iter().map(|r| r.message.as_str()).collect::<Vec<_>>()
+                )
+            });
+        let (patched, outcomes) = apply(source, &row.edits);
+        assert!(
+            outcomes.iter().all(|o| *o == EditOutcome::Applied),
+            "{title} on {source:?}: {outcomes:?}"
+        );
+        assert_eq!(patched, expected, "{title} on {source:?}");
+    }
+
+    /// The semantic-face decline: no row titled `title` with the face
+    /// mounted.
+    fn assert_sem_no_assist(source: &str, own: &str, at: usize, title: &str) {
+        let rows = semantic_assist_rows(source, own, at);
+        assert!(
+            rows.iter().all(|row| row.message != title),
+            "{title} offered on {source:?}"
+        );
+    }
+
+    /// The is-type face folds the preceding declaration into the
+    /// if-case (upstream `convert_to_if_case_statement_test.dart`
+    /// `test_isType`).
+    #[test]
+    fn assist_if_case_statement_folds_is_type() {
+        let source = "void f(A a) {\n  var y = a.x;\n  if (y is List<int>) {\n    print(y);\n  }\n}\n";
+        let expected = "void f(A a) {\n  if (a.x case List<int> y) {\n    print(y);\n  }\n}\n";
+        assert_sem_assist(
+            source,
+            "package:t/main.dart",
+            at(source, "if (y") as usize,
+            "Convert to 'if-case' statement",
+            expected,
+        );
+    }
+
+    /// The not-eq-null face folds with the `final` spelling (upstream
+    /// `test_notEqNull`).
+    #[test]
+    fn assist_if_case_statement_folds_not_eq_null() {
+        let source = "void f(int? x) {\n  final y = x;\n  if (y != null) {\n    print(y);\n  }\n}\n";
+        let expected = "void f(int? x) {\n  if (x case final y?) {\n    print(y);\n  }\n}\n";
+        assert_sem_assist(
+            source,
+            "package:t/main.dart",
+            at(source, "if (y") as usize,
+            "Convert to 'if-case' statement",
+            expected,
+        );
+    }
+
+    /// A reference after the `if` declines the fold (upstream
+    /// `test_referencedInLaterStatements`-shaped gate); the then-branch
+    /// references stay allowed.
+    #[test]
+    fn assist_if_case_statement_declines_on_reference_after() {
+        let source = "void f(A a) {\n  var y = a.x;\n  if (y is int) {\n    print(y);\n  }\n  y;\n}\n";
+        assert_sem_no_assist(
+            source,
+            "package:t/main.dart",
+            at(source, "if (y") as usize,
+            "Convert to 'if-case' statement",
+        );
+    }
+
+    /// The for-in over a `List`-typed variable becomes the for-index
+    /// loop; the declared element form moves to the inserted first-line
+    /// assignment.
+    #[test]
+    fn assist_for_each_to_for_index_declares_the_element() {
+        let source = "void f(List<String> items) {\n  for (var e in items) {\n    print(e);\n  }\n}\n";
+        let expected = "void f(List<String> items) {\n  for (int i = 0; i < items.length; i++) {\n    var e = items[i];\n    print(e);\n  }\n}\n";
+        assert_sem_assist(
+            source,
+            "package:t/main.dart",
+            at(source, "for (") as usize,
+            "Convert to for-index loop",
+            expected,
+        );
+    }
+
+    /// The index name skips a taken `i` (the body's declarations join
+    /// the conflict set).
+    #[test]
+    fn assist_for_each_to_for_index_skips_taken_names() {
+        let source = "void f(List<String> items) {\n  for (String item in items) {\n    int i = 0;\n  }\n}\n";
+        let expected = "void f(List<String> items) {\n  for (int j = 0; j < items.length; j++) {\n    String item = items[j];\n    int i = 0;\n  }\n}\n";
+        assert_sem_assist(
+            source,
+            "package:t/main.dart",
+            at(source, "for (") as usize,
+            "Convert to for-index loop",
+            expected,
+        );
+    }
+
+    /// A non-`List` iterable declines (the resolved type gate); so does
+    /// the unmounted face (the engine-free dispatch never offers the
+    /// resolved-light row).
+    #[test]
+    fn assist_for_each_to_for_index_gates_on_the_list_type() {
+        let source = "void f(Iterable<String> items) {\n  for (var e in items) {\n    print(e);\n  }\n}\n";
+        assert_sem_no_assist(
+            source,
+            "package:t/main.dart",
+            at(source, "for (") as usize,
+            "Convert to for-index loop",
+        );
+        assert_no_assist(
+            source,
+            at(source, "for (") as usize,
+            "Convert to for-index loop",
+        );
+    }
+
+    /// The same-package `package:` import rewrites to the sibling path
+    /// (the quotes stay, the content rewrites).
+    #[test]
+    fn assist_package_to_relative_import_sibling() {
+        let source = "import 'package:t/other.dart';\n";
+        assert_sem_assist(
+            source,
+            "package:t/main.dart",
+            at(source, "other") as usize,
+            "Convert to relative import",
+            "import 'other.dart';\n",
+        );
+    }
+
+    /// The parent-directory face climbs with `..`.
+    #[test]
+    fn assist_package_to_relative_import_parent_directory() {
+        let source = "import 'package:t/other.dart';\n";
+        assert_sem_assist(
+            source,
+            "package:t/lib/main.dart",
+            at(source, "other") as usize,
+            "Convert to relative import",
+            "import '../other.dart';\n",
+        );
+    }
+
+    /// A cross-package import declines (the first-segment gate).
+    #[test]
+    fn assist_package_to_relative_import_cross_package_declines() {
+        let source = "import 'package:u/other.dart';\n";
+        assert_sem_no_assist(
+            source,
+            "package:t/main.dart",
+            at(source, "other") as usize,
+            "Convert to relative import",
+        );
     }
