@@ -767,6 +767,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_malformed_json() {
+        // Malformed JSON throws at this layer — the oracle's
+        // package_config-layer throw (`PackageConfig.parseString`); the
+        // analyzer's catch (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/context/packages.dart
+        // `parsePackageConfigJsonFile` — the read and the parse share one
+        // catch) is the ASSEMBLY's silent `Packages.empty` degrade, so the
+        // reader stays strict and the zero-row floor lives in the corrupt
+        // floor posture (#2427).
+        let malformed = [
+            // Bare word.
+            "not json",
+            // Truncated JSON.
+            r#"{"configVersion": 2, "packages": [{"name": "x""#,
+            // Trailing comma.
+            r#"{"configVersion": 2, "packages": [],}"#,
+            // Unquoted key.
+            r#"{configVersion: 2, "packages": []}"#,
+            // Empty file.
+            "",
+        ];
+        for text in malformed {
+            assert!(
+                PackageConfig::parse(text).is_err(),
+                "malformed JSON must not parse: {text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn resolve_rejects_names_outside_the_reader_grammar() {
         // A space is outside even the reader's loose charset
         // (package_config-3.0.0 util.dart:12-36).

@@ -11,8 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dartq_diagnostics::{
-    CodeInfo, DARTQ_PACKAGE_CONFIG_INVALID, DARTQ_PACKAGE_CONFIG_MISSING,
-    DARTQ_PACKAGE_CONFIG_OUT_OF_DATE,
+    CodeInfo, DARTQ_PACKAGE_CONFIG_MISSING, DARTQ_PACKAGE_CONFIG_OUT_OF_DATE,
 };
 use dartq_engine::semdiag;
 use dartq_engine::{Engine, EngineConfig};
@@ -65,47 +64,19 @@ impl StaleConfigAdvisory {
     }
 }
 
-/// The one non-gating advisory of a corrupt resolution: the
-/// `dartq/package_config_invalid` TOOL diagnostic. The config exists but is
-/// unusable — unreadable, malformed JSON, duplicate package names — and the
-/// analyze path degrades to the oracle's `Packages.empty` floor instead of
-/// refusing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InvalidConfigAdvisory {
-    /// The `package_config.json` that failed — the output faces' row anchor
-    /// (canonical, the oracle path convention).
-    pub config_path: PathBuf,
-    /// The concrete failure (the parse/resolve error), verbatim.
-    pub reason: String,
-}
-
-impl InvalidConfigAdvisory {
-    /// The diagnostic code, pinned to the reserved registry row
-    /// (`dartq_diagnostics::code::DARTQ_PACKAGE_CONFIG_INVALID`).
-    pub const CODE: &'static str = "dartq/package_config_invalid";
-
-    /// One-line message for the output faces.
-    #[must_use]
-    pub fn message(&self) -> String {
-        format!(
-            "package_config.json is unusable ({}); analyzing with `package:` \
-             imports unresolved",
-            self.reason
-        )
-    }
-}
-
 /// The one non-gating workspace advisory of an assembly, riding the #732
 /// output channel (one INFO TOOL row per invocation, never part of the
 /// per-file set or the exit tier). The stale variant covers a config that
 /// exists but looks stale; the missing variant covers degraded mode (#759):
 /// no `package_config.json` found, the context opens on the oracle's
 /// `BasicWorkspace` floor and every `package:` import stays unresolved — the
-/// oracle analyzes, it does not refuse. The invalid variant covers a config
-/// that exists but cannot be used: the oracle's parse-failure catch-all
-/// (upstream Dart SDK source, pkg/analyzer/lib/src/context/packages.dart
-/// `parsePackageConfigJsonFile`) turns any read/parse failure into
-/// `Packages.empty` and keeps analyzing.
+/// oracle analyzes, it does not refuse. A config that exists but cannot be
+/// used rides NO advisory: the oracle's catch-all (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/context/packages.dart `parsePackageConfigJsonFile`)
+/// turns any read/parse/validate failure into a silent `Packages.empty` —
+/// zero rows for the config face under the (severity, code, file) gate
+/// (#2427 probe evidence: truncated JSON, trailing commas, bad tokens,
+/// invalid content, duplicate roots — only import-site rows, every time).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceAdvisory {
     /// The config as written looks stale
@@ -114,9 +85,6 @@ pub enum WorkspaceAdvisory {
     /// No config anywhere (`dartq/package_config_missing`); the payload is
     /// the path `dart pub get` would materialize — the row's anchor.
     MissingConfig(PathBuf),
-    /// The config is unusable (`dartq/package_config_invalid`); the floor
-    /// is `Packages.empty` plus the self package.
-    InvalidConfig(InvalidConfigAdvisory),
 }
 
 impl WorkspaceAdvisory {
@@ -126,18 +94,16 @@ impl WorkspaceAdvisory {
         match self {
             Self::Stale(_) => DARTQ_PACKAGE_CONFIG_OUT_OF_DATE,
             Self::MissingConfig(_) => DARTQ_PACKAGE_CONFIG_MISSING,
-            Self::InvalidConfig(_) => DARTQ_PACKAGE_CONFIG_INVALID,
         }
     }
 
     /// The row's file anchor: the config the advisory names — existing for
-    /// the stale and invalid variants, prospective for the missing one.
+    /// the stale variant, prospective for the missing one.
     #[must_use]
     pub fn config_path(&self) -> &Path {
         match self {
             Self::Stale(advisory) => &advisory.config_path,
             Self::MissingConfig(config_path) => config_path,
-            Self::InvalidConfig(advisory) => &advisory.config_path,
         }
     }
 
@@ -146,7 +112,6 @@ impl WorkspaceAdvisory {
     pub fn message(&self) -> String {
         match self {
             Self::Stale(advisory) => advisory.message(),
-            Self::InvalidConfig(advisory) => advisory.message(),
             // The row's FILE field already carries the path; the message
             // stays position-free.
             Self::MissingConfig(_) => "package_config.json not found; run `dart pub get` \
@@ -358,7 +323,9 @@ pub fn engine_config_with_overrides(
 /// [`Freshness::check`] reports staleness or the graph recorded membership
 /// findings; [`WorkspaceAdvisory::MissingConfig`] when there is no config
 /// at all and the assembly degrades to the oracle's `BasicWorkspace` floor.
-/// Assembly proceeds either way; the advisory is output, not refusal.
+/// A corrupt config floors advisory-lessly (the oracle's catch-all emits
+/// zero rows for the config face). Assembly proceeds either way; the
+/// advisory is output, not refusal.
 ///
 /// The degraded floor (#759, the official locator's posture): the root
 /// walk finds the pubspec (pub's root discovery, the pubspec half of
@@ -425,7 +392,8 @@ pub(crate) fn package_assembly_with(
 /// (the compat face rebuilds its per-axis identity tables from it — the
 /// table is engine-owned, not `Clone`), the config directory, and the one
 /// non-gating advisory (the [`WorkspaceAdvisory::Stale`] variant; the
-/// Missing and Invalid variants are the strict refusals here).
+/// Missing variant and the advisory-less corrupt floor are the strict
+/// refusals here).
 pub(crate) type StrictAssembly = (
     Arc<PackageConfig>,
     ResolvedPackageGraph,
@@ -450,22 +418,27 @@ pub(crate) type StrictAssembly = (
 /// message byte-identical to [`load_workspace_faces`]'s.
 pub(crate) fn package_assembly_strict(dir: &Path) -> Result<StrictAssembly, WorkspaceError> {
     match assemble(dir, None, None)? {
-        AssemblyBody::Floor((_, _, _, _, advisory)) => Err(WorkspaceError(match advisory {
-            Some(WorkspaceAdvisory::MissingConfig(config_path)) => format!(
-                "no package config at {} (run `dart pub get`)",
-                config_path.display()
-            ),
-            Some(WorkspaceAdvisory::InvalidConfig(invalid)) => format!(
-                "package_config.json at {} is unusable: {}",
-                invalid.config_path.display(),
-                invalid.reason
-            ),
-            // The floors carry Missing or Invalid by construction; Stale
-            // and None are the success path's shapes.
-            Some(WorkspaceAdvisory::Stale(_)) | None => {
-                unreachable!("a degrade floor's advisory is Missing or Invalid")
-            }
-        })),
+        AssemblyBody::Floor((_, _, config_dir, _, advisory)) => {
+            Err(WorkspaceError(match advisory {
+                Some(WorkspaceAdvisory::MissingConfig(config_path)) => format!(
+                    "no package config at {} (run `dart pub get`)",
+                    config_path.display()
+                ),
+                // The corrupt-config floor rides no advisory row (the
+                // oracle's catch-all emits zero rows for the config face);
+                // the strict face still refuses, off the floor's config
+                // directory.
+                None => format!(
+                    "package_config.json at {} is unusable",
+                    config_dir.join("package_config.json").display()
+                ),
+                // The floors carry Missing or None by construction; Stale
+                // is the success path's shape.
+                Some(WorkspaceAdvisory::Stale(_)) => {
+                    unreachable!("a degrade floor never carries the stale advisory")
+                }
+            }))
+        }
         AssemblyBody::Resolved {
             config,
             graph,
@@ -574,17 +547,17 @@ fn assemble(
         // self package where the oracle attributes nothing — attribution-only.
         return degraded_assembly(&workspace.root, &config_path, &dir).map(AssemblyBody::Floor);
     }
-    // A config face failure degrades (the oracle's `Packages.empty`
-    // catch-all, packages.dart `parsePackageConfigJsonFile`); a malformed
-    // lock degrades to the lock-absent posture inside `load_workspace_faces`
-    // (the analyzer never reads `pubspec.lock`), and a malformed pubspec
-    // degrades to the empty model (the oracle's `Pubspec.parse` catch).
     let (config, lock, mut pubspec, malformed_lock) =
         match load_workspace_faces(&workspace.root, &config_path) {
             Ok(faces) => faces,
-            Err(WorkspaceFacesError::PackageConfig(reason)) => {
-                return corrupt_config_assembly(&workspace.root, &config_path, &dir, &reason)
-                    .map(AssemblyBody::Floor);
+            // A config face failure degrades (the oracle's `Packages.empty`
+            // catch-all, packages.dart `parsePackageConfigJsonFile`); a
+            // malformed lock degrades to the lock-absent posture inside
+            // `load_workspace_faces` (the analyzer never reads
+            // `pubspec.lock`), and a malformed pubspec degrades to the
+            // empty model (the oracle's `Pubspec.parse` catch).
+            Err(WorkspaceFacesError::PackageConfig(_)) => {
+                return corrupt_config_assembly(&workspace.root, &dir).map(AssemblyBody::Floor);
             }
             Err(error) => return Err(WorkspaceError(error.to_string())),
         };
@@ -618,9 +591,10 @@ fn assemble(
     // `workspace_members: None` outside a pub workspace — the standalone
     // package table must stay byte-identical to the pre-workspace shape.
     let workspace_members = (!pubspec.workspace.is_empty()).then_some(member_names.as_slice());
-    // A graph or table failure is a config-content defect (duplicate
-    // entries, a rejected `rootUri`/name/`packageUri`) — the same corrupt
-    // floor as a parse failure, the reason naming the defect.
+    // A graph or table failure is a config-content defect (a rejected
+    // `rootUri`/name/`packageUri`, colliding roots) — the same corrupt
+    // floor as a parse failure (the dup2 probe: two names over one root
+    // floor the oracle's config to `Packages.empty` too, zero rows).
     let graph = match build_graph(
         &config,
         &lock,
@@ -630,26 +604,14 @@ fn assemble(
         &config_dir,
     ) {
         Ok(graph) => graph,
-        Err(error) => {
-            return corrupt_config_assembly(
-                &workspace.root,
-                &config_path,
-                &dir,
-                &error.to_string(),
-            )
-            .map(AssemblyBody::Floor);
+        Err(_) => {
+            return corrupt_config_assembly(&workspace.root, &dir).map(AssemblyBody::Floor);
         }
     };
     let packages = match PackageTable::build(&config, &graph, &config_dir) {
         Ok(packages) => packages,
-        Err(error) => {
-            return corrupt_config_assembly(
-                &workspace.root,
-                &config_path,
-                &dir,
-                &error.to_string(),
-            )
-            .map(AssemblyBody::Floor);
+        Err(_) => {
+            return corrupt_config_assembly(&workspace.root, &dir).map(AssemblyBody::Floor);
         }
     };
     // The one stale-config advisory: freshness reasons plus the graph's
@@ -756,20 +718,19 @@ fn degraded_assembly(
 }
 
 /// The corrupt-config floor: the oracle's `Packages.empty` catch-all — any
-/// read/parse/resolve failure of an existing `package_config.json` becomes
-/// an empty configuration and the run keeps analyzing with every `package:`
-/// import unresolved (upstream Dart SDK source,
-/// pkg/analyzer/lib/src/context/packages.dart `parsePackageConfigJsonFile`
-/// catch; duplicate names reach it because package:package_config's default
-/// `onError` throws). Same single-package `BasicWorkspace` shape as
-/// [`degraded_assembly`] (the pubspec root is retained), with the
-/// invalid-config advisory carrying the failure.
-fn corrupt_config_assembly(
-    root: &Path,
-    config_path: &Path,
-    dir: &Path,
-    reason: &str,
-) -> Result<Assembly, WorkspaceError> {
+/// read/parse/resolve/validate failure of an existing `package_config.json`
+/// becomes an empty configuration and the run keeps analyzing with every
+/// `package:` import unresolved, emitting ZERO rows for the config face
+/// (upstream Dart SDK source,
+/// pkg/analyzer/lib/src/context/packages.dart `parsePackageConfigJsonFile`:
+/// the read and `PackageConfig.parseString` sit inside one `catch` mapping
+/// every failure to `Packages.empty`; #2427 probes confirm no shape —
+/// malformed JSON, invalid content, duplicate roots — produces a
+/// config-level row). Same single-package `BasicWorkspace` shape as
+/// [`degraded_assembly`] (the pubspec root is retained); the floor carries
+/// no advisory, so the analyze faces render nothing for it while the
+/// strict face refuses on [`AssemblyBody::Floor`]'s advisory-less shape.
+fn corrupt_config_assembly(root: &Path, dir: &Path) -> Result<Assembly, WorkspaceError> {
     let pubspec = load_pubspec_or_empty(root).map_err(WorkspaceError)?;
     let language_version = LanguageVersion::from_sdk_constraint(pubspec.environment.sdk.as_ref());
     let packages = PackageTable::basic(root, self_package_facts(&pubspec, language_version))
@@ -779,10 +740,7 @@ fn corrupt_config_assembly(
         empty_package_config(),
         root.join(".dart_tool"),
         dir.to_path_buf(),
-        Some(WorkspaceAdvisory::InvalidConfig(InvalidConfigAdvisory {
-            config_path: config_path.to_path_buf(),
-            reason: reason.to_owned(),
-        })),
+        None,
     ))
 }
 
@@ -1952,54 +1910,55 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// A malformed `package_config.json` degrades to the oracle's
-    /// `Packages.empty` floor instead of refusing (packages.dart
-    /// `parsePackageConfigJsonFile` catch): the assembly succeeds with the
-    /// self package only, every `package:` import unresolved, and ONE
-    /// TOOL-severity advisory naming the config and the failure.
+    /// A corrupt `package_config.json` — malformed JSON in every shape, or
+    /// valid JSON with unusable content — degrades to the oracle's
+    /// `Packages.empty` floor SILENTLY (packages.dart
+    /// `parsePackageConfigJsonFile`: the read and `PackageConfig.parseString`
+    /// sit inside one catch mapping every failure to `Packages.empty`): the
+    /// assembly succeeds with the self package only, every `package:` import
+    /// stays unresolved at its site, and NO advisory row fires (#2427 — the
+    /// old `dartq/package_config_invalid` row was a pure invention under the
+    /// (severity, code, file) gate).
     #[test]
     fn corrupt_config_degrades_to_empty_floor() {
-        let root = workspace("ws_corrupt", &[]);
-        fs::write(root.join(".dart_tool/package_config.json"), "{not json")
-            .expect("corrupt config");
-
-        let root = root.canonicalize().expect("root");
-        let config_path = root.join(".dart_tool/package_config.json");
-        let (config, _, advisory) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
-            .expect(
-                "a corrupt config degrades, never refuses (the oracle analyzes with \
-                 Packages.empty)",
+        let variants = [
+            // Bad token: bare word.
+            "not json",
+            // Truncated JSON.
+            r#"{"configVersion": 2, "packages": [{"name": "x""#,
+            // Trailing comma.
+            r#"{"configVersion": 2, "packages": [],}"#,
+            // Bad token: unquoted key.
+            r#"{configVersion: 2, "packages": []}"#,
+            // Empty file.
+            "",
+            // Valid JSON, unusable content.
+            r#"{"configVersion": 2, "packages": "nope"}"#,
+            r#"{"packages": []}"#,
+            r#"{"configVersion": 2, "packages": [{"name": "x"}]}"#,
+        ];
+        for (index, variant) in variants.iter().enumerate() {
+            let root = workspace("ws_corrupt", &[]);
+            fs::write(root.join(".dart_tool/package_config.json"), variant)
+                .expect("corrupt config");
+            let root = root.canonicalize().expect("root");
+            let (config, _, advisory) =
+                engine_config_with_advisory(&root, Some(&root.join("sdk"))).expect(
+                    "a corrupt config degrades, never refuses (the oracle analyzes with \
+                     Packages.empty)",
+                );
+            assert!(
+                config.pub_config.packages.is_empty(),
+                "variant {index}: the Packages.empty floor"
             );
-        assert!(
-            config.pub_config.packages.is_empty(),
-            "the Packages.empty floor"
-        );
-        assert_eq!(config.packages.len(), 1, "the self package stays");
-        assert!(config.packages.get("fixture").is_some());
-
-        let advisory = advisory.expect("one advisory");
-        assert_eq!(advisory.code(), DARTQ_PACKAGE_CONFIG_INVALID);
-        // The literal registry string breaks the constant-to-constant
-        // comparison above: a rename inside `DARTQ_PACKAGE_CONFIG_INVALID`
-        // would otherwise pass unnoticed (#2388).
-        assert_eq!(advisory.code().name, "dartq/package_config_invalid");
-        assert_eq!(advisory.code().dtype, dartq_diagnostics::DiagnosticType::Tool);
-        assert_eq!(advisory.config_path(), config_path);
-        let WorkspaceAdvisory::InvalidConfig(invalid) = &advisory else {
-            panic!("invalid-config advisory, got {advisory:?}")
-        };
-        assert!(!invalid.reason.is_empty(), "the failure is named");
-        assert!(
-            advisory
-                .message()
-                .contains("package_config.json is unusable (")
-                && advisory
-                    .message()
-                    .contains("analyzing with `package:` imports unresolved"),
-            "{advisory:?}"
-        );
-
-        fs::remove_dir_all(&root).ok();
+            assert_eq!(config.packages.len(), 1, "variant {index}: the self package stays");
+            assert!(config.packages.get("fixture").is_some());
+            assert!(
+                advisory.is_none(),
+                "variant {index}: zero rows for the config face, got {advisory:?}"
+            );
+            fs::remove_dir_all(&root).ok();
+        }
     }
 
     /// Duplicate package names resolve through the FIRST entry: the parse
