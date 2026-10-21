@@ -189,6 +189,13 @@ impl<'a> Engine<'a> {
         mut skip_own: bool,
     ) -> Walk<'a> {
         let mut name = container;
+        // The container whose supertype clauses wrote the current `name` —
+        // the prefixed-clause probe's writer key (a hop's superclass,
+        // mixins, and faces live in the found container's header; a
+        // prefixed spelling there binds through its import prefix,
+        // `implements idl.X`). The anchor's own name is a declaration, not
+        // a clause face, and keeps the bare resolution.
+        let mut writer = container;
         let mut owner = self.file;
         let mut scope_lib = self.lib;
         let mut seen: FxHashSet<StringId> = FxHashSet::default();
@@ -200,7 +207,7 @@ impl<'a> Engine<'a> {
         // already merges its `implements` faces — shadows an implementor's
         // faces. Collecting per level and seeding deepest-first preserves
         // that order while the chain climbs.
-        let mut pending_faces: Vec<Vec<(StringId, FileId)>> = Vec::new();
+        let mut pending_faces: Vec<Vec<(StringId, FileId, StringId)>> = Vec::new();
         // The current file's written supertype clauses, built on first
         // need — a found mixin member whose signature carries the mixin's
         // own type parameters (the application-site substitution face). The
@@ -212,21 +219,26 @@ impl<'a> Engine<'a> {
             if !seen.insert(name) {
                 return Walk::ChainBroken;
             }
-            let Some((found, found_owner)) = resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                scope_lib,
-                owner,
-                name,
-            ) else {
+            let found = if at_anchor {
+                resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    scope_lib,
+                    owner,
+                    name,
+                )
+            } else {
+                self.resolve_clause_face(writer, owner, scope_lib, name)
+            };
+            let Some((found, found_owner)) = found else {
                 if at_anchor {
                     // The receiver-type spelling itself unresolvable is the
                     // oracle's InvalidType: member reads ride dynamic and
                     // stay silent (the broken chain).
                     return Walk::ChainBroken;
                 }
-                if !self.supertype_hop_dead(name, scope_lib, owner) {
+                if !self.clause_hop_dead(writer, owner, scope_lib, name) {
                     // A declaration the index cannot model stays the broken
                     // chain either way — the oracle sees members we cannot
                     // walk.
@@ -268,14 +280,9 @@ impl<'a> Engine<'a> {
                     return Walk::ChainBroken;
                 }
                 let mixin_lib = owner_lib;
-                if let Some((mixin_container, mixin_owner)) = resolve_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    mixin_lib,
-                    found_owner,
-                    *mixin,
-                ) && let Some(entry) = mixin_container.members.get(&member)
+                if let Some((mixin_container, mixin_owner)) =
+                    self.resolve_clause_face(name, found_owner, mixin_lib, *mixin)
+                    && let Some(entry) = mixin_container.members.get(&member)
                 {
                     // The application-site substitution face: the member
                     // was found through `name`'s `with M<Arg>` edge, so its
@@ -304,7 +311,7 @@ impl<'a> Engine<'a> {
                     found
                         .implements_clause
                         .iter()
-                        .map(|face| (*face, found_owner))
+                        .map(|face| (*face, found_owner, name))
                         .collect(),
                 );
             }
@@ -329,6 +336,7 @@ impl<'a> Engine<'a> {
             // The superclass name is written in the declaring container's
             // file and resolves through that container's library (#491 S2a).
             scope_lib = owner_lib;
+            writer = name;
             name = superclass;
             owner = found_owner;
         }
@@ -344,17 +352,19 @@ impl<'a> Engine<'a> {
     /// The shared breadth-first face-list climb behind the
     /// `implements`-face merges of [`Engine::walk_from`], the super walk,
     /// and the mixin's `on`-constraint super walk: each seed `(name,
-    /// declaring file)` contributes its own (non-static) members and,
-    /// transitively, its supertypes' (a class climbs `extends`/`with`/
-    /// `implements`, a mixin interface its own interfaces, a nested extension
-    /// type its `implements`). A resolved member ends the walk (`Found`); an
-    /// unresolvable or cyclic face poisons the chain (`ChainBroken`, the
-    /// under-report boundary) only when nothing answered. Each face name is
-    /// written in its declaring file and resolves through that container's
-    /// library.
+    /// declaring file, writer container)` contributes its own (non-static)
+    /// members and, transitively, its supertypes' (a class climbs
+    /// `extends`/`with`/`implements`, a mixin interface its own interfaces,
+    /// a nested extension type its `implements`). A resolved member ends the
+    /// walk (`Found`); an unresolvable or cyclic face poisons the chain
+    /// (`ChainBroken`, the under-report boundary) only when nothing
+    /// answered. Each face name is written in its declaring file and
+    /// resolves through that container's library; a prefixed spelling in the
+    /// writer's own header binds through the prefix
+    /// ([`Engine::resolve_clause_face`]).
     pub(crate) fn walk_face_list(
         &self,
-        seeds: impl Iterator<Item = (StringId, FileId)>,
+        seeds: impl Iterator<Item = (StringId, FileId, StringId)>,
         mut scope_lib: LibraryId,
         member: StringId,
         seen: &mut FxHashSet<StringId>,
@@ -362,9 +372,9 @@ impl<'a> Engine<'a> {
     ) -> Walk<'a> {
         // Breadth-first: the declaration order is the oracle's face order,
         // and a shallower hit shadows a deeper one.
-        let mut queue: VecDeque<(StringId, FileId)> = seeds.collect();
+        let mut queue: VecDeque<(StringId, FileId, StringId)> = seeds.collect();
         let mut missing = false;
-        while let Some((face, face_owner)) = queue.pop_front() {
+        while let Some((face, face_owner, face_writer)) = queue.pop_front() {
             if !seen.insert(face) {
                 continue;
             }
@@ -373,20 +383,15 @@ impl<'a> Engine<'a> {
             // face declaring there (a queued `implements` face usually
             // declares elsewhere, #2313).
             let face_lib = self.graph.library_of_file(face_owner).unwrap_or(scope_lib);
-            let Some((face_container, face_container_owner)) = resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                face_lib,
-                face_owner,
-                face,
-            ) else {
-                // An unresolvable interface face — a dead edge (undefined or
-                // non-class spelling, the oracle's InvalidType) contributes
-                // nothing; only a declaration the index cannot model (the
-                // synthetic SDK face) records the broken hop. Either way the
-                // remaining faces keep walking.
-                if !self.supertype_hop_dead(face, face_lib, face_owner) {
+            let Some((face_container, face_container_owner)) =
+                self.resolve_clause_face(face_writer, face_owner, face_lib, face)
+            else {
+                // An unresolvable interface face — a dead edge (undefined,
+                // non-class, or prefixed-miss spelling, the oracle's
+                // InvalidType) contributes nothing; only a declaration the
+                // index cannot model (the synthetic SDK face) records the
+                // broken hop. Either way the remaining faces keep walking.
+                if !self.clause_hop_dead(face_writer, face_owner, face_lib, face) {
                     missing = true;
                 }
                 continue;
@@ -420,7 +425,7 @@ impl<'a> Engine<'a> {
                 .chain(face_container.implements_clause.iter().copied())
                 .chain(on_clause.iter().copied())
             {
-                queue.push_back((super_face, face_container_owner));
+                queue.push_back((super_face, face_container_owner, face));
             }
         }
         if missing {
@@ -458,7 +463,7 @@ impl<'a> Engine<'a> {
                     container_decl
                         .on_clause
                         .iter()
-                        .map(|face| (*face, self.file)),
+                        .map(|face| (*face, self.file, container)),
                     self.lib,
                     member,
                     &mut seen,
@@ -605,7 +610,7 @@ impl<'a> Engine<'a> {
                     spelling
                 };
                 let Some((inherited, face_name, origin, chain)) =
-                    self.face_member_tracked(face, lookup)
+                    self.face_member_tracked(container, face, lookup)
                 else {
                     // Unresolvable or cyclic face chain: suppression
                     // territory (recovery residue in a clause lands here
@@ -761,14 +766,9 @@ impl<'a> Engine<'a> {
             // valid superinterface upstream (`mixinType.isValidSuperinterface`)
             // — the element never enters `directSuperInterfaces`, so neither
             // its members nor its own accumulation slot contribute.
-            let Some((mixin_container, mixin_owner)) = resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                self.lib,
-                self.file,
-                mixin,
-            ) else {
+            let Some((mixin_container, mixin_owner)) =
+                self.resolve_clause_face(container, self.file, self.lib, mixin)
+            else {
                 continue;
             };
             if !matches!(
@@ -876,7 +876,7 @@ impl<'a> Engine<'a> {
                 };
                 for &face in &accumulated {
                     let Some((inherited, face_name, origin, chain)) =
-                        self.face_member_tracked(face, lookup)
+                        self.face_member_tracked(container, face, lookup)
                     else {
                         continue;
                     };
@@ -1095,10 +1095,10 @@ impl<'a> Engine<'a> {
             kind,
             ContainerKind::Extension | ContainerKind::ExtensionType
         );
-        let mut spared = !in_extension && self.face_member_any(decl, spelling);
+        let mut spared = !in_extension && self.face_member_any(decl, container, spelling);
         if !spared && !in_extension && entry.kind == MemberKind::Field {
             let setter = self.setter_spelling(spelling);
-            spared = self.face_member_any(decl, setter);
+            spared = self.face_member_any(decl, container, setter);
         }
         if !spared && !in_extension && entry.kind == MemberKind::Setter {
             // The accessor-twin face: an inherited FIELD induces the setter
@@ -1108,7 +1108,7 @@ impl<'a> Engine<'a> {
             // an inherited setter's spelling.
             let base_text = self.strings.resolve(spelling);
             let base_text = base_text.strip_suffix('=').unwrap_or(base_text);
-            spared = self.face_member_any(decl, self.intern(base_text));
+            spared = self.face_member_any(decl, container, self.intern(base_text));
         }
         if spared {
             return;
@@ -1128,14 +1128,22 @@ impl<'a> Engine<'a> {
     /// except an unindexed dart:core interface, whose declared members the
     /// frozen [`CORE_INTERFACE_MEMBERS`] face answers (a user-declared
     /// same-named container resolves indexed and wins the face first).
-    pub(crate) fn face_member_any(&self, decl: &Container, spelling: StringId) -> bool {
+    /// `container` is the declaring container whose clauses wrote the faces
+    /// (the prefixed-clause probe's writer key).
+    pub(crate) fn face_member_any(
+        &self,
+        decl: &Container,
+        container: StringId,
+        spelling: StringId,
+    ) -> bool {
         let mut faces = Vec::new();
         faces.extend(decl.superclass);
         faces.extend(decl.with_clause.iter().copied());
         faces.extend(decl.implements_clause.iter().copied());
         faces.extend(decl.on_clause.iter().copied());
         faces.into_iter().any(|face| {
-            self.face_member(face, spelling).is_some() || self.face_member_frozen(face, spelling)
+            self.face_member(container, face, spelling).is_some()
+                || self.face_member_frozen(container, face, spelling)
         })
     }
 
@@ -1146,8 +1154,14 @@ impl<'a> Engine<'a> {
     /// ([`CORE_TYPE_MEMBERS`] / [`CORE_INTERFACE_MEMBERS`], aliased for the
     /// collection mixins/bases that re-export a `dart:core` interface's
     /// members, #2161). A hop that resolves to an indexed container whose
-    /// own member walk misses is a real miss and stops the climb.
-    pub(crate) fn face_member_frozen(&self, face: StringId, spelling: StringId) -> bool {
+    /// own member walk misses is a real miss and stops the climb. `writer`
+    /// is the container whose clauses wrote `face`.
+    pub(crate) fn face_member_frozen(
+        &self,
+        writer: StringId,
+        face: StringId,
+        spelling: StringId,
+    ) -> bool {
         let spelling_text = self.strings.resolve(spelling);
         let frozen_hit = |name: &str| {
             let aliases: &[&str] = COLLECTION_INTERFACE_ALIASES
@@ -1163,6 +1177,7 @@ impl<'a> Engine<'a> {
                 })
         };
         let mut name = face;
+        let mut hop_writer = writer;
         let mut owner = self.file;
         let mut scope_lib = self.lib;
         let mut seen = FxHashSet::default();
@@ -1172,32 +1187,31 @@ impl<'a> Engine<'a> {
         // reaching `Set`'s frozen members). Each entry carries the writer
         // hop's library — the queued spelling resolves through it, whatever
         // other hops the drain climbs in between (#2313).
-        let mut pending: VecDeque<(StringId, FileId, LibraryId)> = VecDeque::new();
+        let mut pending: VecDeque<(StringId, FileId, LibraryId, StringId)> = VecDeque::new();
         loop {
             if !seen.insert(name) {
                 return false;
             }
-            let Some((found, found_owner)) = resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                scope_lib,
-                owner,
-                name,
-            ) else {
-                // The unindexed hop — a dart:core/`dart:collection` face —
-                // answers by its frozen member face.
-                if frozen_hit(self.strings.resolve(name)) {
-                    return true;
-                }
-                let Some((next, next_owner, next_lib)) = pending.pop_front() else {
-                    return false;
+            let (found, found_owner) =
+                match self.resolve_clause_face(hop_writer, owner, scope_lib, name) {
+                    Some(pair) => pair,
+                    None => {
+                        // The unindexed hop — a dart:core/`dart:collection` face —
+                        // answers by its frozen member face.
+                        if frozen_hit(self.strings.resolve(name)) {
+                            return true;
+                        }
+                        let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front()
+                        else {
+                            return false;
+                        };
+                        name = next;
+                        owner = next_owner;
+                        scope_lib = next_lib;
+                        hop_writer = next_writer;
+                        continue;
+                    }
                 };
-                name = next;
-                owner = next_owner;
-                scope_lib = next_lib;
-                continue;
-            };
             if let Some(entry) = found.members.get(&spelling)
                 && !entry.is_static
             {
@@ -1211,14 +1225,7 @@ impl<'a> Engine<'a> {
                 if !seen.insert(*mixin) {
                     return false;
                 }
-                match resolve_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    owner_lib,
-                    owner,
-                    *mixin,
-                ) {
+                match self.resolve_clause_face(name, owner, owner_lib, *mixin) {
                     Some((mixin_container, _))
                         if mixin_container
                             .members
@@ -1237,21 +1244,24 @@ impl<'a> Engine<'a> {
                 return true;
             }
             for super_face in found.implements_clause.iter().chain(found.on_clause.iter()) {
-                pending.push_back((*super_face, found_owner, owner_lib));
+                pending.push_back((*super_face, found_owner, owner_lib, name));
             }
             match found.superclass {
                 Some(superclass) => {
                     scope_lib = owner_lib;
+                    hop_writer = name;
                     name = superclass;
                     owner = found_owner;
                 }
                 None => {
-                    let Some((next, next_owner, next_lib)) = pending.pop_front() else {
+                    let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front()
+                    else {
                         return false;
                     };
                     name = next;
                     owner = next_owner;
                     scope_lib = next_lib;
+                    hop_writer = next_writer;
                 }
             }
         }
@@ -3295,9 +3305,9 @@ impl<'a> Engine<'a> {
                 let bare = self
                     .strings
                     .intern(self.strings.resolve(name).strip_suffix('=')?);
-                decl.members.get(&bare).filter(|e| {
-                    declared(*e) && e.kind == MemberKind::Field && !e.is_final
-                })
+                decl.members
+                    .get(&bare)
+                    .filter(|e| declared(*e) && e.kind == MemberKind::Field && !e.is_final)
             })?;
         Some(FaceEntry {
             name,
@@ -3336,7 +3346,9 @@ impl<'a> Engine<'a> {
                     // lets the inherited member claim the implemented seat
                     // and fabricates a comparison against the own declared
                     // signature the oracle never runs.
-                    e.kind == MemberKind::Method || e.kind == MemberKind::Getter || e.kind == MemberKind::Field
+                    e.kind == MemberKind::Method
+                        || e.kind == MemberKind::Getter
+                        || e.kind == MemberKind::Field
                 }
         };
         let entry = decl
@@ -3641,14 +3653,16 @@ impl<'a> Engine<'a> {
     /// #491 S2a; the visited set guards cycles). The third slot is the
     /// defining file — the hit's own declaration-site anchor face (the
     /// `invalid_override` context row resolves through it, cross-file).
-    /// `None` = an unresolvable or cyclic hop — the caller suppresses
-    /// rather than reports.
+    /// `writer` is the container whose supertype clauses wrote `face` (the
+    /// prefixed-clause probe's key). `None` = an unresolvable or cyclic
+    /// hop — the caller suppresses rather than reports.
     pub(crate) fn face_member(
         &self,
+        writer: StringId,
         face: StringId,
         spelling: StringId,
     ) -> Option<(Projected<'a, MemberEntry>, StringId, FileId)> {
-        self.face_member_tracked(face, spelling)
+        self.face_member_tracked(writer, face, spelling)
             .map(|(entry, name, owner, _)| (entry, name, owner))
     }
 
@@ -3659,6 +3673,7 @@ impl<'a> Engine<'a> {
     /// parameters, `Substitution.fromInterfaceType`'s walk).
     pub(crate) fn face_member_tracked(
         &self,
+        writer: StringId,
         face: StringId,
         spelling: StringId,
     ) -> Option<(
@@ -3668,6 +3683,7 @@ impl<'a> Engine<'a> {
         Vec<(StringId, FileId)>,
     )> {
         let mut name = face;
+        let mut hop_writer = writer;
         let mut owner = self.file;
         let mut scope_lib = self.lib;
         let mut seen = FxHashSet::default();
@@ -3681,30 +3697,26 @@ impl<'a> Engine<'a> {
         // hop's library: a queued face's spelling is written in the writer's
         // file and resolves through that library, whatever other hops the
         // drain climbs in between (#2313).
-        let mut pending: VecDeque<(StringId, FileId, LibraryId)> = VecDeque::new();
+        let mut pending: VecDeque<(StringId, FileId, LibraryId, StringId)> = VecDeque::new();
         loop {
             if !seen.insert(name) {
                 return None;
             }
-            let (found, found_owner) = match resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                scope_lib,
-                owner,
-                name,
-            ) {
-                Some(pair) => pair,
-                None => {
-                    let Some((next, next_owner, next_lib)) = pending.pop_front() else {
-                        return None;
-                    };
-                    name = next;
-                    owner = next_owner;
-                    scope_lib = next_lib;
-                    continue;
-                }
-            };
+            let (found, found_owner) =
+                match self.resolve_clause_face(hop_writer, owner, scope_lib, name) {
+                    Some(pair) => pair,
+                    None => {
+                        let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front()
+                        else {
+                            return None;
+                        };
+                        name = next;
+                        owner = next_owner;
+                        scope_lib = next_lib;
+                        hop_writer = next_writer;
+                        continue;
+                    }
+                };
             chain.push((name, found_owner));
             if let Some(entry) = found.members.get(&spelling)
                 && !entry.is_static
@@ -3729,14 +3741,9 @@ impl<'a> Engine<'a> {
                     return None;
                 }
                 let mixin_lib = owner_lib;
-                if let Some((mixin_container, mixin_owner)) = resolve_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    mixin_lib,
-                    owner,
-                    *mixin,
-                ) {
+                if let Some((mixin_container, mixin_owner)) =
+                    self.resolve_clause_face(name, owner, mixin_lib, *mixin)
+                {
                     chain.push((*mixin, mixin_owner));
                     if let Some(entry) = mixin_container.members.get(&spelling)
                         && !entry.is_static
@@ -3755,21 +3762,24 @@ impl<'a> Engine<'a> {
             // whose `extends`/`with` chain ends still contributes its
             // interfaces' members.
             for super_face in found.implements_clause.iter().chain(found.on_clause.iter()) {
-                pending.push_back((*super_face, found_owner, owner_lib));
+                pending.push_back((*super_face, found_owner, owner_lib, name));
             }
             match found.superclass {
                 Some(superclass) => {
                     scope_lib = owner_lib;
+                    hop_writer = name;
                     name = superclass;
                     owner = found_owner;
                 }
                 None => {
-                    let Some((next, next_owner, next_lib)) = pending.pop_front() else {
+                    let Some((next, next_owner, next_lib, next_writer)) = pending.pop_front()
+                    else {
                         return None;
                     };
                     name = next;
                     owner = next_owner;
                     scope_lib = next_lib;
+                    hop_writer = next_writer;
                 }
             }
         }
@@ -4091,6 +4101,170 @@ impl<'a> Engine<'a> {
             }
         }
         map
+    }
+
+    /// The prefixed supertype-clause faces of this file's container headers:
+    /// `(writer container, face local name)` → the written prefix head. The
+    /// element model keeps only the clause continuation (`implements idl.X`
+    /// records `X` — collector.rs's bare-name convention), so a prefixed
+    /// clause face resolves nowhere in the bare scope and every face walk
+    /// over it dies. The dotted spellings live only in the source tokens;
+    /// this bounded header-window walk recovers them once per pass
+    /// ([`FaceMemo::prefixed_clauses`]). A recorded pair whose
+    /// [`prefixed_container`] probe misses is inert: an unregistered prefix
+    /// or an absent local keeps the dead-edge verdict the bare miss already
+    /// answered.
+    fn prefixed_clauses(&self) -> FxHashMap<(StringId, StringId), StringId> {
+        if let Some(hit) = self.member_faces.prefixed_clauses.borrow().as_ref() {
+            return hit.clone();
+        }
+        let map = self.scan_prefixed_clauses();
+        *self.member_faces.prefixed_clauses.borrow_mut() = Some(map.clone());
+        map
+    }
+
+    /// Whether `face` in `writer`'s supertype clauses was spelled through an
+    /// import prefix (`idl.X`) in this file's header text. Only the
+    /// diagnosing file's tokens are scanned — a foreign container's clauses
+    /// keep the bare-name convention (the under-report direction).
+    fn prefixed_clause_prefix(&self, writer: StringId, face: StringId) -> Option<StringId> {
+        let map = self.prefixed_clauses();
+        if map.is_empty() {
+            return None;
+        }
+        map.get(&(writer, face)).copied()
+    }
+
+    /// One linear token pass collecting the dotted clause faces
+    /// ([`Self::prefixed_clauses`]): the same `class`/`mixin`/`enum` header
+    /// trigger [`Self::scan_header_clauses`] applies, each header window
+    /// walked to its body (skipped whole) or `;` mixin-application close,
+    /// `<...>` groups depth-tracked so an argument-position `p.T`
+    /// (`implements List<p.T>`, a bounded parameter) never reads as a clause
+    /// face.
+    fn scan_prefixed_clauses(&self) -> FxHashMap<(StringId, StringId), StringId> {
+        let mut map: FxHashMap<(StringId, StringId), StringId> = FxHashMap::default();
+        let toks = self.tokens.as_slice();
+        let mut i = 0;
+        while i < toks.len() {
+            match self.tokens.lexeme(self.source, i) {
+                "class" | "mixin" | "enum" => i = self.scan_one_prefixed_header(i + 1, &mut map),
+                _ => i += 1,
+            }
+        }
+        map
+    }
+
+    /// Walks one header's window ([`Self::scan_prefixed_clauses`]): an
+    /// identifier at depth 0 followed by `.` and an identifier is a prefixed
+    /// clause face (`idl.X`), recorded under the declaring container's name.
+    /// Recovery residue inside the window can only record a pair whose
+    /// prefix probe misses — the lookup, not the scan, validates.
+    fn scan_one_prefixed_header(
+        &self,
+        start: usize,
+        map: &mut FxHashMap<(StringId, StringId), StringId>,
+    ) -> usize {
+        let toks = self.tokens.as_slice();
+        let lex_at = |i: usize| toks.get(i).map(|_| self.tokens.lexeme(self.source, i));
+        let mut i = start;
+        let Some(container) = self.intern_checked(i) else {
+            return i;
+        };
+        i += 1;
+        let mut angle = 0usize;
+        while let Some(lex) = lex_at(i) {
+            match lex {
+                "{" => return self.tokens.matching_end(i).map_or(toks.len(), |c| c + 1),
+                ";" => return i + 1,
+                "<" => {
+                    angle += 1;
+                    i += 1;
+                }
+                // The scanner never splits shift tokens (`>>` is always one
+                // token — upstream Dart SDK source,
+                // `pkg/front_end/lib/src/scanner/abstract_scanner.dart`
+                // `tokenizeGreaterThan`), so a nested argument group's
+                // closers arrive merged: unwind one depth per `>`.
+                ">" | ">>" | ">>>" => {
+                    angle = angle.saturating_sub(lex.matches('>').count());
+                    i += 1;
+                }
+                "." if angle == 0 => {
+                    // `prefix . local` at a clause-head position: the head
+                    // identifier precedes the dot, the continuation follows.
+                    if let (Some(prefix), Some(local)) = (
+                        i.checked_sub(1).and_then(|p| self.intern_checked(p)),
+                        i.checked_add(1).and_then(|n| self.intern_checked(n)),
+                    ) {
+                        map.insert((container, local), prefix);
+                    }
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
+        i
+    }
+
+    /// Resolves a supertype-clause face as written in `writer`'s header: a
+    /// dotted spelling (`idl.X`, recovered by
+    /// [`Self::prefixed_clause_prefix`]) binds through the prefix's merged
+    /// table — the same container identity an unprefixed import of the same
+    /// library yields ([`prefixed_container`]) — and never falls back to the
+    /// bare scope (a same-named local must not shadow the written face).
+    /// A bare spelling keeps [`resolve_container`]. Only this file's headers
+    /// carry prefix facts; foreign writers keep the bare path.
+    fn resolve_clause_face(
+        &self,
+        writer: StringId,
+        file: FileId,
+        scope_lib: LibraryId,
+        face: StringId,
+    ) -> Option<(&'a Container, FileId)> {
+        if file == self.file
+            && let Some(prefix) = self.prefixed_clause_prefix(writer, face)
+        {
+            let lib = self.graph.library_of_file(file).unwrap_or(scope_lib);
+            return prefixed_container(self.graph, self.namespaces, self.index, lib, prefix, face);
+        }
+        resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            scope_lib,
+            file,
+            face,
+        )
+    }
+
+    /// The dead-edge probe for a clause face ([`supertype_hop_dead`]'s
+    /// prefixed arm): a dotted spelling the prefix table cannot answer
+    /// (unregistered prefix, absent local) is the oracle's
+    /// `undefined_class`-on-the-continuation — the InvalidType dead edge —
+    /// regardless of the bare name's fate; a resolved-but-unindexed target
+    /// is the broken chain, not dead. A bare spelling keeps
+    /// [`Engine::supertype_hop_dead`].
+    fn clause_hop_dead(
+        &self,
+        writer: StringId,
+        file: FileId,
+        lib: LibraryId,
+        name: StringId,
+    ) -> bool {
+        if file == self.file
+            && let Some(prefix) = self.prefixed_clause_prefix(writer, name)
+        {
+            let target_lib = self.graph.library_of_file(file).unwrap_or(lib);
+            return match self
+                .namespaces
+                .lookup_prefixed(self.graph, target_lib, prefix, name)
+            {
+                Lookup::Found(NamespaceEntry::Decl(owner)) => self.index.get(owner).is_none(),
+                _ => true,
+            };
+        }
+        self.supertype_hop_dead(name, lib, file)
     }
 
     /// Parses one class-family header's parameter window and supertype

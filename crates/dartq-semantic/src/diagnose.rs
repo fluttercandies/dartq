@@ -3720,3 +3720,11 @@ mod ticket_2423_tests;
 /// tables instead of the under-report.
 #[cfg(test)]
 mod ticket_2420_tests;
+
+/// The #2429 pins: a prefixed supertype-clause face (`implements idl.X`)
+/// binds through the prefix's export scope — the @override gate spares a
+/// member the prefixed interface declares, reports one the interface lacks,
+/// and a prefixed dead edge behaves like the unprefixed dead edge (#2420's
+/// verdicts).
+#[cfg(test)]
+mod ticket_2429_tests;

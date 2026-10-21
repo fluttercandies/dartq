@@ -896,6 +896,15 @@ pub(crate) enum Walk<'a> {
 #[derive(Default)]
 pub(crate) struct FaceMemo<'a> {
     pub(crate) walks: RefCell<FxHashMap<(StringId, StringId, bool), Walk<'a>>>,
+    /// The prefixed supertype-clause faces of the diagnosing file's
+    /// container headers, scanned once per pass on the first prefixed-face
+    /// question (`(writer container, face local name)` → the written prefix
+    /// head): the element model keeps only the clause continuation
+    /// (`implements idl.X` records `X`), so the dotted spellings live only
+    /// in the source tokens. `None` until scanned; an empty map is a real
+    /// result (no dotted clause face), not an unscanned state. Bounded by
+    /// the file's dotted clause faces; dropped with the engine.
+    pub(crate) prefixed_clauses: RefCell<Option<FxHashMap<(StringId, StringId), StringId>>>,
 }
 
 impl<'a> FaceMemo<'a> {

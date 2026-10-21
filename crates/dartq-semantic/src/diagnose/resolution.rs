@@ -1459,7 +1459,7 @@ impl<'a> Engine<'a> {
                     return Walk::ChainBroken;
                 };
                 self.walk_face_list(
-                    decl.on_clause.iter().map(|face| (*face, self.file)),
+                    decl.on_clause.iter().map(|face| (*face, self.file, container)),
                     self.lib,
                     member,
                     &mut seen,
@@ -1491,7 +1491,7 @@ impl<'a> Engine<'a> {
                     return Walk::Missing;
                 };
                 self.walk_face_list(
-                    [(on, self.file)].into_iter(),
+                    [(on, self.file, container)].into_iter(),
                     self.lib,
                     member,
                     &mut seen,
