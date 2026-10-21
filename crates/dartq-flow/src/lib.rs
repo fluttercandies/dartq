@@ -127,3 +127,6 @@ pub use ty::{NameTypeOps, TypeOps};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod ticket_2460_tests;

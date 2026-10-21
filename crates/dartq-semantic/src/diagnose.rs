@@ -1717,6 +1717,26 @@ pub fn fold_unit_with_ops<'t>(
         lib,
     );
     report.diagnostics = merge_source_ordered(report.diagnostics, dead_cases);
+    // The #2450 unknown-scrutinee face runs on the same joined list: a
+    // scrutinee expression whose latched type is the unknown face (the
+    // oracle's `InvalidType`, chained through an unresolved initializer or
+    // receiver) absorbs the match at the first guard-free resolvable-typed
+    // clause exactly like the written-annotation face above, and switch
+    // EXPRESSIONS join the walk (their arms the statement-only scan never
+    // produced).
+    let dead_cases = synthesize_unknown_scrutinee_dead_cases(
+        &report.diagnostics,
+        &engine.read_types,
+        tokens,
+        source,
+        strings,
+        graph,
+        namespaces,
+        index,
+        file,
+        lib,
+    );
+    report.diagnostics = merge_source_ordered(report.diagnostics, dead_cases);
     // `duplicate_definition`s lead the report, each pointing at the SECOND
     // declaration's name token (the analyzer's diagnose-at-second rule).
     // Setters live under `name=` in the model; the oracle's message names
@@ -3341,6 +3361,396 @@ fn synthesize_invalid_scrutinee_dead_cases(
     rows
 }
 
+/// One switch body's top-level clause, normalized across the statement
+/// (`case <pattern>: <statements>`) and expression (`<pattern> => <arm>`)
+/// body shapes: the pattern-run span plus the clause's end boundary.
+struct SwitchClause {
+    /// The first pattern token (the `case`/`default` keyword for a
+    /// statement clause, the first pattern token for an expression arm).
+    head: usize,
+    /// One past the pattern run (the header colon's index for a statement
+    /// clause, the `=>` index for an arm).
+    pattern_end: usize,
+    /// The clause's end boundary index (the next clause's head, else the
+    /// body's closing brace).
+    end: usize,
+    /// A `default` group — never absorbs.
+    is_default: bool,
+}
+
+/// Synthesizes the switch dead-case rows the oracle owes when the
+/// SCRUTINEE EXPRESSION's own static type is the invalid face (#2450) —
+/// the row shapes [`synthesize_invalid_scrutinee_dead_cases`] covers for
+/// a written-but-unresolvable head annotation, extended to:
+///
+/// - a bare-identifier scrutinee whose latched read row is `Ty::Unknown`
+///   — the unresolved-initializer face (`var x = pop();` under an
+///   unresolvable receiver chains the call's `InvalidType` into the
+///   variable; the corpus census's `ast_builder.dart`
+///   `switch (typeOrFunctionTypedParameter)` / `switch (preliminaryName)`
+///   rows), and
+/// - switch EXPRESSIONS, whose `pattern => arm` bodies the statement-only
+///   walk above never scans (the census's `generic_inferrer.dart` 631-638
+///   rows, whose `<unresolvable>.member` receiver carries the written
+///   invalid annotation).
+///
+/// Upstream `promoteForPattern` (flow_analysis.dart:7708-7768) marks the
+/// matched type covered when `isSubtypeOf(matched, required)` holds, and
+/// the invalid scrutinee is a vacuous subtype of everything
+/// (subtype.dart:274-276) — so the first guard-free case whose pattern
+/// names a resolvable type absorbs the match, the unmatched state goes
+/// unreachable, and every following clause reports `dead_code`. An
+/// equality head (`case null:`, `case 42:`) runs the constant-equality
+/// face instead (`constantPattern_end` → `_handleEqualityCheckPattern`)
+/// and never covers, so it neither absorbs nor abandons the walk — the
+/// corpus's `switch (preliminaryName) { case null: … case Token(): … }`
+/// reports only the clauses after `Token()` (its 6143-6146 rows). A
+/// `when` guard keeps the later clauses live (the guard-false arm joins
+/// the unmatched state) and abandons, as does a `default` group.
+///
+/// The dynamic face stays silent: a written `dynamic` scrutinee latches
+/// `Ty::Dynamic`, whose every-case-can-match answer keeps all clauses
+/// live (probed: `var x; switch (x.y)`). For a `<id>.<id>` head the row
+/// read is the RECEIVER's, so only the written-annotation face fires
+/// there — and only for switch expressions, whose rows the statement arm
+/// above never produced; the statement face stays that arm's exclusive.
+#[allow(clippy::too_many_arguments)] // the analysis context, one field each
+fn synthesize_unknown_scrutinee_dead_cases(
+    diagnostics: &[Diagnostic],
+    read_types: &[(SourceRange, Ty)],
+    tokens: &TokenTable,
+    source: &str,
+    strings: &StringTable,
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    file: FileId,
+    lib: LibraryId,
+) -> Vec<Diagnostic> {
+    let dead_code = SemanticCode::DeadCode;
+    let dead_name = dead_code.code_info().name;
+    let anchored: FxHashSet<u32> = diagnostics
+        .iter()
+        .filter(|d| d.code.name == dead_name)
+        .map(|d| d.range.offset)
+        .collect();
+    // One resolution per distinct head: a corpus unit carries many rows on
+    // the same broken name.
+    let mut resolvable: FxHashMap<StringId, bool> = FxHashMap::default();
+    let slice = tokens.as_slice();
+    let mut rows: Vec<Diagnostic> = Vec::new();
+    for (i, token) in slice.iter().enumerate() {
+        if token.kind != dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Switch) {
+            continue;
+        }
+        if !slice
+            .get(i + 1)
+            .is_some_and(|t| t.kind == dartq_scanner::TokenKind::OpenParen)
+        {
+            continue;
+        }
+        let Some(close) = tokens.matching_end(i + 1) else {
+            continue;
+        };
+        if !slice
+            .get(close + 1)
+            .is_some_and(|t| t.kind == dartq_scanner::TokenKind::OpenCurly)
+        {
+            continue;
+        }
+        let Some(body_close) = tokens.matching_end(close + 1) else {
+            continue;
+        };
+        // The posture head: a bare identifier, or the receiver identifier
+        // of a `<id>.<id>` select — anything else (calls, prefixed chains,
+        // deeper selects) is not decidable at this face.
+        let (head, head_is_receiver) = match slice.get(i + 2..close) {
+            Some([only]) if only.kind == dartq_scanner::TokenKind::Identifier => {
+                (only.utf16_offset, false)
+            }
+            Some([recv, dot, _member])
+                if recv.kind == dartq_scanner::TokenKind::Identifier
+                    && dot.kind == dartq_scanner::TokenKind::Period =>
+            {
+                (recv.utf16_offset, true)
+            }
+            _ => continue,
+        };
+        // The latched read row answers the head's as-written type (a dead
+        // read carries no row — fail open with it). A bare head fires on
+        // the unknown face; a receiver head fires only on the
+        // written-annotation face (its unknown rows are the probed-live
+        // `var x; switch (x.y)` posture), and the receiver face covers
+        // only the expression bodies the #2340 statement walk never
+        // scanned.
+        let Ok(join) = read_types.binary_search_by_key(&head, |(range, _)| range.offset) else {
+            continue;
+        };
+        let mut clauses: Vec<SwitchClause> = Vec::new();
+        let mut statement = false;
+        build_switch_clauses(slice, close + 2, body_close, &mut clauses, &mut statement);
+        if clauses.is_empty() {
+            continue;
+        }
+        let fires = match read_types[join].1 {
+            Ty::Unknown => !head_is_receiver,
+            Ty::Named { name, .. } => {
+                head_is_receiver
+                    && !statement
+                    && !*resolvable.entry(name).or_insert_with(|| {
+                        resolve_container(graph, namespaces, index, lib, file, name).is_some()
+                    })
+            }
+            _ => false,
+        };
+        if !fires {
+            continue;
+        }
+        let Some(absorber) = switch_clause_absorber(
+            slice, tokens, source, strings, &clauses, &mut resolvable, graph, namespaces, index,
+            file, lib,
+        ) else {
+            continue;
+        };
+        for clause in &clauses[absorber + 1..] {
+            if statement {
+                let kw_token = &slice[clause.head];
+                if !anchored.contains(&kw_token.utf16_offset) {
+                    rows.push(Diagnostic::new(
+                        dead_code.severity(),
+                        dead_code.code_info(),
+                        dead_code.message("", ""),
+                        file,
+                        SourceRange {
+                            offset: kw_token.utf16_offset,
+                            length: kw_token.byte_len,
+                        },
+                        dead_code.correction_message(""),
+                    ));
+                }
+                // The first body node: past the header colon, over leading
+                // labels (`l:`) and stray `;`s; an empty body keeps only
+                // its head row.
+                let mut b = clause.pattern_end + 1;
+                loop {
+                    match slice.get(b).map(|t| t.kind) {
+                        Some(dartq_scanner::TokenKind::Identifier)
+                            if slice
+                                .get(b + 1)
+                                .is_some_and(|t| t.kind == dartq_scanner::TokenKind::Colon) =>
+                        {
+                            b += 2;
+                        }
+                        Some(dartq_scanner::TokenKind::Semicolon) => b += 1,
+                        _ => break,
+                    }
+                }
+                if b >= clause.end || anchored.contains(&slice[b].utf16_offset) {
+                    continue;
+                }
+                // The statement interval: to the depth-0 `;` (the row ends
+                // at its boundary), else to the clause's end.
+                let mut depth = 0i32;
+                let mut end_off = slice[clause.end].utf16_offset;
+                for k in b..clause.end {
+                    depth += group_depth_step(slice[k].kind);
+                    if depth == 0 && slice[k].kind == dartq_scanner::TokenKind::Semicolon {
+                        // The oracle's dead interval ends at the
+                        // terminator itself (probed: the body row's
+                        // length covers the statement through its `;`).
+                        end_off = slice[k].utf16_offset + slice[k].byte_len;
+                        break;
+                    }
+                }
+                rows.push(Diagnostic::new(
+                    dead_code.severity(),
+                    dead_code.code_info(),
+                    dead_code.message("", ""),
+                    file,
+                    SourceRange {
+                        offset: slice[b].utf16_offset,
+                        length: end_off - slice[b].utf16_offset,
+                    },
+                    dead_code.correction_message(""),
+                ));
+            } else {
+                // The expression arm's row spans the whole case — pattern
+                // through the arm expression, the trailing `,` excluded
+                // (the oracle's `_ => 2` row shape,
+                // dead_code_test.dart's switch-expression faces).
+                let offset = slice[clause.head].utf16_offset;
+                let last = clause.end - 1;
+                let length = slice[last].utf16_offset + slice[last].byte_len - offset;
+                if length == 0 || anchored.contains(&offset) {
+                    continue;
+                }
+                rows.push(Diagnostic::new(
+                    dead_code.severity(),
+                    dead_code.code_info(),
+                    dead_code.message("", ""),
+                    file,
+                    SourceRange { offset, length },
+                    dead_code.correction_message(""),
+                ));
+            }
+        }
+    }
+    rows
+}
+
+/// Collects one switch body's top-level clauses into [`SwitchClause`]s.
+/// A statement body (a depth-0 `case`/`default` keyword) yields one clause
+/// per keyword, each keeping its header colon; an expression body yields
+/// one clause per depth-0 `=>` arm, bounded by the next depth-0 `,` (or
+/// the body's `}`). Sets `statement` when the body is the statement shape.
+fn build_switch_clauses(
+    slice: &[dartq_scanner::Token],
+    from: usize,
+    body_close: usize,
+    clauses: &mut Vec<SwitchClause>,
+    statement: &mut bool,
+) {
+    let mut depth = 0i32;
+    let mut arm_start = from;
+    let mut arm_arrow: Option<usize> = None;
+    for j in from..body_close {
+        depth += group_depth_step(slice[j].kind);
+        if depth != 0 {
+            continue;
+        }
+        match slice[j].kind {
+            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Case)
+            | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Default) => {
+                *statement = true;
+                clauses.push(SwitchClause {
+                    head: j,
+                    pattern_end: j,
+                    end: body_close,
+                    is_default: slice[j].kind
+                        == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Default),
+                });
+            }
+            dartq_scanner::TokenKind::Colon if *statement => {
+                if let Some(last) = clauses.last_mut().filter(|c| c.pattern_end == c.head) {
+                    last.pattern_end = j;
+                }
+            }
+            dartq_scanner::TokenKind::Function if !*statement => {
+                arm_arrow = Some(j);
+            }
+            dartq_scanner::TokenKind::Comma if !*statement => {
+                if let Some(arrow) = arm_arrow.take() {
+                    clauses.push(SwitchClause {
+                        head: arm_start,
+                        pattern_end: arrow,
+                        end: j,
+                        is_default: false,
+                    });
+                }
+                arm_start = j + 1;
+            }
+            _ => {}
+        }
+    }
+    if !*statement
+        && let Some(arrow) = arm_arrow
+    {
+        clauses.push(SwitchClause {
+            head: arm_start,
+            pattern_end: arrow,
+            end: body_close,
+            is_default: false,
+        });
+    }
+    if *statement {
+        // A statement clause's body ends where the next clause begins.
+        for i in 0..clauses.len() {
+            clauses[i].end = clauses.get(i + 1).map_or(body_close, |c| c.head);
+        }
+    }
+}
+
+/// The absorbing clause: the first guard-free clause whose pattern names a
+/// resolvable type. Constant (`case foo:`), bare wildcard (`case _:`) and
+/// prefixed (`case p.c:`) heads never cover — the scan continues past
+/// them; a `when` guard or a `default` group abandons the whole switch
+/// (the verdict cannot mirror it).
+fn switch_clause_absorber(
+    slice: &[dartq_scanner::Token],
+    tokens: &TokenTable,
+    source: &str,
+    strings: &StringTable,
+    clauses: &[SwitchClause],
+    resolvable: &mut FxHashMap<StringId, bool>,
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    file: FileId,
+    lib: LibraryId,
+) -> Option<usize> {
+    for (idx, clause) in clauses.iter().enumerate() {
+        if clause.is_default {
+            return None;
+        }
+        // A statement clause without its header colon is a shape the
+        // verdict cannot mirror.
+        if clause.pattern_end == clause.head {
+            return None;
+        }
+        let mut depth = 0i32;
+        let mut guarded = false;
+        for &t in &slice[clause.head..clause.pattern_end] {
+            depth += group_depth_step(t.kind);
+            if depth == 0
+                && t.kind == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::When)
+            {
+                guarded = true;
+                break;
+            }
+        }
+        if guarded {
+            return None;
+        }
+        // The pattern head: `[final|var] Type (name | _ | ()`. A statement
+        // clause's span starts at the `case` keyword — step over it.
+        let mut p = clause.head;
+        if matches!(
+            slice[p].kind,
+            dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Case)
+        ) {
+            p += 1;
+        }
+        if matches!(
+            slice.get(p).map(|t| t.kind),
+            Some(
+                dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Final)
+                    | dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::Var)
+            )
+        ) {
+            p += 1;
+        }
+        let typed = slice
+            .get(p)
+            .is_some_and(|t| t.kind == dartq_scanner::TokenKind::Identifier)
+            && slice.get(p + 1).is_some_and(|t| {
+                matches!(
+                    t.kind,
+                    dartq_scanner::TokenKind::Identifier | dartq_scanner::TokenKind::OpenParen
+                )
+            });
+        if !typed {
+            continue;
+        }
+        let name = strings.intern(tokens.lexeme(source, p));
+        if *resolvable.entry(name).or_insert_with(|| {
+            resolve_container(graph, namespaces, index, lib, file, name).is_some()
+        }) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
 /// The forward group-depth step: openers descend a level, closers climb
 /// back, every other token is depth-neutral. (An interpolation expression
 /// is one self-contained token — its internal braces are its own.)
@@ -3874,6 +4284,17 @@ mod ticket_2449_tests;
 #[cfg(test)]
 mod ticket_2442_tests;
 
+/// The #2461 pins: chained member access through implicit-call sends
+/// (census family A4) — a value invocation over a `call`-bearing static
+/// type types the send with the call method's declared return (the
+/// bare-spelling face reads the callee's static type, not the
+/// information-less row type), so `body(ctx).effectiveBooleanValue`,
+/// `key!(ctx).atomize()`, the two-hop chain, and the `yield*` generator
+/// shape resolve through the call's return, and a member missing from
+/// that return reports on it.
+#[cfg(test)]
+mod ticket_2461_tests;
+
 /// The #2458 pins: comment trivia between the last literal element and
 /// the closing `}` is no element — a comment-only leaf segment no longer
 /// flips a context-less all-entry literal to
@@ -3927,3 +4348,32 @@ mod ticket_2460_tests;
 /// keyword the ConstantPattern node starts at.
 #[cfg(test)]
 mod ticket_2468_tests;
+
+/// The #2450 pins: the invalid-scrutinee switch absorption over the
+/// unknown/invalid read faces (statements and expressions, the constant
+/// head skip) and the invalid-operand is-check promotion, plus the
+/// deleted undefined-tested always-true fold — both oracle arms of an
+/// `x is <undefined>` check stay live behind `type_test_with_undefined_name`.
+#[cfg(test)]
+mod ticket_2450_tests;
+
+/// The #2459 pins: the cascade-resolution leakage family A3 — a cascade
+/// section's RHS member chain resolves through its own receiver instead of
+/// the latched cascade target (`..sourceSpan = token.span` answers `span`
+/// on the token type, never a phantom on the target), an extension getter
+/// inside an index-section cascade chain resolves (`..['k'] = s.toJS`
+/// finds the `on String` extension), an index-assign `..[i] = v` over a
+/// `List` target stays silent, and a missing `[]=` reports per section at
+/// the bracket against the TARGET's type.
+#[cfg(test)]
+mod ticket_2459_tests;
+
+/// The #2460 pins: the flow layer mirrors upstream at every A2 promotion
+/// edge (generator suspension keeps promotions, staged writes promote, the
+/// assert message runs on the negated condition) — the remaining family
+/// fixes are semantic-side and their pins ride #[ignore] until they land:
+/// the yield verdict staging for teardown re-decision, the bang right
+/// side staging its non-null face, and the staged write feed scoped per
+/// executable.
+#[cfg(test)]
+mod ticket_2460_tests;
