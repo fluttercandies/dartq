@@ -3881,3 +3881,12 @@ mod ticket_2458_tests;
 /// the compound-assignment face types the augmented read the same way.
 #[cfg(test)]
 mod ticket_2453_tests;
+
+/// The #2451 pins: closure parameters typed through generic iterable chains
+/// (`m.values.map((n) => …)`, an in-package getter's `List<E>` face) bind
+/// from the chain's element — the nullable element fires the
+/// `unchecked_use_of_nullable_value` gate, the non-null/`dynamic` guards
+/// stay silent, and the nullable missing-member read collapses to the same
+/// unchecked row the oracle emits.
+#[cfg(test)]
+mod ticket_2451_tests;

@@ -14,6 +14,19 @@ use super::*;
 /// [`u16::MAX`]; deeper stacks stay untagged (the flat-frame under-report).
 const PATTERN_ARM_SCOPE_BASE: u32 = u32::MAX - u16::MAX as u32;
 
+/// The dart:core iterable-producer getters whose declared returns the
+/// member walk cannot reach (the declaring units are unindexed like every
+/// SDK unit, so `walk_members` chain-breaks on them). Each row is
+/// `(container, getter, element type-argument index, result head)` from
+/// the reference SDK (`sdk/lib/core/map.dart` — `Iterable<K> get keys`,
+/// `Iterable<V> get values`); a chained call's element face reads the
+/// receiver's written type argument at the row's index
+/// (`m.values.map((n) => …)` binds `n` from `Map`'s second argument).
+const CHAIN_PRODUCER_GETTERS: [(&str, &str, usize, &str); 2] = [
+    ("Map", "keys", 0, "Iterable"),
+    ("Map", "values", 1, "Iterable"),
+];
+
 /// One parameter slot of a formal table: a positional ordinal or a named
 /// spelling — the pairing the closure-literal inference walks on both sides
 /// (`_inferFormalParameters`'s positional iterators and its
@@ -960,12 +973,22 @@ impl<'a> Engine<'a> {
         // An unmerged member placeholder (`xs.map(…)`) classifies its
         // receiver from the row directly below it — the same below-row read
         // the argument check makes; a bare callee's own receiver is the
-        // top-level face.
+        // top-level face. A member-access receiver row (`m.values.map(…)`,
+        // `holder.items.map(…)`) carries no receiver face of its own — the
+        // chained call's receiver is the access *result*, which
+        // [`Self::chain_link_receiver`] types.
         let recv = if callee.qualified {
             callee_row
                 .checked_sub(1)
                 .and_then(|below| self.rows.get(below))
-                .map_or(Receiver::Unknown, |below| self.argument_receiver(below))
+                .map_or(Receiver::Unknown, |below| {
+                    let recv = self.argument_receiver(below);
+                    if matches!(recv, Receiver::Unknown) {
+                        self.chain_link_receiver(below)
+                    } else {
+                        recv
+                    }
+                })
         } else {
             Receiver::Unknown
         };
@@ -1602,6 +1625,105 @@ impl<'a> Engine<'a> {
             return None;
         };
         self.boundary.pool().get(args).first().copied()
+    }
+
+    /// The static face of a chained producer's result (`m.values.map(…)`,
+    /// `holder.items.map(…)`): a member-access row carries no receiver face
+    /// of its own ([`Self::argument_receiver`] answers `Unknown`), but the
+    /// chained call's closure literal binds from the access *result*. The
+    /// upstream static type of `e.member` is the getter's declared return
+    /// instantiated with the receiver's written type arguments (upstream
+    /// Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
+    /// property_element_resolver.dart `_executeGetter`); this answers it
+    /// only when the result is a provable named type — every other shape
+    /// keeps the chain's `Unknown` suppression.
+    fn chain_link_receiver(&self, row: &Row) -> Receiver {
+        let RowShape::Member {
+            recv: Receiver::Typed { type_name, ty },
+            ..
+        } = &row.shape
+        else {
+            return Receiver::Unknown;
+        };
+        // An indexed container's own face walks; the getter's declared
+        // return instantiates with the receiver's written arguments (the
+        // anchor's own parameters — an inherited entry's environment is the
+        // supertype's, and a wrong substitution must not form: leftover
+        // unprovable names fail the decidability gate below).
+        if let Walk::Found(entry) = self.walk_members(*type_name, row.name)
+            && entry.kind == MemberKind::Getter
+        {
+            let ret = self.fold_alias_ty(entry.return_ty);
+            let Ty::Named { name, nullable, .. } = ret else {
+                return Receiver::Unknown;
+            };
+            let ret = match self.bounds.container_params(*type_name) {
+                Some(params) if !params.is_empty() => {
+                    let Ty::Named { args: recv_args, .. } = *ty else {
+                        return Receiver::Unknown;
+                    };
+                    let recv_args = self.boundary.pool().get(recv_args).to_vec();
+                    if recv_args.len() != params.len() {
+                        return Receiver::Unknown;
+                    }
+                    let map: Vec<(StringId, Ty)> = params
+                        .iter()
+                        .zip(recv_args.iter())
+                        .map(|((param, ..), arg)| (*param, *arg))
+                        .collect();
+                    match self.subst_params(ret, &map) {
+                        Some(ret) => ret,
+                        None => return Receiver::Unknown,
+                    }
+                }
+                _ => ret,
+            };
+            // A nullable result head (`Node? get best`) is no iterable face
+            // to chain from; a provable non-null named head is the access
+            // result's own receiver.
+            let Ty::Named { args, .. } = ret else {
+                return Receiver::Unknown;
+            };
+            return if nullable
+                || !self.named_type_is_type(name)
+                || !self.args_are_types(args)
+            {
+                Receiver::Unknown
+            } else {
+                Receiver::Typed {
+                    type_name: name,
+                    ty: ret,
+                }
+            };
+        }
+        // The SDK's unindexed units chain-break, so the frozen producer
+        // table stands in: the declared `Iterable<E>` face reads its
+        // element from the receiver's written type argument at the row's
+        // index (the [`CORE_STATIC_RETURNS`] precedent for an unindexed
+        // declared return).
+        let head = self.strings.resolve(*type_name);
+        let Some((_, _, index, result)) = CHAIN_PRODUCER_GETTERS.iter().find(
+            |(container, getter, ..)| *container == head && self.intern(getter) == row.name,
+        ) else {
+            return Receiver::Unknown;
+        };
+        let Ty::Named { args, .. } = *ty else {
+            return Receiver::Unknown;
+        };
+        let Some(element) = self.boundary.pool().get(args).get(*index).copied() else {
+            return Receiver::Unknown;
+        };
+        if !self.schema_type_is_decidable(element) {
+            return Receiver::Unknown;
+        }
+        Receiver::Typed {
+            type_name: self.intern(result),
+            ty: Ty::Named {
+                name: self.intern(result),
+                nullable: false,
+                args: self.boundary.intern_list(&[element]),
+            },
+        }
     }
 
     /// A container head: the member face and the `this`/`super` receiver for
