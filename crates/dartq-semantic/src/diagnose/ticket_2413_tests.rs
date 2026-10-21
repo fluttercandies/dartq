@@ -194,23 +194,32 @@ fn foreign_alias_positional_count_is_checked() {
     );
 }
 
-/// N5, parameterized cell — documented under-report: the element model stores
-/// `var_ty = Ty::UNKNOWN` for a parameterized alias (`Predicate<String>`), so
-/// the use-site-instantiated formals are unrecoverable and `pred(42)` reports
-/// nothing where the oracle emits `argument_type_not_assignable`. Pinning the
-/// silent posture so the model fix (alias-RHS substitution) has a red pin to
-/// flip; the non-generic cells above are the face this ticket carries.
+/// N5, parameterized cell — the element model now captures a
+/// parameterized alias's RHS (`var_ty` in the written shape, its
+/// parameter spellings as bare leaves), and the use-site substitution
+/// face rewrites `Predicate<String>` to the aliased `bool Function(String)`
+/// at the formal's bind — so `pred(42)` counts against the instantiated
+/// formals and reports `argument_type_not_assignable` at the argument,
+/// exactly the oracle's verdict (probed: /tmp/probe2410, dart analyze
+/// Dart 3.13.1, single- and two-file fixtures alike).
 #[test]
-fn foreign_parameterized_alias_is_an_unresolved_under_report() {
+fn foreign_parameterized_alias_argument_is_checked() {
     let main = "import 'lib.dart';\n\
                 bool run(Predicate<String> pred) {\n\
                 \x20 return pred(42);\n\
                 }\n";
-    let names = code_names(&report_two_file(main, TYPEDEF_LIB));
+    let report = report_two_file(main, TYPEDEF_LIB);
+    let names = code_names(&report);
     assert!(
-        !names.contains(&"argument_type_not_assignable"),
-        "parameterized-alias formals resolved — flip this pin: {names:?}"
+        names.contains(&"argument_type_not_assignable"),
+        "parameterized-alias formals unresolved: {names:?}"
     );
+    let row = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "argument_type_not_assignable")
+        .expect("argument row");
+    assert_eq!(row.range.length, 2, "the span covers the `42` argument");
 }
 
 /// N5, lambda-argument cell — documented under-report: a function literal

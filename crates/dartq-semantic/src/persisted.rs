@@ -316,6 +316,16 @@ pub struct PersistedRepFormal {
 pub struct PersistedTopDecl {
     pub kind: PersistedMicroKind,
     pub type_params: u16,
+    /// Additive after the format shipped: the declaration's own
+    /// type-parameter spellings, in declaration order — a type alias only
+    /// (`typedef P<T> = ...` keeps `[T]`); the use-site written arguments
+    /// substitute into the captured right-hand side positionally against
+    /// this list. A pre-slot payload decodes empty, so a parameterized
+    /// alias's use-site substitution zips shorter and the RHS leaves keep
+    /// their written spellings — the under-report direction the pre-slot
+    /// model already answered with (the #539 additive-field discipline).
+    #[serde(default)]
+    pub type_param_names: Vec<u32>,
     pub var_ty: PersistedTy,
     pub return_ty: PersistedTy,
     pub formals: Option<Box<PersistedFormals>>,
@@ -696,6 +706,11 @@ impl PersistedTopDecl {
                 MicroKind::TypeParam => PersistedMicroKind::TypeParam,
             },
             type_params: decl.type_params,
+            type_param_names: decl
+                .type_param_names
+                .iter()
+                .map(|&name| s.id(name))
+                .collect(),
             var_ty: s.ty(&decl.var_ty),
             return_ty: s.ty(&decl.return_ty),
             formals: decl
@@ -719,6 +734,11 @@ impl PersistedTopDecl {
                 PersistedMicroKind::TypeParam => MicroKind::TypeParam,
             },
             type_params: self.type_params,
+            type_param_names: self
+                .type_param_names
+                .into_iter()
+                .map(|at| ids[at as usize])
+                .collect(),
             var_ty: into_ty(self.var_ty, ids, pool),
             return_ty: into_ty(self.return_ty, ids, pool),
             formals: self
@@ -1053,6 +1073,7 @@ mod tests {
             TopDecl {
                 kind: MicroKind::TopLevelFn,
                 type_params: 0,
+                type_param_names: Box::new([]),
                 var_ty: Ty::Unknown,
                 return_ty: Ty::Void,
                 formals: None,

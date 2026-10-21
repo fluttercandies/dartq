@@ -62,14 +62,14 @@ use dartq_source::{FileId, StringId, StringTable};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use dartq_types::{
-    CoreDecls, ParamFacts, ParamFactsTable, TypeDeclId, TypeHierarchy, TypeId, TypeKind,
-    TypeParamId, TypeSystem, TypeTable, UninternedType, Variance,
-    instantiate_type_formals_to_bounds,
+    CoreDecls, NamedMember, ParamFacts, ParamFactsTable, TypeDeclId, TypeHierarchy, TypeId,
+    TypeKind, TypeParamId, TypeSystem, TypeTable, UninternedFunction, UninternedRecord,
+    UninternedType, Variance, instantiate_type_formals_to_bounds,
 };
 
 use crate::bounds::TypeTree;
 use crate::library::ElementIndex;
-use crate::model::{ContainerKind, MicroKind};
+use crate::model::{ArgListId, ArgPool, ContainerKind, MicroKind, Ty};
 
 /// Core-declaration raw ids (the hierarchy requires `Object`, `Future`,
 /// and bare `Function`). Each snapshot owns its id space.
@@ -144,14 +144,25 @@ pub struct LibraryTypes {
     non_containers: FxHashSet<StringId>,
     /// `typedef` name → the aliased head name plus its own `?` flag —
     /// captured only when the element model carried the RHS as a bare
-    /// `Ty::Named` with no written arguments (`typedef A = B`,
-    /// `typedef A = B?`). A `typedef A = List<int>` or
-    /// `typedef F = void Function()` RHS stays in `non_containers` only:
-    /// its `ArgListId`/`FnShapeId` slots index the element model's
-    /// `ArgPool` this snapshot does not hold, so the spelled use keeps
-    /// the opaque face today (the under-report direction — oracle-true
-    /// only for the bare-Named arm this map covers).
+    /// `Ty::Named` with no written arguments and the alias declares no
+    /// type parameters (`typedef A = B`, `typedef A = B?`). The chase
+    /// re-enters the full name precedence on the terminal, so a chain or
+    /// a builtin-spelled terminal resolves exactly as before.
     typedef_targets: FxHashMap<StringId, (StringId, bool)>,
+    /// `typedef` name → the RHS flattened into this snapshot's lattice —
+    /// the shapes the bare-Named chase cannot carry: an argument-bearing
+    /// `Named` (`typedef A = List<int>`), a function shape
+    /// (`typedef F = int Function(String)`), a record shape
+    /// (`typedef R = (int, String)`), and every parameterized alias's
+    /// captured RHS (its parameter leaves ride the alias's own synthetic
+    /// ids; the chase substitutes the use-site written arguments
+    /// positionally). Built once after registration by translating the
+    /// element model's RHS (`Ty` plus the unit's `ArgPool`) into interned
+    /// `TypeId`s — the snapshot needs no pool back-reference at chase
+    /// time. An alias whose RHS names something the snapshot cannot
+    /// resolve registers no entry and keeps the opaque face (the
+    /// under-report direction).
+    typedef_shapes: FxHashMap<StringId, TypedefShape>,
     /// Type-parameter spellings → a synthetic parameter id each
     /// (`MicroKind::TypeParam` declarations). Declaration-scoped in the
     /// official element model but name-keyed here exactly like the flow
@@ -377,6 +388,8 @@ impl LibraryTypes {
             decl_owner,
             non_containers,
             typedef_targets,
+            typedef_shapes: FxHashMap::default(),
+            aliases: Vec::new(),
             type_params,
             facts,
             next_decl: FIRST_CONTAINER_RAW,
@@ -431,12 +444,17 @@ impl LibraryTypes {
                 }
             }
         }
+        // The alias RHS shapes flatten after every registration pass (the
+        // library's units and the import sweep) — a co-alias chain needs
+        // its target's registration first.
+        registry.resolve_typedef_shapes(&table, index, strings);
         let Registry {
             registry,
             decl_params,
             decl_owner,
             non_containers,
             typedef_targets,
+            typedef_shapes,
             type_params,
             facts,
             ..
@@ -587,6 +605,7 @@ impl LibraryTypes {
             decl_params,
             non_containers,
             typedef_targets,
+            typedef_shapes,
             type_params,
         }
     }
@@ -649,6 +668,15 @@ struct Registry {
     /// own spelling — the only alias shape the snapshot can resolve
     /// without the element model's `ArgPool` (see [`LibraryTypes::typedef_targets`]).
     typedef_targets: FxHashMap<StringId, (StringId, bool)>,
+    /// The argument-bearing/function/record/parameterized alias RHS
+    /// shapes, resolved after every file registers (see
+    /// [`LibraryTypes::typedef_shapes`]). Populated by
+    /// [`Registry::resolve_typedef_shapes`].
+    typedef_shapes: FxHashMap<StringId, TypedefShape>,
+    /// Every `TypeAlias` declaration as `(name, file)` — the worklist
+    /// [`Registry::resolve_typedef_shapes`] iterates to its fixpoint
+    /// (a co-alias chain resolves once its target's shape lands).
+    aliases: Vec<(StringId, FileId)>,
     /// Type-parameter spellings → their synthetic parameter ids: the
     /// `TypeKind::TypeParameter` map the adapter answers instead of
     /// `Invalid` for a `T`-shaped name (#2186 S4-C).
@@ -656,6 +684,24 @@ struct Registry {
     facts: ParamFactsTable,
     next_decl: u32,
     next_param: u32,
+}
+
+/// One alias's flattened right-hand side in the snapshot's lattice
+/// ([`LibraryTypes::typedef_shapes`]). The shape interns with its own `?`
+/// stripped into `nullable` — the same composition the bare chase keeps —
+/// and a parameterized alias's `shape` carries its own parameters as
+/// [`TypeKind::TypeParameter`] leaves: the chase zips `params` with the
+/// use-site written arguments and substitutes.
+struct TypedefShape {
+    /// The RHS shape, interned non-null (a parameterized alias keeps its
+    /// parameter leaves unsubstituted).
+    shape: TypeId,
+    /// The RHS's own trailing `?`.
+    nullable: bool,
+    /// The alias's own parameters in declaration order — the positional
+    /// zip the written arguments substitute against. Empty for a
+    /// non-parameterized alias.
+    params: Box<[TypeParamId]>,
 }
 
 impl Registry {
@@ -740,21 +786,299 @@ impl Registry {
                 // face — capture the RHS head so `map_name` chases it instead
                 // of minting an opaque declaration (subtype.dart's `C c = a`
                 // arm would otherwise under-report through `Invalid`).
-                // Argument-carrying and `Function`/`Record` RHS shapes index
-                // the element model's `ArgPool`, which this snapshot does
-                // not hold — they keep the opaque face (under-report).
-                if decl.kind == MicroKind::TypeAlias
-                    && let crate::model::Ty::Named {
-                        name: rhs_name,
-                        nullable: rhs_nullable,
-                        args,
-                    } = decl.var_ty
-                    && args == crate::model::ArgListId::EMPTY
-                {
-                    self.typedef_targets.insert(name, (rhs_name, rhs_nullable));
+                // Argument-carrying and `Function`/`Record` RHS shapes land
+                // in `typedef_shapes` after registration; a parameterized
+                // alias never chases by head (its RHS leaves name its own
+                // parameters, not a terminal head).
+                if decl.kind == MicroKind::TypeAlias {
+                    if decl.type_params == 0
+                        && let crate::model::Ty::Named {
+                            name: rhs_name,
+                            nullable: rhs_nullable,
+                            args,
+                        } = decl.var_ty
+                        && args == crate::model::ArgListId::EMPTY
+                    {
+                        self.typedef_targets.insert(name, (rhs_name, rhs_nullable));
+                    }
+                    self.aliases.push((name, file));
                 }
             }
         }
+    }
+
+    /// Resolves every registered alias's RHS shape to its fixpoint: a
+    /// co-alias chain (`typedef B = A<int>` over `A = List<int>`)
+    /// resolves once its target's shape lands, so the loop retries the
+    /// unresolved entries until a pass makes no progress — bounded by the
+    /// alias count, with a cyclic chain never resolving (the under-report
+    /// direction, the same posture a missing shape keeps). A
+    /// non-parameterized alias whose RHS is a bare `Named` registers
+    /// nothing here — `typedef_targets` owns that shape and its chase
+    /// re-enters the full name precedence on the terminal.
+    fn resolve_typedef_shapes(
+        &mut self,
+        table: &TypeTable,
+        index: &ElementIndex,
+        strings: &StringTable,
+    ) {
+        for _ in 0..=self.aliases.len() {
+            let mut progress = false;
+            for at in 0..self.aliases.len() {
+                let (name, file) = self.aliases[at];
+                if self.typedef_shapes.contains_key(&name) {
+                    continue;
+                }
+                let Some(elements) = index.get(file) else {
+                    continue;
+                };
+                let Some(decl) = elements.decl(name) else {
+                    continue;
+                };
+                if decl.kind != MicroKind::TypeAlias || decl.var_ty == Ty::UNKNOWN {
+                    continue;
+                }
+                let shape_worthy = decl.type_params != 0
+                    || match decl.var_ty {
+                        Ty::Named { args, .. } => args != ArgListId::EMPTY,
+                        Ty::Record { .. } | Ty::Function { .. } => true,
+                        _ => false,
+                    };
+                if !shape_worthy {
+                    continue;
+                }
+                let Some((shape, nullable)) =
+                    self.flatten_rhs(table, elements.type_args(), strings, decl.var_ty, name, &decl.type_param_names)
+                else {
+                    continue;
+                };
+                let params = decl
+                    .type_param_names
+                    .iter()
+                    .filter_map(|spelling| self.type_params.get(spelling).copied())
+                    .collect();
+                self.typedef_shapes.insert(
+                    name,
+                    TypedefShape {
+                        shape,
+                        nullable,
+                        params,
+                    },
+                );
+                progress = true;
+            }
+            if !progress {
+                break;
+            }
+        }
+    }
+
+    /// Translates one element-model RHS (`Ty` over the declaring unit's
+    /// [`ArgPool`]) into the snapshot's lattice, `?` stripped. `alias` is
+    /// the alias being registered (the cycle guard — an RHS naming its own
+    /// alias registers nothing) and `own_params` its parameter spellings
+    /// (a bare leaf naming one reads the alias's own
+    /// [`TypeKind::TypeParameter`]). `None` when some head the tree names
+    /// resolves to nothing this snapshot registers: the alias keeps no
+    /// shape and its uses stay opaque (the under-report direction).
+    fn flatten_rhs(
+        &mut self,
+        table: &TypeTable,
+        pool: &ArgPool,
+        strings: &StringTable,
+        ty: Ty,
+        alias: StringId,
+        own_params: &[StringId],
+    ) -> Option<(TypeId, bool)> {
+        match ty {
+            // A bare unit face (`void`/`dynamic`/`Never`) is not a shape
+            // the chase stands for — the use keeps today's opaque read.
+            Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Void | Ty::Never => None,
+            Ty::Record { shape, nullable } => {
+                let shape = pool.record_shape(shape);
+                let mut positional = Vec::with_capacity(shape.positional.len());
+                for &field in &shape.positional {
+                    positional.push(self.flatten_rhs(table, pool, strings, field, alias, own_params)?.0);
+                }
+                let mut named = Vec::with_capacity(shape.named.len());
+                for &(field_name, field) in &shape.named {
+                    named.push(NamedMember {
+                        name: strings.resolve(field_name).to_string(),
+                        ty: self.flatten_rhs(table, pool, strings, field, alias, own_params)?.0,
+                        required: false,
+                    });
+                }
+                Some((
+                    table
+                        .intern_record(UninternedRecord { positional, named }, false)
+                        .ok()?,
+                    nullable,
+                ))
+            }
+            Ty::Function { shape, nullable } => {
+                let shape = pool.function_shape(shape);
+                let return_ty =
+                    self.flatten_rhs(table, pool, strings, shape.return_ty, alias, own_params)?.0;
+                let mut positional = Vec::with_capacity(shape.positional.len());
+                for &formal in &shape.positional {
+                    positional.push(self.flatten_rhs(table, pool, strings, formal, alias, own_params)?.0);
+                }
+                let mut named = Vec::with_capacity(shape.named.len());
+                for &(formal_name, formal) in &shape.named {
+                    named.push(NamedMember {
+                        name: strings.resolve(formal_name).to_string(),
+                        ty: self.flatten_rhs(table, pool, strings, formal, alias, own_params)?.0,
+                        required: false,
+                    });
+                }
+                // The RHS's own `<T>` group: fresh parameter ids in this
+                // snapshot's space (globally unique per interned signature,
+                // so no binder confusion — the same ids the function-subtype
+                // correlation renames positionally).
+                let mut type_parameters = Vec::new();
+                for _ in 0..shape.type_params {
+                    let id = TypeParamId::from_raw(self.next_param);
+                    self.next_param += 1;
+                    self.facts.set(
+                        id,
+                        ParamFacts {
+                            variance: Variance::Covariant,
+                            bound: None,
+                        },
+                    );
+                    type_parameters.push(id);
+                }
+                let required_positional =
+                    u32::try_from(positional.len()).unwrap_or(u32::MAX);
+                Some((
+                    table
+                        .intern_function(
+                            UninternedFunction {
+                                return_type: return_ty,
+                                type_parameters,
+                                positional,
+                                named,
+                                required_positional,
+                            },
+                            false,
+                        )
+                        .ok()?,
+                    nullable,
+                ))
+            }
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                // The alias's own parameter as a bare leaf: the shape keeps
+                // the parameter unsubstituted (the chase zips the use-site
+                // arguments against `params`).
+                if args == ArgListId::EMPTY
+                    && own_params.contains(&name)
+                    && let Some(&parameter) = self.type_params.get(&name)
+                {
+                    return Some((
+                        table.intern(UninternedType::TypeParameter { parameter }, false),
+                        nullable,
+                    ));
+                }
+                let mut flattened = Vec::with_capacity(pool.get(args).len());
+                for &arg in pool.get(args) {
+                    flattened.push(self.flatten_rhs(table, pool, strings, arg, alias, own_params)?.0);
+                }
+                self.flatten_named_head(table, strings, name, nullable, &flattened, alias)
+            }
+        }
+    }
+
+    /// Resolves one flattened RHS head: another alias (through its
+    /// registered shape, or the bare-Named chase when it has none), a
+    /// registered container, or a `Null`/`Never` spelling — each
+    /// instantiated with the flattened written arguments. `None` keeps
+    /// the enclosing alias shapeless.
+    fn flatten_named_head(
+        &mut self,
+        table: &TypeTable,
+        strings: &StringTable,
+        name: StringId,
+        nullable: bool,
+        args: &[TypeId],
+        alias: StringId,
+    ) -> Option<(TypeId, bool)> {
+        if name == alias {
+            // A self-referential RHS never resolves.
+            return None;
+        }
+        if self.non_containers.contains(&name) {
+            if let Some(entry) = self.typedef_shapes.get(&name) {
+                let (shape, nullable) = (entry.shape, entry.nullable | nullable);
+                if entry.params.is_empty() {
+                    return args.is_empty().then_some((shape, nullable));
+                }
+                if args.len() != entry.params.len() {
+                    return None;
+                }
+                let map: Vec<(TypeParamId, TypeId)> = entry
+                    .params
+                    .iter()
+                    .copied()
+                    .zip(args.iter().copied())
+                    .collect();
+                return Some((table.substitute(shape, &map), nullable));
+            }
+            // A bare-Named alias chain (`typedef B = A;` with `A` still
+            // bare-Named): chase to its terminal and instantiate that —
+            // the same walk `chase_typedef` keeps at query time.
+            let mut chased = name;
+            let mut chased_nullable = nullable;
+            for _ in 0..=self.typedef_targets.len() {
+                let Some(&(next, next_nullable)) = self.typedef_targets.get(&chased) else {
+                    break;
+                };
+                chased = next;
+                chased_nullable |= next_nullable;
+            }
+            return self.registered_instantiation(table, chased, chased_nullable, args);
+        }
+        match strings.resolve(name) {
+            // The two kind-level spellings the registry cannot carry (the
+            // query-time `builtin_spelling` face).
+            "Null" => Some((table.intern(UninternedType::Null, false), true)),
+            "Never" => Some((table.intern(UninternedType::Never, nullable), false)),
+            _ => self.registered_instantiation(table, name, nullable, args),
+        }
+    }
+
+    /// A registered container's instantiation: the written arguments stand
+    /// as given; without any, a generic head instantiates to bounds (the
+    /// official `instantiateToBounds` posture the query-time bare read
+    /// keeps). `None` when the name registers nowhere.
+    fn registered_instantiation(
+        &self,
+        table: &TypeTable,
+        name: StringId,
+        nullable: bool,
+        args: &[TypeId],
+    ) -> Option<(TypeId, bool)> {
+        let &decl = self.registry.get(&name)?;
+        let args = if args.is_empty() {
+            let params = self
+                .decl_params
+                .get(&decl)
+                .map_or(&[][..], Vec::as_slice);
+            if params.is_empty() {
+                Vec::new()
+            } else {
+                instantiate_type_formals_to_bounds(table, &self.facts, params).defaults
+            }
+        } else {
+            args.to_vec()
+        };
+        Some((
+            table.intern(UninternedType::Interface { decl, args }, false),
+            nullable,
+        ))
     }
 }
 
@@ -1167,14 +1491,29 @@ impl<'a> ResolvedTypeOps<'a> {
     /// (`non_containers`) mints its argument-less opaque face, so the base
     /// ops answer "unrelated" exactly like `map_scrutinee`'s arm, and
     /// every other miss is the oracle's `InvalidType`. A typedef name
-    /// first chases its captured `Ty::Named` head — `typedef A = B` reads
-    /// the `B` pair, so `is_subtype(A, B)` answers through the real
-    /// `B <: B` edge rather than the opaque face's "unrelated" arm
-    /// (the oracle resolves the alias wholesale: `C c = a` over
-    /// `A a` still reports `invalid_assignment`).
+    /// first answers through its flattened RHS shape (the argument-bearing,
+    /// function, record, or parameterized faces — the raw-parameter
+    /// reading instantiates every parameter to its to-bounds default, the
+    /// official's raw-alias posture), then chases its captured `Ty::Named`
+    /// head — `typedef A = B` reads the `B` pair, so `is_subtype(A, B)`
+    /// answers through the real `B <: B` edge rather than the opaque
+    /// face's "unrelated" arm (the oracle resolves the alias wholesale:
+    /// `C c = a` over `A a` still reports `invalid_assignment`).
     fn observed_opaque_pair(&self, name: StringId) -> (TypeId, TypeId) {
         if !self.snapshot.non_containers.contains(&name) {
             return (self.invalid, self.invalid);
+        }
+        if let Some(entry) = self.snapshot.typedef_shapes.get(&name) {
+            // No written arguments stand at this face: every parameter
+            // reads its to-bounds default (the unbounded `dynamic`).
+            let map: Vec<(TypeParamId, TypeId)> = entry
+                .params
+                .iter()
+                .map(|&parameter| (parameter, self.dynamic))
+                .collect();
+            let shape = self.snapshot.table.substitute(entry.shape, &map);
+            let non_null = self.with_question(shape, entry.nullable);
+            return (non_null, self.with_question(shape, true));
         }
         let (chased, chased_nullable) = self.chase_typedef(name);
         if chased != name && !self.snapshot.non_containers.contains(&chased) {
@@ -1253,6 +1592,70 @@ impl<'a> ResolvedTypeOps<'a> {
         (chased, nullable)
     }
 
+    /// Re-interns a snapshot type with the `?` projection composed on top
+    /// (`withNullability`, type.dart:1558) — the alias chase composes the
+    /// RHS's own suffix with the use site's. `false` returns the type
+    /// as-is (the flattened shapes intern non-null); a unit kind
+    /// normalizes at the intern (`Never?` reads `Null`).
+    fn with_question(&self, ty: TypeId, nullable: bool) -> TypeId {
+        if !nullable {
+            return ty;
+        }
+        // The signature and record payloads rebuild before the kind match —
+        // both intern through their own entries, not `UninternedType`.
+        if let TypeKind::Function { signature } = self.snapshot.table.get(ty).kind() {
+            let sig = self.snapshot.table.signature(signature);
+            return self
+                .snapshot
+                .table
+                .intern_function(
+                    UninternedFunction {
+                        return_type: sig.return_type,
+                        type_parameters: self
+                            .snapshot
+                            .table
+                            .function_type_parameters(sig.type_parameters),
+                        positional: self.snapshot.table.args(sig.positional),
+                        named: self.snapshot.table.named_members(sig.named),
+                        required_positional: sig.required_positional,
+                    },
+                    true,
+                )
+                .expect("a pooled signature re-interns");
+        }
+        if let TypeKind::Record { shape } = self.snapshot.table.get(ty).kind() {
+            let shape = self.snapshot.table.record_shape(shape);
+            return self
+                .snapshot
+                .table
+                .intern_record(
+                    UninternedRecord {
+                        positional: self.snapshot.table.args(shape.positional),
+                        named: self.snapshot.table.named_members(shape.named),
+                    },
+                    true,
+                )
+                .expect("a pooled record shape re-interns");
+        }
+        let un = match self.snapshot.table.get(ty).kind() {
+            TypeKind::Never => UninternedType::Never,
+            TypeKind::Dynamic => UninternedType::Dynamic,
+            TypeKind::Void => UninternedType::Void,
+            TypeKind::Invalid => UninternedType::Invalid,
+            TypeKind::Null => UninternedType::Null,
+            TypeKind::Interface { decl, args } => UninternedType::Interface {
+                decl,
+                args: self.snapshot.table.args(args),
+            },
+            TypeKind::TypeParameter { parameter } => UninternedType::TypeParameter { parameter },
+            TypeKind::FutureOr { base } => UninternedType::FutureOr { base },
+            TypeKind::Function { .. } | TypeKind::Record { .. } => {
+                unreachable!("handled above")
+            }
+        };
+        self.snapshot.table.intern(un, true)
+    }
+
     /// One written name's resolved mapping — the shared core of
     /// [`ResolvedTypeOps::map_scrutinee`] (a probe/typed-op `Base::Name`
     /// with its own written argument list) and
@@ -1319,12 +1722,33 @@ impl<'a> ResolvedTypeOps<'a> {
             return builtin;
         }
         if self.snapshot.non_containers.contains(&name) {
+            // The flattened RHS shapes land first: an argument-bearing,
+            // function, record, or parameterized alias use reads its RHS
+            // whole — the written arguments substitute the alias's own
+            // parameters positionally (`typedef P<T> = Map<String, T>`
+            // spelled `P<int>` reads `Map<String, int>`), a missing tail
+            // argument reads its to-bounds default, and the use-site `?`
+            // composes with the RHS's own.
+            if let Some(entry) = self.snapshot.typedef_shapes.get(&name) {
+                let written = arena.get(args as usize).map_or(&[][..], Vec::as_slice);
+                let mut mapped: Vec<TypeId> = written
+                    .iter()
+                    .map(|arg| self.map_node(arg, arena, names))
+                    .collect();
+                mapped.resize(entry.params.len(), self.dynamic);
+                let map: Vec<(TypeParamId, TypeId)> = entry
+                    .params
+                    .iter()
+                    .copied()
+                    .zip(mapped)
+                    .collect();
+                let shape = self.snapshot.table.substitute(entry.shape, &map);
+                return self.with_question(shape, entry.nullable || nullable);
+            }
             // A bare `typedef A = B` chases its aliased head before the
             // opaque face — the oracle resolves `A` to `B` wholesale
             // (`B f(A a) => a` is silent, `C c = a` still reports
-            // `invalid_assignment`). Argument-carrying and non-Named RHS
-            // shapes are not modeled here and fall through to opaque
-            // (the under-report direction).
+            // `invalid_assignment`).
             let (chased, chased_nullable) = self.chase_typedef(name);
             let nullable = nullable || chased_nullable;
             if chased != name && !self.snapshot.non_containers.contains(&chased) {

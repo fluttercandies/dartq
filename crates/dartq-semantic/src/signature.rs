@@ -428,6 +428,7 @@ impl<'a> Face<'a> {
             var_ty,
             return_ty,
             formals,
+            ..
         } = decl;
         // Capture-time filter: prefixes and type parameters are
         // declaration-scoped, never a library face (the collector

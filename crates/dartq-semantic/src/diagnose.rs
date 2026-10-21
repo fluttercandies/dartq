@@ -3800,6 +3800,19 @@ mod ticket_2440_tests;
 /// `non_exhaustive` witness over the root is `Enum()` itself).
 #[cfg(test)]
 mod ticket_2439_tests;
+
+/// The #2410 pins: the typedef RHS seam — the four RHS shapes that landed
+/// opaque at the chase site (an argument-bearing `Named`
+/// (`typedef A = List<int>`), a function shape (`typedef F = int
+/// Function(String)`), a record shape (`typedef R = (int, String)`), and a
+/// parameterized alias (`typedef P<T> = ...`)) now resolve through the
+/// snapshot's flattened RHS shapes, and a parameterized use substitutes its
+/// written arguments into the captured RHS at the diagnosing fold (the
+/// #2413 red-pin posture flips to the oracle's
+/// `argument_type_not_assignable`).
+#[cfg(test)]
+mod ticket_2410_tests;
+
 /// The #2441 pins: one argument verdict — [`Engine::argument_verdict`] —
 /// behind every argument face (the two operator folds, the two
 /// const/enum-constructor walks, the fn-signature faces, and the staged

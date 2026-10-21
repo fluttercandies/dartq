@@ -1563,8 +1563,17 @@ pub struct TopDecl {
     pub kind: MicroKind,
     /// The declaration's own type parameters; 0 when non-generic.
     pub type_params: u16,
+    /// The declaration's own type-parameter spellings, in declaration
+    /// order — a type alias only (`typedef P<T, U> = ...` keeps `[T, U]`):
+    /// the use-site written arguments substitute into the captured right
+    /// hand side positionally against this list. Every other kind keeps it
+    /// empty (executables carry the count only).
+    pub type_param_names: Box<[StringId]>,
     /// Declared type of a top-level variable (executables:
-    /// [`Ty::Unknown`]).
+    /// [`Ty::Unknown`]). For a type alias: the right-hand side as written
+    /// — a parameterized alias keeps its parameter spellings as bare
+    /// [`Ty::Named`] leaves (the written-shape face; the substitution face
+    /// applies at the use site).
     pub var_ty: Ty,
     /// Declared return type of a top-level function/getter/setter.
     pub return_ty: Ty,
@@ -1576,10 +1585,11 @@ impl TopDecl {
     /// A bare name tag with no executable facts (containers, variables
     /// whose type was not captured, type parameters).
     #[must_use]
-    pub const fn bare(kind: MicroKind) -> TopDecl {
+    pub fn bare(kind: MicroKind) -> TopDecl {
         TopDecl {
             kind,
             type_params: 0,
+            type_param_names: Box::new([]),
             var_ty: Ty::UNKNOWN,
             return_ty: Ty::UNKNOWN,
             formals: None,

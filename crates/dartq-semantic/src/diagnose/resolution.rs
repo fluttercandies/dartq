@@ -32,24 +32,32 @@ impl<'a> Engine<'a> {
     }
 
     /// The declared-type alias fold: a named type whose head resolves to a
-    /// non-parameterized type alias rewrites to the alias's captured
-    /// right-hand type, carrying the use-site `?` (upstream Dart SDK source,
+    /// type alias rewrites to the alias's captured right-hand type,
+    /// carrying the use-site `?` (upstream Dart SDK source,
     /// pkg/analyzer/lib/src/dart/element/element.dart — a `TypeAliasElement`
     /// use resolves through its aliased type before any type question reads
-    /// it). The loop depth bounds chains and cycles; a parameterized alias
-    /// use and an unresolvable head answer as written (the under-report
-    /// direction); a function/record right-hand side rewrites to that
-    /// right-hand shape whole (`typedef V = void Function();` — the
-    /// use-site `?` joins).
+    /// it). A parameterized alias's written arguments substitute into the
+    /// captured RHS first ([`Self::fold_parameterized_alias`]). The loop
+    /// depth bounds chains and cycles; an unresolvable head answers as
+    /// written (the under-report direction); a function/record right-hand
+    /// side rewrites to that right-hand shape whole
+    /// (`typedef V = void Function();` — the use-site `?` joins).
     pub(crate) fn fold_alias_ty(&self, ty: Ty) -> Ty {
         let Ty::Named {
             name,
             nullable,
-            args: ArgListId::EMPTY,
+            args,
         } = ty
         else {
             return ty;
         };
+        // A use with written arguments whose head resolves to a
+        // parameterized alias substitutes them into the captured RHS
+        // (`Predicate<String>` reads `bool Function(String)`); every other
+        // arg-bearing use keeps the written shape.
+        if args != ArgListId::EMPTY {
+            return self.fold_parameterized_alias(name, nullable, args).unwrap_or(ty);
+        }
         let (mut head, mut head_nullable) = (name, nullable);
         for _ in 0..8 {
             let Some(rhs) = self.alias_rhs(head) else {
@@ -111,6 +119,263 @@ impl<'a> Engine<'a> {
             name: head,
             nullable: head_nullable,
             args: ArgListId::EMPTY,
+        }
+    }
+
+    /// The parameterized-alias use-site substitution face (#2410): the
+    /// captured RHS stands for a written use with the alias's own
+    /// parameters substituted (`Predicate<T> = Callback<T, bool>` spelled
+    /// `Predicate<String>` reads `Callback<String, bool>`, and a co-alias
+    /// chain continues into the terminal function shape). `None` keeps
+    /// the use as written — a head that resolves to no parameterized
+    /// alias (the element-model RHS rides the declaration only when the
+    /// collector armed it; a restored pre-slot payload decodes empty and
+    /// under-reports), a cyclic chain, and a right-hand shape the fold
+    /// does not rewrite (`void`/`Null`/`Unknown`).
+    fn fold_parameterized_alias(
+        &self,
+        name: StringId,
+        nullable: bool,
+        args: ArgListId,
+    ) -> Option<Ty> {
+        let mut seen: FxHashSet<StringId> = FxHashSet::default();
+        let (mut cur, mut cur_nullable, mut cur_args) = (name, nullable, args);
+        for _ in 0..8 {
+            if !seen.insert(cur) {
+                return None;
+            }
+            match self.instantiate_alias(cur, cur_args)? {
+                Ty::Named {
+                    name: next,
+                    nullable: next_nullable,
+                    args: next_args,
+                } if next_args != ArgListId::EMPTY => {
+                    cur = next;
+                    cur_nullable |= next_nullable;
+                    cur_args = next_args;
+                }
+                Ty::Named {
+                    name: next,
+                    nullable: next_nullable,
+                    args: ArgListId::EMPTY,
+                } => {
+                    // The chain landed on a bare named type (a container
+                    // head or a bare-alias face): the use reads that head
+                    // whole — the bare loop's terminal shape.
+                    return Some(Ty::Named {
+                        name: next,
+                        nullable: cur_nullable | next_nullable,
+                        args: ArgListId::EMPTY,
+                    });
+                }
+                Ty::Function {
+                    shape,
+                    nullable: next_nullable,
+                } => {
+                    return Some(Ty::Function {
+                        shape,
+                        nullable: cur_nullable | next_nullable,
+                    });
+                }
+                Ty::Record {
+                    shape,
+                    nullable: next_nullable,
+                } => {
+                    return Some(Ty::Record {
+                        shape,
+                        nullable: cur_nullable | next_nullable,
+                    });
+                }
+                Ty::Dynamic => return Some(Ty::Dynamic),
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// One substitution step: `name`'s parameterized alias declaration
+    /// with `args` zipped against its parameter spellings, the captured
+    /// RHS projected through the boundary and substituted. `None` when
+    /// the head resolves to no parameterized alias with a captured RHS.
+    fn instantiate_alias(&self, name: StringId, args: ArgListId) -> Option<Ty> {
+        let (owner, decl) = match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::Local(decl) => (self.file, decl),
+            ScopedHit::Found(NamespaceEntry::Decl(file)) => {
+                (file, self.index.get(file).and_then(|f| f.decl(name))?)
+            }
+            _ => return None,
+        };
+        if decl.kind != MicroKind::TypeAlias
+            || decl.type_params == 0
+            || decl.var_ty == Ty::UNKNOWN
+        {
+            return None;
+        }
+        let written: Vec<Ty> = self.boundary.pool().get(args).to_vec();
+        let mut subst: FxHashMap<StringId, Ty> = FxHashMap::default();
+        for (spelling, arg) in decl.type_param_names.iter().zip(written) {
+            subst.insert(*spelling, arg);
+        }
+        if subst.is_empty() {
+            // No spellings to substitute against (a pre-slot payload) —
+            // the RHS leaves would stand unsubstituted for the use.
+            return None;
+        }
+        let rhs = self.boundary.ty(owner, decl.var_ty);
+        Some(self.substitute_alias_rhs(rhs, &subst))
+    }
+
+    /// Deep-substitutes the alias's parameter spellings through a
+    /// captured RHS, re-interning every touched pool slot into the
+    /// diagnosing universe's pool. An unlisted bare leaf keeps its
+    /// spelling — a non-parameter leaf name is some other declaration's
+    /// face, not the alias's.
+    fn substitute_alias_rhs(&self, ty: Ty, subst: &FxHashMap<StringId, Ty>) -> Ty {
+        match ty {
+            Ty::Named {
+                name,
+                nullable,
+                args: ArgListId::EMPTY,
+            } => match subst.get(&name) {
+                Some(replacement) => self.with_use_question(*replacement, nullable),
+                None => ty,
+            },
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => {
+                let substituted: Vec<Ty> = self
+                    .boundary
+                    .pool()
+                    .get(args)
+                    .iter()
+                    .map(|&arg| self.substitute_alias_rhs(arg, subst))
+                    .collect();
+                self.boundary.args.borrow_mut().named(name, nullable, &substituted)
+            }
+            Ty::Record { shape, nullable } => {
+                let (positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.record_shape(shape);
+                    (shape.positional.to_vec(), shape.named.to_vec())
+                };
+                let positional: Vec<Ty> = positional
+                    .iter()
+                    .map(|&field| self.substitute_alias_rhs(field, subst))
+                    .collect();
+                let named: Vec<(StringId, Ty)> = named
+                    .iter()
+                    .map(|&(field_name, field)| (field_name, self.substitute_alias_rhs(field, subst)))
+                    .collect();
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .record(&positional, &named, nullable)
+            }
+            Ty::Function { shape, nullable } => {
+                let (type_params, return_ty, positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.function_shape(shape);
+                    (
+                        shape.type_params,
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                    )
+                };
+                let return_ty = self.substitute_alias_rhs(return_ty, subst);
+                let positional: Vec<Ty> = positional
+                    .iter()
+                    .map(|&formal| self.substitute_alias_rhs(formal, subst))
+                    .collect();
+                let named: Vec<(StringId, Ty)> = named
+                    .iter()
+                    .map(|&(formal_name, formal)| {
+                        (formal_name, self.substitute_alias_rhs(formal, subst))
+                    })
+                    .collect();
+                self.boundary.args.borrow_mut().function(
+                    type_params,
+                    return_ty,
+                    &positional,
+                    &named,
+                    nullable,
+                )
+            }
+            _ => ty,
+        }
+    }
+
+    /// Unites a substituted leaf's own `?` with the use's (the
+    /// `T?=String` read is `String?`): re-interning only where the shape
+    /// rides a pool slot; the unit kinds keep their nullability face.
+    fn with_use_question(&self, ty: Ty, nullable: bool) -> Ty {
+        if !nullable {
+            return ty;
+        }
+        match ty {
+            Ty::Named {
+                name,
+                nullable: own,
+                args,
+            } if args == ArgListId::EMPTY => Ty::Named {
+                name,
+                nullable: own || nullable,
+                args,
+            },
+            Ty::Named {
+                name,
+                nullable: own,
+                args,
+            } => {
+                let list: Vec<Ty> = self.boundary.pool().get(args).to_vec();
+                self.boundary.args.borrow_mut().named(name, own || nullable, &list)
+            }
+            Ty::Record {
+                shape,
+                nullable: own,
+            } => {
+                let (positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.record_shape(shape);
+                    (shape.positional.to_vec(), shape.named.to_vec())
+                };
+                self.boundary
+                    .args
+                    .borrow_mut()
+                    .record(&positional, &named, own || nullable)
+            }
+            Ty::Function {
+                shape,
+                nullable: own,
+            } => {
+                let (type_params, return_ty, positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.function_shape(shape);
+                    (
+                        shape.type_params,
+                        shape.return_ty,
+                        shape.positional.to_vec(),
+                        shape.named.to_vec(),
+                    )
+                };
+                self.boundary.args.borrow_mut().function(
+                    type_params,
+                    return_ty,
+                    &positional,
+                    &named,
+                    own || nullable,
+                )
+            }
+            other => other,
         }
     }
 

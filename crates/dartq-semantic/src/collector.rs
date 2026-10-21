@@ -229,11 +229,11 @@ struct PendingTop {
 struct PendingTypedef {
     name: Option<(StringId, SourceRange)>,
     type_params: u16,
-    /// The declaration wrote a `<T>` list (`end_type_variables` latches it
-    /// directly — the `type_params` count routes through
-    /// [`Builder::attach_type_param_count`], whose `executable_header_done`
-    /// gate a preceding typedef's own formal-shape probe already closed).
-    saw_type_params: bool,
+    /// The declaration's own type-parameter spellings, in declaration
+    /// order (taken from [`Builder::type_var_group`] when the depth-1
+    /// group closes) — the use-site substitution face zips the written
+    /// arguments against it.
+    type_param_names: Vec<StringId>,
 }
 
 /// The capture state shared between the listener and [`collect`].
@@ -1982,6 +1982,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                             TopDecl {
                                 kind: MicroKind::TopLevelVar,
                                 type_params: 0,
+                                type_param_names: Box::new([]),
                                 var_ty: ty,
                                 return_ty: Ty::UNKNOWN,
                                 formals: None,
@@ -2163,16 +2164,21 @@ impl ParserListener for DeclarationCollector<'_, '_> {
 
     fn end_type_variables(&mut self, _begin: Token, _end: Token) {
         let builder = &mut self.builder;
-        if builder.type_group_depth == 1
-            && let Some(pending) = &mut builder.pending_typedef
-        {
-            pending.saw_type_params = true;
-        }
         if builder.type_group_depth == 1 && !builder.attach_type_param_count() {
             // A container header: the count carries into the container's
             // `begin_*_declaration` open (official order — the type
             // variables parse before `beginClassDeclaration`).
             builder.header_type_params = builder.type_param_count;
+        }
+        // The group's spellings in declaration order — the use-site
+        // substitution face zips the written arguments against them. The
+        // count's attach above consumed the buffer only for a pending
+        // member; a typedef's group survives it, so the take lands here
+        // (after the attach, matching the count's routing).
+        if builder.type_group_depth == 1
+            && let Some(pending) = &mut builder.pending_typedef
+        {
+            pending.type_param_names = std::mem::take(&mut builder.type_var_group);
         }
         if let Some(site) = builder.capture.as_mut() {
             site.type_variables_end();
@@ -2440,6 +2446,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 TopDecl {
                     kind: MicroKind::TopLevelFn,
                     type_params: pending.type_params,
+                    type_param_names: Box::new([]),
                     var_ty: Ty::UNKNOWN,
                     return_ty: pending.return_ty,
                     formals: pending.formals,
@@ -2455,7 +2462,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.pending_typedef = Some(PendingTypedef {
             name: None,
             type_params: 0,
-            saw_type_params: false,
+            type_param_names: Vec::new(),
         });
         // The typedef opens a fresh declaration header: a preceding
         // declaration's (or a previous typedef RHS's) closed formal list
@@ -2709,12 +2716,16 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             // RHS parses after the name and completes before this event, so
             // `take_armed` answers it (modern `=` form only — the old-style
             // function-typed spelling carries its shape in no single armed
-            // annotation, and a parameterized alias needs its substitution
-            // face before the RHS can stand for uses). The diagnoser's alias
-            // fold resolves uses through this type.
-            let var_ty = match (equals, pending.saw_type_params) {
-                (Some(_), false) => builder.take_armed(),
-                _ => Ty::UNKNOWN,
+            // annotation and stays `Unknown`). A parameterized alias captures
+            // its RHS in the same written shape — the parameter spellings
+            // ride as bare `Ty::Named` leaves — and the substitution faces
+            // apply the use-site written arguments at the read sites (the
+            // snapshot chase in `crate::resolved_ops`, the diagnosing fold's
+            // alias substitution). The diagnoser's alias fold resolves uses
+            // through this type.
+            let var_ty = match equals {
+                Some(_) => builder.take_armed(),
+                None => Ty::UNKNOWN,
             };
             builder.declare_top(
                 name,
@@ -2722,6 +2733,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 TopDecl {
                     kind: MicroKind::TypeAlias,
                     type_params: pending.type_params,
+                    type_param_names: pending.type_param_names.into_boxed_slice(),
                     var_ty,
                     return_ty: Ty::UNKNOWN,
                     formals: None,
@@ -3088,10 +3100,11 @@ mod tests {
         assert_eq!(kind("T"), MicroKind::TypeParam);
     }
 
-    /// The alias right-hand type capture: a modern non-parameterized
-    /// `typedef` keeps its RHS type (the diagnoser's alias fold resolves
-    /// uses through it), a parameterized and an old-style spelling keep
-    /// `Unknown` (their use faces are not modeled).
+    /// The alias right-hand type capture: a modern `typedef` keeps its RHS
+    /// type — a parameterized alias in the written shape (its parameter
+    /// spellings ride as bare `Ty::Named` leaves; the use-site substitution
+    /// faces apply the written arguments), the old-style spelling keeps
+    /// `Unknown` (its shape rides no single armed annotation).
     #[test]
     fn captures_typedef_alias_right_hand_type() {
         let strings = StringTable::new();
@@ -3118,7 +3131,8 @@ mod tests {
         );
         assert_eq!(
             elements.decl(id(&strings, "G")).expect("G").var_ty,
-            Ty::UNKNOWN
+            Ty::named(id(&strings, "int")),
+            "the parameterized RHS captures in the written shape"
         );
         assert_eq!(
             elements.decl(id(&strings, "Old")).expect("Old").var_ty,
