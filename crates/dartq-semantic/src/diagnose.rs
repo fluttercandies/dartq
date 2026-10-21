@@ -3758,3 +3758,10 @@ mod ticket_2430_tests;
 /// twins stay ambiguous.
 #[cfg(test)]
 mod ticket_2431_tests;
+/// The #2432 pins: invocation-level generic type-argument inference — the
+/// member-send/top-level upward unification materializes the call's solved
+/// bindings into the return face, ambiguous candidates poison instead of
+/// first-winning, and the prefixed type head counts its argument group
+/// against the prefix scope's element.
+#[cfg(test)]
+mod ticket_2432_tests;

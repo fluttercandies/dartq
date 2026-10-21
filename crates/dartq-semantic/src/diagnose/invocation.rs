@@ -785,24 +785,41 @@ impl<'a> Engine<'a> {
         // implicit-`this` bare name with, boundary-projected so the slot
         // stays single-pool (`super.` skips the own member map). Getters,
         // statics, and unresolvable chains stay `Unknown` (under-report).
-        let ty = match &recv {
-            Receiver::This { container, .. } => self.member_declared_ty(*container, member.name),
-            Receiver::Super { container, .. } => match self.walk_super(*container, member.name) {
-                Walk::Found(entry) if entry.kind == MemberKind::Field => {
-                    self.fold_alias_ty(entry.var_ty)
+        // An invoked member's row already carries the send's own result
+        // type — the instantiated generic face the argument-group write
+        // landed (`r.readEnum(...)`'s solved `Tag`) — which the declared
+        // re-read must not discard: the folded row IS the invocation's
+        // expression node, so its type is the call's solved return (the
+        // `pending_send_ty` creation fold's same hole, member-side).
+        let ty = if member.ty != Ty::UNKNOWN && member.intent == Intent::Invoke {
+            member.ty
+        } else {
+            match &recv {
+                Receiver::This { container, .. } => {
+                    self.member_declared_ty(*container, member.name)
                 }
-                _ => Ty::UNKNOWN,
-            },
-            Receiver::Typed { type_name, .. } => self.member_declared_ty(*type_name, member.name),
-            // A record-typed receiver (`config.strict`, `pair.$1`): the
-            // field getter's type is the shape's own field type (records
-            // carry no interface members besides `Object`'s, which stay
-            // `Unknown`); a `?.` read joins the null-aware `?`.
-            _ => match self.record_field_ty(merged_receiver_ty, member.name, is_null_aware) {
-                Some(field) if is_null_aware => Self::nullable_form(field),
-                Some(field) => field,
-                None => Ty::UNKNOWN,
-            },
+                Receiver::Super { container, .. } => {
+                    match self.walk_super(*container, member.name) {
+                        Walk::Found(entry) if entry.kind == MemberKind::Field => {
+                            self.fold_alias_ty(entry.var_ty)
+                        }
+                        _ => Ty::UNKNOWN,
+                    }
+                }
+                Receiver::Typed { type_name, .. } => {
+                    self.member_declared_ty(*type_name, member.name)
+                }
+                // A record-typed receiver (`config.strict`, `pair.$1`): the
+                // field getter's type is the shape's own field type (records
+                // carry no interface members besides `Object`'s, which stay
+                // `Unknown`); a `?.` read joins the null-aware `?`.
+                _ => match self.record_field_ty(merged_receiver_ty, member.name, is_null_aware)
+                {
+                    Some(field) if is_null_aware => Self::nullable_form(field),
+                    Some(field) => field,
+                    None => Ty::UNKNOWN,
+                },
+            }
         };
         // A redirecting factory's `= C.name` target: the constructor
         // reference parses as a `head.selector` member merge under
@@ -1686,53 +1703,56 @@ impl<'a> Engine<'a> {
         // literal-invocation recovery shapes (`null(x)`, `true(x)`,
         // `1(x)`) arm the needs-getter face on the literal's own static
         // type.
-        let top = self.callee_index().or_else(|| {
-            // The type-argumented send's head (`f<Missing>(...)`): the
-            // group's UNRESOLVED arguments are the `TypeUse` rows stacked
-            // between the head and the paren (a resolved argument pushes no
-            // row), so the plain top-row read misses the Bare head and the
-            // send links nothing — the callee keeps its read intent and
-            // pass 2 codes the bare-read face where the oracle's invocation
-            // rewrite reports the method/function face (probed:
-            // `Undefined<X>(...)` in an instance body is
-            // `undefined_method` of the enclosing type, at top level
-            // `undefined_function`). Only a live group registration arms
-            // the scan's candidate — `type_argumented` re-checks
-            // `deferred_args` below, so a stray type row above an
-            // unrelated head upgrades nothing.
-            if !matches!(self.rows.last()?.shape, RowShape::TypeUse(..)) {
-                return None;
-            }
-            let mut index = self.rows.len();
-            while index > 0 && matches!(self.rows[index - 1].shape, RowShape::TypeUse(..)) {
-                index -= 1;
-            }
-            let candidate = index.checked_sub(1)?;
-            matches!(
-                self.rows[candidate].shape,
-                RowShape::Bare(_) | RowShape::Member { .. }
-            )
-            .then_some(candidate)
-        }).or_else(|| {
-            // Value and keyword-receiver heads arm the same invocation face:
-            // the literal-invocation recovery shapes (`null(x)`, `true(x)`,
-            // `1(x)`) read the literal's static type, and a bare
-            // `this(...)`/`super(...)` in an instance body reads the
-            // enclosing container's. A bare `this(` inside a
-            // constructor-initializer list is the redirecting-constructor
-            // edge, not an invocation — the F-C redirect face below owns
-            // it.
-            let index = self.rows.len().checked_sub(1)?;
-            let row = &self.rows[index];
-            let arms = match &row.shape {
-                RowShape::Value => true,
-                RowShape::Receiver(Receiver::This { .. } | Receiver::Super { .. }) => {
-                    !(self.initializer_depth > 0 && row.name == self.intern(""))
+        let top = self
+            .callee_index()
+            .or_else(|| {
+                // The type-argumented send's head (`f<Missing>(...)`): the
+                // group's UNRESOLVED arguments are the `TypeUse` rows stacked
+                // between the head and the paren (a resolved argument pushes no
+                // row), so the plain top-row read misses the Bare head and the
+                // send links nothing — the callee keeps its read intent and
+                // pass 2 codes the bare-read face where the oracle's invocation
+                // rewrite reports the method/function face (probed:
+                // `Undefined<X>(...)` in an instance body is
+                // `undefined_method` of the enclosing type, at top level
+                // `undefined_function`). Only a live group registration arms
+                // the scan's candidate — `type_argumented` re-checks
+                // `deferred_args` below, so a stray type row above an
+                // unrelated head upgrades nothing.
+                if !matches!(self.rows.last()?.shape, RowShape::TypeUse(..)) {
+                    return None;
                 }
-                _ => false,
-            };
-            arms.then_some(index)
-        });
+                let mut index = self.rows.len();
+                while index > 0 && matches!(self.rows[index - 1].shape, RowShape::TypeUse(..)) {
+                    index -= 1;
+                }
+                let candidate = index.checked_sub(1)?;
+                matches!(
+                    self.rows[candidate].shape,
+                    RowShape::Bare(_) | RowShape::Member { .. }
+                )
+                .then_some(candidate)
+            })
+            .or_else(|| {
+                // Value and keyword-receiver heads arm the same invocation face:
+                // the literal-invocation recovery shapes (`null(x)`, `true(x)`,
+                // `1(x)`) read the literal's static type, and a bare
+                // `this(...)`/`super(...)` in an instance body reads the
+                // enclosing container's. A bare `this(` inside a
+                // constructor-initializer list is the redirecting-constructor
+                // edge, not an invocation — the F-C redirect face below owns
+                // it.
+                let index = self.rows.len().checked_sub(1)?;
+                let row = &self.rows[index];
+                let arms = match &row.shape {
+                    RowShape::Value => true,
+                    RowShape::Receiver(Receiver::This { .. } | Receiver::Super { .. }) => {
+                        !(self.initializer_depth > 0 && row.name == self.intern(""))
+                    }
+                    _ => false,
+                };
+                arms.then_some(index)
+            });
         let type_argumented =
             top.is_some_and(|i| self.deferred_args.iter().any(|(row, _, _)| *row == i));
         let abuts = top.is_some_and(|i| {
@@ -2274,6 +2294,204 @@ impl<'a> Engine<'a> {
             Ty::Record { .. } | Ty::Function { .. } => None,
             other => Some(other),
         }
+    }
+
+    /// The upward-constraint collector (`generic_inferrer.dart`'s
+    /// `TypeConstraintFromArgument` origins, upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/generic_inferrer.dart — each
+    /// argument-expression type contributes a constraint where the
+    /// corresponding formal's declared type mentions an inference
+    /// parameter). One written formal walks against the argument's
+    /// computed `Ty` and pushes every `(parameter name → matched portion)`
+    /// pair the structure forces:
+    ///
+    /// * a bare `T` formal binds the whole argument type;
+    /// * a `C<…>` formal against a same-head `C<…>` argument binds
+    ///   pairwise through the argument lists;
+    /// * the `List<E>`/`Set<E>` → `Iterable<E>` climb (the builtins
+    ///   supertype table's only single-slot interface edge) crosses the
+    ///   one head hop `Iterable<T>` formals need;
+    /// * a `Function`/`Record` formal against the same shape binds
+    ///   positionally (named slots never unify — the oracle's named-slot
+    ///   pairing is outside this face).
+    ///
+    /// Everything else — a `T?` leaf (the substitution's own `None`
+    /// shape), a mismatched head, an arity disagreement — binds nothing,
+    /// the under-report direction the caller's disagreement rule keeps.
+    fn unify_upward(
+        &self,
+        formal: Ty,
+        arg: Ty,
+        params: &[(StringId, Option<Ty>)],
+        out: &mut Vec<(StringId, Ty)>,
+    ) {
+        match (formal, arg) {
+            (
+                Ty::Named {
+                    name,
+                    nullable: false,
+                    args,
+                },
+                _,
+            ) if args == ArgListId::EMPTY => {
+                if params.iter().any(|(param, _)| *param == name) {
+                    out.push((name, arg));
+                }
+            }
+            (
+                Ty::Named {
+                    name,
+                    nullable: false,
+                    args: formal_args,
+                },
+                Ty::Named {
+                    name: arg_head,
+                    args: arg_args,
+                    ..
+                },
+            ) if formal_args != ArgListId::EMPTY => {
+                let pool = self.boundary.args.borrow();
+                let (formal_args, arg_args) = (pool.get(formal_args), pool.get(arg_args));
+                if name == arg_head && formal_args.len() == arg_args.len() {
+                    for (f, a) in formal_args.iter().zip(arg_args.iter()) {
+                        self.unify_upward(*f, *a, params, out);
+                    }
+                    return;
+                }
+                // The builtins edge: `List<E>`/`Set<E>` implement
+                // `Iterable<E>` — the single-slot interface climb the
+                // `Iterable<T>` formal needs to see its `T`.
+                let iterable = self.intern("Iterable");
+                if name == iterable && formal_args.len() == 1 && arg_args.len() == 1 {
+                    let head = self.strings.resolve(arg_head);
+                    if head == "List" || head == "Set" {
+                        self.unify_upward(formal_args[0], arg_args[0], params, out);
+                    }
+                }
+            }
+            (
+                Ty::Function {
+                    shape: formal_shape,
+                    nullable: false,
+                },
+                Ty::Function {
+                    shape: arg_shape, ..
+                },
+            ) => {
+                let pool = self.boundary.pool();
+                let (formal_shape, arg_shape) = (
+                    pool.function_shape(formal_shape),
+                    pool.function_shape(arg_shape),
+                );
+                for (f, a) in formal_shape
+                    .positional
+                    .iter()
+                    .zip(arg_shape.positional.iter())
+                {
+                    self.unify_upward(*f, *a, params, out);
+                }
+                self.unify_upward(formal_shape.return_ty, arg_shape.return_ty, params, out);
+            }
+            (
+                Ty::Record {
+                    shape: formal_shape,
+                    nullable: false,
+                },
+                Ty::Record {
+                    shape: arg_shape, ..
+                },
+            ) => {
+                let pool = self.boundary.pool();
+                let (formal_shape, arg_shape) = (
+                    pool.record_shape(formal_shape),
+                    pool.record_shape(arg_shape),
+                );
+                for (f, a) in formal_shape
+                    .positional
+                    .iter()
+                    .zip(arg_shape.positional.iter())
+                {
+                    self.unify_upward(*f, *a, params, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A member send's inference parameters and receiver-side seeds —
+    /// `reader.readEnum(...)`, `box.get()`, `this.adopt(...)`: the found
+    /// method's own type-parameter names ([`MemberEntry::type_param_names`])
+    /// join the declaring container's captured parameters
+    /// ([`Bounds::container_params`], in-file only — a foreign container's
+    /// parameter names are unmodeled, the under-report direction). The
+    /// receiver's written instantiation (`box: Box<int>`) seeds the
+    /// container parameters only when the member lives on the receiver's
+    /// own head — an inherited member declares its signatures in the
+    /// supertype's parameter spellings, whose instantiation this
+    /// name-level model cannot map (`C<T> extends B<String>` must not
+    /// seed `B`'s `T` from `C<int>`).
+    fn member_send_params(
+        &self,
+        recv: &Receiver,
+        member: StringId,
+    ) -> Option<(Box<[(StringId, Option<Ty>)]>, Vec<(StringId, Ty)>)> {
+        let (container, recv_ty) = match *recv {
+            Receiver::Typed { type_name, ty } => (type_name, Some(ty)),
+            Receiver::This { container, .. } => (container, None),
+            _ => return None,
+        };
+        let Walk::Found(entry) = self.walk_members(container, member) else {
+            return None;
+        };
+        if entry.kind != MemberKind::Method {
+            return None;
+        }
+        let own_member = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            container,
+        )
+        .is_some_and(|(c, _)| c.members.get(&member).is_some());
+        let mut params: Vec<(StringId, Option<Ty>)> = entry
+            .type_param_names
+            .iter()
+            .map(|name| (*name, None))
+            .collect();
+        // The declaring container's parameters join only for the
+        // receiver's own member: an inherited member's formals spell the
+        // SUPERTYPE's parameter names, which happen to collide with the
+        // receiver's own spelling (`C<T> extends B<String>` calling
+        // `B`'s `m(T)` — binding `C`'s `T` from the argument would invent
+        // a solution the oracle never derives). With no seed the foreign
+        // member's bare-parameter formal binds nothing (the formal spells
+        // a name outside this param list, so `unify_upward` declines it).
+        let container_params = if own_member {
+            self.bounds.container_params(container).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut seeds: Vec<(StringId, Ty)> = Vec::new();
+        if own_member && let Some(Ty::Named { args, .. }) = recv_ty {
+            let pool = self.boundary.args.borrow();
+            let args = pool.get(args);
+            if args.len() == container_params.len() {
+                for ((param, _, _), ty) in container_params.iter().zip(args.iter()) {
+                    seeds.push((*param, *ty));
+                }
+            }
+        }
+        params.extend(
+            container_params
+                .iter()
+                .map(|(param, bound, _)| (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))),
+        );
+        if params.is_empty() {
+            return None;
+        }
+        Some((params.into_boxed_slice(), seeds))
     }
 
     /// The generic inference-failure face (`couldNotInfer`, upstream Dart
@@ -2936,7 +3154,11 @@ impl<'a> Engine<'a> {
                         let mut formals = formals;
                         self.project_formals(super_owner, &mut formals);
                         self.patch_super_formals(superclass, &mut formals);
-                        (formals, Some((super_container, super_owner)), Some(superclass))
+                        (
+                            formals,
+                            Some((super_container, super_owner)),
+                            Some(superclass),
+                        )
                     }
                     // The dead-edge super face (`resolver.dart`'s null
                     // element arm): an unresolvable superclass — the
@@ -3408,7 +3630,12 @@ impl<'a> Engine<'a> {
     /// The instance field's declared type under `name`, the associated
     /// field-formal's own answer — projected out of `owner`'s pool, the
     /// universe the returned `member.var_ty` slots index.
-    fn declared_field_ty(&self, container: &Container, owner: FileId, name: StringId) -> Option<Ty> {
+    fn declared_field_ty(
+        &self,
+        container: &Container,
+        owner: FileId,
+        name: StringId,
+    ) -> Option<Ty> {
         let member = container.members.get(&name)?;
         (member.kind == MemberKind::Field && !member.is_static)
             .then(|| self.boundary.ty(owner, member.var_ty))
@@ -3725,6 +3952,11 @@ impl<'a> Engine<'a> {
         // upstream resolves the variable's declared function type and
         // counts against it (`resolveArgumentsToParameters`).
         let mut sig_from_row: Option<Box<FnVarSig>> = None;
+        // The member send's resolved receiver (`x.m(...)`, `this.m(...)`,
+        // the merged `RowShape::Member` send): the generic-inference face
+        // below reads it for the member's own type parameters and the
+        // receiver-instantiation seeds.
+        let mut send_recv: Option<Receiver> = None;
         // A same-named member claims the unqualified callee ahead of the
         // namespace (the oracle resolves `this.x` before any top-level
         // spelling): the return face below reads the flag — a member-owned
@@ -3766,6 +3998,7 @@ impl<'a> Engine<'a> {
                             )
                         })
                         .and_then(|(container, kind)| {
+                            send_recv = Some(Receiver::This { container, kind });
                             self.member_formals_full(&Receiver::This { container, kind }, row.name)
                         }),
                 };
@@ -3835,53 +4068,48 @@ impl<'a> Engine<'a> {
                 // path above answers `Some(None)` — the member gate opened,
                 // the written-signature table had no entry — so the empty
                 // inner must flatten before the alias arm can run.
-                let sig_formals = sig_formals
-                    .filter(Option::is_some)
-                    .or_else(|| {
-                        let RowShape::Bare(BareInfo::Plain { ty }) = &row.shape else {
-                            return None;
-                        };
-                        match *ty {
-                            // A foreign alias's declared type already folded
-                            // to the alias's function RHS (`bind_parameter_type`
-                            // rewrites `FailureJoiner joiner` to the raw
-                            // `Ty::Function` — the element model's alias row
-                            // never reaches the callee): the pool shape is the
-                            // signature `resolveArgumentsToParameters` counts
-                            // against. Same shape the assignability face's
-                            // `function_shape_sig` reads.
-                            Ty::Function {
-                                shape,
-                                nullable: false,
-                            } => {
-                                let (return_ty, positional, named) = {
-                                    let pool = self.boundary.pool();
-                                    let shape = pool.function_shape(shape);
-                                    (
-                                        shape.return_ty,
-                                        shape.positional.to_vec(),
-                                        shape.named.to_vec(),
-                                    )
-                                };
-                                let sig = Box::new(FnVarSig {
-                                    params: Box::default(),
-                                    required_positional: u16::try_from(positional.len())
-                                        .unwrap_or(u16::MAX),
-                                    positional: positional.into(),
-                                    named: named
-                                        .iter()
-                                        .map(|(name, ty)| (*name, *ty, false))
-                                        .collect(),
-                                    return_ty,
-                                });
-                                Some(Some((sig.formals(self.intern("")), sig)))
-                            }
-                            Ty::Named { name, .. } => self
-                                .alias_fn_sig(name)
-                                .map(|sig| Some((sig.formals(self.intern("")), sig))),
-                            _ => None,
+                let sig_formals = sig_formals.filter(Option::is_some).or_else(|| {
+                    let RowShape::Bare(BareInfo::Plain { ty }) = &row.shape else {
+                        return None;
+                    };
+                    match *ty {
+                        // A foreign alias's declared type already folded
+                        // to the alias's function RHS (`bind_parameter_type`
+                        // rewrites `FailureJoiner joiner` to the raw
+                        // `Ty::Function` — the element model's alias row
+                        // never reaches the callee): the pool shape is the
+                        // signature `resolveArgumentsToParameters` counts
+                        // against. Same shape the assignability face's
+                        // `function_shape_sig` reads.
+                        Ty::Function {
+                            shape,
+                            nullable: false,
+                        } => {
+                            let (return_ty, positional, named) = {
+                                let pool = self.boundary.pool();
+                                let shape = pool.function_shape(shape);
+                                (
+                                    shape.return_ty,
+                                    shape.positional.to_vec(),
+                                    shape.named.to_vec(),
+                                )
+                            };
+                            let sig = Box::new(FnVarSig {
+                                params: Box::default(),
+                                required_positional: u16::try_from(positional.len())
+                                    .unwrap_or(u16::MAX),
+                                positional: positional.into(),
+                                named: named.iter().map(|(name, ty)| (*name, *ty, false)).collect(),
+                                return_ty,
+                            });
+                            Some(Some((sig.formals(self.intern("")), sig)))
                         }
-                    });
+                        Ty::Named { name, .. } => self
+                            .alias_fn_sig(name)
+                            .map(|sig| Some((sig.formals(self.intern("")), sig))),
+                        _ => None,
+                    }
+                });
                 match (member, sig_formals) {
                     (Some(formals), _) => {
                         // The member's alias signature doubles as the
@@ -3924,6 +4152,7 @@ impl<'a> Engine<'a> {
                     .checked_sub(1)
                     .and_then(|index| self.rows.get(index))
                     .map_or(Receiver::Unknown, |below| self.argument_receiver(below));
+                send_recv = Some(recv);
                 match self.member_formals_full(&recv, row.name) {
                     Some(formals) => Some(formals.into_owned()),
                     // The named creation's selector (`B.named(x)`, #1351):
@@ -3971,9 +4200,11 @@ impl<'a> Engine<'a> {
                     formals
                 })
             }
-            RowShape::Member { recv } => self
-                .member_formals_full(recv, row.name)
-                .map(std::borrow::Cow::into_owned),
+            RowShape::Member { recv } => {
+                send_recv = Some(*recv);
+                self.member_formals_full(recv, row.name)
+                    .map(std::borrow::Cow::into_owned)
+            }
             _ => None,
         };
         // The implicit-`call` face (the callee's type names a container
@@ -4068,7 +4299,35 @@ impl<'a> Engine<'a> {
                     } => Some(name),
                     _ => None,
                 };
-                (container, None)
+                // The member send's declared return face (`r.readEnum<T>()`
+                // before the dot merge folds it): the receiver's member
+                // walk answers the method's written return, which the
+                // solved map instantiates below — the unmerged placeholder
+                // carries no `Member` shape for `callee_return_ty` to read.
+                // A class-head receiver (`C.sm()`) is the creation arm's
+                // territory and keeps the prior `None` face.
+                let member_return = container.is_none().then(|| {
+                    let container = match send_recv {
+                        Some(
+                            Receiver::This { container, .. }
+                            | Receiver::Super { container, .. }
+                            | Receiver::Typed {
+                                type_name: container,
+                                ..
+                            },
+                        ) => container,
+                        _ => return None,
+                    };
+                    match self.walk_members(container, row.name) {
+                        Walk::Found(entry)
+                            if matches!(entry.kind, MemberKind::Method | MemberKind::Getter) =>
+                        {
+                            Some(entry.return_ty)
+                        }
+                        _ => None,
+                    }
+                });
+                (container, member_return.flatten())
             }
             RowShape::Bare(BareInfo::Plain { .. }) => (
                 None,
@@ -4077,12 +4336,42 @@ impl<'a> Engine<'a> {
                 // poisoned in the declared-type slot). A member-owned
                 // callee never reads the namespace: the same-spelled
                 // top-level function's return is not the member's
-                // callable's return.
-                sig_from_row.as_ref().map(|sig| sig.return_ty).or_else(|| {
-                    (!member_owns_callee)
-                        .then(|| self.top_level_decl(row.name).map(|decl| decl.return_ty))
-                        .flatten()
-                }),
+                // callable's return — the member's own declared return
+                // rides the receiver's member walk instead
+                // (`this.readEnum(xs)` inside the declaring class) so the
+                // solved map below can instantiate it.
+                sig_from_row
+                    .as_ref()
+                    .map(|sig| sig.return_ty)
+                    .or_else(|| {
+                        (!member_owns_callee)
+                            .then(|| self.top_level_decl(row.name).map(|decl| decl.return_ty))
+                            .flatten()
+                    })
+                    .or_else(|| {
+                        let container = match send_recv {
+                            Some(
+                                Receiver::This { container, .. }
+                                | Receiver::Super { container, .. }
+                                | Receiver::Typed {
+                                    type_name: container,
+                                    ..
+                                },
+                            ) => container,
+                            _ => return None,
+                        };
+                        match self.walk_members(container, row.name) {
+                            Walk::Found(entry)
+                                if matches!(
+                                    entry.kind,
+                                    MemberKind::Method | MemberKind::Getter
+                                ) =>
+                            {
+                                Some(entry.return_ty)
+                            }
+                            _ => None,
+                        }
+                    }),
             ),
             // The member's declared return rides the element walk (the
             // instantiation write below grounds `T` returns).
@@ -4140,6 +4429,23 @@ impl<'a> Engine<'a> {
             && !params.is_empty()
         {
             exec_params = Some(params.iter().map(|name| (*name, None)).collect());
+        }
+        // The member send's inference parameters (`reader.readEnum(...)`,
+        // `this.adopt(...)`, `box.get()`): the found method's own
+        // `type_param_names` — keyed by the member walk, so a same-spelled
+        // member elsewhere never lends them — plus the declaring
+        // container's captured parameters, which the receiver's written
+        // instantiation seeds (`Box<int>.get()` binds `T := int`). Member
+        // type-parameter bounds are not modeled on the element entry, so
+        // every parameter lands unbounded (the under-report direction the
+        // name-keyed model already carries).
+        let mut receiver_seeds: Vec<(StringId, Ty)> = Vec::new();
+        if exec_params.is_none()
+            && let Some(recv) = send_recv
+            && let Some((params, seeds)) = self.member_send_params(&recv, row.name)
+        {
+            receiver_seeds = seeds;
+            exec_params = Some(params);
         }
         // The count decisions. The parser's total is exact where the row
         // recovery is not, so the positional supply is the total less the
@@ -4286,6 +4592,17 @@ impl<'a> Engine<'a> {
                     *slot = Some(*ty);
                 }
             }
+            // The receiver's written instantiation seeds the declaring
+            // container's own parameters (`Box<int>.get()` solves `T` before
+            // any argument reads) — explicit type arguments above win, so a
+            // slot already fixed never re-seeds.
+            for (name, ty) in &receiver_seeds {
+                if let Some(index) = param_index(*name)
+                    && solutions[index].is_none()
+                {
+                    solutions[index] = Some(*ty);
+                }
+            }
             // The bare-type-parameter shape: the only form the substitution
             // answers (written arguments keep their own face).
             let param_of = |ty: Ty| match ty {
@@ -4332,8 +4649,20 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
-            // Upward face: the first matched argument's type names the
-            // parameter (an untypeable argument infers nothing).
+            // Upward face: the argument constraints solve each parameter
+            // (`generic_inferrer.dart`'s `TypeConstraintFromArgument`
+            // origins). Every formal the write pairs unifies structurally
+            // against the argument's computed type — a bare `T` formal
+            // binds its whole argument; a `List<T>`/`Map<K, V>` formal
+            // binds the matched argument slots through the same-head
+            // argument lists; the `List<E>`/`Set<E>` → `Iterable<E>` edge
+            // (the builtins table's only single-slot interface climb)
+            // crosses one head hop. A parameter solved from exactly one
+            // decidable position — or several positions all agreeing —
+            // materializes; positions that disagree leave the slot empty
+            // (the upstream solver's LUB merge is outside this model —
+            // under-report beats an invented binding).
+            let mut candidates: Vec<(StringId, Ty)> = Vec::new();
             let mut positional_index = 0usize;
             for (name, ty, _literal, _range) in &level.args {
                 let formal = if let Some(n) = name {
@@ -4346,14 +4675,31 @@ impl<'a> Engine<'a> {
                 let Some(formal) = formal else {
                     continue;
                 };
-                let Some(param) = param_of(formal.ty) else {
-                    continue;
-                };
+                if *ty != Ty::Unknown {
+                    self.unify_upward(formal.ty, *ty, params, &mut candidates);
+                }
+            }
+            // Slots an earlier phase already fixed (explicit arguments,
+            // the downward context, the receiver seeds) are authoritative:
+            // upward candidates compete only for the still-open slots. A
+            // parameter whose candidates disagree stays empty — and a
+            // later agreeing candidate cannot resurrect a poisoned slot.
+            let prior: Box<[bool]> = solutions.iter().map(|s| s.is_some()).collect();
+            let mut poisoned: FxHashSet<usize> = FxHashSet::default();
+            for (param, ty) in candidates {
                 let Some(index) = param_index(param) else {
                     continue;
                 };
-                if solutions[index].is_none() && *ty != Ty::Unknown {
-                    solutions[index] = Some(*ty);
+                if prior[index] || poisoned.contains(&index) {
+                    continue;
+                }
+                match solutions[index] {
+                    None => solutions[index] = Some(ty),
+                    Some(kept) if kept == ty => {}
+                    Some(_) => {
+                        poisoned.insert(index);
+                        solutions[index] = None;
+                    }
                 }
             }
         }
@@ -4567,27 +4913,36 @@ impl<'a> Engine<'a> {
             }
         }
         // The substituted return type (#1351, part d): a generic send's
-        // static type is the solved return — the exact-parameter shape
-        // only (a compound return keeps the declared face). The row
-        // carries it for the downstream assignment/argument checks; a
-        // nullable solution under-reports.
+        // static type is the solved return — the bare-parameter shape maps
+        // to its slot, and a compound return (`List<T>`) substitutes the
+        // solved map through `subst_params` — both forms the oracle's
+        // `instantiate` writes on the invocation node. A parameter-less or
+        // unsubstitutable return (a record/function shape, a `T?` leaf the
+        // substitution declines) keeps the declared face — the
+        // under-report direction a wrong binding would violate.
         // The implicit-`call` face's result type (the concrete-return
-        // shape — the exactly-parameter shape above already wrote the
+        // shape — the parameter-return shape above already wrote the
         // solved one): `return body(inner)` reads `XPathSequence`
         // (`Expr.call`'s), never the callee's own `Expr` class — the
         // oracle types the invocation node with the called member's
         // return (function_expression_invocation_resolver.dart:230-256).
+        let mut return_written = false;
         if let Some(params) = &exec_params
-            && let Some(Ty::Named {
-                name: param,
-                nullable: false,
-                args,
-            }) = return_face
-            && args == ArgListId::EMPTY
-            && let Some(index) = params.iter().position(|(p, _)| *p == param)
+            && let Some(rf) = return_face
         {
-            self.rows[callee].ty = effective[index];
-        } else if let Some((ret, _)) = implicit_call {
+            let map: Vec<(StringId, Ty)> = params
+                .iter()
+                .zip(effective.iter())
+                .map(|((param, _), ty)| (*param, *ty))
+                .collect();
+            if let Some(instantiated) = self.subst_params(rf, &map)
+                && instantiated != rf
+            {
+                self.rows[callee].ty = instantiated;
+                return_written = true;
+            }
+        }
+        if !return_written && let Some((ret, _)) = implicit_call {
             self.rows[callee].ty = ret;
         }
         // The creation's instantiated self type: the send merge replaces
@@ -4950,7 +5305,8 @@ impl<'a> Engine<'a> {
                 .call_ends
                 .binary_search_by_key(&callee_offset, |(offset, _)| *offset)
             {
-                self.call_ends.insert(index, (callee_offset, end.range.end()));
+                self.call_ends
+                    .insert(index, (callee_offset, end.range.end()));
             }
         } else {
             return None;
@@ -5288,6 +5644,39 @@ impl<'a> Engine<'a> {
                         &ctor,
                         "",
                     );
+                    return;
+                }
+                // The prefixed-creation spelling (`fb.ListReader<idl.X>(...)`):
+                // the parser keeps `p.C` on the member-send shape — the head
+                // `p` latched as the prefix receiver and the class `C` as the
+                // member name — so the group never arms `creation_ref`. When
+                // the member name resolves to a CONTAINER through the
+                // prefix's scope, the invocation is a constructor call whose
+                // group counts the class's declared arity (the base code, as
+                // the unprefixed `C<T>` head's); a non-container member keeps
+                // the member walk (a prefixed method's own arity is
+                // unmodeled — under-report).
+                if let Receiver::Prefix { name: prefix } = recv
+                    && let Some((container, _)) = prefixed_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        prefix,
+                        name,
+                    )
+                {
+                    let declared = container.type_params;
+                    if declared != count {
+                        let name_text = self.strings.resolve(name).to_string();
+                        self.emit3(
+                            SemanticCode::WrongNumberOfTypeArguments,
+                            range,
+                            &name_text,
+                            &declared.to_string(),
+                            &count.to_string(),
+                        );
+                    }
                     return;
                 }
                 self.member_exec_arity(&recv, name)
@@ -5644,6 +6033,109 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The continuation head of a prefixed type (`C` of `p.C<T>`): the
+    /// written name directly precedes the head's span as `prefix.`, and the
+    /// declared arity resolves through the import-prefix scope — a bare
+    /// lookup can land on a resolution-elsewhere homonym whose parameter
+    /// count is not the named element's (`shared.X<A,B,C,D>` inside a
+    /// typedef RHS counted against the local typedef of the same spelling).
+    /// Textual recovery keeps the armed-head tuple prefix-free: a bare head
+    /// finds no `.` before its span and resolves through the ordinary path.
+    /// A prefix segment that does not resolve as a registered import prefix
+    /// suppresses the check (the dead-prefix face already disarmed this
+    /// head upstream; reaching here with one is a parse-shape anomaly —
+    /// under-report).
+    fn prefixed_head(&self, head_range: SourceRange) -> Option<StringId> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(head_range.offset);
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor == 0 || bytes[cursor - 1] != b'.' {
+            return None;
+        }
+        cursor -= 1;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        let end = cursor;
+        while cursor > 0
+            && matches!(bytes[cursor - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'$')
+        {
+            cursor -= 1;
+        }
+        if cursor == end {
+            return None;
+        }
+        let prefix = self.strings.intern(&self.source[cursor..end]);
+        // Only a live import prefix qualifies — `C.named` (a constructor
+        // selector spelling) or a local shadow keeps the ordinary face.
+        matches!(
+            self.namespaces.lookup(self.graph, self.lib, prefix),
+            dartq_resolution::Lookup::Found(NamespaceEntry::Prefix)
+        )
+        .then_some(prefix)
+    }
+
+    /// The declared type-parameter count of `name` resolved through the
+    /// import prefix `prefix` (`p.C<T>`): the container model answers a
+    /// class/mixin/enum count, the declaration index a typedef's or
+    /// function's. An unresolved or unindexed element suppresses — the
+    /// prefixed resolution face owns its own report.
+    fn declared_type_params_prefixed(&self, prefix: StringId, name: StringId) -> Option<u16> {
+        if let Some((container, _)) = prefixed_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            prefix,
+            name,
+        ) {
+            return Some(container.type_params);
+        }
+        match self
+            .namespaces
+            .lookup_prefixed(self.graph, self.lib, prefix, name)
+        {
+            dartq_resolution::Lookup::Found(NamespaceEntry::Decl(file)) => self
+                .index
+                .get(file)
+                .and_then(|f| f.decl(name))
+                .map(|decl| decl.type_params),
+            _ => None,
+        }
+    }
+
+    /// [`Engine::check_annotation_arity`] for a continuation head: recover
+    /// the written prefix from the head's span and count against the
+    /// prefix-scoped element when one exists; bare heads (and continuations
+    /// whose prefix never registered) keep the ordinary lookup.
+    fn check_prefixed_annotation_arity(
+        &mut self,
+        name: StringId,
+        head_range: SourceRange,
+        count: u16,
+        range: SourceRange,
+    ) {
+        let declared = match self.prefixed_head(head_range) {
+            Some(prefix) => self.declared_type_params_prefixed(prefix, name),
+            None => self.declared_type_params(name),
+        };
+        let Some(declared) = declared else {
+            return;
+        };
+        if declared != count {
+            let name_text = self.strings.resolve(name).to_string();
+            self.emit3(
+                SemanticCode::WrongNumberOfTypeArguments,
+                range,
+                &name_text,
+                &declared.to_string(),
+                &count.to_string(),
+            );
+        }
+    }
+
     /// A type head's declared type-parameter count: `dynamic` and type
     /// parameters declare none, a container keeps its own count, a
     /// typedef/function keeps its declaration's; anything unresolved is
@@ -5785,8 +6277,8 @@ impl<'a> Engine<'a> {
         self.bounds.alias_end_group(range);
         // The #612 capture: the header's group closed into its frame.
         self.var_end_group();
-        if let Some((head, _head_range)) = head {
-            self.check_annotation_arity(head, count, range);
+        if let Some((head, head_range)) = head {
+            self.check_prefixed_annotation_arity(head, head_range, count, range);
             return;
         }
         // An enum constant's constructor type arguments (`a<int>()`,
@@ -5845,13 +6337,42 @@ impl<'a> Engine<'a> {
             && let Some((class, ctor)) = self.creation_ref
         {
             match ctor {
-                Some((ctor, _)) => {
+                Some((ctor, ctor_range)) => {
                     // The `.new` selector (or one spelled as the class) is
                     // the unnamed face: the explicit arguments check against
                     // the CLASS's declared count, not the constructor's
                     // (constructors never declare type parameters).
                     if ctor == class || self.strings.resolve(ctor) == "new" {
                         self.check_annotation_arity(class, count, range);
+                    } else if let BareInfo::Prefix { .. } = self.resolve_bare(class).0 {
+                        // The wave-3 reference is `prefix.Class<T>` — the
+                        // parser cannot tell a prefixed class head from a
+                        // `C.ctor` pair, so the class segment latched as the
+                        // head and the real class as its selector. The group
+                        // counts against the continuation resolved through
+                        // the prefix's scope (`fb.ListReader<idl.X>`). A
+                        // third segment (`p.C.named<T>` — a `.` follows the
+                        // selector) keeps the `_constructor` face: the group
+                        // there applies to the named constructor.
+                        let mut cursor = self.byte_of(ctor_range.end());
+                        while cursor < self.source.len()
+                            && self.source.as_bytes()[cursor].is_ascii_whitespace()
+                        {
+                            cursor += 1;
+                        }
+                        if cursor < self.source.len() && self.source.as_bytes()[cursor] == b'.' {
+                            let class = self.strings.resolve(class).to_string();
+                            let ctor = self.strings.resolve(ctor).to_string();
+                            self.emit3(
+                                SemanticCode::WrongNumberOfTypeArgumentsConstructor,
+                                range,
+                                &class,
+                                &ctor,
+                                "",
+                            );
+                        } else {
+                            self.check_prefixed_annotation_arity(ctor, ctor_range, count, range);
+                        }
                     } else if !matches!(self.resolve_bare(class).0, BareInfo::Missing { .. }) {
                         let class = self.strings.resolve(class).to_string();
                         let ctor = self.strings.resolve(ctor).to_string();
