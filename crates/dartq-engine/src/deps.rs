@@ -80,6 +80,12 @@ pub(crate) struct DepIndex {
     pub load_failures: u64,
     /// The one-shot stderr note's tripwire for cap overflows.
     pub cap_noted: bool,
+    /// The loaded SDK libraries by `dart:` name → their files (the entry
+    /// first, then its parts), every one a unit in `units`
+    /// ([`crate::sdk_units`]).
+    pub sdk_libraries: FxHashMap<String, Vec<FileId>>,
+    /// How many of `units` are SDK files — exempt from [`DEP_FILE_CAP`].
+    pub sdk_file_count: usize,
 }
 
 /// Seeds and drains the dependency closure for the current live libraries.
@@ -96,6 +102,7 @@ pub(crate) fn load_dep_closure(state: &mut EngineState) {
         .deps
         .units
         .retain(|file, _| !state.residency.contains_key(file));
+    crate::sdk_units::load_sdk_units(state);
     let mut queue: Vec<(FileId, u8)> = Vec::new();
     for library in state.libraries.live() {
         let Some(info) = state.libraries.info(library) else {
@@ -137,7 +144,7 @@ pub(crate) fn load_dep_closure(state: &mut EngineState) {
         if state.deps.units.contains_key(&file) || state.residency.contains_key(&file) {
             continue;
         }
-        if state.deps.units.len() >= DEP_FILE_CAP {
+        if state.deps.units.len() - state.deps.sdk_file_count >= DEP_FILE_CAP {
             if !state.deps.cap_noted {
                 state.deps.cap_noted = true;
                 eprintln!(

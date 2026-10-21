@@ -2296,16 +2296,11 @@ impl<'a> Engine<'a> {
         // head, a surplus at the first extra positional argument (the
         // probed `@P()` / `@P(1, 2, 3)` pairings).
         let given = named.iter().filter(|flag| !**flag).count();
-        // Required-ness derives from the default value, not the stored
-        // flag alone: a required positional never carries one and an
-        // optional always does, while initializing formals (`this.a`)
-        // lose the parser's required classification upstream — the flag
-        // stays in the disjunction for the plain-formal worlds.
-        let required = formals
-            .positional
-            .iter()
-            .filter(|f| f.required || f.default_value.is_none())
-            .count();
+        // Required-ness is the parser's classification (the formal's own
+        // group: `[...]` is optional whether or not a default is written —
+        // `const JS([this.name])` takes no argument), exactly the count the
+        // invocation face reads.
+        let required = formals.positional.iter().filter(|f| f.required).count();
         if given < required {
             let display = match selector {
                 Some(id) => format!(

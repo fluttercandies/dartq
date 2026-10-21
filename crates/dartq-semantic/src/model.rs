@@ -1485,6 +1485,15 @@ pub struct Container {
     /// resolved type), so cross-file member faces substitute exactly
     /// instead of by the order a signature happens to spell the names.
     pub type_param_names: Box<[StringId]>,
+    /// Each type parameter's declared bound, parallel to
+    /// [`Self::type_param_names`]; [`Ty::Dynamic`] for an absent bound —
+    /// the Dart reading (an unbounded parameter is bounded by `dynamic`).
+    /// A raw receiver (`JSArray x`, `List xs`) instantiates to THESE
+    /// bounds (`instantiateToBounds`: `JSArray<JSAny?>`, `List<dynamic>`)
+    /// before an extension's `on` face asks its own parameter bounds of
+    /// the arguments. Empty when non-generic or decoded from a pre-field
+    /// payload (the additive-default posture: unbounded).
+    pub type_param_bounds: Box<[Ty]>,
     /// The `sealed` modifier was present (the exhaustiveness splitter,
     /// `types/sealed.dart`).
     pub sealed: bool,

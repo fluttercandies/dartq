@@ -102,8 +102,9 @@ fn messages(report: &FileReport, name: &str) -> Vec<String> {
 /// The unshadowed hot path: three sends on the same `int` head — the
 /// first computes the shadow verdict (no container declares `int`), the
 /// next two read the memo — and every node still refines `int <op>
-/// invalid` to `double` (the `argument_type_not_assignable` row names
-/// 'double' each time).
+/// invalid` to `double` (the `argument_type_not_assignable` row against
+/// the `int` formal names 'double' each time; a `num` formal would accept
+/// `double` and report nothing).
 #[test]
 fn unshadowed_int_refines_across_repeated_sends() {
     let source = "\
@@ -111,7 +112,7 @@ class Node {
   int end = 0;
 }
 
-void g({required num length}) {}
+void g({required int length}) {}
 
 void f(Node node, Token operator) {
   g(length: node.end + operator.offset);

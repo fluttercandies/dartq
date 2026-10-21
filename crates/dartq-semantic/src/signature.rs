@@ -87,8 +87,12 @@ use crate::model::{
 /// spellings in declaration order (#2502) — a parameter-respelling-only
 /// edit changes every dependent's cross-file receiver-instantiation
 /// pairing (the member faces substitute by the declared name order), so
-/// it must flip the L2 gate.
-pub const SIGNATURE_VERSION: u32 = 10;
+/// it must flip the L2 gate. v11: the container's type-parameter bounds,
+/// parallel to the names — a bound-only edit moves every dependent's
+/// raw-receiver instantiation (`instantiateToBounds`: `JSArray<T extends
+/// JSAny?>` reads a bare `JSArray` as `JSArray<JSAny?>`) and so the
+/// extension faces that apply to it.
+pub const SIGNATURE_VERSION: u32 = 11;
 
 /// The 128-bit blake3 digest of a file's canonical element face — the same
 /// width family as [`dartq_source::ContentId`].
@@ -503,6 +507,7 @@ impl<'a> Face<'a> {
             members,
             type_params,
             type_param_names,
+            type_param_bounds,
             sealed,
             with_clause,
             implements_clause,
@@ -532,6 +537,14 @@ impl<'a> Face<'a> {
         self.usize(type_param_names.len());
         for param in type_param_names {
             self.name(*param);
+        }
+        // The declared bounds, parallel to the names: a bound-only edit
+        // moves every dependent's raw-receiver instantiation
+        // (`instantiateToBounds`) and extension applicability, so it must
+        // flip the L2 gate (v11).
+        self.usize(type_param_bounds.len());
+        for bound in type_param_bounds {
+            self.ty(*bound);
         }
         self.field(if *is_abstract { "abstract" } else { "concrete" });
         self.field(if *sealed { "sealed" } else { "unsealed" });

@@ -136,7 +136,16 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// legacy name-forced rule (an under-report posture, never an over-report
 /// face). The same train raised `dartq_semantic::SIGNATURE_VERSION` to 10
 /// (the spellings hash into the element face, so a respelling-only edit
-/// flips the L2 gate).
+/// flips the L2 gate). v17: the container's type-parameter bounds column
+/// (`type_param_bounds`, parallel to the spellings) — a raw receiver
+/// instantiates to its declaration's bounds (`JSArray<T extends JSAny?>`
+/// reads a bare `JSArray` as `JSArray<JSAny?>`) before an extension's
+/// `on` face asks its own bounds of the arguments. Additive-default
+/// decodes bounds-empty (unbounded: the pre-column engine's own reading),
+/// but a payload the old producer wrote would keep the bounded faces
+/// dropping on raw receivers, so the version moves. The same train raised
+/// `dartq_semantic::SIGNATURE_VERSION` to 11 (the bounds hash into the
+/// element face).
 ///
 /// # Bump contract (structural guard)
 ///
@@ -155,7 +164,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// version too.) The bump lane also forks on capture-behavior changes with
 /// no layout delta: a payload the old producer wrote must not be served to
 /// a producer whose capture output diverges from it.
-const FACTS_SHAPE_VERSION: u32 = 16;
+const FACTS_SHAPE_VERSION: u32 = 17;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component of
 /// `EngineSemanticVersion`): the engine facts shape folded with

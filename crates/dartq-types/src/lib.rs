@@ -103,7 +103,7 @@ pub use generic_function::{
     Boundedness, TypeArgumentIssue, instantiate_function, is_well_bounded, regular_bounded_issues,
     replace_top_bottom,
 };
-pub use hierarchy::{CoreDecls, DeclInfo, TypeHierarchy, TypeHierarchyBuilder};
+pub use hierarchy::{CoreDecls, DeclInfo, DroppedEdge, TypeHierarchy, TypeHierarchyBuilder};
 pub use ids::{FunctionSigId, RecordShapeId, TypeDeclId, TypeId, TypeParamId};
 pub use inference::{
     InferenceLattice, MergedTypeConstraint, choose_final_type, choose_preliminary_type,

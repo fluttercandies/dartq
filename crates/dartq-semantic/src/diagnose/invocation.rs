@@ -252,7 +252,18 @@ impl<'a> Engine<'a> {
         // its own real receiver `D`), while a bare-identifier RHS
         // (`..version = version`, a `Bare` leftover) collapses exactly like
         // a literal `Value` one.
-        let cascade_recv = (self.in_cascade)
+        // Only a section selector (`..m` / `?..m`) resolves against the
+        // latched target: a plain `.` access inside a section's argument
+        // list (`..writeln(argParser.usage)`) merges with its own bare
+        // receiver row, which is no leftover — latching it read `usage`
+        // against the cascade target (`StringBuffer`) and reported every
+        // such argument undefined.
+        let is_section = {
+            let at = self.byte_of(op_range.offset);
+            let rest = &self.source.as_bytes()[at..];
+            rest.starts_with(b"..") || rest.starts_with(b"?..")
+        };
+        let cascade_recv = (self.in_cascade && is_section)
             .then(|| {
                 // The latched target read is the LAST CASCADE-SECTION read, not
                 // `member_reads`' plain tail: a member-read RHS (`..p =

@@ -1968,6 +1968,24 @@ impl<'a> Engine<'a> {
                 ) {
                     Walk::Found(entry) => Walk::Found(entry),
                     walk => {
+                        // An `on` head that resolves to nothing (`extension
+                        // E on Gone` — the same `Missing` verdict that
+                        // reports `undefined_class` on the clause) is the
+                        // oracle's `InvalidType` extended type: it
+                        // contributes no member face at all, so the
+                        // extension's scope is its own member map alone and
+                        // a bare miss reports `undefined_identifier` (#2186
+                        // S2, probed 3.13.1). A head the scope resolves or
+                        // cannot decide (an unindexed SDK interface such as
+                        // `MessagePort`), and a frozen SDK face spelling
+                        // (`Stream` — the tables stand in for the library
+                        // the diagnosing scope may not index), take the
+                        // frozen consult below.
+                        if matches!(self.type_resolution(on).0, TypeResolution::Missing)
+                            && !Self::frozen_face_text(self.strings.resolve(on))
+                        {
+                            return Walk::Missing;
+                        }
                         // The `on` head's frozen-face consult (#2474 G1): an
                         // SDK interface name the scope resolves ambiguously
                         // (`Stream` — `dart:core`'s re-export of `dart:async`'s

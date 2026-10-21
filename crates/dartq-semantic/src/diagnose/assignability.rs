@@ -1450,7 +1450,8 @@ impl<'a> Engine<'a> {
             return;
         };
         let right_ty = self.equality_operand_ty(&rhs_row);
-        let from = self.refine_numeric_binary(op, read_ty, right_ty, declared);
+        let face = self.operand_face(&rhs_row, right_ty);
+        let from = self.refine_numeric_binary(op, read_ty, face, declared);
         if matches!(from, Ty::Unknown | Ty::Void | Ty::Dynamic) || self.written_ty_invalid(from) {
             return;
         }
@@ -2312,8 +2313,26 @@ impl<'a> Engine<'a> {
     }
 
     /// Substitutes a captured root's type-free coverage with the
-    /// scrutinee's context type.
+    /// scrutinee's context type. A top-typed scrutinee (`dynamic`, an
+    /// unknown or `void` face) is spelled `Object?` — the type-free row
+    /// covers the whole space there exactly as it covers a named context,
+    /// where the tracker's name-only substitution would leave the row
+    /// unknown and the remaining `Object` half falsely uncovered.
     pub(crate) fn substitute_root(&self, root: Option<Restriction>) -> Restriction {
+        if root == Some(Restriction::NamedContext) {
+            let scrutinee = self
+                .switch
+                .switches
+                .last()
+                .map_or(Ty::Unknown, |ctx| ctx.scrutinee);
+            match NameTy::from_semantic(scrutinee) {
+                NameTy::TopNullable => return Restriction::Named(self.intern("Object"), true),
+                NameTy::TopNonNullable => {
+                    return Restriction::Named(self.intern("Object"), false);
+                }
+                _ => {}
+            }
+        }
         self.switch.substitute_root(root)
     }
 

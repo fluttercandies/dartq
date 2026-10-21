@@ -198,14 +198,19 @@ impl AstBuilder {
     /// all-synthetic nodes).
     ///
     /// An `end` with no node open (an unbalanced bridge event) is dropped:
-    /// every other degradation would corrupt the arena. Debug builds assert
-    /// the pairing invariant and, additionally, that `end_token` is not
-    /// before the node's `first_token`, that `end_kind` accepts the open
-    /// kind (pairing table), that the sealed kind's payload fits the
-    /// materialized slot, and that no payload word is still `POISON` (a
-    /// missed `patch`); release builds trust the parser.
+    /// every other degradation would corrupt the arena. An `end_token`
+    /// before the node's `first_token` (a bridge seal that carries no
+    /// closer — the empty record type `()` seals after its last child and
+    /// has none; a recovery shape that began at a parser-inserted token)
+    /// seals the node zero-width at its head with the `ERROR` flag — the
+    /// inverted range would make every span reader's arithmetic wrap, the
+    /// flagged zero-width node is the same degraded face an all-synthetic
+    /// node already has. Debug builds additionally assert that `end_kind`
+    /// accepts the open kind (pairing table), that the sealed kind's
+    /// payload fits the materialized slot, and that no payload word is
+    /// still `POISON` (a missed `patch`); release builds trust the parser.
     pub fn end(&mut self, end_kind: NodeKind, end_token: u32) {
-        let Some(node) = self.open.pop() else {
+        let Some(mut node) = self.open.pop() else {
             debug_assert!(false, "end without a matching begin");
             return;
         };
@@ -214,11 +219,12 @@ impl AstBuilder {
             "end {end_kind:?} does not pair with open {:?}",
             node.kind
         );
-        debug_assert!(
-            end_token >= node.first_token,
-            "end {end_kind:?}: end_token {end_token} precedes first_token {}",
+        let end_token = if end_token < node.first_token {
+            node.errored = true;
             node.first_token
-        );
+        } else {
+            end_token
+        };
         let width = payload_len(end_kind) as usize;
         let data = match node.payload_start {
             Some(start) => {
@@ -477,13 +483,15 @@ impl AstBuilder {
             }
         };
         if field >= payload_len(kind) as usize {
-            // Release guard for the debug assertion: a field outside the
-            // open node's slot addresses a NEIGHBORING node's pool word —
-            // silent corruption. Impossible input corrupts nothing instead:
-            // the error is recorded through the builder's error log (it
-            // propagates to ancestors at seal and stays rollback-safe) and
-            // the write is skipped.
-            debug_assert!(false, "patch field {field} outside the slot of {kind:?}");
+            // A field outside the open node's slot addresses a NEIGHBORING
+            // node's pool word — silent corruption. The shape reaches here
+            // from a bridge event that patches a child's field while the
+            // child was never begun (a deferred-seal parent such as
+            // `AsExpression` is the open node when the type production's
+            // end event patches its own words): the error is recorded
+            // through the builder's error log (it propagates to ancestors
+            // at seal and stays rollback-safe) and the write is skipped,
+            // in every build.
             self.mark_error();
             return;
         }

@@ -326,16 +326,52 @@ pub(crate) fn analyze(
         names
     });
 
-    // The dependency units' clause trees, captured once per analyze (the
-    // same bounded gate the members' capture runs): `class DelegatingList
-    // implements List<E>` in a dep file becomes the argument-bearing edge
-    // in every library fold below instead of the to-bounds face. Store or
-    // UTF-8 misses keep the name-level edges — the open direction.
-    let dep_clauses = folding.then(|| {
+    // The clause trees, captured once per analyze over every gated unit —
+    // the workspace residency and the dependency units alike (the same
+    // bounded gate): a library's snapshot edges the written supertype trees
+    // of every container its registry reaches, and a container reached
+    // through an import from a sibling workspace library (`Column<T>
+    // extends Expression<T>` in a `dsl` library, read by the query-builder
+    // library's fold) carries its argument-bearing edge exactly as a member
+    // or a dep container does. The per-fold member capture it replaces left
+    // such a container on the name-level to-bounds face, where
+    // `GeneratedColumn<Object> <: Expression<Object>` answered false through
+    // `Column → Expression<dynamic>` and the `is` promotion was lost. A
+    // settled-face, store, or UTF-8 miss keeps the name-level edges — the
+    // open direction — and each unit parses once here instead of once per
+    // fold that lists it.
+    let clauses = folding.then(|| {
         let generic = generic_containers.as_ref().expect("built above when folding");
+        let gated: Vec<FileId> = state
+            .residency
+            .iter()
+            .filter(|(_, facts)| captures_a_header(facts, generic))
+            .map(|(&file, _)| file)
+            .collect();
+        let captured: Vec<dartq_semantic::ClauseTrees> = gated
+            .par_iter()
+            .filter_map(|&file| {
+                let face = state.settled_face(file)?;
+                let bytes = state.store.get(state.residency[&file].content())?;
+                let text = std::str::from_utf8(bytes).ok()?;
+                let mut trees = dartq_semantic::ClauseTrees::empty();
+                dartq_semantic::capture_clause_trees(
+                    file,
+                    text,
+                    &face.tokens,
+                    ParserFeatures::from_feature_set(face.features),
+                    &state.strings,
+                    &mut trees,
+                );
+                Some(trees)
+            })
+            .collect();
         let mut trees = dartq_semantic::ClauseTrees::empty();
+        for unit_trees in &captured {
+            dartq_semantic::extend_clause_trees(&mut trees, unit_trees);
+        }
         for (&file, unit) in &state.deps.units {
-            if !clauses_a_generic_head(&unit.facts, generic) {
+            if !captures_a_header(&unit.facts, generic) {
                 continue;
             }
             let Some(bytes) = state.store.get(unit.facts.content()) else {
@@ -390,8 +426,7 @@ pub(crate) fn analyze(
                 seam,
                 index.as_ref(),
                 class_modifiers.as_ref(),
-                generic_containers.as_ref(),
-                dep_clauses.as_ref(),
+                clauses.as_ref(),
                 *library,
             );
             // The run's canonical sort rides the job too (a pure read of the
@@ -762,17 +797,24 @@ fn budget_anchor(state: &EngineState, order: &[LibraryId]) -> Option<FileId> {
         .or_else(|| state.libraries.live().find_map(defining))
 }
 
-/// Whether any of the unit's containers clauses a name that declares type
-/// parameters — the only supertype face a written argument tree can
-/// sharpen (`Box<int>` vs the to-bounds `Box<dynamic>`; a bare head maps
-/// to the same instantiate-to-bounds edge both arms produce). Mixin `on`
-/// constraints join the walk too: they ride the same clause capture.
-fn clauses_a_generic_head(facts: &UnitFacts, generic: &FxHashSet<StringId>) -> bool {
+/// Whether the unit's headers carry anything the clause-tree capture can
+/// sharpen: a container clause naming a generic head (the written argument
+/// tree `Box<int>` vs the to-bounds `Box<dynamic>` — mixin `on` constraints
+/// ride the same capture), or a container declaring type parameters of its
+/// own (#2508 — the `<T extends B>` window's bound trees feed the
+/// snapshot's `ParamFacts`, and a bounded parameter transports only through
+/// this capture). A bare head still maps to the same instantiate-to-bounds
+/// edge the name-level arm produces, so neither arm changes the default
+/// corpus's fold.
+fn captures_a_header(facts: &UnitFacts, generic: &FxHashSet<StringId>) -> bool {
     let elements = &facts.elements;
     elements.container_order().iter().any(|&name| {
         let Some(container) = elements.container(name) else {
             return false;
         };
+        if container.type_params > 0 {
+            return true;
+        }
         container
             .superclass
             .iter()
@@ -798,8 +840,7 @@ fn diagnose_library(
     seam: Option<&Namespaces>,
     index: Option<&ElementIndex>,
     class_modifiers: Option<&LibraryClassModifiers>,
-    generic_containers: Option<&FxHashSet<StringId>>,
-    dep_clauses: Option<&dartq_semantic::ClauseTrees>,
+    clauses: Option<&dartq_semantic::ClauseTrees>,
     library: LibraryId,
 ) -> Vec<Arc<Diagnostic>> {
     let info = state.libraries.info(library).expect("live library");
@@ -952,48 +993,15 @@ fn diagnose_library(
         // the `analyzer.language.strict-*` flags resolved through the
         // governing options entry.
         let strict = state.strict_modes_for(info.defining);
-        // The clause-tree capture (#2229): member files whose containers
-        // clause a generic head re-parse their headers once here, threading
-        // the written argument trees (`class A extends S<int>`'s real edge)
-        // into the per-library snapshot. Every other container keeps the
-        // name-level edges — an absent entry only ever under-reports, the
-        // transport's own posture — and a bare-head tree maps to the same
-        // instantiate-to-bounds edge the name-level arm produces, so the
-        // default corpus folds byte-identically.
-        let mut clause_trees = dartq_semantic::ClauseTrees::empty();
-        if let Some(generic_containers) = generic_containers {
-            for file in &members {
-                let facts = &state.residency[file];
-                if !clauses_a_generic_head(facts, generic_containers) {
-                    continue;
-                }
-                // A settled-face, store, or UTF-8 miss skips the capture —
-                // the name-level edges stand (the under-report direction).
-                let Some(face) = scanned.get(file) else {
-                    continue;
-                };
-                let Some(bytes) = state.store.get(facts.content()) else {
-                    continue;
-                };
-                let Ok(text) = std::str::from_utf8(bytes) else {
-                    continue;
-                };
-                dartq_semantic::capture_clause_trees(
-                    *file,
-                    text,
-                    &face.tokens,
-                    ParserFeatures::from_feature_set(face.features),
-                    &state.strings,
-                    &mut clause_trees,
-                );
-            }
-        }
-        // The dependency units' precomputed captures ride every fold: the
-        // dep files are no fold's members, so this merge is the only path
-        // their written supertype trees take into the per-library snapshot.
-        if let Some(dep_clauses) = dep_clauses {
-            dartq_semantic::extend_clause_trees(&mut clause_trees, dep_clauses);
-        }
+        // The clause trees (#2229) are the analyze-wide capture: every
+        // gated workspace and dependency unit's written supertype trees and
+        // parameter bounds, captured once before the fan-out, so a
+        // container the registry reaches through an import from a sibling
+        // library edges its real `extends S<T>` face here exactly as a
+        // member's does. A container with no capture keeps the name-level
+        // edges — an absent entry only ever under-reports.
+        let empty_clauses = dartq_semantic::ClauseTrees::empty();
+        let clause_trees = clauses.unwrap_or(&empty_clauses);
         // The per-library resolved-type snapshot (#2204 phase A): one
         // `dartq_types` table + hierarchy + name registry over the whole
         // residency's element index, built once per library beside the
@@ -1005,7 +1013,7 @@ fn diagnose_library(
             index,
             &state.strings,
             resolved.graph_ids[&library],
-            &clause_trees,
+            clause_trees,
         );
         let view = LibraryView {
             library,
@@ -1536,49 +1544,157 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
         graph_ids.insert(*library, graph_id);
     }
 
-    // The synthetic SDK nodes: one per entry of the generated export-face
-    // table (dart:core plus every other addressable public `dart:` library).
-    // A hit answers "defined" without an element model — kind-unknown, so
-    // container and member questions about core faces suppress (the M1
-    // under-report posture) — while a name outside the face still reports:
-    // the edge carries declarations, not suppressions, and the semantic
-    // engine's undefined guard reads broken (`target: None`) edges only.
-    // The nodes have no engine-library mapping: no directive resolves to
-    // them, and they contribute no dependency edges (cascade and CSR shapes
-    // are untouched). Stays serial: it mutates the file table and the
-    // builder; the table is interned once per graph build (~2.5k names, a
-    // one-time cost at the interning layer).
-    let sdk_faces: FxHashMap<&str, dartq_resolution::LibraryId> = SDK_LIBRARY_FACES
+    // The SDK nodes: one per `dart:` library. A library whose sources
+    // loaded (`crate::sdk_units`) registers unit-backed — its entry and
+    // part files as the node's units, every file's declarations with
+    // their class-modifier facts — so the semantic layer resolves its
+    // faces through the element model exactly as it resolves a dep file's
+    // (`FormatException`'s constructor formals, `List`'s real members and
+    // `implements Iterable<E>` edge). A library the SDK root does not
+    // carry keeps the generated names-only face: a hit answers "defined"
+    // without an element model, and a name outside the face still
+    // reports. Stays serial: it mutates the file table and the builder.
+    let mut sdk_faces: FxHashMap<String, dartq_resolution::LibraryId> = FxHashMap::default();
+    let sdk_loaded: Vec<(String, Vec<FileId>)> = {
+        let mut loaded: Vec<(String, Vec<FileId>)> = state
+            .deps
+            .sdk_libraries
+            .iter()
+            .map(|(name, files)| (name.clone(), files.clone()))
+            .collect();
+        loaded.sort_by(|a, b| a.0.cmp(&b.0));
+        loaded
+    };
+    let sdk_files: FxHashSet<FileId> = sdk_loaded
         .iter()
-        .map(|(uri, names)| {
-            let node = builder.intern(&format!("dart:{uri}"));
-            let file = state.files.intern(Path::new(&format!("<dart:{uri}>")));
-            // The face file registers as the node's unit so the graph's
-            // `library_of_file` answers it: the namespace merge's SDK
-            // preference reads the declaring library's URI (a `dart:` name
-            // loses to a same-spelling package declaration,
-            // `element/scope.dart:811-832`).
-            builder.unit(node, file);
-            for name in *names {
-                builder.declare(node, state.strings.intern(name), file);
-            }
-            (*uri, node)
-        })
+        .flat_map(|(_, files)| files.iter().copied())
         .collect();
+    let register_sdk_units =
+        |builder: &mut LibraryGraphBuilder<'_>, node: dartq_resolution::LibraryId, files: &[FileId]| {
+            for &file in files {
+                let Some(unit) = state.deps.units.get(&file) else {
+                    continue;
+                };
+                builder.unit(node, file);
+                for (name, declaration) in unit.facts.elements.declarations() {
+                    if declaration.kind == MicroKind::TypeParam {
+                        continue;
+                    }
+                    match class_modifier_facts(&unit.facts.elements, name) {
+                        Some(modifiers) => builder.declare_class(node, name, file, modifiers),
+                        None => builder.declare(node, name, file),
+                    }
+                }
+            }
+        };
+    for (uri, names) in SDK_LIBRARY_FACES {
+        let node = builder.intern(&format!("dart:{uri}"));
+        match sdk_loaded.iter().find(|(name, _)| name == uri) {
+            Some((_, files)) => {
+                register_sdk_units(&mut builder, node, files);
+                // The face names the sources never declare (`Never` is a
+                // built-in type with no `dart:core` declaration; the
+                // generated face reads the analyzer's export namespace,
+                // which carries it) stay declared on the synthetic face
+                // file, so the spelling resolves exactly as before.
+                let declared: FxHashSet<StringId> = files
+                    .iter()
+                    .filter_map(|file| state.deps.units.get(file))
+                    .flat_map(|unit| unit.facts.elements.declarations().map(|(name, _)| name))
+                    .collect();
+                let face_only: Vec<StringId> = names
+                    .iter()
+                    .map(|name| state.strings.intern(name))
+                    .filter(|name| !declared.contains(name))
+                    .collect();
+                if !face_only.is_empty() {
+                    let file = state.files.intern(Path::new(&format!("<dart:{uri}>")));
+                    builder.unit(node, file);
+                    for name in face_only {
+                        builder.declare(node, name, file);
+                    }
+                }
+            }
+            None => {
+                let file = state.files.intern(Path::new(&format!("<dart:{uri}>")));
+                // The face file registers as the node's unit so the graph's
+                // `library_of_file` answers it: the namespace merge's SDK
+                // preference reads the declaring library's URI (a `dart:`
+                // name loses to a same-spelling package declaration,
+                // `element/scope.dart:811-832`).
+                builder.unit(node, file);
+                for name in *names {
+                    builder.declare(node, state.strings.intern(name), file);
+                }
+            }
+        }
+        sdk_faces.insert((*uri).to_string(), node);
+    }
+    // The loaded libraries outside the public face table (`dart:_internal`
+    // and the other `_`-prefixed implementation libraries `dart:core`
+    // imports) register the same way — their declarations are what the
+    // public libraries' supertype and member walks resolve through.
+    for (name, files) in &sdk_loaded {
+        if sdk_faces.contains_key(name) {
+            continue;
+        }
+        let node = builder.intern(&format!("dart:{name}"));
+        register_sdk_units(&mut builder, node, files);
+        sdk_faces.insert(name.clone(), node);
+    }
     // dart:core's node doubles as the implicit core import's target; its
-    // generated face carries the library's own surface plus the
-    // async/collection re-exports (`Future`, `Stream`, …) — the oracle's
-    // import-namespace shape at name granularity.
+    // face carries the library's own surface plus the async/collection
+    // re-exports (`Future`, `Stream`, …) — the oracle's import-namespace
+    // shape at name granularity.
     let core = sdk_faces["core"];
-    // Every other SDK face library gets the same implicit `dart:core`
-    // prelude a real source library's graph row carries — `<dart:collection>`
-    //'s excerpt declares `HashMap implements Map<K,V>` and the member walk
-    // resolves that face through `dart:collection`'s import table, which an
-    // edge-free face would leave empty (the oracle's `dart:collection` sees
-    // `Map` via the prelude). Idempotent against a face whose generated
-    // table already re-exports `dart:core` (an edge keyed on the same target
-    // dedups in the namespace merge).
-    for (&uri, &node) in &sdk_faces {
+    // The loaded libraries' own edges: the entry file's `import`/`export`
+    // directives (every one a `dart:` URI) map onto the library nodes by
+    // name — `dart:core`'s `export 'dart:async' show Future, Stream;` is
+    // the re-export the prelude's namespace carries.
+    for (name, files) in &sdk_loaded {
+        let (Some(&entry), Some(&node)) = (files.first(), sdk_faces.get(name)) else {
+            continue;
+        };
+        let Some(unit) = state.deps.units.get(&entry) else {
+            continue;
+        };
+        for directive in &unit.facts.directives {
+            let Some(target) = directive
+                .uri
+                .as_deref()
+                .and_then(crate::sdk_units::sdk_library_of)
+                .and_then(|library| sdk_faces.get(library).copied())
+            else {
+                continue;
+            };
+            match directive.kind {
+                DirectiveKind::Import => builder.import(
+                    node,
+                    ImportEdge {
+                        target: Some(target),
+                        prefix: directive.prefix,
+                        deferred: directive.deferred,
+                        combinators: directive.combinators.clone(),
+                    },
+                ),
+                DirectiveKind::Export => builder.export(
+                    node,
+                    ExportEdge {
+                        target: Some(target),
+                        combinators: directive.combinators.clone(),
+                    },
+                ),
+                _ => {}
+            }
+        }
+    }
+    // Every other SDK library gets the same implicit `dart:core` prelude a
+    // real source library's graph row carries — `<dart:collection>`'s
+    // `HashMap implements Map<K,V>` resolves `Map` through the prelude.
+    // Idempotent against a library whose own directives already import
+    // `dart:core` (an edge keyed on the same target dedups in the
+    // namespace merge).
+    for (uri, &node) in &sdk_faces {
         if uri != "core" {
             builder.import(
                 node,
@@ -1598,7 +1714,13 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
     // identities and declarations first (so an edge between two dep files
     // resolves regardless of which registers first), then the edges.
     let mut dep_nodes: FxHashMap<FileId, dartq_resolution::LibraryId> = FxHashMap::default();
-    let mut dep_files: Vec<FileId> = state.deps.units.keys().copied().collect();
+    let mut dep_files: Vec<FileId> = state
+        .deps
+        .units
+        .keys()
+        .copied()
+        .filter(|file| !sdk_files.contains(file))
+        .collect();
     dep_files.sort_by(|a, b| {
         let key = |file: FileId| {
             state
@@ -1815,10 +1937,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
     ResolvedGraph {
         graph,
         graph_ids,
-        sdk_faces: sdk_faces
-            .into_iter()
-            .map(|(name, node)| (name.to_owned(), node))
-            .collect(),
+        sdk_faces,
         dep_nodes,
         namespaces: OnceLock::new(),
     }

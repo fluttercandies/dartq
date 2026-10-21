@@ -1989,6 +1989,16 @@ impl<'a> Engine<'a> {
             }
             _ => false,
         };
+        // `Object`'s own members read on a nullable receiver need no null
+        // check: `Null` declares them too, so the oracle resolves
+        // `x.hashCode` / `x.toString()` / `x.runtimeType` /
+        // `x.noSuchMethod(...)` on an `Object?` receiver through the
+        // nullable type's interface and reports nothing
+        // (`type_property_resolver.dart`'s nullable-receiver branch looks
+        // the name up on `Null` before reporting).
+        if receiver_nullable && self.members.object_members.contains(&row.name) {
+            receiver_nullable = false;
+        }
         // The promoted-property face (#1409, pass-2 leg): a member access
         // whose receiver read stood promoted (`_r != null` in the guard)
         // reads a non-null receiver — the promotable-field substitution
@@ -2116,6 +2126,22 @@ impl<'a> Engine<'a> {
             }
             match self.walk_members(container, row.name) {
                 Walk::Found(entry) => {
+                    // The nullable-dereference face the plain member arm
+                    // fires (`member_defined`'s found arm): the oracle's
+                    // `isNullable` tail precedes every member resolution, so
+                    // a found member read through a nullable receiver is
+                    // `unchecked_use_of_nullable_value` at the selector even
+                    // as the operator's own face resolves on the getter's
+                    // result (`a.offset - b.offset` over `a: Node?` reports
+                    // the unchecked row, never an undefined getter).
+                    if receiver_nullable {
+                        let name_text = self.strings.resolve(row.name);
+                        self.emit_corrected(
+                            SemanticCode::UncheckedUseOfNullableValue,
+                            row.range,
+                            name_text,
+                        );
+                    }
                     let ty = Self::member_result_ty(&entry);
                     self.check_operator_expr(ty, row);
                     return;
@@ -2756,6 +2782,22 @@ impl<'a> Engine<'a> {
     /// its members could carry the name). `Defined` needs the write
     /// spelling joined by its setter form upstream: call sites pass the
     /// single spelling this access resolves through.
+    /// Whether `name` is a frozen SDK face the member tables carry (the
+    /// `dart:core`/`dart:async`/`dart:io` interfaces plus the
+    /// `dart:collection` bases that re-export them, and the `Stream` row
+    /// the tables lack) — its members are known exactly, so a spelling it
+    /// lacks contributes nothing.
+    pub(crate) fn frozen_face_text(name: &str) -> bool {
+        CORE_INTERFACE_MEMBERS
+            .iter()
+            .chain(CORE_TYPE_MEMBERS.iter())
+            .chain(SDK_FACES_EXTRA.iter())
+            .any(|(container, _)| name == *container)
+            || COLLECTION_INTERFACE_ALIASES
+                .iter()
+                .any(|(alias, _)| name == *alias)
+    }
+
     pub(crate) fn frozen_member_verdict(&self, face: StringId, spelling: StringId) -> FrozenFace {
         self.frozen_faces_verdict([(face, self.file)].into_iter(), spelling, true)
     }
@@ -2843,21 +2885,7 @@ impl<'a> Engine<'a> {
         anchor: bool,
     ) -> FrozenFace {
         let spelling_text = self.strings.resolve(spelling);
-        // Whether `name` is a frozen SDK face the member tables carry (the
-        // `dart:core`/`dart:async`/`dart:io` interfaces plus the
-        // `dart:collection` bases that re-export them, and the `Stream`
-        // row the tables lack) — its members are known exactly, so a
-        // spelling it lacks contributes nothing.
-        let frozen_face = |name: &str| {
-            CORE_INTERFACE_MEMBERS
-                .iter()
-                .chain(CORE_TYPE_MEMBERS.iter())
-                .chain(SDK_FACES_EXTRA.iter())
-                .any(|(container, _)| name == *container)
-                || COLLECTION_INTERFACE_ALIASES
-                    .iter()
-                    .any(|(alias, _)| name == *alias)
-        };
+        let frozen_face = Self::frozen_face_text;
         let frozen_hit = |name: &str| {
             let aliases: &[&str] = COLLECTION_INTERFACE_ALIASES
                 .iter()
@@ -3641,7 +3669,10 @@ impl<'a> Engine<'a> {
         // count caps the recovered cycle (`T extends T`). A shape the
         // name level cannot order keeps the face (the under-report
         // direction).
-        let satisfies_bound = |receiver_arg: Ty, bound: Ty| -> bool {
+        let satisfies_bound = |receiver_arg: Ty,
+                               bound: Ty,
+                               bindings: &[(dartq_types::TypeParamId, dartq_types::TypeId)]|
+         -> bool {
             let mut arg = receiver_arg;
             let mut hops = 0u8;
             while let Ty::Named {
@@ -3678,6 +3709,40 @@ impl<'a> Engine<'a> {
                 hops += 1;
                 if hops >= 8 {
                     break;
+                }
+            }
+            // #2508: both sides concrete — the snapshot's structural
+            // subtype answers the bound check (`arg <: bound[T := arg]`,
+            // `tryChooseFinalTypes`' instantiation before the subtype
+            // test) where the name-level match below can only
+            // pattern-match heads. The face-parameter bindings substitute
+            // first, so a recursive bound (`T extends Comparable<T>`)
+            // reads `Comparable<arg>` exactly like the oracle's inference
+            // result. A `None` — an unmodelled arg or bound, or a bound
+            // that still mentions a parameter after the substitution —
+            // keeps the name-level arms verbatim (the under-report
+            // direction). The parameter-arg chain above already resolved
+            // every in-scope parameter through `param_bound_of`; a name
+            // that still maps to a declared parameter (`type_params` is
+            // name-keyed — a container-level parameter no exec window
+            // declares) is NOT a concrete pair, so the strict arm
+            // declines it the same way.
+            if let Some(ops) = self.ops {
+                let arg_id = ops.map_ty_strict(arg, &self.boundary.args.borrow());
+                let bound_id = ops
+                    .map_ty_strict(bound, &self.boundary.args.borrow())
+                    .map(|bound_id| ops.substitute(bound_id, bindings));
+                if let (Some(arg_id), Some(bound_id)) = (arg_id, bound_id)
+                    && !ops.mentions_param(arg_id)
+                    && !ops.mentions_param(bound_id)
+                    && ops.subtype_ids(arg_id, bound_id)
+                {
+                    // A structural subtype path is a proof; a structural
+                    // `false` is not — the snapshot's hierarchy carries only
+                    // the edges the captures fed (an SDK `num` without its
+                    // `Comparable<num>` face), so the negative falls to
+                    // the name-level arms below.
+                    return true;
                 }
             }
             match (arg, bound) {
@@ -3780,43 +3845,80 @@ impl<'a> Engine<'a> {
             };
             let receiver_args = boundary.pool().get(receiver_args).to_vec();
             let on_args = boundary.pool().get(on_args).to_vec();
-            // A raw-head receiver (`Map x`) instantiates each parameter to
-            // its declared bound — the unbounded parameter's `dynamic` row,
-            // a bounded one's own bound (`JSArray` with `T extends JSAny?`
-            // IS `JSArray<JSAny?>` upstream; `applicableTo` infers the
-            // extended type's parameters against the receiver, and a bare
-            // receiver defaults to bounds — the `#2506` js-interop faces
-            // apply over every bare `JSArray` receiver). An `on` argument
-            // that is concrete or nested keeps the raw-`dynamic` face: the
-            // defaulted bound still fails it exactly as `dynamic` does, so
-            // a bare `Map` against `on Map<K, FieldItem>` fails
-            // `dynamic <: FieldItem` exactly as the oracle's
-            // `applicableTo` rejects it.
+            // A raw-head receiver (`Map x`, `List xs`, `JSArray a`)
+            // instantiates each of ITS OWN declared parameters to that
+            // parameter's bound (`instantiateToBounds`: `List<dynamic>`,
+            // `JSArray<JSAny?>`) — the receiver DECLARATION's bounds
+            // (`Container::type_param_bounds`, projected across its file
+            // boundary), never the face's: the face's parameter bound is
+            // the question's right-hand side. An unbounded or unmodeled
+            // parameter reads `dynamic`, so a bare `Map` against `on Map<K,
+            // FieldItem>` fails `dynamic <: FieldItem` and a bare `List`
+            // against `T extends AccessorFragment` fails its bound, exactly
+            // as the oracle's `applicableTo` rejects both (probed 3.13.1:
+            // `List xs; xs.withOrigin` over two bounded `on List<T>` faces
+            // is `undefined_getter`, never ambiguous), while a bare
+            // `JSArray` reads `JSArray<JSAny?>` and `JSArrayToList<T extends
+            // JSAny?>` applies.
             let receiver_args = if receiver_args.is_empty() && !on_args.is_empty() {
-                on_args
-                    .iter()
-                    .map(|&on_arg| {
-                        let Ty::Named {
-                            name: arg_name,
-                            args,
-                            ..
-                        } = on_arg
-                        else {
-                            return Ty::Dynamic;
-                        };
-                        if args != ArgListId::EMPTY {
-                            return Ty::Dynamic;
-                        }
-                        face.type_param_names
-                            .iter()
-                            .position(|&n| n == arg_name)
-                            .and_then(|index| face.type_param_bounds.get(index).copied())
-                            .map(|bound| boundary.ty(face_file, bound))
-                            .unwrap_or(Ty::Dynamic)
-                    })
+                let declared: Vec<Ty> = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    receiver_head,
+                )
+                .map(|(decl, owner)| {
+                    decl.type_param_bounds
+                        .iter()
+                        .map(|&bound| boundary.ty(owner, bound))
+                        .collect()
+                })
+                .unwrap_or_default();
+                (0..on_args.len())
+                    .map(|index| declared.get(index).copied().unwrap_or(Ty::Dynamic))
                     .collect()
             } else {
                 receiver_args
+            };
+            // #2508: the face-parameter binding table the strict bound
+            // check substitutes — `applicableTo` binds each `on`
+            // parameter to the receiver's argument at the same position
+            // (the identity projection this whole `arg_applicable` arm
+            // already assumes), then asks `arg <: bound[T:=arg]`. A
+            // receiver argument that maps nothing structural leaves its
+            // slot out, and a bound leaf over that parameter keeps the
+            // `TypeParameter` shape — the strict arm declines it (the
+            // under-report direction).
+            let strict_bindings: Vec<(dartq_types::TypeParamId, dartq_types::TypeId)> = match self
+                .ops
+            {
+                Some(ops) if receiver_args.len() == on_args.len() => {
+                    let pool = boundary.args.borrow();
+                    receiver_args
+                        .iter()
+                        .zip(on_args.iter())
+                        .filter_map(|(&receiver_arg, &on_arg)| {
+                            let Ty::Named {
+                                name: param_name,
+                                nullable: on_nullable,
+                                args: param_args,
+                            } = on_arg
+                            else {
+                                return None;
+                            };
+                            if param_args != ArgListId::EMPTY {
+                                return None;
+                            }
+                            let param = ops.param_id(param_name)?;
+                            let bound_arg =
+                                bind_through_nullable(on_nullable, receiver_arg);
+                            Some((param, ops.map_ty_strict(bound_arg, &pool)?))
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
             };
             if receiver_head != on_head {
                 // The subtype hop's argument projection is unmodeled; the
@@ -3877,7 +3979,11 @@ impl<'a> Engine<'a> {
                         if matches!(bound, Ty::Dynamic) {
                             return true;
                         }
-                        satisfies_bound(bind_through_nullable(on_nullable, receiver_arg), bound)
+                        satisfies_bound(
+                            bind_through_nullable(on_nullable, receiver_arg),
+                            bound,
+                            &strict_bindings,
+                        )
                     },
                 );
             }
@@ -3922,6 +4028,7 @@ impl<'a> Engine<'a> {
                         return satisfies_bound(
                             bind_through_nullable(on_nullable, receiver_arg),
                             bound,
+                            &strict_bindings,
                         );
                     }
                     // Covariant positions: the receiver's argument must be
@@ -4066,6 +4173,29 @@ impl<'a> Engine<'a> {
             } else {
                 self.extension_receiver_resolves(receiver_ty)
             };
+        // #2508: the mounted `LibraryTypes` snapshot answers the
+        // applicability test structurally — `applicableTo` instantiates
+        // the extended type's parameters against the receiver's RESOLVED
+        // type (`constrainArgument` over the supertype projection) and
+        // asks `isSubtypeOf(receiver, extendedType)`, so a generic hop's
+        // argument projection (`Box<int>` reaching `Iterable<Wrapper<int>>`
+        // against `on Iterable<T>`) decides by the real lattice instead
+        // of the name-level argument gate. The `on` type's own parameter
+        // leaves bind through the face's declared parameter names
+        // (`snapshot.type_params` is name-keyed — a name no declaration
+        // registers simply binds nothing). A `None` verdict — an
+        // unmodeled receiver/on shape, an unregistered head, a bound the
+        // capture never fed — keeps the whole name-level gate chain
+        // verbatim (the under-report direction).
+        let ops = self.ops;
+        let applies_strict = |face: &ExtensionFace, face_file: FileId, on_ty: Ty| -> Option<bool> {
+            let ops = ops?;
+            // The face's own bounds ride the question explicitly
+            // ([`Engine::strict_face_params`]); a bound the snapshot cannot
+            // map declines the whole strict verdict.
+            let face_params = self.strict_face_params(face, face_file)?;
+            ops.extension_applies_strict(receiver_ty, on_ty, &face_params, &boundary.args.borrow())
+        };
         let mut applicable: Vec<(&ExtensionFace, Ty, FileId)> = Vec::new();
         if receiver_valid {
             for &(face, face_file) in faces {
@@ -4075,18 +4205,22 @@ impl<'a> Engine<'a> {
                 {
                     continue;
                 }
-                if !reaches(receiver, on)
-                    || !provenance_ok(face_file, receiver, on)
-                    || !arg_applicable(face, face_file)
-                {
+                // The full `on` type projects into the diagnosing pool
+                // ahead of both gates — the structural arm needs the
+                // projected shape, and the name-level arm reads it
+                // verbatim below.
+                let on_ty = boundary.ty(face_file, face.on_ty);
+                // A structural `true` is a proof the face applies; a
+                // structural `false` (or no fact) hands the question to the
+                // name-level gate chain — the snapshot's hierarchy is only
+                // as complete as the captures that fed it.
+                let applicable_face = matches!(applies_strict(face, face_file, on_ty), Some(true))
+                    || (reaches(receiver, on)
+                        && provenance_ok(face_file, receiver, on)
+                        && arg_applicable(face, face_file));
+                if !applicable_face {
                     continue;
                 }
-                // The full `on` type rides the candidate for the
-                // specificity comparison below (the head gate above stays
-                // name-level); the boundary projects a foreign face's
-                // interned type into this pool exactly as the argument
-                // gate did.
-                let on_ty = boundary.ty(face_file, face.on_ty);
                 applicable.push((face, on_ty, face_file));
             }
         }
@@ -4103,6 +4237,18 @@ impl<'a> Engine<'a> {
         // lists, unknowns) answers compatible; those pairs fall to step
         // 5's instantiate-to-bounds tail below.
         let on_subtype = |sub: Ty, sup: Ty| -> bool {
+            // #2508: the snapshot orders the instantiated `on` types
+            // structurally where it can — a generic face's
+            // `Iterable<Wrapper<int>>` subtyping its `Iterable<Base>`
+            // twin decides through the real lattice, not the covariant
+            // head-argument read below. `None` keeps the name-level arms.
+            if self
+                .ops
+                .and_then(|ops| ops.try_subtype_strict(sub, sup, &self.boundary.args.borrow()))
+                == Some(true)
+            {
+                return true;
+            }
             let (
                 Ty::Named {
                     name: sub_head,
@@ -4346,10 +4492,38 @@ impl<'a> Engine<'a> {
                     // mutually compatible `on` types order on the
                     // instantiate-to-bounds projections — the bounded face
                     // dominates its unbounded twin when the projections
-                    // order one way and not the other.
+                    // order one way and not the other. #2508: the
+                    // snapshot's own `ParamFacts` bounds drive the
+                    // projection where both `on` types map; a `None`
+                    // verdict keeps the name-level projection and pair
+                    // test verbatim.
+                    // Each face's OWN bounds (`strict_face_params`) feed
+                    // the projection — the snapshot's name-keyed registry
+                    // would fold two faces' same-spelled parameters into
+                    // one bound.
+                    let strict = match (
+                        self.ops,
+                        self.strict_face_params(other_face, other_file),
+                        self.strict_face_params(face, face_file),
+                    ) {
+                        (Some(ops), Some(sub_params), Some(sup_params)) => ops.try_bounds_subtype(
+                            other_on_ty,
+                            &sub_params,
+                            on_ty,
+                            &sup_params,
+                            &self.boundary.args.borrow(),
+                        ),
+                        _ => None,
+                    };
+                    // Either world's `true` proves a direction; the
+                    // negative needs both worlds (a structural `false` over
+                    // an incompletely fed hierarchy is no fact).
                     let sub = bound_projected(other_face, other_file, other_on_ty);
                     let sup = bound_projected(face, face_file, on_ty);
-                    bounds_subtype(sub, sup) && !bounds_subtype(sup, sub)
+                    let (strict_sub_le_sup, strict_sup_le_sub) =
+                        strict.unwrap_or((false, false));
+                    (strict_sub_le_sup || bounds_subtype(sub, sup))
+                        && !(strict_sup_le_sub || bounds_subtype(sup, sub))
                 } else {
                     false
                 }

@@ -20,6 +20,7 @@ impl<'a> Engine<'a> {
         patterns_enabled: bool,
         strict: StrictModes,
         class_modifiers: &'a LibraryClassModifiers,
+        ops: Option<&'a crate::resolved_ops::ResolvedTypeOps<'a>>,
     ) -> Self {
         let guard = UndefinedGuard::build(graph, lib);
         let identical_id = strings.intern("identical");
@@ -308,6 +309,7 @@ impl<'a> Engine<'a> {
             local_fn_stack: Vec::new(),
             strict,
             class_modifiers,
+            ops,
             tv_window: None,
             pending_tv: None,
             container_unbounded: FxHashMap::default(),
@@ -2596,7 +2598,7 @@ impl<'a> Engine<'a> {
         &self,
         op: &str,
         left_ty: Ty,
-        right_ty: Ty,
+        right: OperandFace,
         declared: Ty,
     ) -> Ty {
         if !matches!(op, "+" | "-" | "*" | "%") {
@@ -2674,30 +2676,42 @@ impl<'a> Engine<'a> {
             return declared;
         }
         // `_refineNumericInvocationTypeNullSafe`'s branch ladder
-        // (type_system.dart:2093-2118). The invalid/unknown and `dynamic`
-        // faces read as subtype-of-everything in the recovery lattice
-        // (`NameTy::from_semantic`'s nullable top), so a right operand the
-        // engine cannot type still decides the branch — `int - <invalid>`
-        // answers `double` and the downstream assignability faces fire
-        // (probed 3.13.1: `g(length: node.end - operator.offset)` with
-        // `Token` undefined — import-broken or bare — reports the
-        // `double`-against-`int` argument row; `int - dynamic` likewise).
-        // An unresolvable `Named` head is that same `InvalidType` face
-        // (upstream types the undefined annotation `InvalidType`, a
-        // subtype of everything): a head no declared face resolves
-        // ([`NameWorld::is_known_head`]) rides the branch too.
-        // `Never` stays excluded (the upstream `!s.isBottom` cut) and
-        // falls to `num`.
+        // (type_system.dart:2093-2118). `T <: double?` decides first,
+        // whatever `S` is ("this includes S being dynamic or Never").
         if self.name_subtype(left_ty, named_q(double)) {
             return Ty::named(double);
         }
-        let right_top = match right_ty {
-            Ty::Unknown | Ty::Dynamic => true,
+        let right_ty = match right {
+            // The oracle's InvalidType operand — an undefined name, a
+            // member read on an unresolvable receiver — is a subtype of
+            // everything (subtype.dart's `InvalidTypeImpl` arm), so it
+            // decides the `double` branch: `int - <invalid>` answers
+            // `double` and the downstream `int` sinks report (probed
+            // 3.13.1: `g(length: node.end - operator.offset)` with `Token`
+            // undefined reports the `double`-against-`int` argument row).
+            // An unresolvable written head on a typed operand is the same
+            // face (upstream types the undefined annotation InvalidType).
+            OperandFace::Invalid => return Ty::named(double),
+            // A face the engine cannot type though the oracle can — the
+            // node's own type is unknowable here, so every downstream
+            // check suppresses (the under-report direction) rather than
+            // reading the gap as InvalidType.
+            OperandFace::Gap => return Ty::UNKNOWN,
+            // `dynamic` and `void` are Left Top (`Object? <: double?` is
+            // false, as is `<: int?`): neither branch fires and the node
+            // answers `num` (`int + dynamic` is `num`, so an `int` sink
+            // still reports — with `num` in the message).
+            OperandFace::Typed(Ty::Dynamic | Ty::Void) => return Ty::named(num),
+            OperandFace::Typed(ty) => ty,
+        };
+        let right_invalid = match right_ty {
             Ty::Named { name, .. } => !self.name_world().is_known_head(name),
             _ => false,
         };
+        // `Never` stays excluded (the upstream `!s.isBottom` cut) and
+        // falls to `num`.
         if right_ty != Ty::Never
-            && (right_top || self.name_subtype(right_ty, named_q(double)))
+            && (right_invalid || self.name_subtype(right_ty, named_q(double)))
         {
             return Ty::named(double);
         }
@@ -2808,7 +2822,8 @@ impl<'a> Engine<'a> {
                     } else {
                         // The refinement's own `num?` receiver gate
                         // decides — unconditional here.
-                        self.refine_numeric_binary(&op_text, left_ty, right_ty, declared)
+                        let face = self.operand_face(&right, right_ty);
+                        self.refine_numeric_binary(&op_text, left_ty, face, declared)
                     }
                 }
                 None => Ty::UNKNOWN,

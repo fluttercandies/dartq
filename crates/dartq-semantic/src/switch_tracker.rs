@@ -802,6 +802,12 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                 self.is_subtype_of(&NameTy::Named(self.bool_id, false), sup)
             }
             (NameTy::TopNonNullable, NameTy::TopNonNullable) => true,
+            // The non-nullable top IS `Object` (static_type.dart's
+            // `nonNullableObject`): it fits the `Object`/`Object?` name
+            // exactly as every non-nullable name fits it.
+            (NameTy::TopNonNullable, NameTy::Named(tn, _) | NameTy::NamedArgs(tn, _, _)) => {
+                *tn == self.object_id
+            }
             _ => false,
         }
     }

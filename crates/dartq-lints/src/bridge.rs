@@ -744,12 +744,22 @@ impl ParserListener for AstListener {
         &mut self,
         left_paren: TokenSpan,
         question: Option<TokenSpan>,
-        _count: usize,
-        _has_named_fields: bool,
+        count: usize,
+        has_named_fields: bool,
     ) {
         self.b.patch(0, self.t(left_paren.id));
         self.patch_token(1, question);
-        self.end_last(NodeKind::RecordType);
+        // The event carries no right paren (the official `endRecordType`
+        // shape): a `?` suffix is the last token, a populated type seals
+        // after its last entry, and the empty `()` — no entry to seal
+        // after — closes at the token following `(`.
+        match question {
+            Some(question) => self.end_incl(NodeKind::RecordType, question),
+            None if count == 0 && !has_named_fields => {
+                self.end_at(NodeKind::RecordType, self.t(left_paren.id) + 2);
+            }
+            None => self.end_last(NodeKind::RecordType),
+        }
     }
 
     fn begin_record_type_entry(&mut self, first: TokenSpan) {
@@ -2997,6 +3007,17 @@ impl ParserListener for AstListener {
     }
 
     fn handle_cast_pattern(&mut self, operator: TokenSpan) {
+        // The cast's type parses inside the same as-operator-type window an
+        // expression cast does (`beginAsOperatorType`/`endAsOperatorType`,
+        // parser_impl.dart's `parseCastPattern`), which opened the deferred
+        // `AsExpression` — but no `handleAsOperator` follows a pattern, so
+        // the deferred seal closes here or the open stack desynchronizes
+        // (`end CaseExpression does not pair with open AsExpression`).
+        if self.deferred_seal == Some(NodeKind::AsExpression) {
+            self.deferred_seal = None;
+            self.b.patch(0, self.t(operator.id));
+            self.end_last(NodeKind::AsExpression);
+        }
         // The anchor-miss face skips the pattern emission (one atomic
         // begin+end).
         let Some(first) = self.expect_paired("cast pattern anchor", self.b.last_first_token())

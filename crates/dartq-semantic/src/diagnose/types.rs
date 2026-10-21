@@ -2728,6 +2728,12 @@ pub(crate) struct Engine<'a> {
     /// parameter — `type_arguments_verifier.dart:711-735`). Cross-file
     /// containers and fully-bounded ones stay out: no fact, no report.
     pub(crate) container_unbounded: FxHashMap<StringId, u16>,
+    /// The library's resolved-type face (#2204): the `LibraryTypes`
+    /// snapshot this unit's diagnosing fold asks structural type questions
+    /// against — the extension application's subtype/specificity/bounds
+    /// checks read it instead of the name-level approximations whenever it
+    /// is mounted (`None` keeps the name-level posture, the rig default).
+    pub(crate) ops: Option<&'a crate::resolved_ops::ResolvedTypeOps<'a>>,
     /// The #610 boundedness capture (the `bounds` module): the parse-time
     /// type-tree index plus the lazy `dartq_types` snapshot the checks run
     /// against.

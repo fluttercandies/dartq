@@ -128,6 +128,9 @@ struct OpenContainer {
     /// container-open take of the buffered group; empty when the header
     /// parsed none — the `header_type_params` count keys the take).
     type_param_names: Vec<StringId>,
+    /// The header's type-variable bounds, parallel to `type_param_names`
+    /// (`Dynamic` for an absent bound).
+    type_param_bounds: Vec<Ty>,
     /// The `sealed` modifier was present on the class header.
     sealed: bool,
     /// The header's clause type names, per clause family and in written
@@ -304,7 +307,6 @@ struct Builder<'src, 'tab> {
     /// the open container ([`OpenContainer::type_param_names`]) — every
     /// container kind keeps them for the receiver-instantiation pairing,
     /// the extension close hands them to the application face.
-    extension_type_param_bounds: Vec<Ty>,
     /// The open field group's `abstract`/`external` modifiers (`begin_fields`
     /// latches, `end_fields` clears).
     field_abstract: bool,
@@ -454,7 +456,6 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             extension_on_type: None,
             extension_on_type_nullable: false,
             extension_on_ty: None,
-            extension_type_param_bounds: Vec::new(),
             field_abstract: false,
             field_external: false,
             field_final: false,
@@ -897,13 +898,13 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         };
         // The bounds ride the same window (their buffer mutated in lockstep
         // with the names); an absent bound stays at its `Dynamic`
-        // placeholder.
-        self.extension_type_param_bounds =
-            if kind == ContainerKind::Extension && header_type_params > 0 {
-                std::mem::take(&mut self.type_var_bounds)
-            } else {
-                Vec::new()
-            };
+        // placeholder. Every container kind keeps them: a class's bounds
+        // instantiate its raw receivers, an extension's gate its `on` face.
+        let type_param_bounds = if header_type_params > 0 {
+            std::mem::take(&mut self.type_var_bounds)
+        } else {
+            Vec::new()
+        };
         self.containers.push(OpenContainer {
             name,
             kind,
@@ -916,6 +917,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             members: NameMapBuilder::default(),
             type_params: header_type_params,
             type_param_names,
+            type_param_bounds,
             sealed: false,
             with_clause: Vec::new(),
             implements_clause: Vec::new(),
@@ -951,13 +953,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.field_annotations.clear();
         let extension_on_type = self.extension_on_type.take();
         let extension_on_ty = self.extension_on_ty.take().unwrap_or(Ty::Unknown);
-        let extension_type_param_bounds =
-            std::mem::take(&mut self.extension_type_param_bounds).into_boxed_slice();
         let Some(mut open) = self.containers.pop() else {
             return;
         };
         let members = open.members;
         let type_param_names = std::mem::take(&mut open.type_param_names).into_boxed_slice();
+        let type_param_bounds = std::mem::take(&mut open.type_param_bounds).into_boxed_slice();
         if open.kind == ContainerKind::Extension && open.name.is_none() {
             // An unnamed extension has no container entry: its application
             // face owns the members outright. An on-type that never produced
@@ -969,8 +970,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 on_type: extension_on_type,
                 on_type_nullable: self.extension_on_type_nullable,
                 on_ty: extension_on_ty,
-                type_param_names: type_param_names,
-                type_param_bounds: extension_type_param_bounds,
+                type_param_names,
+                type_param_bounds,
                 members: members.finish(),
             });
             return;
@@ -986,7 +987,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 on_type_nullable: self.extension_on_type_nullable,
                 on_ty: extension_on_ty,
                 type_param_names: type_param_names.clone(),
-                type_param_bounds: extension_type_param_bounds,
+                type_param_bounds: type_param_bounds.clone(),
                 members: members.clone().finish(),
             });
         }
@@ -1009,6 +1010,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 members: members.finish(),
                 type_params: open.type_params,
                 type_param_names,
+                type_param_bounds,
                 sealed: open.sealed,
                 // The clause columns seal at exact length here — the
                 // push-grown staging Vecs shed their growth slack by

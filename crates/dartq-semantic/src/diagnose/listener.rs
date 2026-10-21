@@ -1699,6 +1699,9 @@ impl ParserListener for DiagnoseListener<'_> {
                 } else {
                     ty
                 };
+                // An explicit-argument creation's written arguments ride
+                // the head (`creation_args.rs`).
+                let ty = engine.with_explicit_creation_args(mark, ty);
                 engine.bind_var_type(name, ty);
                 // The promotion face rides the flow layer's declared-type
                 // slot (#2140): a name-level type with no written
@@ -3072,6 +3075,12 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.ur_seal_used();
         engine.merge_member(is_null_aware, token.range, end.range.end());
         engine.const_capture.dot_access(is_null_aware, end.range);
+        // The member send's bottom face latches here, not at the send
+        // event that preceded this one (`never_send.rs`): the merged row
+        // is the first shape the callee's declared return reads through.
+        if !is_null_aware && engine.merged_send_returns_never() {
+            self.pending_exit = Some(end);
+        }
     }
 
     fn handle_cascade_access(&mut self, operator: Token, end: Token, is_null_aware: bool) {
@@ -3236,6 +3245,18 @@ impl ParserListener for DiagnoseListener<'_> {
                         }
                     }
                 }
+            };
+            // A collection literal right side (`collection_literal.rs`):
+            // the opaque value row types as the target's non-null declared
+            // type — the oracle's downward-inferred literal, non-null
+            // whatever its arguments.
+            let from_ty = if from_ty == Ty::UNKNOWN
+                && matches!(rhs_row.shape, RowShape::Value)
+                && engine.collection_literal_starts_at(operator.range.end())
+            {
+                Engine::non_null_form(engine.receiver_static_ty(&engine.rows[target]))
+            } else {
+                from_ty
             };
             // A `?.`-merged right side reads the short-circuit's nullable
             // result into the flow's staged face (`x = a?.b` demotes `x`'s
@@ -4540,6 +4561,22 @@ impl ParserListener for DiagnoseListener<'_> {
         ) && engine.rows[pos].intent == Intent::Read
         {
             let index_op = engine.intern("[]");
+            // The result row's static type (`index_result.rs`): the
+            // receiver's `[]` return under its written arguments, nullable
+            // through a `?[` access — the staged write face and the
+            // operand folds read it where the opaque row read a gap.
+            let receiver_ty = {
+                let ty = Engine::receiver_row_ty(&engine.rows[pos]);
+                if ty == Ty::UNKNOWN {
+                    engine.receiver_static_ty(&engine.rows[pos])
+                } else {
+                    ty
+                }
+            };
+            let result_ty = match engine.index_result_ty(receiver_ty) {
+                ty if question.is_some() => Engine::nullable_form(ty),
+                ty => ty,
+            };
             // The operand rows leave the stack, but every operand still
             // owes its pass-2 resolution — the official resolves every
             // subexpression (`builder..foo[bar]`'s `bar` reports its
@@ -4553,6 +4590,11 @@ impl ParserListener for DiagnoseListener<'_> {
             }
             engine.rows[pos].intent = Intent::Operator(index_op, bracket);
             engine.push_value_row(close);
+            if result_ty != Ty::UNKNOWN
+                && let Some(result) = engine.rows.last_mut()
+            {
+                result.ty = result_ty;
+            }
         }
     }
 

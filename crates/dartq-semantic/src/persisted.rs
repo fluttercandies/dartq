@@ -224,6 +224,12 @@ pub struct PersistedContainer {
     /// exact-pairing face falls back to its legacy name-forced rule).
     #[serde(default)]
     pub type_param_names: Vec<u32>,
+    /// Each type parameter's declared bound (`Dynamic` for an absent
+    /// bound), parallel to `type_param_names`. Additive after the format
+    /// shipped: a pre-field payload decodes empty, which every consumer
+    /// reads as unbounded — the same answer the pre-field engine gave.
+    #[serde(default)]
+    pub type_param_bounds: Vec<PersistedTy>,
     pub sealed: bool,
     pub with_clause: Vec<u32>,
     pub implements_clause: Vec<u32>,
@@ -777,6 +783,11 @@ impl PersistedContainer {
                 .collect(),
             type_params: container.type_params,
             type_param_names: s.ids(&container.type_param_names),
+            type_param_bounds: container
+                .type_param_bounds
+                .iter()
+                .map(|bound| s.ty(bound))
+                .collect(),
             sealed: container.sealed,
             with_clause: s.ids(&container.with_clause),
             implements_clause: s.ids(&container.implements_clause),
@@ -833,6 +844,11 @@ impl PersistedContainer {
                 .type_param_names
                 .iter()
                 .map(|&at| ids[at as usize])
+                .collect(),
+            type_param_bounds: self
+                .type_param_bounds
+                .into_iter()
+                .map(|bound| into_ty(bound, ids, pool))
                 .collect(),
             sealed: self.sealed,
             with_clause: self
@@ -1109,6 +1125,7 @@ mod tests {
                     .collect(),
                 type_params: 2,
                 type_param_names: Box::new([name("K"), name("V")]),
+                type_param_bounds: Box::new([Ty::Dynamic, Ty::named(name("Object"))]),
                 sealed: true,
                 with_clause: Box::new([]),
                 implements_clause: Box::new([name("I")]),
@@ -1279,6 +1296,7 @@ mod tests {
                     .collect(),
                 type_params: 0,
                 type_param_names: Box::new([]),
+                type_param_bounds: Box::new([]),
                 sealed: false,
                 with_clause: Box::new([]),
                 implements_clause: Box::new([]),

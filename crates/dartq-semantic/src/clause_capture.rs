@@ -70,10 +70,16 @@ impl HeaderCapture {
 }
 
 /// One container's ledger row: the type-parameter spellings adopted at the
-/// begin event, the supertype trees written at the body, and the
-/// faithfulness bit.
+/// begin event, each parameter's written bound tree in the same order, the
+/// supertype trees written at the body, and the faithfulness bit.
 struct Row {
     params: Vec<StringId>,
+    /// Each parameter's bound tree, parallel to `params` — `None` for an
+    /// unbounded parameter (the implicit `Object?`), `Some` for a written
+    /// `extends` bound. Captured while the declaring `<...>` window was
+    /// open (the parser completes the variables in reverse order, each
+    /// bound's roots closing just before its own `end_type_variable`).
+    param_bounds: Vec<Option<TypeTree>>,
     supers: Vec<TypeTree>,
     open: bool,
 }
@@ -90,11 +96,24 @@ struct CaptureListener<'src, 'tab> {
     containers: FxHashMap<StringId, Row>,
     /// The open container header: its name and its clause cursor.
     header: Option<(StringId, HeaderCapture)>,
-    /// The open `<...>` type-variables group's names, declaration order.
-    window: Vec<StringId>,
-    /// The just-closed window's names and close offset, awaiting the
-    /// container begin event that adopts them.
-    pending: Option<(Vec<StringId>, u32)>,
+    /// The open `<...>` type-variables group's bound capture: completed
+    /// bound roots accumulate in `bound_sink`, each variable's completion
+    /// claims its own.
+    bound_sink: Option<TreeSink>,
+    /// The open group's variable names in declaration order
+    /// (`begin_type_variable` fires in written order); `end_type_variable`
+    /// pops the last — the parser completes the variables in reverse
+    /// declaration order, re-parsing each bound anchored at its own
+    /// `extends` token, so the completing variable is always the
+    /// last-pushed name.
+    var_names: Vec<StringId>,
+    /// The open group's variables in completion order (reverse
+    /// declaration order): the name and the bound tree claimed at its
+    /// `end_type_variable`.
+    window: Vec<(StringId, Option<TypeTree>)>,
+    /// The just-closed window's names, bounds, and close offset, awaiting
+    /// the container begin event that adopts them.
+    pending: Option<(Vec<StringId>, Vec<Option<TypeTree>>, u32)>,
     /// The type head the parser arms at a type reference and re-fires
     /// after its argument group (`Box` of `Box<int>`) — the group's head.
     pending_head: Option<(StringId, SourceRange)>,
@@ -126,12 +145,19 @@ impl<'src, 'tab> CaptureListener<'src, 'tab> {
                 open: false,
             },
         ));
-        let params = match self.pending.take() {
-            Some((names, window_end)) if token.range.offset < window_end => names,
-            _ => Vec::new(),
+        // The just-closed type-variable window is this container's when its
+        // declaring name precedes the group's close — the same token-order
+        // guard `crate::bounds` applies. A foreign window (a preceding
+        // generic function's, a typedef's) never adopts.
+        let (params, param_bounds) = match self.pending.take() {
+            Some((names, bounds, window_end)) if token.range.offset < window_end => {
+                (names, bounds)
+            }
+            _ => (Vec::new(), Vec::new()),
         };
         self.containers.entry(id).or_insert(Row {
             params,
+            param_bounds,
             supers: Vec::new(),
             // An extension type's supertype face is not its class-style
             // edge set: the capture stays unfaithful, the snapshot never
@@ -170,9 +196,6 @@ impl ParserListener for CaptureListener<'_, '_> {
         let Some(head) = self.name_of(name) else {
             return;
         };
-        let Some((_, header)) = self.header.as_mut() else {
-            return;
-        };
         let range = match question {
             Some(q) => SourceRange {
                 offset: name.range.offset,
@@ -180,13 +203,25 @@ impl ParserListener for CaptureListener<'_, '_> {
             },
             None => name.range,
         };
-        header.sink.leaf(head, question.is_some(), range);
+        // The routing mirrors `crate::bounds`: an open container header
+        // wins (a nested function type's own `<T>` group inside a clause
+        // completes its bound leaves into the header sink — they land as
+        // unclaimed roots and mark the capture `open`); otherwise the
+        // type-variables window's bound sink takes them (a container's own
+        // `<T extends num>` parses before its header opens).
+        if let Some((_, header)) = self.header.as_mut() {
+            header.sink.leaf(head, question.is_some(), range);
+        } else if let Some(sink) = self.bound_sink.as_mut() {
+            sink.leaf(head, question.is_some(), range);
+        }
     }
 
     fn handle_void_keyword(&mut self, token: Token) {
         let void_id = self.strings.intern("void");
         if let Some((_, header)) = self.header.as_mut() {
             header.sink.leaf(void_id, false, token.range);
+        } else if let Some(sink) = self.bound_sink.as_mut() {
+            sink.leaf(void_id, false, token.range);
         }
     }
 
@@ -194,15 +229,20 @@ impl ParserListener for CaptureListener<'_, '_> {
         let head = self.pending_head.take();
         if let Some((_, header)) = self.header.as_mut() {
             header.sink.begin_group(head);
+        } else if let Some(sink) = self.bound_sink.as_mut() {
+            sink.begin_group(head);
         }
     }
 
     fn end_type_arguments(&mut self, _count: usize, begin: Token, end: Token) {
+        let range = SourceRange {
+            offset: begin.range.offset,
+            length: end.range.end() - begin.range.offset,
+        };
         if let Some((_, header)) = self.header.as_mut() {
-            header.sink.end_group(SourceRange {
-                offset: begin.range.offset,
-                length: end.range.end() - begin.range.offset,
-            });
+            header.sink.end_group(range);
+        } else if let Some(sink) = self.bound_sink.as_mut() {
+            sink.end_group(range);
         }
     }
 
@@ -211,8 +251,14 @@ impl ParserListener for CaptureListener<'_, '_> {
     }
 
     fn begin_function_type(&mut self, _begin: Token) {
+        // Function-type shapes are outside the clause/bound model: poison
+        // every open window (the same belt `crate::bounds` keeps — a
+        // function-typed bound fails its one-root claim anyway).
         if let Some((_, header)) = self.header.as_mut() {
             header.sink.poison();
+        }
+        if let Some(sink) = self.bound_sink.as_mut() {
+            sink.poison();
         }
     }
 
@@ -220,22 +266,63 @@ impl ParserListener for CaptureListener<'_, '_> {
         if let Some((_, header)) = self.header.as_mut() {
             header.sink.poison();
         }
+        if let Some(sink) = self.bound_sink.as_mut() {
+            sink.poison();
+        }
     }
 
     fn begin_type_variables(&mut self, _token: Token) {
         self.pending = None;
+        self.bound_sink = Some(TreeSink::default());
+        self.var_names.clear();
         self.window.clear();
     }
 
     fn begin_type_variable(&mut self, token: Token) {
         if let Some(name) = self.name_of(token) {
-            self.window.push(name);
+            self.var_names.push(name);
         }
     }
 
+    fn end_type_variable(
+        &mut self,
+        token: Token,
+        _index: usize,
+        extends_or_super: Option<Token>,
+        _variance: Option<Token>,
+    ) {
+        let Some(name) = self.var_names.pop().or_else(|| self.name_of(token)) else {
+            return;
+        };
+        let bound = if extends_or_super.is_some()
+            && let Some(sink) = self.bound_sink.as_mut()
+        {
+            // The parser completes the variables in reverse order, each
+            // bound's roots closing just before its own `end_type_variable`
+            // — the roots completed since the previous completion are this
+            // variable's bound. Exactly one root is faithful; anything else
+            // is a recovery shape the conversion suppresses (kept as `Some`
+            // poisoned or `None` — the consumer maps only modelable trees).
+            let mut roots = sink.take_done();
+            match roots.len() {
+                1 => roots.pop(),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        self.window.push((name, bound));
+    }
+
     fn end_type_variables(&mut self, _begin: Token, end: Token) {
-        let names = std::mem::take(&mut self.window);
-        self.pending = (!names.is_empty()).then_some((names, end.range.offset));
+        self.bound_sink = None;
+        // Completion order reverses back to declaration order — the
+        // capture's parameter order is the written one.
+        let mut window = std::mem::take(&mut self.window);
+        window.reverse();
+        let (names, bounds): (Vec<StringId>, Vec<Option<TypeTree>>) =
+            window.into_iter().unzip();
+        self.pending = (!names.is_empty()).then_some((names, bounds, end.range.offset));
     }
 
     fn handle_class_extends(&mut self, extends: Option<Token>, count: usize) {
@@ -440,13 +527,22 @@ pub fn capture_clause_trees(
         strings,
         containers: FxHashMap::default(),
         header: None,
+        bound_sink: None,
+        var_names: Vec::new(),
         window: Vec::new(),
         pending: None,
         pending_head: None,
     };
     Parser::new(source, tokens, features, &mut listener).parse_unit();
     for (name, row) in listener.containers {
-        if row.open || row.supers.is_empty() {
+        // A capture lands when its header parsed faithfully (`open` clear)
+        // and carries something the name-level face lacks: argument-bearing
+        // supertype trees, or written parameter bounds (`class C<T
+        // extends num>` has no supers to speak of — its bounds are the
+        // payload).
+        if row.open
+            || (row.supers.is_empty() && row.param_bounds.iter().all(Option::is_none))
+        {
             continue;
         }
         into.insert(
@@ -454,6 +550,7 @@ pub fn capture_clause_trees(
             name,
             ClauseCapture {
                 params: row.params.into_boxed_slice(),
+                param_bounds: row.param_bounds.into_boxed_slice(),
                 supers: row.supers,
             },
         );
@@ -470,6 +567,7 @@ pub fn extend_clause_trees(target: &mut ClauseTrees, source: &ClauseTrees) {
     for (&key, capture) in &source.trees {
         target.trees.entry(key).or_insert_with(|| ClauseCapture {
             params: capture.params.clone(),
+            param_bounds: capture.param_bounds.clone(),
             supers: capture.supers.clone(),
         });
     }

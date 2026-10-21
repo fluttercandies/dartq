@@ -6,20 +6,21 @@
 //! `_resolveUserDefinableType` answers the resolved operator's declared
 //! return and `_refineNumericInvocationTypeNullSafe` (upstream Dart SDK
 //! source, pkg/analyzer/lib/src/dart/element/type_system.dart:2059-2121)
-//! refines it — the recovery lattice reads an invalid/dynamic side as
-//! subtype-of-everything, so the `S <: double?` branch fires and
+//! refines it — `InvalidType` is a subtype of everything (subtype.dart's
+//! `InvalidTypeImpl` arm), so the `S <: double?` branch fires and
 //! `int - <invalid>` types `double` (then the ordinary assignability
-//! faces report against `int` contexts). The operators outside the
-//! refinement set (`~/`, `/`, `&`, relational) keep the declared return,
-//! and a receiver outside `num` (`String`) keeps its own.
+//! faces report against `int` contexts); `dynamic` is Left Top and fires
+//! neither branch, so `int - <dynamic>` types `num`. The operators
+//! outside the refinement set (`~/`, `/`, `&`, relational) keep the
+//! declared return, and a receiver outside `num` (`String`) keeps its own.
 //!
-//! Oracle provenance: /tmp/probe2453 — `dart analyze` 3.13.1: p_matrix +
-//! p_str (`int {+,-,*,%,/} invalid` → `double`, `int ~/ invalid` → `int`,
-//! `num - invalid` → `double`, `String + invalid` → `String`,
-//! `int - dynamic` → `double`, invalid-left and relational silent,
-//! `int total; total += <invalid>` → `invalid_assignment` 'double'),
-//! p_2172 (the `mystery()` dynamic face also answers `double` and
-//! reports `return_of_invalid_type`).
+//! Oracle provenance: `dart analyze` 3.13.1 probes (`int {+,-,*,%}
+//! invalid` → `double`, `int / invalid` → `double`, `int ~/ invalid` →
+//! `int`, `num - invalid` → `double`, `String + invalid` → `String`,
+//! `int - dynamic` → `num`, invalid-left and relational silent,
+//! `int total; total += <invalid>` → `invalid_assignment` 'double',
+//! the undefined-callee `mystery()` face is InvalidType too, answers
+//! `double` and reports `return_of_invalid_type`).
 
 use crate::collector::collect;
 use crate::diagnose::{FileReport, StrictModes, diagnose_with};
@@ -247,11 +248,14 @@ void f(Node node, Token operator) {
     );
 }
 
-/// `dynamic` reads as subtype-of-everything too: `int - <dynamic>` types
-/// `double` (p_matrix line 33 — the upstream note "This includes S being
-/// dynamic or Never").
+/// `dynamic` is Left Top, not a subtype of everything: `dynamic <:
+/// double?` and `dynamic <: int?` both fail (subtype.dart's Left Top rule
+/// asks `Object? <: T1`), so neither refinement branch fires and `int -
+/// <dynamic>` types `num` — the `int` sink reports with 'num' (probed
+/// 3.13.1; the earlier 'double' reading was wrong and left the `double`
+/// sinks silent, see `operand_face_tests`).
 #[test]
-fn int_minus_dynamic_types_double() {
+fn int_minus_dynamic_types_num() {
     let source = "\
 class Node {
   int end = 0;
@@ -266,7 +270,7 @@ void f(Node node, dynamic dy) {
     let report = unit_report(source);
     assert_eq!(
         messages(&report, "argument_type_not_assignable"),
-        ["The argument type 'double' can't be assigned to the parameter type 'int'. "],
+        ["The argument type 'num' can't be assigned to the parameter type 'int'. "],
         "{:?}",
         messages(&report, "argument_type_not_assignable")
     );

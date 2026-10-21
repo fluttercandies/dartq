@@ -756,19 +756,39 @@ fn poison_sweep_catches_missed_patch() {
 }
 
 #[test]
-#[cfg(debug_assertions)]
-fn patch_outside_slot_fails_loudly() {
+fn patch_outside_slot_marks_the_node_and_skips_the_write() {
     // A field past the open node's payload width would write a NEIGHBORING
-    // node's pool word. Debug builds fail at the assertion; release builds
-    // take the soft path (record the error through the error log, skip the
-    // write) so impossible input corrupts nothing.
-    let result = std::panic::catch_unwind(|| {
-        let mut b = AstBuilder::new();
-        b.begin(NodeKind::CompilationUnit, 0);
-        b.begin(NodeKind::Break, 0); // width 1: has_target
-        b.patch(1, 0); // outside the slot
-    });
-    assert!(result.is_err(), "out-of-slot patch must fail loudly");
+    // node's pool word. Every build takes the soft path — the error is
+    // recorded through the builder's error log (the node seals flagged)
+    // and the write is skipped — so a bridge event patching a child's
+    // field while the deferred parent is the open node corrupts nothing
+    // and panics nothing (the lint pass runs over real corpora in debug
+    // builds too).
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::Break, 0); // width 1: has_target
+    b.patch(1, 0); // outside the slot
+    b.patch(0, 0); // the real field, so the seal's poison sweep passes
+    b.end(NodeKind::Break, 1);
+    b.end(NodeKind::CompilationUnit, 1);
+    let ast = b.finish();
+    assert!(ast.is_error(0), "the out-of-slot patch flags the node");
+}
+
+#[test]
+fn end_before_first_token_seals_zero_width_and_flags() {
+    // A seal before the node's own head (a bridge end event carrying no
+    // closer for an empty production) seals zero-width at the head with
+    // the error flag instead of recording an inverted range.
+    let mut b = AstBuilder::new();
+    b.begin(NodeKind::CompilationUnit, 0);
+    b.begin(NodeKind::Break, 5); // width 1: has_target
+    b.patch(0, 0);
+    b.end(NodeKind::Break, 2); // precedes first_token 5
+    b.end(NodeKind::CompilationUnit, 6);
+    let ast = b.finish();
+    assert!(ast.is_error(0));
+    assert_eq!(ast.token_range(0), 5..5);
 }
 
 #[test]

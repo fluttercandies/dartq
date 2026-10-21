@@ -326,9 +326,12 @@ fn bound_failure_falls_through_to_the_remaining_face() {
                   void useRules(Set<Rule> rules) {\n\
                   \x20 rules.sorted();\n\
                   }\n";
+    // Source order (the oracle's own row order on the same fixture:
+    // UNUSED_ELEMENT at the dropped member's name, col 11, before
+    // UNUSED_ELEMENT_PARAMETER at `compare`, col 43).
     assert_eq!(
         code_names(&report(source)),
-        ["unused_element_parameter", "unused_element"],
+        ["unused_element", "unused_element_parameter"],
         "{:?}",
         code_views(&report(source))
     );

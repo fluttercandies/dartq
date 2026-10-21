@@ -113,15 +113,14 @@ const STEPS: &[Step] = &[
         changed: &["lib/a.dart"],
         invalidated: &["lib/a.dart", "lib/b.dart", "lib/c.dart", "lib/m.dart"],
         // The rename orphans b's only use of a: the `f()` reference resolves
-        // to nothing, so a.dart's import has no used elements — upstream
-        // reports `unused_import` on the URI alongside `undefined_function`
-        // (upstream Dart SDK source, imports_verifier.dart
-        // `generateUnusedImportWarnings`; the not-existing-URI skip does not
-        // apply, a.dart resolves).
-        expected: &[
-            ("undefined_function", "lib/b.dart"),
-            ("unused_import", "lib/b.dart"),
-        ],
+        // to nothing — `undefined_function`. The import does NOT report
+        // `unused_import` beside it (probed 3.13.1; upstream Dart SDK
+        // source, library_analyzer.dart
+        // `_hasDiagnosticReportedThatPreventsImportWarnings`: an
+        // `undefined_function`/`undefined_identifier`/`undefined_class`
+        // row anywhere in the library skips the whole `ImportsVerifier`
+        // pass — the undefined name might have come from one of them).
+        expected: &[("undefined_function", "lib/b.dart")],
         stable: false,
     },
     Step {

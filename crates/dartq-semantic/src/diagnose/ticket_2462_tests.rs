@@ -105,6 +105,10 @@ fn code_names(report: &FileReport) -> Vec<&'static str> {
 #[test]
 fn differing_type_arguments_keep_the_is_check_live() {
     let source = "\
+class num {}
+class int extends num {}
+class String {}
+class List<E> {}
 class Box<T> {
   Box();
 }
@@ -139,6 +143,10 @@ void f(Box<List<int>> stream) {
 #[test]
 fn same_arguments_stay_constant_true() {
     let source = "\
+class num {}
+class int extends num {}
+class String {}
+class List<E> {}
 class Box<T> {
   Box();
 }
@@ -160,6 +168,10 @@ void f(Box<int> b) {
 #[test]
 fn covariant_arguments_stay_constant_true() {
     let source = "\
+class num {}
+class int extends num {}
+class String {}
+class List<E> {}
 class Box<T> {
   Box();
 }
@@ -181,6 +193,10 @@ void f(Box<int> b) {
 #[test]
 fn type_variable_tested_face_stays_conservative() {
     let source = "\
+class num {}
+class int extends num {}
+class String {}
+class List<E> {}
 class Box<T> {
   Box();
 }
@@ -205,6 +221,10 @@ void f<T>(Box<T> b) {
 #[test]
 fn declined_fold_keeps_the_demoted_arm_live() {
     let source = "\
+class num {}
+class int extends num {}
+class String {}
+class List<E> {}
 class Box<T> {
   Box();
 }
@@ -238,6 +258,10 @@ String h(Box<List<int>> stream) {
 #[test]
 fn nullable_receiver_against_bare_target_stays_live() {
     let source = "\
+class num {}
+class int extends num {}
+class String {}
+class List<E> {}
 class Box<T> {
   Box();
 }

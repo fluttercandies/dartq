@@ -1795,12 +1795,18 @@ impl<'a> Snapshot<'a> {
             }
         }
 
-        // Freeze the snapshot. An invalid captured graph (a cycle
-        // through invalid sources) falls back to the bare core; the
-        // declarations it drops from the hierarchy are marked unsafe so
-        // no walk can ever reach them.
-        let hierarchy = match builder.build(&table) {
-            Ok(hierarchy) => hierarchy,
+        // Freeze the snapshot edge by edge: an edge the build rejects (a
+        // back edge of a cyclic `extends` pair, an arity-mismatched
+        // instantiation) drops out alone and its owner goes unsafe — its
+        // supertype closure is incomplete from that edge on, so no bound
+        // check may answer through it — while every other declaration
+        // keeps its face. The declaration-level contract never fails from
+        // source shape; the bare core answers the unreachable arm.
+        let hierarchy = match builder.build_lenient(&table) {
+            Ok((hierarchy, dropped)) => {
+                unsafe_decls.extend(dropped.iter().map(|edge| edge.owner));
+                hierarchy
+            }
             Err(_) => TypeHierarchy::builder(CoreDecls {
                 object,
                 future,

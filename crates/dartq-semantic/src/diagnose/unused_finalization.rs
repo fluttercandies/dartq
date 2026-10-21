@@ -1,5 +1,25 @@
 use super::*;
 
+/// The diagnostic codes whose presence anywhere in the unit skips the
+/// whole import-warning pass (upstream Dart SDK source,
+/// library_analyzer.dart `_hasDiagnosticReportedThatPreventsImportWarnings`
+/// — the exact set, machine spellings lowered to the engine's code names).
+const IMPORT_WARNING_GATE: &[&str] = &[
+    "ambiguous_import",
+    "const_with_non_type",
+    "extends_non_class",
+    "implements_non_class",
+    "mixin_of_non_class",
+    "new_with_non_type",
+    "not_a_type",
+    "prefix_identifier_not_followed_by_dot",
+    "undefined_class",
+    "undefined_function",
+    "undefined_identifier",
+    "undefined_prefixed_name",
+    "deprecated_export_use",
+];
+
 impl<'a> Engine<'a> {
     /// The with-clause entry face (`class_used_as_mixin`, messages.yaml
     /// :2737-2741): every entry span whose name resolves to a plain class —
@@ -1309,6 +1329,23 @@ impl<'a> Engine<'a> {
         if self.imports.is_empty() {
             return;
         }
+        // The library-wide gate (upstream Dart SDK source,
+        // library_analyzer.dart `_hasDiagnosticReportedThatPreventsImportWarnings`):
+        // a resolution failure anywhere in the unit skips the whole
+        // `ImportsVerifier` pass — the undefined name might have come from
+        // one of the imports, so no `unused_import`/`unused_shown_name`
+        // row may second-guess it (probed 3.13.1: `import 'a.dart' as p;
+        // fa();` reports `undefined_function` alone, the unused prefix
+        // import stays silent; `import 'a.dart'; p.fa();` likewise keeps
+        // the wholly unused import silent beside `undefined_identifier`).
+        if self
+            .report
+            .diagnostics
+            .iter()
+            .any(|row| IMPORT_WARNING_GATE.contains(&row.code.name))
+        {
+            return;
+        }
         let mut edges = self.graph.import_edges(self.lib);
         // The implicit prelude edge is exactly one leading entry (the merge
         // inserts it before every written edge), targets `dart:core`, and
@@ -1331,26 +1368,6 @@ impl<'a> Engine<'a> {
         if edges.len() != self.imports.len() {
             return;
         }
-        // A failed unqualified lookup still consulted the combined
-        // unprefixed namespace: the attempt itself spares the unprefixed
-        // imports from the whole face — the file with a bare miss reports
-        // `undefined_function`/`undefined_identifier` alone, no
-        // `unused_import` on the imports it consulted and no
-        // `unused_shown_name` on their shown lists (probed: dart analyze
-        // 3.13.1 — a bare `zz()` miss leaves even a wholly unused unprefixed
-        // import unreported, while a named-argument label miss does not
-        // spare). The named-argument label is the excluded miss kind: its
-        // check runs against the resolved callee's formal table, never the
-        // namespace (upstream Dart SDK source, pkg/analyzer/lib/src/dart/
-        // resolver/scope_analyzer.dart:913-921 — the unqualified lookup
-        // walks the scope chain through the imports for every bare name;
-        // method_invocation_resolver.dart:146-156 — "the prefix is still
-        // used, so its imports must not be reported as unused").
-        let bare_miss = self
-            .report
-            .names
-            .iter()
-            .any(|row| !row.qualified && row.use_kind != NameUse::NamedArgument);
         let used: Vec<StringId> = self
             .used_names
             .iter()
@@ -1379,11 +1396,9 @@ impl<'a> Engine<'a> {
                     self.used_names.contains(&prefix) || self.import_used.contains(&prefix)
                 }
                 None => {
-                    bare_miss
-                        || used.iter().any(|&n| {
-                            edge.combinators.allows(n) && self.graph.exported(target, n).is_some()
-                        })
-                        || self.import_credits_extension_member(edge, target, &used)
+                    used.iter().any(|&n| {
+                        edge.combinators.allows(n) && self.graph.exported(target, n).is_some()
+                    }) || self.import_credits_extension_member(edge, target, &used)
                 }
             };
             if !is_used {
@@ -1398,10 +1413,11 @@ impl<'a> Engine<'a> {
             // resolution gate (the official `element == null` skip) leaves
             // an undefined shown name to its own code.
             for (name, range) in shown {
-                // The consultation silences the shown-name face too: the
-                // spared import's list never reports (probed: dart analyze
-                // 3.13.1 — a used show list plus a bare miss stays silent).
-                if (bare_miss && prefix.is_none()) || self.graph.exported(target, name).is_none() {
+                // The resolution gate (the official `element == null`
+                // skip): an undefined shown name keeps its own code. The
+                // library-wide import-warning gate above already silenced
+                // every list beside a resolution failure.
+                if self.graph.exported(target, name).is_none() {
                     continue;
                 }
                 let name_used = (self.used_names.contains(&name)

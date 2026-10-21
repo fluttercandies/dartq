@@ -179,7 +179,9 @@ pub struct LibraryTypes {
 
 /// One container's parse-time supertype capture: the type-parameter
 /// spellings in declaration order (the scope the clause trees resolve
-/// their parameter arguments through) and the written supertype trees
+/// their parameter arguments through), each parameter's written bound
+/// tree in the same order (`None` for an unbounded parameter — the
+/// implicit `Object?`), and the written supertype trees
 /// (`extends`/`with`/`implements`, in clause order — the `on` constraints
 /// of a mixin are constraints, not edges, and ride the name-level arm).
 /// The capture's `open` bit never reaches here: an unfaithful capture
@@ -188,6 +190,11 @@ pub struct LibraryTypes {
 pub(crate) struct ClauseCapture {
     /// The container's own type-parameter spellings, declaration order.
     pub(crate) params: Box<[StringId]>,
+    /// Each parameter's written bound tree, parallel to
+    /// [`Self::params`]; `None` for an unbounded parameter. The trees
+    /// resolve inside the container's own parameter scope (a bound may
+    /// name a sibling parameter — `T extends Comparable<T>`).
+    pub(crate) param_bounds: Box<[Option<TypeTree>]>,
     /// The written supertype trees (extends/with/implements), clause order.
     pub(crate) supers: Vec<TypeTree>,
 }
@@ -456,7 +463,7 @@ impl LibraryTypes {
             typedef_targets,
             typedef_shapes,
             type_params,
-            facts,
+            mut facts,
             ..
         } = registry;
 
@@ -483,18 +490,61 @@ impl LibraryTypes {
         // `decl_owner` pairs each decl back to its declaring file and
         // library: an imported container's `extends` resolves in its
         // own scope, not `lib`'s (the same discipline `resolve_container`
-        // climbs with).
+        // climbs with). The name of each decl comes from the inverted
+        // registry, built once (the registry is the snapshot's only
+        // name→decl pairing).
+        let name_of_decl: FxHashMap<TypeDeclId, StringId> =
+            registry.iter().map(|(&name, &decl)| (decl, name)).collect();
+        let scope_of = |capture: &ClauseCapture, decl: TypeDeclId| {
+            let params = decl_params.get(&decl).map_or(&[][..], Vec::as_slice);
+            capture
+                .params
+                .iter()
+                .copied()
+                .zip(params.iter().copied())
+                .collect::<FxHashMap<StringId, TypeParamId>>()
+        };
+        // Pass 1 — the written parameter bounds of every captured
+        // container feed `ParamFacts.bound` before any edge maps:
+        // `instantiate_type_formals_to_bounds` and the bound-projecting
+        // subtype arms read them, and a raw head inside another
+        // container's clause (`extends Base` for `class Base<T extends
+        // num>`) instantiates to the bound only when the bound is already
+        // set — a single interleaved pass made that read order-dependent.
+        // A bound resolves inside the container's own parameter scope
+        // (`T extends Comparable<T>` names a sibling — the scope is
+        // complete before any bound maps), and a bound that fails to map
+        // keeps the `None` face (the open direction — an unmodeled bound
+        // only ever under-reports through `instantiate_to_bounds`).
+        for (&decl, &(file, _)) in &decl_owner {
+            let Some(&name) = name_of_decl.get(&decl) else {
+                continue;
+            };
+            let Some(capture) = clauses.get(file, name) else {
+                continue;
+            };
+            let params = decl_params.get(&decl).map_or(&[][..], Vec::as_slice);
+            let scope = scope_of(capture, decl);
+            for (&param_id, bound_tree) in params.iter().zip(capture.param_bounds.iter()) {
+                let Some(tree) = bound_tree else {
+                    continue;
+                };
+                let bound = clause_arg_ty(&table, &registry, &decl_params, &facts, &scope, tree);
+                facts.set(
+                    param_id,
+                    ParamFacts {
+                        variance: Variance::Covariant,
+                        bound,
+                    },
+                );
+            }
+        }
+        // Pass 2 — the supertype edges.
         for (&decl, &(file, owner)) in &decl_owner {
             let Some(elements) = index.get(file) else {
                 continue;
             };
-            // Recover the decl's name from the registry (the only
-            // name→decl pairing the snapshot carries; a build-time scan
-            // pays once per decl).
-            let Some(name) = registry
-                .iter()
-                .find_map(|(&n, &d)| (d == decl).then_some(n))
-            else {
+            let Some(&name) = name_of_decl.get(&decl) else {
                 continue;
             };
             let Some(container) = elements.container(name) else {
@@ -508,13 +558,7 @@ impl LibraryTypes {
             // capture that fails to map contributes no edge (the open
             // direction — a dropped edge only ever under-reports).
             if let Some(capture) = clauses.get(file, name) {
-                let params = decl_params.get(&decl).map_or(&[][..], Vec::as_slice);
-                let scope: FxHashMap<StringId, TypeParamId> = capture
-                    .params
-                    .iter()
-                    .copied()
-                    .zip(params.iter().copied())
-                    .collect();
+                let scope = scope_of(capture, decl);
                 for tree in &capture.supers {
                     if let Some(ty) =
                         clause_tree_ty(&table, &registry, &decl_params, &facts, &scope, tree)
@@ -526,27 +570,13 @@ impl LibraryTypes {
                         builder = builder.supertype(decl, ty);
                     }
                 }
-                // A mixin's `on` constraints still join at name level —
-                // the capture's `On` trees are discarded upstream of
-                // `ClauseCapture::supers`, exactly like today's clause-name
-                // arm keeps them.
-                if container.kind == ContainerKind::Mixin {
-                    for &target_name in &container.on_clause {
-                        if let Some(ty) = clause_head_instantiation(
-                            &table,
-                            &registry,
-                            &decl_params,
-                            &facts,
-                            namespaces,
-                            graph,
-                            index,
-                            owner,
-                            target_name,
-                        ) {
-                            builder = builder.supertype(decl, ty);
-                        }
-                    }
-                }
+                // A mixin's `on` constraints ride the capture too (the
+                // listener claims them as supertype roots), so no
+                // name-level join repeats them: the to-bounds
+                // instantiation it would add beside the written
+                // `TableInfo<TableDsl, D>` made every `TableInfo<_, _>`
+                // a supertype of the mixin — the over-admitting duplicate
+                // edge.
                 continue;
             }
             let clause_names = container
@@ -578,12 +608,19 @@ impl LibraryTypes {
             }
         }
 
-        // Freeze: an invalid captured graph (a cycle, an arity-mismatched
-        // edge) falls back to the bare core — declarations stay
-        // registered but carry no hierarchy face, the same under-report
-        // posture `crate::bounds` takes.
-        let hierarchy = match builder.build(&table) {
-            Ok(hierarchy) => hierarchy,
+        // Freeze edge by edge: a malformed captured edge (an arity-mismatched
+        // instantiation, a foreign parameter, a back edge of a cyclic
+        // `extends` pair) drops out alone and its owner keeps the rest of
+        // its face — the official hierarchy stays usable around such a
+        // declaration, and a whole-snapshot fallback would blank every
+        // other declaration's supertype face in the unit (a lost `is`
+        // promotion in an unrelated file, #2508's drift regression). The
+        // declaration-level contract never fails from source shape: every
+        // registered decl is unique and the core decls are the fixed
+        // sentinels, so the error arm is unreachable by construction and
+        // only the bare core answers it.
+        let hierarchy = match builder.build_lenient(&table) {
+            Ok((hierarchy, _dropped)) => hierarchy,
             Err(_) => TypeHierarchy::builder(CoreDecls {
                 object,
                 future,
@@ -1817,6 +1854,474 @@ impl<'a> ResolvedTypeOps<'a> {
                     .intern(UninternedType::Never, nullable),
             ),
             _ => None,
+        }
+    }
+
+    // —— #2508: the strict `Ty` → `TypeId` map —————————————————————————
+    // The extension application's structural face. Unlike `map_name`'s
+    // every-name-answers contract — which resolves unknown spellings to
+    // `Invalid` or the opaque decl so flow probes keep an answer — this
+    // map answers `Some` only where the snapshot carries a REAL fact:
+    // registered containers and builtins, declared type parameters, the
+    // unit kinds. Anything else (the `Ty::Unknown` sentinel, a
+    // `non_containers` spelling, an unresolvable head, a record or
+    // function shape, an arity mismatch) maps `None` and the caller
+    // degrades to the name-level logic — the `Invalid` arm's vacuous
+    // `true` must never leak into the applicability/specificity gates.
+
+    /// Maps a diagnosing `Ty` to the snapshot's `TypeId`, `None` where the
+    /// structural world carries no fact for it.
+    ///
+    /// `pool` is the boundary pool the `Ty`'s argument lists index — the
+    /// caller projects foreign `Ty`s through [`Boundary::ty`] first, so a
+    /// list here always resolves in the diagnosing universe.
+    pub(crate) fn map_ty_strict(
+        &self,
+        ty: Ty,
+        pool: &crate::model::ArgPool,
+    ) -> Option<TypeId> {
+        match ty {
+            Ty::Unknown => None,
+            Ty::Null => Some(self.null),
+            Ty::Dynamic => Some(self.dynamic),
+            Ty::Never => Some(
+                self.snapshot
+                    .table
+                    .intern(UninternedType::Never, false),
+            ),
+            Ty::Void => Some(self.void),
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => self.map_named_strict(name, nullable, args, pool),
+            // The structural snapshot models records and functions, but
+            // the diagnosing `Ty` shapes live in a different pool — the
+            // shape translation is M2 work and the caller's name-level
+            // read answers for them today (the fallback discipline).
+            Ty::Record { .. } | Ty::Function { .. } => None,
+        }
+    }
+
+    /// The `Ty::Named` arm of [`Self::map_ty_strict`]: a type parameter, the
+    /// `FutureOr` pseudo type, a registered container, or the `Null`/`Never`
+    /// spellings — precedence mirroring [`Self::map_name`].
+    fn map_named_strict(
+        &self,
+        name: StringId,
+        nullable: bool,
+        args: crate::model::ArgListId,
+        pool: &crate::model::ArgPool,
+    ) -> Option<TypeId> {
+        if let Some(&param) = self.snapshot.type_params.get(&name) {
+            return Some(
+                self.snapshot
+                    .table
+                    .intern(UninternedType::TypeParameter { parameter: param }, nullable),
+            );
+        }
+        let lexeme = self.strings.resolve(name);
+        if lexeme == "FutureOr" {
+            let written = pool.get(args);
+            let base = if written.is_empty() {
+                self.dynamic
+            } else if written.len() == 1 {
+                self.map_ty_strict(written[0], pool)?
+            } else {
+                return None;
+            };
+            return Some(
+                self.snapshot
+                    .table
+                    .intern(UninternedType::FutureOr { base }, nullable),
+            );
+        }
+        if let Some(&decl) = self
+            .snapshot
+            .registry
+            .get(&name)
+            .filter(|_| !self.snapshot.non_containers.contains(&name))
+        {
+            let params = self
+                .snapshot
+                .decl_params
+                .get(&decl)
+                .map_or(&[][..], Vec::as_slice);
+            let mapped: Vec<TypeId> = if args == crate::model::ArgListId::EMPTY {
+                // A bare head instantiates to bounds exactly like the
+                // `map_name` registered arm (`Map` reads `Map<dynamic,
+                // dynamic>` under the unbounded defaults).
+                if params.is_empty() {
+                    Vec::new()
+                } else {
+                    instantiate_type_formals_to_bounds(
+                        &self.snapshot.table,
+                        &self.snapshot.facts,
+                        params,
+                    )
+                    .defaults
+                }
+            } else {
+                let written = pool.get(args);
+                if written.len() != params.len() {
+                    return None;
+                }
+                let mut mapped = Vec::with_capacity(written.len());
+                for &arg in written {
+                    mapped.push(self.map_ty_strict(arg, pool)?);
+                }
+                mapped
+            };
+            return Some(
+                self.snapshot
+                    .table
+                    .intern(UninternedType::Interface { decl, args: mapped }, nullable),
+            );
+        }
+        self.builtin_spelling(lexeme, nullable)
+    }
+
+    /// The structural subtype answer over two diagnosing `Ty`s: `Some`
+    /// where both sides map into the snapshot, `None` where either carries
+    /// no structural fact (the caller's name-level fallback keeps the
+    /// question).
+    pub(crate) fn try_subtype_strict(
+        &self,
+        sub: Ty,
+        sup: Ty,
+        pool: &crate::model::ArgPool,
+    ) -> Option<bool> {
+        Some(
+            self.system
+                .is_subtype(self.map_ty_strict(sub, pool)?, self.map_ty_strict(sup, pool)?),
+        )
+    }
+
+    /// Whether `ty` mentions a `TypeParameter` leaf anywhere in its
+    /// structure — the strict path's decline signal: `is_subtype`'s
+    /// M1 parameter arms answer `false` where the oracle reads the
+    /// parameter's own bound, so a pair carrying one keeps the
+    /// name-level verdict (the under-report direction).
+    pub(crate) fn mentions_param(&self, ty: TypeId) -> bool {
+        let table = &self.snapshot.table;
+        match table.get(ty).kind() {
+            TypeKind::TypeParameter { .. } => true,
+            TypeKind::Interface { args, .. } => {
+                table.args(args).iter().any(|&a| self.mentions_param(a))
+            }
+            TypeKind::FutureOr { base } => self.mentions_param(base),
+            TypeKind::Function { signature } => {
+                let sig = table.signature(signature);
+                self.mentions_param(sig.return_type)
+                    || table
+                        .args(sig.positional)
+                        .iter()
+                        .any(|&a| self.mentions_param(a))
+                    || table
+                        .named_members(sig.named)
+                        .iter()
+                        .any(|member| self.mentions_param(member.ty))
+            }
+            TypeKind::Record { shape } => {
+                let shape = table.record_shape(shape);
+                table
+                    .args(shape.positional)
+                    .iter()
+                    .any(|&a| self.mentions_param(a))
+                    || table
+                        .named_members(shape.named)
+                        .iter()
+                        .any(|member| self.mentions_param(member.ty))
+            }
+            _ => false,
+        }
+    }
+
+    /// `is_subtype` over already-mapped ids — the caller's own guard ran
+    /// first, so the question stands on mapped facts alone.
+    pub(crate) fn subtype_ids(&self, sub: TypeId, sup: TypeId) -> bool {
+        self.system.is_subtype(sub, sup)
+    }
+
+    /// `Substitution.fromPairs` over the snapshot's interned ids — the
+    /// bound-check's `bound[T := arg]` instantiation.
+    pub(crate) fn substitute(&self, ty: TypeId, map: &[(TypeParamId, TypeId)]) -> TypeId {
+        self.snapshot.table.substitute(ty, map)
+    }
+
+    /// The `TypeParamId` a written parameter name lands on in this
+    /// snapshot (`type_params` is name-keyed across the library — the
+    /// flow layer's own declaration-scope convention). `None` for a name
+    /// no declaration registers.
+    pub(crate) fn param_id(&self, name: StringId) -> Option<TypeParamId> {
+        self.snapshot.type_params.get(&name).copied()
+    }
+
+    /// Step-5's instantiate-to-bounds projection
+    /// (`extension_member_resolver.dart:459-466` `_instantiateToBounds`)
+    /// over a mapped `on` type: every bare face-parameter leaf is replaced
+    /// by that parameter's declared bound — an unbounded parameter by
+    /// `dynamic` (the Dart reading of unbounded), a written bound as the
+    /// FACE declares it (`face_params` carries each parameter's own mapped
+    /// bound: the snapshot's `type_params` registry is name-keyed, so two
+    /// faces spelling the same `DT` would otherwise share one
+    /// `ParamFacts.bound` — `BaseAggregate<DT extends Object>` and
+    /// `ArithmeticAggregates<DT extends num>` both `on Expression<DT>`
+    /// must project to `Expression<Object>` and `Expression<num>`
+    /// respectively, never to one shared face). `T extends Comparable<T>`
+    /// substitutes as written, the residual parameter riding as the
+    /// unmodeled shape the subtype arm leaves unordered. `None` when
+    /// `on_ty` maps no structural face — the caller keeps the name-level
+    /// projection.
+    pub(crate) fn bounds_projection(
+        &self,
+        on_ty: Ty,
+        face_params: &[(TypeParamId, Option<TypeId>)],
+        pool: &crate::model::ArgPool,
+    ) -> Option<TypeId> {
+        if face_params.is_empty() {
+            return None;
+        }
+        let on = self.map_ty_strict(on_ty, pool)?;
+        let mut facts = ParamFactsTable::new();
+        for &(id, bound) in face_params {
+            facts.set(
+                id,
+                ParamFacts {
+                    variance: Variance::Covariant,
+                    bound,
+                },
+            );
+        }
+        let ids: Vec<TypeParamId> = face_params.iter().map(|(id, _)| *id).collect();
+        let instantiation =
+            instantiate_type_formals_to_bounds(&self.snapshot.table, &facts, &ids);
+        let map: Vec<(TypeParamId, TypeId)> = ids
+            .iter()
+            .copied()
+            .zip(instantiation.defaults.iter().copied())
+            .collect();
+        Some(self.snapshot.table.substitute(on, &map))
+    }
+
+    /// The structural answer over two instantiate-to-bounds projections —
+    /// step 5's pair test: `(sub <: sup, sup <: sub)` computed over the
+    /// two mapped projections in one pass. `None` where either side
+    /// carries no structural fact.
+    pub(crate) fn try_bounds_subtype(
+        &self,
+        sub_on_ty: Ty,
+        sub_face_params: &[(TypeParamId, Option<TypeId>)],
+        sup_on_ty: Ty,
+        sup_face_params: &[(TypeParamId, Option<TypeId>)],
+        pool: &crate::model::ArgPool,
+    ) -> Option<(bool, bool)> {
+        let sub = self.bounds_projection(sub_on_ty, sub_face_params, pool)?;
+        let sup = self.bounds_projection(sup_on_ty, sup_face_params, pool)?;
+        Some((
+            self.system.is_subtype(sub, sup),
+            self.system.is_subtype(sup, sub),
+        ))
+    }
+
+    /// Instantiates an extension's `on` type against the receiver's
+    /// resolved instantiation of the `on` declaration
+    /// (`applicable_extensions.dart:223-240`: `constrainArgument` binds
+    /// the extended type's fresh parameters to the receiver's
+    /// projection), gates every bound instantiation through its declared
+    /// bound (the inference's `tryChooseFinalTypes` fails a face whose
+    /// argument violates the parameter's bound — `List<String>` never
+    /// applies `ListToJSArray<T extends JSAny?>`), then answers whether
+    /// the receiver is a subtype of the instantiated `on` type.
+    /// `face_params` are the extension's own type parameters (the ids
+    /// [`Self::param_id`] resolves) with their mapped bounds — `None` for
+    /// an unbounded parameter.
+    ///
+    /// `None` where the projection or the subtype question has no
+    /// structural fact: `receiver`'s supertype closure never reaches the
+    /// `on` declaration (the `reaches` gate already rejected it — this
+    /// arm under-reports the same direction), a shape inside the `on`
+    /// type maps no parameter, or a bound question still mentions a
+    /// parameter after the substitution.
+    pub(crate) fn extension_applies_strict(
+        &self,
+        receiver: Ty,
+        on_ty: Ty,
+        face_params: &[(TypeParamId, Option<TypeId>)],
+        pool: &crate::model::ArgPool,
+    ) -> Option<bool> {
+        let receiver = self.map_ty_strict(receiver, pool)?;
+        let on = self.map_ty_strict(on_ty, pool)?;
+        let ids: Vec<TypeParamId> = face_params.iter().map(|(id, _)| *id).collect();
+        let (instantiated, map) = self.unify_extended(receiver, on, &ids)?;
+        for (param, bound) in face_params {
+            let Some(bound) = bound else { continue };
+            let Some(&(_, instantiation)) =
+                map.iter().find(|(bound_param, _)| bound_param == param)
+            else {
+                continue;
+            };
+            let bound = self.substitute(*bound, &map);
+            if self.mentions_param(bound) || self.mentions_param(instantiation) {
+                return None;
+            }
+            if !self.system.is_subtype(instantiation, bound) {
+                return Some(false);
+            }
+        }
+        Some(self.system.is_subtype(receiver, instantiated))
+    }
+
+    /// `constrainArgument` over the `on` type's parameter leaves: walks
+    /// `receiver`'s instantiated supertype closure to the `on`
+    /// declaration, then binds each `TypeParameter` leaf in the `on`
+    /// type's argument positions to the receiver's projected argument —
+    /// `Box<int>` reaching `Iterable<Wrapper<int>>` against `on
+    /// Iterable<T>` binds `T := Wrapper<int>` (the hop's argument
+    /// projection the name-level read cannot express).
+    ///
+    /// Answers the instantiated `on` type beside the binding map it was
+    /// built from (the bound gate reads the map). `None` when `receiver`
+    /// is not an `Interface`, the `on` type is not an `Interface` with the
+    /// receiver in its closure, or the binding walk diverges — the caller
+    /// keeps the name-level answer.
+    fn unify_extended(
+        &self,
+        receiver: TypeId,
+        on: TypeId,
+        face_params: &[TypeParamId],
+    ) -> Option<(TypeId, Vec<(TypeParamId, TypeId)>)> {
+        let table = &self.snapshot.table;
+        let TypeKind::Interface { decl: on_decl, args: on_args } =
+            table.get(on).kind()
+        else {
+            // A non-interface `on` type has no parameter positions to
+            // bind — the subtype answer stands on it as written.
+            return Some((on, Vec::new()));
+        };
+        let TypeKind::Interface {
+            decl: recv_decl,
+            args: recv_args,
+        } = table.get(receiver).kind()
+        else {
+            return None;
+        };
+        // The receiver's instantiation of `on_decl`: a depth-first walk
+        // over instantiated supertype edges mirroring `interface_walk`'s
+        // order (LIFO pops, declaration-order pushes — first match decides,
+        // sound under Dart's single-instantiation invariant). Each edge is
+        // a template over its OWNER's parameters; `table.substitute`
+        // instantiates it with the frontier entry's concrete arguments.
+        let projected: Vec<TypeId> = if recv_decl == on_decl {
+            table.args(recv_args)
+        } else {
+            let mut seen: FxHashSet<TypeId> = FxHashSet::default();
+            let mut frontier: Vec<TypeId> = Vec::new();
+            if let Some(info) = self.system.hierarchy().decl(recv_decl) {
+                let map: Vec<(TypeParamId, TypeId)> = info
+                    .type_parameters
+                    .iter()
+                    .copied()
+                    .zip(table.args(recv_args))
+                    .collect();
+                for &edge in &info.supertypes {
+                    frontier.push(table.substitute(edge, &map));
+                }
+            }
+            let mut found = None;
+            while let Some(current) = frontier.pop() {
+                if !seen.insert(current) {
+                    continue;
+                }
+                let TypeKind::Interface { decl, args } = table.get(current).kind() else {
+                    continue;
+                };
+                if decl == on_decl {
+                    found = Some(table.args(args));
+                    break;
+                }
+                let Some(info) = self.system.hierarchy().decl(decl) else {
+                    continue;
+                };
+                let map: Vec<(TypeParamId, TypeId)> = info
+                    .type_parameters
+                    .iter()
+                    .copied()
+                    .zip(table.args(args))
+                    .collect();
+                for &edge in &info.supertypes {
+                    frontier.push(table.substitute(edge, &map));
+                }
+            }
+            found?
+        };
+        // Positional unification: each `on` argument's face-parameter leaf
+        // binds the receiver's projected argument at the same position
+        // (`on Map<K, List<V>>` vs `Map<K, List<RV>>` descends into the
+        // nested group — `constrainArgument`'s interface shape).
+        let on_args = table.args(on_args);
+        if on_args.len() != projected.len() {
+            return None;
+        }
+        let mut map: Vec<(TypeParamId, TypeId)> = Vec::new();
+        for (&on_arg, &proj) in on_args.iter().zip(projected.iter()) {
+            Self::bind_face_params(table, on_arg, proj, face_params, &mut map);
+        }
+        Some((table.substitute(on, &map), map))
+    }
+
+    /// Descends `on_arg` binding every face-parameter leaf to `proj` —
+    /// `constrainArgument`'s parameter-position arm: a bare `TypeParameter`
+    /// binds directly, a nested interface group descends argument-wise
+    /// (same decl, matching arity), every other shape binds nothing.
+    fn bind_face_params(
+        table: &TypeTable,
+        on_arg: TypeId,
+        proj: TypeId,
+        face_params: &[TypeParamId],
+        map: &mut Vec<(TypeParamId, TypeId)>,
+    ) {
+        if let TypeKind::TypeParameter { parameter } = table.get(on_arg).kind() {
+            if face_params.contains(&parameter) {
+                // `constrainArgument`'s nullable absorption (upstream Dart
+                // SDK source, extension_member_resolver.dart: `P? :> A?`
+                // constrains `P` against `A`'s non-null face — `on
+                // Iterable<T?>` over `Iterable<String?>` binds `T := String`,
+                // so `T extends Object` holds and the face applies). A
+                // nullable parameter leaf strips the projected argument's
+                // own `?` before binding; a non-null leaf binds verbatim.
+                let binding = if table.get(on_arg).is_nullable() {
+                    non_nullable_of(table, proj)
+                } else {
+                    proj
+                };
+                map.push((parameter, binding));
+            }
+            return;
+        }
+        let (
+            TypeKind::Interface {
+                decl: on_decl,
+                args: on_args,
+            },
+            TypeKind::Interface {
+                decl: proj_decl,
+                args: proj_args,
+            },
+        ) = (table.get(on_arg).kind(), table.get(proj).kind())
+        else {
+            return;
+        };
+        if on_decl != proj_decl {
+            return;
+        }
+        let on_args = table.args(on_args);
+        let proj_args = table.args(proj_args);
+        if on_args.len() != proj_args.len() {
+            return;
+        }
+        for (&on_arg, &proj) in on_args.iter().zip(proj_args.iter()) {
+            Self::bind_face_params(table, on_arg, proj, face_params, map);
         }
     }
 
@@ -4209,6 +4714,7 @@ mod tests {
             strings.intern("A"),
             ClauseCapture {
                 params: Vec::new().into_boxed_slice(),
+                param_bounds: Vec::new().into_boxed_slice(),
                 supers: vec![s_of_int],
             },
         );
@@ -4371,4 +4877,30 @@ mod tests {
             "the demoted Object read must miss `length`: {codes:?}"
         );
     }
+}
+
+/// The `?`-stripped projection of `ty` (same kind, non-nullable face).
+/// Function/record shapes have no nullable re-intern here and keep their
+/// suffix — the binding sites that reach them are cold edge faces.
+fn non_nullable_of(table: &TypeTable, ty: TypeId) -> TypeId {
+    let face = table.get(ty);
+    if !face.is_nullable() {
+        return ty;
+    }
+    let uninterned = match face.kind() {
+        TypeKind::Never => UninternedType::Never,
+        TypeKind::Dynamic => UninternedType::Dynamic,
+        TypeKind::Void => UninternedType::Void,
+        TypeKind::Invalid => UninternedType::Invalid,
+        TypeKind::Null => UninternedType::Null,
+        TypeKind::Interface { decl, args } => UninternedType::Interface {
+            decl,
+            args: table.args(args),
+        },
+        TypeKind::TypeParameter { parameter } => UninternedType::TypeParameter { parameter },
+        TypeKind::Function { .. } | TypeKind::FutureOr { .. } | TypeKind::Record { .. } => {
+            return ty
+        }
+    };
+    table.intern(uninterned, false)
 }

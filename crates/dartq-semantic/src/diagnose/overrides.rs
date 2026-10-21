@@ -4071,7 +4071,7 @@ impl<'a> Engine<'a> {
     /// union — `D?` over the argument `S?` stays `S?`), a named type with
     /// arguments recurses into them (re-interned when any argument
     /// changed), every other shape passes through.
-    fn substitute_ty(&self, ty: Ty, keys: &FxHashMap<StringId, Ty>) -> Ty {
+    pub(crate) fn substitute_ty(&self, ty: Ty, keys: &FxHashMap<StringId, Ty>) -> Ty {
         match ty {
             Ty::Named {
                 name,

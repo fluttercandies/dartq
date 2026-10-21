@@ -46,6 +46,7 @@ pub mod cancel;
 pub mod context;
 mod cycle;
 mod deps;
+mod sdk_units;
 pub mod event;
 pub mod l1;
 pub mod pipeline;
@@ -1209,6 +1210,12 @@ impl Engine {
         if let Some(facts) = self.state.residency.get(&file) {
             return Some(&facts.line_index);
         }
+        // A dependency unit's face: a context message anchors there (an
+        // overridden member declared in a pub-cache file) and the output
+        // writers resolve its line the same way.
+        if let Some(unit) = self.state.deps.units.get(&file) {
+            return Some(&unit.facts.line_index);
+        }
         if let Some((_, index)) = self.state.reported.get(&file) {
             return Some(index);
         }
@@ -1228,6 +1235,9 @@ impl Engine {
     pub fn content(&self, file: FileId) -> Option<&[u8]> {
         if let Some(facts) = self.state.residency.get(&file) {
             return self.state.store.get(facts.content);
+        }
+        if let Some(unit) = self.state.deps.units.get(&file) {
+            return self.state.store.get(unit.facts.content);
         }
         if let Some((text, _)) = self.state.reported.get(&file) {
             return Some(text.as_bytes());

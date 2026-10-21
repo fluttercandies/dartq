@@ -945,6 +945,7 @@ fn foreign_static_call_formals_render_through_the_boundary() {
         true,
         StrictModes::default(),
         &posture,
+        None,
     );
     let recv = Receiver::Container {
         name: strings.intern("A"),
@@ -1141,6 +1142,7 @@ fn boundary_reinterns_foreign_types_and_memoizes_slots() {
         true,
         StrictModes::default(),
         &posture,
+        None,
     );
     // Main's own pool is empty; the foreign `List<int>` field type is
     // the boundary pool's one non-empty slot.

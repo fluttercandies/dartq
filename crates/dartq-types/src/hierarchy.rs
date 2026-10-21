@@ -161,6 +161,22 @@ impl TypeHierarchy {
     }
 }
 
+/// A supertype edge [`TypeHierarchyBuilder::build_lenient`] left out: the
+/// declaration that wrote it, the supertype it named, and why the edge is
+/// not part of the snapshot. The owner's supertype closure is incomplete
+/// from this edge on, which is what a consumer needs to know to keep an
+/// over-report away from it (a subtype question through the missing edge
+/// answers `false`, not "unknown").
+#[derive(Clone, Debug)]
+pub struct DroppedEdge {
+    /// The declaration whose edge was dropped.
+    pub owner: TypeDeclId,
+    /// The supertype the edge named.
+    pub supertype: TypeId,
+    /// The validation failure.
+    pub error: TypeError,
+}
+
 /// Builder for [`TypeHierarchy`]; validates every edge before the snapshot
 /// becomes observable.
 #[derive(Clone, Debug)]
@@ -214,12 +230,42 @@ impl TypeHierarchyBuilder {
     /// [`TypeError::SupertypeNotInterface`], [`TypeError::ObjectSupertype`],
     /// [`TypeError::NullableSupertype`], [`TypeError::ArityMismatch`],
     /// [`TypeError::ForeignTypeParameter`], [`TypeError::CyclicHierarchy`].
+    pub fn build(self, table: &TypeTable) -> Result<TypeHierarchy, TypeError> {
+        self.assemble(table, false).map(|(hierarchy, _)| hierarchy)
+    }
+
+    /// Validates the graph edge by edge and freezes the snapshot, keeping
+    /// every declaration's well-formed edges: a supertype edge that fails
+    /// validation is left out, and a cycle loses the back edge that closes
+    /// it, while the owner keeps its other edges and the implicit `Object`
+    /// edge. A graph assembled from source can carry both (`class A extends
+    /// B {} class B extends A {}`, an `extends List<int, int>`), and the
+    /// official analyzer keeps the rest of the hierarchy usable around them
+    /// — one malformed edge must not blank every other declaration's
+    /// supertype face. The dropped edges' errors come back in encounter
+    /// order.
+    ///
+    /// # Errors
+    /// Only the declaration-level contract violations the builder's caller
+    /// controls: [`TypeError::DuplicateDecl`] and the core declarations'
+    /// [`TypeError::UndeclaredDecl`] / [`TypeError::ArityMismatch`].
+    pub fn build_lenient(
+        self,
+        table: &TypeTable,
+    ) -> Result<(TypeHierarchy, Vec<DroppedEdge>), TypeError> {
+        self.assemble(table, true)
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one long pass mirrors the official hierarchy build; splitting would scatter \
                   the oracle mapping across helpers"
     )]
-    pub fn build(self, table: &TypeTable) -> Result<TypeHierarchy, TypeError> {
+    fn assemble(
+        self,
+        table: &TypeTable,
+        lenient: bool,
+    ) -> Result<(TypeHierarchy, Vec<DroppedEdge>), TypeError> {
         let core = self.core;
         let sealed = self.sealed;
         let mut decls: FxHashMap<TypeDeclId, Vec<TypeParamId>> = FxHashMap::default();
@@ -256,10 +302,18 @@ impl TypeHierarchyBuilder {
             }
         }
 
+        let mut dropped: Vec<DroppedEdge> = Vec::new();
         let mut edges: Vec<(TypeDeclId, TypeDeclId, TypeId)> = Vec::with_capacity(self.edges.len());
         for (owner, supertype) in self.edges {
-            let target = validate_edge(table, &decls, core, owner, supertype)?;
-            edges.push((owner, target, supertype));
+            match validate_edge(table, &decls, core, owner, supertype) {
+                Ok(target) => edges.push((owner, target, supertype)),
+                Err(error) if lenient => dropped.push(DroppedEdge {
+                    owner,
+                    supertype,
+                    error,
+                }),
+                Err(error) => return Err(error),
+            }
         }
 
         // One adjacency index — `owner → positions in `edges`` — built once
@@ -301,7 +355,27 @@ impl TypeHierarchyBuilder {
             "validated edges must keep `Object` uniquely at depth 1 for the LUB rule"
         );
 
-        detect_cycles(&decls, &edges, &adjacency)?;
+        // A back edge closes a cycle: the strict build reports the first,
+        // the lenient build drops every one from its owner's adjacency so
+        // the depth sweep and the supertype faces below see a DAG. The
+        // edge list keeps its positions (adjacency slots index into it);
+        // the dropped slots are skipped wherever the list is read directly.
+        let back = back_edges(&decls, &edges, &adjacency);
+        let mut dropped_slots: FxHashSet<usize> = FxHashSet::default();
+        if let Some((_, cycle)) = back.first() {
+            if !lenient {
+                return Err(TypeError::CyclicHierarchy(cycle.clone()));
+            }
+            dropped_slots.extend(back.iter().map(|&(slot, _)| slot));
+            for slots in adjacency.values_mut() {
+                slots.retain(|slot| !dropped_slots.contains(slot));
+            }
+            dropped.extend(back.into_iter().map(|(slot, cycle)| DroppedEdge {
+                owner: edges[slot].0,
+                supertype: edges[slot].2,
+                error: TypeError::CyclicHierarchy(cycle),
+            }));
+        }
 
         let mut infos: FxHashMap<TypeDeclId, DeclInfo> = FxHashMap::default();
         for (decl, params) in &decls {
@@ -340,24 +414,30 @@ impl TypeHierarchyBuilder {
         // — the exhaustiveness checker's expansion roots. Insertion order is
         // declaration order of the edges, which is the witness-choice order.
         let mut subclasses: FxHashMap<TypeDeclId, Vec<TypeDeclId>> = FxHashMap::default();
-        for &(owner, target, _) in &edges {
+        for (slot, &(owner, target, _)) in edges.iter().enumerate() {
+            if dropped_slots.contains(&slot) {
+                continue;
+            }
             if sealed.contains(&target) || enum_constants.contains_key(&target) {
                 subclasses.entry(target).or_default().push(owner);
             }
         }
-        Ok(TypeHierarchy {
-            core,
-            decls: infos,
-            sentinels: Sentinels {
-                object_none,
-                object_question,
-                null,
+        Ok((
+            TypeHierarchy {
+                core,
+                decls: infos,
+                sentinels: Sentinels {
+                    object_none,
+                    object_question,
+                    null,
+                },
+                depths,
+                sealed: sealed.into_iter().collect(),
+                enum_constants,
+                subclasses,
             },
-            depths,
-            sealed: sealed.into_iter().collect(),
-            enum_constants,
-            subclasses,
-        })
+            dropped,
+        ))
     }
 }
 
@@ -378,14 +458,18 @@ fn class_depths(
     adjacency: &FxHashMap<TypeDeclId, Vec<usize>>,
 ) -> FxHashMap<TypeDeclId, u32> {
     // Unresolved supertypes per owner, and the reverse adjacency that
-    // releases an owner each time one of its supertypes resolves.
+    // releases an owner each time one of its supertypes resolves. Both
+    // read the adjacency (the live edge set) — a slot the lenient build
+    // dropped must neither count as pending nor release its owner.
     let mut waiting: FxHashMap<TypeDeclId, usize> = decls
         .keys()
         .map(|&decl| (decl, adjacency.get(&decl).map_or(0, Vec::len)))
         .collect();
     let mut owners_of: FxHashMap<TypeDeclId, Vec<TypeDeclId>> = FxHashMap::default();
-    for &(owner, target, _) in edges {
-        owners_of.entry(target).or_default().push(owner);
+    for (&owner, slots) in adjacency {
+        for &slot in slots {
+            owners_of.entry(edges[slot].1).or_default().push(owner);
+        }
     }
 
     let mut depths: FxHashMap<TypeDeclId, u32> =
@@ -474,19 +558,23 @@ enum Visit {
     Done,
 }
 
-/// Depth-first cycle detection over the declaration graph, on an explicit
-/// `(declaration, next-edge)` frame stack: the `Unvisited`/`InProgress`/
-/// `Done` coloring and the reported cycle path are exactly the recursive
-/// form's, but the walk cannot overflow the thread stack on deep-but-valid
-/// hierarchies — the same guarantee the Kahn sweep in [`class_depths`] was
-/// built for.
-fn detect_cycles(
+/// Depth-first back-edge detection over the declaration graph, on an
+/// explicit `(declaration, next-edge)` frame stack: the `Unvisited`/
+/// `InProgress`/`Done` coloring and the reported cycle paths are exactly
+/// the recursive form's, but the walk cannot overflow the thread stack on
+/// deep-but-valid hierarchies — the same guarantee the Kahn sweep in
+/// [`class_depths`] was built for. Every back edge comes back as its
+/// adjacency slot plus the path slice that closes it, in encounter order;
+/// removing exactly those slots leaves a DAG (a DFS forest minus its back
+/// edges is acyclic), which is what the lenient build does.
+fn back_edges(
     decls: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
     edges: &[(TypeDeclId, TypeDeclId, TypeId)],
     adjacency: &FxHashMap<TypeDeclId, Vec<usize>>,
-) -> Result<(), TypeError> {
+) -> Vec<(usize, Vec<TypeDeclId>)> {
     let mut state: FxHashMap<TypeDeclId, Visit> =
         decls.keys().map(|&decl| (decl, Visit::Unvisited)).collect();
+    let mut back: Vec<(usize, Vec<TypeDeclId>)> = Vec::new();
     // The DFS path, as frames of (declaration, index of the next unexplored
     // supertype edge).
     let mut path: Vec<TypeDeclId> = Vec::new();
@@ -513,14 +601,15 @@ fn detect_cycles(
             match state[&target] {
                 Visit::Done => {}
                 Visit::InProgress => {
-                    // A back edge: report the path slice that closes it.
+                    // A back edge: record the path slice that closes it and
+                    // walk on without descending.
                     let start = path
                         .iter()
                         .position(|&d| d == target)
                         .expect("in-progress node is on the path");
                     let mut cycle: Vec<TypeDeclId> = path[start..].to_vec();
                     cycle.push(target);
-                    return Err(TypeError::CyclicHierarchy(cycle));
+                    back.push((slot, cycle));
                 }
                 Visit::Unvisited => {
                     state.insert(target, Visit::InProgress);
@@ -530,7 +619,7 @@ fn detect_cycles(
             }
         }
     }
-    Ok(())
+    back
 }
 
 #[cfg(test)]

@@ -255,8 +255,10 @@ fn well_typed_operand_keeps_the_undefined_argument_test_live() {
 // —— G8: the identical-null condition fold —————————————————————————————
 
 /// `identical(v, null)` on a non-nullable `v` folds constant-false: the
-/// then branch reports `dead_code` at its first statement (probe p8 case
-/// `a`; the census's html `dom.dart:446` ternary shares the verdict).
+/// then branch reports `dead_code` spanning the whole block statement
+/// (probed 3.13.1: `DEAD_CODE` at the `{`, length 24 — the oracle's
+/// `_verifyStatement` anchors the block, not its first statement; the
+/// census's html `dom.dart:446` ternary shares the verdict).
 #[test]
 fn identical_null_on_non_nullable_deads_the_then() {
     let source = concat!(
@@ -267,10 +269,10 @@ fn identical_null_on_non_nullable_deads_the_then() {
         "}\n",
     );
     let report = report_ops(source);
-    let then_start = source.find("print('dead')").unwrap() as u32;
+    let then_block = source.find("{\n    print('dead')").unwrap() as u32;
     let dead = rows(&report, "dead_code");
     assert!(
-        dead.iter().any(|&(offset, _)| offset >= then_start),
+        dead.iter().any(|&(offset, _)| offset == then_block),
         "the then branch of identical(v, null) is dead: {:?}",
         report.diagnostics
     );
@@ -288,10 +290,10 @@ fn identical_null_swapped_arguments_deads_the_then() {
         "}\n",
     );
     let report = report_ops(source);
-    let then_start = source.find("print('dead')").unwrap() as u32;
+    let then_block = source.find("{\n    print('dead')").unwrap() as u32;
     let dead = rows(&report, "dead_code");
     assert!(
-        dead.iter().any(|&(offset, _)| offset >= then_start),
+        dead.iter().any(|&(offset, _)| offset == then_block),
         "the then branch of identical(null, v) is dead: {:?}",
         report.diagnostics
     );
