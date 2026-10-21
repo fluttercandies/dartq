@@ -81,7 +81,17 @@ impl PackageConfig {
     /// # Errors
     ///
     /// Returns [`PubError::PackageConfig`] for invalid JSON, a
-    /// `configVersion` other than `2`, or malformed entries.
+    /// `configVersion` other than `2`, malformed entries, or a repeated
+    /// package name. Every one of these is a whole-config defect: the
+    /// oracle's loader (`PackageConfig.parseString` under the catching
+    /// `parsePackageConfigJsonFile`) throws on the first one and degrades
+    /// to a silent `Packages.empty` — valid siblings do NOT survive
+    /// (mixed-entry probes #2434: a bad name, a duplicate name, a missing
+    /// `rootUri`, or a typed-null `packageUri`/`languageVersion` floor the
+    /// good entries along with the bad one). Only entry-level content the
+    /// oracle never validates — percent-escape spellings, `file:` URL
+    /// authorities, the free-form `generator` fields — resolves entry by
+    /// entry; those shapes are consumed, not rejected, here as well.
     pub fn parse(json: &str) -> Result<PackageConfig, PubError> {
         let invalid = |what: String| PubError::PackageConfig(what);
         let root: serde_json::Value =
@@ -108,41 +118,32 @@ impl PackageConfig {
         let mut seen_names = BTreeSet::new();
         for entry in packages_raw {
             let entry = parse_entry(entry)?;
-            // A repeated name folds to its first entry: the reader parses
-            // every entry as written and the duplicate disposition skips the
-            // later one (package_config-3.0.0 `package_config.dart:624-633`,
-            // `_validatePackages`'s `onError` + `continue`). The oracle never
-            // surfaces a repeated name as a diagnostic — its loader catch
-            // degrades any parse-stage verdict to a silent `Packages.empty`
-            // floor (upstream Dart SDK source,
-            // pkg/analyzer/lib/src/context/packages.dart `parsePackageConfigJsonFile`)
-            // — and pub's writer cannot produce one, so the fold keeps the
-            // config usable as written instead of refusing the resolution.
-            if seen_names.insert(entry.name.clone()) {
-                packages.push(entry);
+            // A repeated name floors the whole config: `_validatePackages`
+            // reports the duplicate through `onError` and the analyzer's
+            // default handler throws (the loop's `continue` never runs) —
+            // the loader catch turns that into a silent `Packages.empty`
+            // (mixed-entry probe #2434: two entries sharing a name, with
+            // distinct resolvable roots, leave BOTH unresolved).
+            if !seen_names.insert(entry.name.clone()) {
+                return Err(invalid(format!("duplicate package name `{}`", entry.name)));
             }
+            packages.push(entry);
         }
 
+        // The generator fields are free-form: the oracle's parse reads only
+        // `configVersion` and `packages` as schema, everything else rides
+        // `extraData` unvalidated (probed #2434: `generator: 123` and
+        // `generatorVersion: "garbage"` resolve fine). dartq keeps the
+        // typed faces for well-formed values — the freshness face compares
+        // `generatorVersion` against the running SDK — and reads any other
+        // JSON shape as absent rather than rejecting the config.
         let generator = match root.get("generator") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(value) => Some(
-                value
-                    .as_str()
-                    .ok_or_else(|| invalid("generator must be a string, if given".into()))?
-                    .to_owned(),
-            ),
+            Some(serde_json::Value::String(text)) => Some(text.clone()),
+            _ => None,
         };
         let generator_version = match root.get("generatorVersion") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(raw) => {
-                let text = raw
-                    .as_str()
-                    .ok_or_else(|| invalid("generatorVersion must be a string, if given".into()))?;
-                Some(
-                    Version::parse(text)
-                        .map_err(|e| PubError::PackageConfig(format!("generatorVersion: {e}")))?,
-                )
-            }
+            Some(serde_json::Value::String(text)) => Version::parse(text).ok(),
+            _ => None,
         };
 
         let additional_properties = root
@@ -161,8 +162,9 @@ impl PackageConfig {
 
     /// Looks an entry up by package name.
     ///
-    /// Names are unique: [`Self::parse`] folds repeated names to their
-    /// first entry, so the lookup answers with the one effective entry.
+    /// Names are unique: [`Self::parse`] rejects a repeated name outright
+    /// (the oracle floors such a config), so the lookup answers with the
+    /// one effective entry.
     #[must_use]
     pub fn entry(&self, name: &str) -> Option<&PackageConfigEntry> {
         self.packages.iter().find(|entry| entry.name == name)
@@ -179,7 +181,7 @@ impl PackageConfig {
         if !rest.starts_with('/') {
             return None;
         }
-        percent_decode(rest).ok().map(PathBuf::from)
+        Some(PathBuf::from(percent_decode(rest)))
     }
 }
 
@@ -205,45 +207,56 @@ impl PackageConfigEntry {
 
     /// Resolves `rootUri` against `config_dir`, the directory holding
     /// `package_config.json` (normally `.dart_tool/`). Works for absolute
-    /// `file:` URIs — `file:///abs` (the only shape pub writes) and the
-    /// single-slash `file:/abs`, which Dart's `Uri.parse` + `toFilePath`
-    /// both read as `/abs`, with or without a trailing slash (hosted cache
-    /// dirs have none, git checkouts do) — and relative URI paths.
+    /// `file:` URIs — `file:///abs` (the only shape pub writes), the
+    /// single-slash `file:/abs`, and `file://host/abs` whose authority the
+    /// oracle's path face ignores (probed #2434: the entry resolves at
+    /// `/cache/a`) — and relative URI paths, with or without a trailing
+    /// slash (hosted cache dirs have none, git checkouts do).
+    ///
+    /// Percent escapes decode into the path text (`%20` → space, and a
+    /// `%2F` → a real separator, both oracle-probed); a `%` with no two hex
+    /// digits after it stays a literal `%` (the oracle's `Uri.parse`
+    /// re-encodes the bare `%` as `%25` and the path face decodes that
+    /// back, so `../x%zz` resolves the directory literally named `x%zz`).
     ///
     /// The result is only lexically joined; callers that need a canonical
     /// filesystem path should canonicalize it themselves.
     ///
     /// # Errors
     ///
-    /// Returns [`PubError::PackageConfig`] for unsupported (non-`file`)
-    /// URI schemes, a non-empty `file:` authority, or malformed escapes.
+    /// Returns [`PubError::PackageConfig`] for a non-`file` absolute URI
+    /// scheme. The oracle crashes its own analysis server on that shape
+    /// (`fileUriToNormalizedPath`: `Uri http://... must have scheme
+    /// 'file:'` — probed #2434), an unmatchable failure; dartq's
+    /// structured error keeps the corrupt-config silent floor instead.
     pub fn resolve_root(&self, config_dir: &Path) -> Result<PathBuf, PubError> {
         let uri = &self.root_uri;
         if let Some(rest) = uri.strip_prefix("file:") {
-            if let Some(path) = rest.strip_prefix("//") {
-                // `file:///abs/path` — everything after `file://` is the
-                // absolute path (empty authority, the only shape pub
-                // writes); non-empty authorities (`file://host/...`) are
-                // unsupported.
-                if !path.starts_with('/') {
-                    return Err(PubError::PackageConfig(format!(
-                        "unsupported file URI authority `{uri}`"
-                    )));
-                }
-                return Ok(PathBuf::from(percent_decode(path)?));
+            if let Some(after_authority) = rest.strip_prefix("//") {
+                // `file:///abs/path` and `file://host/abs/path` alike: the
+                // path is everything from the first `/` — an authority is
+                // not part of the filesystem path (the oracle's
+                // `PosixStyle.pathFromUri` reads `uri.path` only). An
+                // authority with no path (`file://host`) names the root.
+                let path = after_authority
+                    .find('/')
+                    .map_or("/", |index| &after_authority[index..]);
+                return Ok(PathBuf::from(percent_decode(path)));
             }
-            // The single-slash absolute form `file:/abs`; require the
-            // leading `/`, anything else falls through to the relative
-            // branch below.
+            // The single-slash absolute form `file:/abs` (the leading `/`
+            // stays part of the path); a `file:relative` reference falls
+            // through and resolves against the config directory like any
+            // relative path.
             if rest.starts_with('/') {
-                return Ok(PathBuf::from(percent_decode(rest)?));
+                return Ok(PathBuf::from(percent_decode(rest)));
             }
+            return Ok(config_dir.join(percent_decode(rest)));
         } else if self.is_absolute_uri() {
             return Err(PubError::PackageConfig(format!(
                 "unsupported rootUri scheme `{uri}`"
             )));
         }
-        Ok(config_dir.join(percent_decode(uri)?))
+        Ok(config_dir.join(percent_decode(uri)))
     }
 }
 
@@ -282,9 +295,9 @@ impl PackageConfig {
     ///   normalization a `../lib` spelling escapes and is rejected loudly
     ///   instead of silently mis-resolving.
     ///
-    /// - **Names are already unique here** — [`Self::parse`] folds repeated
-    ///   names to their first entry, so a later duplicate cannot reach the
-    ///   resolution.
+    /// - **Names are already unique here** — [`Self::parse`] rejects a
+    ///   repeated name outright (the oracle floors such a config), so no
+    ///   duplicate reaches the resolution.
     ///
     /// `config_dir` must be absolute — the engine's assembly step passes the
     /// absolute `.dart_tool/` directory, and a relative one would silently
@@ -377,9 +390,14 @@ fn parse_entry(entry: &serde_json::Value) -> Result<PackageConfigEntry, PubError
     // slash; absent `packageUri` stays `None` so `resolve` can anchor the
     // source root at `rootUri` itself — the oracle's reader contract
     // (package_config_json.dart:151-155), not the `lib/` default pub's
-    // writer emits.
+    // writer emits. A typed null is NOT absent: the oracle's `checkType`
+    // rejects a JSON `null` where a string is due and the loader floors
+    // (probed #2434), so both fields error here.
     let package_uri = match object.get("packageUri") {
-        None | Some(serde_json::Value::Null) => None,
+        None => None,
+        Some(serde_json::Value::Null) => {
+            return Err(invalid("packageUri must be a string, if given".into()));
+        }
         Some(value) => {
             let text = value
                 .as_str()
@@ -393,7 +411,12 @@ fn parse_entry(entry: &serde_json::Value) -> Result<PackageConfigEntry, PubError
     };
 
     let language_version = match object.get("languageVersion") {
-        None | Some(serde_json::Value::Null) => None,
+        None => None,
+        Some(serde_json::Value::Null) => {
+            return Err(invalid(format!(
+                "package `{name}` languageVersion must be a string"
+            )));
+        }
         Some(value) => {
             let text = value.as_str().ok_or_else(|| {
                 invalid(format!("package `{name}` languageVersion must be a string"))
@@ -424,32 +447,42 @@ fn parse_entry(entry: &serde_json::Value) -> Result<PackageConfigEntry, PubError
     })
 }
 
-/// Decodes `%XX` escapes into a UTF-8 string (URIs carry percent-encoded
-/// paths, e.g. spaces as `%20`).
-fn percent_decode(text: &str) -> Result<String, PubError> {
+/// Decodes `%XX` escapes into the path text they name (URIs carry
+/// percent-encoded paths, e.g. spaces as `%20`). A `%` with no two hex
+/// digits after it stays a literal `%` — the oracle's `Uri.parse` re-encodes
+/// a bare `%` as `%25` and its path face decodes that back, so the net
+/// meaning of `x%zz` is the literal directory name `x%zz` (probed #2434).
+/// Bytes that do not form UTF-8 become `U+FFFD`, the way Dart's
+/// `decodeComponent` yields a String for any input.
+fn percent_decode(text: &str) -> String {
     if !text.contains('%') {
-        return Ok(text.to_owned());
+        return text.to_owned();
     }
     let bytes = text.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let hex = bytes
-                .get(index + 1..index + 3)
-                .and_then(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok());
-            let byte = hex.ok_or_else(|| {
-                PubError::PackageConfig(format!("invalid percent escape in `{text}`"))
-            })?;
-            decoded.push(byte);
+        if bytes[index] == b'%'
+            && let (Some(&high), Some(&low)) = (bytes.get(index + 1), bytes.get(index + 2))
+            && let (Some(high), Some(low)) = (hex_nibble(high), hex_nibble(low))
+        {
+            decoded.push((high << 4) | low);
             index += 3;
         } else {
             decoded.push(bytes[index]);
             index += 1;
         }
     }
-    String::from_utf8(decoded)
-        .map_err(|_| PubError::PackageConfig(format!("rootUri is not valid UTF-8: `{text}`")))
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -537,6 +570,61 @@ mod tests {
         assert!(PackageConfig::parse(bad_lv).is_err());
         let no_uri = r#"{"configVersion": 2, "packages": [{"name": "a"}]}"#;
         assert!(PackageConfig::parse(no_uri).is_err());
+        // A typed null is not absence: the oracle's `checkType` rejects a
+        // JSON null where a string is due and the loader floors the whole
+        // config (mixed-entry probe #2434 — the good sibling dies too).
+        let null_uri = r#"{"configVersion": 2, "packages": [{"name": "a", "rootUri": null}]}"#;
+        assert!(PackageConfig::parse(null_uri).is_err());
+        let null_package_uri = r#"{"configVersion": 2, "packages": [
+            {"name": "a", "rootUri": "../", "packageUri": null}]}"#;
+        assert!(PackageConfig::parse(null_package_uri).is_err());
+        let null_language_version = r#"{"configVersion": 2, "packages": [
+            {"name": "a", "rootUri": "../", "languageVersion": null}]}"#;
+        assert!(PackageConfig::parse(null_language_version).is_err());
+    }
+
+    /// A repeated name floors the whole config: `_validatePackages`
+    /// reports the duplicate through `onError` and the analyzer's default
+    /// handler throws — the loader catch degrades to a silent
+    /// `Packages.empty`. Probed #2434 with distinct resolvable roots
+    /// (first-wins folding would have resolved one of them): neither
+    /// resolves.
+    #[test]
+    fn duplicate_names_floor_the_config() {
+        let duplicated = r#"{"configVersion": 2, "packages": [
+            {"name": "app", "rootUri": "../"},
+            {"name": "app", "rootUri": "../other"}]}"#;
+        let error = PackageConfig::parse(duplicated).expect_err("duplicate name");
+        assert!(
+            error.to_string().contains("duplicate package name `app`"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The generator fields are free-form extraData for the oracle (probed
+    /// #2434: `generator: 123` and `generatorVersion: "garbage"` resolve
+    /// fine — its parse validates only `configVersion` and `packages`), so
+    /// any JSON shape is consumed: well-formed values keep the typed faces
+    /// (the freshness comparison), anything else reads as absent.
+    #[test]
+    fn generator_fields_tolerate_any_json() {
+        let garbage = r#"{"configVersion": 2, "generator": 123, "generatorVersion": "garbage",
+            "packages": [{"name": "a", "rootUri": "../"}]}"#;
+        let config = PackageConfig::parse(garbage).expect("tolerated");
+        assert_eq!(config.generator, None);
+        assert_eq!(config.generator_version, None);
+        let well_formed = r#"{"configVersion": 2, "generator": "pub", "generatorVersion": "3.13.1",
+            "packages": []}"#;
+        let config = PackageConfig::parse(well_formed).expect("typed");
+        assert_eq!(config.generator.as_deref(), Some("pub"));
+        assert_eq!(
+            config
+                .generator_version
+                .as_ref()
+                .expect("version")
+                .to_string(),
+            "3.13.1"
+        );
     }
 
     #[test]
@@ -623,7 +711,9 @@ mod tests {
             {"name": "a", "rootUri": "file:///cache/a-1.0.0"}]}"#;
         let config = PackageConfig::parse(hosted).expect("ok");
         assert!(config.packages[0].is_absolute_uri());
-        // file:/// yields an absolute path; a non-empty authority is rejected.
+        // file:/// yields an absolute path; a non-empty authority is
+        // skipped — the oracle's path face reads `uri.path` only (probed
+        // #2434: `file://host/cache/a` resolves at `/cache/a`).
         assert_eq!(
             config.packages[0]
                 .resolve_root(Path::new("/anywhere"))
@@ -633,7 +723,73 @@ mod tests {
         let bad_host = r#"{"configVersion": 2, "packages": [
             {"name": "a", "rootUri": "file://host/cache/a-1.0.0"}]}"#;
         let config = PackageConfig::parse(bad_host).expect("ok");
-        assert!(config.packages[0].resolve_root(Path::new("/p")).is_err());
+        assert_eq!(
+            config.packages[0]
+                .resolve_root(Path::new("/p"))
+                .expect("the authority is ignored"),
+            PathBuf::from("/cache/a-1.0.0")
+        );
+        // An authority with no path names the filesystem root.
+        let bare_host = r#"{"configVersion": 2, "packages": [
+            {"name": "a", "rootUri": "file://host"}]}"#;
+        let config = PackageConfig::parse(bare_host).expect("ok");
+        assert_eq!(
+            config.packages[0]
+                .resolve_root(Path::new("/p"))
+                .expect("ok"),
+            PathBuf::from("/")
+        );
+    }
+
+    /// A `%` with no two hex digits after it is NOT a defect: the oracle's
+    /// `Uri.parse` re-encodes the bare `%` as `%25` and its path face
+    /// decodes that back, so `../x%zz` resolves the directory literally
+    /// named `x%zz` (probed #2434 — the entry survives, valid siblings
+    /// resolve, and a real `x%zz` directory on disk matches). A `%2F`
+    /// decodes into a real path separator, like any escape. Bytes that do
+    /// not form UTF-8 become `U+FFFD`, `decodeComponent`'s face.
+    #[test]
+    fn invalid_escapes_resolve_as_literal_text() {
+        let escaped = r#"{"configVersion": 2, "packages": [
+            {"name": "esc", "rootUri": "../x%zz"}]}"#;
+        let config = PackageConfig::parse(escaped).expect("the escape is not a defect");
+        assert_eq!(
+            config.packages[0]
+                .resolve_root(Path::new("/p/.dart_tool"))
+                .expect("ok"),
+            PathBuf::from("/p/.dart_tool/../x%zz")
+        );
+        // Truncated escape: same literal face.
+        let truncated = r#"{"configVersion": 2, "packages": [
+            {"name": "esc", "rootUri": "../x%2"}]}"#;
+        let config = PackageConfig::parse(truncated).expect("ok");
+        assert_eq!(
+            config.packages[0]
+                .resolve_root(Path::new("/p/.dart_tool"))
+                .expect("ok"),
+            PathBuf::from("/p/.dart_tool/../x%2")
+        );
+        // Valid escapes keep decoding, `%2F` included — a real separator
+        // (oracle-probed: the entry resolves into the split directory).
+        let slash = r#"{"configVersion": 2, "packages": [
+            {"name": "esc", "rootUri": "../x%2Fsub"}]}"#;
+        let config = PackageConfig::parse(slash).expect("ok");
+        assert_eq!(
+            config.packages[0]
+                .resolve_root(Path::new("/p/.dart_tool"))
+                .expect("ok"),
+            PathBuf::from("/p/.dart_tool/../x/sub")
+        );
+        // Invalid UTF-8 escapes degrade to `U+FFFD`, never an error.
+        let binary = r#"{"configVersion": 2, "packages": [
+            {"name": "esc", "rootUri": "../x%FF"}]}"#;
+        let config = PackageConfig::parse(binary).expect("ok");
+        assert_eq!(
+            config.packages[0]
+                .resolve_root(Path::new("/p/.dart_tool"))
+                .expect("ok"),
+            PathBuf::from("/p/.dart_tool/../x\u{fffd}")
+        );
     }
 
     #[test]
@@ -664,7 +820,12 @@ mod tests {
         let bad_host = r#"{"configVersion": 2, "packages": [
             {"name": "a", "rootUri": "file://host/cache/a-1.0.0"}]}"#;
         let config = PackageConfig::parse(bad_host).expect("ok");
-        assert!(config.packages[0].resolve_root(Path::new("/p")).is_err());
+        assert_eq!(
+            config.packages[0]
+                .resolve_root(Path::new("/p"))
+                .expect("the authority is ignored"),
+            PathBuf::from("/cache/a-1.0.0")
+        );
     }
 
     #[test]
@@ -742,28 +903,6 @@ mod tests {
         assert_eq!(resolved[0].lib_dir, PathBuf::from("/proj"));
         assert_eq!(resolved[1].root, PathBuf::from("/proj/deps/dep"));
         assert_eq!(resolved[1].lib_dir, PathBuf::from("/proj/deps/dep/src"));
-    }
-
-    #[test]
-    fn duplicate_names_keep_the_first_entry() {
-        // A repeated name folds to its first entry: the reader parses every
-        // entry as written and the duplicate disposition skips the later one
-        // (package_config-3.0.0 `package_config.dart:624-633`). The oracle
-        // never surfaces a repeated name as a diagnostic (its
-        // packages.dart:28-37 face degrades parse-stage verdicts silently),
-        // and pub's writer cannot produce one.
-        let duplicated = r#"{"configVersion": 2, "packages": [
-            {"name": "app", "rootUri": "../"},
-            {"name": "app", "rootUri": "../other"}]}"#;
-        let config = PackageConfig::parse(duplicated).expect("parses with the fold");
-        assert_eq!(config.packages.len(), 1, "the later duplicate is skipped");
-        assert_eq!(config.packages[0].root_uri, "../");
-
-        let resolved = config
-            .resolve(Path::new("/proj/.dart_tool"))
-            .expect("the folded config resolves");
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].root, PathBuf::from("/proj"));
     }
 
     #[test]

@@ -1961,21 +1961,17 @@ mod tests {
         }
     }
 
-    /// Duplicate package names resolve through the FIRST entry: the parse
-    /// layer dedups repeated names to their first entry (package_config's
-    /// package-table builder, package_config_impl.dart:86-92; the oracle
-    /// never surfaces a repeated name as a diagnostic — its packages.dart
-    /// face turns parse errors into a silent `Packages.empty` floor and
-    /// keeps analyzing), so the resolution stays usable as written: the
-    /// effective config holds one entry per name, the table attributes the
-    /// self package at the first entry's root, and no advisory fires.
+    /// Duplicate package names floor the whole config: the oracle's
+    /// package-table builder reports the duplicate through `onError` and
+    /// the analyzer's default handler throws, so the loader catch degrades
+    /// to a silent `Packages.empty` — valid siblings do NOT survive
+    /// (#2434 mixed-entry probe: two entries sharing a name, with distinct
+    /// resolvable roots, leave BOTH unresolved). The assembly takes the
+    /// advisory-less corrupt floor: self package only, every `package:`
+    /// import unresolved, zero rows for the config face.
     #[test]
-    fn duplicate_config_names_resolve_to_the_first_entry() {
+    fn duplicate_config_names_floor_the_config() {
         let root = workspace("ws_dupes", &[]);
-        // The two spellings differ so first-vs-last wins is observable: the
-        // effective entry resolves at `../` (the workspace root), and a
-        // kept-later `../elsewhere` — a root with no pubspec — would fail
-        // the assembly or shift the attribution instead of passing here.
         fs::write(
             root.join(".dart_tool/package_config.json"),
             r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}, {"name": "fixture", "rootUri": "../elsewhere", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
@@ -1984,30 +1980,81 @@ mod tests {
 
         let root = root.canonicalize().expect("root");
         let (config, _, advisory) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
-            .expect("duplicate names dedup, the resolution stays usable");
+            .expect("duplicate names degrade, never refuse (Packages.empty)");
+        assert!(
+            config.pub_config.packages.is_empty(),
+            "the Packages.empty floor"
+        );
+        assert_eq!(config.packages.len(), 1, "the self package stays");
+        assert!(config.packages.get("fixture").is_some());
+        assert!(
+            advisory.is_none(),
+            "zero rows for the config face, got {advisory:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// An entry-level percent-escape oddity is NOT a config defect: the
+    /// oracle's `Uri.parse` re-encodes a bare `%` as `%25` and its path
+    /// face decodes that back, so `../x%zz` resolves the directory
+    /// literally named `x%zz`, and the entry's valid siblings resolve
+    /// alongside it (#2434 probes v1/v2: the bare-`%` spelling and the
+    /// re-encoded `%25` spelling produce identical output). The assembly
+    /// keeps both entries and the table maps the escape package into the
+    /// literal directory — exactly where the oracle looks.
+    #[test]
+    fn invalid_escape_entry_resolves_to_its_literal_directory() {
+        let root = workspace("ws_escape", &[]);
+        // The literal-`%` sibling the escape decodes to, with a pubspec so
+        // the freshness face stays quiet.
+        fs::create_dir_all(root.join("weird%zz")).expect("escape target dir");
+        fs::write(
+            root.join("weird%zz/pubspec.yaml"),
+            "name: esc\nversion: 0.1.0\n",
+        )
+        .expect("escape target pubspec");
+        fs::write(
+            root.join(".dart_tool/package_config.json"),
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "languageVersion": "3.5"}, {"name": "esc", "rootUri": "../weird%zz", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
+        )
+        .expect("escape config");
+        let old = FileTime::from_unix_time(1_000, 0);
+        set_file_mtime(root.join("pubspec.yaml"), old).expect("set mtime");
+        set_file_mtime(root.join("pubspec.lock"), old).expect("set mtime");
+        set_file_mtime(
+            root.join(".dart_tool/package_config.json"),
+            FileTime::from_unix_time(3_000, 0),
+        )
+        .expect("set mtime");
+
+        let root = root.canonicalize().expect("root");
+        let (config, _, advisory) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
+            .expect("the escape entry survives, siblings resolve");
         assert_eq!(
             config.pub_config.packages.len(),
-            1,
-            "the later duplicate is skipped"
+            2,
+            "both entries stay in the table"
         );
-        assert_eq!(config.pub_config.packages[0].name, "fixture");
+        let config_dir = root.join(".dart_tool");
+        let escape_root = config
+            .pub_config
+            .entry("esc")
+            .expect("escape entry")
+            .resolve_root(&config_dir)
+            .expect("escapes resolve");
         assert_eq!(
-            config.pub_config.packages[0].root_uri, "../",
-            "first wins"
+            normalize(&escape_root),
+            root.join("weird%zz"),
+            "the literal-`%` directory is the escape's root"
         );
-        assert_eq!(
-            config.packages.len(),
-            1,
-            "the deduped entry is the self package"
-        );
-        let identity = config.packages.get("fixture").expect("self package");
-        assert_eq!(
-            identity.root, root,
-            "the first entry's rootUri is the effective root"
+        assert!(
+            config.packages.get("fixture").is_some(),
+            "the good sibling's attribution survives"
         );
         assert!(
             advisory.is_none(),
-            "a repeated name is not a defect: {advisory:?}"
+            "an escape spelling is not a defect: {advisory:?}"
         );
 
         fs::remove_dir_all(&root).ok();
