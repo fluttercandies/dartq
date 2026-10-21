@@ -47,6 +47,7 @@ pub(crate) const SDK_FACES_EXTRA: &[(&str, &[&str])] = &[(
         "timeout",
         "toList",
         "toSet",
+        "transform",
         "where",
     ],
 )];
@@ -1773,6 +1774,43 @@ impl<'a> Engine<'a> {
             if row.name == self.intern("==") || self.members.object_members.contains(&row.name) {
                 return;
             }
+            // The `on`-face consult the plain tail runs (`this`'s static
+            // type inside a mixin or extension body is the constraint /
+            // extended type): the operator-merged row owes it too —
+            // `this.offset + 1` inside `extension E on C` resolves `offset`
+            // through C's face, never through the extension's member table.
+            // A resolvable member suppresses; an undecidable face (a frozen
+            // `Unknown` — the on-name the diagnosing scope cannot name is
+            // the oracle's `InvalidType` extendedType) silences the miss
+            // the same; only a decidable `Absent` reports below, naming the
+            // `on` type.
+            let mut report_on = container;
+            if let Some(kind) = self.container_kind_of(container)
+                && matches!(kind, ContainerKind::Mixin | ContainerKind::Extension)
+            {
+                if !matches!(self.on_face_walk(container, kind, row.name), Walk::Missing) {
+                    self.record_miss(row.name, row.range, true, NameUse::Read);
+                    return;
+                }
+                if kind == ContainerKind::Extension && matches!(recv, Receiver::This { .. }) {
+                    match self.enclosing_extension_on_type(container) {
+                        Some(on) => {
+                            if !matches!(
+                                self.frozen_member_verdict(on, row.name),
+                                FrozenFace::Absent
+                            ) {
+                                self.record_miss(row.name, row.range, true, NameUse::Read);
+                                return;
+                            }
+                            report_on = on;
+                        }
+                        None => {
+                            self.record_miss(row.name, row.range, true, NameUse::Read);
+                            return;
+                        }
+                    }
+                }
+            }
             match self.walk_members(container, row.name) {
                 Walk::Found(entry) => {
                     let ty = Self::member_result_ty(&entry);
@@ -1787,7 +1825,7 @@ impl<'a> Engine<'a> {
                 // unchecked-access code on a merely-nullable receiver — and
                 // a genuinely unindexed declaration keeps the under-report.
                 Walk::ChainBroken => {
-                    match self.frozen_member_verdict(container, row.name) {
+                    match self.frozen_member_verdict(report_on, row.name) {
                         FrozenFace::Absent => {
                             let name_text = self.strings.resolve(row.name);
                             if receiver_nullable {
@@ -1797,7 +1835,7 @@ impl<'a> Engine<'a> {
                                     name_text,
                                 );
                             } else {
-                                let type_text = self.strings.resolve(container).to_string();
+                                let type_text = self.strings.resolve(report_on).to_string();
                                 self.emit(
                                     SemanticCode::UndefinedGetter,
                                     row.range,
@@ -1820,7 +1858,7 @@ impl<'a> Engine<'a> {
                             name_text,
                         );
                     } else {
-                        let type_text = self.strings.resolve(container).to_string();
+                        let type_text = self.strings.resolve(report_on).to_string();
                         self.emit(
                             SemanticCode::UndefinedGetter,
                             row.range,
@@ -2129,15 +2167,23 @@ impl<'a> Engine<'a> {
                         // the extension applies to a receiver whose
                         // interface carries the member. A miss names the
                         // `on` type in the report below (the climb anchors
-                        // at the on-name itself).
-                        if matches!(
-                            self.frozen_member_verdict(on, row.name),
-                            FrozenFace::Defined
-                        ) {
-                            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
-                            return;
+                        // at the on-name itself). A face the verdict
+                        // cannot decide keeps the record-only posture: the
+                        // on-name itself is the oracle's unresolvable
+                        // extended type (`InvalidType`), whose member
+                        // misses stay silent.
+                        match self.frozen_member_verdict(on, row.name) {
+                            FrozenFace::Defined | FrozenFace::Unknown => {
+                                self.record_miss(
+                                    row.name,
+                                    row.range,
+                                    true,
+                                    use_kind_of(&row.intent),
+                                );
+                                return;
+                            }
+                            FrozenFace::Absent => report_on = on,
                         }
-                        report_on = on;
                     }
                     // The on-name never resolved — nothing honest names the
                     // report, so the record-only posture holds here too.

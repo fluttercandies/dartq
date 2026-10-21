@@ -3865,6 +3865,15 @@ mod ticket_2447_tests;
 #[cfg(test)]
 mod ticket_2449_tests;
 
+/// The #2442 pins: the analyzer-census member-resolution false-positive
+/// family — an extension `this` whose `on` name is the oracle's
+/// `InvalidType` (unresolvable through a broken export) stays silent on
+/// every member face; `Stream.transform` rides the frozen `dart:async`
+/// face; and the operator-merged row runs the same on-face union the
+/// plain tail does, naming the `on` type on a decidable miss.
+#[cfg(test)]
+mod ticket_2442_tests;
+
 /// The #2458 pins: comment trivia between the last literal element and
 /// the closing `}` is no element — a comment-only leaf segment no longer
 /// flips a context-less all-entry literal to
@@ -3898,3 +3907,5 @@ mod ticket_2448_tests;
 /// unchecked row the oracle emits.
 #[cfg(test)]
 mod ticket_2451_tests;
+
+mod ticket_2460_tests;
