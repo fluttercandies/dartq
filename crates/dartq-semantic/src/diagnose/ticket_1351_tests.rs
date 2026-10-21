@@ -309,6 +309,41 @@ fn promoted_matched_type_redecides_constant_pattern() {
     );
 }
 
+/// Every head of a shared-body group re-decides against the promoted
+/// match on its own anchor: the clause anchor latches at the head's
+/// opening (`begin_case_expression`), so `case 'a': case 'b':` carries
+/// two candidates, each keyed to its own `case` keyword and each
+/// reported at its constant (probe: `dart analyze` 3.13.1 reports at
+/// both, 1:54 and 1:64).
+#[test]
+fn shared_heads_each_redecide_against_the_promoted_match() {
+    let source = "void f(Object o) { if (o is int) { switch (o) { case 'a': case 'b': break; } } }";
+    let report = unit_report(source);
+    let ats: Vec<u32> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "constant_pattern_never_matches_value_type")
+        .map(|d| d.range.offset)
+        .collect();
+    assert_eq!(ats, [at(source, "'a'"), at(source, "'b'")], "{source}");
+}
+
+/// The `is!`-remainder promotion feeds the same re-decision: the early
+/// return leaves `o` promoted to `int` on the fall-through, so the
+/// switch's matched type is `int` and `'a'` can never equal it (probe:
+/// `dart analyze` 3.13.1 reports once at the constant).
+#[test]
+fn is_not_remainder_promotion_feeds_the_redecision() {
+    let source = "void f(Object o) { if (o is! int) { return; } switch (o) { case 'a': break; } }";
+    let report = unit_report(source);
+    one_at(
+        &report,
+        "constant_pattern_never_matches_value_type",
+        at(source, "'a'"),
+        source,
+    );
+}
+
 // —— Part 4: the #1404 decision-point pins ————————————————————————
 
 /// A property condition operand stages at the member row and the

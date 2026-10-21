@@ -4887,9 +4887,19 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_case_expression(&mut self, case_kw: Token) {
         self.flow().begin_case_expression(case_kw);
 
-        self.engine.switch.case_sink_open = true;
-        if !self.engine.patterns_enabled {
-            self.engine.const_capture.open_constant_pattern();
+        let engine = &mut self.engine;
+        engine.switch.case_sink_open = true;
+        // The clause anchor latches at the HEAD's opening, before its
+        // pattern parses: a constant-pattern candidate inside the head
+        // defers to the teardown join keyed on this anchor (#1351), and
+        // `begin_switch_case` fires only at the case body — after every
+        // head in the group has already been checked (the parser's
+        // `parse_statements_in_switch_case` runs past the head loop).
+        // The token is the same `case` keyword the flow's `MatchedType`
+        // fact anchors at (`end_case_expression`'s `case_kw`).
+        engine.clause_anchor = Some(case_kw.range);
+        if !engine.patterns_enabled {
+            engine.const_capture.open_constant_pattern();
         }
     }
 

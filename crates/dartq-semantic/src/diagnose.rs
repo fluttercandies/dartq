@@ -1653,12 +1653,19 @@ pub fn fold_unit_with_ops<'t>(
         if engine.constant_never_matches(cand.constant, matched) {
             let a0 = engine.ty_display(matched);
             let a1 = engine.ty_display(cand.constant);
-            engine.stage_typed(
-                SemanticCode::ConstantPatternNeverMatchesValueType,
+            // The row stages into the TAKEN report's usage tail: the
+            // engine's own report left with `let mut report` above, so an
+            // `engine.stage_typed` push here would land in the fresh
+            // engine-side usage and never merge (#1351 teardown drop).
+            let code = SemanticCode::ConstantPatternNeverMatchesValueType;
+            report.usage.push(Diagnostic::new(
+                code.severity(),
+                code.code_info(),
+                code.message(&a0, &a1),
+                file,
                 cand.at,
-                &a0,
-                &a1,
-            );
+                code.correction_message(""),
+            ));
         }
     }
     let survivors = engine.filter_staged(&promotions, &condition_types, &prop_promotions);
@@ -3694,6 +3701,7 @@ mod ticket_2422_tests;
 /// class instance silent while an incompatible `call` signature reports.
 #[cfg(test)]
 mod ticket_2425_tests;
+
 
 /// The #2420 pins: the supertype member walk survives the dead supertype
 /// hop — `extends Dead implements Live` still merges the live interface's
