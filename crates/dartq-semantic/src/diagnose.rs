@@ -3685,3 +3685,13 @@ mod ticket_2417_tests;
 /// declaration-initializer, and return faces.
 #[cfg(test)]
 mod ticket_2422_tests;
+
+/// The #2425 pins: the function-involved cross-family assignability face —
+/// `super('x')` against a function-typed formal (foreign or same-file)
+/// reports `argument_type_not_assignable` the way the oracle's
+/// `isAssignableTo` decides it, a function argument against a non-function
+/// formal reports, and the 'call' tearoff arm keeps a compatible callable
+/// class instance silent while an incompatible `call` signature reports.
+#[cfg(test)]
+mod ticket_2425_tests;
+

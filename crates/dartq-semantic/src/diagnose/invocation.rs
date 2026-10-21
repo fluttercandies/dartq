@@ -2115,7 +2115,7 @@ impl<'a> Engine<'a> {
     /// call method's formals, its declared return type, and its own
     /// type-parameter names (the inference parameters a generic
     /// `R call<R>(R x)` solves at the send).
-    fn implicit_call_face(&self, ty: Ty) -> Option<(Formals, Ty, Box<[StringId]>)> {
+    pub(crate) fn implicit_call_face(&self, ty: Ty) -> Option<(Formals, Ty, Box<[StringId]>)> {
         let Ty::Named {
             name: container,
             args: ArgListId::EMPTY,

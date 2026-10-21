@@ -2440,10 +2440,10 @@ impl<'a> Engine<'a> {
         // interface walk cannot relate two alias heads at all. Non-function
         // pairs (and pairs where one side alone unfolds) keep the ordinary
         // paths below, byte-identical.
-        if let (Some(from_fn), Some(to_fn)) =
-            (self.function_shape_sig(from), self.function_shape_sig(to))
-        {
-            return self.fn_sig_subtype(&from_fn, &to_fn);
+        let from_fn = self.function_shape_sig(from);
+        let to_fn = self.function_shape_sig(to);
+        if let (Some(from_fn), Some(to_fn)) = (from_fn.as_ref(), to_fn.as_ref()) {
+            return self.fn_sig_subtype(from_fn, to_fn);
         }
         if let Some(verdict) = to.assignable_from(from) {
             // The strict-casts overlay (`type_system.dart:891-930`: with
@@ -2524,6 +2524,64 @@ impl<'a> Engine<'a> {
             }
             return (!unknown).then_some(true);
         }
+        // The cross-family function face (upstream `isAssignableTo`,
+        // type_system.dart:891-930 — the ask behind
+        // `argument_type_not_assignable`): with a function shape on one
+        // side the pair is decisive, not a blind spot. A function-shaped
+        // source subtypes exactly the `Object` and `Function` heads among
+        // interface targets (subtype.dart's function block, then the
+        // unconditional `return false`); an interface or record source
+        // subtypes a function-shaped target in no case — except the 'call'
+        // tearoff arm (type_system.dart:906-916): a resolved non-nullable
+        // interface source whose `call` method's own signature subtypes
+        // the target assigns (the oracle accepts a callable class instance
+        // where a function type is expected). Heads the index cannot
+        // resolve are `InvalidType` upstream (accepted silently) and keep
+        // the under-report `None`; the bare `Function`-head context stays
+        // with the ordinary named path below.
+        if let Some(to_fn) = to_fn.as_ref() {
+            return match from {
+                Ty::Named {
+                    name,
+                    nullable: false,
+                    args,
+                } => self.call_method_assignable(name, args, to_fn),
+                // A record source subtypes a function target in no case
+                // (subtype.dart's record block falls to the same
+                // `return false`).
+                Ty::Record { .. } => Some(false),
+                _ => None,
+            };
+        }
+        if from_fn.is_some() {
+            return match to {
+                Ty::Named {
+                    name,
+                    nullable: false,
+                    ..
+                } => {
+                    if name == self.intern("Object") || name == self.intern("Function") {
+                        Some(true)
+                    } else if self.members.primitive_ids.contains(&name)
+                        || resolve_container(
+                            self.graph,
+                            self.namespaces,
+                            self.index,
+                            self.lib,
+                            self.file,
+                            name,
+                        )
+                        .is_some()
+                    {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                }
+                Ty::Record { nullable: false, .. } => Some(false),
+                _ => None,
+            };
+        }
         let (
             Ty::Named {
                 name: from_name,
@@ -2600,6 +2658,66 @@ impl<'a> Engine<'a> {
             return Some(from_literal);
         }
         Some(false)
+    }
+
+    /// The 'call' tearoff arm of the cross-family function face
+    /// (`isAssignableTo`'s callable-class acceptance,
+    /// type_system.dart:906-916): the non-nullable interface head `name`
+    /// is assigned into the function shape `to_fn`. A generic
+    /// instantiation needs the call method's own instantiation
+    /// (under-report); a head the index cannot resolve is `InvalidType`
+    /// upstream (accepted silently, `None`); a resolved head without a
+    /// `call` method is the reportable rejection; the method's own
+    /// signature decides the rest (an incompatible `call` reports, the
+    /// same rejection the bare interface would).
+    fn call_method_assignable(
+        &self,
+        name: StringId,
+        args: ArgListId,
+        to_fn: &FnVarSig,
+    ) -> Option<bool> {
+        if args != ArgListId::EMPTY {
+            return None;
+        }
+        if !self.members.primitive_ids.contains(&name) {
+            resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                name,
+            )?;
+        }
+        let Some((formals, return_ty, params)) =
+            self.implicit_call_face(Ty::Named {
+                name,
+                nullable: false,
+                args,
+            })
+        else {
+            return Some(false);
+        };
+        if !params.is_empty() {
+            // A generic `call` needs the inference the declared facts do
+            // not carry — the under-report direction.
+            return None;
+        }
+        let call_sig = FnVarSig {
+            params: Box::default(),
+            required_positional: u16::try_from(
+                formals.positional.iter().filter(|f| f.required).count(),
+            )
+            .unwrap_or(u16::MAX),
+            positional: formals.positional.iter().map(|f| f.ty).collect(),
+            named: formals
+                .named
+                .iter()
+                .map(|f| (f.name, f.ty, f.required))
+                .collect(),
+            return_ty,
+        };
+        self.fn_sig_subtype(&call_sig, to_fn)
     }
 
     /// The covariant interface rule for one generic head —
