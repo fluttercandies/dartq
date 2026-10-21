@@ -12,7 +12,7 @@
 //! depends on this file's API surface". The daemon passes real before/after
 //! diffs through the same query.
 //!
-//! Output is the frozen JSON contract (`schema_version: 2`; the labels are
+//! Output is the frozen JSON contract (`schema_version: 3`; the labels are
 //! the shared pkg_label projection — a file under a package's `lib` tree
 //! answers its `package:<name>/<path>` form, files outside one keep the
 //! canonical path), schema-valid at birth (the shared core's shaper
@@ -259,7 +259,7 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         // Lib files answer their package-form references (the shared
         // pkg_label projection), ASCII-sorted, hypothetical signature
         // flags.

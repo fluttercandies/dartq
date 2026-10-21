@@ -2469,8 +2469,14 @@ mod tests {
             &["query", "references"][..],
             &["query", "callers"][..],
             &["query", "bogus"][..],
-            &["explain"][..],
+            // `explain` parses bare since the face landed (74e3258a): the
+            // symbol slot is optional and the run tier rejects the
+            // no-selector form — the invalid-value role these lines pin is
+            // the report format's (`--format=machine`; json is the only
+            // spelling) and the required changed-file positional of
+            // `impact` (483a6642).
             &["explain", "--format=machine", "Dog"][..],
+            &["impact"][..],
         ] {
             assert!(parse_args_of(args).is_err(), "must reject {args:?}");
         }
