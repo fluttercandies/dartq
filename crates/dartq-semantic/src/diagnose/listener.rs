@@ -1605,6 +1605,20 @@ impl ParserListener for DiagnoseListener<'_> {
                 && let Some(ty) = engine
                     .initializer_static_ty(&engine.rows[mark])
                     .map(|ty| engine.staged_read_ty(&engine.rows[mark]).unwrap_or(ty))
+                    .or_else(|| {
+                        // The #2481 face: a member read the window's own
+                        // faces leave `Unknown` still owns a static type —
+                        // the accessor's declared return (instance getter)
+                        // or the applied extension face's (the census's
+                        // `var element = elementAnnotation?.element`
+                        // shape), nullable re-armed for a `?.` merge. The
+                        // bind and the flow staging below ride it, so an
+                        // extension use through the inferred local
+                        // resolves and credits.
+                        let row = engine.rows[mark].clone();
+                        let derived = engine.initializer_read_ty(&row);
+                        (derived != Ty::UNKNOWN).then_some(derived)
+                    })
             {
                 engine.bind_var_type(name, ty);
                 // The promotion face rides the flow layer's declared-type

@@ -4464,6 +4464,17 @@ mod ticket_2484_tests;
 #[cfg(test)]
 mod ticket_2489_tests;
 
+/// The #2481 pins: the `var`-inference window's extension-face receiver
+/// typing — a member read the merge-time field face leaves `Unknown`
+/// answers its accessor's declared return (the instance accessor face,
+/// then the applied extension face under the unique-declarer gate), so an
+/// extension use reached through the inferred local credits; the unused
+/// member beside a typed var still reports, the ambiguous two-face
+/// application credits nothing, and the `?.`-merged initializer keeps the
+/// nullable face.
+#[cfg(test)]
+mod ticket_2481_tests;
+
 /// The #2491 pins: a switch-case object pattern's named type never lends
 /// its type-argument group to an older expression's row — the group-close
 /// deferral anchors to a trivia-adjacent head row only, so the pattern's

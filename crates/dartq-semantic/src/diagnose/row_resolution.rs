@@ -1394,6 +1394,102 @@ impl<'a> Engine<'a> {
             .is_some_and(|text| matches!(text, "var" | "final" | "const" | "dynamic" | "void"))
     }
 
+    /// The static type of one receiver EXPRESSION: the flow read-type face
+    /// first (the #2346① leg — a promoted local's read answers at its own
+    /// span), then the chained-member face — a receiver that is itself a
+    /// merged member read (`e.supertype.m`'s `e.supertype`, `a.b.c`'s
+    /// `a.b`) owns the accessor's declared return even when the merge froze
+    /// the leaf's receiver `Unknown` because the predecessor hop resolved
+    /// on the declared (unpromoted) receiver type. The merge records the
+    /// receiver's span as the receiver ROW's own range — for a chained
+    /// member node that is the node's member token — so the chain leg
+    /// matches the node's staged read record by its token's end and
+    /// re-derives its receiver through this same face
+    /// ([`Self::receiver_static_ty`] then answers getters, fields, and
+    /// invocation returns alike). Each backward hop matches a strictly
+    /// earlier token, so the walk descends the chain monotonically and
+    /// terminates.
+    fn recv_expression_ty(&self, read_span: SourceRange) -> Option<Ty> {
+        if let Some(ty) = self.read_type_at(read_span) {
+            return Some(ty);
+        }
+        // The chain leg reads the staged member-read records only: a chain
+        // node's own record sits at its member token, whose span END equals
+        // the receiver span the child merge recorded (`e.supertype.m`'s
+        // leaf names `supertype`'s end) — so the walk matches the node by
+        // its member token's end and descends through each record's
+        // `recv_span`. Offsets are UTF-16 units, so the token end is the
+        // name's UTF-16 length past its offset.
+        let end = read_span.offset + read_span.length;
+        let token_end = |read: &MemberRead| {
+            let name = self.strings.resolve(read.name);
+            let units: usize = if name.is_ascii() {
+                name.len()
+            } else {
+                name.chars().map(char::len_utf16).sum()
+            };
+            read.offset as usize + units == end as usize
+        };
+        let prev = self
+            .member_reads
+            .iter()
+            .rev()
+            .find(|read| read.offset >= read_span.offset && token_end(read))?;
+        self.chained_read_static_ty(prev)
+    }
+
+    /// The re-derived static type of one chained member node, keyed by its
+    /// staged read record: the receiver re-reads through
+    /// [`Self::recv_expression_ty`] — the flow face wins because the
+    /// record's merge-time receiver carries the declared, unpromoted type
+    /// — with the record's classified receiver as the flow-blind
+    /// fallback, and the accessor face answers over the re-typed
+    /// receiver — [`Self::receiver_static_ty`] on a synthetic row whose
+    /// receiver carries the re-derived type, so the
+    /// getter/field/tear-off/invocation distinctions stay in one place.
+    fn chained_read_static_ty(&self, read: &MemberRead) -> Option<Ty> {
+        // The re-derived face wins: the record's merge-time receiver carries
+        // the UNPROMOTED static type (the promotion re-decision #1465 keeps
+        // the declared face when the flow answers only in pass 2), so the
+        // flow read at the receiver's own span — the same face the node's
+        // own member verdict runs on — re-types it first. The record's
+        // classified receiver remains the fallback for the shapes the flow
+        // layer cannot spell (`this`, a created receiver).
+        let recv_ty = self.recv_expression_ty(read.recv_span).or(match &read.recv {
+            Receiver::Typed { ty, .. } => Some(*ty),
+            Receiver::This {
+                container, kind, ..
+            } => Some(self.this_static_ty(*container, *kind)),
+            Receiver::Created {
+                name,
+                kind: ContainerKind::Class,
+            } => Some(Ty::named(*name)),
+            _ => None,
+        })?;
+        let Ty::Named { name, .. } = recv_ty else {
+            return None;
+        };
+        let row = Row {
+            name: read.name,
+            range: SourceRange {
+                offset: read.offset,
+                length: 0,
+            },
+            qualified: true,
+            shape: RowShape::Member {
+                recv: Receiver::Typed {
+                    type_name: name,
+                    ty: recv_ty,
+                },
+            },
+            intent: Intent::Read,
+            write_op: None,
+            ty: Ty::UNKNOWN,
+        };
+        let ty = self.receiver_static_ty(&row);
+        (ty != Ty::UNKNOWN).then_some(ty)
+    }
+
     /// Marks a read-shaped member access under its resolved receiver
     /// handle (the `unused_field` element-identity face). An unresolved
     /// receiver marks nothing — the name-level `read_names` still feeds
@@ -1587,7 +1683,7 @@ impl<'a> Engine<'a> {
                         face @ Ty::Named {
                             name: flow_head, ..
                         },
-                    ) = self.read_type_at(read_span)
+                    ) = self.recv_expression_ty(read_span)
                 {
                     self.check_instance_member(
                         promotions,
@@ -3145,6 +3241,102 @@ impl<'a> Engine<'a> {
         } else {
             row.ty
         }
+    }
+
+    /// The member-read row's static type for the `var`-inference window —
+    /// the follow-up the window's own faces answer `Unknown` on: the
+    /// official `staticType` of a property access is the resolved member's
+    /// declared type, so a getter read merged over a typed receiver
+    /// answers its declared return (the accessor face
+    /// [`Self::receiver_static_ty`] already carries), and an instance miss
+    /// consults the applied extension face ([`Self::extension_read_ty`]).
+    /// The extension getter's return is the one shape the merge-time
+    /// field face can never answer (the merged row's `ty` keeps `Unknown`
+    /// there), and every `var` declarator the read initializes stays
+    /// untyped without it, so an extension use reached through the local
+    /// never credits (`element.ffiClass` over `var element =
+    /// elementAnnotation?.element` — the ffi_verifier census shape). The
+    /// `?.` short-circuit's result nullability re-arms on the answer
+    /// (`var a = c?.id` keeps `a` nullable). Every shape neither arm
+    /// answers stays [`Ty::UNKNOWN`] — the under-report direction; a
+    /// method tear-off is the window's own face, not this one.
+    pub(crate) fn initializer_read_ty(&mut self, row: &Row) -> Ty {
+        if row.intent != Intent::Read {
+            return Ty::UNKNOWN;
+        }
+        let declared = match self.receiver_static_ty(row) {
+            Ty::UNKNOWN => None,
+            ty => Some(ty),
+        };
+        let Some(ty) = declared.or_else(|| self.extension_read_ty(row)) else {
+            return Ty::UNKNOWN;
+        };
+        if self.null_aware_members.contains(&row.range.offset)
+            && !self.bool_decided_covers(row)
+        {
+            return Self::nullable_form(ty);
+        }
+        ty
+    }
+
+    /// The extension arm of [`Self::initializer_read_ty`]: a member read
+    /// whose instance walk missed but whose accessor resolves through an
+    /// applied extension face answers the face's declared return. The
+    /// application runs the resolve-side pipeline
+    /// ([`Self::extension_application`]) — applicability, specificity, and
+    /// the element credit the access owes — so the verdict must be a
+    /// resolved application (`Single`/`UnsafeSingle`), and the attributed
+    /// face is the pool's UNIQUE declarer of the spelling: a second
+    /// declarer is the ambiguous or specificity-ordered application this
+    /// face cannot attribute (the oracle's ambiguous access resolves no
+    /// member either). `None` keeps the under-report: an unclassified
+    /// receiver, a nullable-`on`-less verdict, and non-accessor members.
+    fn extension_read_ty(&mut self, row: &Row) -> Option<Ty> {
+        let RowShape::Member { recv } = &row.shape else {
+            return None;
+        };
+        let (head, receiver_ty, receiver_nullable) = match recv {
+            Receiver::Typed { type_name, ty, .. } => (*type_name, *ty, Self::is_nullable_ty(*ty)),
+            Receiver::This { container, kind } => {
+                let ty = self.this_static_ty(*container, *kind);
+                let Ty::Named { name, .. } = ty else {
+                    return None;
+                };
+                (name, ty, Self::is_nullable_ty(ty))
+            }
+            Receiver::Created {
+                name,
+                kind: ContainerKind::Class,
+            } => (*name, Ty::named(*name), false),
+            _ => return None,
+        };
+        // A `?.` access unwraps the receiver before the member read (the
+        // same verdict `check_instance_member` feeds the application).
+        let receiver_nullable =
+            receiver_nullable && !self.null_aware_members.contains(&row.range.offset);
+        self.accessible_extension_faces();
+        let faces = self.accessible_extensions.as_deref().unwrap_or(&[]);
+        let declarers: Vec<(&ExtensionFace, FileId)> = faces
+            .iter()
+            .filter(|(face, _)| face.members.contains_key(&row.name))
+            .copied()
+            .collect();
+        if declarers.len() != 1 {
+            return None;
+        }
+        match self.extension_application(head, receiver_ty, row.name, false, receiver_nullable) {
+            ExtensionApp::Single | ExtensionApp::UnsafeSingle => {}
+            _ => return None,
+        }
+        let (face, face_file) = declarers[0];
+        let entry = face.members.get(&row.name)?;
+        let declared = match entry.kind {
+            MemberKind::Getter => entry.return_ty,
+            MemberKind::Field => entry.var_ty,
+            _ => return None,
+        };
+        let ty = self.boundary.ty(face_file, declared);
+        Some(self.fold_alias_ty(ty))
     }
 
     /// The operator application on a known receiver type (`c + d`, `c[i]`,
