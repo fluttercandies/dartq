@@ -1942,6 +1942,162 @@ impl<'a> Engine<'a> {
         ))
     }
 
+    /// The for-in loop variable's staged element type (#2506): the first
+    /// written argument of a sequence-implementing iterable head —
+    /// `dynamic` for a raw `Iterable`/`Stream` — spelled as a staging
+    /// entry (the flow lattice's own shape; the listener interns the
+    /// lexeme in the flow name table). The gate mirrors
+    /// `check_for_in_iterable`'s own ask (the sequence-face `implements`
+    /// walk must answer `Some(true)`), so only iterables the oracle
+    /// would type through the element face stage here; everything else
+    /// (unresolvable, undecidable, non-sequence, argument-less) keeps
+    /// the flow row's own inference.
+    pub(crate) fn for_in_element_staging(
+        &self,
+        mark: usize,
+        await_: bool,
+    ) -> Option<(Ty, dartq_flow::ty::StagedArg)> {
+        let Some((ty, _, _)) = self.single_row_since(mark) else {
+            return None;
+        };
+        // A function-flavored element (`List<C Function(String)>`): the
+        // element model poisons the annotation into the plain `Named`
+        // return head (rule 0c), so staging it would retag the loop
+        // variable a non-function class and the invocation face would
+        // mis-fire. The formal's declaration consumed the completed
+        // signature into `fn_var_sigs` — the iterable's spelling answers
+        // the question here (the under-report direction keeps the fold's
+        // own silence).
+        let iterable_name = self
+            .rows
+            .iter()
+            .skip(mark)
+            .find(|row| !matches!(row.shape, RowShape::TypeUse(..)))
+            .map(|row| row.name);
+        if iterable_name.is_some_and(|n| self.fn_var_sigs.contains_key(&n)) {
+            return None;
+        }
+        let Ty::Named {
+            name,
+            nullable: false,
+            args,
+        } = ty
+        else {
+            return None;
+        };
+        let head = if await_ {
+            self.intern("Stream")
+        } else {
+            self.collection_heads[3]
+        };
+        // The acceptance the oracle's own element inference implies: a
+        // static type assignable to `Iterable<dynamic>` has an element.
+        // The spelling set answers the core heads directly (the
+        // `implements` walk only matches through *unresolved* edges —
+        // `List implements Iterable` resolves on an indexed graph and
+        // never compares), and the walk stays for the deep chains
+        // (typed data and user subtypes).
+        let core_spelling = name == head
+            || (!await_
+                && (name == self.collection_heads[0]
+                    || name == self.collection_heads[1]
+                    || name == self.collection_heads[3]));
+        // The typed-data families: fixed-width views whose element face is
+        // a core primitive by declaration (upstream Dart SDK source,
+        // sdk/lib/typed_data/typed_data.dart — `Uint8List implements
+        // _TypedIntList` → `TypedDataList<int>` → `List<int>`), pinned as
+        // a curated fact because the container model carries no clause
+        // type arguments for the substitution walk.
+        const TYPED_DATA_ELEMENTS: &[(&str, &str)] = &[
+            ("Int8List", "int"),
+            ("Uint8List", "int"),
+            ("Uint8ClampedList", "int"),
+            ("Int16List", "int"),
+            ("Uint16List", "int"),
+            ("Int32List", "int"),
+            ("Uint32List", "int"),
+            ("Int64List", "int"),
+            ("Uint64List", "int"),
+            ("Float32List", "double"),
+            ("Float64List", "double"),
+        ];
+        let typed_data_element = (!await_)
+            .then(|| {
+                TYPED_DATA_ELEMENTS
+                    .iter()
+                    .find(|&(spelling, _)| self.strings.resolve(name) == *spelling)
+                    .map(|(_, element)| Ty::named(self.intern(element)))
+            })
+            .flatten();
+        if let Some(element) = typed_data_element {
+            let staged_args =
+                super::listener::staged_arg_tree(&self.boundary.args.borrow(), self.strings, ArgListId::EMPTY)
+                    .unwrap_or_default();
+            let lexeme = match &element {
+                Ty::Named { name, .. } => self.strings.resolve(*name).to_string(),
+                _ => String::new(),
+            };
+            return Some((
+                element,
+                dartq_flow::ty::StagedArg::Named {
+                    lexeme,
+                    nullable: false,
+                    args: staged_args,
+                },
+            ));
+        }
+        let accepted = core_spelling
+            || implements_interface(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.strings,
+                self.lib,
+                self.file,
+                name,
+                head,
+                false,
+            ) == Some(true);
+        if !accepted {
+            return None;
+        }
+        // A bare sequence head's element is `dynamic` (the spec's
+        // `Iterable<dynamic>` instantiation — the same face the raw
+        // `Iterable` iterable stages); a written instantiation takes its
+        // first type argument.
+        if args == ArgListId::EMPTY {
+            return Some((Ty::Dynamic, dartq_flow::ty::StagedArg::Dynamic));
+        }
+        let element = self.boundary.args.borrow().get(args).first().copied()?;
+        match &element {
+            Ty::Named {
+                name, nullable, args,
+            } => {
+                let staged_args = super::listener::staged_arg_tree(
+                    &self.boundary.args.borrow(),
+                    self.strings,
+                    *args,
+                )
+                .unwrap_or_default();
+                Some((
+                    element,
+                    dartq_flow::ty::StagedArg::Named {
+                        lexeme: self.strings.resolve(*name).to_string(),
+                        nullable: *nullable,
+                        args: staged_args,
+                    },
+                ))
+            }
+            // A raw `Iterable`'s element is `dynamic` (the spec folds the
+            // iterable onto `Iterable<dynamic>` — the variable holds that
+            // instantiation's element face): the flow read row spells
+            // `dynamic`, never the `Unknown` the InvalidType-scrutinee
+            // posture keys on.
+            Ty::Dynamic => Some((element, dartq_flow::ty::StagedArg::Dynamic)),
+            _ => None,
+        }
+    }
+
     /// The for-in iterable face (`for_in_of_invalid_type`, the M1
     /// `_checkForEachParts` arm — error_verifier.dart:4890-4958): the
     /// iterable's static type must be assignable to `Iterable<dynamic>`,

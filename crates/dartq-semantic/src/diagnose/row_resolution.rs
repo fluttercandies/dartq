@@ -3724,12 +3724,41 @@ impl<'a> Engine<'a> {
             };
             let receiver_args = boundary.pool().get(receiver_args).to_vec();
             let on_args = boundary.pool().get(on_args).to_vec();
-            // A raw-head receiver (`Map x`) instantiates to bounds — the
-            // unbounded-`dynamic` row — so a bare `Map` against `on
-            // Map<K, FieldItem>` fails `dynamic <: FieldItem` exactly as
-            // the oracle's `applicableTo` rejects it.
+            // A raw-head receiver (`Map x`) instantiates each parameter to
+            // its declared bound — the unbounded parameter's `dynamic` row,
+            // a bounded one's own bound (`JSArray` with `T extends JSAny?`
+            // IS `JSArray<JSAny?>` upstream; `applicableTo` infers the
+            // extended type's parameters against the receiver, and a bare
+            // receiver defaults to bounds — the `#2506` js-interop faces
+            // apply over every bare `JSArray` receiver). An `on` argument
+            // that is concrete or nested keeps the raw-`dynamic` face: the
+            // defaulted bound still fails it exactly as `dynamic` does, so
+            // a bare `Map` against `on Map<K, FieldItem>` fails
+            // `dynamic <: FieldItem` exactly as the oracle's
+            // `applicableTo` rejects it.
             let receiver_args = if receiver_args.is_empty() && !on_args.is_empty() {
-                vec![Ty::Dynamic; on_args.len()]
+                on_args
+                    .iter()
+                    .map(|&on_arg| {
+                        let Ty::Named {
+                            name: arg_name,
+                            args,
+                            ..
+                        } = on_arg
+                        else {
+                            return Ty::Dynamic;
+                        };
+                        if args != ArgListId::EMPTY {
+                            return Ty::Dynamic;
+                        }
+                        face.type_param_names
+                            .iter()
+                            .position(|&n| n == arg_name)
+                            .and_then(|index| face.type_param_bounds.get(index).copied())
+                            .map(|bound| boundary.ty(face_file, bound))
+                            .unwrap_or(Ty::Dynamic)
+                    })
+                    .collect()
             } else {
                 receiver_args
             };

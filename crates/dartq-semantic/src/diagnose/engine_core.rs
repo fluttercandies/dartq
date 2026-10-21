@@ -271,6 +271,8 @@ impl<'a> Engine<'a> {
             open_return_span: None,
             cond_mark: None,
             for_in_marks: Vec::new(),
+            for_in_loop_var: None,
+            await_operand_extents: Vec::new(),
             cond_case: false,
             if_element_cond: 0,
             record_type_depth: 0,
@@ -1531,22 +1533,189 @@ impl<'a> Engine<'a> {
                 return;
             }
         } else {
-            // A non-matching pair is informative — the official order has
-            // no subtype-negative verdict (`TypeSystem::type_check_verdict`'s
-            // doc): only the constant-true answer reports here, with `is!`
-            // mapping to the 'false' row below. The name-level lattice
-            // answers first; pairs it cannot pose (a `FutureOr` source —
-            // `FutureOr<S> <: T` needs rule 6's legs — or an
-            // `InvalidType` nested inside the arguments, which only the
-            // resolved face reads as 0c-vacuous) re-ask through
-            // [`Self::resolved_subtype`], the same strict-subtype
-            // question over the operand's full face.
-            if !self.name_subtype(operand_ty, checked)
+            // A bare operand head against an argument-carrying checked
+            // type of the same head is informative: the bare side is
+            // `C<dynamic>` (upstream `TypeSystem::type_check_verdict` reads
+            // the operand's instantiated arguments — `C<dynamic> is
+            // C<DateTime>` is a real runtime question), and the wildcard
+            // the name-level lattice gives a bare side must not decide the
+            // constant-true verdict. The one provable shape stays: every
+            // checked argument accepting the `dynamic` row (`dynamic`
+            // itself and the bare/nullable `Object` — the only tops
+            // `dynamic <: T` answers) keeps the subtype question.
+            let object = self.intern("Object");
+            if let Ty::Named {
+                name: operand_name,
+                args: ArgListId::EMPTY,
+                ..
+            } = operand_ty
+                && let Ty::Named {
+                    name: checked_name,
+                    args: checked_args,
+                    ..
+                } = checked
+                && operand_name == checked_name
+                && checked_args != ArgListId::EMPTY
+            {
+                let accepts_dynamic = self.boundary.args.borrow().get(checked_args).iter().all(
+                    |&arg| match arg {
+                        Ty::Dynamic => true,
+                        Ty::Named {
+                            name,
+                            args: ArgListId::EMPTY,
+                            ..
+                        } => name == object,
+                        _ => false,
+                    },
+                );
+                if !accepts_dynamic {
+                    return;
+                }
+            }
+            // A type-parameter argument position decides through the
+            // parameter's bound exactly as the oracle's verdict does
+            // (`List<T extends num> is List<num>` is constant-true,
+            // `List<T> is List<DateTime?>` is informative — the bare
+            // parameter's `T <: S` is provable only through its bound,
+            // subtype.dart:306-317): an operand argument spelling a bare
+            // type parameter the walk cannot resolve as a container keeps
+            // the verdict only when its bound (or a top checked argument)
+            // proves the pair. No recoverable bound is the unprovability
+            // itself — informative. The bound question asks the
+            // declared-edge lattice alone — [`Self::resolved_subtype`]'s
+            // slot matrix answers every nullable named target as a right
+            // top (the M1 approximation `num <: DateTime? == true`), which
+            // is not the strict provability the verdict needs. When every
+            // position is such a parameter and every bound proves the
+            // pair, the constant-true answer stands directly — the lattice
+            // ask below cannot spell the parameter side and would
+            // under-report the oracle's row.
+            let mut param_pair_true = false;
+            let mut non_param_position = false;
+            if let Ty::Named {
+                name: operand_name,
+                args: operand_args,
+                ..
+            } = operand_ty
+                && let Ty::Named {
+                    name: checked_name,
+                    args: checked_args,
+                    ..
+                } = checked
+                && operand_name == checked_name
+                && operand_args != ArgListId::EMPTY
+                && operand_args != checked_args
+            {
+                let operand_args = self.boundary.args.borrow().get(operand_args).to_vec();
+                let checked_args = self.boundary.args.borrow().get(checked_args).to_vec();
+                if operand_args.len() == checked_args.len() {
+                    param_pair_true = true;
+                    for (&operand_arg, &checked_arg) in
+                        operand_args.iter().zip(checked_args.iter())
+                    {
+                        let Ty::Named {
+                            name: param,
+                            args: ArgListId::EMPTY,
+                            ..
+                        } = operand_arg
+                        else {
+                            non_param_position = true;
+                            continue;
+                        };
+                        if resolve_container(
+                            self.graph,
+                            self.namespaces,
+                            self.index,
+                            self.lib,
+                            self.file,
+                            param,
+                        )
+                        .is_some()
+                        {
+                            non_param_position = true;
+                            continue;
+                        }
+                        // A top checked argument proves every operand side.
+                        let top = match checked_arg {
+                            Ty::Dynamic => true,
+                            Ty::Named {
+                                name,
+                                args: ArgListId::EMPTY,
+                                ..
+                            } => name == object,
+                            _ => false,
+                        };
+                        if top {
+                            continue;
+                        }
+                        let bound = match self.param_bound_of(param) {
+                            Some(Ty::Dynamic) => return,
+                            Some(bound) => bound,
+                            None => return,
+                        };
+                        if !self.name_subtype(bound, checked_arg) {
+                            return;
+                        }
+                    }
+                }
+            }
+            // The wrong-arity checked head (`x is Response<int, int>` over
+            // the one-parameter class) reads the oracle's recovered
+            // `Response<Invalid>` interface — beside the arity row the
+            // type-arguments pass already reports — whose vacuous argument
+            // comparison (subtype.dart's 0c arm) answers the same-head
+            // question constant-true: the `is`/`is!` polarity rows fire
+            // (#2380's recv_arity probes — the oracle reports
+            // `unnecessary_type_check` on both polarities).
+            let arity_true =
+                if let (
+                    Ty::Named {
+                        name: operand_name, ..
+                    },
+                    Ty::Named {
+                        name: checked_name,
+                        args: checked_args,
+                        ..
+                    },
+                ) = (operand_ty, checked)
+                    && operand_name == checked_name
+                    && checked_args != ArgListId::EMPTY
+                    && let Some((container, _)) = resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        checked_name,
+                    )
+                {
+                    self.boundary.args.borrow().get(checked_args).len()
+                        != container.type_params as usize
+                } else {
+                    false
+                };
+            if arity_true {
+                Some(true)
+            } else if param_pair_true && !non_param_position {
+                Some(true)
+            } else if !self.name_subtype(operand_ty, checked)
                 && !self.resolved_subtype(operand_ty, checked)
             {
+                // A non-matching pair is informative — the official order
+                // has no subtype-negative verdict
+                // (`TypeSystem::type_check_verdict`'s doc): only the
+                // constant-true answer reports here, with `is!` mapping
+                // to the 'false' row below. The name-level lattice
+                // answers first; pairs it cannot pose (a `FutureOr`
+                // source — `FutureOr<S> <: T` needs rule 6's legs — or an
+                // `InvalidType` nested inside the arguments, which only
+                // the resolved face reads as 0c-vacuous) re-ask through
+                // [`Self::resolved_subtype`], the same strict-subtype
+                // question over the operand's full face.
                 return;
+            } else {
+                Some(true)
             }
-            Some(true)
         };
         let Some(constant_true) = verdict else { return };
         let code = match (constant_true, negated) {

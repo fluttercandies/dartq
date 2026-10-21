@@ -3398,6 +3398,98 @@ struct SwitchClause {
 /// read is the RECEIVER's, so only the written-annotation face fires
 /// there — and only for switch expressions, whose rows the statement arm
 /// above never produced; the statement face stays that arm's exclusive.
+/// Whether an undefined-name row anchors inside the bare scrutinee
+/// identifier's value chain — its nearest declaring initializer
+/// (`name = expr;`, a later assignment shadowing an earlier declaration) or
+/// for-in iterable (`for (... name in iterable)`). The InvalidType posture
+/// the synthesizer mirrors rides an unresolved reference in that chain
+/// (upstream `InvalidType` propagates only through unresolved names — the
+/// `var preliminaryName = pop();` face, where the undefined-method row the
+/// oracle also fires poisons the static type); an `Unknown` that is only a
+/// local inference gap — an extension member or a spread literal our faces
+/// never typed — keeps every clause live, because the oracle holds a real
+/// type there and reports nothing.
+fn undefined_in_scrutinee_chain(
+    diagnostics: &[Diagnostic],
+    tokens: &TokenTable,
+    source: &str,
+    slice: &[dartq_scanner::Token],
+    switch_idx: usize,
+) -> bool {
+    // The bare-head token sits two past the `switch` keyword.
+    let Some(head) = slice.get(switch_idx + 2) else {
+        return false;
+    };
+    if head.kind != dartq_scanner::TokenKind::Identifier {
+        return false;
+    }
+    let lexeme = tokens.lexeme(source, switch_idx + 2);
+    let mut j = switch_idx;
+    while j > 0 {
+        j -= 1;
+        let token = &slice[j];
+        if token.kind != dartq_scanner::TokenKind::Identifier
+            || tokens.lexeme(source, j) != lexeme
+        {
+            continue;
+        }
+        // The declaring occurrence: `name = initializer;` or a for-in loop
+        // variable. A read occurrence (`name.foo`) declares nothing — keep
+        // scanning backward.
+        let span = if slice
+            .get(j + 1)
+            .is_some_and(|t| t.kind == dartq_scanner::TokenKind::Eq)
+        {
+            let Some(start) = slice.get(j + 2).map(|t| t.utf16_offset) else {
+                continue;
+            };
+            let mut depth = 0i32;
+            let mut k = j + 2;
+            while k < slice.len() {
+                depth += group_depth_step(slice[k].kind);
+                if depth == 0 && slice[k].kind == dartq_scanner::TokenKind::Semicolon {
+                    break;
+                }
+                k += 1;
+            }
+            slice
+                .get(k)
+                .map(|t| (start, t.utf16_offset + t.byte_len))
+        } else if j > 0
+            && slice[j - 1].kind
+                == dartq_scanner::TokenKind::Keyword(dartq_scanner::Keyword::In)
+        {
+            // The iterable runs to the for-header's closing `)`.
+            let Some(start) = slice.get(j + 1).map(|t| t.utf16_offset) else {
+                continue;
+            };
+            let mut depth = 0i32;
+            let mut k = j + 1;
+            let mut end = None;
+            while k < slice.len() {
+                if depth == 0 && slice[k].kind == dartq_scanner::TokenKind::CloseParen {
+                    end = Some((start, slice[k].utf16_offset + slice[k].byte_len));
+                    break;
+                }
+                depth += group_depth_step(slice[k].kind);
+                k += 1;
+            }
+            end
+        } else {
+            continue;
+        };
+        let Some((start, end)) = span else {
+            continue;
+        };
+        return diagnostics.iter().any(|d| {
+            d.code.name.starts_with("undefined_")
+                && d.range.offset >= start
+                && d.range.offset < end
+        });
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)] // the analysis context, one field each
 fn synthesize_unknown_scrutinee_dead_cases(
     diagnostics: &[Diagnostic],
@@ -3477,7 +3569,10 @@ fn synthesize_unknown_scrutinee_dead_cases(
             continue;
         }
         let fires = match read_types[join].1 {
-            Ty::Unknown => !head_is_receiver,
+            Ty::Unknown => {
+                !head_is_receiver
+                    && undefined_in_scrutinee_chain(diagnostics, tokens, source, slice, i)
+            }
             Ty::Named { name, .. } => {
                 head_is_receiver
                     && !statement

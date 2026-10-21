@@ -70,7 +70,7 @@ pub struct Flow<'t> {
     /// the promotion machinery answers on inferred locals exactly like
     /// annotated ones. Entries whose executable never replays are inert
     /// (bounded by the unit's declarator count).
-    inferred_locals: FxHashMap<u32, crate::ty::Ty>,
+    inferred_locals: FxHashMap<u32, (crate::ty::Ty, u32)>,
     /// Assignment right-hand-side types beside their written-argument
     /// arena index, keyed on the write target token's offset: the
     /// semantic layer resolves an assignment's RHS shape its own rows
@@ -667,10 +667,20 @@ impl<'t> Flow<'t> {
     /// declarator, keyed on the declarator name token's offset. The fold
     /// adopts it at `InitializerEnd` when the written header left the
     /// slot unknown ([`crate::interp::VarMeta`] keeps the same anchor);
-    /// staged shapes the flow lattice cannot spell never arrive (the
-    /// stager drops them, the unknown-declared under-report stands).
-    pub fn stage_inferred_local(&mut self, decl_offset: u32, ty: crate::ty::Ty) {
-        self.inferred_locals.insert(decl_offset, ty);
+    /// the staged written-argument tree rides beside the head (#2506 —
+    /// the `ArgListId::EMPTY` gate dropped every argument-bearing
+    /// inference, and the Unknown read row downstream mis-fires the
+    /// InvalidType-scrutinee posture). Shapes the flow lattice cannot
+    /// spell never arrive (the stager drops them, the unknown-declared
+    /// under-report stands).
+    pub fn stage_inferred_local(
+        &mut self,
+        decl_offset: u32,
+        ty: crate::ty::Ty,
+        args: Vec<crate::ty::StagedArg>,
+    ) {
+        let args = self.intern_staged_args(&args);
+        self.inferred_locals.insert(decl_offset, (ty, args));
     }
 
     /// Stages one assignment's right-hand-side type beside its written

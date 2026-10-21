@@ -681,6 +681,15 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The innermost frame's declared slot for a local — the typedness ask
+    /// the for-in element staging makes before overwriting an inferred
+    /// (`Unknown`) slot.
+    pub(crate) fn local_declared_ty(&self, name: StringId) -> Option<Ty> {
+        self.frames
+            .last()
+            .and_then(|frame| frame.var_types.get(&name).copied())
+    }
+
     /// The flat record destructure bind (`final (a, b) = pair()`): the
     /// pattern variables carry no written type — the oracle infers each
     /// from the matched record's positional slots
@@ -1128,11 +1137,18 @@ impl<'a> Engine<'a> {
                 nullable,
                 args,
             } => {
-                if nullable {
-                    return Some(self.object_question());
-                }
+                // `greatestClosure`'s decidable face (upstream
+                // `_inferFormalParameters`): a provable named schema entry
+                // binds itself — `(e)` under `void Function(R?)` binds
+                // `R?`, nullable suffix and all — not the `Object?`
+                // recovery that face exists for (an `InvalidType` or
+                // `T <: Null` head).
                 if self.named_type_is_type(head) && self.args_are_types(args) {
-                    return None;
+                    return Some(Ty::Named {
+                        name: head,
+                        nullable,
+                        args,
+                    });
                 }
                 // The schema entry the formal's inference consumed carries
                 // a name the file cannot prove is a type — a declaration's
@@ -1188,7 +1204,9 @@ impl<'a> Engine<'a> {
         callee_name: StringId,
         callee_row: usize,
     ) -> Option<Ty> {
-        let (params, seeds, ordered) = self.closure_callee_params(recv, callee_name)?;
+        let Some((params, seeds, ordered)) = self.closure_callee_params(recv, callee_name) else {
+            return None;
+        };
         if params.is_empty() {
             return None;
         }
@@ -1338,28 +1356,40 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|name| (*name, None))
                     .collect();
-                let container_params = if own_member {
-                    self.bounds.container_params(container).unwrap_or_default()
-                } else {
-                    Vec::new()
-                };
                 let mut seeds: Vec<(StringId, Ty)> = Vec::new();
-                if own_member
-                    && let Some(Ty::Named { args, .. }) = recv_ty
-                {
-                    let pool = self.boundary.pool();
-                    let args = pool.get(args);
-                    if args.len() == container_params.len() {
-                        for ((param, _, _), ty) in container_params.iter().zip(args.iter()) {
-                            seeds.push((*param, *ty));
+                if own_member {
+                    if let Some(container_params) = self.bounds.container_params(container) {
+                        if let Some(Ty::Named { args, .. }) = recv_ty {
+                            let pool = self.boundary.pool();
+                            let args = pool.get(args);
+                            if args.len() == container_params.len() {
+                                for ((param, _, _), ty) in
+                                    container_params.iter().zip(args.iter())
+                                {
+                                    seeds.push((*param, *ty));
+                                }
+                            }
+                        }
+                        params.extend(container_params.iter().map(|(param, bound, _)| {
+                            (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))
+                        }));
+                    } else if let Some(recv_ty) = recv_ty
+                        && let Some(env) = self.member_recv_env(recv_ty, container, &entry)
+                    {
+                        // A foreign container's parameter set spells nowhere
+                        // in this unit's capture index; the member's own
+                        // signature names it (`Map`'s `forEach(void
+                        // action(K,V))`), and the direct receiver spelling
+                        // `Map<String,R>` instantiates it positionally — the
+                        // same env the send-close solver reads. The declared
+                        // names join `params` boundless (the excerpt declares
+                        // them unbounded).
+                        for (param, ty) in env {
+                            seeds.push((param, ty));
+                            params.push((param, None));
                         }
                     }
                 }
-                params.extend(
-                    container_params
-                        .iter()
-                        .map(|(param, bound, _)| (*param, bound.as_ref().map(|tree| self.tree_ty(tree)))),
-                );
                 return Some((params, seeds, true));
             }
             return None;

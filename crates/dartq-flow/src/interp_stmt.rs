@@ -1211,8 +1211,9 @@ impl Interp<'_> {
                             .decl_span
                             .and_then(|span| self.inferred_locals.get(&span.offset))
                             .copied();
-                        if let Some(staged) = staged {
+                        if let Some((staged, staged_args)) = staged {
                             meta.ty = staged;
+                            meta.args = staged_args;
                         } else if rhs.ty.nullable
                             && matches!(
                                 rhs.ty.base,
@@ -1272,7 +1273,26 @@ impl Interp<'_> {
                 this_or_super: _,
                 token,
             } => {
-                let ty = self.pending_ty.take().unwrap_or(Ty::UNKNOWN);
+                let ty = match self.pending_ty.take() {
+                    // The context-inferred formal face (official
+                    // `_inferFormalParameters`): an implicitly typed
+                    // formal of an open function literal arrives with
+                    // `pending_ty` already materialized as `Some(Unknown)`
+                    // by the type-completion event — not `None` — so the
+                    // `var` face's `.or_else` chain never consults the
+                    // staged schema entry. A genuinely written annotation
+                    // never lands here (its `pending_ty` resolves non-
+                    // unknown); an unknown pending with a staged inferred
+                    // type adopts the staged spelling exactly like the
+                    // `var`-declarator window's `meta.ty` adoption
+                    // (#2140).
+                    None | Some(Ty::UNKNOWN) => self
+                        .inferred_locals
+                        .get(&token.range.offset)
+                        .map(|&(ty, _)| ty)
+                        .unwrap_or(Ty::UNKNOWN),
+                    Some(ty) => ty,
+                };
                 let args = std::mem::take(&mut self.pending_ty_args);
                 let meta = VarMeta {
                     ty,

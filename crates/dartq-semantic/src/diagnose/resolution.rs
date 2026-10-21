@@ -1273,7 +1273,7 @@ impl<'a> Engine<'a> {
     /// signature). The member's own type parameters are bound in its
     /// signature and never substitute — `m<M>(M x)` shadows any same-spelled
     /// container key.
-    fn member_recv_env(
+    pub(crate) fn member_recv_env(
         &self,
         recv_ty: Ty,
         container: StringId,
@@ -1296,10 +1296,12 @@ impl<'a> Engine<'a> {
             names.into_iter().zip(written).collect()
         } else {
             // A foreign container's parameters spell nowhere in this unit —
-            // the name-forced rule alone binds: exactly one declared
-            // parameter, one written argument, one free parameter spelling
-            // in the member's signature (the declaring file's TypeParam tag
-            // separates a parameter from a real type at the name level).
+            // the name-forced rule binds when the member's own signature
+            // spells exactly the declaring parameter set, in declaration
+            // order (`Map<K,V>`'s `forEach(action(K,V))` spells `K`/`V`
+            // once each; `Iterable<E>`'s `fold` spells `E` in `combine`).
+            // A count mismatch — the member never names every parameter —
+            // keeps the under-report (the written arguments cannot pair).
             let (found, owner) = resolve_container(
                 self.graph,
                 self.namespaces,
@@ -1308,9 +1310,6 @@ impl<'a> Engine<'a> {
                 self.file,
                 container,
             )?;
-            if found.type_params != 1 || written.len() != 1 {
-                return None;
-            }
             let mut free: Vec<StringId> = Vec::new();
             let mut collect = |ty: Ty| {
                 self.member_free_params(ty, entry, owner, &mut free);
@@ -1322,10 +1321,10 @@ impl<'a> Engine<'a> {
                     collect(formal.ty);
                 }
             }
-            if free.len() != 1 {
+            if usize::from(found.type_params) != free.len() || free.len() != written.len() {
                 return None;
             }
-            vec![(free[0], written[0])]
+            free.into_iter().zip(written).collect()
         };
         map.retain(|(param, _)| !entry.type_param_names.contains(param));
         (!map.is_empty()).then_some(map)
@@ -1344,24 +1343,57 @@ impl<'a> Engine<'a> {
         scope_file: FileId,
         free: &mut Vec<StringId>,
     ) {
-        let Ty::Named { name, args, .. } = ty else {
-            return;
-        };
-        let is_type_param = !member.type_param_names.contains(&name)
-            && self
-                .index
-                .get(scope_file)
-                .and_then(|f| f.decl(name))
-                .is_some_and(|decl| decl.kind == crate::model::MicroKind::TypeParam);
-        if is_type_param && !free.contains(&name) {
-            free.push(name);
-        }
-        if args == ArgListId::EMPTY {
-            return;
-        }
-        let list: Vec<Ty> = self.boundary.args.borrow().get(args).to_vec();
-        for arg in list {
-            self.member_free_params(arg, member, scope_file, free);
+        match ty {
+            Ty::Named { name, args, .. } => {
+                let is_type_param = !member.type_param_names.contains(&name)
+                    && self
+                        .index
+                        .get(scope_file)
+                        .and_then(|f| f.decl(name))
+                        .is_some_and(|decl| decl.kind == crate::model::MicroKind::TypeParam);
+                if is_type_param && !free.contains(&name) {
+                    free.push(name);
+                }
+                if args == ArgListId::EMPTY {
+                    return;
+                }
+                let list: Vec<Ty> = self.boundary.args.borrow().get(args).to_vec();
+                for arg in list {
+                    self.member_free_params(arg, member, scope_file, free);
+                }
+            }
+            Ty::Function { shape, .. } => {
+                let (positional, named, return_ty) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.function_shape(shape);
+                    (
+                        shape.positional.clone(),
+                        shape.named.clone(),
+                        shape.return_ty,
+                    )
+                };
+                for ty in positional {
+                    self.member_free_params(ty, member, scope_file, free);
+                }
+                for (_, ty) in named {
+                    self.member_free_params(ty, member, scope_file, free);
+                }
+                self.member_free_params(return_ty, member, scope_file, free);
+            }
+            Ty::Record { shape, .. } => {
+                let (positional, named) = {
+                    let pool = self.boundary.pool();
+                    let shape = pool.record_shape(shape);
+                    (shape.positional.clone(), shape.named.clone())
+                };
+                for ty in positional {
+                    self.member_free_params(ty, member, scope_file, free);
+                }
+                for (_, ty) in named {
+                    self.member_free_params(ty, member, scope_file, free);
+                }
+            }
+            _ => {}
         }
     }
 

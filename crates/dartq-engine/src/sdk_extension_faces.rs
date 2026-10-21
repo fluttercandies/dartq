@@ -91,6 +91,32 @@ extension BoolToJSBoolean on bool {
 extension StringToJSString on String {
   external JSString get toJS;
 }
+// The nullable-receiver faces (upstream Dart SDK source,
+// sdk/lib/js_interop/js_interop.dart:1021-1231): both extensions declare
+// `on JSAny?` / `on Object?` — their members apply to a NULLABLE receiver
+// as the safe match (the nullable-`on` application the extension walk
+// already carries), so `payload.isUndefinedOrNull` over a `JSAny?`
+// parameter resolves and never reports
+// `unchecked_use_of_nullable_value`. Concrete bodies
+// (`isUndefinedOrNull` => `this == null`, `instanceOfString`'s
+// `globalContext` walk) spell `external` — the name-level model is
+// identical and no body is captured either way.
+extension NullableUndefineableJSAnyExtension on JSAny? {
+  external bool get isUndefined;
+  external bool get isNull;
+  external bool get isUndefinedOrNull;
+  external bool get isDefinedAndNotNull;
+}
+extension JSAnyUtilityExtension on JSAny? {
+  external bool typeofEquals(String typeString);
+  external bool instanceof(JSFunction constructor);
+  external bool instanceOfString(String constructorName);
+  external Object? dartify();
+}
+extension NullableObjectUtilExtension on Object? {
+  external JSAny? jsify();
+  external bool isA<T extends JSAny?>();
+}
 extension type JSAny._(JSAnyType _jsAny) implements Object, JSAnyType {}
 extension type JSObject._(JSObjectType _jsObject)
     implements JSAny, JSObjectType {
@@ -102,6 +128,44 @@ extension type JSFunction<T extends Function>._(JSFunctionType _jsFunction)
     implements JSObject, JSFunctionType {
   external int get length;
   external String get name;
+}
+// The primitive and array extension types (upstream :515/:822/:826/:830) —
+// receiver spellings the cast face and the member walk resolve; the
+// internal `JS*Type` representation spellings and the `JSIterable`
+// protocol edge stay undeclared like `JSAnyType` above (upstream they
+// live in `dart:_js_types`, which `dart:js_interop` imports but never
+// exports — no user-visible resolution can name them either).
+extension type JSArray<T extends JSAny?>._(JSArrayType _jsArray)
+    implements JSObject, JSArrayType, JSIterable<T> {
+  external JSArray();
+  external JSArray.withLength(int length);
+  external int get length;
+  external set length(int newLength);
+  external T operator [](int position);
+  external void operator []=(int position, T value);
+  external void add(T value);
+}
+extension type JSNumber._(JSNumberType _jsNumber)
+    implements JSAny, JSNumberType {}
+extension type JSBoolean._(JSBooleanType _jsBoolean)
+    implements JSAny, JSBooleanType {}
+extension type JSString._(JSStringType _jsString)
+    implements JSAny, JSStringType {}
+// The interop-to-Dart conversion extensions (upstream :2061/:2128/:2151/
+// :2163) — `JSNumberToNumber` spells exactly `toDartDouble`/`toDartInt`
+// (no plain `toDart` exists upstream for numbers).
+extension JSArrayToList<T extends JSAny?> on JSArray<T> {
+  external List<T> get toDart;
+}
+extension JSNumberToNumber on JSNumber {
+  external double get toDartDouble;
+  external int get toDartInt;
+}
+extension JSBooleanToBool on JSBoolean {
+  external bool get toDart;
+}
+extension JSStringToString on JSString {
+  external String get toDart;
 }
 "#,
     ),

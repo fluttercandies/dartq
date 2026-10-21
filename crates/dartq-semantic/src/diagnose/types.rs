@@ -2494,6 +2494,21 @@ pub(crate) struct Engine<'a> {
     /// collection for-element inside an iterable expression nests a second
     /// begin/handle pair inside the outer window.
     pub(crate) for_in_marks: Vec<usize>,
+    /// The for-in head's declarator latch (#2506): the loop variable's
+    /// name token, captured at its declaration event (the head parses
+    /// before the iterable) and consumed at `handle_for_in_loop_parts`
+    /// to stage the element type on the flow declared-type seam. Every
+    /// loop head resets it, so a classic-for declarator's stale latch
+    /// never reaches a later for-in's consume.
+    pub(crate) for_in_loop_var: Option<(StringId, SourceRange)>,
+    /// The operand extents of this unit's `await` expressions
+    /// (`(after-the-await-keyword, expression-end)`): the close-time row
+    /// rewrite cannot flatten a member operand (its row resolves only in
+    /// the later pass), so the extents re-apply the flatten where the
+    /// resolved type is consumed — the `var`-inferred local's bind (#2506
+    /// await face). One entry per await, file-scoped, read-only after the
+    /// event.
+    pub(crate) await_operand_extents: Vec<(u32, u32)>,
     /// The condition carried a pattern clause (`if (e case p)`): the
     /// official driver routes such statements through `analyzeIfCaseStatement`
     /// (type_analyzer.dart:3399-3412) and never reaches

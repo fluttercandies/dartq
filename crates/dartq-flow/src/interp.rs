@@ -742,7 +742,7 @@ pub(crate) struct Interp<'o> {
     /// this unit (#2140), keyed on the declarator name token's offset —
     /// adopted at `InitializerEnd` when the written header left the slot
     /// unknown. Read-only for the replay.
-    pub(crate) inferred_locals: &'o FxHashMap<u32, crate::ty::Ty>,
+    pub(crate) inferred_locals: &'o FxHashMap<u32, (crate::ty::Ty, u32)>,
     /// The staged assignment RHS types the semantic layer resolved for this
     /// unit (#2174), beside their written-argument arena index (#2364),
     /// keyed on the write target token's offset — adopted at `Ev::Assign`
@@ -912,7 +912,7 @@ static NO_TOP_LEVEL: std::sync::LazyLock<FxHashMap<u32, crate::record::TopVar>> 
 /// The direct-construction default for [`Interp::inferred_locals`]: no
 /// staged inferred-local types — every `var`/`final` declarator keeps its
 /// unknown-declared slot (the pre-#2140 behavior).
-static NO_INFERRED_LOCALS: std::sync::LazyLock<FxHashMap<u32, crate::ty::Ty>> =
+static NO_INFERRED_LOCALS: std::sync::LazyLock<FxHashMap<u32, (crate::ty::Ty, u32)>> =
     std::sync::LazyLock::new(FxHashMap::default);
 
 /// The direct-construction default for [`Interp::staged_rhs`]: no staged
@@ -2794,7 +2794,7 @@ impl Interp<'_> {
         // (upstream `_inferForEachVariable` reads the resolved element
         // type; the name-level face of `Iterable<E>`'s `E` is the
         // iterable's first written argument).
-        let element_ty = self
+        let mut element_ty = self
             .exprs
             .pop()
             .and_then(|iterable| {
@@ -2831,7 +2831,35 @@ impl Interp<'_> {
             // iterable's written first argument). An explicitly spelled
             // head (`for (int e in xs)`) keeps its annotation — only the
             // unknown face fills.
-            if let Some(meta) = self.vars.get_mut(var as usize)
+            // The element face the fold writes: its own written-args
+            // inference first; the semantic layer's staged element type
+            // (#2506) fills when the fold could not — a property-read
+            // iterable (`unit.directives`) carries no written argument
+            // tree, and the Unknown slot downstream mis-fires the
+            // InvalidType-scrutinee posture over the loop variable.
+            // An explicitly spelled head (`for (int e in xs)`) keeps its
+            // annotation — the unknown face fills below.
+            let staged = if element_ty.0.base == crate::ty::Base::Unknown {
+                self.vars
+                    .get(var as usize)
+                    .and_then(|meta| meta.decl_span)
+                    .and_then(|span| self.inferred_locals.get(&span.offset))
+                    .copied()
+            } else {
+                None
+            };
+            if let Some((staged_ty, staged_args)) = staged {
+                element_ty = (staged_ty, staged_args);
+                // The declared slot the `final e`/`var e` head left
+                // unknown adopts the element type — the same inferred-type
+                // fill `InitializerEnd` performs for `var v = e`.
+                if let Some(meta) = self.vars.get_mut(var as usize)
+                    && meta.ty.base == crate::ty::Base::Unknown
+                {
+                    meta.ty = staged_ty;
+                    meta.args = staged_args;
+                }
+            } else if let Some(meta) = self.vars.get_mut(var as usize)
                 && meta.ty.base == crate::ty::Base::Unknown
             {
                 meta.ty = element_ty.0;

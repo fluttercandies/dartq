@@ -1447,6 +1447,11 @@ impl ParserListener for DiagnoseListener<'_> {
         // The head's declaration list is its own duplicate scope
         // (`checkForVariables`) — reset per loop.
         engine.dup_for_parts.clear();
+        // Reset the for-in declarator latch (#2506): a classic-for head's
+        // declarator latches below and never consumes it (no
+        // `handle_for_in_loop_parts`), so the reset belongs at every loop
+        // head — the stale latch dies here, never inside a later for-in.
+        engine.for_in_loop_var = None;
         // The condition/updater window (classic for) or the iterable window
         // (for-in) opens at the keyword — the statement form (1).
         engine.in_for_parts.push(1);
@@ -1478,6 +1483,65 @@ impl ParserListener for DiagnoseListener<'_> {
         // by `end_for_in_control_flow`). A push here would strand the loop
         // variable in a frame popped before it closed, or strand a mark that
         // shifts every later close by one.
+
+        // The loop variable's element-type staging (#2506): a property-read
+        // iterable (`for (var d in unit.directives)`) carries no written-arg
+        // inference the flow layer can read, so the loop variable's row
+        // would latch `Unknown` — the InvalidType-scrutinee posture the
+        // second DEAD_CODE synthesizer keys on. The element face (the
+        // sequence head's first written argument, gated by the same
+        // `implements` walk as the iterable check below) stages on the flow
+        // declared-type seam, keyed on the latched declarator token. The
+        // mark is only peeked here — the iterable check pops it below.
+        let loop_var = self.engine.for_in_loop_var.take();
+        if let (Some(&mark), Some((name, name_tok))) =
+            (self.engine.for_in_marks.last(), loop_var.as_ref())
+            && let Some((sem_ty, staged)) =
+                self.engine.for_in_element_staging(mark, await_kw.is_some())
+        {
+            // The loop variable's own declared slot takes the element type
+            // — the same inferred-type fill the resolver gives the `var`
+            // head (`bind_declared_type` latched `Unknown` for it). The
+            // fill is what later read rows resolve at fold time: without
+            // it a staged variable in a binary operand resolves `Unknown`
+            // and the numeric refinement answers `double`
+            // (`int + e` over `for (var e in <int list>)` mis-fired
+            // INVALID_ASSIGNMENT). A typed head (`for (int e …)`) keeps
+            // its spelled annotation — the slot is not `Unknown`.
+            if self.engine.local_declared_ty(*name) == Some(Ty::UNKNOWN) {
+                self.engine.bind_var_type(*name, sem_ty.clone());
+            }
+            match staged {
+                dartq_flow::ty::StagedArg::Named {
+                    lexeme,
+                    nullable,
+                    args,
+                } => {
+                    let base = self.flow().intern_name(&lexeme);
+                    self.flow().stage_inferred_local(
+                        name_tok.offset,
+                        FlowTy {
+                            base: FlowBase::Name(base),
+                            nullable,
+                        },
+                        args,
+                    );
+                }
+                // The raw-`Iterable` element: the flow's `dynamic` base,
+                // never `Unknown`.
+                dartq_flow::ty::StagedArg::Dynamic => {
+                    self.flow().stage_inferred_local(
+                        name_tok.offset,
+                        FlowTy {
+                            base: FlowBase::Dynamic,
+                            nullable: false,
+                        },
+                        Vec::new(),
+                    );
+                }
+                _ => {}
+            }
+        }
 
         // The `_checkForEachParts` iterable face: the iterable's operand
         // rows closed at `end_for_in_expression` and the `await` keyword
@@ -1620,6 +1684,21 @@ impl ParserListener for DiagnoseListener<'_> {
                         (derived != Ty::UNKNOWN).then_some(derived)
                     })
             {
+                // The await operand's extent re-applies the flatten here
+                // (#2506): the close-time rewrite reads an `Unknown` row
+                // (member rows resolve in the later pass), so the resolved
+                // `Future<T>`-shaped type flattens at the bind — the local
+                // holds `T`, nullability preserved.
+                let ty = if engine.await_operand_extents.iter().any(
+                    |&(start, end)| {
+                        engine.rows[mark].range.offset >= start
+                            && engine.rows[mark].range.end() <= end
+                    },
+                ) {
+                    engine.flatten(ty)
+                } else {
+                    ty
+                };
                 engine.bind_var_type(name, ty);
                 // The promotion face rides the flow layer's declared-type
                 // slot (#2140): a name-level type with no written
@@ -1634,16 +1713,29 @@ impl ParserListener for DiagnoseListener<'_> {
                 if let Ty::Named {
                     name: ty_name,
                     nullable,
-                    args: ArgListId::EMPTY,
+                    args,
                 } = ty
                 {
                     let lexeme = engine.strings.resolve(ty_name).to_string();
-                    staged = Some((decl_range.offset, lexeme, nullable));
+                    // #2506: the written-argument tree rides beside the
+                    // head — the `ArgListId::EMPTY` gate dropped every
+                    // argument-bearing inference, and the Unknown read row
+                    // downstream mis-fires the InvalidType-scrutinee
+                    // posture. A tree the flow lattice cannot spell
+                    // (`staged_arg_tree`'s `None`) stages the bare head —
+                    // the pre-#2506 under-report, never a wrong tree.
+                    let tree = staged_arg_tree(
+                        &engine.boundary.args.borrow(),
+                        &engine.strings,
+                        args,
+                    )
+                    .unwrap_or_default();
+                    staged = Some((decl_range.offset, lexeme, nullable, tree));
                 }
             }
             staged
         };
-        if let Some((offset, lexeme, nullable)) = staged {
+        if let Some((offset, lexeme, nullable, tree)) = staged {
             let base = self.flow().intern_name(&lexeme);
             self.flow().stage_inferred_local(
                 offset,
@@ -1651,6 +1743,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     base: FlowBase::Name(base),
                     nullable,
                 },
+                tree,
             );
         }
         self.flow().end_variable_initializer(token);
@@ -1901,6 +1994,14 @@ impl ParserListener for DiagnoseListener<'_> {
                 if let Some(name) = name {
                     engine.note_local(name, token.range);
                     engine.const_decl_name(name, false);
+                    // The for-in head's declarator latches its name token
+                    // (#2506) — `handle_for_in_loop_parts` stages the
+                    // element type on it. Latched for both forms (the
+                    // statement head's `in_for_parts` is 1, the collection
+                    // element's 2); every loop head resets it.
+                    if !engine.in_for_parts.is_empty() {
+                        engine.for_in_loop_var = Some((name, token.range));
+                    }
                     // A `var`/type-inferred declarator parks its name and
                     // name token: the initializer's resolved expression
                     // type binds as the declared type at
@@ -3060,23 +3161,81 @@ impl ParserListener for DiagnoseListener<'_> {
             // The RHS's value row: the expression's own result row, not the
             // single-row window `check_assignment` uses (a multi-row shape —
             // an argument-bearing send — is exactly the face this staging
-            // exists for). The send face types on demand
+            // exists for). The result row is the outermost *expression* row —
+            // `Receiver`/`Member`-shaped, never a `Bare` or `Value` sub-row:
+            // an explicit type-argument's own row (`<int>` of `C<int>()`)
+            // sits rightmost yet types the argument, not the creation, so the
+            // rightmost non-`Bare`/`Value` row is the result; an earlier
+            // invoke (`g() ?? R()`'s `g`) is an operand, never the result.
+            let rhs_index = engine.rows[target + 1..]
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.range.offset > limit)
+                .rev()
+                .find(|(_, row)| !matches!(row.shape, RowShape::Bare(_) | RowShape::Value))
+                .or_else(|| {
+                    engine.rows[target + 1..]
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, row)| row.range.offset > limit)
+                        .last()
+                })
+                .map(|(index, _)| target + 1 + index)?;
+            let rhs_row = engine.rows[rhs_index].clone();
+            // The send face types on demand
             // ([`Engine::callee_return_ty`]): an invocation row's stored
             // type is the callee head's, the resolved return is the send's.
-            let after = || {
-                engine.rows[target + 1..]
-                    .iter()
-                    .filter(|row| row.range.offset > limit)
-            };
-            let rhs_row = after()
-                .clone()
-                .filter(|row| row.intent == Intent::Invoke)
-                .last()
-                .or_else(|| after().clone().last())?;
-            let from_ty = if rhs_row.intent == Intent::Invoke {
-                engine.callee_return_ty(rhs_row)
-            } else {
-                rhs_row.ty
+            // A member read resolves through the accessor walk
+            // ([`Engine::initializer_read_ty`]); a folded creation's type
+            // head (`R` of `R()`) is the instance the send produces. An
+            // arg-bearing stored type wins over every on-demand arm — the
+            // merged `Created` row's `ty` already carries the solved
+            // instantiation (`C<int>()`'s `<int>`), which the declared-head
+            // reads would strip to `C`.
+            let from_ty = match rhs_row.ty {
+                Ty::Named { args, .. } if args != crate::model::ArgListId::EMPTY => rhs_row.ty,
+                _ if rhs_row.intent == Intent::Invoke => engine.callee_return_ty(&rhs_row),
+                _ => {
+                    let resolved = engine.initializer_read_ty(&rhs_row);
+                    if resolved != Ty::UNKNOWN {
+                        resolved
+                    } else {
+                        match &rhs_row.shape {
+                            RowShape::Receiver(Receiver::Typed { ty, .. }) => *ty,
+                            RowShape::Receiver(
+                                Receiver::Container { name, .. }
+                                | Receiver::Created { name, .. }
+                                | Receiver::PrefixedContainer { name, .. },
+                            ) => {
+                                // An explicit-argument creation
+                                // (`C<int>()`) never lands a solved
+                                // `pending_send_ty` — its instantiation
+                                // rides in `call_type_args` keyed on this
+                                // callee row. The bare head would stage a
+                                // `C` write and demote the target's
+                                // promoted `C<int>`.
+                                let explicit = engine
+                                    .call_type_args
+                                    .iter()
+                                    .find(|(row, _)| *row == rhs_index)
+                                    .map(|(_, tys)| tys.clone());
+                                match explicit {
+                                    Some(tys) => engine
+                                        .boundary
+                                        .args
+                                        .borrow_mut()
+                                        .named(*name, false, &tys),
+                                    None => Ty::Named {
+                                        name: *name,
+                                        nullable: false,
+                                        args: crate::model::ArgListId::EMPTY,
+                                    },
+                                }
+                            }
+                            _ => rhs_row.ty,
+                        }
+                    }
+                }
             };
             // A `?.`-merged right side reads the short-circuit's nullable
             // result into the flow's staged face (`x = a?.b` demotes `x`'s
@@ -6353,6 +6512,14 @@ impl ParserListener for DiagnoseListener<'_> {
         if let (Some(row), Some(ty)) = (engine.rows.last_mut(), flat_ty) {
             row.ty = ty;
         }
+        // The extent outlives the rewrite: a member operand's row resolves
+        // only in the later pass (its close-time `ty` is still `Unknown`),
+        // so the `var`-inferred bind re-applies the flatten over the
+        // resolved type (#2506 await face — `final d = await t.r;` binds
+        // `R`, not `Future<R?>`).
+        engine
+            .await_operand_extents
+            .push((begin.range.end(), end.range.offset));
     }
 
     fn handle_throw_expression(&mut self, throw: Token, end: Token) {
@@ -6468,6 +6635,9 @@ impl ParserListener for DiagnoseListener<'_> {
         // The head's declaration list is its own duplicate scope
         // (`checkForVariables`) — reset per loop.
         engine.dup_for_parts.clear();
+        // Reset the for-in declarator latch (#2506) — see the statement
+        // form's reset for the stale-latch reasoning.
+        engine.for_in_loop_var = None;
         // The collection-element form's window (2): its condition is an
         // expression statement like the statement form's; its window closes
         // at the control-flow end.
@@ -6715,6 +6885,56 @@ impl ParserListener for DiagnoseListener<'_> {
         kind: FormalParameterKind,
         member_kind: dartq_parser::MemberKind,
     ) {
+        // The inferred-formal face (`_inferFormalParameters`'s flow half):
+        // an implicitly typed formal of an open function literal binds its
+        // context schema entry in `var_types` at the name event, but the
+        // flow's `Ev::Formal` declares `Unknown` without a written
+        // annotation — every `e != null` on the inferred formal then finds
+        // no nullable step and its reads stay unpromoted (the oracle
+        // promotes them). Stage the schema-derived type on the name token
+        // before the `Ev::Formal` record consumes it; the same
+        // spellability gate as the `var` face holds (a name-level
+        // argument-less head — argument-bearing and non-named shapes the
+        // flow lattice cannot spell stay untyped, the under-report
+        // posture). A formal with a written annotation never arrives: the
+        // written `pending_ty` owns the declaration.
+        if self.engine.formal_written.is_none()
+            && this_keyword.is_none()
+            && super_keyword.is_none()
+        {
+            let staged = self
+                .engine
+                .name_of(name)
+                .and_then(|name_id| {
+                    self.engine
+                        .frames
+                        .last()
+                        .and_then(|frame| frame.var_types.get(&name_id).copied())
+                })
+                .and_then(|ty| match ty {
+                    Ty::Named {
+                        name: ty_name,
+                        nullable,
+                        args: ArgListId::EMPTY,
+                    } => Some((
+                        name.range.offset,
+                        self.engine.strings.resolve(ty_name).to_string(),
+                        nullable,
+                    )),
+                    _ => None,
+                });
+            if let Some((offset, lexeme, nullable)) = staged {
+                let base = self.flow().intern_name(&lexeme);
+                self.flow().stage_inferred_local(
+                    offset,
+                    FlowTy {
+                        base: FlowBase::Name(base),
+                        nullable,
+                    },
+                    Vec::new(),
+                );
+            }
+        }
         self.flow().end_formal_parameter(
             var_or_final,
             covariant_kw,
@@ -8014,7 +8234,7 @@ fn typed_group_head(engine: &Engine<'_>, left: Token) -> Option<usize> {
 /// faces. Any other entry (a record or function shape) cannot stage
 /// faithfully, so the whole tree drops — the unknown-written demotion
 /// stands, the conservative face for an unspellable tree.
-fn staged_arg_tree(
+pub(super) fn staged_arg_tree(
     pool: &ArgPool,
     strings: &StringTable,
     args: ArgListId,

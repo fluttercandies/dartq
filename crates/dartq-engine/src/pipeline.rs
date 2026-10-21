@@ -1570,6 +1570,27 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
     // async/collection re-exports (`Future`, `Stream`, …) — the oracle's
     // import-namespace shape at name granularity.
     let core = sdk_faces["core"];
+    // Every other SDK face library gets the same implicit `dart:core`
+    // prelude a real source library's graph row carries — `<dart:collection>`
+    //'s excerpt declares `HashMap implements Map<K,V>` and the member walk
+    // resolves that face through `dart:collection`'s import table, which an
+    // edge-free face would leave empty (the oracle's `dart:collection` sees
+    // `Map` via the prelude). Idempotent against a face whose generated
+    // table already re-exports `dart:core` (an edge keyed on the same target
+    // dedups in the namespace merge).
+    for (&uri, &node) in &sdk_faces {
+        if uri != "core" {
+            builder.import(
+                node,
+                ImportEdge {
+                    target: Some(core),
+                    prefix: None,
+                    deferred: false,
+                    combinators: Combinators::unfiltered(),
+                },
+            );
+        }
+    }
 
     // The dependency-interface nodes: one per lazily indexed dep file, in
     // path order (deterministic registration — node order is an observable

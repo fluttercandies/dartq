@@ -1354,7 +1354,13 @@ mod tests {
                     || d.code.name == "ambiguous_extension_member_access"
             })
             .collect();
-        assert!(misses.is_empty(), "{misses:?}");
+        // The scalar conversions (`s/b/i/d.toJS`) resolve silently through
+        // the bundled faces; `List<String>.toJS` is the oracle's own
+        // `undefined_getter` — the `List<X>` conversion extensions carry
+        // `@Since('3.14')` upstream and do not fire under the 3.13.1 oracle,
+        // so the report is the correct shape.
+        assert_eq!(misses.len(), 1, "{misses:?}");
+        assert_eq!(misses[0].code.name, "undefined_getter");
     }
 
     /// The residue contract under the extension faces: a member the core
