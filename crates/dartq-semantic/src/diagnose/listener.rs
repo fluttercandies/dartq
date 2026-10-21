@@ -4581,9 +4581,21 @@ impl ParserListener for DiagnoseListener<'_> {
             Restriction::EnumValue(enum_name, _) => Some(Ty::named(enum_name)),
             _ => None,
         });
-        let at = engine
-            .const_fold
-            .take_at()
+        // The capture closes first so the never-match anchor is the FULL
+        // constant node: upstream anchors `constantPatternNeverMatchesValueType`
+        // at the ConstantPattern node itself (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/dart/constant/constant_verifier.dart,
+        // visitConstantPattern's `.at(node)`) — `A.a` whole, not the inner
+        // identifier the resolution rows carry nor the member tail. The
+        // capture root spans the parsed expression (a member access spans
+        // receiver-through-selector; a literal spans its token), so the
+        // literal forms keep their old anchors; the recovery fallbacks
+        // below hold the pre-capture chain for windows that never opened.
+        let capture = engine.const_capture.close_constant_pattern();
+        let at = capture
+            .as_ref()
+            .map(|node| node.span)
+            .or_else(|| engine.const_fold.take_at())
             .or_else(|| engine.rows.last().map(|row| row.range));
         engine.check_constant_pattern(constant, at);
         // `visitConstantPattern`'s `_evaluateAndReportError`: the
@@ -4592,7 +4604,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // at the failing node's span. `Value`/`Constant` (and a `null` root
         // — a window that never opened, e.g. a recovery path) stay silent;
         // the oracle's `InvalidType` early-return maps to the same silence.
-        if let Some(node) = engine.const_capture.close_constant_pattern() {
+        if let Some(node) = capture {
             match eval(&node, engine) {
                 // An unresolved reference is the oracle's `InvalidType`
                 // early-return (constant_verifier.dart:134-136): the

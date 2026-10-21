@@ -3882,6 +3882,14 @@ mod ticket_2458_tests;
 #[cfg(test)]
 mod ticket_2453_tests;
 
+/// The #2448 pins: the constant-pattern never-match anchor spans the full
+/// constant node — a qualified `case A.a:` row anchors `A.a` whole and an
+/// enum-constant `case E.a:` row anchors the full pattern node (the
+/// upstream `visitConstantPattern` `.at(node)` face), with the literal
+/// forms keeping their token anchors.
+#[cfg(test)]
+mod ticket_2448_tests;
+
 /// The #2451 pins: closure parameters typed through generic iterable chains
 /// (`m.values.map((n) => …)`, an in-package getter's `List<E>` face) bind
 /// from the chain's element — the nullable element fires the
