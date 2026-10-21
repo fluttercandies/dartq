@@ -314,6 +314,168 @@ impl<'a> Engine<'a> {
             || (self.strings.resolve(member) == "new" && found.has_unnamed_constructor)
     }
 
+    /// The extension-element uses the resolve-side credit never records
+    /// (#2465), re-attributed onto the element key the consume arms check
+    /// (`extension_member_used`). Two derivations:
+    ///
+    /// The SELF-USE arm: inside an extension body a bare reference or an
+    /// explicit `this.m` access resolves against the extension's OWN member
+    /// scope first (the enclosing container's member walk answers before
+    /// the `on` face — the oracle's implicit-`this` lookup), so the
+    /// resolved row names the extension as its owner
+    /// (`RefTarget::Member`/`Receiver::This` carry the extension). The
+    /// oracle's element model records that use on the member element
+    /// (`usedElements.members`), but the application credit only runs on
+    /// member ACCESSES, never on the body's own scope resolutions — the
+    /// census's implicit-`this` shapes (`_nameTokens`, `_writeElement`)
+    /// over-reported. The container spelling names the face; the empty
+    /// spelling is the unnamed faces' shared key, so every same-file
+    /// unnamed face declaring the member takes the credit (the
+    /// sibling-same-spelling corner stays unmodelable at the recorded
+    /// granularity).
+    ///
+    /// The UNIVERSAL-`on`-TYPE arm: a face whose `on` type's head is the
+    /// face's own type parameter (`extension<T> on T` / `on T?`) applies to
+    /// every valid receiver in the oracle — the application instantiates
+    /// the parameter to the receiver's type — but the name-level
+    /// reachability probe can never walk into a type parameter, so
+    /// `extension_application` answered no candidates and the resolve-side
+    /// credit never fired (the `visitWithOverride`/`mapOrNull` rows). For a
+    /// member access whose recomputed instance-member walk missed (a real
+    /// member beats every extension) on a resolvable receiver, the face
+    /// whose member spelling is UNIQUE among the accessible faces is the
+    /// resolution the oracle reached; a second declarer would be the
+    /// ambiguous application that credits nothing and leaves every
+    /// candidate reporting.
+    fn credit_derived_extension_uses(&mut self) {
+        let Some(elements) = self.index.get(self.file) else {
+            return;
+        };
+        let faces = elements.extension_faces();
+        if faces.is_empty() {
+            return;
+        }
+        // Self-use arm: the same-file faces keyed by the container spelling
+        // the resolution rows record.
+        let empty = self.intern("");
+        let mut face_keys: FxHashMap<StringId, Vec<u32>> = FxHashMap::default();
+        for (index, face) in faces.iter().enumerate() {
+            if let Ok(index) = u32::try_from(index) {
+                face_keys.entry(face.name.unwrap_or(empty)).or_default().push(index);
+            }
+        }
+        let mut derived: FxHashSet<(FileId, u32, StringId)> = FxHashSet::default();
+        for unit_ref in &self.refs {
+            if let RefTarget::Member { container } = unit_ref.target {
+                self.note_extension_self_use(&face_keys, &mut derived, container, unit_ref.name);
+            }
+        }
+        for read in &self.member_reads {
+            if let Receiver::This { container, .. } = read.recv {
+                self.note_extension_self_use(&face_keys, &mut derived, container, read.name);
+            }
+        }
+        self.extension_member_used.extend(derived);
+        // Universal-`on`-type arm: the re-adjudicated accesses. The
+        // declarer count rides the whole accessible pool (own units +
+        // imports — the resolve-side ambiguity set), so the guard keeps the
+        // oracle's no-unique-resolution posture.
+        let faces: Vec<(&ExtensionFace, FileId)> = self.accessible_extension_faces().to_vec();
+        if faces.is_empty() {
+            return;
+        }
+        let mut declarers: FxHashMap<StringId, u32> = FxHashMap::default();
+        for (face, _) in &faces {
+            for spelling in face.members.keys() {
+                *declarers.entry(*spelling).or_default() += 1;
+            }
+        }
+        for read in self.member_reads.clone() {
+            let (head, ty) = match self.promoted_receiver(read.offset, read.recv) {
+                Receiver::Typed { type_name, ty, .. } => (type_name, ty),
+                Receiver::Created { name, .. } | Receiver::Container { name, .. } => {
+                    (name, Ty::UNKNOWN)
+                }
+                // `this`/`super` ride the self-use arm; a prefix namespace
+                // access and an unresolvable receiver keep the element
+                // posture (an unresolvable receiver resolves no member).
+                _ => continue,
+            };
+            if self.member_found(head, read.name, false) || self.ctor_found(head, read.name) {
+                continue;
+            }
+            let receiver_valid = !matches!(ty, Ty::Dynamic)
+                && if ty == Ty::UNKNOWN {
+                    self.type_resolution(head).0 == TypeResolution::Type
+                } else {
+                    self.extension_receiver_resolves(ty)
+                };
+            if !receiver_valid || declarers.get(&read.name).copied() != Some(1) {
+                continue;
+            }
+            let Some(&(face, face_file)) =
+                faces.iter().find(|(face, _)| face.members.contains_key(&read.name))
+            else {
+                continue;
+            };
+            // The face must be universal: its `on` type's head is its own
+            // type parameter — the one shape the reachability probe cannot
+            // decide and the oracle's instantiation always admits.
+            let universal = match face.on_ty {
+                Ty::Named { name, .. } => face.type_param_names.contains(&name),
+                _ => false,
+            };
+            if !universal {
+                continue;
+            }
+            if let Some(face_index) = self
+                .index
+                .get(face_file)
+                .and_then(|elements| {
+                    elements
+                        .extension_faces()
+                        .iter()
+                        .position(|entry| std::ptr::eq(entry, face))
+                })
+                .and_then(|index| u32::try_from(index).ok())
+            {
+                self.extension_member_used
+                    .insert((face_file, face_index, read.name));
+                self.credit_extension_import(face, face_file);
+            }
+        }
+    }
+
+    /// One self-use re-attribution: the container spelling keys the
+    /// same-file face(s), and the member must sit on the face under its
+    /// written or bare spelling. The credits land on the derived set the
+    /// caller folds into [`Engine::extension_member_used`].
+    fn note_extension_self_use(
+        &self,
+        face_keys: &FxHashMap<StringId, Vec<u32>>,
+        derived: &mut FxHashSet<(FileId, u32, StringId)>,
+        container: StringId,
+        member: StringId,
+    ) {
+        let Some(indices) = face_keys.get(&container) else {
+            return;
+        };
+        let Some(elements) = self.index.get(self.file) else {
+            return;
+        };
+        let faces = elements.extension_faces();
+        let bare = self.bare_name(member);
+        for index in indices {
+            let Some(face) = faces.get(*index as usize) else {
+                continue;
+            };
+            if face.members.contains_key(&member) || face.members.contains_key(&bare) {
+                derived.insert((self.file, *index, member));
+                derived.insert((self.file, *index, bare));
+            }
+        }
+    }
+
     /// The usage cluster's library-level pass, after every use is indexed:
     /// the declaration sites of this file walk against the use index (the
     /// official `UnusedLocalElementsVerifier`), then the import directives
@@ -321,6 +483,7 @@ impl<'a> Engine<'a> {
     /// Each arm's gate mirrors the official `_isUsed*` split; every
     /// unmodelable corner suppresses (the under-report direction).
     pub(crate) fn finalize_usage(&mut self) {
+        self.credit_derived_extension_uses();
         // The element-attributed use pool: `used_names` minus the member
         // spellings that only an unresolved access contributed (the
         // `Receiver::Unknown`/`Prefix` rows — an `InvalidType` or `dynamic`
@@ -372,7 +535,7 @@ impl<'a> Engine<'a> {
             // or getter that declares no return type reports. Setters are
             // exempt (`!node.isSetter`, and the getter visitor names
             // `TopLevelGetterDeclaration` only); local functions are the
-            // oracle's own TODO (its visit skips them) and members stay
+            // oracle's own open point (its visit skips them) and members stay
             // deferred — the override exemption needs the full supertype
             // walk M1's name edges cannot answer.
             if self.strict.inference
