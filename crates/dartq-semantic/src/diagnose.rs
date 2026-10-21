@@ -4440,6 +4440,8 @@ mod ticket_2485_tests;
 /// field's declared type while the neighboring `absoluteFilePath:` slot
 /// keeps enforcing `String`.
 #[cfg(test)]
+mod ticket_2472_tests;
+
 /// The #2484 pins: the listener-family residual batch (#2478/#2480) — the
 /// super/redirect initializer argument lists scan under the const
 /// constructor's `CtorScope` (a formal passed through `: super(f)` is
@@ -4451,3 +4453,6 @@ mod ticket_2485_tests;
 /// literal context alone.
 #[cfg(test)]
 mod ticket_2484_tests;
+
+#[cfg(test)]
+mod probe2471_tests;

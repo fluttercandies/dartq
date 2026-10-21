@@ -335,6 +335,14 @@ struct Builder<'src, 'tab> {
     pending_ctor_formals: Option<(StringId, Option<Box<Formals>>)>,
     /// Formal-nesting depth; the executable's own group is depth 1.
     formal_depth: u32,
+    /// The open default-value expression's nesting depth
+    /// (`begin_formal_parameter_default_value_expression` raises,
+    /// `end_formal_parameter_default_value_expression` lowers). Type
+    /// references inside a default (`this.headers = const <String,
+    /// String>{}`) are expression type arguments, never the formal's
+    /// annotation — arming them would leave the literal's last type
+    /// argument in the armed slot the formal's take consumes.
+    formal_default_depth: u32,
     positional_formals: Vec<Formal>,
     named_formals: Vec<Formal>,
     /// The current type-parameter list's nesting depth (the executable's
@@ -459,6 +467,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             factory_ctor_head: None,
             pending_ctor_formals: None,
             formal_depth: 0,
+            formal_default_depth: 0,
             positional_formals: Vec::new(),
             named_formals: Vec::new(),
             type_group_depth: 0,
@@ -1732,30 +1741,46 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // The head's own group (if any) closed before this completion;
         // the slot is consumed either way.
         builder.pending_type_head = None;
+        // A default-value expression's type references are argument
+        // positions, not the formal's annotation: arming them would leave
+        // the literal's last type argument in the armed slot
+        // (`end_formal_parameter` takes after the default parsed), and the
+        // captured formal would carry it (`this.headers = const <String,
+        // String>{}` capturing `String`). The annotation itself armed
+        // before the name and survives the window.
+        let in_default = builder.formal_default_depth > 0;
         // The #610 capture, collector-side: the completing head merges
         // into the open site's root (the re-fired parameterized head
         // carries the trailing `?`), and a single-root tree arms beside
         // the type for the consuming declaration to intern.
-        builder.armed_tree = spelling.and_then(|spelling| {
-            let range = match question {
-                Some(q) => SourceRange {
-                    offset: name.range.offset,
-                    length: q.range.end() - name.range.offset,
+        builder.armed_tree = if in_default {
+            None
+        } else {
+            spelling.and_then(|spelling| {
+                let range = match question {
+                    Some(q) => SourceRange {
+                        offset: name.range.offset,
+                        length: q.range.end() - name.range.offset,
+                    },
+                    None => name.range,
+                };
+                builder.complete_type_site(spelling, question.is_some(), range)
+            })
+        };
+        builder.armed_ty = if in_default {
+            None
+        } else {
+            spelling.map(|spelling| match builder.strings.resolve(spelling) {
+                "dynamic" => Ty::Dynamic,
+                "void" => Ty::Void,
+                "Null" => Ty::Null,
+                _ => Ty::Named {
+                    name: spelling,
+                    nullable: question.is_some(),
+                    args: ArgListId::EMPTY,
                 },
-                None => name.range,
-            };
-            builder.complete_type_site(spelling, question.is_some(), range)
-        });
-        builder.armed_ty = spelling.map(|spelling| match builder.strings.resolve(spelling) {
-            "dynamic" => Ty::Dynamic,
-            "void" => Ty::Void,
-            "Null" => Ty::Null,
-            _ => Ty::Named {
-                name: spelling,
-                nullable: question.is_some(),
-                args: ArgListId::EMPTY,
-            },
-        });
+            })
+        };
         // The extension on-latch carries the written type's nullability:
         // the header window is still open here (the latch's own
         // `note_header_reference` never sees the `?`), and the completing
@@ -1778,20 +1803,30 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         let builder = &mut self.builder;
         // A `void` type argument (`List<void>`) is a leaf of the open
         // capture like any named head; outside a capture a stale tree
-        // cannot survive the arm.
+        // cannot survive the arm. A default-value window's leaves arm
+        // nothing (the same posture [`Self::handle_type`] keeps).
         let void_id = builder.strings.intern("void");
+        let in_default = builder.formal_default_depth > 0;
         if let Some(site) = builder.capture.as_mut() {
             site.leaf(void_id, false, token.range);
         } else {
             builder.armed_tree = None;
         }
-        builder.armed_ty = Some(Ty::Void);
+        builder.armed_ty = (!in_default).then_some(Ty::Void);
     }
 
     fn handle_void_keyword_with_type_arguments(&mut self, _token: Token) {
         let builder = &mut self.builder;
         builder.armed_tree = None;
-        builder.armed_ty = Some(Ty::Void);
+        builder.armed_ty = (builder.formal_default_depth == 0).then_some(Ty::Void);
+    }
+
+    fn begin_formal_parameter_default_value_expression(&mut self, _token: Token) {
+        self.builder.formal_default_depth += 1;
+    }
+
+    fn end_formal_parameter_default_value_expression(&mut self, _token: Token) {
+        self.builder.formal_default_depth = self.builder.formal_default_depth.saturating_sub(1);
     }
 
     fn begin_type_arguments(&mut self, _token: Token) {

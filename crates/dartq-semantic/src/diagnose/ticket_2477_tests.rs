@@ -159,7 +159,7 @@ fn undefined_scrutinee_switch_reports_body_might() {
     );
     if let Some(expected) = name_offset {
         assert!(
-            might.iter().any(|&(offset, _)| offset == expected),
+            might.iter().any(|&(offset, _)| offset == expected as u32),
             "body_might anchors at the declaring name at {expected}: {might:?}"
         );
     }

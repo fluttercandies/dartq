@@ -1684,6 +1684,101 @@ impl<'a> Engine<'a> {
         self.utf16_of(cursor)
     }
 
+    /// The creation head a written type-argument group separates from its
+    /// argument list (`const C<T>(...)`, `new C<T>(...)`): the identifier
+    /// before the balanced `<…>`, under the same guards
+    /// [`Engine::bare_creation_head_name`] applies (ASCII identifier shape,
+    /// no selector `.` left of it — the named-selector spellings
+    /// (`C<T>.named(`) answer through [`Engine::creation_class_before`]
+    /// instead). `None` when no balanced group sits between the head and
+    /// the paren — the strict-adjacency fallback
+    /// ([`Engine::bare_creation_head_before`]) owns the no-group shape.
+    fn type_arg_creation_head_before(&self, open: u32) -> Option<(StringId, SourceRange)> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(open);
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor == 0 || bytes[cursor - 1] != b'>' {
+            return None;
+        }
+        let mut depth = 0usize;
+        loop {
+            if cursor == 0 {
+                return None;
+            }
+            cursor -= 1;
+            match bytes[cursor] {
+                b'>' => depth += 1,
+                b'<' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        let end = cursor;
+        while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_')
+        {
+            cursor -= 1;
+        }
+        if cursor == end {
+            return None;
+        }
+        // The head is ASCII, so its UTF-16 length is its byte length.
+        let range = SourceRange {
+            offset: self.utf16_of(cursor),
+            length: self.utf16_of(end) - self.utf16_of(cursor),
+        };
+        let name = self.bare_creation_head_name(range)?;
+        Some((name, range))
+    }
+
+    /// The UTF-16 offset just after the balanced `<…>` group a creation
+    /// head writes before its argument list — the anchor the
+    /// written-argument parse reads the group's segments against (the
+    /// group's `>` is the byte before it). `None` when the first
+    /// non-trivia bytes after `from` are not a balanced group closed
+    /// directly by the argument list's `(`.
+    fn type_arg_group_end(&self, from: u32) -> Option<u32> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(from);
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() || bytes[cursor] != b'<' {
+            return None;
+        }
+        let mut depth = 0usize;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+        if depth != 0 {
+            return None;
+        }
+        cursor += 1;
+        let mut probe = cursor;
+        while probe < bytes.len() && bytes[probe].is_ascii_whitespace() {
+            probe += 1;
+        }
+        (probe < bytes.len() && bytes[probe] == b'(').then_some(self.utf16_of(cursor))
+    }
+
     pub(crate) fn open_arguments(&mut self, open_offset: u32) {
         // F-C: an argument group right after a folded `super.` selector arms
         // the same invocation flag the merge's source peek set — this rider
@@ -1839,6 +1934,7 @@ impl<'a> Engine<'a> {
         let bare_head = if callee.is_none() {
             self.bare_creation_head_before(open_offset)
                 .or_else(|| self.named_selector_head_before(open_offset))
+                .or_else(|| self.type_arg_creation_head_before(open_offset))
         } else {
             None
         };
@@ -1975,6 +2071,32 @@ impl<'a> Engine<'a> {
                     length: close.end().saturating_sub(head_range.offset),
                 };
                 self.ur_register_creation(head_range.offset, range, head);
+                // The written type arguments instantiate the created type
+                // (upstream Dart SDK source,
+                // pkg/analyzer/lib/src/generated/resolver.dart,
+                // visitInstanceCreationExpression — the static type is the
+                // constructor's return with the resolved type arguments):
+                // `const ListEquality<Attr>().hash(...)` resolves `hash` on
+                // `ListEquality<Attr>`, never on the enclosing context's
+                // face. A group the segment parser cannot spell (a
+                // function-typed argument) keeps the raw head — the
+                // under-report posture the no-group spelling shares.
+                let ty = self
+                    .type_arg_group_end(head_range.end())
+                    .and_then(|group_end| {
+                        let token = Token {
+                            id: 0,
+                            range: SourceRange {
+                                offset: group_end,
+                                length: 1,
+                            },
+                        };
+                        self.literal_group_args(token)
+                    })
+                    .map_or_else(
+                        || Ty::named(head),
+                        |args| self.boundary.args.borrow_mut().named(head, false, &args),
+                    );
                 self.rows.push(Row {
                     name: head,
                     range,
@@ -1985,7 +2107,7 @@ impl<'a> Engine<'a> {
                     }),
                     intent: Intent::Read,
                     write_op: None,
-                    ty: Ty::named(head),
+                    ty,
                 });
             }
         }
