@@ -1221,6 +1221,22 @@ impl Interp<'_> {
                         {
                             meta.ty = rhs.ty;
                             meta.args = rhs.args;
+                        } else if rhs.this_recv
+                            && matches!(rhs.ty.base, crate::ty::Base::Name(_))
+                        {
+                            // The `this`-initializer face adopts whole even
+                            // non-nullable: the staged read is the same
+                            // answer the type layer computes for `this`
+                            // (the enclosing container, an extension's
+                            // written `on` type — argument-bearing
+                            // spellings drop to the bare head the flow
+                            // lattice spells), not a fold guess — the
+                            // official `_inferLocalVariable` types
+                            // `final that = this;` with `this`'s own
+                            // static type, and the switch-end
+                            // exhaustiveness verdict reads it.
+                            meta.ty = rhs.ty;
+                            meta.args = rhs.args;
                         } else if rhs.ty.base == crate::ty::Base::Unknown {
                             meta.ty = Ty::UNKNOWN_NULLABLE;
                         }

@@ -4472,3 +4472,12 @@ mod ticket_2489_tests;
 /// pattern), while send-position arity keeps every adjacent-head anchor.
 #[cfg(test)]
 mod ticket_2491_tests;
+
+/// The #2471 pins: the switch return-exhaustiveness face
+/// `body_might_complete_normally` reads — a switch over a sealed
+/// scrutinee whose every case returns cannot complete normally. The
+/// generic-extension `this` scrutinee closes through the recorder's
+/// `on`-type head capture; the open-scrutinee reporting direction and
+/// the plain-method/non-generic keep-greens guard the capture's edges.
+#[cfg(test)]
+mod ticket_2471_tests;

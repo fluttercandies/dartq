@@ -185,6 +185,18 @@ pub struct Flow<'t> {
     /// that switches over it is captured too late — the verdict
     /// under-reports there.
     closed: crate::ty::ClosedNames,
+    /// The written `on`-type head of the extension header now parsing:
+    /// `(interned head id, written-? flag)` — the last depth-0
+    /// [`ParserListener::handle_type`] before the body opens (the header's
+    /// primary-constructor parameter types arrive first, the on-type's own
+    /// type arguments nest at depth 1, so the last depth-0 head is the
+    /// `on` clause's). `None` outside extension headers.
+    extension_on_head: Option<(u32, bool)>,
+    /// Whether the type annotations still arriving belong to an extension
+    /// header (`begin_extension_declaration` opens,
+    /// [`ParserListener::begin_class_or_mixin_or_extension_body`] /
+    /// `handle_no_extension_body` / `end_extension_declaration` close).
+    in_extension_header: bool,
     /// The resolved type-operations back-end ([`crate::ty::TypeOps`]) the
     /// consumer mounts through [`Flow::set_ops`] before the parse — the
     /// official `FlowAnalysisTypeOperations` slot. `None` keeps the
@@ -236,6 +248,8 @@ impl<'t> Flow<'t> {
             inferred_locals: FxHashMap::default(),
             staged_rhs: FxHashMap::default(),
             staged_this: FxHashMap::default(),
+            extension_on_head: None,
+            in_extension_header: false,
             pending_label_ref: None,
             pending_labels: Vec::new(),
             pending_label_token: None,
@@ -1027,6 +1041,12 @@ impl ParserListener for Flow<'_> {
         _extension_keyword: Token,
         _name: Option<Token>,
     ) {
+        // The header's type annotations now arriving race for the on-type
+        // latch (see [`Flow::extension_on_head`]): the primary
+        // constructor's parameter types arrive first, the on-type's head
+        // is the last depth-0 head before the body opens.
+        self.in_extension_header = true;
+        self.extension_on_head = None;
         self.container_depth += 1;
     }
 
@@ -1038,6 +1058,18 @@ impl ParserListener for Flow<'_> {
         _end: Token,
     ) {
         self.container_depth = self.container_depth.saturating_sub(1);
+        self.in_extension_header = false;
+        self.extension_on_head = None;
+    }
+
+    fn begin_class_or_mixin_or_extension_body(&mut self, kind: DeclarationKind, _token: Token) {
+        if kind == dartq_parser::DeclarationKind::Extension {
+            self.in_extension_header = false;
+        }
+    }
+
+    fn handle_no_extension_body(&mut self, _semicolon: Token) {
+        self.in_extension_header = false;
     }
 
     fn begin_extension_type_declaration(
@@ -1364,6 +1396,17 @@ impl ParserListener for Flow<'_> {
         // argument groups, and after any nested function-type capture).
         if self.type_arg_groups.is_empty() && self.tv_capturing() {
             self.capture_bound_type(base, nullable, args);
+        }
+        // The extension header's on-type latch (see
+        // [`Flow::extension_on_head`]): only depth-0 heads race — the
+        // on-type's own type arguments nest inside their group — and only
+        // a plain named head feeds the `this` staging (a `dynamic`/`void`/
+        // `Never`/`Null` head answers nothing the verdict reads).
+        if self.in_extension_header
+            && self.type_arg_groups.is_empty()
+            && let crate::ty::Base::Name(head) = base
+        {
+            self.extension_on_head = Some((head, nullable));
         }
     }
 
@@ -2082,6 +2125,30 @@ impl ParserListener for Flow<'_> {
 
     fn handle_this_expression(&mut self, token: Token, _context: IdentifierContext) {
         self.record(Ev::This { span: token });
+        // The extension on-type face (see [`Flow::extension_on_head`]):
+        // `this` inside an extension member reads the written `on` type
+        // (upstream Dart SDK source,
+        // pkg/analyzer/lib/src/dart/element/extension_member.dart,
+        // `ExtensionImpl.extendedType`). The mounted consumer stages the
+        // same answer through [`Flow::stage_this_type`] when the type is
+        // name-level spellable — but an argument-bearing `on` spelling
+        // (`extension E<T> on A<T>`) drops there, and the flow lattice
+        // still needs the HEAD: the switch-end exhaustiveness verdict is
+        // an element question (`TypeSystem.isAlwaysExhaustive`'s sealed
+        // arm reads the declaration, not its arguments — the nullability
+        // half is the space model's). Fill only the gap: a first-writer
+        // map keeps the consumer's staged entry, and only a non-nullable
+        // head stages (a nullable `on` type keeps the unknown-read
+        // posture — the nullable face would arm null-dereference rows
+        // this capture cannot answer for).
+        if let Some((head, false)) = self.extension_on_head {
+            self.staged_this
+                .entry(token.range.offset)
+                .or_insert(crate::ty::Ty {
+                    base: crate::ty::Base::Name(head),
+                    nullable: false,
+                });
+        }
     }
 
     fn handle_super_expression(&mut self, token: Token, _context: IdentifierContext) {
