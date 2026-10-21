@@ -192,6 +192,36 @@ fn classic_for_loop() {
 }
 
 #[test]
+fn classic_for_comma_init_recovery_triple() {
+    // Ticket #2418 shape: `for (a == s, c = 0; ...)` — the initializer's
+    // first segment parses as an expression, then `parseForLoopPartsRest`
+    // reports the missing `;` anchored on the segment's last token
+    // (`ensureSemicolon` → `findPreviousNonZeroLengthToken`,
+    // parser_impl.dart:5093-5112), the comma can't begin the condition
+    // expression so its identifier template reports `missing_identifier`
+    // and splices a synthetic name (identifier_context_impl.dart
+    // `ExpressionIdentifierContext.ensureIdentifier` — the comma is on
+    // the do-not-consume exemption list), and the parts stall at the
+    // real `;` which is reported as unexpected before the cursor jumps
+    // to the `(` group's closer (:10369-10373). Exactly the oracle's
+    // three rows, in order; a fourth row of either family means the
+    // recovery looped.
+    let c = parse(
+        "void f(int a, int c, String s) {\n  for (a == s, c = 0; c < 1; c++) {\n    c = 1;\n  }\n}\n",
+    );
+    assert_eq!(
+        c.errors,
+        vec![
+            ("expected_token".to_string(), 45, 46),
+            ("missing_identifier".to_string(), 46, 47),
+            ("unexpected_token".to_string(), 53, 54),
+        ],
+        "oracle triple: `;` at `s`, identifier at the comma, unexpected `;`"
+    );
+    c.assert_sequence(&[("begin", "for_statement"), ("end", "for_statement")]);
+}
+
+#[test]
 fn empty_for_loop() {
     let c = parse("void f() { for (;;) { break; } }");
     assert!(c.errors.is_empty(), "{:?}", c.errors);

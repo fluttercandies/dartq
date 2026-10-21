@@ -1143,3 +1143,74 @@ fn unnecessary_lambdas_silent_faces() {
         );
     }
 }
+
+/// The comma-init recovery faces (ticket #2418; oracle probe 14:8:6): the
+/// recovered classic-`for` header reports every effect-free segment. The
+/// oracle's parser recovery splices a synthetic `;` after the first
+/// segment (upstream Dart SDK source,
+/// pkg/_fe_analyzer_shared/lib/src/parser/parser_impl.dart,
+/// `parseForLoopPartsRest` → `ensureSemicolon`, :10344-10349) and the
+/// trailing comma list parses as the updater list, so the upstream walk
+/// (pkg/linter/lib/src/rules/unnecessary_statements.dart :209-217) reads
+/// the first segment off `initialization` and each later segment off
+/// `updaters` — dartq's `check_for` window split (content end at the
+/// spliced separator, rows from the separator payload tokens) lands the
+/// same segments in the same walks. Assignments and postfix steps stay
+/// silent, and the real header condition past the recovery stays silent
+/// (the oracle's recovery drops it — only the synthesized condition
+/// remains in the visited `ForPartsWithExpression`).
+#[test]
+fn unnecessary_statements_comma_init_recovery_faces() {
+    // The expression-led list reports the first segment at the whole
+    // expression (`a == s`, len 6 — oracle 14:8:6); the recovered `c = 0`
+    // assignment stays silent.
+    let source =
+        "void f(int a, int c, String s) {\n  for (a == s, c = 0; c < 1; c++) {\n    c = 1;\n  }\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    assert_eq!(lints[0].range.start, utf16_at(&f, tok(source, &f.tokens, "a", 1)));
+    assert_eq!(lints[0].range.end, utf16_at(&f, tok(source, &f.tokens, "s", 1)) + 1);
+
+    // An assignment-led list reports the trailing expression segment only
+    // (oracle w.dart 2:15).
+    let source =
+        "void f(int a, int c, String s) {\n  for (c = 0, a == s; c < 1; c++) {\n    c = 1;\n  }\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    assert_eq!(lints[0].range.start, utf16_at(&f, tok(source, &f.tokens, "a", 1)));
+    assert_eq!(lints[0].range.end, utf16_at(&f, tok(source, &f.tokens, "s", 1)) + 1);
+
+    // Both expression segments of a recovered list report, in order
+    // (oracle multi.dart 2:8 + 2:16): the second via the updater walk.
+    let source = "void f(int a, int b, int c, String s) {\n  for (a == s, b == a, c = 0; c < 1; c++) {\n    c = 1;\n  }\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 2, "{lints:?}");
+    let f = Fixture::parse(source);
+    assert_eq!(lints[0].range.start, utf16_at(&f, tok(source, &f.tokens, "a", 1)));
+    assert_eq!(lints[1].range.start, utf16_at(&f, tok(source, &f.tokens, "b", 1)));
+
+    // The real header condition past the recovery stays silent — the
+    // oracle drops it (only the synthesized condition joins the recovered
+    // `ForPartsWithExpression`), so the second `a == s` never reports
+    // (oracle w.dart w3 shape: one lint at the initialization, none at the
+    // condition).
+    let source =
+        "void f(int a, int c, String s) {\n  for (a == s, c = 0; a == s, c = 1; c++) {\n    c = 1;\n  }\n}\n";
+    let lints = run_semantic(source, "unnecessary_statements");
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let f = Fixture::parse(source);
+    assert_eq!(lints[0].range.start, utf16_at(&f, tok(source, &f.tokens, "a", 1)));
+
+    // Silent controls: an assignment-only comma list and a postfix step
+    // init report nothing (oracle: `c = 0, a = 0` and `a++, c = 0` carry
+    // clear effects).
+    for source in [
+        "void f(int c, int a) {\n  for (c = 0, a = 0; c < 1; c++) {\n    c = 1;\n  }\n}\n",
+        "void f(int a, int c) {\n  for (a++, c = 0; c < 1; c++) {\n    c = 1;\n  }\n}\n",
+    ] {
+        let lints = run_semantic(source, "unnecessary_statements");
+        assert!(lints.is_empty(), "{source}: {lints:?}");
+    }
+}
