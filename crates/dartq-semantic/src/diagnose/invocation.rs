@@ -2601,12 +2601,12 @@ impl<'a> Engine<'a> {
         recv: &Receiver,
         member: StringId,
     ) -> Option<(Box<[(StringId, Option<Ty>)]>, Vec<(StringId, Ty)>)> {
-        let (container, recv_ty) = match *recv {
-            Receiver::Typed { type_name, ty } => (type_name, Some(ty)),
-            Receiver::This { container, .. } => (container, None),
+        let (container, kind, recv_ty) = match *recv {
+            Receiver::Typed { type_name, ty } => (type_name, ContainerKind::Class, Some(ty)),
+            Receiver::This { container, kind } => (container, kind, None),
             _ => return None,
         };
-        let Walk::Found(entry) = self.walk_members(container, member) else {
+        let Walk::Found(entry) = self.bare_member_walk(container, kind, member) else {
             return None;
         };
         if entry.kind != MemberKind::Method {
@@ -2991,6 +2991,19 @@ impl<'a> Engine<'a> {
         let Ty::Named { name, .. } = ty else {
             return false;
         };
+        if let Some(verdict) = self.prefix_head_memo.borrow().get(&name) {
+            return *verdict;
+        }
+        let verdict = self.prefix_head_walk(name);
+        self.prefix_head_memo.borrow_mut().insert(name, verdict);
+        verdict
+    }
+
+    /// The unmemoized [`Engine::prefix_head_ty`] walk: the namespaces
+    /// probe, the `name_resolvable` probe, then the prefix-name set —
+    /// assembled once from every library's import edges (the O(L+E) scan
+    /// the per-call walk used to pay).
+    fn prefix_head_walk(&self, name: StringId) -> bool {
         if matches!(
             self.namespaces.lookup(self.graph, self.lib, name),
             dartq_resolution::Lookup::Found(NamespaceEntry::Prefix)
@@ -3000,12 +3013,15 @@ impl<'a> Engine<'a> {
         if self.name_resolvable(name) {
             return false;
         }
-        self.graph.libraries().any(|lib| {
-            self.graph
-                .import_edges(lib)
-                .iter()
-                .any(|edge| edge.prefix == Some(name))
-        })
+        self.prefix_names
+            .get_or_init(|| {
+                self.graph
+                    .libraries()
+                    .flat_map(|lib| self.graph.import_edges(lib).iter())
+                    .filter_map(|edge| edge.prefix)
+                    .collect()
+            })
+            .contains(&name)
     }
 
     /// Whether `name` denotes any type the diagnosing file can spell: a
@@ -3890,9 +3906,12 @@ impl<'a> Engine<'a> {
     /// never build on (`typedef DioMediaType = MediaType;` with the RHS
     /// unresolved — the head is a type, not a value, so the oracle's plain
     /// method invocation reports `invocation_of_non_function` at the head,
-    /// element_resolver.dart's function-invocation face). `true` when the
-    /// row emitted and the miss handler must stay silent; `false` leaves
-    /// the latch to [`Engine::report_bare_creation_miss`].
+    /// element_resolver.dart's function-invocation face). A `const` head
+    /// takes the creation face instead: `const Alias()` reports
+    /// `creation_with_non_type` naming the alias (`instance_creation_
+    /// resolver`'s non-type face). `true` when the row emitted and the
+    /// miss handler must stay silent; `false` leaves the latch to
+    /// [`Engine::report_bare_creation_miss`].
     pub(crate) fn report_alias_invocation_of_non_function(&mut self) -> bool {
         let Some((name, range)) = self.pending_bare_creation else {
             return false;
@@ -3909,8 +3928,135 @@ impl<'a> Engine<'a> {
             return false;
         }
         let name_text = self.strings.resolve(name).to_string();
-        self.emit(SemanticCode::InvocationOfNonFunction, range, &name_text, "");
+        if self.creation_head_is_const(range.offset) {
+            self.emit(SemanticCode::CreationWithNonType, range, &name_text, "");
+        } else {
+            self.emit(SemanticCode::InvocationOfNonFunction, range, &name_text, "");
+        }
         true
+    }
+
+    /// The dot-preceded latch head that names an ungrounded type alias
+    /// (`Alias.named()` over `typedef Alias = shared.Foreign<Node>;`):
+    /// the oracle resolves the selector against the alias's `Type` face —
+    /// `The method 'named' isn't defined for the type 'Type'.` at the
+    /// selector — and a `const` head takes the creation face at the alias
+    /// spelling instead (`creation_with_non_type`). Every other
+    /// dot-preceded head keeps its existing fold.
+    ///
+    /// The latch holds the selector (`named` at its own range); the class
+    /// segment the selector hangs off is re-derived from the spelling
+    /// ([`Engine::creation_class_before`]), which also skips a balanced
+    /// `<…>` group (`Gen<int>.named(`).
+    pub(crate) fn report_alias_selector_face(&mut self) {
+        let Some((selector, selector_range)) = self.pending_bare_creation else {
+            return;
+        };
+        let Some((name, name_start)) = self.creation_class_before(selector_range) else {
+            return;
+        };
+        if !matches!(
+            self.top_level_decl(name).as_deref(),
+            Some(decl) if decl.kind == MicroKind::TypeAlias
+        ) {
+            return;
+        }
+        if self.alias_creation_grounded(name, 0) {
+            return;
+        }
+        if self.creation_head_is_const(name_start) {
+            let name_text = self.strings.resolve(name).to_string();
+            let range = SourceRange {
+                offset: name_start,
+                length: name_text.len() as u32,
+            };
+            self.emit(SemanticCode::CreationWithNonType, range, &name_text, "");
+            return;
+        }
+        let selector_text = self.strings.resolve(selector).to_string();
+        self.emit(
+            SemanticCode::UndefinedMethod,
+            selector_range,
+            &selector_text,
+            "Type",
+        );
+    }
+
+    /// Whether the head at the UTF-16 `offset` is written after the `const`
+    /// keyword (trivia may intervene): `const Alias()` marks the creation
+    /// const. `const` is reserved, so an identifier run spelling `const`
+    /// before a creation head is always the keyword.
+    fn creation_head_is_const(&self, offset: u32) -> bool {
+        let bytes = self.source.as_bytes();
+        let mut at = self.byte_of(offset);
+        while at > 0 && bytes[at - 1].is_ascii_whitespace() {
+            at -= 1;
+        }
+        let end = at;
+        while at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
+            at -= 1;
+        }
+        end - at == 5 && &bytes[at..end] == b"const"
+    }
+
+    /// The import prefix the head at the UTF-16 `offset` is written behind
+    /// (`shared.Foreign` — a dot before the head across trivia), with the
+    /// prefix identifier's run start. `None` for a bare head.
+    fn written_prefix_before(&self, offset: u32) -> Option<(StringId, u32)> {
+        let bytes = self.source.as_bytes();
+        let mut at = self.byte_of(offset);
+        while at > 0 && bytes[at - 1].is_ascii_whitespace() {
+            at -= 1;
+        }
+        if at == 0 || bytes[at - 1] != b'.' {
+            return None;
+        }
+        at -= 1;
+        while at > 0 && bytes[at - 1].is_ascii_whitespace() {
+            at -= 1;
+        }
+        let end = at;
+        while at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
+            at -= 1;
+        }
+        if at == end {
+            return None;
+        }
+        let text = self.source.get(at..end)?;
+        Some((self.strings.intern(text), self.utf16_of(at)))
+    }
+
+    /// The `(prefix, real head)` pair of a captured alias RHS written
+    /// `p.C<…>`: the capture's first leaf is the spelling's first token —
+    /// the prefix for a qualified name (`handle_type` completes on it and
+    /// the `TypeReferenceContinuation` joins no leaf, so a non-generic
+    /// `p.C` keeps only the `p` leaf). A `.`+identifier read straight off
+    /// the source after the head token splits the pair; a bare head or a
+    /// generic head whose tree names the real class already returns
+    /// `None` (the unprefixed walk handles it).
+    fn prefixed_alias_head(&self, tree: &crate::capture::TypeTree) -> Option<(StringId, StringId)> {
+        let bytes = self.source.as_bytes();
+        let mut at = self.byte_of(tree.range.offset)
+            + self.strings.resolve(tree.head).len();
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        if at >= bytes.len() || bytes[at] != b'.' {
+            return None;
+        }
+        at += 1;
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        let start = at;
+        while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+            at += 1;
+        }
+        if at == start {
+            return None;
+        }
+        let real = self.source.get(start..at)?;
+        Some((tree.head, self.strings.intern(real)))
     }
 
     /// Whether the bare creation `name(...)` can build on the alias chain:
@@ -3929,6 +4075,33 @@ impl<'a> Engine<'a> {
             None => self.bounds.alias_fn_shape(name).is_none(),
             Some((_, tree)) if depth < 8 => {
                 let head = tree.head;
+                // A head written behind an import prefix (`typedef Alias =
+                // shared.Foreign<Node>;`) grounds only through that
+                // prefix's namespace — the bare-name walk never sees the
+                // aliased class (`io.File` grounds, `shared.Foreign` with
+                // an empty prefix namespace does not). Two spellings the
+                // capture stores: a generic RHS keeps the real head's
+                // tree (`Foreign<Node>`) whose token a dot + identifier
+                // BEFORE it qualifies; a non-generic `p.C` keeps only the
+                // prefix leaf (`handle_type` completes on the prefix, the
+                // continuation joins no leaf) whose real head the dot +
+                // identifier AFTER it carries. The spelling decides the
+                // split either way.
+                let pair = self
+                    .written_prefix_before(tree.range.offset)
+                    .map(|(prefix, _)| (prefix, head))
+                    .or_else(|| self.prefixed_alias_head(tree));
+                if let Some((prefix, real)) = pair {
+                    return prefixed_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        prefix,
+                        real,
+                    )
+                    .is_some();
+                }
                 if resolve_container(
                     self.graph,
                     self.namespaces,
@@ -4003,11 +4176,87 @@ impl<'a> Engine<'a> {
                 let start = self.byte_of(range.offset);
                 start > 0 && self.source.as_bytes()[start - 1] == b'.'
             });
-            if !dot_preceded && !self.report_alias_invocation_of_non_function() {
+            if dot_preceded {
+                self.report_alias_selector_face();
+            } else if !self.report_alias_invocation_of_non_function() {
                 self.report_bare_creation_miss();
             }
             return;
         };
+        // The resolved-typedef send faces (#2452 F4): a callee row spelling
+        // a type alias whose RHS grounds nothing. The empty-invokes latch
+        // above cannot reach these — the typedef pushes a resolved callee
+        // row — so the row-shape arm decides here.
+        //
+        // - `Alias(...)`: the oracle's function-invocation face reports
+        //   `invocation_of_non_function` at the alias spelling ('Alias'
+        //   isn't a function); a `const` head takes the creation face
+        //   `creation_with_non_type` instead.
+        // - `Alias.named(...)`: the selector resolves against the alias's
+        //   `Type` face — `undefined_method` at `named` — and a `const`
+        //   head reports `creation_with_non_type` at the class segment.
+        //
+        // A grounded alias (its RHS resolves a class through the bare or
+        // prefixed namespace) is a plain creation and keeps its existing
+        // fold.
+        {
+            let alias_head: Option<(StringId, SourceRange, bool)> = self
+                .rows
+                .get(callee)
+                .and_then(|row| {
+                    if row.qualified {
+                        // `Alias.named(` — the selector callee: the class
+                        // segment is the row directly below.
+                        let head = callee
+                            .checked_sub(1)
+                            .and_then(|index| self.rows.get(index))?;
+                        (head.range.end() <= row.range.offset
+                            && !head.qualified
+                            && matches!(head.shape, RowShape::Bare(BareInfo::Plain { .. }))
+                            && matches!(
+                                self.top_level_decl(head.name).as_deref(),
+                                Some(decl) if decl.kind == MicroKind::TypeAlias
+                            )
+                            && !self.alias_creation_grounded(head.name, 0))
+                        .then_some((head.name, head.range, false))
+                    } else if matches!(row.shape, RowShape::Bare(BareInfo::Plain { .. }))
+                        && matches!(
+                            self.top_level_decl(row.name).as_deref(),
+                            Some(decl) if decl.kind == MicroKind::TypeAlias
+                        )
+                        && !self.alias_creation_grounded(row.name, 0)
+                    {
+                        Some((row.name, row.range, true))
+                    } else {
+                        None
+                    }
+                });
+            if let Some((name, head_range, bare)) = alias_head {
+                let const_head = self.creation_head_is_const(head_range.offset);
+                let name_text = self.strings.resolve(name).to_string();
+                if const_head {
+                    self.emit(SemanticCode::CreationWithNonType, head_range, &name_text, "");
+                    return;
+                }
+                if !bare
+                    && let Some(selector) = self.rows.get(callee)
+                {
+                    let selector_text = self.strings.resolve(selector.name).to_string();
+                    self.emit(
+                        SemanticCode::UndefinedMethod,
+                        selector.range,
+                        &selector_text,
+                        "Type",
+                    );
+                }
+                // A bare non-const head reports through
+                // `check_invocation_face`'s spelled-alias leg — the same
+                // `invocation_of_non_function` at the same range — so
+                // this arm leaves it to fire downstream rather than
+                // double-reporting.
+                return;
+            }
+        }
         // The null-argument face runs before the row borrow opens (it
         // re-reads the rows itself and emits).
         self.check_null_argument(callee, &level.args);
@@ -4236,9 +4485,9 @@ impl<'a> Engine<'a> {
                     None => (!shadowed)
                         .then(|| self.container_context())
                         .flatten()
-                        .filter(|(container, _)| {
+                        .filter(|(container, kind)| {
                             matches!(
-                                self.walk_members(*container, row.name),
+                                self.bare_member_walk(*container, *kind, row.name),
                                 Walk::Found(entry) if entry.kind == MemberKind::Method
                             )
                         })
@@ -4258,8 +4507,11 @@ impl<'a> Engine<'a> {
                 // — but the top-level fallback must never lend its formals
                 // to a call the member already claimed.
                 let member_found = !shadowed
-                    && self.container_context().is_some_and(|(container, _)| {
-                        matches!(self.walk_members(container, row.name), Walk::Found(_))
+                    && self.container_context().is_some_and(|(container, kind)| {
+                        matches!(
+                            self.bare_member_walk(container, kind, row.name),
+                            Walk::Found(_)
+                        )
                     });
                 member_owns_callee = member_found;
                 let member_sig: Option<Box<FnVarSig>> = match member {
@@ -4268,20 +4520,22 @@ impl<'a> Engine<'a> {
                         .then(|| self.container_context())
                         .flatten()
                         .and_then(
-                            |(container, _)| match self.walk_members(container, row.name) {
-                                Walk::Found(entry) if entry.kind == MemberKind::Field => {
-                                    match self.fold_alias_ty(entry.var_ty) {
-                                        Ty::Named { name, .. } => Some(name),
-                                        _ => None,
+                            |(container, kind)| {
+                                match self.bare_member_walk(container, kind, row.name) {
+                                    Walk::Found(entry) if entry.kind == MemberKind::Field => {
+                                        match self.fold_alias_ty(entry.var_ty) {
+                                            Ty::Named { name, .. } => Some(name),
+                                            _ => None,
+                                        }
                                     }
-                                }
-                                Walk::Found(entry) if entry.kind == MemberKind::Getter => {
-                                    match self.fold_alias_ty(entry.return_ty) {
-                                        Ty::Named { name, .. } => Some(name),
-                                        _ => None,
+                                    Walk::Found(entry) if entry.kind == MemberKind::Getter => {
+                                        match self.fold_alias_ty(entry.return_ty) {
+                                            Ty::Named { name, .. } => Some(name),
+                                            _ => None,
+                                        }
                                     }
+                                    _ => None,
                                 }
-                                _ => None,
                             },
                         )
                         .and_then(|name| self.alias_fn_sig(name)),
@@ -4561,18 +4815,18 @@ impl<'a> Engine<'a> {
                 // A class-head receiver (`C.sm()`) is the creation arm's
                 // territory and keeps the prior `None` face.
                 let member_return = container.is_none().then(|| {
-                    let container = match send_recv {
+                    let (container, kind) = match send_recv {
+                        Some(Receiver::This { container, kind }) => (container, kind),
                         Some(
-                            Receiver::This { container, .. }
-                            | Receiver::Super { container, .. }
+                            Receiver::Super { container, .. }
                             | Receiver::Typed {
                                 type_name: container,
                                 ..
                             },
-                        ) => container,
+                        ) => (container, ContainerKind::Class),
                         _ => return None,
                     };
-                    match self.walk_members(container, row.name) {
+                    match self.bare_member_walk(container, kind, row.name) {
                         Walk::Found(entry)
                             if matches!(entry.kind, MemberKind::Method | MemberKind::Getter) =>
                         {
@@ -4603,18 +4857,18 @@ impl<'a> Engine<'a> {
                             .flatten()
                     })
                     .or_else(|| {
-                        let container = match send_recv {
+                        let (container, kind) = match send_recv {
+                            Some(Receiver::This { container, kind }) => (container, kind),
                             Some(
-                                Receiver::This { container, .. }
-                                | Receiver::Super { container, .. }
+                                Receiver::Super { container, .. }
                                 | Receiver::Typed {
                                     type_name: container,
                                     ..
                                 },
-                            ) => container,
+                            ) => (container, ContainerKind::Class),
                             _ => return None,
                         };
-                        match self.walk_members(container, row.name) {
+                        match self.bare_member_walk(container, kind, row.name) {
                             Walk::Found(entry)
                                 if matches!(
                                     entry.kind,

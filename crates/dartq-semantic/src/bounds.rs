@@ -925,6 +925,22 @@ impl<'a> Bounds<'a> {
             })
         } else if stray == 1 {
             alias.sink.done.pop().map(AliasRhs::Named)
+        } else if stray == 2
+            && !alias.sink.done[0].args.is_empty()
+            && alias.sink.done[1].args.is_empty()
+            && alias.sink.done[1].record.is_none()
+            && alias.sink.done[1].function.is_none()
+            && alias.sink.done[1].range.offset < alias.sink.done[0].range.offset
+        {
+            // A prefixed generic RHS (`typedef A = p.C<T>`): the argument
+            // group's node lands first (the group closes inside the
+            // qualified name), then `handle_type` completes on the
+            // prefix token and drops the `p` leaf behind it. Keep the
+            // head tree (`done[0]`); the trailing prefix leaf rides the
+            // same spelling — the groundedness walk re-derives the
+            // prefix from the source (`prefixed_alias_head`).
+            let head_tree = alias.sink.done.remove(0);
+            Some(AliasRhs::Named(head_tree))
         } else {
             None
         };

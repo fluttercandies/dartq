@@ -1385,6 +1385,16 @@ pub(crate) struct Engine<'a> {
     /// char, built on first use; empty for an ASCII file (the rust-analyzer
     /// wide-char layout).
     pub(crate) wide_chars: std::cell::OnceCell<Vec<(u32, u32)>>,
+    /// Every import prefix registered anywhere in the library graph —
+    /// [`Engine::prefix_head_ty`]'s graph-wide face. Built on first use: a
+    /// run whose argument walk never meets a named-type head pays nothing.
+    pub(crate) prefix_names: std::cell::OnceCell<FxHashSet<StringId>>,
+    /// The `prefix_head_ty` verdict per head name (the namespaces probe,
+    /// the `name_resolvable` probe and the prefix-set hit are all
+    /// run-stable), so a repeated `from` argument — the named-argument
+    /// prologue's dominant shape — answers without re-walking any of the
+    /// three legs.
+    pub(crate) prefix_head_memo: std::cell::RefCell<FxHashMap<StringId, bool>>,
     /// The `refine_numeric_binary` shadow-guard verdicts, one slot per
     /// core numeric head (`int`/`double`/`num` — the only heads the guard
     /// admits). The guard's `resolve_container` probes answer run-stable

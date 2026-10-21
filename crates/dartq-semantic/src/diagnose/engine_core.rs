@@ -34,6 +34,8 @@ impl<'a> Engine<'a> {
             source,
             tokens,
             wide_chars: std::cell::OnceCell::new(),
+            prefix_names: std::cell::OnceCell::new(),
+            prefix_head_memo: std::cell::RefCell::new(FxHashMap::default()),
             numeric_shadow_memo: std::array::from_fn(|_| std::cell::Cell::new(None)),
             file,
             lib,

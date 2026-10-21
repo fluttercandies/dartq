@@ -1867,8 +1867,17 @@ impl<'a> Engine<'a> {
                     // constraint face is unknowable, so a member could hide.
                     return Walk::ChainBroken;
                 };
+                // The mixin body's member scope is `this`'s interface: the
+                // `on` constraints AND the `implements` faces — the oracle's
+                // `MixinMemberScope` resolves a bare name through both
+                // (`toSql` inside `mixin M implements Base` resolves
+                // `Base.toSql`, #2473 G2b). `on` faces still climb their own
+                // constraints transitively via `climb_on`.
                 self.walk_face_list(
-                    decl.on_clause.iter().map(|face| (*face, self.file, container)),
+                    decl.on_clause
+                        .iter()
+                        .chain(decl.implements_clause.iter())
+                        .map(|face| (*face, self.file, container)),
                     self.lib,
                     member,
                     &mut seen,
@@ -1899,15 +1908,60 @@ impl<'a> Engine<'a> {
                     // nothing (the oracle's `InvalidType` extendedType).
                     return Walk::Missing;
                 };
-                self.walk_face_list(
+                match self.walk_face_list(
                     [(on, self.file, container)].into_iter(),
                     self.lib,
                     member,
                     &mut seen,
                     true,
-                )
+                ) {
+                    Walk::Found(entry) => Walk::Found(entry),
+                    walk => {
+                        // The `on` head's frozen-face consult (#2474 G1): an
+                        // SDK interface name the scope resolves ambiguously
+                        // (`Stream` — `dart:core`'s re-export of `dart:async`'s
+                        // decl lands two `Decl` face files, the `Ambiguous`
+                        // verdict) walks to a dead-edge `Missing` here even
+                        // though the oracle's `this` carries the interface's
+                        // full member surface. The frozen member tables model
+                        // exactly that surface: `Defined` suppresses (the
+                        // member lives on the `on` type — the same
+                        // undecidable-owner posture `ChainBroken` carries),
+                        // `Unknown` stays undecidable, and `Absent` keeps
+                        // the walk's clean miss (a name `Stream` genuinely
+                        // lacks still reports `undefined_*` for 'Stream').
+                        match self.frozen_member_verdict(on, member) {
+                            super::row_resolution::FrozenFace::Defined
+                            | super::row_resolution::FrozenFace::Unknown => Walk::ChainBroken,
+                            super::row_resolution::FrozenFace::Absent => walk,
+                        }
+                    }
+                }
             }
             _ => Walk::Missing,
+        }
+    }
+
+    /// The bare-name member union [`Engine::resolve_bare`] computes: the
+    /// container's own climb (`walk_members` — declared members plus the
+    /// supertype chain), then the `on`-face climb for a mixin or extension
+    /// container whose own climb did not find the member. The invocation
+    /// face shares this — a bare send inside an extension body resolves
+    /// against `this`'s full interface (upstream `ExtensionMemberScope`),
+    /// so `dartCast<String>()` inside `extension E on Expression<int>`
+    /// finds `Expression.dartCast` here even though the extension's own
+    /// member map lacks it (#2473 G2a).
+    pub(crate) fn bare_member_walk(
+        &self,
+        container: StringId,
+        kind: ContainerKind,
+        member: StringId,
+    ) -> Walk<'a> {
+        match self.walk_members(container, member) {
+            Walk::Missing if matches!(kind, ContainerKind::Mixin | ContainerKind::Extension) => {
+                self.on_face_walk(container, kind, member)
+            }
+            walk => walk,
         }
     }
 

@@ -4069,3 +4069,28 @@ mod ticket_2471_tests;
 #[cfg(test)]
 mod ticket_2497_tests;
 
+/// The #2452 pins: invocation/creation through a type alias whose RHS
+/// names an unresolved class behind an import prefix — the bare head
+/// reports `invocation_of_non_function`, the named-selector head reports
+/// `undefined_method` on `Type`, the `const` head reports
+/// `creation_with_non_type`, and a prefix-resolvable RHS grounds the
+/// chain silent.
+#[cfg(test)]
+mod ticket_2452_tests;
+
+/// The #2474 pins: bare names inside an `extension` body resolve against
+/// the `on` type's frozen member face when the clause walk cannot reach
+/// it — `on Stream<S>` whose `Stream` head walks `Ambiguous` across the
+/// `dart:core`/`dart:async` synthetic face files suppresses `listen`/
+/// `isBroadcast`, while a name the frozen face lacks still reports.
+#[cfg(test)]
+mod ticket_2474_tests;
+
+/// The #2473 pins: the bare member scope inside `mixin`/`extension`
+/// bodies — the invocation face reads the same `walk_members` ∪
+/// `on_face_walk` union `resolve_bare` computes, so a generic send
+/// through the `on` type instantiates its return and a mixin's
+/// `implements` face joins the member scope.
+#[cfg(test)]
+mod ticket_2473_tests;
+
