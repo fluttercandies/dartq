@@ -1449,6 +1449,37 @@ impl Interp<'_> {
                 // `ArgumentsBegin` and stays open to the chain's end;
                 // official `nullShortingTargetDepth` bound).
                 self.flush_null_shorts_above(self.consumer_base(*count));
+                // The dart:core `identical(a, b)` face: the official
+                // resolver routes the invocation through
+                // `equalityOperation_end` exactly like a binary `==`
+                // (upstream Dart SDK source,
+                // pkg/analyzer/lib/src/dart/resolver/
+                // invocation_inferrer.dart:556-577 — the `_isIdentical`
+                // gate is the resolved dart:core top-level function with
+                // exactly two arguments; the shared fold lives in
+                // `equalityOperation_end`, flow_analysis.dart:6806-6852),
+                // so the same verdicts apply: the disjoint-by-nullability
+                // check folds the call constant-false and deads the true
+                // branch (`identical(v, null)` on a non-nullable `v` —
+                // html `dom.dart:446`), and the null-literal face
+                // promotes. The bare-head spelling match is exact for
+                // bare calls (a same-library declaration lexically
+                // shadows the import and keeps both branches — probed
+                // 3.13.1); a prefixed or member send never matches the
+                // bare-head shape and stays under-report live.
+                if *count == 2 && self.send_callee_is_core_identical() {
+                    let right = self.pop_value();
+                    let left = self.pop_value();
+                    self.equality_check(&left, &right, false);
+                    // The fold's result is the send's value: drop the
+                    // callee head so the following `Send` finds the
+                    // equality expression on top and re-pushes it as the
+                    // call's own result.
+                    let folded = self.pop_value();
+                    self.exprs.pop();
+                    self.exprs.push(folded);
+                    return true;
+                }
                 for _ in 0..*count {
                     self.exprs.pop();
                 }

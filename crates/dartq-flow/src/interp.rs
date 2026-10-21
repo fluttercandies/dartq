@@ -1517,6 +1517,34 @@ impl<'o> Interp<'o> {
             })
     }
 
+    /// Whether the send about to consume its two arguments is a bare
+    /// `identical(a, b)` call: the callee three slots below the argument
+    /// pair is an unresolved bare head spelling `identical` — not a
+    /// variable read (a local callable named `identical` carries its
+    /// reference) and not a member/prefixed send (those carry no bare
+    /// head name). The [`Interp::equality_check`] face applies
+    /// (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/invocation_inferrer.dart
+    /// :773-785: the resolved dart:core top-level `identical` with
+    /// exactly two arguments).
+    pub(crate) fn send_callee_is_core_identical(&self) -> bool {
+        let Some(callee) = self
+            .exprs
+            .len()
+            .checked_sub(3)
+            .and_then(|index| self.exprs.get(index))
+        else {
+            return false;
+        };
+        callee.reference.is_none()
+            && callee.prop.is_some()
+            && callee.name.is_some_and(|name| {
+                self.names
+                    .get(name as usize)
+                    .is_some_and(|s| &**s == "identical")
+            })
+    }
+
     /// Official `_typesAreDisjointDueToNullability`: one side is
     /// null-or-equivalent (`classifyType` → nullOrEquivalent) while the
     /// other is non-nullable — every value of either lies outside the

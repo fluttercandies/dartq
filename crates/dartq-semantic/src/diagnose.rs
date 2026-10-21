@@ -4392,3 +4392,15 @@ mod ticket_2465_tests;
 /// verifier's shadowing fix in its owning lane).
 #[cfg(test)]
 mod ticket_2478_tests;
+
+/// The #2477 pins: the oracle's second-order derivations over undefined
+/// types (census G6+G8) — the undefined-scrutinee switch keeps its
+/// fall-through so `body_might_complete_normally` reports, the
+/// `FutureOr<Undefined> is Future<Undefined>` shape folds constant-true
+/// through the written-argument `Invalid` face, the bare two-argument
+/// dart:core `identical(v, null)` routes through the equality fold and
+/// deads the impossible branch on a non-nullable operand, and the
+/// keep-honest faces (a resolvable enum switch closes, well-typed and
+/// `dynamic` operands stay live) hold.
+#[cfg(test)]
+mod ticket_2477_tests;
