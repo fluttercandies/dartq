@@ -3075,6 +3075,38 @@ impl ParserListener for DiagnoseListener<'_> {
             } else {
                 from_ty
             };
+            // A trailing `!` re-decides the write face: the assertion's own
+            // static type is the operand's non-null form (`check_null_assert`'s
+            // promoteToNonNull row rewrite), so the assignment writes that
+            // face — never the nullable return the declared-return recompute
+            // or the `?.` merge projected (upstream Dart SDK source,
+            // pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver
+            // .dart — the flow write carries the assignment expression's own
+            // static type, non-null for `e!` right sides: `command =
+            // cmds.at('x')!` promotes `command` to `Cmd`).
+            let bang = {
+                // The row's expression end: an invoke row anchors at its
+                // callee token (`at` of `cmds.at('x')`) — the send span
+                // expands it to the closing `)` ([`Engine::invocation_span`]).
+                let end = if rhs_row.intent == Intent::Invoke {
+                    engine
+                        .invocation_span(rhs_row.range)
+                        .map(|span| span.end())
+                        .unwrap_or_else(|| rhs_row.range.end())
+                } else {
+                    rhs_row.range.end()
+                };
+                let mut at = end;
+                while engine.byte_at(at).is_some_and(|b| b.is_ascii_whitespace()) {
+                    at += 1;
+                }
+                engine.byte_at(at) == Some(b'!') && engine.byte_at(at + 1) != Some(b'=')
+            };
+            let from_ty = if bang {
+                Engine::non_null_form(from_ty)
+            } else {
+                from_ty
+            };
             if let Ty::Named {
                 name,
                 nullable,
@@ -3092,7 +3124,7 @@ impl ParserListener for DiagnoseListener<'_> {
                         engine.rows[target].name,
                         (
                             engine.rows[target].range.offset,
-                            engine.frames.len(),
+                            engine.exec_serial(),
                             from_ty,
                         ),
                     );
@@ -6320,6 +6352,15 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().begin_assert(token, kind);
     }
 
+    // The message analyzes under the negated-condition state
+    // (flow_analysis.dart:6478-6485 — `assert_afterCondition` runs the
+    // message closure on the condition-false arm), so the forwarded event
+    // must reach the recorder or the message's reads analyze under the
+    // unconditioned entry state.
+    fn assert_after_condition(&mut self) {
+        self.flow().assert_after_condition();
+    }
+
     fn begin_block(&mut self, token: Token, kind: BlockKind) {
         self.flow().begin_block(token, kind);
 
@@ -8469,8 +8510,12 @@ impl Engine<'_> {
             return;
         };
         if self.assignable(expr_ty, e, false) == Some(false) {
-            let (a0, a1) = (self.ty_display(expr_ty), self.ty_display(e));
-            self.emit(SemanticCode::YieldOfInvalidType, range, &a0, &a1);
+            // Staged, not emitted: the yield expression's promoted read
+            // re-decides at the teardown join — a generator body's top
+            // level is no demotion point, so the `??=`/guard promotion
+            // stands for the verdict (the same face `check_return` stages;
+            // the official row reads the flow-aware static type).
+            self.stage(StagedKind::Yield, range, expr_ty, e, false);
         }
     }
 

@@ -425,6 +425,14 @@ pub(crate) struct Frame {
     /// rewrite their not-yet-scoped `undefined_class` rows only above this
     /// mark, never an outer declaration's stale row.
     pub(crate) row_mark: usize,
+    /// The executable's push-order serial — unique across the file's
+    /// executables; containers and blocks carry 0. The `staged_write_tys`
+    /// inference feed keys on it ([`Engine::staged_read_ty`]): a write
+    /// staged inside one executable must never type another executable's
+    /// `var` initializer — a constructor initializer's write and a later
+    /// method's read share the bare-name key and, one pop later, the frame
+    /// depth (#2460 A2c).
+    pub(crate) serial: usize,
 }
 
 pub(crate) enum FrameKind {
@@ -2154,15 +2162,19 @@ pub(crate) struct Engine<'a> {
     pub(crate) var_infer_pending: Option<(StringId, SourceRange)>,
     /// The staged assignment RHS types by write-target name (#2174's
     /// inference feed): the latest plain `=` write whose resolved RHS the
-    /// flow staged, as `(write offset, frame depth, resolved type)`. A
-    /// `var`-inferred declarator whose initializer is a bare read of that
+    /// flow staged, as `(write offset, executable serial, resolved type)`.
+    /// A `var`-inferred declarator whose initializer is a bare read of that
     /// name infers the staged type — the oracle's inference is flow-aware
     /// (the promoted read type), and the declared slot the loop-head join
     /// demotes to must carry it (`var max = end` after
     /// `end = RangeError.checkValidRange(...)` infers `int`, not `int?`).
-    /// The frame guard keeps a write inside one function body from typing
-    /// another's initializer.
+    /// The executable serial keeps the feed inside the executable that
+    /// wrote it (#2460 A2c) — two executables at the same frame depth
+    /// never share a face.
     pub(crate) staged_write_tys: FxHashMap<StringId, (u32, usize, Ty)>,
+    /// The next executable serial handed to a pushed [`Frame`]
+    /// ([`Frame::serial`]).
+    pub(crate) next_exec_serial: usize,
     /// An enum-constant window is open (`handle_enum_element` doubles as
     /// the previous element's close).
     pub(crate) enum_element_open: bool,
@@ -3343,6 +3355,12 @@ pub(crate) enum StagedKind {
     /// flow's condition-type row at the operand read (the flow-aware
     /// static type the official verdict reads, #1349/#1351).
     NullableCondition,
+    /// `yield_of_invalid_type`: the generator body's element verdict —
+    /// the yield expression's promoted read re-decides at the teardown
+    /// join, the same face [`StagedKind::Return`] stages (the official
+    /// row reads the expression's flow-aware static type,
+    /// `yield_statement_resolver.dart`'s `expression.staticType`).
+    Yield,
 }
 
 /// A passing constant-pattern candidate (#1351): the parse-time check ran

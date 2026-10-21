@@ -191,6 +191,7 @@ impl<'a> Engine<'a> {
             arg_gates: Vec::new(),
             var_infer_pending: None,
             staged_write_tys: FxHashMap::default(),
+            next_exec_serial: 0,
             enum_element_open: false,
             const_string_begins: Vec::new(),
             ctor_init_latch: None,
@@ -746,6 +747,7 @@ impl<'a> Engine<'a> {
                 StagedKind::NeverReceiver | StagedKind::NullableCondition => continue,
                 StagedKind::Assignment => (SemanticCode::InvalidAssignment, None),
                 StagedKind::Argument => (SemanticCode::ArgumentTypeNotAssignable, None),
+                StagedKind::Yield => (SemanticCode::YieldOfInvalidType, None),
                 StagedKind::Return { host, name, .. } => {
                     (SemanticCode::ReturnOfInvalidType(host), Some(name))
                 }
@@ -947,8 +949,19 @@ impl<'a> Engine<'a> {
             }
         }
         self.type_params.extend(pending);
+        // The executable serial (#2460 A2c): a fresh identity per
+        // executable — the `staged_write_tys` inference feed keys on it,
+        // so a write staged inside one executable never types another's
+        // `var` initializer across a popped frame at the same depth.
+        let serial = if matches!(kind, FrameKind::Executable { .. }) {
+            self.next_exec_serial += 1;
+            self.next_exec_serial
+        } else {
+            0
+        };
         self.frames.push(Frame {
             kind,
+            serial,
             locals: FxHashSet::default(),
             var_types: FxHashMap::default(),
             fn_formal_rets: FxHashMap::default(),
@@ -1589,7 +1602,8 @@ impl<'a> Engine<'a> {
     /// suppress-everything sentinel — under-report, never over-report).
     /// The flow-aware initializer type for a bare read (#2174's inference
     /// feed): a read of the name whose latest staged plain-`=` write
-    /// resolved a type (same frame, earlier offset) infers that type — the
+    /// resolved a type (same executable, earlier offset — the feed keys on
+    /// the write's executable serial, #2460 A2c) infers that type — the
     /// oracle's inference reads the promoted type of the initializer
     /// expression, and the declared slot the loop-head join demotes to must
     /// carry it (`var max = end` after
@@ -1599,8 +1613,20 @@ impl<'a> Engine<'a> {
         if !matches!(row.shape, RowShape::Bare(BareInfo::Plain { .. })) {
             return None;
         }
-        let &(offset, frame, ty) = self.staged_write_tys.get(&row.name)?;
-        (offset < row.range.offset && frame == self.frames.len()).then_some(ty)
+        let &(offset, exec, ty) = self.staged_write_tys.get(&row.name)?;
+        (offset < row.range.offset && exec == self.exec_serial()).then_some(ty)
+    }
+
+    /// The innermost executable frame's serial — the executable-scoped
+    /// identity the inference feed keys on ([`Self::staged_read_ty`]).
+    /// Top-level writes and reads share serial 0 (no executable frame).
+    pub(crate) fn exec_serial(&self) -> usize {
+        self.frames
+            .iter()
+            .rev()
+            .find(|f| matches!(f.kind, FrameKind::Executable { .. }))
+            .map(|f| f.serial)
+            .unwrap_or(0)
     }
 
     pub(crate) fn initializer_static_ty(&self, row: &Row) -> Option<Ty> {

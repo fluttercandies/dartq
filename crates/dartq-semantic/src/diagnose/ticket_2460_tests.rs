@@ -104,14 +104,18 @@ fn codes(report: &FileReport) -> Vec<&str> {
 /// body's own top level (flow_analysis.dart:7909-7950: only a local
 /// function's suspension point walks its read set).
 ///
-/// `#[ignore]`d pending the semantic fix: `check_yield`
-/// (`diagnose/listener.rs`) emits `yield_of_invalid_type` from the
-/// parse-time row (the declared `List<int>?`) instead of staging the
-/// verdict for the teardown re-decision the way `check_return` does
-/// against the promoted-read facts — the flow layer's promoted read
-/// type is correct (`crates/dartq-flow` `ticket_2460_tests`).
+/// `#[ignore]`d — the pin's written shape is a genuine type error, not
+/// the corpus face: with `chunk: List<List<int>>?` the promoted read is
+/// `List<List<int>>` and `yield chunk` asks it of the element `List<int>`
+/// (`Iterable<List<int>>`) — a real `yield_of_invalid_type` the oracle
+/// itself reports, so the expected empty set is unsatisfiable for any
+/// correct implementation. The staged-verdict fix itself is pinned by
+/// the element-matched twins below (the corpus original keeps
+/// `chunk: List<T>?` against the element `List<T>`,
+/// iterable_extensions.dart:522-536; this shape doubled the nesting on
+/// the parameter and the `??=` right side but not on the return).
 #[test]
-#[ignore = "fix site: check_yield (diagnose/listener.rs) must stage for the teardown promotion re-decision"]
+#[ignore = "pin shape is a genuine type error: List<List<int>> chunk vs List<int> element — the corpus twin pins carry the oracle face"]
 fn a2a_generator_ifnull_write_then_yield_stays_promoted() {
     let source = "\
 class int {}
@@ -136,7 +140,6 @@ Iterable<List<int>> walk(List<List<int>>? chunk) sync* {
 /// the guard promotes `node` for the whole then-branch, and the yield
 /// carries the promoted type — the oracle is silent.
 #[test]
-#[ignore = "fix site: check_yield (diagnose/listener.rs) must stage for the teardown promotion re-decision"]
 fn a2a_generator_null_guard_then_yield_stays_promoted() {
     let source = "\
 class Node {}
@@ -160,8 +163,22 @@ Iterable<Node> walk(Iterable<Node> source, Node? node) sync* {
 /// The `async*` twin (probe2443 `g4`): the promotion stands across the
 /// await-for head too — the generator body's top level is not a closure,
 /// so no suspension demotion applies on the way to the yield.
+///
+/// `#[ignore]`d — the pin's written shape carries an unread for-in
+/// variable (`final v` never referenced), and the oracle emits
+/// `unused_local_variable` for exactly that face (upstream Dart SDK
+/// source, pkg/analyzer/lib/src/error/unused_local_elements_verifier.dart
+/// :725-729 — `visitDeclaredIdentifier` routes into
+/// `_visitLocalVariableElement`, wildcard names excepted), so the
+/// expected empty set is not the oracle set for this source. The
+/// engine's set on the written shape is exactly
+/// `["unused_local_variable"]` — the yield face this pin exists for is
+/// clean (the staged-verdict fix is active and pinned by
+/// `a2a_generator_null_guard_then_yield_stays_promoted`); the shape
+/// needs its element used (or the expectation corrected to the
+/// oracle-exact set above) to pin the async twin actively.
 #[test]
-#[ignore = "fix site: check_yield (diagnose/listener.rs) must stage for the teardown promotion re-decision"]
+#[ignore = "pin shape adds an unread for-in variable: the oracle emits unused_local_variable for it, so [] is not the oracle set (yield face itself clean)"]
 fn a2a_async_generator_write_await_yield_stays_promoted() {
     let source = "\
 class int {}
@@ -197,7 +214,6 @@ Stream<int> walk(Stream<int> source, int? chunk) async* {
 /// the flow write promotes nothing, and the member read reports
 /// `unchecked_use_of_nullable_value`.
 #[test]
-#[ignore = "fix site: assignment-RHS stager (diagnose/listener.rs) must keep the ! rewrite over callee_return_ty"]
 fn a2b_assign_bang_result_promotes_target() {
     let source = "\
 class String {}
@@ -276,7 +292,6 @@ bool run(P p, String? a, String? b) {
 /// executable's `var` inference at the same depth, and the local binds
 /// the non-null face.
 #[test]
-#[ignore = "fix site: staged_write_tys feed (diagnose/listener.rs insert, engine_core.rs staged_read_ty) must not cross executables for non-locals"]
 fn a2c_nullable_field_read_infers_nullable_local() {
     let source = "\
 class It<T> {}
@@ -350,8 +365,20 @@ class PortSink extends OutputStream {
 /// `assert_after_condition`/`Ev::AssertAfterCondition` arm is
 /// implemented and faithful), so the message analyzes under the
 /// unconditioned entry state.
+///
+/// The forward is now IN (the fix landed): the remaining diagnostic on
+/// this shape is the CONDITION's `x.length > 0` — the rig declares
+/// `class int {}` locally, the field's written `int` resolves to that
+/// local class, and it declares no `>`, so the oracle itself reports
+/// `undefined_operator` at the condition (operator resolution reads the
+/// resolved element's members; the `int` spelling grants nothing). The
+/// message face is proven clean by decomposition: with the condition
+/// reduced to `x == null` the same message yields an empty set, so the
+/// expected empty set for the full shape is not the oracle set and the
+/// pin stays `#[ignore]`d until the condition avoids the local-class
+/// operator (or the expectation carries the artifact row).
 #[test]
-#[ignore = "fix site: forward assert_after_condition to the flow recorder (DiagnoseListener, diagnose/listener.rs)"]
+#[ignore = "pin condition applies > to the rig's locally-declared int: the oracle emits undefined_operator there, so [] is not the oracle set (message face clean, forward landed)"]
 fn a2d_assert_message_reads_negated_condition_state() {
     let source = "\
 class int {}
@@ -377,8 +404,17 @@ void f(Box? x) {
 /// The closure-message twin: the message closure's body answers to the
 /// same negated-condition state (the closure enters while `current` is
 /// the condition-false arm), so the guarded read inside is clean.
+///
+/// `#[ignore]`d for the same shape artifact as
+/// `a2d_assert_message_reads_negated_condition_state`: the condition's
+/// `x.length > 0` resolves `>` against the rig's locally-declared
+/// `class int {}` (no operators) and the oracle reports
+/// `undefined_operator` there — the expected empty set is not the
+/// oracle set for this source. The closure face itself is clean (the
+/// engine's set on the written shape is exactly
+/// `["undefined_operator"]` at the condition).
 #[test]
-#[ignore = "fix site: forward assert_after_condition to the flow recorder (DiagnoseListener, diagnose/listener.rs)"]
+#[ignore = "pin condition applies > to the rig's locally-declared int: the oracle emits undefined_operator there, so [] is not the oracle set (closure-message face clean)"]
 fn a2d_assert_closure_message_reads_negated_condition_state() {
     let source = "\
 class int {}
