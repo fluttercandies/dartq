@@ -27,6 +27,7 @@ members = [
     "crates/dartq-cli",
     "crates/dartq-schema",
     "tests/harness",
+    "tools/bench-corpus-gen",
     "tools/corpus-gen",
     "tools/sdk-faces-gen",
 ]
