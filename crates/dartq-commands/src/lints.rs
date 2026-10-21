@@ -601,6 +601,15 @@ fn fold_names(names: &FxHashSet<String>) -> u64 {
 /// construction, and the faces' single stable display sort downstream
 /// stays tie-identical to a serial run.
 ///
+/// The semantic-fold substrate is a per-library shared artifact, built
+/// once per multi-member needing library in its own fan-out before the
+/// per-file one: every linted member of such a library mounts the
+/// identical graph/namespaces/index tables (each job's own scan and
+/// analysis stay job-local), so the library pays its substrate build once
+/// instead of once per member; a lone-member library builds inline as
+/// before — sharing one member's tables through a map would only add a
+/// pass.
+///
 /// The package-aware rules read the containing package's facts through
 /// `Unit.workspace` and the unit's features from the engine's settled
 /// per-file face (#722) — the `@dart` override and grants already folded
@@ -608,8 +617,8 @@ fn fold_names(names: &FxHashSet<String>) -> u64 {
 /// face is settled. The fold-consuming rules
 /// ([`dartq_lints::SEMANTIC_RULES`]) read the per-file
 /// [`dartq_semantic::Analysis`] the job builds before the unit — the
-/// owning library's isolated context (declarations and element models, no
-/// import edges) folded once per miss, mounted through
+/// owning library's shared context (declarations and element models, no
+/// import edges; one build per library), mounted through
 /// [`dartq_lints::Unit::run_with_semantics`] — and the same fold's
 /// `AsyncContextUse` facts mount as `Unit::async_context_uses` for
 /// `use_build_context_synchronously` (#1198). The engine's reachability
@@ -726,6 +735,11 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
     // linted all the same — it just carries no content id to key with.
     let mut slotted: Vec<Option<Arc<Vec<Lint>>>> = vec![None; files.len()];
     let mut misses: Vec<(usize, FileId, Option<LintMemoKey>)> = Vec::new();
+    // The libraries whose misses mount the semantic fold and carry two or
+    // more members: one shared substrate is built per such library below,
+    // so every linted member answers from one graph/namespaces/index
+    // build instead of each file rebuilding the identical tables.
+    let mut needing: FxHashSet<LibraryId> = FxHashSet::default();
     for (slot, file) in files.iter().enumerate() {
         let Some(path) = engine.file_table().path(*file) else {
             continue;
@@ -752,6 +766,14 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
         let features = engine.settled_features(*file).map_or(fallback, features_of);
         let version = engine.settled_version(*file).unwrap_or(fallback_version);
         let Some(unit_facts) = engine.file_facts(*file) else {
+            if mounts_semantics(set)
+                && let Some(library) = engine.library_of(*file)
+                && library_members
+                    .get(&library)
+                    .is_some_and(|members| members.len() > 1)
+            {
+                needing.insert(library);
+            }
             misses.push((slot, *file, None));
             continue;
         };
@@ -795,9 +817,36 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
         );
         match memo.get(&key) {
             Some(rows) => slotted[slot] = Some(rows),
-            None => misses.push((slot, *file, Some(key))),
+            None => {
+                // Sharing pays from two members up: a lone-member library
+                // builds its substrate inline in the job, exactly as
+                // before, and never enters the shared map.
+                if mounts_semantics(set)
+                    && let Some(library) = engine.library_of(*file)
+                    && library_members
+                        .get(&library)
+                        .is_some_and(|members| members.len() > 1)
+                {
+                    needing.insert(library);
+                }
+                misses.push((slot, *file, Some(key)));
+            }
         }
     }
+
+    // The shared substrates, one per multi-member needing library, built
+    // in a per-library fan-out ahead of the per-file one — the pipeline's
+    // shared-artifact shape (the same pure member-set fold the per-file
+    // jobs used to repeat once per member). Members carry a deterministic
+    // order, so each library's build is byte-identical to the standalone
+    // per-file build it replaces.
+    let artifacts: FxHashMap<LibraryId, LibrarySemantics> = needing
+        .into_par_iter()
+        .filter_map(|library| {
+            let members = library_members.get(&library)?;
+            Some((library, build_library_semantics(engine, members[0], members)))
+        })
+        .collect();
 
     // One independent job per miss: `&Engine` reads and `LazyLock` statics
     // only, the rows pre-stamping (file-relative). The slot index rides
@@ -840,16 +889,25 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
                 .and_then(|library| library_members.get(&library))
                 .map_or(&[], |members| members.as_slice());
             // The semantic fold runs before the unit is built: its context
-            // tables and the analysis borrowing them are job-local, and the
-            // flow-fact rows the async-gap seam mounts come off the analysis
-            // (#1198). Only where the enabled set consumes the fold — a
-            // fold-less file parses and runs as before.
+            // tables are the owning library's shared substrate (built once
+            // above, from two members up; a lone-member library builds the
+            // identical tables inline), and the analysis borrowing them is
+            // job-local. The flow-fact rows the async-gap seam mounts come
+            // off the analysis (#1198). Only where the enabled set consumes
+            // the fold — a fold-less file parses and runs as before.
             let context = if mounts_semantics(set) && !members.is_empty() {
                 let strict = stricts
                     .get(dir)
                     .copied()
                     .expect("strict modes precomputed for every resident file's directory");
-                Some((build_semantic_context(engine, text, file, members), strict))
+                let mounted = match engine
+                    .library_of(file)
+                    .and_then(|library| artifacts.get(&library))
+                {
+                    Some(shared) => semantic_context(text, file, shared),
+                    None => build_semantic_context(engine, text, file, members),
+                };
+                Some((mounted, strict))
             } else {
                 None
             };
@@ -1059,13 +1117,21 @@ pub fn analyze_lints(engine: &Engine, roots: &[PathBuf], memo: &mut LintMemo) ->
                     let (context, strict) = match &context {
                         Some(mounted) => (&mounted.0, mounted.1),
                         None => {
-                            join_context = (
-                                build_semantic_context(engine, text, file, members),
-                                stricts.get(dir).copied().expect(
-                                    "strict modes precomputed for every resident file's directory",
-                                ),
+                            // The library's shared substrate when one was
+                            // built, the standalone build otherwise (a
+                            // library no semantic-mount miss needed) — the
+                            // same tables either way.
+                            join_context = match engine
+                                .library_of(file)
+                                .and_then(|library| artifacts.get(&library))
+                            {
+                                Some(shared) => semantic_context(text, file, shared),
+                                None => build_semantic_context(engine, text, file, members),
+                            };
+                            let join_strict = stricts.get(dir).copied().expect(
+                                "strict modes precomputed for every resident file's directory",
                             );
-                            (&join_context.0, join_context.1)
+                            (&join_context, join_strict)
                         }
                     };
                     let neutral = neutralize_ignore_keywords(text, &comments);
@@ -1242,41 +1308,50 @@ fn seed_prefixed_imports(
     }
 }
 
-/// One file's semantic-fold substrate, job-local: the owning library's
-/// isolated context (its member files' declarations declared into a
-/// per-file [`LibraryGraphBuilder`] graph — the class family with its
-/// modifier facts, exactly the analyze-built graph's declaration posture —
-/// plus the members' element models in the [`ElementIndex`]), the fold's
-/// own scan, and the library node the declarations declared under.
-/// [`analyze_unit`] borrows these tables for the
-/// [`dartq_semantic::Analysis`] it returns, so the bundle must outlive
-/// both that analysis and the rule run mounting it — the job holds the
-/// binding straight through the run.
+/// One library's semantic-fold substrate, built once per library and
+/// shared by every linted member: the library's isolated context (its
+/// member files' declarations declared into a [`LibraryGraphBuilder`]
+/// graph — the class family with its modifier facts, exactly the
+/// analyze-built graph's declaration posture — plus the members' element
+/// models in the [`ElementIndex`]) and the library node the declarations
+/// declared under. Every field is a pure function of the member set and
+/// the engine's facts, so one build answers all members identically —
+/// the pipeline's per-library shared-artifact shape (the retired
+/// per-file rebuild paid the identical build once per linted member).
+pub(crate) struct LibrarySemantics {
+    lib: dartq_resolution::LibraryId,
+    graph: Arc<LibraryGraph>,
+    namespaces: Arc<Namespaces>,
+    index: Arc<ElementIndex>,
+}
+
+/// One file's semantic-fold mount: its owning library's shared
+/// [`LibrarySemantics`] plus the file's own scan. The tables are shared
+/// read-only across the library's jobs ([`analyze_unit`] and the fold
+/// borrow them for the analysis' lifetime), so the bundle outlives the
+/// analysis and the rule run — the job holds the binding straight
+/// through the run.
 pub(crate) struct SemanticContext {
     pub(crate) lib: dartq_resolution::LibraryId,
-    pub(crate) graph: LibraryGraph,
-    pub(crate) namespaces: Namespaces,
-    pub(crate) index: ElementIndex,
+    pub(crate) graph: Arc<LibraryGraph>,
+    pub(crate) namespaces: Arc<Namespaces>,
+    pub(crate) index: Arc<ElementIndex>,
     pub(crate) scanned: dartq_scanner::ScanResult,
 }
 
-/// Builds one file's semantic-fold substrate: the owning library's
-/// isolated context, never import edges — the context is the owning
-/// library alone, so cross-library faces under-report `None` — the M1
+/// Builds one library's shared substrate: the owning library alone,
+/// never import edges — cross-library faces under-report `None` — the M1
 /// posture (a query never fabricates a binding the context did not
 /// decide), not a divergence from the semantic tier's answers about *this*
-/// library's own declarations. The tables are job-locals: they live
-/// exactly as long as the job's analysis and run, which keeps the fan-out
-/// lock-free (each job owns its face).
-pub(crate) fn build_semantic_context(
+/// library's own declarations.
+fn build_library_semantics(
     engine: &Engine,
-    text: &str,
     file: FileId,
     members: &[FileId],
-) -> SemanticContext {
+) -> LibrarySemantics {
     let strings = engine.strings();
     let mut builder = LibraryGraphBuilder::new(strings);
-    // The library node's identity is internal to this per-file graph; the
+    // The library node's identity is internal to this per-library graph; the
     // defining file's path spells it deterministically.
     let node_uri = engine
         .file_table()
@@ -1304,7 +1379,7 @@ pub(crate) fn build_semantic_context(
     // generated core face (own surface plus the async/collection
     // re-exports) declared at the engine's synthetic `<dart:core>` file
     // when a graph build already interned it, the analyzed file otherwise
-    // (both stay outside the per-file index, so SDK names resolve
+    // (both stay outside the per-library index, so SDK names resolve
     // "defined" with no element model).
     let core_file = engine
         .file_table()
@@ -1324,14 +1399,44 @@ pub(crate) fn build_semantic_context(
             index.insert(member, Arc::clone(&facts.elements));
         }
     }
-    let scanned = dartq_scanner::scan(text, SEMANTIC_SCAN_CONFIG, file);
-    SemanticContext {
+    LibrarySemantics {
         lib,
-        graph,
-        namespaces,
-        index,
-        scanned,
+        graph: Arc::new(graph),
+        namespaces: Arc::new(namespaces),
+        index: Arc::new(index),
     }
+}
+
+/// Mounts one file's fold substrate: the library's shared tables by
+/// reference plus the file's own scan of the exact bytes the job
+/// analyzes.
+fn semantic_context(
+    text: &str,
+    file: FileId,
+    shared: &LibrarySemantics,
+) -> SemanticContext {
+    SemanticContext {
+        lib: shared.lib,
+        graph: Arc::clone(&shared.graph),
+        namespaces: Arc::clone(&shared.namespaces),
+        index: Arc::clone(&shared.index),
+        scanned: dartq_scanner::scan(text, SEMANTIC_SCAN_CONFIG, file),
+    }
+}
+
+/// Builds one file's semantic-fold substrate standalone: the owning
+/// library's substrate built inline plus the file's scan. The one-off
+/// face for callers outside the lint fan-out (the fix evidence and
+/// assist mounts); the fan-out itself shares one
+/// [`LibrarySemantics`] per library.
+pub(crate) fn build_semantic_context(
+    engine: &Engine,
+    text: &str,
+    file: FileId,
+    members: &[FileId],
+) -> SemanticContext {
+    let shared = build_library_semantics(engine, file, members);
+    semantic_context(text, file, &shared)
 }
 
 /// Joins the engine's reachability flags (#1199) with the file's capture
@@ -3556,6 +3661,159 @@ void stray() {}
             .collect();
         assert_eq!(files.len(), 1, "{files:?}");
         assert!(files[0].ends_with("packages/a/pubspec.yaml"), "{files:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A main + part library for the shared-substrate pins: the part
+    /// declares the class the lookups probe, the main declares its own.
+    /// The pins read the engine's facts after the run returns (the run's
+    /// borrow ends with its scope).
+    fn part_library_engine(tag: &str) -> (PathBuf, Engine) {
+        let root = crate::workspace::test_fixture::workspace(
+            tag,
+            &[
+                ("lib/main.dart", "part 'part.dart';\n\nclass Main {}\n"),
+                (
+                    "lib/part.dart",
+                    "part of 'main.dart';\n\nclass PartWidget {}\n",
+                ),
+            ],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("run");
+        (root, engine)
+    }
+
+    /// The one two-member library of [`part_library_engine`]'s fixture
+    /// and its member files (defining first).
+    fn part_library_members(engine: &Engine) -> Vec<FileId> {
+        let mut libraries = engine.libraries();
+        libraries.retain(|(_, files)| files.len() == 2);
+        let [(_, members)] = libraries.as_slice() else {
+            panic!("one two-file library expected: {libraries:?}");
+        };
+        members.clone()
+    }
+
+    /// The shared substrate is the standalone build: for a two-file
+    /// library, [`build_library_semantics`] + [`semantic_context`] answer
+    /// exactly what the per-file [`build_semantic_context`] answers — the
+    /// library node, the cross-file namespace lookups (the part-declared
+    /// class resolves to the part's file in both), and the member element
+    /// models in the index.
+    #[test]
+    fn shared_substrate_equals_the_standalone_build() {
+        let (root, engine) = part_library_engine("lints_shared_substrate");
+        let members = part_library_members(&engine);
+        let (main, part) = (members[0], members[1]);
+        let main_text = std::str::from_utf8(engine.content(main).expect("main bytes"))
+            .expect("main utf8");
+        let shared = build_library_semantics(&engine, main, &members);
+        let mounted = semantic_context(main_text, main, &shared);
+        let standalone = build_semantic_context(&engine, main_text, main, &members);
+        assert_eq!(mounted.lib, standalone.lib, "the library node identity");
+        let strings = engine.strings();
+        for name in ["Main", "PartWidget", "Object"] {
+            let id = strings.intern(name);
+            assert_eq!(
+                mounted.namespaces.lookup(&mounted.graph, mounted.lib, id),
+                standalone.namespaces.lookup(&standalone.graph, standalone.lib, id),
+                "the lookup of {name} agrees"
+            );
+        }
+        assert_eq!(
+            mounted.namespaces.lookup(&mounted.graph, mounted.lib, strings.intern("PartWidget")),
+            dartq_resolution::Lookup::Found(dartq_resolution::NamespaceEntry::Decl(part)),
+            "the part-declared class resolves to the part's file"
+        );
+        for member in [main, part] {
+            let count = |context: &SemanticContext| {
+                context
+                    .index
+                    .get(member)
+                    .map(|elements| elements.declarations().count())
+            };
+            assert_eq!(
+                count(&mounted),
+                count(&standalone),
+                "the element model of member {member:?} is indexed alike"
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The sharing contract: both members' mounts point at the one
+    /// library artifact's tables (the Arc identity the fan-out leans on),
+    /// while each member's scan stays its own.
+    #[test]
+    fn semantic_context_shares_the_library_tables() {
+        let (root, engine) = part_library_engine("lints_shared_identity");
+        let members = part_library_members(&engine);
+        let shared = build_library_semantics(&engine, members[0], &members);
+        let text = |file: FileId| {
+            std::str::from_utf8(engine.content(file).expect("bytes")).expect("utf8")
+        };
+        let main = semantic_context(text(members[0]), members[0], &shared);
+        let part = semantic_context(text(members[1]), members[1], &shared);
+        assert!(Arc::ptr_eq(&main.graph, &shared.graph), "the graph shares");
+        assert!(
+            Arc::ptr_eq(&main.namespaces, &shared.namespaces),
+            "the namespaces share"
+        );
+        assert!(Arc::ptr_eq(&main.index, &shared.index), "the index shares");
+        assert!(Arc::ptr_eq(&part.graph, &shared.graph), "the part shares too");
+        assert_ne!(
+            main.scanned.tokens.len(),
+            part.scanned.tokens.len(),
+            "each member scans its own bytes"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The fan-out end to end over a two-file library: one shared
+    /// substrate mounts for both members' jobs and the rows still come
+    /// out — the part file's `print` reports through the shared graph's
+    /// implicit-core seed, exactly as the per-file build reported.
+    #[test]
+    fn two_member_library_lints_through_the_shared_substrate() {
+        let root = crate::workspace::test_fixture::workspace(
+            "lints_shared_fanout",
+            &[
+                (
+                    "analysis_options.yaml",
+                    "linter:\n  rules:\n    - avoid_print\n",
+                ),
+                ("lib/main.dart", "part 'part.dart';\n"),
+                (
+                    "lib/part.dart",
+                    "part of 'main.dart';\n\nvoid p() {\n  print('x');\n}\n",
+                ),
+            ],
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let (config, _) =
+            crate::workspace::engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+        let mut engine = Engine::new(config).expect("engine");
+        let run = crate::analyze::run_overlaid(&mut engine, &[], std::slice::from_ref(&root))
+            .expect("run");
+        let rows: Vec<(u32, String)> = run
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                d.code.name == "avoid_print"
+                    && run.layout.file_path(d.file).ends_with("lib/part.dart")
+            })
+            .map(|d| (d.range.offset, d.message.clone().into_owned()))
+            .collect();
+        assert_eq!(rows.len(), 1, "the part's print reports once: {rows:?}");
+        assert!(
+            rows[0].1.contains("print"),
+            "the avoid_print message: {rows:?}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 }
