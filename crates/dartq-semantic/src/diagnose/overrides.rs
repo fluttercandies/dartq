@@ -220,19 +220,34 @@ impl<'a> Engine<'a> {
                 owner,
                 name,
             ) else {
-                // The anchor itself unresolved (an undefined receiver-type
-                // spelling) is the oracle's InvalidType: member reads ride
-                // dynamic and stay silent. A dead-edge HOP (undefined,
-                // ambiguous, or non-class supertype spelling) contributes
-                // nothing to the interface: the climb ends in a clean miss
-                // and the member lookups against the remaining face report.
-                // A declaration the index cannot model (the synthetic SDK
-                // face) stays the broken chain either way — the oracle sees
-                // members we cannot walk.
-                if !at_anchor && self.supertype_hop_dead(name, scope_lib, owner) {
+                if at_anchor {
+                    // The receiver-type spelling itself unresolvable is the
+                    // oracle's InvalidType: member reads ride dynamic and
+                    // stay silent (the broken chain).
+                    return Walk::ChainBroken;
+                }
+                if !self.supertype_hop_dead(name, scope_lib, owner) {
+                    // A declaration the index cannot model stays the broken
+                    // chain either way — the oracle sees members we cannot
+                    // walk.
+                    return Walk::ChainBroken;
+                }
+                // A dead-edge hop (undefined, ambiguous, or non-class
+                // supertype spelling — the oracle's InvalidType) contributes
+                // nothing to the interface: the `implements` faces collected
+                // on the climb still merge exactly like the `superclass:
+                // None` arm's tail (the oracle's interface merge); none is
+                // the clean miss the member lookups report.
+                if pending_faces.is_empty() {
                     return Walk::Missing;
                 }
-                return Walk::ChainBroken;
+                return self.walk_face_list(
+                    pending_faces.iter().rev().flatten().copied(),
+                    scope_lib,
+                    member,
+                    &mut seen,
+                    false,
+                );
             };
             at_anchor = false;
             if !skip_own && let Some(entry) = found.members.get(&member) {

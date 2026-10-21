@@ -1107,7 +1107,24 @@ impl<'a> Engine<'a> {
                 // member scope (the star corpus's silent o-only mirrors —
                 // the oracle's own interface ends at the resolved part of
                 // the chain and still answers the miss).
-                None => matches!(self.walk_members(container, name), Walk::Found(_)),
+                //
+                // The frozen-face refinement (#2420 D1): a broken chain over
+                // the SDK's names-only stub is not undecided — the member
+                // tables carry `dart:core`'s declared instance surface
+                // exactly (the same verdict the dotted-member arm asks
+                // below). `extends Iterable<E>` therefore claims
+                // `iterator`/`first`/`length`, whether the argument is a
+                // real type or an unresolvable one (probed 3.47.1: the
+                // oracle keeps the supertype and reads every member
+                // silently). Anything else keeps the fall-through.
+                None => match self.walk_members(container, name) {
+                    Walk::Found(_) => true,
+                    Walk::ChainBroken => matches!(
+                        self.frozen_member_verdict(container, name),
+                        super::row_resolution::FrozenFace::Defined
+                    ),
+                    Walk::Missing => false,
+                },
             };
             if member_found {
                 return (

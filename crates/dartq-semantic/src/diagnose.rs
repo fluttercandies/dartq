@@ -3695,3 +3695,12 @@ mod ticket_2422_tests;
 #[cfg(test)]
 mod ticket_2425_tests;
 
+/// The #2420 pins: the supertype member walk survives the dead supertype
+/// hop — `extends Dead implements Live` still merges the live interface's
+/// members (the analyzer corpus's `AstNodeImpl extends SyntacticEntity
+/// implements AstNode` shape) while a dead edge with no interfaces reports
+/// cleanly — and a resolved-but-unindexed supertype hop (`extends
+/// Iterable<MissingItem>`) answers through the frozen `dart:core` member
+/// tables instead of the under-report.
+#[cfg(test)]
+mod ticket_2420_tests;
