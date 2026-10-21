@@ -3808,7 +3808,7 @@ mod closure_return_tests {
 mod alias_function_subtyping_tests {
     use super::async_return_tests::{code_names, report};
 
-    /// The triage §4 repro (typeprobe 113), rig head: `Pred2<Cat?>` fits
+    /// The triage repro (typeprobe 113), rig head: `Pred2<Cat?>` fits
     /// `Pred2<Cat>` — the alias unfolds, the formal slot is contravariant
     /// (`Cat <: Cat?`), the returns coincide. The fixture avoids core head
     /// spellings (the rig rejects a redeclared core name as

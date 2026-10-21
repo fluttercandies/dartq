@@ -829,7 +829,7 @@ fn bare_call_miss_still_reports_when_no_extension_carries() {
     /// The mirror half: a bare creation send of a scoped class inside the
     /// same container resolves through the scope — the send is the class's
     /// creation, never an implicit-this member (the drift corpus's
-    /// bare-creation `undefined_method` family, retriage §2.12's posture:
+    /// bare-creation `undefined_method` family, the retriage posture:
     /// a `ChainBroken` member question falls through to the scope).
     #[test]
     fn broken_chain_bare_creation_resolves_the_scoped_class() {
