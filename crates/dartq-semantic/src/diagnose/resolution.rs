@@ -2394,7 +2394,6 @@ impl<'a> Engine<'a> {
         // enclosing container only — statics and non-members never ride
         // `this`).
         if self.in_instance_field_initializer() {
-            self.field_init_rows.insert(range.offset);
             let instance_member = match &target {
                 RefTarget::Member { container } => match self.walk_members(*container, name) {
                     Walk::Found(entry) => !entry.is_static,
@@ -2494,10 +2493,6 @@ impl<'a> Engine<'a> {
 
     /// An identifier after a dot, awaiting the merge at the dot event.
     pub(crate) fn push_member(&mut self, name: StringId, range: SourceRange) {
-        // The implicit-this face's push-time snapshot (see `push_bare`).
-        if self.in_instance_field_initializer() {
-            self.field_init_rows.insert(range.offset);
-        }
         // A record-typed receiver's field access is resolvable without the
         // member face: the record shape the receiver's row carries names
         // the positional `$n` and named slots (`rect.width` on

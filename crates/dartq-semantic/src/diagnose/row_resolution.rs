@@ -487,26 +487,13 @@ impl<'a> Engine<'a> {
             return recv;
         };
         let read_span = self.member_reads[index].recv_span;
-        match self.read_type_at(read_span) {
-            Some(face @ Ty::Named { name: flow_head, .. }) => {
-                // The postfix-`!` upgrade the popped row carried
-                // (`token!.span` — `receiver_static_ty`'s non-null rewrite):
-                // the flow read type at the receiver's own span describes
-                // the pre-assert state, so a bang directly after the
-                // receiver read lifts the corrected face to its non-null
-                // form.
-                let asserted =
-                    self.byte_at(self.skip_whitespace(read_span.end())) == Some(b'!');
-                let face = if asserted {
-                    Self::non_null_form(face)
-                } else {
-                    face
-                };
-                Receiver::Typed {
-                    type_name: flow_head,
-                    ty: face,
-                }
-            }
+        // The receiver expression's own face — the flow read type (with
+        // its trailing `!` applied) or the chain link below.
+        match self.recv_expression_ty(read_span) {
+            Some(face @ Ty::Named { name: flow_head, .. }) => Receiver::Typed {
+                type_name: flow_head,
+                ty: face,
+            },
             _ => recv,
         }
     }
@@ -1409,7 +1396,14 @@ impl<'a> Engine<'a> {
     /// invocation returns alike). Each backward hop matches a strictly
     /// earlier token, so the walk descends the chain monotonically and
     /// terminates.
-    fn recv_expression_ty(&self, read_span: SourceRange) -> Option<Ty> {
+    pub(crate) fn recv_expression_ty(&self, read_span: SourceRange) -> Option<Ty> {
+        self.recv_expression_face(read_span)
+            .map(|ty| self.null_asserted_after(read_span, ty))
+    }
+
+    /// [`Self::recv_expression_ty`] before the trailing null-assert: the
+    /// flow read face, then the chained-member face.
+    fn recv_expression_face(&self, read_span: SourceRange) -> Option<Ty> {
         if let Some(ty) = self.read_type_at(read_span) {
             return Some(ty);
         }
@@ -2264,28 +2258,13 @@ impl<'a> Engine<'a> {
             }
         }
         if self.member_defined(container, receiver_ty, row, false, receiver_nullable) {
-            // The implicit-this face (`_checkForInvalidInstanceMemberAccess2`,
-            // error_verifier.dart — `ThisContext.instanceFieldDeclaration`
-            // disallows `this`): an instance-member reference — implicit or
-            // explicit `this` — inside an instance field's declaration
-            // initializer reports at the referencing expression. The
-            // push-time snapshot set decides (the field group tears down
-            // before pass 2); a static member rides no `this` and stays
-            // silent.
-            if self.field_init_rows.contains(&row.range.offset)
-                && !matches!(
-                    self.walk_members(container, row.name),
-                    Walk::Found(entry) if entry.is_static
-                )
-            {
-                let name_text = self.strings.resolve(row.name);
-                self.emit(
-                    SemanticCode::ImplicitThisReferenceInInitializer,
-                    row.range,
-                    &name_text,
-                    "",
-                );
-            }
+            // No implicit-this face here: every caller hands a QUALIFIED
+            // member (`x.m`, `C().m`, `this.m`), and the oracle runs
+            // `_checkForInvalidInstanceMemberAccess2` from the unqualified
+            // nodes only (`visitUnqualifiedNameExpression`,
+            // `UnqualifiedFunctionInvocation`, the unqualified assignment
+            // targets) — the bare-row face owns it; an explicit `this` in
+            // an initializer is `invalid_reference_to_this` at the keyword.
             self.check_member_unused_result(
                 row,
                 container,
@@ -2454,18 +2433,9 @@ impl<'a> Engine<'a> {
             return;
         };
         if kind == ContainerKind::Enum && self.members.enum_synth_members.contains(&row.name) {
-            // The synthesized `index`/`values`/`names` getters are instance
-            // members: the initializer-context face fires for them too (the
-            // corpus's `final int code = index;` resolves exactly here).
-            if self.field_init_rows.contains(&row.range.offset) {
-                let name_text = self.strings.resolve(row.name);
-                self.emit(
-                    SemanticCode::ImplicitThisReferenceInInitializer,
-                    row.range,
-                    &name_text,
-                    "",
-                );
-            }
+            // The synthesized `index`/`values`/`names` getters are defined
+            // instance members; a qualified read of one never reports the
+            // initializer face (the bare `index` read is the bare row's).
             return;
         }
         // The `on`-face union (#2186 S2): `walk_members` never climbs a
@@ -3261,13 +3231,17 @@ impl<'a> Engine<'a> {
     /// statically-`bool` composite keeps the composite's `bool`: `x?.m ==
     /// y` types `bool`, never `bool?` — so the upgrade leaves both alone.
     pub(crate) fn expression_row_ty(&self, row: &Row) -> Ty {
+        // An invocation row stores its callee's declared type; the
+        // expression's type is the send's result
+        // ([`Self::invoked_callee_result`]).
+        let ty = self.invoked_callee_result(row).unwrap_or(row.ty);
         if self.null_aware_members.contains(&row.range.offset)
             && !matches!(row.intent, Intent::Operator(..))
             && !self.bool_decided_covers(row)
         {
-            Self::nullable_form(row.ty)
+            Self::nullable_form(ty)
         } else {
-            row.ty
+            ty
         }
     }
 

@@ -1212,6 +1212,12 @@ impl<'a> Engine<'a> {
         }
         let param_index = |name: StringId| params.iter().position(|(param, _)| *param == name);
         let mut solutions: Vec<Option<Ty>> = vec![None; params.len()];
+        // The slots the call fixes outright — an explicit type argument,
+        // the receiver's written instantiation — are final: the upward
+        // face neither re-solves nor poisons them (`fold<Folder?>(null,
+        // ...)`'s `Null` argument never overrides the written `Folder?`;
+        // the oracle runs no inference over an explicit argument list).
+        let mut fixed: Vec<bool> = vec![false; params.len()];
         // Explicit type arguments fix first — peeked, not consumed (the
         // send-close face owns the slot). A positional list pairs against
         // the declaration's parameter order, which the foreign-declaration
@@ -1222,8 +1228,9 @@ impl<'a> Engine<'a> {
                 .iter()
                 .find(|(row, _)| *row == callee_row)
         {
-            for (slot, ty) in solutions.iter_mut().zip(explicit.iter()) {
+            for ((slot, fixed), ty) in solutions.iter_mut().zip(fixed.iter_mut()).zip(explicit) {
                 *slot = Some(*ty);
+                *fixed = true;
             }
         }
         for (name, ty) in &seeds {
@@ -1231,6 +1238,7 @@ impl<'a> Engine<'a> {
                 && solutions[index].is_none()
             {
                 solutions[index] = Some(*ty);
+                fixed[index] = true;
             }
         }
         // Upward face: the arguments already typed at bind time unify
@@ -1259,7 +1267,7 @@ impl<'a> Engine<'a> {
             let Some(index) = param_index(param) else {
                 continue;
             };
-            if poisoned.contains(&index) {
+            if fixed[index] || poisoned.contains(&index) {
                 continue;
             }
             match solutions[index] {

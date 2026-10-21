@@ -153,6 +153,7 @@ pub mod model;
 pub mod persisted;
 pub mod resolved_ops;
 pub mod signature;
+pub mod ty_fold;
 pub(crate) mod switch_tracker;
 pub mod use_face;
 

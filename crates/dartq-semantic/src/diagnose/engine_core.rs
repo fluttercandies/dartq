@@ -169,8 +169,9 @@ impl<'a> Engine<'a> {
             external_type_params: EXTERNAL_CORE_TYPE_PARAMS.map(|(n, k)| (strings.intern(n), k)),
             initializer_depth: 0,
             init_rows: FxHashMap::default(),
-            field_init_rows: FxHashSet::default(),
             field_init_this_rows: FxHashSet::default(),
+            pattern_shadows: Vec::new(),
+            if_case_scopes: Vec::new(),
             pending_init_super: Vec::new(),
             init_item_head: None,
             redirect_edges: Vec::new(),
@@ -194,6 +195,7 @@ impl<'a> Engine<'a> {
             pending_init_names: Vec::new(),
             arg_gates: Vec::new(),
             var_infer_pending: None,
+            init_declarators: Vec::new(),
             staged_write_tys: FxHashMap::default(),
             next_exec_serial: 0,
             enum_element_open: false,
@@ -1775,22 +1777,18 @@ impl<'a> Engine<'a> {
             return sig.return_ty;
         }
         if row.ty != Ty::UNKNOWN {
-            if let Ty::Function { shape, .. } = row.ty {
-                return self.boundary.pool().function_shape(shape).return_ty;
+            // A function-typed callee (or the bare `Function` interface)
+            // answers the send face ([`Self::invoked_callee_result`]).
+            if let Some(result) = self.invoked_callee_result(row) {
+                return result;
             }
             // The row keeps the callee's DECLARED type, never the send's
             // result — a spelled named type that is a type alias's head
-            // (`Predicate<T> p` invoked as `p(x)`) or the bare `Function`
-            // interface (`Function findLocale` called `findLocale(x)`)
-            // answers nothing about the call: the alias head is
-            // undecidable when its RHS is unresolvable here (the verdict
-            // drops to the declared-return walk), and a bare `Function`
-            // send's static result is `dynamic` (the oracle's
-            // `Function.apply`-less face).
+            // (`Predicate<T> p` invoked as `p(x)`) answers nothing about
+            // the call: the alias head is undecidable when its RHS is
+            // unresolvable here (the verdict drops to the declared-return
+            // walk).
             if let Ty::Named { name, .. } = row.ty {
-                if self.strings.resolve(name) == "Function" {
-                    return Ty::Dynamic;
-                }
                 if let Some(decl) = self.top_level_decl(name)
                     && matches!(decl.kind, MicroKind::TypeAlias)
                 {

@@ -382,6 +382,9 @@ mod invocation;
 mod index_result;
 mod listener;
 mod never_send;
+mod pattern_scope;
+mod receiver_face;
+mod send_result;
 mod operand_face;
 mod overrides;
 mod resolution;
@@ -4684,3 +4687,13 @@ mod exhaustive_dynamic_tests;
 /// receiver, never the cascade target.
 #[cfg(test)]
 mod cascade_argument_tests;
+
+/// The engine faces the indexed SDK sources exposed (#2515).
+#[cfg(test)]
+mod sdk_exposure_tests;
+#[cfg(test)]
+mod receiver_face_tests;
+#[cfg(test)]
+mod flow_scope_tests;
+#[cfg(test)]
+mod scope_inference_tests;

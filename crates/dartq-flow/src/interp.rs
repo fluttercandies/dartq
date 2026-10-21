@@ -108,6 +108,12 @@ pub(crate) struct PatternState {
     pub pre_guard: Option<State>,
     /// Pattern-declared variables awaiting scope flush (name id, final).
     pub pending_decls: Vec<(u32, bool)>,
+    /// The bindings the pattern's variables shadowed in the innermost
+    /// scope (name id, previously bound variable): an if-case restores
+    /// them when its then branch ends — the pattern variables are in scope
+    /// in the guard and the then statement only (`if (p case Sub p) ...
+    /// else p.other` reads the OUTER `p` in the else branch).
+    pub shadowed: Vec<(u32, Option<u32>)>,
 }
 
 /// Replay frames (official `_FlowContext` subclasses).
@@ -134,6 +140,9 @@ pub(crate) enum Frame {
     If {
         branch: State,
         after_then: Option<State>,
+        /// An if-case's shadowed bindings (see [`PatternState::shadowed`]),
+        /// restored when the then branch ends; empty for a plain `if`.
+        shadowed: Vec<(u32, Option<u32>)>,
     },
     Cond {
         branch: State,
@@ -1094,6 +1103,33 @@ impl<'o> Interp<'o> {
     pub(crate) fn bind_name(&mut self, name_id: u32, var: u32) {
         if let Some(scope) = self.scopes.last_mut() {
             scope.bindings.insert(name_id, var);
+        }
+    }
+
+    /// The innermost scope's current binding of a name — what a fresh
+    /// declaration of the same spelling is about to shadow.
+    pub(crate) fn bound_var(&self, name_id: u32) -> Option<u32> {
+        self.scopes
+            .last()
+            .and_then(|scope| scope.bindings.get(&name_id).copied())
+    }
+
+    /// Restores the bindings a construct's pattern variables shadowed
+    /// (newest first): the construct's scope ended, and the spellings read
+    /// their outer declarations again.
+    pub(crate) fn restore_bindings(&mut self, shadowed: &[(u32, Option<u32>)]) {
+        let Some(scope) = self.scopes.last_mut() else {
+            return;
+        };
+        for (name_id, prev) in shadowed.iter().rev() {
+            match prev {
+                Some(var) => {
+                    scope.bindings.insert(*name_id, *var);
+                }
+                None => {
+                    scope.bindings.remove(name_id);
+                }
+            }
         }
     }
 

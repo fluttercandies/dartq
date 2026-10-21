@@ -777,68 +777,10 @@ impl<'a> Engine<'a> {
     }
 
     /// The receiver a merged member row resolves against, re-decided
-    /// against the flow read-type face (#1465): when the receiver read's
-    /// flow type names a different container than the push-time static
-    /// type, a promotion stands, and the member walk follows the promoted
-    /// spelling — the official resolver reads the flow-aware static type,
-    /// so `case Some(): option.value` resolves on `Some`, not the declared
-    /// `Option`. Every other shape keeps the push-time classification: a
-    /// non-`Typed` receiver has no static container to differ from, a
-    /// non-named flow face (`dynamic`/`Null`/unknown, or a join the
-    /// staged drop rules refused) has no member face to walk, and an equal
-    /// type is the declared fallback — today's behavior byte for byte.
+    /// against the receiver expression's re-derived static type
+    /// ([`Self::rederived_receiver`]).
     pub(crate) fn promoted_receiver(&self, member_offset: u32, recv: Receiver) -> Receiver {
-        let Receiver::Typed { ty: static_ty, .. } = recv else {
-            return recv;
-        };
-        let Some(read_span) = self
-            .promoted_recv_reads
-            .binary_search_by(|(member, _)| member.cmp(&member_offset))
-            .ok()
-            .map(|index| self.promoted_recv_reads[index].1)
-        else {
-            return recv;
-        };
-        let Some(flow_ty) = self.read_type_at(read_span) else {
-            return recv;
-        };
-        let Ty::Named { name, .. } = flow_ty else {
-            return recv;
-        };
-        if flow_ty == static_ty {
-            return recv;
-        }
-        // A postfix-`!` receiver already carries its non-null static type:
-        // the flow read at the variable's span describes the pre-assert
-        // state, not the asserted expression — `x!.m` resolves on `C`
-        // even when `x`'s flow type at the read is `C?` (#2161). That
-        // pre-state's signature is the static face's own head widened back
-        // to nullable — promotion never widens nullability, so only the
-        // `!` rewrite produces it. Every other differing flow face is a
-        // promotion and re-decides, including one of a non-nullable
-        // declared type (`other is Money11 && other.cents` on an
-        // `Object other`, #2167).
-        if matches!(
-            (&flow_ty, &static_ty),
-            (
-                Ty::Named {
-                    name: flow_head,
-                    nullable: true,
-                    ..
-                },
-                Ty::Named {
-                    name: static_head,
-                    nullable: false,
-                    ..
-                },
-            ) if flow_head == static_head
-        ) {
-            return recv;
-        }
-        Receiver::Typed {
-            type_name: name,
-            ty: flow_ty,
-        }
+        self.rederived_receiver(member_offset, recv)
     }
 
     /// The declared return type of an invoked callee row (a completed
@@ -898,9 +840,11 @@ impl<'a> Engine<'a> {
             // the real-corpus `usageException` idiom, #2161).
             if let (_, RefTarget::Member { container }) = self.resolve_bare(row.name)
                 && let Walk::Found(entry) = self.walk_members(container, row.name)
-                && matches!(entry.kind, MemberKind::Method | MemberKind::Getter)
             {
-                return entry.return_ty;
+                let result = self.member_invoke_result(&entry);
+                if result != Ty::UNKNOWN {
+                    return result;
+                }
             }
             return self
                 .top_level_decl(row.name)

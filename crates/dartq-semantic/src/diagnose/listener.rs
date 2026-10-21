@@ -1646,6 +1646,11 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.in_initializer = true;
         engine.init_frame_depth = engine.frames.len();
         engine.init_mark = Some(engine.rows.len());
+        // This initializer's own declarator (latched at its name): parked
+        // on the window stack so nested declarations inside the
+        // initializer cannot re-latch it.
+        let declarator = engine.var_infer_pending.take();
+        engine.init_declarators.push(declarator);
         engine.open_const_initializer();
     }
 
@@ -1663,7 +1668,11 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.ur_seal_used();
             engine.in_initializer = false;
             let mut staged = None;
-            if let Some((name, decl_range)) = engine.var_infer_pending.take()
+            // A declarator latched inside this initializer and never
+            // consumed (a for-element's loop variable) is dropped with the
+            // window: it belongs to no initializer.
+            engine.var_infer_pending = None;
+            if let Some((name, decl_range)) = engine.init_declarators.pop().flatten()
                 && let Some(mark) = engine.init_mark
                 && engine.rows.len() == mark + 1
                 && let Some(ty) = engine
@@ -2835,6 +2844,9 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_initializer(&mut self, token: Token) {
+        // The flow layer brackets the entry: its `f = e` assign writes the
+        // field, never a like-named formal (`Ev::Assign::field_init`).
+        self.flow().begin_initializer(token);
         // F-C: the item's head token — a `this`/`super` event at this offset
         // is the keyword head of a constructor-initializer construct, not a
         // `ThisExpression`/`SuperReference` (upstream `buildInitializer`'s
@@ -2842,7 +2854,8 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.init_item_head = Some(token.range.offset);
     }
 
-    fn end_initializer(&mut self, _end: Token) {
+    fn end_initializer(&mut self, end: Token) {
+        self.flow().end_initializer(end);
         self.engine.init_item_head = None;
     }
 
@@ -5117,6 +5130,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // `PatternVariableDeclaration` group reports all-or-nothing.
         if let Some(name) = engine.name_of(variable) {
             engine.last_pattern_variable = Some((name, variable.range));
+            engine.note_pattern_shadow(name);
             engine.add_tracked_local(name, variable.range, LocalKind::PatternVariable);
             // The DeclaredVariable kind of `checkPatternNeverMatchesValueType`
             // (type_analyzer.dart:723-756) reads the still-armed declared
@@ -6662,6 +6676,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_else_statement(&mut self, token: Token) {
         self.flow().begin_else_statement(token);
+        self.engine.if_then_end();
         // Insurance: the condition sealed at `begin_then_statement`.
         self.engine.ur_seal_used();
     }
@@ -6723,6 +6738,7 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_if_statement(&mut self, token: Token) {
         self.flow().begin_if_statement(token);
         let engine = &mut self.engine;
+        engine.if_condition_begin();
         // The condition's operand rows open here (the `non_bool_condition`
         // anchor's first row).
         engine.cond_mark = Some(engine.rows.len());
@@ -6768,6 +6784,7 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_then_statement(&mut self, token: Token) {
         self.flow().begin_then_statement(token);
         let engine = &mut self.engine;
+        engine.if_then_begin();
         // `IfStatement` is in the official used set (the condition).
         engine.ur_seal_used();
         // The if-condition operand's flow-aware static type is `bool?` —
@@ -7343,6 +7360,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_if_statement(&mut self, token: Token, else_kw: Option<Token>, end: Token) {
         self.flow().end_if_statement(token, else_kw, end);
+        self.engine.if_statement_end();
         self.engine.ur_seal_used();
     }
 

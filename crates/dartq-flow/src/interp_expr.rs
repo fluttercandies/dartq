@@ -34,9 +34,20 @@ impl Interp<'_> {
             } => {
                 use dartq_parser::IdentifierContext as Ctx;
                 match context {
-                    Ctx::Expression | Ctx::ExpressionContinuation
-                        if matches!(events.get(i + 1), Some(Ev::ForInExprBegin)) =>
-                    {
+                    // A member selector (`x.name`, `..name`, `p.name`): the
+                    // lexical scope never answers it — a like-named local
+                    // (`var manifest = element.manifest?.instance`) is not
+                    // read, written, or typed by the access (the official
+                    // selector resolution never consults the scope). The
+                    // DotAccess fold types the access from the receiver's
+                    // own slot.
+                    Ctx::ExpressionContinuation => {
+                        let mut expr = Expr::trivial(Ty::UNKNOWN_NULLABLE);
+                        expr.name = Some(*name);
+                        expr.read_span = Some(*token);
+                        self.exprs.push(expr);
+                    }
+                    Ctx::Expression if matches!(events.get(i + 1), Some(Ev::ForInExprBegin)) => {
                         // A for-in loop target (`for (i in xs)`) is the
                         // write, not a read (analyzer for_resolver.dart
                         // :237-241 `flow?.write` right before
@@ -58,7 +69,7 @@ impl Interp<'_> {
                             );
                         }
                     }
-                    Ctx::Expression | Ctx::ExpressionContinuation => match self.resolve(*name) {
+                    Ctx::Expression => match self.resolve(*name) {
                         Some(Resolved::Local(var)) => {
                             self.check_unassigned_read(*token, var);
                             self.record_read(var);
@@ -166,40 +177,34 @@ impl Interp<'_> {
                             // `_resolveUnqualifiedNameRead`'s
                             // `thisLookupGetter2` dispatch,
                             // property_element_resolver.dart:2137/:2183).
-                            // A member continuation (`c._b`'s `_b`) owns
-                            // no row here: its DotAccess decides the row
-                            // from the real receiver's slot — the `this`
-                            // slot would double-report the access.
                             let mut expr = Expr::trivial(Ty::UNKNOWN_NULLABLE);
-                            if matches!(context, Ctx::Expression) {
-                                let slot = self.prop_slot(THIS_RECEIVER, *name);
-                                let promoted = self.prop_promoted(THIS_RECEIVER, slot);
-                                if promoted && self.reachable() {
-                                    self.emit(FlowFact::PromotedPropertyRead { span: *token });
-                                } else if self.reachable() {
-                                    // The non-promoted mirror (upstream
-                                    // `_getNonPromotionReasons`'s property
-                                    // arm): the slot's cleared promoted
-                                    // types stand as evidence for the
-                                    // consumer's element-layer verdict.
-                                    let history = self.current.prop(slot).history;
-                                    if history != crate::model::NIL {
-                                        let entries = self.intern_non_promotion(None, history);
-                                        self.emit(FlowFact::NonPromotedPropertyRead {
-                                            span: *token,
-                                            name: *name,
-                                            receiver: PropReceiver::This,
-                                            entries,
-                                        });
-                                    }
+                            let slot = self.prop_slot(THIS_RECEIVER, *name);
+                            let promoted = self.prop_promoted(THIS_RECEIVER, slot);
+                            if promoted && self.reachable() {
+                                self.emit(FlowFact::PromotedPropertyRead { span: *token });
+                            } else if self.reachable() {
+                                // The non-promoted mirror (upstream
+                                // `_getNonPromotionReasons`'s property
+                                // arm): the slot's cleared promoted
+                                // types stand as evidence for the
+                                // consumer's element-layer verdict.
+                                let history = self.current.prop(slot).history;
+                                if history != crate::model::NIL {
+                                    let entries = self.intern_non_promotion(None, history);
+                                    self.emit(FlowFact::NonPromotedPropertyRead {
+                                        span: *token,
+                                        name: *name,
+                                        receiver: PropReceiver::This,
+                                        entries,
+                                    });
                                 }
-                                expr.ty = if promoted {
-                                    Ty::UNKNOWN
-                                } else {
-                                    Ty::UNKNOWN_NULLABLE
-                                };
-                                expr.prop = Some(slot);
                             }
+                            expr.ty = if promoted {
+                                Ty::UNKNOWN
+                            } else {
+                                Ty::UNKNOWN_NULLABLE
+                            };
+                            expr.prop = Some(slot);
                             expr.name = Some(*name);
                             expr.read_span = Some(*token);
                             self.exprs.push(expr);

@@ -316,6 +316,14 @@ impl<'a> Engine<'a> {
                 );
             }
             let Some(superclass) = found.superclass else {
+                // An enum's implicit superinterface (`Enum`, dart:core —
+                // every enum declaration implements it, so `index` and the
+                // `EnumName` extension's receiver resolve through it): the
+                // interface joins the climb as the enum's own level, written
+                // by the enum in its declaring file.
+                if found.kind == ContainerKind::Enum {
+                    pending_faces.push(vec![(self.intern("Enum"), found_owner, name)]);
+                }
                 // The `extends` chain ends: the collected interfaces still
                 // contribute members — every face met on the climb, deepest
                 // level first (a superclass interface already merged its
@@ -1026,30 +1034,23 @@ impl<'a> Engine<'a> {
         scope_file: FileId,
         free: &mut Vec<StringId>,
     ) {
-        if let Ty::Named { name, args, .. } = ty {
+        // The structural visit ([`crate::ty_fold`]) reaches every named
+        // node — a parameter nested in a function-typed formal or a record
+        // field is as free as a bare one.
+        self.boundary.pool().visit_named(ty, &mut |named| {
+            let Ty::Named { name, .. } = named else {
+                return;
+            };
             let is_type_param = !member.type_param_names.contains(&name)
                 && self
                     .index
                     .get(scope_file)
                     .and_then(|f| f.decl(name))
                     .is_some_and(|decl| decl.kind == crate::model::MicroKind::TypeParam);
-            if args == crate::model::ArgListId::EMPTY {
-                if is_type_param && !free.contains(&name) {
-                    free.push(name);
-                }
-                return;
-            }
-            // A type-parameter head with its own arguments cannot occur
-            // (parameters are never generic), but the head still counts
-            // when it is a parameter spelling — record it, then descend.
             if is_type_param && !free.contains(&name) {
                 free.push(name);
             }
-            let pool = self.boundary.pool();
-            for arg in pool.get(args).iter().copied().collect::<Vec<_>>() {
-                self.free_params_in(arg, member, scope_file, free);
-            }
-        }
+        });
     }
 
     /// The `@override` presence face (`override_verifier.dart`): an
@@ -4072,30 +4073,17 @@ impl<'a> Engine<'a> {
     /// arguments recurses into them (re-interned when any argument
     /// changed), every other shape passes through.
     pub(crate) fn substitute_ty(&self, ty: Ty, keys: &FxHashMap<StringId, Ty>) -> Ty {
-        match ty {
-            Ty::Named {
-                name,
-                nullable,
-                args,
-            } if args != crate::model::ArgListId::EMPTY => {
-                let old: Vec<Ty> = self.boundary.pool().get(args).to_vec();
-                let substituted: Vec<Ty> = old
-                    .iter()
-                    .map(|arg| self.substitute_ty(*arg, keys))
-                    .collect();
-                if substituted == old {
-                    return ty;
-                }
-                self.boundary
-                    .args
-                    .borrow_mut()
-                    .named(name, nullable, &substituted)
-            }
-            Ty::Named {
-                name,
-                nullable,
-                args: _,
-            } => match keys.get(&name) {
+        if keys.is_empty() {
+            return ty;
+        }
+        // The structural fold ([`crate::ty_fold`]) reaches every leaf —
+        // a parameter nested in a function-typed formal (`bool
+        // Function(E)`) or a record field instantiates like a bare one.
+        self.boundary.args.borrow_mut().map_leaves(ty, &mut |leaf| {
+            let Ty::Named { name, nullable, .. } = leaf else {
+                return leaf;
+            };
+            match keys.get(&name) {
                 Some(replacement) => {
                     let mut replaced = *replacement;
                     if nullable && !Self::is_nullable_ty(replaced) {
@@ -4103,10 +4091,9 @@ impl<'a> Engine<'a> {
                     }
                     replaced
                 }
-                None => ty,
-            },
-            _ => ty,
-        }
+                None => leaf,
+            }
+        })
     }
 
     /// The current file's written supertype clauses, one token walk. The

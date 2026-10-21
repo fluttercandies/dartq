@@ -66,6 +66,7 @@ impl Interp<'_> {
                             guard: None,
                             pre_guard: None,
                             pending_decls: Vec::new(),
+                            shadowed: Vec::new(),
                         });
                     }
                 }
@@ -297,9 +298,11 @@ impl Interp<'_> {
                     is_final: *is_final,
                     decl_span: Some(token.range),
                 };
+                let shadowed = self.bound_var(*name);
                 self.declare_var(*name, meta, true);
                 if let Some(pattern) = self.pattern.as_mut() {
                     pattern.pending_decls.push((*name, *is_final));
+                    pattern.shadowed.push((*name, shadowed));
                 }
                 // A typed declared-variable pattern at the top level IS the
                 // pattern's type test (`case int n` — official
@@ -589,6 +592,7 @@ impl Interp<'_> {
             guard: None,
             pre_guard: None,
             pending_decls: Vec::new(),
+            shadowed: Vec::new(),
         });
     }
 

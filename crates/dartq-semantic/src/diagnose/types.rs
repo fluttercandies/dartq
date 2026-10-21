@@ -1981,15 +1981,22 @@ pub(crate) struct Engine<'a> {
     /// `RedirectingConstructorInvocation` visits) and never reports the
     /// member trio or `undefined_identifier` there.
     pub(crate) init_rows: FxHashMap<u32, StringId>,
-    /// The offsets of bare/member rows pushed inside an instance field's
-    /// declaration initializer (`in_instance_field_initializer` is live
-    /// only at push time — pass 2 runs after the field group tears down).
-    /// The implicit-this face consults it at resolve time.
-    pub(crate) field_init_rows: FxHashSet<u32>,
-    /// The subset of [`Engine::field_init_rows`] whose name resolved to an
-    /// INSTANCE member of the enclosing container (the rows that ride
-    /// `this`) — statics and non-members never do.
+    /// The offsets of bare rows pushed inside an instance field's
+    /// declaration initializer whose name resolved to an INSTANCE member
+    /// of the enclosing container (the rows that ride `this`) — statics
+    /// and non-members never do. Snapshotted at push time
+    /// (`in_instance_field_initializer` is live only then — pass 2 runs
+    /// after the field group tears down); the implicit-this face consults
+    /// it at resolve time. Qualified member rows never enter: the oracle
+    /// runs the face from the unqualified nodes only.
     pub(crate) field_init_this_rows: FxHashSet<u32>,
+    /// The frame types the current `if` condition's pattern variables
+    /// shadowed (name, previous type) — the statement's case scope
+    /// ([`super::pattern_scope`]).
+    pub(crate) pattern_shadows: Vec<(StringId, Option<Ty>)>,
+    /// The open `if` statements' case scopes, innermost last; restored
+    /// when the then statement ends.
+    pub(crate) if_case_scopes: Vec<Vec<(StringId, Option<Ty>)>>,
     /// F-C: the folded `super.`-selector candidates of the open list
     /// ([`PendingInitSuper`]); drained at `end_initializers`, where the
     /// invocation shape decides
@@ -2177,6 +2184,12 @@ pub(crate) struct Engine<'a> {
     /// the flow layer's declared type (#2140), keyed on the declarator
     /// name token.
     pub(crate) var_infer_pending: Option<(StringId, SourceRange)>,
+    /// The open variable initializers' own inferred declarators, innermost
+    /// last: `begin_variable_initializer` moves the latched declarator
+    /// here so a declaration nested in the initializer (a for-element's
+    /// loop variable, a closure's local) cannot re-latch the slot before
+    /// the outer initializer closes — the close binds ITS declarator.
+    pub(crate) init_declarators: Vec<Option<(StringId, SourceRange)>>,
     /// The staged assignment RHS types by write-target name (#2174's
     /// inference feed): the latest plain `=` write whose resolved RHS the
     /// flow staged, as `(write offset, executable serial, resolved type)`.

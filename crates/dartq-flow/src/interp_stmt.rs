@@ -135,6 +135,7 @@ impl Interp<'_> {
                 self.stack.push(Frame::If {
                     branch: if_false,
                     after_then: None,
+                    shadowed: Vec::new(),
                 });
                 self.current = if_true;
             }
@@ -149,14 +150,21 @@ impl Interp<'_> {
                 // `Covered::Body`'s `>=`, not `Strict`.
                 self.flow_end(crate::interp::Covered::Body);
                 let after_then = self.current.clone();
-                if let Some(Frame::If {
-                    branch,
-                    after_then: slot,
-                }) = self.stack.last_mut()
-                {
-                    *slot = Some(after_then);
-                    self.current = branch.clone();
-                }
+                // The then branch's scope ends: an if-case's pattern
+                // variables leave the lexical scope here.
+                let shadowed = match self.stack.last_mut() {
+                    Some(Frame::If {
+                        branch,
+                        after_then: slot,
+                        shadowed,
+                    }) => {
+                        *slot = Some(after_then);
+                        self.current = branch.clone();
+                        std::mem::take(shadowed)
+                    }
+                    _ => Vec::new(),
+                };
+                self.restore_bindings(&shadowed);
                 // Entering the else branch adopts the pre-then state: when
                 // it is alive over a dead-from-exit current, the exit's
                 // anchoring duty ends with the then region ([`Interp::join`]'s
@@ -173,9 +181,15 @@ impl Interp<'_> {
                 // (dead_code_verifier.dart:453-459), covering a wholly
                 // dead branch anchored at its own block (`Covered::Body`).
                 self.flow_end(crate::interp::Covered::Body);
-                let Some(Frame::If { branch, after_then }) = self.stack.pop() else {
+                let Some(Frame::If {
+                    branch,
+                    after_then,
+                    shadowed,
+                }) = self.stack.pop()
+                else {
                     return true;
                 };
+                self.restore_bindings(&shadowed);
                 let then_state = if *has_else { after_then } else { None };
                 let joined = self.join(then_state.or(Some(branch)), Some(self.current.clone()));
                 self.current = joined.inherit_tested(&self.current, &mut self.lists);
@@ -1749,6 +1763,7 @@ impl Interp<'_> {
         self.stack.push(Frame::If {
             branch: pattern.unmatched,
             after_then: None,
+            shadowed: pattern.shadowed,
         });
         self.current = matched;
     }

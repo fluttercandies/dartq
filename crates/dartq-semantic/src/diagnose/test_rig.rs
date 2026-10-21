@@ -26,11 +26,14 @@ use std::path::Path;
 /// the fixture on one line so the fixture's own line numbers shift by
 /// exactly one (the name layer resolves them as unit declarations; the
 /// type registry keeps its builtin rows for the ones it already carries).
-pub(super) const CORE_PRELUDE: &str = "class num {} class int extends num {} class double extends num {} \
+pub(super) const CORE_PRELUDE: &str = "class num {} \
+     class int extends num { int operator +(int o) => this; int operator -(int o) => this; bool operator >(int o) => true; bool operator <(int o) => true; } \
+     class double extends num {} \
      class String { String operator +(String other) => this; int get length => 0; } class bool {} class Iterable<E> {} \
      class List<E> extends Iterable<E> { void add(E e) {} E operator [](int i) => throw 0; int get length => 0; } \
      class Map<K, V> { V? operator [](K k) => null; Iterable<K> get keys => throw 0; } \
-     class Set<E> extends Iterable<E> {} class Exception {}\n";
+     class Set<E> extends Iterable<E> {} class Exception {} \
+     abstract class Enum { int get index => 0; }\n";
 
 /// The names-only `dart:core` stub: the special spellings the engine
 /// decides by name (`Never` is the bottom type, `Object` the root) resolve
