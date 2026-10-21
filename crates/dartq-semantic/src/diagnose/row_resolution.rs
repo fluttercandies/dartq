@@ -65,6 +65,21 @@ pub(crate) enum FrozenFace {
     Unknown,
 }
 
+/// The static type a cascade target receiver classifies to (#2459②③): the
+/// named faces answer the `..[` section's operator question directly, a
+/// prefix or unresolvable receiver has no type the model can walk.
+fn cascade_target_ty_of(recv: &Receiver) -> Option<Ty> {
+    match recv {
+        Receiver::Typed { ty, .. } => Some(*ty),
+        Receiver::Created { name, .. }
+        | Receiver::Container { name, .. }
+        | Receiver::PrefixedContainer { name, .. }
+        | Receiver::This { container: name, .. }
+        | Receiver::Super { container: name, .. } => Some(Ty::named(*name)),
+        Receiver::Prefix { .. } | Receiver::Unknown => None,
+    }
+}
+
 impl<'a> Engine<'a> {
     /// The named argument membership test against the active callee
     /// (`type_analyzer.dart:5820`): a resolved callee whose formal table
@@ -248,6 +263,30 @@ impl<'a> Engine<'a> {
     pub(crate) fn resolve_rows(&mut self, promotions: &PromotionStaging) {
         self.build_ur_sites();
         let rows = std::mem::take(&mut self.rows);
+        // The #2459 cascade-index target latches: a first-section `..[` fold
+        // binds the cascade target row itself, and its push-time type is the
+        // target's static type — the oracle resolves EVERY section's index
+        // face against it (`x..[0] = 1..[1] = 2` reports both brackets on
+        // the target's type). Continuation sections bind the same `..[` fold
+        // to the previous section's RHS leftover row (the walk's newest row
+        // before the bracket), so their target question reads this table
+        // instead.
+        let cascade_targets: Vec<(u32, Ty)> = rows
+            .iter()
+            .filter_map(|row| {
+                let Intent::Operator(op, bracket) = row.intent else {
+                    return None;
+                };
+                if op != self.intern("[]") {
+                    return None;
+                }
+                if self.cascade_index_continuation(bracket.offset) {
+                    return None;
+                }
+                let ty = row.ty;
+                (ty != Ty::UNKNOWN).then_some((row.range.offset, ty))
+            })
+            .collect();
         let mut deferred = std::mem::take(&mut self.deferred_miss_rows);
         deferred.sort_by_key(|row| row.range.offset);
         // The fold-deferred rows interleave by offset: their emissions keep
@@ -268,32 +307,62 @@ impl<'a> Engine<'a> {
                     .conditional_uri_rows
                     .contains(&deferred[index].range.offset)
                 {
-                    self.resolve_row(promotions, &deferred[index]);
+                    self.resolve_row(promotions, &deferred[index], &cascade_targets);
                 }
                 index += 1;
             }
-            self.resolve_row(promotions, row);
+            self.resolve_row(promotions, row, &cascade_targets);
         }
         for deferred_row in &deferred[index..] {
             if !self
                 .conditional_uri_rows
-                .contains(&deferred_row.range.offset)
+                .contains(&deferred[index].range.offset)
             {
-                self.resolve_row(promotions, deferred_row);
+                self.resolve_row(promotions, deferred_row, &cascade_targets);
             }
         }
     }
 
     /// One row's pass-2 dispatch (shared by the main stack and the
     /// fold-deferred rows).
-    pub(crate) fn resolve_row(&mut self, promotions: &PromotionStaging, row: &Row) {
+    pub(crate) fn resolve_row(
+        &mut self,
+        promotions: &PromotionStaging,
+        row: &Row,
+        cascade_targets: &[(u32, Ty)],
+    ) {
+        // The #2459②③ cascade-index misfold: a CONTINUATION section's
+        // `..[` fold binds the previous section's RHS leftover row
+        // (`x..[0] = s..[1] = 2` folds the second bracket onto `s`, a
+        // `JSObject()..['k'] = v.toJS` chain folds the next bracket onto
+        // the `toJS` getter row) — the official walk binds every section's
+        // index face to the CASCADE TARGET, never to that row. Answer the
+        // target's own `[]`/`[]=` question at the bracket, then resolve the
+        // row's pre-fold read face (the oracle still reads every leftover:
+        // `s` stays a use, `toJS` resolves through its extension).
+        if let Intent::Operator(op, bracket) = row.intent
+            && op == self.intern("[]")
+            && self.cascade_index_continuation(bracket.offset)
+        {
+            if let Some(target) = self.cascade_index_target_ty(bracket.offset, cascade_targets) {
+                self.check_operator_expr(target, row);
+            }
+            let plain = Row {
+                intent: Intent::Read,
+                write_op: None,
+                ..row.clone()
+            };
+            self.resolve_row(promotions, &plain, cascade_targets);
+            return;
+        }
         match &row.shape {
             RowShape::Bare(info) => self.resolve_bare_row(promotions, row, *info),
             RowShape::Member { recv } => {
+                let recv = self.cascade_recv_receiver(row, *recv);
                 let recv = self.tolerant_receiver(
                     promotions,
                     row,
-                    self.promoted_receiver(row.range.offset, *recv),
+                    self.promoted_receiver(row.range.offset, recv),
                 );
                 self.resolve_member_row(promotions, row, recv);
             }
@@ -301,6 +370,144 @@ impl<'a> Engine<'a> {
             RowShape::TypeUse(..) => self.resolve_type_row(row),
             RowShape::Record(fields) => self.resolve_record_row(row, fields),
             RowShape::Value => {}
+        }
+    }
+
+    /// Whether a `;` separates two UTF-16 offsets — the same separator
+    /// probe `merge_member`'s cascade window runs: a statement boundary
+    /// proves a fresh cascade, while a `;` inside an expression's own spans
+    /// (a `"a;b"` literal) is part of it.
+    pub(crate) fn semicolon_between(&self, from: u32, to: u32) -> bool {
+        let (start, end) = (self.byte_of(from), self.byte_of(to));
+        let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+        self.source.as_bytes()[lo..hi].contains(&b';')
+    }
+
+    /// Whether the `..[`-preceded bracket at `bracket_offset` belongs to a
+    /// CONTINUATION index section. The FIRST section's `..[` fold binds the
+    /// cascade target row itself (the walk's newest row before its bracket
+    /// is the target), while every LATER section's fold binds the previous
+    /// section's RHS leftover row — so the fold's legitimacy is the
+    /// section's own position: walking back from the section operator at
+    /// bracket depth 0, a preceding `..`/`?..` before any chain boundary
+    /// (`;`, `,`, or the target's own opening group) marks a continuation.
+    /// `false` also answers for every bracket a cascade section does not
+    /// own (`..b[0]` reads the selector spelling).
+    fn cascade_index_continuation(&self, bracket_offset: u32) -> bool {
+        let mut b = self.byte_of(bracket_offset);
+        let src = self.source.as_bytes();
+        while b > 0 && src[b - 1].is_ascii_whitespace() {
+            b -= 1;
+        }
+        if b < 2 || src[b - 1] != b'.' || src[b - 2] != b'.' {
+            return false;
+        }
+        b -= 2; // the section's own `..`
+        let mut depth = 0i32;
+        while b > 0 {
+            let c = src[b - 1];
+            b -= 1;
+            match c {
+                b']' | b')' => depth += 1,
+                b'[' | b'(' => {
+                    if depth == 0 {
+                        return false;
+                    }
+                    depth -= 1;
+                }
+                b';' | b',' | b'{' | b'}' if depth == 0 => return false,
+                b'.' if depth == 0 => {
+                    if b > 0 && src[b - 1] == b'.' {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// The static type of the cascade target an index section resolves
+    /// against (#2459②③): the newest selector-section read inside the
+    /// `;`-free window carries the latched target receiver
+    /// (`C()..foo = 1..[0] = 2` answers on `C`), else the nearest
+    /// first-section target fold's push-time type (`x..[0] = 1..[1] = 2`
+    /// answers on the target). Every miss keeps the section silent — the
+    /// under-report posture for the shapes no pass-2 record describes.
+    fn cascade_index_target_ty(
+        &self,
+        bracket_offset: u32,
+        cascade_targets: &[(u32, Ty)],
+    ) -> Option<Ty> {
+        if let Some(read) = self.member_reads.iter().rev().find(|read| {
+            read.offset < bracket_offset
+                && self.cascade_sections.contains(&read.offset)
+                && !self.semicolon_between(read.offset, bracket_offset)
+        }) {
+            return cascade_target_ty_of(&read.recv);
+        }
+        cascade_targets
+            .iter()
+            .rev()
+            .find(|(offset, _)| {
+                *offset < bracket_offset && !self.semicolon_between(*offset, bracket_offset)
+            })
+            .map(|(_, ty)| *ty)
+    }
+
+    /// The #2459① cascade-RHS receiver: a member merge inside a cascade
+    /// section's RHS or arguments that is NOT a section selector itself
+    /// (`..sourceSpan = token.span`'s `span`, `..p = original.p`'s inner
+    /// read) resolves through its own receiver upstream, but the merge-time
+    /// cascade latch (S4-B) substitutes the latched cascade target verbatim
+    /// whenever the popped row is a leftover at section level. The
+    /// substitution is detectable here: the recorded receiver equals the
+    /// newest section read's receiver exactly, and the row's recorded
+    /// receiver span still points at the true receiver expression — the
+    /// flow read type at that span re-derives the receiver the same way the
+    /// inferred-slot face (#2346①) does. Section selectors keep the latched
+    /// target (the S4-B face itself), and every other shape keeps the
+    /// merge-time record byte for byte.
+    fn cascade_recv_receiver(&self, row: &Row, recv: Receiver) -> Receiver {
+        if self.cascade_sections.contains(&row.range.offset) {
+            return recv;
+        }
+        let Some(src) = self.member_reads.iter().rev().find(|read| {
+            read.offset < row.range.offset && self.cascade_sections.contains(&read.offset)
+        }) else {
+            return recv;
+        };
+        if self.semicolon_between(src.offset, row.range.offset) || src.recv != recv {
+            return recv;
+        }
+        let Ok(index) = self
+            .member_reads
+            .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+        else {
+            return recv;
+        };
+        let read_span = self.member_reads[index].recv_span;
+        match self.read_type_at(read_span) {
+            Some(face @ Ty::Named { name: flow_head, .. }) => {
+                // The postfix-`!` upgrade the popped row carried
+                // (`token!.span` — `receiver_static_ty`'s non-null rewrite):
+                // the flow read type at the receiver's own span describes
+                // the pre-assert state, so a bang directly after the
+                // receiver read lifts the corrected face to its non-null
+                // form.
+                let asserted =
+                    self.byte_at(self.skip_whitespace(read_span.end())) == Some(b'!');
+                let face = if asserted {
+                    Self::non_null_form(face)
+                } else {
+                    face
+                };
+                Receiver::Typed {
+                    type_name: flow_head,
+                    ty: face,
+                }
+            }
+            _ => recv,
         }
     }
 
@@ -3736,7 +3943,7 @@ impl<'a> Engine<'a> {
     /// against the oracle: `MyList<Missing>` applies `on MyList<C>` (the
     /// member resolves, no `undefined_*`), while a `(Missing,)` receiver
     /// reports `undefined_getter` through the argument gate's own verdict.
-    fn extension_receiver_resolves(&self, receiver_ty: Ty) -> bool {
+    pub(crate) fn extension_receiver_resolves(&self, receiver_ty: Ty) -> bool {
         match receiver_ty {
             Ty::Named { name, .. } => {
                 self.type_resolution(name).0 == TypeResolution::Type

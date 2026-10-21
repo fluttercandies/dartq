@@ -4357,6 +4357,17 @@ mod ticket_2468_tests;
 #[cfg(test)]
 mod ticket_2450_tests;
 
+/// The #2459 pins: the cascade-resolution leakage family A3 — a cascade
+/// section's RHS member chain resolves through its own receiver instead of
+/// the latched cascade target (`..sourceSpan = token.span` answers `span`
+/// on the token type, never a phantom on the target), an extension getter
+/// inside an index-section cascade chain resolves (`..['k'] = s.toJS`
+/// finds the `on String` extension), an index-assign `..[i] = v` over a
+/// `List` target stays silent, and a missing `[]=` reports per section at
+/// the bracket against the TARGET's type.
+#[cfg(test)]
+mod ticket_2459_tests;
+
 /// The #2465 pins: the unused-element scan's extension-member and
 /// part-file shapes — a bare or explicit-`this` self-use inside an
 /// extension body and a member access through a universal
