@@ -1158,11 +1158,19 @@ pub fn fold_unit_with_ops<'t>(
         file,
         parse_diagnostics: Vec::new(),
     };
+    // The parse runs inside the argument-aware fold window (#2462): the
+    // is-check folds over argument-carrying types re-ask the semantic
+    // subtype face through the engine while it lives here. The guard
+    // closes before the destructure below moves the engine out of the
+    // listener — the registered address is valid for the window's whole
+    // life.
+    let parse_window = crate::switch_tracker::push_fold_engine(&listener.engine);
     // The parse borrows the listener; `drop(parser)` ends the borrow and
     // the destructure below takes the engine and flow recorder back.
     let mut parser = Parser::new(source, tokens, features, &mut listener);
     parser.parse_unit();
     drop(parser);
+    drop(parse_window);
     // The pending exit is dropped unflushed — the old listener drop
     // did exactly the same (a latch with no following flow event never
     // records).
@@ -4404,3 +4412,11 @@ mod ticket_2478_tests;
 /// `dynamic` operands stay live) hold.
 #[cfg(test)]
 mod ticket_2477_tests;
+
+/// The #2462 pins: the is-check fold over argument-carrying types (census
+/// family A5) — differing written arguments keep the test live with both
+/// arms reachable, the provable same-type and covariant folds stay
+/// constant-true, the type-variable face stays conservative, and the
+/// nullability gate keeps its verdict.
+#[cfg(test)]
+mod ticket_2462_tests;

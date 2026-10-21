@@ -2361,7 +2361,7 @@ impl<'a> Engine<'a> {
         // would be the world's blind spot, not the program's (#2139 — a
         // record alias now folds to its shape, surfacing the face).
         let expression_face_decides = match value {
-            NameTy::Named(name, _) => world.name_resolvable(name),
+            NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _) => world.name_resolvable(name),
             NameTy::Unknown(u64::MAX) => false,
             _ => true,
         };
@@ -2371,7 +2371,7 @@ impl<'a> Engine<'a> {
         // `_private` code family instead — unmodeled here, so the face
         // suppresses rather than emit the public row.
         let private_foreign_enum = match value {
-            NameTy::Named(name, _)
+            NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _)
                 if world.is_enum_name(name) && world.is_foreign_library(name) =>
             {
                 self.strings.resolve(name).starts_with('_')

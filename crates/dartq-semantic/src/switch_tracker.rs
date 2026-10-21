@@ -7,8 +7,9 @@
 //! its event handlers; [`NameWorld`] resolves the sealed/enum/subtype facts
 //! the exhaustiveness verdict reads, over the unit's element model.
 
+use crate::diagnose::Engine;
 use crate::library::{ElementIndex, resolve_container};
-use crate::model::{Container, ContainerKind, MemberKind, Ty};
+use crate::model::{ArgListId, Container, ContainerKind, MemberKind, Ty};
 use dartq_resolution::{LibraryGraph, LibraryId, Namespaces};
 use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use dartq_types::{ExhaustivenessWorld, Key, Single, Space};
@@ -140,7 +141,9 @@ impl SwitchTracker {
             return match NameTy::from_semantic(
                 self.switches.last().map_or(Ty::Unknown, |c| c.scrutinee),
             ) {
-                NameTy::Named(name, nullable) => Restriction::Named(name, nullable),
+                NameTy::Named(name, nullable) | NameTy::NamedArgs(name, nullable, _) => {
+                    Restriction::Named(name, nullable)
+                }
                 _ => Restriction::Unknown,
             };
         }
@@ -329,6 +332,19 @@ pub(crate) enum NameTy {
     /// A named type as written, with the syntactic `?`. The nullable
     /// projection doubles as the engine's `Nullable` variant.
     Named(StringId, bool),
+    /// A named type whose written type arguments the projection keeps
+    /// ([`ArgListId`] — the semantic pool slot, canonical within one
+    /// diagnosis). Bare `Named` collapses every instantiation of a head
+    /// into one shape, which is the right posture for the exhaustiveness
+    /// columns (a pattern never writes arguments) but folds the is-check
+    /// verdicts over differing instantiations: `Stream<List<int>>` and
+    /// `Stream<Uint8List>` must not compare equal at the fold. The
+    /// subtype arms treat the bare head as the wildcard side (every
+    /// instantiation fits a bare-head ask — the covariant fit the
+    /// oracle's interface rule gives) and decide the pair over
+    /// argument-carrying sides through the semantic subtype face
+    /// ([`NameWorld::args_subtype`]).
+    NamedArgs(StringId, bool, ArgListId),
     /// An enum constant: the enum's name and the constant's.
     EnumValue(StringId, StringId),
     BoolValue(bool),
@@ -583,8 +599,19 @@ impl NameTy {
             // everything).
             Ty::Never => NameTy::Never,
             // The S0 side channel keeps its name-level shape; the argument
-            // slot stays in the semantic lattice (`Ty`), not here.
-            Ty::Named { name, nullable, .. } => NameTy::Named(name, nullable),
+            // slot rides along by pool id (`NamedArgs`) when written — the
+            // is-check folds compare instantiations, the exhaustiveness
+            // columns never write arguments and keep the bare head.
+            Ty::Named {
+                name,
+                nullable,
+                args: ArgListId::EMPTY,
+            } => NameTy::Named(name, nullable),
+            Ty::Named {
+                name,
+                nullable,
+                args,
+            } => NameTy::NamedArgs(name, nullable, args),
             // Record and function types have no name-level decomposition
             // (the columns live in the `Ty` shape, not here): a sentinel
             // keyed by the canonically-interned shape id keeps equal
@@ -608,6 +635,60 @@ impl NameTy {
             }
         }
     }
+}
+
+// The parse-time engine stack ([`push_fold_engine`]): the argument-aware
+// subtype arm ([`NameWorld::args_subtype`]) re-asks the semantic subtype
+// face through it, because the world carries only the long-lived
+// `&'a`-borrowed facts while the boundary pool — where `ArgListId`s
+// resolve — lives inside the engine owned by the fold's own frame.
+//
+// Raw addresses, never dereferenced outside a push window: the window
+// opens after the fold's listener is built and closes (guard drop) before
+// that listener is destructured, so no stored address can outlive its
+// owner. Re-entrant folds stack; a query reads the topmost window, which
+// is the engine whose verdict is being computed. Faces that run outside
+// any window (the teardown's column asks, the bare-world rigs) find an
+// empty stack and keep the pre-#2462 answer — the collapse, never a
+// panic.
+thread_local! {
+    static FOLD_ENGINES: RefCell<Vec<*const Engine<'static>>> =
+        RefCell::new(Vec::new());
+}
+
+/// Opens a parse-time window for `engine` ([`FOLD_ENGINES`]); the returned
+/// guard closes it. The erasure to `Engine<'static>` is address-only — the
+/// pointee is used exclusively between this call and the guard's drop,
+/// inside the caller's frame that owns the engine.
+pub(crate) fn push_fold_engine(engine: &Engine<'_>) -> FoldEngineGuard {
+    FOLD_ENGINES.with(|stack| {
+        stack
+            .borrow_mut()
+            .push(engine as *const Engine<'_> as *const Engine<'static>);
+    });
+    FoldEngineGuard
+}
+
+/// The window guard ([`push_fold_engine`]).
+pub(crate) struct FoldEngineGuard;
+
+impl Drop for FoldEngineGuard {
+    fn drop(&mut self) {
+        FOLD_ENGINES.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+/// The topmost window's engine, when one is open.
+fn fold_engine() -> Option<&'static Engine<'static>> {
+    FOLD_ENGINES.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .copied()
+            .map(|ptr| unsafe { &*ptr })
+    })
 }
 
 impl ExhaustivenessWorld for NameWorld<'_> {
@@ -635,6 +716,7 @@ impl ExhaustivenessWorld for NameWorld<'_> {
         match ty {
             // The nullable projection of a name.
             NameTy::Named(name, _) => NameTy::Named(*name, true),
+            NameTy::NamedArgs(name, _, args) => NameTy::NamedArgs(*name, true, *args),
             // A restricted value's projection keeps the restriction
             // (`NullableStaticType` over the value static type,
             // static_type.dart:350-383, `NonNullableStaticType.nullable`):
@@ -664,11 +746,31 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             | (NameTy::Never, _)
             | (
                 NameTy::Null,
-                NameTy::Named(_, true) | NameTy::EnumValueOrNull(..) | NameTy::BoolOrNull(_),
+                NameTy::Named(_, true)
+                | NameTy::NamedArgs(_, true, _)
+                | NameTy::EnumValueOrNull(..)
+                | NameTy::BoolOrNull(_),
             ) => true,
             // `S <: T?` iff `S <: T` (static_type.dart:365-372); `S? <: T?`
             // likewise; `S? <: T` never (null matches no plain T).
             (NameTy::Named(sn, s), NameTy::Named(tn, t)) => (!*s || *t) && self.named_sub(*sn, *tn),
+            // An argument-carrying pair decides through the semantic
+            // subtype face ([`Self::args_subtype`]) — the interface rule's
+            // pairwise argument ask (upstream Dart SDK source,
+            // pkg/analyzer/lib/src/dart/element/subtype.dart, the interface
+            // type case: same declaration answers through the type
+            // argument list, distinct heads through the supertype graph).
+            // A bare side stays the wildcard it always was: the
+            // instantiate-to-bound head fits any instantiation covariantly,
+            // so the declared-edge walk alone answers (the pre-#2462
+            // collapse answer, byte-identical).
+            (NameTy::NamedArgs(sn, s, sa), NameTy::NamedArgs(tn, t, ta)) => {
+                (!*s || *t) && self.args_subtype(*sn, *s, *sa, *tn, *t, *ta)
+            }
+            (NameTy::NamedArgs(sn, s, _), NameTy::Named(tn, t))
+            | (NameTy::Named(sn, s), NameTy::NamedArgs(tn, t, _)) => {
+                (!*s || *t) && self.named_sub(*sn, *tn)
+            }
             // The bare value fits its own nullable projection (the
             // must-match rule: `true <: true?` through the identical
             // restriction, types.dart:52-56).
@@ -678,7 +780,10 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             // (`NonNullableStaticType.isSubtypeOf`, static_type.dart
             // :415-421).
             (
-                NameTy::Named(_, false) | NameTy::EnumValue(..) | NameTy::BoolValue(_),
+                NameTy::Named(_, false)
+                | NameTy::NamedArgs(_, false, _)
+                | NameTy::EnumValue(..)
+                | NameTy::BoolValue(_),
                 NameTy::TopNonNullable,
             ) => true,
             // A constant's type is its enum, non-null.
@@ -686,7 +791,7 @@ impl ExhaustivenessWorld for NameWorld<'_> {
             // The restricted nullable inherits the value's type edges, but
             // only toward nullable targets (its `null` half never fits a
             // non-nullable type).
-            (NameTy::EnumValueOrNull(en, _), NameTy::Named(tn, true)) => {
+            (NameTy::EnumValueOrNull(en, _), NameTy::Named(tn, true) | NameTy::NamedArgs(tn, true, _)) => {
                 self.is_subtype_of(&NameTy::Named(*en, false), &NameTy::Named(*tn, true))
             }
             (NameTy::BoolOrNull(_), NameTy::Named(tn, true)) => self.is_subtype_of(
@@ -705,10 +810,13 @@ impl ExhaustivenessWorld for NameWorld<'_> {
         match ty {
             // Nullable projections split (static_type.dart:356).
             NameTy::Named(_, true)
+            | NameTy::NamedArgs(_, true, _)
             | NameTy::TopNullable
             | NameTy::EnumValueOrNull(..)
             | NameTy::BoolOrNull(_) => true,
-            NameTy::Named(name, false) => self.is_sealed_name(*name),
+            NameTy::Named(name, false) | NameTy::NamedArgs(name, false, _) => {
+                self.is_sealed_name(*name)
+            }
             _ => false,
         }
     }
@@ -716,6 +824,9 @@ impl ExhaustivenessWorld for NameWorld<'_> {
     fn subtypes(&self, ty: &NameTy) -> Vec<NameTy> {
         match ty {
             NameTy::Named(name, true) => vec![NameTy::Named(*name, false), NameTy::Null],
+            NameTy::NamedArgs(name, true, args) => {
+                vec![NameTy::NamedArgs(*name, false, *args), NameTy::Null]
+            }
             NameTy::TopNullable => vec![NameTy::TopNonNullable, NameTy::Null],
             // NullableStaticType.getSubtypes: the value plus `null`
             // (static_type.dart:359-362).
@@ -723,7 +834,9 @@ impl ExhaustivenessWorld for NameWorld<'_> {
                 vec![NameTy::EnumValue(*enum_name, *constant), NameTy::Null]
             }
             NameTy::BoolOrNull(value) => vec![NameTy::BoolValue(*value), NameTy::Null],
-            NameTy::Named(name, false) => self.name_subtypes(*name),
+            NameTy::Named(name, false) | NameTy::NamedArgs(name, false, _) => {
+                self.name_subtypes(*name)
+            }
             _ => Vec::new(),
         }
     }
@@ -733,7 +846,7 @@ impl ExhaustivenessWorld for NameWorld<'_> {
     /// know it (the checker's columns then fall back to the nullable
     /// object, exhaustive.dart:396-406).
     fn property_type(&self, ty: &NameTy, key: &Key) -> Option<NameTy> {
-        let NameTy::Named(name, _) = ty else {
+        let (NameTy::Named(name, _) | NameTy::NamedArgs(name, _, _)) = ty else {
             return None;
         };
         let Key::Name(member) = key else {
@@ -899,6 +1012,7 @@ impl<'a> NameWorld<'a> {
         !matches!(
             ty,
             NameTy::Named(_, false)
+                | NameTy::NamedArgs(_, false, _)
                 | NameTy::TopNonNullable
                 | NameTy::EnumValue(..)
                 | NameTy::BoolValue(_)
@@ -911,6 +1025,7 @@ impl<'a> NameWorld<'a> {
     fn head_name(&self, ty: &NameTy) -> Option<StringId> {
         match ty {
             NameTy::Named(name, _)
+            | NameTy::NamedArgs(name, _, _)
             | NameTy::EnumValue(name, _)
             | NameTy::EnumValueOrNull(name, _) => Some(*name),
             NameTy::BoolValue(_) | NameTy::BoolOrNull(_) => Some(self.bool_id),
@@ -944,11 +1059,16 @@ impl<'a> NameWorld<'a> {
     /// every other shape answers `true` (the official's type-parameter
     /// and non-interface fallbacks).
     pub(crate) fn can_be_equal(&self, constant: &NameTy, value: &NameTy) -> bool {
-        if !matches!(constant, NameTy::Named(..) | NameTy::Null) {
+        if !matches!(
+            constant,
+            NameTy::Named(..) | NameTy::NamedArgs(..) | NameTy::Null
+        ) {
             return true;
         }
         match value {
-            NameTy::Named(..) | NameTy::Null => self.is_subtype_of(constant, value),
+            NameTy::Named(..) | NameTy::NamedArgs(..) | NameTy::Null => {
+                self.is_subtype_of(constant, value)
+            }
             _ => true,
         }
     }
@@ -1097,6 +1217,16 @@ impl<'a> NameWorld<'a> {
                     text.to_string()
                 }
             }
+            // The witness text keeps the head spelling (the exhaustiveness
+            // witnesses never write arguments — the pre-#2462 text).
+            NameTy::NamedArgs(name, nullable, _) => {
+                let text = self.strings.resolve(*name);
+                if *nullable {
+                    format!("{text}?")
+                } else {
+                    text.to_string()
+                }
+            }
             NameTy::EnumValue(enum_name, constant) => {
                 format!(
                     "{}.{}",
@@ -1168,6 +1298,45 @@ impl<'a> NameWorld<'a> {
             }
         }
         false
+    }
+
+    /// The argument-carrying pair's verdict: the semantic subtype face
+    /// decides the full pair (upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/subtype.dart — the interface type
+    /// case: same declaration answers through the type argument list,
+    /// distinct heads through the supertype graph). `Some(true)` folds the
+    /// check; a decidable miss and an unprovable pair both decline it (the
+    /// test stays live, promotion stays conservative — the
+    /// `_checkAllTypeChecks` verdict only ever fires on a proven
+    /// constant). The ask runs through the parse-time engine window
+    /// ([`fold_engine`]) because the argument slots resolve in the
+    /// boundary pool the engine owns; outside a window (the bare-world
+    /// rigs, faces past the parse) the pre-#2462 collapse answer stands.
+    fn args_subtype(
+        &self,
+        sub_name: StringId,
+        sub_nullable: bool,
+        sub_args: ArgListId,
+        sup_name: StringId,
+        sup_nullable: bool,
+        sup_args: ArgListId,
+    ) -> bool {
+        match fold_engine() {
+            Some(engine) => {
+                let sub = Ty::Named {
+                    name: sub_name,
+                    nullable: sub_nullable,
+                    args: sub_args,
+                };
+                let sup = Ty::Named {
+                    name: sup_name,
+                    nullable: sup_nullable,
+                    args: sup_args,
+                };
+                engine.slot_subtype(sub, sup) == Some(true)
+            }
+            None => true,
+        }
     }
 
     /// The closed-walk subtype verdict over the same lattice
