@@ -31,6 +31,24 @@
 //! them. `NumToJSExtension.toJS` is a concrete getter upstream; the excerpt
 //! declares it `external` — the name-level model (name, kind, return type)
 //! is identical and no body is captured either way.
+//!
+//! The `js_interop` excerpt also carries the library's extension-type
+//! declarations (`JSAny`, `JSObject`, `JSFunction` — upstream
+//! js_interop.dart:181/:200/:248). Without a container for the receiver's
+//! type spelling, the semantic member walk reads it as unresolvable
+//! (`ChainBroken`): member and operator misses rode dynamic and stayed
+//! silent where the oracle reports them. The declarations' internal
+//! `JS*Type` representation spellings stay undeclared — they live in
+//! `dart:_js_types` upstream, which `dart:js_interop` imports but never
+//! exports, so no user-visible resolution can name them either.
+//!
+//! The table consumes two sources: this engine's built-in excerpts and
+//! [`dartq_sdk::EXTENSION_FACE_SOURCES`] (the `dart:core` enum pair the
+//! census keyed on — `values.byName` over `List<T extends Enum>`
+//! receivers). Both flow through the same scan-collect-index shape below;
+//! the tables must stay library-disjoint, since a duplicate entry would
+//! silently overwrite the earlier face's element model (pinned by an
+//! in-module test).
 
 use std::path::Path;
 
@@ -47,6 +65,15 @@ use dartq_semantic::{ElementIndex, collect};
 /// libraries whose face is name-only complete.
 static SDK_EXTENSION_FACE_SOURCES: &[(&str, &str)] = &[
     (
+        // Upstream Dart SDK source, sdk/lib/js_interop/js_interop.dart —
+        // the declaration surfaces verbatim. Concrete member bodies are
+        // spelled `external` (the name-level model is identical and no
+        // body is captured either way); the private `_getProperty`/
+        // `_callMethod` members of `JSAny` and the private top-level
+        // `_createObjectLiteral` stay out — library-private upstream,
+        // invisible to every user-visible resolution. The `@JS`/`@Since`
+        // annotations are dropped: metadata plays no part in the
+        // resolution surfaces the faces carry.
         "js_interop",
         r#"extension ListToJSArray<T extends JSAny?> on List<T> {
   external JSArray<T> get toJS;
@@ -63,6 +90,18 @@ extension BoolToJSBoolean on bool {
 }
 extension StringToJSString on String {
   external JSString get toJS;
+}
+extension type JSAny._(JSAnyType _jsAny) implements Object, JSAnyType {}
+extension type JSObject._(JSObjectType _jsObject)
+    implements JSAny, JSObjectType {
+  external JSObject.fromInteropObject(Object interopObject);
+  external JSObject();
+  external static JSObject? getPrototypeOf(JSAny value);
+}
+extension type JSFunction<T extends Function>._(JSFunctionType _jsFunction)
+    implements JSObject, JSFunctionType {
+  external int get length;
+  external String get name;
 }
 "#,
     ),
@@ -100,16 +139,21 @@ extension JSFunctionUnsafeUtilExtension on JSFunction {
 /// `<dart:{library}>` (same table, idempotent by path), so the semantic
 /// extension pool finds the faces through the import edge's export scope.
 ///
-/// Runs once per analyze, beside [`crate::semdiag::build_index`]; the
-/// excerpts are fixed ASCII with no directives, so the scan is
-/// config-stable (modern feature posture, the platform libraries' own) and
-/// cannot produce scanner diagnostics.
+/// Both tables feed the same scan-collect-index shape: the engine's
+/// built-in excerpts and the sdk crate's [`dartq_sdk::EXTENSION_FACE_SOURCES`]
+/// (the `dart:core` enum pair). Runs once per analyze, beside
+/// [`crate::semdiag::build_index`]; the excerpts are fixed ASCII with no
+/// directives, so the scan is config-stable (modern feature posture, the
+/// platform libraries' own) and cannot produce scanner diagnostics.
 pub(crate) fn insert_sdk_extension_faces(
     index: &mut ElementIndex,
     files: &mut FileTable,
     strings: &StringTable,
 ) {
-    for (library, source) in SDK_EXTENSION_FACE_SOURCES {
+    for (library, source) in SDK_EXTENSION_FACE_SOURCES
+        .iter()
+        .chain(dartq_sdk::EXTENSION_FACE_SOURCES.iter())
+    {
         let file = files.intern(Path::new(&format!("<dart:{library}>")));
         let scanned = scan(
             source,
@@ -126,5 +170,39 @@ pub(crate) fn insert_sdk_extension_faces(
         let features = ParserFeatures::from_feature_set(FeatureSet::latest());
         let elements = collect(source, &scanned.tokens, features, strings);
         index.insert(file, elements);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SDK_EXTENSION_FACE_SOURCES;
+    use dartq_sdk::{EXTENSION_FACE_SOURCES, FLAT_LIBRARIES};
+
+    /// The two face-source tables feed one loop, and the loop indexes each
+    /// excerpt under its library's face file with whole-file replacement —
+    /// a library carried by both tables would silently drop the earlier
+    /// face's element model. The tables are curated static data in two
+    /// crates, so the disjointness contract is pinned where both are
+    /// visible, and every entry must name an addressable `dart:` library
+    /// (one the generated flat surface knows, so the synthetic face file
+    /// pairs with a library the graph build interned).
+    #[test]
+    fn chained_face_tables_are_disjoint_and_addressable() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (library, source) in SDK_EXTENSION_FACE_SOURCES
+            .iter()
+            .chain(EXTENSION_FACE_SOURCES.iter())
+        {
+            assert!(
+                seen.insert(*library),
+                "extension face `{library}` carried by both tables: the later \
+                 index.insert would silently overwrite the earlier face"
+            );
+            assert!(
+                FLAT_LIBRARIES.iter().any(|(name, _)| name == library),
+                "extension face `{library}` is not an addressable dart: library"
+            );
+            assert!(!source.is_empty(), "extension face `{library}` is empty");
+        }
     }
 }
