@@ -118,6 +118,35 @@ fn strictly_non_nullable() {
     assert!(!sys.is_strictly_non_nullable(fx.type_param(fx.d.iterable_t)));
 }
 
+/// The census row-3 contract (`FutureOr` over an unresolved type argument):
+/// the oracle substitutes the invalid argument in place and `isNullable`
+/// recurses into it, so `FutureOr<Invalid>` reads as the nullable top —
+/// the receiver verdict behind `unchecked_use_of_nullable_value` on a
+/// member send. Anchors: upstream Dart SDK source,
+/// pkg/analyzer/lib/src/dart/element/type_system.dart (isNullable 1216,
+/// isTop 1277, isObject 1241) and
+/// pkg/analyzer/lib/src/error/nullable_dereference_verifier.dart.
+#[test]
+fn future_or_over_invalid_normalizes_to_nullable_top() {
+    let fx = fixture();
+    let sys = fx.system();
+    let over_invalid = fx.future_or_of(fx.invalid(), false);
+    // NULLABLE(FutureOr<T>) iff NULLABLE(T); Invalid is nullable.
+    assert!(sys.is_nullable(over_invalid));
+    assert!(!sys.is_non_nullable(over_invalid));
+    // TOP(FutureOr<T>) iff TOP(T); Invalid is top.
+    assert!(sys.is_top(over_invalid));
+    // OBJECT(FutureOr<T>) iff OBJECT(T) — the top/object split the
+    // suffixed branch of `isTop` consumes stays on the `top` side.
+    assert!(!sys.is_object(over_invalid));
+    // The strict receiver-gate mirror: never reads as dereference-safe.
+    assert!(!sys.is_strictly_non_nullable(over_invalid));
+    // The suffixed neighbor rides the ordinary `T?` disjunction.
+    let suffixed = fx.future_or_of(fx.invalid(), true);
+    assert!(sys.is_nullable(suffixed));
+    assert!(sys.is_top(suffixed));
+}
+
 #[test]
 fn assignability() {
     let fx = fixture();
