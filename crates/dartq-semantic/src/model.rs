@@ -1371,6 +1371,17 @@ pub struct ExtensionFace {
     /// (the oracle's `applicableTo` inference), so the argument-level gate
     /// only compares the concrete arguments.
     pub type_param_names: Box<[StringId]>,
+    /// Each type parameter's declared bound, parallel to
+    /// [`Self::type_param_names`] (index i is the bound of
+    /// `type_param_names[i]`); [`Ty::Dynamic`] for an absent bound — the
+    /// Dart reading (an unbounded parameter is bounded by `dynamic`) and
+    /// the consumer's no-constraint marker. The bounds gate both
+    /// applicability — an argument instantiating a parameter must satisfy
+    /// its bound or the inference fails and the face drops
+    /// (`applicable_extensions.dart` `applicableTo`) — and the specificity
+    /// step's instantiate-to-bounds tail (`extension_member_resolver.dart`
+    /// `_isMoreSpecific` step 5 through `_instantiateToBounds`).
+    pub type_param_bounds: Box<[Ty]>,
     /// The extension's members under their lookup spellings (setters under
     /// `name=`), static bit preserved.
     pub members: NameMap<MemberEntry>,
@@ -2241,21 +2252,37 @@ mod tests {
     #[test]
     fn record_display_order_is_independent_of_intern_arrival() {
         let reverse = StringTable::new();
-        let (c, b, a) = (reverse.intern("c"), reverse.intern("b"), reverse.intern("a"));
+        let (c, b, a) = (
+            reverse.intern("c"),
+            reverse.intern("b"),
+            reverse.intern("a"),
+        );
         let forward = StringTable::new();
-        let (a2, b2, c2) = (forward.intern("a"), forward.intern("b"), forward.intern("c"));
+        let (a2, b2, c2) = (
+            forward.intern("a"),
+            forward.intern("b"),
+            forward.intern("c"),
+        );
         let (int_r, int_f) = (reverse.intern("int"), forward.intern("int"));
 
         let mut pool_r = ArgPool::default();
         let mut pool_f = ArgPool::default();
         let ty_r = pool_r.record(
             &[],
-            &[(b, Ty::named(int_r)), (a, Ty::named(int_r)), (c, Ty::named(int_r))],
+            &[
+                (b, Ty::named(int_r)),
+                (a, Ty::named(int_r)),
+                (c, Ty::named(int_r)),
+            ],
             false,
         );
         let ty_f = pool_f.record(
             &[],
-            &[(b2, Ty::named(int_f)), (a2, Ty::named(int_f)), (c2, Ty::named(int_f))],
+            &[
+                (b2, Ty::named(int_f)),
+                (a2, Ty::named(int_f)),
+                (c2, Ty::named(int_f)),
+            ],
             false,
         );
         assert_eq!(ty_r.render(&reverse, &pool_r), "({int a, int b, int c})");
@@ -2282,7 +2309,10 @@ mod tests {
         let ty = pool.record(&[], &[(a, Ty::named(int)), (b, Ty::named(int))], false);
         assert_eq!(ty.render(&strings, &pool), "({int a, int b})");
         let twin = pool.record(&[], &[(b, Ty::named(int)), (a, Ty::named(int))], false);
-        assert_eq!(ty, twin, "written order does not change the shape's identity");
+        assert_eq!(
+            ty, twin,
+            "written order does not change the shape's identity"
+        );
         assert_eq!(twin.render(&strings, &pool), "({int a, int b})");
     }
 

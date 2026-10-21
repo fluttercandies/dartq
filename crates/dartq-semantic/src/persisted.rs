@@ -284,6 +284,15 @@ pub struct PersistedExtensionFace {
     /// comparing concretely.
     #[serde(default)]
     pub type_param_names: Vec<u32>,
+    /// Additive after the format shipped: each parameter's declared bound,
+    /// parallel to `type_param_names` — the applicability gate's bound
+    /// check and the specificity step's instantiate-to-bounds tail. A
+    /// pre-slot payload decodes empty (no bound consumer existed), and a
+    /// shorter column reads as `Dynamic` past its end — the unbounded
+    /// direction both consumers already suppress on (the #539
+    /// additive-field discipline).
+    #[serde(default)]
+    pub type_param_bounds: Vec<PersistedTy>,
     pub members: Vec<(u32, PersistedMemberEntry)>,
 }
 
@@ -534,6 +543,11 @@ impl PersistedElements {
                 on_type_nullable: face.on_type_nullable,
                 on_ty: s.ty(&face.on_ty),
                 type_param_names: s.ids(&face.type_param_names),
+                type_param_bounds: face
+                    .type_param_bounds
+                    .iter()
+                    .map(|bound| s.ty(bound))
+                    .collect(),
                 members: face
                     .members
                     .iter()
@@ -617,10 +631,11 @@ impl PersistedElements {
                     on_type: face.on_type.map(&at_name),
                     on_type_nullable: face.on_type_nullable,
                     on_ty: into_ty(face.on_ty, &ids, &mut type_args),
-                    type_param_names: face
-                        .type_param_names
+                    type_param_names: face.type_param_names.into_iter().map(&at_name).collect(),
+                    type_param_bounds: face
+                        .type_param_bounds
                         .into_iter()
-                        .map(&at_name)
+                        .map(|bound| into_ty(bound, &ids, &mut type_args))
                         .collect(),
                     members: face
                         .members
@@ -1107,6 +1122,7 @@ mod tests {
             on_type_nullable: false,
             on_ty: Ty::named(name("int")),
             type_param_names: Box::new([]),
+            type_param_bounds: Box::new([]),
             members: [(name("e"), member("e"))].into_iter().collect(),
         }]);
         elements.duplicates = Box::new([DuplicateDecl {

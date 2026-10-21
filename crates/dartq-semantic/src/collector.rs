@@ -297,6 +297,12 @@ struct Builder<'src, 'tab> {
     /// count-only attach so the application face can tell an `on`-argument
     /// that names a type parameter (instantiable) from a concrete one.
     extension_type_param_names: Vec<StringId>,
+    /// The extension's type-parameter bounds, parallel to
+    /// [`Builder::extension_type_param_names`] (`Ty::Dynamic` for an absent
+    /// bound — the Dart reading of unbounded); taken from the type-var
+    /// group's own bounds buffer at the container's open and consumed into
+    /// the [`ExtensionFace`] at the close.
+    extension_type_param_bounds: Vec<Ty>,
     /// The open field group's `abstract`/`external` modifiers (`begin_fields`
     /// latches, `end_fields` clears).
     field_abstract: bool,
@@ -342,6 +348,13 @@ struct Builder<'src, 'tab> {
     /// Names in the current depth-1 type-parameter list (`duplicate_definition`
     /// compares per list, `duplicate_definition_verifier.dart:124-135`).
     type_var_group: Vec<StringId>,
+    /// The group's declared bounds, parallel to [`Builder::type_var_group`]
+    /// (`Dynamic` placeholder at `begin_type_variable`, the variable's
+    /// written bound latched at its `end_type_variable` — the bound
+    /// re-parses just before that event, so the armed pair is it). Every
+    /// `type_var_group` mutation mirrors here, and a group without a bound
+    /// leaves its slot at `Dynamic`.
+    type_var_bounds: Vec<Ty>,
     /// Count of the open depth-1 type-parameter list.
     type_param_count: u16,
     /// A depth-1 count that closed before its declaration's container
@@ -422,6 +435,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             extension_on_type_nullable: false,
             extension_on_ty: None,
             extension_type_param_names: Vec::new(),
+            extension_type_param_bounds: Vec::new(),
             field_abstract: false,
             field_external: false,
             field_final: false,
@@ -439,6 +453,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             type_group_depth: 0,
             type_arg_depth: 0,
             type_var_group: Vec::new(),
+            type_var_bounds: Vec::new(),
             type_param_count: 0,
             header_type_params: 0,
             header_super_open: false,
@@ -502,8 +517,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
 
     /// Records a declaration-arity violation.
     fn record_arity(&mut self, violation: ArityViolation, range: SourceRange) {
-        self.arity_violations
-            .push(ArityDecl { violation, range });
+        self.arity_violations.push(ArityDecl { violation, range });
     }
 
     /// Declares a top-level name, logging a duplicate when taken.
@@ -581,8 +595,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             .into_iter()
             .map(|(name, field)| (name, self.record_field_ty(field)))
             .collect();
-        self.type_args
-            .record(&positional, &named, tree.nullable)
+        self.type_args.record(&positional, &named, tree.nullable)
     }
 
     fn record_field_ty(&mut self, tree: TypeTree) -> Ty {
@@ -609,13 +622,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             .into_iter()
             .map(|(name, formal)| (name, self.arg_ty(formal)))
             .collect();
-        self.type_args.function(
-            fn_tree.type_params,
-            ret,
-            &positional,
-            &named,
-            tree.nullable,
-        )
+        self.type_args
+            .function(fn_tree.type_params, ret, &positional, &named, tree.nullable)
     }
 
     /// One argument subtree. The head canonicalizes exactly like the
@@ -831,13 +839,21 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         // carries a count only from a real group, which also keys the take
         // (a parameterless `extension E` after `class C<T>` must not
         // inherit C's still-buffered names).
-        self.extension_type_param_names = if kind == ContainerKind::Extension
-            && header_type_params > 0
-        {
-            std::mem::take(&mut self.type_var_group)
-        } else {
-            Vec::new()
-        };
+        self.extension_type_param_names =
+            if kind == ContainerKind::Extension && header_type_params > 0 {
+                std::mem::take(&mut self.type_var_group)
+            } else {
+                Vec::new()
+            };
+        // The bounds ride the same window (their buffer mutated in lockstep
+        // with the names); an absent bound stays at its `Dynamic`
+        // placeholder.
+        self.extension_type_param_bounds =
+            if kind == ContainerKind::Extension && header_type_params > 0 {
+                std::mem::take(&mut self.type_var_bounds)
+            } else {
+                Vec::new()
+            };
         self.containers.push(OpenContainer {
             name,
             kind,
@@ -886,6 +902,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         let extension_on_ty = self.extension_on_ty.take().unwrap_or(Ty::Unknown);
         let extension_type_param_names =
             std::mem::take(&mut self.extension_type_param_names).into_boxed_slice();
+        let extension_type_param_bounds =
+            std::mem::take(&mut self.extension_type_param_bounds).into_boxed_slice();
         let Some(open) = self.containers.pop() else {
             return;
         };
@@ -902,6 +920,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 on_type_nullable: self.extension_on_type_nullable,
                 on_ty: extension_on_ty,
                 type_param_names: extension_type_param_names,
+                type_param_bounds: extension_type_param_bounds,
                 members: members.finish(),
             });
             return;
@@ -915,6 +934,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
                 on_type_nullable: self.extension_on_type_nullable,
                 on_ty: extension_on_ty,
                 type_param_names: extension_type_param_names,
+                type_param_bounds: extension_type_param_bounds,
                 members: members.clone().finish(),
             });
         }
@@ -1237,6 +1257,9 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         if let Some(pending) = &mut self.pending_member {
             pending.type_params = count;
             pending.type_param_names = std::mem::take(&mut self.type_var_group);
+            // The member face keeps only the names; the bounds buffer
+            // leaves with the group it mirrors (no bound consumer here).
+            std::mem::take(&mut self.type_var_bounds);
         } else if let Some(pending) = &mut self.pending_top {
             pending.type_params = count;
         } else if let Some(pending) = &mut self.pending_typedef {
@@ -2073,6 +2096,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             builder.type_param_count = 0;
         }
         builder.type_var_group.clear();
+        builder.type_var_bounds.clear();
         if let Some(site) = builder.capture.as_mut() {
             site.type_variables_begin();
         }
@@ -2088,6 +2112,9 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 builder.record_duplicate(name, range);
             } else {
                 builder.type_var_group.push(name);
+                // The bound latches at the variable's `end_type_variable`;
+                // until then the slot carries the unbounded reading.
+                builder.type_var_bounds.push(Ty::Dynamic);
             }
             builder
                 .decls
@@ -2098,6 +2125,39 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             if let Some(site) = builder.capture.as_mut() {
                 site.function_type_variable();
             }
+        }
+    }
+
+    fn end_type_variable(
+        &mut self,
+        token: Token,
+        index: usize,
+        extends_or_super: Option<Token>,
+        variance: Option<Token>,
+    ) {
+        let builder = &mut self.builder;
+        let _ = (index, variance);
+        // A bound re-parses immediately before this event (the group
+        // completes in reverse declaration order, each bound rewinding to
+        // its own `extends` — `type_args.rs`'s completion loop), so with a
+        // bound written the armed pair is this variable's bound. The
+        // armed pair is single-slot, but nothing else arms inside a type
+        // variable (metadata fires no `handle_type`), and a return type
+        // arms — and is consumed at its name event — before the group
+        // opens, so the slot is intact for whoever completes last.
+        // A variable without a bound keeps its `Dynamic` placeholder (the
+        // no-`handle_type` arm fires `handle_no_type`, clearing the pair).
+        if extends_or_super.is_none() {
+            return;
+        }
+        let Some((name, _)) = builder.capture_name(token) else {
+            return;
+        };
+        let Some(at) = builder.type_var_group.iter().rposition(|&n| n == name) else {
+            return;
+        };
+        if at < builder.type_var_bounds.len() {
+            builder.type_var_bounds[at] = builder.take_armed();
         }
     }
 
@@ -2740,8 +2800,11 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                         || matches!(text, "[]" | "[]=" | "~" | "-")
                 });
             if operator_spelling.is_some() {
-                builder.pending_member.as_mut().expect("just read").return_ty =
-                    builder.take_armed();
+                builder
+                    .pending_member
+                    .as_mut()
+                    .expect("just read")
+                    .return_ty = builder.take_armed();
             }
             // The executable's type parameters must all precede its formals.
             builder.executable_header_done = true;
@@ -3572,10 +3635,7 @@ mod tests {
         };
         let top = elements.decl(id(&strings, "topFn")).expect("topFn");
         assert_eq!(names(&top.formals), ["task", "sched"]);
-        let members = &elements
-            .container(id(&strings, "C"))
-            .unwrap()
-            .members;
+        let members = &elements.container(id(&strings, "C")).unwrap().members;
         let m = members.get(&id(&strings, "m")).expect("m");
         assert_eq!(names(&m.formals), ["task", "sched"]);
         let n = members.get(&id(&strings, "n")).expect("n");
@@ -3785,7 +3845,10 @@ mod tests {
         assert_eq!(c.implements_clause.as_ref(), vec![id(&strings, "List")]);
         assert!(c.header_residue.is_empty(), "{:?}", c.header_residue);
         let w = elements.container(id(&strings, "W")).expect("W");
-        assert_eq!(w.with_clause.as_ref(), vec![id(&strings, "M"), id(&strings, "N")]);
+        assert_eq!(
+            w.with_clause.as_ref(),
+            vec![id(&strings, "M"), id(&strings, "N")]
+        );
         assert!(w.header_residue.is_empty(), "{:?}", w.header_residue);
         let mx = elements.container(id(&strings, "Mx")).expect("Mx");
         assert_eq!(mx.on_clause.as_ref(), vec![id(&strings, "T")]);

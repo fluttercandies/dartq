@@ -3750,3 +3750,11 @@ mod ticket_2433_tests;
 /// parameter-mentioning bound suppresses.
 #[cfg(test)]
 mod ticket_2430_tests;
+/// The #2431 pins: the extension face's type-parameter bounds — the
+/// applicability gate drops a face whose bound rejects the receiver's
+/// argument (the raw-`List` receiver's `dynamic` instantiation fails every
+/// concrete bound), and the specificity step's instantiate-to-bounds tail
+/// orders a bounded face against its unbounded twin while equally-bounded
+/// twins stay ambiguous.
+#[cfg(test)]
+mod ticket_2431_tests;

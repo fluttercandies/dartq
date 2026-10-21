@@ -606,9 +606,7 @@ impl<'a> Engine<'a> {
                 // the extension (the same face `note_member_read`'s `This`
                 // arm carries).
                 if !matches!(row.intent, Intent::Write)
-                    && !self
-                        .statement_discarded_rows
-                        .contains(&row.range.offset)
+                    && !self.statement_discarded_rows.contains(&row.range.offset)
                 {
                     if let Some(&pushed) = self.field_read_rows.get(&row.range.offset) {
                         self.read_names.insert(row.name);
@@ -3215,16 +3213,69 @@ impl<'a> Engine<'a> {
                 .all(|(&receiver_arg, &on_arg)| {
                     // An `on` argument spelling one of the extension's own
                     // type parameters instantiates against the receiver —
-                    // the inferrer binds it, never constrains it.
+                    // the inferrer binds it, then checks the instantiated
+                    // bound: an argument the bound rejects fails the
+                    // inference and the face never applies
+                    // (`applicable_extensions.dart` `applicableTo`'s
+                    // `tryChooseFinalTypes`), the
+                    // `_ListOfPropertyAccessorFragment<T extends
+                    // PropertyAccessorFragmentImpl> on List<T>` shape. A
+                    // raw receiver instantiates to the `dynamic` row
+                    // below, which every concrete bound rejects — the
+                    // oracle answers `undefined_getter` on `List<dynamic>`
+                    // there (probed, /tmp/probe2431/lib/b.dart:38).
                     if let Ty::Named {
                         name: arg_name,
                         args,
                         ..
                     } = on_arg
                         && args == ArgListId::EMPTY
-                        && face.type_param_names.contains(&arg_name)
+                        && let Some(param_index) =
+                            face.type_param_names.iter().position(|&n| n == arg_name)
                     {
-                        return true;
+                        let bound = face
+                            .type_param_bounds
+                            .get(param_index)
+                            .copied()
+                            .unwrap_or(Ty::Dynamic);
+                        let bound = boundary.ty(face_file, bound);
+                        if matches!(bound, Ty::Dynamic) {
+                            return true;
+                        }
+                        return match (receiver_arg, bound) {
+                            // `dynamic <: Object` and `dynamic <: Object?`
+                            // — the only tops a `dynamic` instantiation
+                            // satisfies; any concrete bound rejects it.
+                            (Ty::Dynamic, Ty::Named { name, args, .. }) => {
+                                args == ArgListId::EMPTY && name == object
+                            }
+                            (
+                                Ty::Named {
+                                    name: arg_head,
+                                    nullable: arg_nullable,
+                                    args: arg_args,
+                                },
+                                Ty::Named {
+                                    name: bound_head,
+                                    nullable: bound_nullable,
+                                    args: bound_args,
+                                },
+                            ) => {
+                                // A bound carrying its own arguments (the
+                                // recursive `T extends Comparable<T>`)
+                                // stays unmodeled at the name level — the
+                                // face stays applicable (under-report).
+                                if arg_args != ArgListId::EMPTY || bound_args != ArgListId::EMPTY {
+                                    return true;
+                                }
+                                (!arg_nullable || bound_nullable)
+                                    && (arg_head == bound_head || reaches(arg_head, bound_head))
+                            }
+                            // A shape the name level cannot order (an
+                            // unknown instantiation, a record or function
+                            // bound) keeps the face.
+                            _ => true,
+                        };
                     }
                     // Covariant positions: the receiver's argument must be
                     // a subtype of the `on` argument. Only a bare concrete
@@ -3314,11 +3365,8 @@ impl<'a> Engine<'a> {
         // supertype (`Map<K, FieldItem>` vs `Map<K, ManifestItem>`) — and
         // unequal heads ride the declared supertype walk. A shape the
         // name level cannot order (an own type parameter, nested argument
-        // lists, unknowns) answers compatible, and step 5's
-        // instantiate-to-bounds tail needs the extension's declared bounds,
-        // which the face does not carry — those pairs stay mutually
-        // unordered and the access stays ambiguous (the oracle's
-        // `IterableComparableExtension`-vs-`IterableExtension` shape).
+        // lists, unknowns) answers compatible; those pairs fall to step
+        // 5's instantiate-to-bounds tail below.
         let on_subtype = |sub: Ty, sup: Ty| -> bool {
             let (
                 Ty::Named {
@@ -3377,13 +3425,175 @@ impl<'a> Engine<'a> {
                 a_head == b_head || reaches(a_head, b_head)
             })
         };
+        // Step 5's instantiate-to-bounds projection
+        // (`extension_member_resolver.dart:459-466` `_instantiateToBounds`):
+        // every bare own-parameter position in the `on` type's arguments is
+        // replaced by its declared bound — a bound-less parameter by
+        // `dynamic`, the Dart reading of unbounded. A bound written in
+        // terms of its own parameter (the recursive
+        // `T extends Comparable<T>`) substitutes as written; its residual
+        // parameter rides the comparison as the unmodeled shape. A
+        // non-parameter argument, an argument-less `on` type, or a face
+        // without type parameters projects to itself.
+        let bound_projected = |face: &ExtensionFace, face_file: FileId, on_ty: Ty| -> Ty {
+            let Ty::Named {
+                name,
+                nullable,
+                args,
+            } = on_ty
+            else {
+                return on_ty;
+            };
+            if args == ArgListId::EMPTY || face.type_param_names.is_empty() {
+                return on_ty;
+            }
+            let on_args = boundary.pool().get(args).to_vec();
+            let projected: Vec<Ty> = on_args
+                .iter()
+                .map(|&arg| {
+                    let Ty::Named {
+                        name: param,
+                        args: param_args,
+                        ..
+                    } = arg
+                    else {
+                        return arg;
+                    };
+                    if param_args != ArgListId::EMPTY {
+                        return arg;
+                    }
+                    let Some(index) = face.type_param_names.iter().position(|&n| n == param) else {
+                        return arg;
+                    };
+                    let bound = face
+                        .type_param_bounds
+                        .get(index)
+                        .copied()
+                        .unwrap_or(Ty::Dynamic);
+                    boundary.ty(face_file, bound)
+                })
+                .collect();
+            let projected_args = boundary.args.borrow_mut().named(name, nullable, &projected);
+            match projected_args {
+                Ty::Named { args, .. } => Ty::Named {
+                    name,
+                    nullable,
+                    args,
+                },
+                _ => on_ty,
+            }
+        };
+        // Step 5's pair test at the projections' name level. Unlike the
+        // steps 3-4 read, the projections' arguments carry the bounds, so
+        // the unbounded parameter's `dynamic` instantiation decides
+        // strictly: it subtypes only the tops (`dynamic` itself and the
+        // argument-less `Object`/`Object?`) and every concrete bound
+        // rejects it — the `IterableComparableExtension<T extends
+        // Comparable<T>>`-over-`IterableExtension<T>` ordering (probed,
+        // /tmp/probe2431/lib/a.dart and d.dart). A shape the name level
+        // cannot model (a residual parameter inside a bound, nested
+        // argument lists) answers unordered — the pair stays mutually
+        // compatible and step 5 decides nothing (the under-report
+        // direction).
+        let bounds_subtype = |sub: Ty, sup: Ty| -> bool {
+            let (
+                Ty::Named {
+                    name: sub_head,
+                    nullable: sub_nullable,
+                    args: sub_args,
+                },
+                Ty::Named {
+                    name: sup_head,
+                    nullable: sup_nullable,
+                    args: sup_args,
+                },
+            ) = (sub, sup)
+            else {
+                return false;
+            };
+            if sub_nullable && !sup_nullable {
+                return false;
+            }
+            if sub_head != sup_head {
+                return reaches(sub_head, sup_head);
+            }
+            if sub_args == ArgListId::EMPTY || sup_args == ArgListId::EMPTY {
+                return true;
+            }
+            let sub_args = boundary.pool().get(sub_args).to_vec();
+            let sup_args = boundary.pool().get(sup_args).to_vec();
+            if sub_args.len() != sup_args.len() {
+                return true;
+            }
+            sub_args.iter().zip(sup_args.iter()).all(|(&a, &b)| {
+                // `dynamic <: dynamic`, and `dynamic <: Object`/`Object?` —
+                // nothing else accepts it.
+                if matches!(b, Ty::Dynamic) {
+                    return true;
+                }
+                if matches!(a, Ty::Dynamic) {
+                    return match b {
+                        Ty::Named {
+                            name,
+                            args: ArgListId::EMPTY,
+                            ..
+                        } => name == object,
+                        _ => false,
+                    };
+                }
+                let (
+                    Ty::Named {
+                        name: a_head,
+                        nullable: a_nullable,
+                        ..
+                    },
+                    Ty::Named {
+                        name: b_head,
+                        nullable: b_nullable,
+                        ..
+                    },
+                ) = (a, b)
+                else {
+                    return false;
+                };
+                if a_nullable && !b_nullable {
+                    return false;
+                }
+                if a_head != b_head {
+                    return reaches(a_head, b_head);
+                }
+                // Equal heads with argument lists on both sides: only a
+                // concrete bare pair could still order, and steps 3-4
+                // would have ordered it — what reaches here carries a
+                // residual parameter (the recursive bound) and stays
+                // unordered.
+                false
+            })
+        };
         let mut specific: Vec<(&ExtensionFace, FileId, (String, String))> = Vec::new();
         let mut nullable: Vec<(&ExtensionFace, FileId, (String, String))> = Vec::new();
         for (index, &(face, on_ty, face_file)) in applicable.iter().enumerate() {
             let dominated = applicable.iter().enumerate().any(|(other, _)| {
-                other != index
-                    && on_subtype(applicable[other].1, on_ty)
-                    && !on_subtype(on_ty, applicable[other].1)
+                if other == index {
+                    return false;
+                }
+                let (other_face, other_on_ty, other_file) = applicable[other];
+                if on_subtype(other_on_ty, on_ty) {
+                    if !on_subtype(on_ty, other_on_ty) {
+                        // Steps 3-4: the instantiated `on` types order.
+                        return true;
+                    }
+                    // Step 5 (`extension_member_resolver.dart:500-506`):
+                    // mutually compatible `on` types order on the
+                    // instantiate-to-bounds projections — the bounded face
+                    // dominates its unbounded twin when the projections
+                    // order one way and not the other.
+                    let sub = bound_projected(other_face, other_file, other_on_ty);
+                    let sup = bound_projected(face, face_file, on_ty);
+                    bounds_subtype(sub, sup) && !bounds_subtype(sup, sub)
+                } else {
+                    false
+                }
             });
             if dominated {
                 continue;
