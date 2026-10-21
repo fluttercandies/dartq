@@ -32,6 +32,9 @@
 //!   library / package and maps it onto
 //!   [`FeatureSet`](dartq_language::FeatureSet) at a given language
 //!   version.
+//! - [`EXTENSION_FACE_SOURCES`] bundles the `dart:` extension declarations
+//!   whose members apply implicitly to receiver types (the enum pair of
+//!   `dart:core` today), for the engine's extension-face indexing.
 //!
 //! Error discipline: where the analyzer silently degrades — a missing
 //! library map yields empty analysis and a malformed
@@ -39,12 +42,14 @@
 //! with [`SdkError`], so a crippled SDK can never masquerade as a valid
 //! analysis baseline.
 
+mod extension_faces;
 mod flat_libraries;
 mod identity;
 mod loader;
 mod metadata;
 mod query;
 
+pub use extension_faces::EXTENSION_FACE_SOURCES;
 pub use flat_libraries::FLAT_LIBRARIES;
 pub use loader::SdkError;
 pub use metadata::{
