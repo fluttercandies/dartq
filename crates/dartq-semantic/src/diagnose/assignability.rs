@@ -1318,12 +1318,15 @@ impl<'a> Engine<'a> {
         let literal = Self::primitive_literal(&rhs_row, &self.members.primitive_ids);
         let target_row = self.rows[target].clone();
         let to = self.assignment_target_ty(&target_row);
-        // The invalid-side gate (upstream `InvalidType`): a written type
-        // whose head resolves to no type — the parameter's `AstNode?` over
-        // an undefined class — asks no assignability question (probed
-        // 3.47.1: `expression = parent` with `AstNode? parent` stays
-        // silent). The return check's own host gate shares the rule.
-        if self.written_ty_invalid(from) || self.written_ty_invalid(to) {
+        // The invalid-source gate (upstream `InvalidType`): a right side
+        // whose written head resolves to no type asks no assignability
+        // question (probed 3.47.1: `expression = parent` with `AstNode?
+        // parent` stays silent). The target side gates nothing — a
+        // projected foreign declared type this unit cannot name
+        // (`List<int>` of an import) still reports (`Null` into it is the
+        // oracle's `invalid_assignment`), and an invalid target face
+        // already decides silent through the target read's own recovery.
+        if self.written_ty_invalid(from) {
             return;
         }
         if self.assignable(from, to, literal) == Some(false) {
@@ -1368,11 +1371,12 @@ impl<'a> Engine<'a> {
         // A `?.`-merged initializer reads the short-circuit's nullable
         // result (`int x = a?.b` asks `B?` against `int`).
         let from = self.expression_row_ty(row);
-        // The invalid-side gate: a written head that resolves to no type
+        // The invalid-source gate: a written head that resolves to no type
         // poisons the whole spelling (upstream `InvalidType`) — probed
         // 3.47.1: `int x = astNodeVal` over an undefined-class parameter
-        // stays silent.
-        if self.written_ty_invalid(from) || self.written_ty_invalid(to) {
+        // stays silent. The declared target gates nothing: the group's
+        // written annotation is the question's own face.
+        if self.written_ty_invalid(from) {
             self.init_mark = None;
             return;
         }
@@ -2590,15 +2594,19 @@ impl<'a> Engine<'a> {
         // side the pair is decisive, not a blind spot. A function-shaped
         // source subtypes exactly the `Object` and `Function` heads among
         // interface targets (subtype.dart's function block, then the
-        // unconditional `return false`); an interface or record source
-        // subtypes a function-shaped target in no case — except the 'call'
-        // tearoff arm (type_system.dart:906-916): a resolved non-nullable
-        // interface source whose `call` method's own signature subtypes
-        // the target assigns (the oracle accepts a callable class instance
-        // where a function type is expected). Heads the index cannot
-        // resolve are `InvalidType` upstream (accepted silently) and keep
-        // the under-report `None`; the bare `Function`-head context stays
-        // with the ordinary named path below.
+        // unconditional `return false`); an interface source facing a
+        // function-shaped target decides only on two-sided facts — the
+        // final primitives reject outright and the 'call' tearoff arm
+        // (type_system.dart:906-916) decides from the method's own
+        // signature (the oracle accepts a callable class instance where a
+        // function type is expected, and rejects an incompatible one).
+        // Every other interface source keeps the under-report `None`: the
+        // slot also receives derived asks the oracle never makes (the
+        // covariant element walk, the staged-mark channel the
+        // closure-return face pins clean), and a bare rejection there
+        // would report inference residue instead of the oracle's
+        // silence. The bare `Function`-head context stays with the
+        // ordinary named path below.
         if let Some(to_fn) = to_fn.as_ref() {
             return match from {
                 Ty::Named {
@@ -2723,13 +2731,20 @@ impl<'a> Engine<'a> {
     /// The 'call' tearoff arm of the cross-family function face
     /// (`isAssignableTo`'s callable-class acceptance,
     /// type_system.dart:906-916): the non-nullable interface head `name`
-    /// is assigned into the function shape `to_fn`. A generic
-    /// instantiation needs the call method's own instantiation
-    /// (under-report); a head the index cannot resolve is `InvalidType`
-    /// upstream (accepted silently, `None`); a resolved head without a
-    /// `call` method is the reportable rejection; the method's own
-    /// signature decides the rest (an incompatible `call` reports, the
-    /// same rejection the bare interface would).
+    /// is assigned into the function shape `to_fn`. The rejection fires
+    /// only where the facts are two-sided: the final primitives (whose
+    /// member surface is compiler-known — no `call`, never a subtype of a
+    /// function type) reject outright, and a written `call` method's own
+    /// signature decides (compatible assigns, incompatible reports).
+    /// Every other interface source keeps the under-report `None`: a
+    /// resolvable class without `call` decides `false` upstream, but this
+    /// slot also receives derived asks the oracle never makes (the
+    /// covariant element walk's slot pairs, the staged-mark channel the
+    /// closure-return face pins clean), and a bare rejection there would
+    /// report inference residue instead of the oracle's silence. A
+    /// generic instantiation needs the call method's own instantiation,
+    /// and a generic `call` the inference the declared facts do not
+    /// carry — both under-report.
     fn call_method_assignable(
         &self,
         name: StringId,
@@ -2739,15 +2754,8 @@ impl<'a> Engine<'a> {
         if args != ArgListId::EMPTY {
             return None;
         }
-        if !self.members.primitive_ids.contains(&name) {
-            resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                self.lib,
-                self.file,
-                name,
-            )?;
+        if self.members.primitive_ids.contains(&name) {
+            return Some(false);
         }
         let Some((formals, return_ty, params)) =
             self.implicit_call_face(Ty::Named {
@@ -2756,7 +2764,7 @@ impl<'a> Engine<'a> {
                 args,
             })
         else {
-            return Some(false);
+            return None;
         };
         if !params.is_empty() {
             // A generic `call` needs the inference the declared facts do

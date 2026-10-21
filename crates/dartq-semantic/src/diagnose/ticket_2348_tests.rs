@@ -113,13 +113,22 @@ fn codes(report: &FileReport, name: &str) -> Vec<u32> {
 /// re-enters `assignable` → `instantiated_alias_sig` → `intern_list`. The
 /// oracle reports the assignment mismatch (`Pred<B>` `<:` `Pred<A>` fails
 /// the contravariant formal leg); the verdict must arrive without the
-/// pool's `borrow_mut` panicking against the loop's live `Ref`.
+/// pool's `borrow_mut` panicking against the loop's live `Ref`. `Box` is
+/// DECLARED on purpose: an undefined head makes both written types
+/// `InvalidType` and the oracle stays silent on the assignment (probed
+/// 3.47.1 — the undeclared spelling pins nothing but `undefined_class`),
+/// so the declared spelling is the oracle-probed contract this chain
+/// guards.
 #[test]
 fn covariant_alias_argument_chain_completes_without_pool_panic() {
     let source = "class A {}\n\
                   \x20class B {}\n\
                   \x20class D {}\n\
                   \x20typedef Pred<T> = D Function(T);\n\
+                  \x20class Box<T> {\n\
+                  \x20  T value;\n\
+                  \x20  Box(this.value);\n\
+                  \x20}\n\
                   \x20void take(Box<Pred<A>> a, Box<Pred<B>> b) {\n\
                   \x20  a = b;\n\
                   \x20}";
