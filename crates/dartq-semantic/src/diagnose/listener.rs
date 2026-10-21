@@ -2891,6 +2891,34 @@ impl ParserListener for DiagnoseListener<'_> {
     // —— receivers and selectors ——————————————————————————————————————
 
     fn handle_this_expression(&mut self, token: Token, context: IdentifierContext) {
+        // The static type of `this` rides the flow layer's staged side
+        // channel (#2292): the same answer `push_keyword_receiver` reads —
+        // `this_static_ty` over the enclosing container, an extension's
+        // written `on` type included — keyed on the keyword's offset. The
+        // fold adopts it at `Ev::This`, so a `switch (this)` scrutinee
+        // carries the real type and the exhaustiveness verdict closes;
+        // argument-bearing shapes the flow lattice cannot spell never
+        // arrive (the unknown-read face stands).
+        if let Some((container, kind)) = self.engine.container_context() {
+            let this_ty = self.engine.this_static_ty(container, kind);
+            if let Ty::Named {
+                name,
+                nullable,
+                args: ArgListId::EMPTY,
+            } = this_ty
+            {
+                let lexeme = self.engine.strings.resolve(name).to_string();
+                let base = self.flow().intern_name(&lexeme);
+                self.flow().stage_this_type(
+                    token.range.offset,
+                    FlowTy {
+                        base: FlowBase::Name(base),
+                        nullable,
+                    },
+                );
+            }
+        }
+
         self.flow().handle_this_expression(token, context);
 
         self.engine.push_keyword_receiver(token, false);

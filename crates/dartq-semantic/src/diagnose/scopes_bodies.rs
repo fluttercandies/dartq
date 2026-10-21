@@ -1017,7 +1017,23 @@ impl<'a> Engine<'a> {
                 .and_then(|ty| self.closure_schema_sig(ty))
                 .and_then(|sig| Self::schema_entry(&sig, formal))
                 .or_else(|| match recv {
-                    Receiver::Typed { ty, .. } => self.receiver_first_type_arg(ty),
+                    Receiver::Typed { ty, .. } => {
+                        // The stand-in substitutes into a *declared* type's
+                        // instantiation. An invalid receiver head — the
+                        // oracle's `InvalidType` (an unresolvable
+                        // `NodeList<Annotation>`) — has no function type to
+                        // read, so no schema entry forms: the formal keeps
+                        // `dynamic` and its member reads stay silent. A
+                        // provable head keeps the stand-in (`List<Und>`'s
+                        // `E` is still that first written argument).
+                        let Ty::Named { name: head, .. } = ty else {
+                            return None;
+                        };
+                        if !self.named_type_is_type(head) {
+                            return None;
+                        }
+                        self.receiver_first_type_arg(ty)
+                    }
                     _ => None,
                 }),
         }?;

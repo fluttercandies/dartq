@@ -3728,3 +3728,10 @@ mod ticket_2420_tests;
 /// verdicts).
 #[cfg(test)]
 mod ticket_2429_tests;
+
+/// The #2426 pins: the closure-formal inference's receiver-head gate — the
+/// unindexed receiver's first type argument stands in for `map`'s `E` only
+/// when the receiver's written head is provably a type — and the staged
+/// static type of `this` closing an exhaustive `switch (this)` body.
+#[cfg(test)]
+mod ticket_2426_tests;
