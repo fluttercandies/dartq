@@ -4464,5 +4464,11 @@ mod ticket_2484_tests;
 #[cfg(test)]
 mod ticket_2489_tests;
 
+/// The #2491 pins: a switch-case object pattern's named type never lends
+/// its type-argument group to an older expression's row — the group-close
+/// deferral anchors to a trivia-adjacent head row only, so the pattern's
+/// `<` reports nothing against the previous case body's last send (the
+/// census's `wrong_number_of_type_arguments_element` at the NEXT case's
+/// pattern), while send-position arity keeps every adjacent-head anchor.
 #[cfg(test)]
-mod probe2471_tests;
+mod ticket_2491_tests;

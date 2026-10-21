@@ -6492,9 +6492,25 @@ impl<'a> Engine<'a> {
         // A type head makes the group an annotation or a creation type
         // reference.
         let (head, base) = self.group_heads.pop().unwrap_or((None, 0));
+        // The row the group applies to anchors the group only when it abuts
+        // the group across trivia: the head token is the group's syntactic
+        // predecessor, so a row ending earlier belongs to an older
+        // expression. A switch-case object pattern's named type pushes its
+        // row only at `handle_object_pattern`, after its group closed, so
+        // the group would otherwise classify against whatever invocation row
+        // the previous case body left open (#2491: the pattern's `<`
+        // reported the previous arm's callee's arity as
+        // `wrong_number_of_type_arguments_element`).
+        let anchored = base
+            .checked_sub(1)
+            .and_then(|i| self.rows.get(i))
+            .is_some_and(|row| self.trivia_between(row.range.end(), begin.range.offset));
         // The written-argument capture closes with its own (headless)
-        // group; the head row is the one the group applies to.
-        if head.is_none() {
+        // group; the head row is the one the group applies to. An
+        // unanchored headless group grounds no callee — the capture dies
+        // here so its members never latch onto the stale slot (the same
+        // under-report posture as the merge drains' entry-drop rule).
+        if head.is_none() && anchored {
             self.call_args_end(base.saturating_sub(1));
         }
         // The clause-entry capture (#1289 E1): the group closed — an
@@ -6744,7 +6760,13 @@ impl<'a> Engine<'a> {
         // `<` (`base - 1`); rows pushed inside the group are its own type
         // arguments — unresolved ones are `TypeUse` rows. An unresolved head
         // pushes its own `TypeUse` row, which the deferred checks then
-        // ignore; a row from an older expression never matches.
+        // ignore; a row from an older expression never matches — and only a
+        // trivia-adjacent row is this group's head at all (`anchored`): a
+        // pattern named type's group, whose own row lands later at
+        // `handle_object_pattern`, defers against nothing.
+        if !anchored {
+            return;
+        }
         let Some(target) = base.checked_sub(1).and_then(|i| self.rows.get(i)) else {
             return;
         };
