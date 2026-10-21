@@ -770,6 +770,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // and a later foreign window must not adopt its name.
         if engine.formal_list_depth == 0 {
             engine.pending_exec_name = None;
+            engine.pending_exec_is_method = false;
             // The outer list's claims start in the required-positional
             // section; the group events re-arm it.
             engine.fn_formal_named_section = false;
@@ -2152,6 +2153,7 @@ impl ParserListener for DiagnoseListener<'_> {
                     // #1314 FAM10: the header's declaring name — its
                     // type-variable window pairs at the window's close.
                     engine.pending_exec_name = Some((name, token.range.offset));
+                    engine.pending_exec_is_method = false;
                 } else {
                     // The nameless recovery face (`name ?? '<unnamed>'`):
                     // the declaration joins under the empty name at the
@@ -2181,6 +2183,13 @@ impl ParserListener for DiagnoseListener<'_> {
                     // variable's.
                     engine.fn_stash_drop();
                     engine.latch_return_type(ExecKind::Method, name, token.range);
+                    // #2430: the method header's declaring name joins the
+                    // FAM10 pairing — its type-variable window lands in
+                    // `method_exec_bounds` at the close, the bound-aware
+                    // nullability/never-match gates' read of the
+                    // enclosing method's own parameter bounds.
+                    engine.pending_exec_name = Some((name, token.range.offset));
+                    engine.pending_exec_is_method = true;
                     // A constructor head also rides this event;
                     // `begin_constructor` already opened the head's site
                     // and its provisional range is this same token, so the
@@ -4260,7 +4269,10 @@ impl ParserListener for DiagnoseListener<'_> {
             } else {
                 NullAwareKind::Cascade
             };
-            if ty.is_strictly_non_nullable() {
+            // The bound-aware strictly face: an in-scope parameter
+            // receiver decides through its written bound (`T extends C?`
+            // keeps `?[` legal, `T extends C` reports).
+            if engine.strictly_non_nullable(ty) {
                 let (op, replacement) = kind.lexemes();
                 engine.emit3(
                     SemanticCode::InvalidNullAwareOperator,
@@ -7580,18 +7592,18 @@ fn angle_group_end(bytes: &[u8], lt: usize, end: usize) -> Option<usize> {
                         j += 1;
                     }
                     return match bytes.get(j) {
-                        None | Some(b',') | Some(b'}') | Some(b')') | Some(b']')
-                        | Some(b'{') | Some(b'(') | Some(b':') | Some(b';')
-                        | Some(b'=') | Some(b'>') => Some(i + 1),
+                        None | Some(b',') | Some(b'}') | Some(b')') | Some(b']') | Some(b'{')
+                        | Some(b'(') | Some(b':') | Some(b';') | Some(b'=') | Some(b'>') => {
+                            Some(i + 1)
+                        }
                         _ => None,
                     };
                 }
             }
             // Anything outside a type-use's byte set disqualifies the group:
             // strings, arithmetic/comparison/logical operators, brackets.
-            b'\'' | b'"' | b'!' | b'&' | b'|' | b'+' | b'-' | b'*' | b'/'
-            | b'%' | b'^' | b'=' | b'~' | b'(' | b')' | b'[' | b']' | b'{'
-            | b'}' | b':' | b';' => return None,
+            b'\'' | b'"' | b'!' | b'&' | b'|' | b'+' | b'-' | b'*' | b'/' | b'%' | b'^' | b'='
+            | b'~' | b'(' | b')' | b'[' | b']' | b'{' | b'}' | b':' | b';' => return None,
             _ => {}
         }
         i += 1;

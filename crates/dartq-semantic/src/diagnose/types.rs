@@ -1872,6 +1872,19 @@ pub(crate) struct Engine<'a> {
     /// extends num>(T t)` → `[(T, num)]`). The argument-check
     /// substitution reads it for same-file generic callees.
     pub(crate) exec_bounds: FxHashMap<StringId, Box<[(StringId, Option<Ty>)]>>,
+    /// The enclosing-method shape of the same capture (`void m<T extends
+    /// C?>(T t)` → `[(T, C?)]`, keyed by declaring name): the
+    /// nullability/never-match gates read the enclosing executable's own
+    /// parameter bounds through it. Held apart from [`Engine::exec_bounds`]
+    /// so the callee-side substitution faces — whose member-send
+    /// inference sources its own parameters from the member walk — never
+    /// see a method entry race them.
+    pub(crate) method_exec_bounds: FxHashMap<StringId, Box<[(StringId, Option<Ty>)]>>,
+    /// Whether the latched [`Engine::pending_exec_name`] header is a
+    /// method (`MethodDeclaration` — routed to
+    /// [`Engine::method_exec_bounds`]) or a top-level function (routed to
+    /// [`Engine::exec_bounds`]).
+    pub(crate) pending_exec_is_method: bool,
     /// The written signatures of function-typed variables (top-level
     /// variables and fields annotated `T Function<T>(T)`), keyed by
     /// variable name — the invocation face's formals for callees the

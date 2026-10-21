@@ -684,7 +684,10 @@ impl<'a> Engine<'a> {
             } else {
                 NullAwareKind::Access
             };
-            if receiver_ty.is_strictly_non_nullable() {
+            // The bound-aware strictly face: an in-scope parameter
+            // receiver decides through its written bound (`T extends
+            // AstNodeImpl?` keeps `?.` legal, `T extends C` reports).
+            if self.strictly_non_nullable(receiver_ty) {
                 let (op, replacement) = kind.lexemes();
                 self.emit3(
                     SemanticCode::InvalidNullAwareOperator,

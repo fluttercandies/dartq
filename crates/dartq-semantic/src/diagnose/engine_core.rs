@@ -146,6 +146,8 @@ impl<'a> Engine<'a> {
             group_final: false,
             group_const: false,
             exec_bounds: FxHashMap::default(),
+            method_exec_bounds: FxHashMap::default(),
+            pending_exec_is_method: false,
             fn_var_sigs: FxHashMap::default(),
             fn_formal_sigs: FxHashMap::default(),
             arg_sigs: FxHashMap::default(),
@@ -1704,6 +1706,86 @@ impl<'a> Engine<'a> {
         ))
     }
 
+    /// The in-scope type-parameter test: `type_params`/`pending_type_params`
+    /// are the de-facto "is this name a parameter" check — the written name
+    /// carries no element at this layer (the `Ty` reads `Named{"T"}`).
+    pub(crate) fn is_scope_param(&self, name: StringId) -> bool {
+        self.type_params.contains(&name) || self.pending_type_params.contains(&name)
+    }
+
+    /// The captured bound of the in-scope parameter `name` (`None` = no
+    /// bound — the implicit `Object?`): the declaring executable's window
+    /// first (`void f<T extends num>(T t)`, the [`Engine::exec_bounds`]
+    /// capture), then the enclosing container's capture (`class C<T
+    /// extends num>`, the `container_params` face). Both record `(param,
+    /// bound)` per owner in declaration order; the innermost owner wins.
+    pub(crate) fn param_bound(&self, name: StringId) -> Option<Ty> {
+        if let Some(exec) = self.exec_self_name() {
+            if let Some(window) = self.exec_bounds.get(&exec)
+                && let Some((_, bound)) = window.iter().find(|(param, _)| *param == name)
+            {
+                return *bound;
+            }
+            if let Some(window) = self.method_exec_bounds.get(&exec)
+                && let Some((_, bound)) = window.iter().find(|(param, _)| *param == name)
+            {
+                return *bound;
+            }
+        }
+        let container = self.frames.iter().rev().find_map(|f| match &f.kind {
+            FrameKind::Container { name, .. } => Some(*name),
+            _ => None,
+        })?;
+        let params = self.bounds.container_params(container)?;
+        let tree = params.into_iter().find(|(param, _, _)| *param == name)?.1?;
+        Some(self.tree_ty(&tree))
+    }
+
+    /// Whether `ty` mentions an in-scope parameter anywhere in its shape
+    /// (the official's `hasTypeParameterReference` gate over a bound: a
+    /// bound that references a parameter — `T extends S` — proves no
+    /// disjointness).
+    fn ty_mentions_param(&self, ty: Ty) -> bool {
+        let Ty::Named { name, args, .. } = ty else {
+            return false;
+        };
+        if self.is_scope_param(name) {
+            return true;
+        }
+        self.boundary
+            .args
+            .borrow()
+            .get(args)
+            .iter()
+            .any(|&arg| self.ty_mentions_param(arg))
+    }
+
+    /// The bound-aware `isStrictlyNonNullable` (type_system.dart:1921-
+    /// read through `TypeParameterType`'s bound): an in-scope unsubstituted
+    /// parameter's nullability is its written bound's — a nullable bound or
+    /// the implicit `Object?` (`T` alone) reads nullable-possible (`?.`
+    /// stays legal, `!` stays live), a non-nullable bound keeps the
+    /// strictly face (the oracle reports the dead operator over it). A
+    /// bound that itself mentions a parameter stays unprovable; every
+    /// other face answers [`Ty::is_strictly_non_nullable`] unchanged.
+    pub(crate) fn strictly_non_nullable(&self, ty: Ty) -> bool {
+        let Ty::Named {
+            name,
+            nullable: false,
+            ..
+        } = ty
+        else {
+            return ty.is_strictly_non_nullable();
+        };
+        if !self.is_scope_param(name) {
+            return ty.is_strictly_non_nullable();
+        }
+        match self.param_bound(name) {
+            None => false,
+            Some(bound) => !self.ty_mentions_param(bound) && bound.is_strictly_non_nullable(),
+        }
+    }
+
     /// The `e!` pair (`visitNullAssertionExpression`,
     /// best_practices_verifier.dart:795-799, and the
     /// `_checkForUnnecessaryNullAware` gate, `error_verifier.dart`:
@@ -1745,7 +1827,7 @@ impl<'a> Engine<'a> {
         };
         if ty == Ty::Null {
             self.stage_usage(SemanticCode::NullCheckAlwaysFails, at, "");
-        } else if ty.is_strictly_non_nullable() {
+        } else if self.strictly_non_nullable(ty) {
             self.stage_usage(SemanticCode::UnnecessaryNonNullAssertion, at, "");
         } else if ty != Ty::Unknown && !qualified && self.local_hits.contains_key(&read_span.offset)
         {
@@ -1802,20 +1884,12 @@ impl<'a> Engine<'a> {
         } else {
             operand.ty
         };
-        // A type-parameter read (`T` with any bound) is never
-        // decided-never-null here: the official
-        // `isStrictlyNonNullable(TypeParameterType)` reads the bound, and
-        // a nullable bound (`T extends AstNodeImpl?`) answers false — the
-        // written name carries no bound at this layer, so the read
-        // suppresses (the under-report direction).
-        let strictly_non_null = match &operand_ty {
-            Ty::Named {
-                name,
-                nullable: false,
-                ..
-            } => !self.type_params.contains(name) && !self.pending_type_params.contains(name),
-            _ => operand_ty.is_strictly_non_nullable(),
-        };
+        // A type-parameter read decides through its written bound (the
+        // official `isStrictlyNonNullable(TypeParameterType)` reads the
+        // bound): a nullable bound (`T extends AstNodeImpl?`) and the
+        // implicit `Object?` (`T` alone) suppress, a non-nullable bound
+        // (`T extends int`) decides never-null (probed 3.13.1).
+        let strictly_non_null = self.strictly_non_nullable(operand_ty);
         let never_null = strictly_non_null
             || match &operand.shape {
                 RowShape::Receiver(Receiver::Super { .. }) => true,
@@ -2535,7 +2609,7 @@ impl<'a> Engine<'a> {
         let Some(ctx) = self.switch.switches.last() else {
             return;
         };
-        if !ctx.scrutinee.is_strictly_non_nullable() {
+        if !self.strictly_non_nullable(ctx.scrutinee) {
             return;
         }
         let code = if is_assert {
@@ -2552,7 +2626,44 @@ impl<'a> Engine<'a> {
     /// official's JavaScript note), otherwise the name-level equality
     /// relation decides. Shared by the parse-time check and the teardown
     /// re-decision (#1351).
+    ///
+    /// An in-scope unsubstituted parameter stands in its written bound
+    /// (upstream Dart SDK source, pkg/analyzer/lib/src/dart/constant/
+    /// constant_verifier.dart:577-586, `_canBeEqual`'s TypeParameterType
+    /// arm: the bound — made nullable under a `?` suffix — replaces the
+    /// parameter face when it references no parameter itself): the
+    /// disjointness proof reads the bound (`case 1` never equals a `T
+    /// extends Color` value, `case Color.red` can). An unbounded or
+    /// parameter-mentioning bound, and a parameter-spelled constant face
+    /// (the official's InterfaceType gate never descends for one), answer
+    /// "possible" — disjointness unprovable. A parameter bound to a
+    /// concrete type before the comparison (the solved-call substitution)
+    /// no longer spells a parameter here and decides ordinarily.
     pub(crate) fn constant_never_matches(&self, constant: Ty, matched: Ty) -> bool {
+        let matched = match &matched {
+            Ty::Named { name, nullable, .. } if self.is_scope_param(*name) => {
+                match self.param_bound(*name) {
+                    Some(bound) if !self.ty_mentions_param(bound) => {
+                        if *nullable {
+                            Self::nullable_form(bound)
+                        } else {
+                            bound
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            _ => matched,
+        };
+        if let Ty::Named {
+            name,
+            nullable: false,
+            ..
+        } = constant
+            && self.is_scope_param(name)
+        {
+            return false;
+        }
         if let (Ty::Named { name: c, .. }, Ty::Named { name: v, .. }) = (constant, matched) {
             let (int, double) = (self.members.primitive_ids[0], self.members.primitive_ids[1]);
             if (c == int && v == double) || (c == double && v == int) {
@@ -2612,12 +2723,20 @@ impl<'a> Engine<'a> {
             // The declared-scrutinee check passed; the flow's promoted
             // matched type re-decides at the teardown join (#1351) — a
             // narrowed matched type can never equal the constant where
-            // the declared type could.
-            self.pending_matched.push(PendingMatched {
-                constant,
-                at,
-                clause,
-            });
+            // the declared type could. A matched face still spelling an
+            // in-scope parameter skips the push: its bound relation
+            // decided here, and after the walk drains the scope stacks
+            // the same spelling re-arrives undecidable (a promoted read
+            // instead arrives concretely typed and re-decides).
+            let param_matched =
+                matches!(&matched, Ty::Named { name, .. } if self.is_scope_param(*name));
+            if !param_matched {
+                self.pending_matched.push(PendingMatched {
+                    constant,
+                    at,
+                    clause,
+                });
+            }
         }
     }
 

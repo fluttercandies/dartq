@@ -3742,3 +3742,11 @@ mod ticket_2426_tests;
 /// one level deep.
 #[cfg(test)]
 mod ticket_2433_tests;
+/// The #2430 pins: the parameter-bound materialization at the
+/// nullability and never-match gates — a written bound (`T extends
+/// AstNodeImpl?`) decides the `?.`/`!`/null-comparison/null-check faces
+/// through its nullability, and the never-match verdict reads the bound
+/// as the matched parameter's stand-in while an unbounded or
+/// parameter-mentioning bound suppresses.
+#[cfg(test)]
+mod ticket_2430_tests;

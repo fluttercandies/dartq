@@ -42,7 +42,15 @@ impl<'a> Engine<'a> {
             .iter()
             .map(|(param, bound, _)| (*param, bound.as_ref().map(|tree| self.tree_ty(tree))))
             .collect();
-        self.exec_bounds.insert(name, window);
+        // The method head routes apart so the callee-side substitution
+        // faces — whose member-send inference sources its own parameters
+        // from the member walk — never see a method entry race them
+        // (their `exec_params.is_none()` guard would starve).
+        if self.pending_exec_is_method {
+            self.method_exec_bounds.insert(name, window);
+        } else {
+            self.exec_bounds.insert(name, window);
+        }
     }
 
     /// #1314 FAM18: the group's close — the constructor-independent faces
@@ -801,14 +809,10 @@ impl<'a> Engine<'a> {
     /// for-loops push [`FrameKind::Block`] frames over the executable, so
     /// the walk reads the innermost *executable* frame's latch.
     fn in_block_body(&self) -> bool {
-        self.frames
-            .iter()
-            .rev()
-            .find_map(|f| match &f.kind {
-                FrameKind::Executable { body_brace, .. } => Some(body_brace.is_some()),
-                _ => None,
-            })
-            == Some(true)
+        self.frames.iter().rev().find_map(|f| match &f.kind {
+            FrameKind::Executable { body_brace, .. } => Some(body_brace.is_some()),
+            _ => None,
+        }) == Some(true)
     }
 
     /// `end_function_type`: the frame closes into a stashed signature —
