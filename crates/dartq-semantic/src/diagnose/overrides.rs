@@ -3225,6 +3225,30 @@ impl<'a> Engine<'a> {
             if concrete.entry.ptr() == specific.entry.ptr() {
                 continue;
             }
+            // The free-parameter suppression gate: either compared signature
+            // carrying its declaring container's type parameters is the
+            // unsubstituted read — the element model strips clause type
+            // arguments, and this loop tracks no edge chain, so the
+            // substitution environment is undecidable here (a foreign hop's
+            // clauses live in another file's tokens by design). Comparing
+            // raw false-breaks on the free heads (the covariant result
+            // face's Left-Nullable arm, the dead-edge arm — the
+            // `implements TypeVisitor<R>` family), so the comparison skips;
+            // the under-report posture every other arm keeps. Upgrade point
+            // (the interface-completeness analog of the single-member
+            // `check_override` substitution face): composing the per-edge
+            // environment here — the `instantiate_inherited` machinery over
+            // a chain this loop would have to track — replaces the blanket
+            // skip with the substituted comparison.
+            if !self
+                .super_free_params(&concrete.entry, concrete.owner_file)
+                .is_empty()
+                || !self
+                    .super_free_params(&specific.entry, specific.owner_file)
+                    .is_empty()
+            {
+                continue;
+            }
             if !self.override_broken(
                 &concrete.entry,
                 (concrete.owner_file, concrete.owner_name),

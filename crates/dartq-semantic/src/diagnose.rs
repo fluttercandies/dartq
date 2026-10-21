@@ -3765,3 +3765,11 @@ mod ticket_2431_tests;
 /// against the prefix scope's element.
 #[cfg(test)]
 mod ticket_2432_tests;
+/// The #2436 pins: the concrete-implementation completeness loop skips the
+/// signature comparison when either compared side carries its declaring
+/// container's free type parameters (the unsubstituted read — clause type
+/// arguments stripped — false-breaks on the free heads, the #2435 audit's
+/// 74 `invalid_implementation_override` corpus rows), while a genuine
+/// concrete-type mismatch keeps its row.
+#[cfg(test)]
+mod ticket_2436_tests;
