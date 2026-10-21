@@ -3,13 +3,11 @@
 //! `(severity, code, file, line:col)` burn-down, rooted in four oracle
 //! mechanisms each fixture reproduces end-to-end.
 //!
-//! - `x is T` / `x is! T` with an unresolvable `T` (the broken-import
-//!   corpus's dominant `dead_code` root): the oracle's `InvalidType` is
-//!   a vacuous subtype in both directions (subtype.dart:274-276), so
-//!   `factor(previous, InvalidType)` is `Never` and the losing branch
-//!   reports `dead_code` at its first node — `is` deads the else,
-//!   `is!` deads the then (verified against `dart analyze` 3.13.1,
-//!   `sdk: ^3.13.0`).
+//! - `x is T` / `x is! T` with an unresolvable `T`: the oracle's flow
+//!   BAILS — `type_test_with_undefined_name` fires on the spelling and
+//!   neither branch reports dead (#2450 counter-finding; the probe pair
+//!   `p12_isdead`). The pre-#2450 always-true fold over-reported the
+//!   losing branch; its removal is pinned below.
 //! - `unused_field`'s `unresolvedReadMembers` fallback
 //!   (unused_local_elements_verifier.dart:1030-1055): a read-shaped
 //!   member access that bound no element (`f._x` on an
@@ -53,8 +51,8 @@ fn scan(source: &str, file: FileId) -> (dartq_scanner::ScanResult, ParserFeature
 }
 
 /// Diagnoses `source` as the sole file of a library with the resolved
-/// `TypeOps` face mounted — the engine path the `x is Missing` fold
-/// needs (the name-level ops cannot see `InvalidType`).
+/// `TypeOps` face mounted — the engine path the `x is Missing` tested
+/// face resolves through (the name-level ops cannot see `InvalidType`).
 fn report_ops(source: &str) -> FileReport {
     let strings = StringTable::new();
     let mut files = FileTable::new();
@@ -151,15 +149,15 @@ fn rows(report: &FileReport, code: &str) -> Vec<(u32, u32)> {
 
 // —— dead_code: the InvalidType checked type ————————————————————————
 
-/// `x is Missing` deads the else branch: `factor(int, InvalidType)`
-/// is `Never` — the oracle's 0c subtype arm makes `int <:
-/// InvalidType` vacuously true, so the "not Missing" remainder is
-/// empty and the else reports `dead_code` at its first node.
-/// Oracle-verified (dart analyze 3.13.1, `sdk: ^3.13.0`): the probe
-/// pairs `type_test_with_undefined_name` on the spelling with
-/// `dead_code` at the else arm.
+/// `x is Missing` reports the undefined-name code and keeps BOTH arms
+/// live (#2450 counter-finding): the oracle's flow bails on a tested
+/// type that resolves nowhere — `type_test_with_undefined_name` fires
+/// on the spelling and neither branch reports dead (probe pair
+/// `p12_isdead`, dart analyze). The pre-#2450 pins read the 0c vacuous
+/// arm (subtype.dart:274-276) as folding the test constant-true; the
+/// corpus differential showed that face over-reporting.
 #[test]
-fn is_test_with_undefined_name_deads_the_else() {
+fn is_test_with_undefined_name_keeps_both_arms() {
     let source = "void f(int x) {\n\
                       \x20 if (x is Missing) {\n\
                       \x20   x;\n\
@@ -168,20 +166,25 @@ fn is_test_with_undefined_name_deads_the_else() {
                       \x20 }\n\
                       }";
     let report = report_ops(source);
-    let dead = rows(&report, "dead_code");
-    let else_start = source.find("else").unwrap() as u32;
     assert!(
-        dead.iter().any(|&(offset, _)| offset >= else_start),
-        "the else arm of `x is Missing` is dead: {:?}",
+        rows(&report, "dead_code").is_empty(),
+        "an undefined checked type never deads a branch: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        code_names(&report)
+            .iter()
+            .any(|name| *name == "type_test_with_undefined_name"),
+        "the undefined spelling reports its own code: {:?}",
         report.diagnostics
     );
 }
 
-/// `x is! Missing` deads the then branch — the `is`-false arm is the
-/// impossible remainder, and `is!` swaps the branches
-/// (`expressionInfo._invert()`).
+/// `x is! Missing` — the `is!` polarity of the same bail: the undefined
+/// name's code fires on the spelling, both arms stay live
+/// (`expressionInfo._invert()` never runs — no split exists).
 #[test]
-fn is_not_test_with_undefined_name_deads_the_then() {
+fn is_not_test_with_undefined_name_keeps_both_arms() {
     let source = "void f(int x) {\n\
                       \x20 if (x is! Missing) {\n\
                       \x20   x;\n\
@@ -190,13 +193,16 @@ fn is_not_test_with_undefined_name_deads_the_then() {
                       \x20 }\n\
                       }";
     let report = report_ops(source);
-    let dead = rows(&report, "dead_code");
-    let test_start = source.find("is!").unwrap() as u32;
-    let else_start = source.find("else").unwrap() as u32;
     assert!(
-        dead.iter()
-            .any(|&(offset, _)| offset > test_start && offset < else_start),
-        "the then arm of `x is! Missing` is dead: {:?}",
+        rows(&report, "dead_code").is_empty(),
+        "an undefined checked type never deads a branch: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        code_names(&report)
+            .iter()
+            .any(|name| *name == "type_test_with_undefined_name"),
+        "the undefined spelling reports its own code: {:?}",
         report.diagnostics
     );
 }

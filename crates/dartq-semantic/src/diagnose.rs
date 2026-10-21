@@ -4357,23 +4357,13 @@ mod ticket_2468_tests;
 #[cfg(test)]
 mod ticket_2450_tests;
 
-/// The #2459 pins: the cascade-resolution leakage family A3 — a cascade
-/// section's RHS member chain resolves through its own receiver instead of
-/// the latched cascade target (`..sourceSpan = token.span` answers `span`
-/// on the token type, never a phantom on the target), an extension getter
-/// inside an index-section cascade chain resolves (`..['k'] = s.toJS`
-/// finds the `on String` extension), an index-assign `..[i] = v` over a
-/// `List` target stays silent, and a missing `[]=` reports per section at
-/// the bracket against the TARGET's type.
+/// The #2465 pins: the unused-element scan's extension-member and
+/// part-file shapes — a bare or explicit-`this` self-use inside an
+/// extension body and a member access through a universal
+/// `extension<T> on T`-style face re-attribute onto the element-attributed
+/// application credit (the census's implicit-`this` and on-type-parameter
+/// over-reports), the genuinely unused members and sibling-spelling
+/// decoys keep reporting, and the part-file use lands in the part's use
+/// face the library-wide close merges.
 #[cfg(test)]
-mod ticket_2459_tests;
-
-/// The #2460 pins: the flow layer mirrors upstream at every A2 promotion
-/// edge (generator suspension keeps promotions, staged writes promote, the
-/// assert message runs on the negated condition) — the remaining family
-/// fixes are semantic-side and their pins ride #[ignore] until they land:
-/// the yield verdict staging for teardown re-decision, the bang right
-/// side staging its non-null face, and the staged write feed scoped per
-/// executable.
-#[cfg(test)]
-mod ticket_2460_tests;
+mod ticket_2465_tests;

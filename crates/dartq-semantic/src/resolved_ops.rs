@@ -2013,12 +2013,16 @@ impl<'a> ResolvedTypeOps<'a> {
     /// posture: `is_invalid_typed` reads `map_scrutinee` directly, and a
     /// wrong-arity pattern skips its type test exactly as before.
     ///
-    /// Only the registered-container spelling recovers. An unresolved head
-    /// (`x is Missing`) stays the whole-face `Invalid` whose 0c arm deads
-    /// the else exactly as the analyzer reports it, and a
+    /// Only the registered-container spelling recovers. A
     /// resolved-but-unmodeled name keeps its opaque face; a bare spelling
     /// instantiates to bounds instead of vetoing, so `row.is_empty()` and
     /// the equal-count case never reach the recovery.
+    ///
+    /// An unresolved head (`x is Missing`) maps to the whole-face `Invalid`
+    /// for the mapping's shape, but the is-check FOLDS refuse it before any
+    /// subtype question runs ([`Self::tested_head_undefined`] — #2450: the
+    /// oracle reports `type_test_with_undefined_name` on the spelling and
+    /// keeps both branches live; the 0c vacuous answer never fires).
     fn map_tested(
         &self,
         ty: FlowTy,
@@ -2061,6 +2065,41 @@ impl<'a> ResolvedTypeOps<'a> {
             },
             ty.nullable,
         )
+    }
+
+    /// Whether the is-check's tested spelling heads with a name that
+    /// resolves nowhere — the oracle's undefined-name face. The same
+    /// resolution chain [`Self::map_name`] walks decides: a type
+    /// parameter, the `FutureOr` pseudo type, a registered container, the
+    /// `Null`/`Never` kind spellings, or a resolved-but-unmodeled
+    /// (`non_containers`) name all resolve; anything else is the
+    /// undefined head the official's `named_type_resolver.dart` reports
+    /// `type_test_with_undefined_name` on.
+    ///
+    /// #2450 counter-finding: an is-check whose tested type is that face
+    /// never folds. The oracle's flow bails — no constant verdict, no
+    /// promotion, `factorType` keeps the operand whole (probe pair
+    /// `x is Missing` / `x is! Missing`: the code row fires on the
+    /// spelling and neither branch reports dead). The pre-#2450 posture
+    /// let the mapped `Invalid` reach the 0c arm (subtype.dart:274-276)
+    /// and answer vacuously, over-reporting the dead branch.
+    fn tested_head_undefined(&self, ty: FlowTy, names: &[Box<str>]) -> bool {
+        let Base::Name(id) = ty.base else {
+            return false;
+        };
+        let Some(lexeme) = names.get(id as usize) else {
+            return false;
+        };
+        if matches!(&**lexeme, "FutureOr" | "Null" | "Never") {
+            return false;
+        }
+        let name = self.strings.intern(lexeme);
+        if self.snapshot.type_params.contains_key(&name)
+            || self.snapshot.non_containers.contains(&name)
+        {
+            return false;
+        }
+        !self.snapshot.registry.contains_key(&name)
     }
 }
 
@@ -2268,6 +2307,13 @@ impl TypeOps for ResolvedTypeOps<'_> {
         arena: &[Vec<ArgTy>],
         names: &[Box<str>],
     ) -> FlowTy {
+        // An undefined tested head contributes no remainder fact (#2450):
+        // the oracle's is-check against a name that resolves nowhere bails
+        // (`type_test_with_undefined_name` on the spelling, neither branch
+        // dead), so the 0c vacuous arm never turns the remainder `Never`.
+        if self.tested_head_undefined(what, names) {
+            return from;
+        }
         self.observe_names(names);
         let f = self.map_scrutinee(from, from_args, arena, names);
         let w = self.map_tested(what, what_args, arena, names);
@@ -2322,6 +2368,13 @@ impl TypeOps for ResolvedTypeOps<'_> {
         arena: &[Vec<ArgTy>],
         names: &[Box<str>],
     ) -> bool {
+        // The undefined tested head keeps the guaranteed-succeed face
+        // silent (#2450 — [`Self::tested_head_undefined`]): no subtype
+        // verdict runs over a name the oracle reports
+        // `type_test_with_undefined_name` on.
+        if self.tested_head_undefined(right, names) {
+            return false;
+        }
         self.observe_names(names);
         // Two signature-less function spellings: the flow layer records
         // every function type as the bare `Base::Function` head (no
@@ -2369,6 +2422,13 @@ impl TypeOps for ResolvedTypeOps<'_> {
         arena: &[Vec<ArgTy>],
         names: &[Box<str>],
     ) -> Option<FlowTy> {
+        // No promotion rides an undefined tested head (#2450 —
+        // [`Self::tested_head_undefined`]): the oracle's promotion gate
+        // never fires for a spelling it reports
+        // `type_test_with_undefined_name` on.
+        if self.tested_head_undefined(to, names) {
+            return None;
+        }
         self.observe_names(names);
         let t = self.map_tested(to, to_args, arena, names);
         let f = self.map_scrutinee(from, from_args, arena, names);
