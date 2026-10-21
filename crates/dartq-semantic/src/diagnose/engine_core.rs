@@ -668,6 +668,41 @@ impl<'a> Engine<'a> {
                 }
                 continue;
             }
+            if let StagedKind::YieldEach { seq_head } = check.kind {
+                // The yield-each verdict reads the source's flow-aware
+                // static type (upstream Dart SDK source,
+                // pkg/analyzer/lib/src/dart/resolver/
+                // yield_statement_resolver.dart `_checkForYieldOfInvalidType`
+                // — `expression.typeOrThrow` after the shared analyzer's
+                // yield-star rewrite): a null-guard promotion on the read
+                // substitutes the promoted type itself and the verdict
+                // re-decides, while the no-fact face re-decides on the
+                // parse-time wrap (byte-identical to the parse-time emit —
+                // a promotion can only clean the verdict, never create
+                // it, so the arm only stages where the parse-time face
+                // answered negative).
+                let implied = match promotions.promoted(check.range) {
+                    Some(Ty::Unknown) => Self::non_null_form(check.from),
+                    Some(promoted) => promoted,
+                    None => self
+                        .boundary
+                        .args
+                        .borrow_mut()
+                        .named(seq_head, false, &[check.from]),
+                };
+                if self.assignable(implied, check.to, check.literal) == Some(false) {
+                    let (a0, a1) = (self.ty_display(implied), self.ty_display(check.to));
+                    survivors.push(Diagnostic::new(
+                        SemanticCode::YieldEachOfInvalidType.severity(),
+                        SemanticCode::YieldEachOfInvalidType.code_info(),
+                        SemanticCode::YieldEachOfInvalidType.message(&a0, &a1),
+                        self.file,
+                        check.range,
+                        None,
+                    ));
+                }
+                continue;
+            }
             let staged_promotion = promotions.promoted(check.range);
             let from = match staged_promotion {
                 // The opaque-head promotion (#2174 — a signature-less
@@ -746,6 +781,7 @@ impl<'a> Engine<'a> {
                 // Routed by the early blocks above; the arms only keep the
                 // match total.
                 StagedKind::NeverReceiver | StagedKind::NullableCondition => continue,
+                StagedKind::YieldEach { .. } => continue,
                 StagedKind::Assignment => (SemanticCode::InvalidAssignment, None),
                 StagedKind::Argument => (SemanticCode::ArgumentTypeNotAssignable, None),
                 StagedKind::Yield => (SemanticCode::YieldOfInvalidType, None),

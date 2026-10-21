@@ -1559,7 +1559,7 @@ impl<'a> Engine<'a> {
     /// the constructor whose formals are in scope (the site name rewritten
     /// to the selector — the collector's own table key), and its table
     /// carries the initializing formals under their reference spelling too.
-    fn ctor_init_formals(&self) -> Vec<StringId> {
+    pub(crate) fn ctor_init_formals(&self) -> Vec<StringId> {
         if self.initializer_depth == 0 || !self.in_const_ctor {
             return Vec::new();
         }
@@ -1685,6 +1685,23 @@ impl<'a> Engine<'a> {
                         if !self.const_arg_row_at(span) {
                             self.emit(SemanticCode::InvalidConstant, span, "", "");
                         }
+                    } else if self.initializer_depth > 0 && self.in_const_ctor {
+                        // A literal inside the const constructor's
+                        // initializer list is never `isConst`
+                        // (`constantContext2` answers null on the
+                        // initializer ancestors), so the element faces
+                        // never run there — the gate is the initializer's
+                        // potentially-constant scan (upstream Dart SDK
+                        // source, pkg/analyzer/lib/src/dart/constant/
+                        // constant_verifier.dart
+                        // `_validateConstructorInitializers` →
+                        // `_reportNotPotentialConstants`), whose face is
+                        // `invalid_constant` at the failing leaf
+                        // (probe2484 p4a: `: rec = (a: g)` reports
+                        // `invalid_constant` at `g`, never
+                        // `non_constant_record_field` — that face owns the
+                        // true const literal context alone, probe2484 p4b).
+                        self.emit(SemanticCode::InvalidConstant, span, "", "");
                     } else {
                         self.emit(code, span, "", "");
                         // A leaf under an open annotation window joins the

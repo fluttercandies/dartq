@@ -4440,3 +4440,14 @@ mod ticket_2485_tests;
 /// field's declared type while the neighboring `absoluteFilePath:` slot
 /// keeps enforcing `String`.
 #[cfg(test)]
+/// The #2484 pins: the listener-family residual batch (#2478/#2480) — the
+/// super/redirect initializer argument lists scan under the const
+/// constructor's `CtorScope` (a formal passed through `: super(f)` is
+/// potentially constant, the scan is const-constructor-only), the
+/// `yield*` verdict stages through the promoted read (the official
+/// implied type is the source's flow-aware static type), and a record
+/// field inside a const-constructor initializer reports the initializer
+/// scan's `invalid_constant`, the element face owning the true const
+/// literal context alone.
+#[cfg(test)]
+mod ticket_2484_tests;

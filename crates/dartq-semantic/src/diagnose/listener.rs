@@ -3836,9 +3836,39 @@ impl ParserListener for DiagnoseListener<'_> {
                 .const_capture
                 .end_init_invocation_arguments(end.range);
             if let Some(closed) = &closed {
+                // The scan is the const constructor's own gate (upstream
+                // Dart SDK source, pkg/analyzer/lib/src/dart/constant/
+                // constant_verifier.dart — `_validateConstructorInitializers`
+                // runs under `node.constKeyword != null` only; probe2484
+                // p1d/p1e: a NON-const constructor's `super(f)` stays
+                // silent), and its name rule is the potentially-constant
+                // one (`potentially_constant.dart` `_nameExpression`): the
+                // enclosing const constructor's formal parameters are
+                // potentially constant, so the scan runs with the formals
+                // bound as opaque names (the [`CtorScope`] overlay) — a
+                // const-ctor formal passed through `: super(f)` /
+                // `: this.other(f)` stays silent, a genuinely non-constant
+                // argument still collects.
                 let mut spans = Vec::new();
-                for arg in &closed.args {
-                    collect_not_potentially_constant(arg, &self.engine, &mut spans);
+                if self.engine.in_const_ctor {
+                    let formals = self.engine.ctor_init_formals();
+                    if formals.is_empty() {
+                        for arg in &closed.args {
+                            collect_not_potentially_constant(arg, &self.engine, &mut spans);
+                        }
+                    } else {
+                        let mut env: FxHashMap<StringId, CtorBinding> = FxHashMap::default();
+                        for name in formals {
+                            env.insert(name, CtorBinding::Opaque);
+                        }
+                        let scope = CtorScope {
+                            engine: &self.engine,
+                            env: &env,
+                        };
+                        for arg in &closed.args {
+                            collect_not_potentially_constant(arg, &scope, &mut spans);
+                        }
+                    }
                 }
                 let engine = &mut self.engine;
                 for span in spans {
@@ -8495,8 +8525,20 @@ impl Engine<'_> {
                 .borrow_mut()
                 .named(seq_head, false, &[expr_ty]);
             if self.assignable(implied, ret.ty, false) == Some(false) {
-                let (a0, a1) = (self.ty_display(implied), self.ty_display(ret.ty));
-                self.emit(SemanticCode::YieldEachOfInvalidType, range, &a0, &a1);
+                // Staged, not emitted: the oracle's verdict reads the
+                // source's flow-aware static type
+                // (`yield_statement_resolver.dart` `expression.typeOrThrow`
+                // — probe2484: a null-guard-promoted `yield* src` stays
+                // silent), so the promoted read re-decides at the teardown
+                // join with the promoted type as the implied sequence; the
+                // no-fact face re-decides on this parse-time wrap.
+                self.stage(
+                    StagedKind::YieldEach { seq_head },
+                    range,
+                    expr_ty,
+                    ret.ty,
+                    false,
+                );
             }
             return;
         }
