@@ -1674,43 +1674,62 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.var_infer_pending = None;
             if let Some((name, decl_range)) = engine.init_declarators.pop().flatten()
                 && let Some(mark) = engine.init_mark
-                && let Some(expr) = match engine.rows.len() {
-                    // The single-row window every fold-as-one shape keeps.
-                    count if count == mark + 1 => Some(mark),
-                    // The `[]` fold leaves the receiver's operator row plus
-                    // the result's value row (#2521): the initializer's
-                    // expression row is the value row — one past the
-                    // operator — so `var symbols = map[key]!` infers the
-                    // index result's type exactly like a plain read. Only
-                    // the assertion-decided NON-NULL face binds: a nullable
-                    // index result (`var h = headers[k]`, `var r =
-                    // byIndex[i]`) owes the null-check promotion and the
-                    // reassignment writes the staged faces re-decide
-                    // downstream, and binding it here fires the return/
-                    // unchecked/undefined verdicts before those re-decides
-                    // run (the analyzer corpus's map-inferred locals) —
-                    // the under-report stands until the write-side staging
-                    // carries them. The `!`-asserted face is the one shape
-                    // with no such question standing: the assertion itself
-                    // decided nullness, the type is the index result's own,
-                    // and no promotion re-decide can change it.
-                    count
-                        if count == mark + 2
-                            && matches!(
-                                engine.rows[mark].intent,
-                                Intent::Operator(op, _) if op == engine.intern("[]")
-                            )
-                            && matches!(engine.rows[mark + 1].shape, RowShape::Value)
-                            && engine.rows[mark + 1].ty != Ty::UNKNOWN
-                            && !Engine::is_nullable_ty(engine.rows[mark + 1].ty)
-                            && engine.byte_at(engine.rows[mark + 1].range.end())
-                                == Some(b'!') =>
-                    {
-                        Some(mark + 1)
+                && let Some((expr, ifnull_ty)) = {
+                    // The `??` pair's own face folds here (this slice): the
+                    // two-operand window types the local as
+                    // `LUB(NonNull(lhs), rhs)` before the pass-2 flow face
+                    // — the flow layer widened the write conservatively (it
+                    // cannot resolve the right operand's member face), and
+                    // without this bind the promoted-receiver re-derive
+                    // fills the widened nullable face below (`final v =
+                    // target ?? h.cols; v.isEmpty` reported unchecked where
+                    // the oracle stays silent). The `expr` index the tail
+                    // reads is the pair's left row (await extents, the
+                    // #2539 latch and the explicit-argument rider all key
+                    // on it or miss).
+                    let ifnull_ty = engine.ifnull_initializer_ty(mark);
+                    if ifnull_ty.is_some() {
+                        Some((mark, ifnull_ty))
+                    } else {
+                        match engine.rows.len() {
+                        // The single-row window every fold-as-one shape keeps.
+                        count if count == mark + 1 => Some((mark, None)),
+                        // The `[]` fold leaves the receiver's operator row plus
+                        // the result's value row (#2521): the initializer's
+                        // expression row is the value row — one past the
+                        // operator — so `var symbols = map[key]!` infers the
+                        // index result's type exactly like a plain read. Only
+                        // the assertion-decided NON-NULL face binds: a nullable
+                        // index result (`var h = headers[k]`, `var r =
+                        // byIndex[i]`) owes the null-check promotion and the
+                        // reassignment writes the staged faces re-decide
+                        // downstream, and binding it here fires the return/
+                        // unchecked/undefined verdicts before those re-decides
+                        // run (the analyzer corpus's map-inferred locals) —
+                        // the under-report stands until the write-side staging
+                        // carries them. The `!`-asserted face is the one shape
+                        // with no such question standing: the assertion itself
+                        // decided nullness, the type is the index result's own,
+                        // and no promotion re-decide can change it.
+                        count
+                            if count == mark + 2
+                                && matches!(
+                                    engine.rows[mark].intent,
+                                    Intent::Operator(op, _) if op == engine.intern("[]")
+                                )
+                                && matches!(engine.rows[mark + 1].shape, RowShape::Value)
+                                && engine.rows[mark + 1].ty != Ty::UNKNOWN
+                                && !Engine::is_nullable_ty(engine.rows[mark + 1].ty)
+                                && engine.byte_at(engine.rows[mark + 1].range.end())
+                                    == Some(b'!') =>
+                        {
+                            Some((mark + 1, None))
+                        }
+                        _ => None,
+                        }
                     }
-                    _ => None,
                 }
-                && let Some(ty) = engine
+                && let Some(ty) = ifnull_ty.or_else(|| engine
                     .initializer_static_ty(&engine.rows[expr])
                     .map(|ty| engine.staged_read_ty(&engine.rows[expr]).unwrap_or(ty))
                     .or_else(|| {
@@ -1726,7 +1745,7 @@ impl ParserListener for DiagnoseListener<'_> {
                         let row = engine.rows[expr].clone();
                         let derived = engine.initializer_read_ty(&row);
                         (derived != Ty::UNKNOWN).then_some(derived)
-                    })
+                    }))
             {
                 // The await operand's extent re-applies the flatten here
                 // (#2506): the close-time rewrite reads an `Unknown` row

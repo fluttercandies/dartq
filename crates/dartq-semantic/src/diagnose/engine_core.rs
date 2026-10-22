@@ -2027,6 +2027,90 @@ impl<'a> Engine<'a> {
         self.tearoff_ty(row)
     }
 
+    /// The `??` initializer pair's inferred type (`resolveIfNull`,
+    /// upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/resolver/binary_expression_resolver.dart:
+    /// 69-109): the declaration window holds exactly the two operand rows
+    /// — the ifnull leaves no result row ([`Self::end_if_null`] only
+    /// stages the dead-coalesce verdict) — with the operator in the gap
+    /// between them. The local's type is `LUB(NonNull(lhs), rhs)`:
+    /// nullable exactly when the right side is (`int? ?? int?` stays
+    /// `int?`), the left's non-null form when the right's face is unknown
+    /// (the official folds an invalid operand away,
+    /// `LUB(NonNull(T), Invalid) = NonNull(T)`), and the right's face when
+    /// the left's is (the same fold, mirrored). Only same-head,
+    /// same-argument, NON-NULL faces bind: a cross-head or widened least
+    /// upper bound stays unbound — the under-report posture every untyped
+    /// initializer keeps (binding a nullable inference fires the
+    /// return/unchecked verdicts before the write-side re-decides run, the
+    /// `[]`-fold arm's rule below the declaration bind).
+    pub(crate) fn ifnull_initializer_ty(&mut self, mark: usize) -> Option<Ty> {
+        if self.rows.len() != mark + 2 {
+                return None;
+        }
+        let lhs = self.rows[mark].clone();
+        let rhs = self.rows[mark + 1].clone();
+        // The pair is one `??` initializer only when the operator's first
+        // non-whitespace bytes follow the left row's end.
+        let mut at = lhs.range.end();
+        while matches!(self.byte_at(at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            at += 1;
+        }
+        if self.byte_at(at) != Some(b'?') || self.byte_at(at + 1) != Some(b'?') {
+                return None;
+        }
+        let lhs_face = self
+            .initializer_static_ty(&lhs)
+            .filter(|ty| *ty != Ty::UNKNOWN)
+            .or_else(|| {
+                let derived = self.initializer_read_ty(&lhs);
+                (derived != Ty::UNKNOWN).then_some(derived)
+            })
+            .unwrap_or(Ty::UNKNOWN);
+        let rhs_face = self
+            .initializer_static_ty(&rhs)
+            .filter(|ty| *ty != Ty::UNKNOWN)
+            .or_else(|| {
+                let derived = self.initializer_read_ty(&rhs);
+                (derived != Ty::UNKNOWN).then_some(derived)
+            })
+            .unwrap_or(Ty::UNKNOWN);
+        let face = match (lhs_face, rhs_face) {
+            (a, b) if a == b => a,
+            (Ty::UNKNOWN, b) => b,
+            (a, Ty::UNKNOWN) => Engine::non_null_form(a),
+            (
+                lhs @ Ty::Named {
+                    name: l,
+                    ..
+                },
+                Ty::Named {
+                    name: r,
+                    args: ra,
+                    nullable: rn,
+                },
+            ) if l == r && {
+                // Structural argument agreement: separately interned
+                // trees spell the same instantiation (`List<TableColumn>`
+                // from the parameter annotation and from `toList`'s
+                // return), so the assignability matrix decides — mutual
+                // assignability of the non-null forms is the same-type
+                // question; a one-way or undecidable pair leaves the
+                // local unbound (the under-report posture).
+                let lhs_nn = Engine::non_null_form(lhs);
+                let rhs_nn = Engine::non_null_form(rhs_face);
+                self.assignable(lhs_nn, rhs_nn, false) == Some(true)
+                    && self.assignable(rhs_nn, lhs_nn, false) == Some(true)
+            } => Ty::Named {
+                name: r,
+                nullable: rn,
+                args: ra,
+            },
+            _ => return None,
+        };
+        (!matches!(face, Ty::Named { nullable: true, .. })).then_some(face)
+    }
+
     /// The tear-off function type of a member row resolving to a declared
     /// method: `M Function<M>(M)` for `m`'s `M m<M>(M)` — the member's own
     /// type-parameter count, written return type, and formal table

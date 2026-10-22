@@ -11201,6 +11201,59 @@ fn ifnull_dead_code_and_dead_null_aware_coexist() {
     assert_eq!(rhs.range.length, 1);
 }
 
+/// A `??` initializer with a resolvable NON-NULL right operand infers the
+/// local's non-null type (`resolveIfNull`'s `LUB(NonNull(lhs), rhs)`,
+/// binary_expression_resolver.dart:69-109): the declaration window folds
+/// the two operand rows itself — the flow layer widened the written face
+/// conservatively (it cannot resolve the right operand's member face),
+/// and without the bind the pass-2 re-derive filled the nullable face
+/// (`v.flag` reported unchecked where the oracle stays silent).
+/// Oracle probed: silent.
+#[test]
+fn ifnull_init_non_null_rhs_binds_non_null_local() {
+    let source = "class C { bool get flag => false; }\n\
+         class H { C c = C(); }\n\
+         void f(C? target, H h) {\n\
+           final v = target ?? h.c;\n\
+           if (v.flag) {\n\
+             return;\n\
+           }\n\
+         }\n";
+    let report = report(source);
+    assert!(
+        !code_names(&report)
+            .iter()
+            .any(|name| *name == "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&report)
+    );
+}
+
+/// The complementary face: a NULLABLE right operand keeps the local
+/// nullable (`LUB(NonNull(T), T?) = T?`) — the flow layer's conservative
+/// widening owns that case (the declaration bind skips non-non-null
+/// faces), and the unchecked row fires exactly where the oracle fires it.
+/// Oracle probed: `UNCHECKED_USE_OF_NULLABLE_VALUE` at the `flag` read.
+#[test]
+fn ifnull_init_nullable_rhs_keeps_unchecked_row() {
+    let source = "class C { bool get flag => false; }\n\
+         class H { C? nc; }\n\
+         void f(C? target, H h) {\n\
+           final v = target ?? h.nc;\n\
+           if (v.flag) {\n\
+             return;\n\
+           }\n\
+         }\n";
+    let report = report(source);
+    let rows: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "unchecked_use_of_nullable_value")
+        .collect();
+    assert_eq!(rows.len(), 1, "{:?}", code_names(&report));
+    assert_eq!(rows[0].range.offset, offset_of(source, "v.flag") + 2);
+}
+
 /// `true || b`: the row spans `[operator, rightOperand.end]` — the bare
 /// identifier operand ends at itself, never at the tiled follower token
 /// (oracle row 2:12 len 4).
