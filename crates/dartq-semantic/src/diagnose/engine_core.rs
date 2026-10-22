@@ -289,6 +289,8 @@ impl<'a> Engine<'a> {
             null_assert_staged: Vec::new(),
             null_aware_staged: Vec::new(),
             promoted_recv_reads: Vec::new(),
+            inferred_formal_containers: FxHashSet::default(),
+            inferred_recv_used_members: FxHashSet::default(),
             prop_promotion_rows: PropPromotionStaging::default(),
             member_reads: Vec::new(),
             member_recv_tys: FxHashMap::default(),

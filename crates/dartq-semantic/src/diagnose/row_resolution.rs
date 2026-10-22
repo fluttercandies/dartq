@@ -2153,6 +2153,38 @@ impl<'a> Engine<'a> {
             Receiver::Typed { type_name, .. } => (type_name, None),
             _ => return,
         };
+        // A receiver whose class came from the closure-formal inference
+        // (the solved callee-own parameter — the type is OUR approximation
+        // of the oracle's): the member walk on it under-resolves the
+        // extension/import members the oracle resolves through, so every
+        // face against it stays silent — the undefined rows the walk would
+        // emit (and the operator faces beside them) are under-report, not
+        // evidence.
+        if self.inferred_formal_containers.contains(&container) {
+            // The oracle resolves this access (the posture's premise), so
+            // the spelling stays a resolved use — the declaration it names
+            // must not flip to `unused_element` because OUR walk sat out.
+            // Instance-member sites read the spelling credit; extension
+            // members read the per-face triple the application credit
+            // keys — every same-file face declaring the spelling takes it
+            // (the self-use arm's granularity; a suppressed access never
+            // disambiguates siblings).
+            self.inferred_recv_used_members.insert(row.name);
+            if let Some(elements) = self.index.get(self.file) {
+                let face_credits: Vec<u32> = elements
+                    .extension_faces()
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, face)| face.members.contains_key(&row.name))
+                    .filter_map(|(index, _)| u32::try_from(index).ok())
+                    .collect();
+                for index in face_credits {
+                    self.extension_member_used
+                        .insert((self.file, index, row.name));
+                }
+            }
+            return;
+        }
         // The extension-application faces read the receiver's nullability
         // (applicability and the unchecked-access companion both split on
         // it). A `?.`-merged access unwraps the receiver first — `x?.m`

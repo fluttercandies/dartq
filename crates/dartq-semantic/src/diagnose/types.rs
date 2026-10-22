@@ -2648,6 +2648,22 @@ pub(crate) struct Engine<'a> {
     /// through it — the official resolver's chain for every one of these
     /// heads.
     pub(crate) member_recv_tys: FxHashMap<u32, Ty>,
+    /// Receiver classes bound to closure formals by the call-time
+    /// inference (the solved callee-own parameter's substituted head —
+    /// see [`Engine::closure_param_context_ty`]). A closure formal's
+    /// type is OUR approximation of the oracle's inference; the member
+    /// walk on it under-resolves the extension/import members the oracle
+    /// resolves through, so the undefined-member rows against these
+    /// containers stay silent — the under-report posture.
+    pub(crate) inferred_formal_containers: FxHashSet<StringId>,
+    /// Member spellings whose resolution the inference-bound receiver gate
+    /// suppressed ([`Engine::inferred_formal_containers`]): the oracle
+    /// resolves every one of those accesses (the under-report posture's
+    /// premise), so the spelling stays a RESOLVED use — without the credit
+    /// the member walk never ran and the declaration would flip to
+    /// `unused_element` (manifest_item.dart's extension `write` family,
+    /// whose only uses ride inferred formals).
+    pub(crate) inferred_recv_used_members: FxHashSet<StringId>,
     /// One record per completed send: the callee row's offset through the
     /// closing `)` (offset-keyed, kept sorted — nested calls complete
     /// inner-first, so pushes are not monotonic). The assignability emit

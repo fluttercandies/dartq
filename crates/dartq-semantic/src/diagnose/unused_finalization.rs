@@ -227,6 +227,10 @@ impl<'a> Engine<'a> {
                 .iter()
                 .map(|&(_, _, spelling)| spelling),
         );
+        // The inference-bound receiver gate's suppressed spellings are
+        // resolved uses in the oracle's eyes — credit them the same or the
+        // member's declaration flips to `unused_element`.
+        resolved.extend(self.inferred_recv_used_members.iter().copied());
         resolved.extend(self.member_read_owners.keys().copied());
         for read in &self.member_reads {
             let recv = self.promoted_receiver(read.offset, read.recv);

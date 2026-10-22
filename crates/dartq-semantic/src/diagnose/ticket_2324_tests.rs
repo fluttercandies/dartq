@@ -432,10 +432,11 @@ fn container_param_schema_under_argless_receiver_stays_dynamic() {
 /// nullability: official `A? <: T?` binds `T` the argument's NON-NULL
 /// head (probed 3.13.1: a resolved `Tok2?` argument types the callback
 /// formal `Tok2` — `n.lexeme` is `UNDEFINED_GETTER on 'Tok2'`, never an
-/// unchecked row). The solved head is the oracle's silent arm — the
-/// engine binds `dynamic` (its member walk under-resolves the
-/// extension/import members the oracle resolves through, the
-/// manifest_item `items.write` family).
+/// unchecked row). The solved head binds its class now — feeding the
+/// call's downstream nesting — with the undefined-member faces on the
+/// inference-bound receiver kept silent
+/// (`callee_own_solve_binds_class_feeding_assignability` carries the
+/// shape).
 #[test]
 fn nullable_formal_absorbs_arg_nullability() {
     let source = "class BW { void take<T>(T? o, void Function(T x) w) {} }\n\
@@ -469,6 +470,46 @@ fn extension_this_arg_solves_on_type() {
     let rep = report(source);
     assert!(
         !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// The solved callee-own parameter binds its class — not the silent
+/// `dynamic` the under-report posture used to carry. The concrete bind
+/// is oracle-true (probed 3.15: the analyzer's `T := A` types the
+/// callback formal `A`, so `B x = a;` reports `invalid_assignment`)
+/// and feeds the call's downstream nesting — bundle_writer.dart's
+/// `writeOptionalObject(info, (info) { writeMap(info, …) })` types the
+/// inner map's key/value from the OUTER formal's class, which a
+/// `dynamic` bind starves into the unchecked/argument-type false
+/// positives. The undefined-member exemption rides the same solve:
+/// [`Engine::inferred_formal_containers`] keeps the member walk's
+/// undefined rows silent on the inference-bound receiver (the walk
+/// cannot see the extension/import members the oracle resolves through;
+/// a same-file misspell shares that silence as collateral).
+#[test]
+fn callee_own_solve_binds_class_feeding_assignability() {
+    let source = "class BW { void take<T>(T? o, void Function(T x) w) {} }\n\
+                  class A { void ok() {} }\n\
+                  class B {}\n\
+                  void f(BW bw) {\n\
+                  bw.take(A(), (a) { B x = a; });\n\
+                  }\n";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "invalid_assignment"),
+        "{:?}",
+        code_names(&rep)
+    );
+    let source = "class BW { void take<T>(T? o, void Function(T x) w) {} }\n\
+                  class A { void ok() {} }\n\
+                  void f(BW bw) {\n\
+                  bw.take(A(), (a) { a.ok(); a.nope(); });\n\
+                  }\n";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "undefined_method"),
         "{:?}",
         code_names(&rep)
     );

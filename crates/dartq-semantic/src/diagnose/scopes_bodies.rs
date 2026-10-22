@@ -1167,13 +1167,23 @@ impl<'a> Engine<'a> {
                 // head (probed: a resolved `Tok2?` argument types the
                 // callback formal `Tok2`; manifest_id.dart:150/157's
                 // `this` under `extension on ManifestItemId?` stays
-                // silent on `it.write`). Our member walk under-resolves
-                // the extension/import members those faces often carry
-                // (manifest_item.dart's `items.write` family), so the
-                // under-report posture binds `dynamic` — silent on
-                // every face — instead of the concrete class.
-                if callee_own_head && instantiated.is_some() {
-                    return Some(Ty::Dynamic);
+                // silent on `it.write`). The class itself binds now —
+                // the solved face feeds the call's downstream nesting
+                // (bundle_writer.dart's `writeOptionalObject(info, (info)
+                // { writeMap(info, … writeValue: (value) => …) })` types
+                // the inner map's `K`/`V` from the OUTER formal, which a
+                // `dynamic` bind starves) — and the receiver class joins
+                // [`Engine::inferred_formal_containers`]: our member walk
+                // under-resolves the extension/import members those faces
+                // often carry (manifest_item.dart's `items.write`
+                // family), so the undefined-member rows against an
+                // inference-bound receiver stay silent (the under-report
+                // posture — the oracle resolves them).
+                if callee_own_head && let Some(solved) = instantiated {
+                    if let Ty::Named { name, .. } = solved {
+                        self.inferred_formal_containers.insert(name);
+                    }
+                    return Some(solved);
                 }
                 // `greatestClosure`'s decidable face (upstream
                 // `_inferFormalParameters`): a provable named schema entry
@@ -1355,7 +1365,28 @@ impl<'a> Engine<'a> {
                             {
                                 self.this_static_ty(container, kind)
                             } else {
-                                self.initializer_read_ty(&row)
+                                let read = self.initializer_read_ty(&row);
+                                if read == Ty::Unknown
+                                    && !row.qualified
+                                    && self.top_level_decl(row.name).is_some_and(|decl| {
+                                        matches!(decl.kind, MicroKind::Class)
+                                    })
+                                {
+                                    // A creation argument (`A()`): the
+                                    // invocation's static type is the
+                                    // class itself — the send's merge
+                                    // hasn't typed the row yet (the
+                                    // staged entry carries the bare
+                                    // callee, `Read`-intent, identifier
+                                    // span) at this bind-time read, so
+                                    // the class declaration answers
+                                    // directly. A bare class-name
+                                    // expression (a type literal) rides
+                                    // the same face — under-report.
+                                    Ty::named(row.name)
+                                } else {
+                                    read
+                                }
                             }
                         } else {
                             ty
