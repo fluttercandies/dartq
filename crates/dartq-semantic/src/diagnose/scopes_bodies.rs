@@ -1129,9 +1129,25 @@ impl<'a> Engine<'a> {
         // callee actually declares as inference parameters can bind — a
         // misspelt head collects no binding and keeps the unresolvable
         // fallback below.
-        let schema = self
-            .closure_schema_instantiate(schema, &recv, callee_name, callee_row)
-            .unwrap_or(schema);
+        let callee_own_head = match (schema, &recv) {
+            (
+                Ty::Named {
+                    name: head,
+                    nullable: false,
+                    args,
+                },
+                Receiver::Typed { type_name: container, .. },
+            ) if args == ArgListId::EMPTY
+                && matches!(self.walk_members(*container, callee_name), Walk::Found(ref entry)
+                    if entry.kind == MemberKind::Method
+                        && entry.type_param_names.contains(&head)) =>
+            {
+                true
+            }
+            _ => false,
+        };
+        let instantiated = self.closure_schema_instantiate(schema, &recv, callee_name, callee_row);
+        let schema = instantiated.unwrap_or(schema);
         // `greatestClosure`'s nullable face: `T <: Null` binds `Object?`;
         // an invalid type argument (`List<Und>`'s `E`) collapses to the
         // same; a genuinely nullable schema type binds itself; `dynamic`
@@ -1145,6 +1161,20 @@ impl<'a> Engine<'a> {
                 nullable,
                 args,
             } => {
+                // A callee-own head the call's upward face solved to a
+                // type the file CAN name: the oracle binds the class —
+                // official `A? <: T?` binds `T` the argument's non-null
+                // head (probed: a resolved `Tok2?` argument types the
+                // callback formal `Tok2`; manifest_id.dart:150/157's
+                // `this` under `extension on ManifestItemId?` stays
+                // silent on `it.write`). Our member walk under-resolves
+                // the extension/import members those faces often carry
+                // (manifest_item.dart's `items.write` family), so the
+                // under-report posture binds `dynamic` — silent on
+                // every face — instead of the concrete class.
+                if callee_own_head && instantiated.is_some() {
+                    return Some(Ty::Dynamic);
+                }
                 // `greatestClosure`'s decidable face (upstream
                 // `_inferFormalParameters`): a provable named schema entry
                 // binds itself — `(e)` under `void Function(R?)` binds
@@ -1313,8 +1343,20 @@ impl<'a> Engine<'a> {
                 match owned {
                     Some(row) => {
                         let ty = self.expression_row_ty(&row);
-                        if ty == Ty::UNKNOWN {
-                            self.initializer_read_ty(&row)
+                        if ty == Ty::Unknown {
+                            // A bare `this` argument's face is the
+                            // enclosing container's static type — the
+                            // extension's on-type with its nullability
+                            // and arguments (`extension on ManifestItemId?`
+                            // contributes `ManifestItemId?`, so the `T?`
+                            // absorption above solves `T` its non-null
+                            // head, manifest_id.dart:150/157).
+                            if let Receiver::This { container, kind } = self.argument_receiver(&row)
+                            {
+                                self.this_static_ty(container, kind)
+                            } else {
+                                self.initializer_read_ty(&row)
+                            }
                         } else {
                             ty
                         }
@@ -1597,6 +1639,45 @@ impl<'a> Engine<'a> {
         out: &mut Vec<(StringId, Ty)>,
     ) {
         match (formal, arg) {
+            (
+                Ty::Named {
+                    name,
+                    nullable: true,
+                    args,
+                },
+                arg,
+            ) if args == ArgListId::EMPTY => {
+                // A nullable-writable bare parameter (`writeOptionalObject<
+                // T>(T? object, …)`): the formal's own top-level `?`
+                // absorbs the argument's nullability — official `A? <: T?`
+                // binds `T` the argument's NON-NULL head (probed: a
+                // resolved `Tok2?` argument types the callback formal
+                // `Tok2`; `extension on ManifestItemId?`'s `this` stays
+                // silent on `it.write`, manifest_id.dart:150/157). The
+                // non-null strip only lands on the arg's nullable named
+                // face; every other shape (a `Null` literal, `dynamic`)
+                // contributes itself, and the caller's decidable gate
+                // still rejects heads the file cannot name — those keep
+                // the unsolved fall-to-bound (`Object?`) route below
+                // (ast_binary_writer.dart:864's unresolvable `Token?`).
+                if params.iter().any(|(param, _)| *param == name) {
+                    let bound = if let Ty::Named {
+                        name: arg_name,
+                        args: arg_args,
+                        nullable: true,
+                    } = arg
+                    {
+                        Ty::Named {
+                            name: arg_name,
+                            args: arg_args,
+                            nullable: false,
+                        }
+                    } else {
+                        arg
+                    };
+                    out.push((name, bound));
+                }
+            }
             (
                 Ty::Named {
                     name,

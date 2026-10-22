@@ -427,6 +427,53 @@ fn container_param_schema_under_argless_receiver_stays_dynamic() {
     );
 }
 
+/// A callee-own parameter under a nullable-writable formal solves from
+/// the typed argument with the formal's own `?` absorbing the argument's
+/// nullability: official `A? <: T?` binds `T` the argument's NON-NULL
+/// head (probed 3.13.1: a resolved `Tok2?` argument types the callback
+/// formal `Tok2` — `n.lexeme` is `UNDEFINED_GETTER on 'Tok2'`, never an
+/// unchecked row). The solved head is the oracle's silent arm — the
+/// engine binds `dynamic` (its member walk under-resolves the
+/// extension/import members the oracle resolves through, the
+/// manifest_item `items.write` family).
+#[test]
+fn nullable_formal_absorbs_arg_nullability() {
+    let source = "class BW { void take<T>(T? o, void Function(T x) w) {} }\n\
+                  class V { int get flag => 1; }\n\
+                  void f(BW bw, V? v) {\n\
+                    bw.take(v, (x) { x.flag; });\n\
+                  }\n";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+
+/// A bare `this` argument carries the enclosing extension's on-type —
+/// `extension on M2?` contributes `M2?`, whose nullability the formal's
+/// `?` absorbs, so the callback formal stays silent on member uses
+/// (manifest_id.dart:150/157's `writeOptionalObject(this, (it) =>
+/// it.write(writer))`).
+#[test]
+fn extension_this_arg_solves_on_type() {
+    let source = "class BW { void take<T>(T? o, void Function(T x) w) {} }\n\
+                  class M2 { void write() {} }\n\
+                  extension E on M2? {\n\
+                    void go(BW bw) {\n\
+                      bw.take(this, (x) { x.write(); });\n\
+                    }\n\
+                  }\n";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
 /// An annotated invalid formal is `InvalidType` itself — the
 /// `isInvalidBounded` arm answers before `isNullable` runs, so `x.foo()`
 /// stays silent. (`Und` still reports its own `undefined_class` face.)
