@@ -273,3 +273,41 @@ fn a_prefixed_creation_folds_a_value_row_under_its_members() {
         assert_silent(&report);
     }
 }
+
+/// An extension-getter argument to a FOREIGN generic helper types the
+/// closure formals through upward inference (the analyzer corpus's
+/// `forCorrespondingPairs(fragmentList.withOriginDeclaration, infoList,
+/// (fragment, info) …)`): the flush face leaves the extension read
+/// `Unknown` (the merge-time field face never types one), so the schema
+/// solver re-types the argument's row on demand — the element flows into
+/// `T1` and the formal binds `Fragment`, not the `Object?` recovery whose
+/// every member read reported `unchecked_use_of_nullable_value`.
+#[test]
+fn an_extension_getter_argument_types_the_foreign_helper_closure_formals() {
+    let report = report_ops_imports(
+        "class Fragment { void setCodeRange(int a) {} }\n\
+         class Info { int codeOffset = 0; }\n\
+         extension on Bag<Fragment> {\n\
+           Bag<Fragment> get withOriginDeclaration => this;\n\
+         }\n\
+         void apply(Bag<Fragment> fragmentList, Bag<Info> infoList) {\n\
+           forCorrespondingPairs(fragmentList.withOriginDeclaration, infoList, (\n\
+             fragment,\n\
+             info,\n\
+           ) {\n\
+             fragment.setCodeRange(info.codeOffset);\n\
+           });\n\
+         }\n",
+        &[RigImport {
+            uri: "package:probe/coll.dart",
+            prefix: None,
+            source: "class Bag<T> {}\n\
+                     void forCorrespondingPairs<T1, T2>(\n\
+                       Bag<T1> list1,\n\
+                       Bag<T2> list2,\n\
+                       void Function(T1, T2) f,\n\
+                     ) {} \n",
+        }],
+    );
+    assert_silent(&report);
+}

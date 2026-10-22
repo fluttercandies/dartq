@@ -3350,6 +3350,57 @@ impl<'a> Engine<'a> {
             _ => return None,
         };
         let ty = self.boundary.ty(face_file, declared);
+        // A generic extension's declared return still spells its own type
+        // parameters (`Iterable<T>` under `extension E<T> on List<T>`); the
+        // oracle instantiates the extended type against the receiver before
+        // answering, so the `on` type's bare-parameter arguments pair with
+        // the receiver's arguments positionally (`List<X>` binds `T := X`)
+        // and the declared return substitutes through. An argument-less
+        // `on` type or a non-parameter argument keeps the declared return.
+        // The face's `on` type is a foreign-file payload (its argument
+        // list is interned in the extension's own pool) — project it
+        // through the boundary before any argument read, the same
+        // cross-pool discipline the declared return takes.
+        let on_ty = self.boundary.ty(face_file, face.on_ty);
+        let map: Vec<(StringId, Ty)> = match (on_ty, receiver_ty) {
+            (
+                Ty::Named {
+                    args: on_args, ..
+                },
+                Ty::Named {
+                    args: recv_args, ..
+                },
+            ) if on_args != ArgListId::EMPTY
+                && recv_args != ArgListId::EMPTY
+                && !face.type_param_names.is_empty() =>
+            {
+                let on_list = self.boundary.pool().get(on_args).to_vec();
+                let recv_list = self.boundary.pool().get(recv_args).to_vec();
+                on_list
+                    .into_iter()
+                    .zip(recv_list)
+                    .filter_map(|(on_arg, recv_arg)| {
+                        let Ty::Named {
+                            name,
+                            args: ArgListId::EMPTY,
+                            ..
+                        } = on_arg
+                        else {
+                            return None;
+                        };
+                        face.type_param_names
+                            .contains(&name)
+                            .then_some((name, recv_arg))
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let ty = if map.is_empty() {
+            ty
+        } else {
+            self.subst_params(ty, &map).unwrap_or(ty)
+        };
         Some(self.fold_alias_ty(ty))
     }
 

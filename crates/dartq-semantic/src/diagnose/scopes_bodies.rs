@@ -1198,7 +1198,7 @@ impl<'a> Engine<'a> {
     /// substituted schema must itself stay decidable in the caller's scope
     /// ([`Self::schema_type_is_decidable`]), else no substitution forms.
     fn closure_schema_instantiate(
-        &self,
+        &mut self,
         ty: Ty,
         recv: &Receiver,
         callee_name: StringId,
@@ -1245,10 +1245,38 @@ impl<'a> Engine<'a> {
         // Upward face: the arguments already typed at bind time unify
         // against the callee's formals for the still-open slots.
         let formals = self.callee_formals(recv, callee_name)?;
-        let level = self.arg_levels.last()?;
+        let level_args = self.arg_levels.last()?.args.clone();
         let mut candidates: Vec<(StringId, Ty)> = Vec::new();
         let mut positional_index = 0usize;
-        for (name, ty, _literal, _range) in &level.args {
+        for (name, ty, _literal, range) in &level_args {
+            // An argument the flush face could not type — an
+            // extension-getter send keeps `Unknown` there (the merge-time
+            // field face never types one, and the multi-row window records
+            // the raw unknown) — recovers its static type from its own row
+            // on demand, the same resolution the `var`-inference window
+            // runs. Without it the schema slot stays unsolved and the
+            // closure formal collapses to the `Object?` recovery.
+            let ty = if *ty != Ty::Unknown || range.length == 0 {
+                *ty
+            } else {
+                let owned = self
+                    .rows
+                    .iter()
+                    .rev()
+                    .find(|row| row.range == *range)
+                    .cloned();
+                match owned {
+                    Some(row) => {
+                        let ty = self.expression_row_ty(&row);
+                        if ty == Ty::UNKNOWN {
+                            self.initializer_read_ty(&row)
+                        } else {
+                            ty
+                        }
+                    }
+                    None => Ty::Unknown,
+                }
+            };
             let formal = match name {
                 Some(n) => formals.named_formal(*n),
                 None => {
@@ -1257,10 +1285,8 @@ impl<'a> Engine<'a> {
                     formal
                 }
             };
-            if let Some(formal) = formal
-                && *ty != Ty::Unknown
-            {
-                self.closure_unify_upward(formal.ty, *ty, &params, &mut candidates);
+            if let Some(formal) = formal && ty != Ty::Unknown {
+                self.closure_unify_upward(formal.ty, ty, &params, &mut candidates);
             }
         }
         let mut poisoned: FxHashSet<usize> = FxHashSet::default();
@@ -1296,7 +1322,7 @@ impl<'a> Engine<'a> {
         // unsubstituted schema never did (`Bag<Und>`'s `T` is a provable
         // same-file type parameter, `Und` is not). Rejection keeps the
         // schema untouched — exactly the pre-existing route.
-        (out != ty && self.schema_type_is_decidable(out)).then_some(out)
+(out != ty && self.schema_type_is_decidable(out)).then_some(out)
     }
 
     /// Whether a substituted schema entry is a type the caller's scope can

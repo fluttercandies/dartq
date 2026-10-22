@@ -2310,15 +2310,24 @@ impl<'a> Engine<'a> {
                 }
                 None => match self.composite_bool_arg(mark, hi) {
                     Some((ty, range)) => Some((ty, false, range, None)),
-                    None => Some((
-                        Ty::UNKNOWN,
-                        false,
-                        SourceRange {
-                            offset: 0,
-                            length: 0,
-                        },
-                        None,
-                    )),
+                    None => {
+                        // The unmerged window's last row anchors the
+                        // argument for the schema recovery (the type stays
+                        // `Unknown` so the assignability face reads the same
+                        // posture as before; the closure-schema face re-types
+                        // the row on demand through the recorded range).
+                        let anchor = hi
+                            .checked_sub(1)
+                            .and_then(|i| self.rows.get(i))
+                            .map_or(
+                                SourceRange {
+                                    offset: 0,
+                                    length: 0,
+                                },
+                                |row| row.range,
+                            );
+                        Some((Ty::UNKNOWN, false, anchor, None))
+                    }
                 },
             }
         };
