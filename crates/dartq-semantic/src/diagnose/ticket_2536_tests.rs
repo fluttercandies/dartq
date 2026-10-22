@@ -474,3 +474,59 @@ void keepsAssertFace(Sdk? sourceFactory) {
         .collect::<Vec<_>>();
     assert!(family.is_empty(), "faces leaked: {cs:?}");
 }
+
+/// The condition-variable face (language#1274): a bool local bound from a
+/// null comparison replays its split when read as a condition operand —
+/// `hasFlags && flags.contains(...)` and `!hasFlags || flags.contains(...)`
+/// see `flags` promoted in the taken arm (oracle-pinned silent).
+#[test]
+fn condition_variable_replays_the_null_comparison_split() {
+    let report = unit_report(
+        r#"
+class Flags {
+  bool contains(String s) => false;
+}
+
+void sink(bool b) {}
+
+void f(Flags? flags) {
+  final hasFlags = flags != null;
+  sink(hasFlags && flags.contains('q'));
+  sink(!hasFlags || flags.contains('x'));
+}
+"#,
+    );
+    let cs = codes(&report);
+    assert!(
+        !cs.contains(&"unchecked_use_of_nullable_value"),
+        "unchecked leaked: {cs:?}"
+    );
+}
+
+/// The switch-case scrutinee promotion in the case body: `spec(context)`
+/// calls the narrowed `call` class — the parse-time invocation face
+/// defers and re-decides on the flow read type (#2547).
+#[test]
+fn switch_case_promotes_the_scrutinee_for_the_call() {
+    let report = unit_report(
+        r#"
+class Expr {
+  Object call(Object c) => c;
+}
+
+void f(Object spec) {
+  switch (spec) {
+    case Expr():
+      final seq = spec(1);
+      final other = spec(2);
+  }
+}
+"#,
+    );
+    let cs = codes(&report);
+    assert!(
+        !cs.contains(&"invocation_of_non_function_expression")
+            && !cs.contains(&"invocation_of_non_function"),
+        "invocation face leaked: {cs:?}"
+    );
+}

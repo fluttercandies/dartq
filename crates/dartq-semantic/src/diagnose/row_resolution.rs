@@ -260,6 +260,46 @@ impl<'a> Engine<'a> {
     /// promotions (#2241) ride beside the read types: the member walk's
     /// receiver verdict re-decides against them, exactly like the staged
     /// families' teardown join.
+    /// The deferred invocation face's pass-2 half (#2547): the callee's
+    /// flow read type re-decides callability — a promotion that narrowed
+    /// the local to a callable face (a `call` class, a function shape)
+    /// drops the staged row; any other flow face (or none — the
+    /// read-type fact missing) keeps the parse-time verdict.
+    fn apply_deferred_invocation_faces(&mut self) {
+        let deferred = std::mem::take(&mut self.deferred_invocation_faces);
+        for (span, name) in deferred {
+            let flow_ty = self.read_type_at(span);
+            let callable = match flow_ty {
+                Some(ty) => match ty {
+                    Ty::Function { .. } => true,
+                    Ty::Named { name: head, .. } => {
+                        self.strings.resolve(head) == "Function"
+                            || self.fn_var_sigs.contains_key(&name)
+                            || self.alias_fn_sig(head).is_some()
+                            || matches!(
+                                self.resolved_member(head, self.intern("call")),
+                                Some(entry) if entry.kind == MemberKind::Method
+                            )
+                    }
+                    _ => false,
+                },
+                None => false,
+            };
+            if callable {
+                continue;
+            }
+            let code = SemanticCode::InvocationOfNonFunctionExpression;
+            self.report.usage.push(Diagnostic::new(
+                code.severity(),
+                code.code_info(),
+                code.message("", ""),
+                self.file,
+                span,
+                code.correction_message(""),
+            ));
+        }
+    }
+
     /// The pass-2 re-bind of a promotion-latched initializer (#2539):
     /// each deferred local re-derives its initializer member's accessor
     /// over the promoted receiver (the same re-decision
@@ -359,6 +399,7 @@ impl<'a> Engine<'a> {
 
     pub(crate) fn resolve_rows(&mut self, promotions: &PromotionStaging) {
         self.apply_deferred_rebinds();
+        self.apply_deferred_invocation_faces();
         self.build_ur_sites();
         let rows = std::mem::take(&mut self.rows);
         // The #2459 cascade-index target latches: a first-section `..[` fold

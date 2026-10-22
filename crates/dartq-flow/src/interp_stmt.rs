@@ -1193,6 +1193,25 @@ impl Interp<'_> {
                 if let Some(rhs) = &rhs {
                     self.rejoin_value_split(rhs);
                 }
+                // The condition-variable capture (language#1274): the
+                // initializer IS the null-comparison/type-test split —
+                // save its arms keyed on the declared local for the
+                // condition reads below.
+                if let Some(rhs) = rhs.as_ref()
+                    && rhs.test_split
+                    && let Some((if_true, if_false)) = &rhs.branches
+                    && let (Some(var), Some(tested)) = (var, self.cond_split_var.take())
+                {
+                    self.cond_vars.insert(
+                        var,
+                        crate::interp::CondVarEntry {
+                            tested,
+                            version: self.current.model(tested).version,
+                            if_true: if_true.clone(),
+                            if_false: if_false.clone(),
+                        },
+                    );
+                }
                 if let (Some(var), Some(rhs)) = (var, rhs) {
                     // The declared-type slot the written header left unknown
                     // adopts the initializer's inferred face (#2140): the

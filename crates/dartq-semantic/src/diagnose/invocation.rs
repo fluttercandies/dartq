@@ -5775,6 +5775,20 @@ impl<'a> Engine<'a> {
                 {
                     return;
                 }
+                // A local callee may stand flow-promoted at the send (a
+                // switch-case pattern narrowed the local to a `call`
+                // class — the flow read-type fact drains only at pass 2):
+                // the row defers its re-decision instead of reporting the
+                // declared face (#2547).
+                if self
+                    .frames
+                    .iter()
+                    .rev()
+                    .any(|f| f.locals.contains(&row.name))
+                {
+                    self.deferred_invocation_faces.push((row.range, row.name));
+                    return;
+                }
                 let range = row.range;
                 self.emit(
                     SemanticCode::InvocationOfNonFunctionExpression,

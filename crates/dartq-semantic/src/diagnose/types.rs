@@ -2265,6 +2265,13 @@ pub(crate) struct Engine<'a> {
     /// pass 2 recomputes the accessor over the re-derived receiver and
     /// re-binds before any row resolves.
     pub(crate) deferred_var_rebinds: Vec<(u32, u32, Ty)>,
+    /// Deferred invocation faces (#2547): a bare-local callee the
+    /// parse-time pass typed as non-callable may stand flow-promoted at
+    /// the send (a switch-case pattern promoted the local to a `call`
+    /// class) — the read-type fact drains only at pass 2, so the
+    /// `invocation_of_non_function` row defers and re-decides on the
+    /// flow face there.
+    pub(crate) deferred_invocation_faces: Vec<(SourceRange, StringId)>,
     /// The names a deferred re-bind actually retyped (#2539): the
     /// receiver re-decision consults the frame's var-types for these
     /// names when the flow read face carries no promotion — the local's

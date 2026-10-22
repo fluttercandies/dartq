@@ -742,8 +742,9 @@ impl Interp<'_> {
                         // ([`Interp::rejoin_value_split`]) — an `is` result
                         // read as a plain value narrows nothing officially.
                         self.current = if_true.clone();
-                        expr.branches = Some((if_true, if_false));
+                        expr.branches = Some((if_true.clone(), if_false.clone()));
                         expr.test_split = true;
+                        self.cond_split_var = Some(var);
                     }
                 } else {
                     let cur = self.current.clone();
@@ -2106,8 +2107,9 @@ impl Interp<'_> {
                         (eq_true, eq_false)
                     };
                     self.current = if_true.clone();
-                    expr.branches = Some((if_true, if_false));
+                    expr.branches = Some((if_true.clone(), if_false.clone()));
                     expr.test_split = true;
+                    self.cond_split_var = Some(var);
                 }
             }
             // The property-check face (#1409): a null check on a

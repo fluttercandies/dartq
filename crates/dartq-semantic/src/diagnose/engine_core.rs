@@ -207,6 +207,7 @@ impl<'a> Engine<'a> {
             pending_matched: Vec::new(),
             pending_switch_coverings: Vec::new(),
             deferred_var_rebinds: Vec::new(),
+            deferred_invocation_faces: Vec::new(),
             rebound_locals: FxHashMap::default(),
             clause_anchor: None,
             primary_constructors_enabled,

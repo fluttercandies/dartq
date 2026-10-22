@@ -366,6 +366,20 @@ impl Default for DeclCtx {
 }
 
 /// One expression value on the expression stack.
+/// One captured condition-variable binding (language#1274): the split
+/// states saved at `final b = v != null;` (or `==`, or a type test),
+/// replayed when `b` reads as a condition operand.
+pub(crate) struct CondVarEntry {
+    /// The tested variable.
+    pub tested: u32,
+    /// Its write-version at capture — a mismatch at replay invalidates.
+    pub version: u32,
+    /// The split's true-arm state (the tested variable's model read).
+    pub if_true: State,
+    /// The false-arm state.
+    pub if_false: State,
+}
+
 pub(crate) struct Expr {
     /// Type of the expression (name-level).
     pub ty: Ty,
@@ -799,6 +813,19 @@ pub(crate) struct Interp<'o> {
     /// never freed (stable across collect rollbacks, which truncate back to
     /// the snapshot's length).
     pub(crate) props: Vec<(u32, u32)>,
+    /// The tested reference of the most recent type-test/equality-null
+    /// split fold (the condition-variable capture's feed, language#1274):
+    /// an initializer whose expression IS that fold binds the split to
+    /// the declared local.
+    pub(crate) cond_split_var: Option<u32>,
+    /// The condition variables (language#1274, official
+    /// `restoreConditionVariableState`): a bool local bound from a
+    /// null-comparison or type-test split replays the split's
+    /// tested-variable models when the local itself is later read as a
+    /// condition operand — invalidated by an intervening write (the
+    /// captured write-version check stands in the official's
+    /// `ValueVersion` rebasing).
+    pub(crate) cond_vars: std::collections::HashMap<u32, CondVarEntry>,
     /// Property key → slot, the resolve-or-insert side of
     /// [`Interp::prop_slot`].
     prop_slots: FxHashMap<(u32, u32), u32>,
@@ -984,6 +1011,8 @@ impl<'o> Interp<'o> {
             vars: Vec::new(),
             facts: Vec::new(),
             props: Vec::new(),
+            cond_split_var: None,
+            cond_vars: std::collections::HashMap::new(),
             prop_slots: FxHashMap::default(),
             decl: DeclCtx::default(),
             decl_stack: Vec::new(),
@@ -1314,6 +1343,26 @@ impl<'o> Interp<'o> {
     pub(crate) fn cond_split(&mut self, expr: &Expr) -> (State, State) {
         if let Some((if_true, if_false)) = &expr.branches {
             return (if_true.clone(), if_false.clone());
+        }
+        // The condition-variable replay (language#1274, official
+        // `restoreConditionVariableState`): a bare read of a bool local
+        // bound from a null-comparison/type-test split re-derives its
+        // arms — the tested variable's saved models rebased onto the
+        // CURRENT state (an intervening write invalidates via the
+        // version check).
+        if let Some(var) = expr.reference
+            && let Some(entry) = self.cond_vars.get(&var)
+            && self.current.model(entry.tested).version == entry.version
+        {
+            let t = self
+                .current
+                .clone()
+                .with_model(entry.tested, entry.if_true.model(entry.tested));
+            let f = self
+                .current
+                .clone()
+                .with_model(entry.tested, entry.if_false.model(entry.tested));
+            return (t, f);
         }
         match expr.bool_value {
             Some(true) => (
