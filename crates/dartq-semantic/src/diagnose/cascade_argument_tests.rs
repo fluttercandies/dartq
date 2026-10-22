@@ -5,7 +5,7 @@
 //!
 //! Oracle provenance (`dart analyze` 3.13.1): silent.
 
-use super::test_rig::{assert_silent, report_ops};
+use super::test_rig::{assert_silent, code_names, report_ops, rows};
 
 #[test]
 fn cascade_argument_member_reads_its_own_receiver() {
@@ -82,4 +82,37 @@ fn optional_initializing_formal_annotation_shapes() {
          class Z {}\n",
     );
     assert_silent(&report);
+}
+
+/// A promoted local read inside a cascade section's ARGUMENT list keeps its
+/// promotion (`tracker()..markOpened(file.path, ...)` — the argument list
+/// is ordinary expression context, so the `.` merge takes the
+/// promoted-receiver latch like any plain access; only the section
+/// selector itself resolves against the latched cascade target,
+/// type_analyzer.dart:611-618). The push-time face kept the declared
+/// nullable type when the latch was gated on the whole cascade, and the
+/// promoted read reported `unchecked_use_of_nullable_value`.
+///
+/// Oracle provenance (`dart analyze` 3.13.1): silent besides the unused
+/// field warning.
+#[test]
+fn cascade_argument_promoted_local_keeps_promotion() {
+    let report = report_ops(
+        "class F { String get path => ''; }\n\
+         class T { void markOpened(String p, Object? db) {} }\n\
+         T tracker() => T();\n\
+         Object? _trackedBy;\n\
+         void f(F? file) {\n\
+           if (file != null) {\n\
+             _trackedBy = tracker()..markOpened(file.path, null);\n\
+           }\n\
+         }\n",
+    );
+    assert!(
+        !code_names(&report)
+            .iter()
+            .any(|name| *name == "unchecked_use_of_nullable_value"),
+        "{:?}",
+        rows(&report)
+    );
 }

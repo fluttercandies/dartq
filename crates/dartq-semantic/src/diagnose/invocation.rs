@@ -426,15 +426,24 @@ impl<'a> Engine<'a> {
                 // The promoted-receiver candidate (#1465): a bare
                 // declared-type read's member re-decides in pass 2 against
                 // the flow read type at this span — the merged row keeps the
-                // push-time classification until then. Cascade sections take
-                // no latch (the chained-read branch below documents the same
-                // rule): their "receiver" row is the previous section's RHS
-                // leftover, and pass 2's promoted re-decision would re-type
-                // the member against the RHS's declared face
-                // (`..version = version` → `String`) where upstream resolves
-                // the latched cascade target (type_analyzer.dart:611-618).
+                // push-time classification until then. A cascade SECTION
+                // selector takes no latch (the chained-read branch below
+                // documents the same rule): its "receiver" row is the
+                // previous section's RHS leftover, and pass 2's promoted
+                // re-decision would re-type the member against the RHS's
+                // declared face (`..version = version` → `String`) where
+                // upstream resolves the latched cascade target
+                // (type_analyzer.dart:611-618). A plain `.` merge inside a
+                // section (`..markOpened(file.path, ...)` — the argument
+                // list is ordinary expression context) is NOT a section
+                // merge: its receiver is a genuine bare read, and skipping
+                // its latch froze the push-time nullable face (the promoted
+                // local read inside cascade arguments reported
+                // `unchecked_use_of_nullable_value` where the oracle stays
+                // silent — the promotion fact exists at the read; only the
+                // re-decision latch was gated on `in_cascade`).
                 if matches!(popped_shape, RowShape::Bare(BareInfo::Plain { .. }))
-                    && !self.in_cascade
+                    && !(self.in_cascade && is_section)
                     // The invoked callee's span describes the callee VALUE's
                     // declared type in the flow table, never the send result
                     // — a promotion re-decision there would un-type the
@@ -459,16 +468,19 @@ impl<'a> Engine<'a> {
                 // declared getter's `Object`, never the promoted field's
                 // `double` — pass 1 cannot see the flow promotion), so this
                 // row's pass-2 verdict owes the same re-derivation its
-                // receiver got. Cascade sections take no latch: their
-                // receiver re-classifies to the latched cascade target
-                // (S4-B), a face no chain link describes. The zero-length
+                // receiver got. A cascade SECTION selector takes no latch:
+                // its receiver re-classifies to the latched cascade target
+                // (S4-B), a face no chain link describes — a plain `.`
+                // merge inside a section's arguments takes the latch like
+                // any other chain link (the same section-scoped rule as the
+                // bare-read latch above). The zero-length
                 // span marks the chained form — read-type lookups compare
                 // the full range and never hit it, so pass 2 keeps the
                 // frozen row byte for byte — while its offset keys the
                 // receiver read's own entry for the teardown settlement
                 // (`finalize_redirects`' tail).
                 if matches!(popped_shape, RowShape::Member { .. })
-                    && !self.in_cascade
+                    && !(self.in_cascade && is_section)
                     && self
                         .promoted_recv_reads
                         .binary_search_by(|(row, _)| row.cmp(&popped.range.offset))
