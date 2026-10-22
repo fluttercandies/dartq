@@ -530,3 +530,53 @@ void f(Object spec) {
         "invocation face leaked: {cs:?}"
     );
 }
+
+/// The collect-rollback binding-journal invariant (Wave K): a collect
+/// walk's declarations must not survive into the real walk's scope. The
+/// leak this pins against (`driver.dart:2132-2242`, the analyzer corpus):
+/// the collect walk's later same-named binding stayed in the pre-existing
+/// scope after the length-only truncation, the if-case scrutinee read
+/// then resolved the collect-only variable, and the pattern's non-null
+/// narrowing landed on the wrong slot — the member read under it reported
+/// `unchecked_use_of_nullable_value`. The undo journal (scope depth plus
+/// generation) restores the pre-collect binding; the corpus differential
+/// is the leak's regression net (the full-method topology that trips the
+/// pre-journal engine spans more than this unit rig exercises), and this
+/// pin holds the same-named pattern sites' clean baseline: no unchecked,
+/// no undefined, no dead rows.
+#[test]
+fn collect_rollback_keeps_pattern_scrutinee_identity() {
+    let report = unit_report(
+        r#"
+class W {
+  W? next() => null;
+}
+class Box {
+  W? take() => null;
+}
+void drive(void Function() g) {}
+void f(Box box) {
+  var ws = box.take();
+  ws?.next();
+  if (ws case var ws?) {
+    ws.next();
+  }
+  drive(() {
+    var inner = box.take();
+    inner?.next();
+  });
+  if (ws case var ws?) {
+    ws.next();
+  }
+}
+"#,
+    );
+    let cs = codes(&report);
+    assert!(
+        !cs.contains(&"unchecked_use_of_nullable_value")
+            && !cs.contains(&"undefined_getter")
+            && !cs.contains(&"undefined_method")
+            && !cs.contains(&"dead_code"),
+        "collect rollback leaked a binding into the real walk: {cs:?}"
+    );
+}

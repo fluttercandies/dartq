@@ -8,7 +8,7 @@ use dartq_source::saturate_slot_u32;
 use crate::ev::{BlockKind, Ev};
 use crate::facts::FlowFact;
 use crate::interp::{
-    DeclCtx, Effects, Expr, Frame, Interp, LabeledEffects, PatternKind, Scope, VarMeta,
+    DeclCtx, Effects, Expr, Frame, Interp, LabeledEffects, PatternKind, VarMeta,
 };
 use crate::model::{NIL, State, attach_finally_model};
 use crate::ty::Ty;
@@ -455,7 +455,7 @@ impl Interp<'_> {
                 // `visitTryStatement`'s `flowEnd` on the body, fired before
                 // the catch clauses run).
                 self.flow_end(crate::interp::Covered::Strict);
-                self.scopes.push(Scope::new());
+                self.push_scope();
                 if self.collecting() {
                     return true;
                 }
@@ -1358,7 +1358,7 @@ impl Interp<'_> {
                 {
                     self.dead_code(*span);
                 }
-                self.scopes.push(Scope::new());
+                self.push_scope();
                 self.stack.push(Frame::Block {
                     scopes_base: self.scopes.len() - 1,
                 });

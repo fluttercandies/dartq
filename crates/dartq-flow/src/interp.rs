@@ -36,14 +36,36 @@ pub(crate) struct VarMeta {
 /// One lexical scope frame: name id to variable id.
 pub(crate) struct Scope {
     bindings: FxHashMap<u32, u32>,
+    /// Monotonic generation, unique per pushed scope instance: the binding
+    /// journal's undo entries address their scope by (depth, gen), so a
+    /// scope popped during a collect replay and re-pushed at the same depth
+    /// is never the target of a stale binding restore.
+    scope_id: u32,
 }
 
 impl Scope {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(scope_id: u32) -> Self {
         Self {
             bindings: FxHashMap::default(),
+            scope_id,
         }
     }
+}
+
+/// One undo entry of the name-binding journal: the scope a binding landed
+/// in (depth at bind time plus its generation), the bound name, and the
+/// binding it replaced. `collect_ranges`' rollback replays entries past
+/// the snapshot point backwards, restoring each scope's pre-collect
+/// binding — a collect walk's declarations into a scope that existed
+/// before the run must not survive into the real walk (`_produceErrors`'
+/// scrutinee once resolved to a like-named variable declared kilobytes
+/// later: the if-case pattern then narrowed the wrong face, and every
+/// promoted read under it answered `Unknown`).
+pub(crate) struct BindingUndo {
+    depth: usize,
+    scope_id: u32,
+    name: u32,
+    prev: Option<u32>,
 }
 
 /// Effect sets of one construct extent (official `AssignedVariablesNodeInfo`).
@@ -830,6 +852,15 @@ pub(crate) struct Interp<'o> {
     /// [`Interp::prop_slot`].
     prop_slots: FxHashMap<(u32, u32), u32>,
 
+    /// Monotonic scope generation: every pushed scope takes the next
+    /// value, so a re-pushed scope at a recycled depth never aliases a
+    /// journal entry's target.
+    pub(crate) scope_gen: u32,
+    /// The name-binding undo journal ([`BindingUndo`]): one entry per
+    /// `bind_name`, replayed backwards by `collect_ranges`' rollback for
+    /// entries past the snapshot point.
+    binding_journal: Vec<BindingUndo>,
+
     pub(crate) decl: DeclCtx,
     /// Enclosing declaration contexts: `VarDeclBegin` swaps the single
     /// active slot out to here, `VarDeclEnd` restores it (#1051 — a nested
@@ -930,6 +961,12 @@ struct Snapshot {
     scopes_len: usize,
     vars_len: usize,
     facts_len: usize,
+    /// The binding journal's length at freeze: rollback replays the
+    /// entries beyond it, restoring every scope binding the collect walk
+    /// touched (truncating `scopes` alone leaves a walked-in binding in a
+    /// pre-existing scope alive — the next real-walk read resolves the
+    /// collect-only variable).
+    journal_len: usize,
     /// The interned non-promotion rows roll back with the collect run —
     /// their fact rows do, so unreferenced rows must not linger.
     non_promotions_len: usize,
@@ -1007,10 +1044,13 @@ impl<'o> Interp<'o> {
             exprs: Vec::new(),
             scopes: vec![Scope {
                 bindings: FxHashMap::default(),
+                scope_id: 0,
             }],
             vars: Vec::new(),
             facts: Vec::new(),
             props: Vec::new(),
+            scope_gen: 1,
+            binding_journal: Vec::new(),
             cond_split_var: None,
             cond_vars: std::collections::HashMap::new(),
             prop_slots: FxHashMap::default(),
@@ -1129,9 +1169,28 @@ impl<'o> Interp<'o> {
         var
     }
 
+    /// Pushes a fresh scope with the next generation id — the single
+    /// allocation point so every pushed scope's `scope_id` stays unique
+    /// over the whole interp lifetime.
+    pub(crate) fn push_scope(&mut self) {
+        let scope_id = self.scope_gen;
+        self.scope_gen = self.scope_gen.wrapping_add(1);
+        self.scopes.push(Scope::new(scope_id));
+    }
+
     pub(crate) fn bind_name(&mut self, name_id: u32, var: u32) {
+        let Some(depth) = self.scopes.len().checked_sub(1) else {
+            return;
+        };
         if let Some(scope) = self.scopes.last_mut() {
-            scope.bindings.insert(name_id, var);
+            let scope_id = scope.scope_id;
+            let prev = scope.bindings.insert(name_id, var);
+            self.binding_journal.push(BindingUndo {
+                depth,
+                scope_id,
+                name: name_id,
+                prev,
+            });
         }
     }
 
@@ -1977,6 +2036,7 @@ impl<'o> Interp<'o> {
             scopes_len: self.scopes.len(),
             vars_len: self.vars.len(),
             facts_len: self.facts.len(),
+            journal_len: self.binding_journal.len(),
             non_promotions_len: self.non_promotions.len(),
             props_len: self.props.len(),
             dead: self.dead,
@@ -2002,6 +2062,27 @@ impl<'o> Interp<'o> {
             return Effects::default();
         };
         self.exprs.truncate(s.exprs_len);
+        // Undo the collect walk's name bindings BEFORE the scope
+        // truncation: entries whose scope survives (`depth < scopes_len`,
+        // generation match) restore the pre-collect binding or remove it
+        // entirely; a generation mismatch means the binding's scope was
+        // popped mid-walk (a newer scope now sits at that depth — leave
+        // it), and a depth past the truncation point dies with its scope.
+        while self.binding_journal.len() > s.journal_len {
+            let undo = self.binding_journal.pop().expect("journal len checked");
+            if let Some(scope) = self.scopes.get_mut(undo.depth) {
+                if scope.scope_id == undo.scope_id {
+                    match undo.prev {
+                        Some(prev) => {
+                            scope.bindings.insert(undo.name, prev);
+                        }
+                        None => {
+                            scope.bindings.remove(&undo.name);
+                        }
+                    }
+                }
+            }
+        }
         self.stack.truncate(s.frames_len);
         self.scopes.truncate(s.scopes_len);
         self.vars.truncate(s.vars_len);
@@ -2379,9 +2460,7 @@ impl Interp<'_> {
     // —— executable framing ————————————————————————————————————————————
 
     fn exec_begin(&mut self, is_closure: bool, events: &[Ev], i: usize, match_of: &[u32]) {
-        self.scopes.push(Scope {
-            bindings: FxHashMap::default(),
-        });
+        self.push_scope();
         let scopes_base = self.scopes.len() - 1;
         if self.collect.is_some() {
             self.collect_push();
