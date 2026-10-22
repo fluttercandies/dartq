@@ -2080,7 +2080,7 @@ impl<'a> Engine<'a> {
             (Ty::UNKNOWN, b) => b,
             (a, Ty::UNKNOWN) => Engine::non_null_form(a),
             (
-                lhs @ Ty::Named {
+                Ty::Named {
                     name: l,
                     ..
                 },
@@ -2089,23 +2089,22 @@ impl<'a> Engine<'a> {
                     args: ra,
                     nullable: rn,
                 },
-            ) if l == r && {
-                // Structural argument agreement: separately interned
-                // trees spell the same instantiation (`List<TableColumn>`
-                // from the parameter annotation and from `toList`'s
-                // return), so the assignability matrix decides — mutual
-                // assignability of the non-null forms is the same-type
-                // question; a one-way or undecidable pair leaves the
-                // local unbound (the under-report posture).
-                let lhs_nn = Engine::non_null_form(lhs);
-                let rhs_nn = Engine::non_null_form(rhs_face);
-                self.assignable(lhs_nn, rhs_nn, false) == Some(true)
-                    && self.assignable(rhs_nn, lhs_nn, false) == Some(true)
-            } => Ty::Named {
-                name: r,
-                nullable: rn,
-                args: ra,
-            },
+            ) if l == r => {
+                // Upstream folds every same-head pair: `resolveIfNull`
+                // computes `LUB(NonNull(T1), T2)`, and two instantiations
+                // of the same generic head LUB to that head instantiated
+                // (`List<TableColumn> ?? List<Column>.toList()` keeps
+                // `List`-of-the-join, never `Object`). The name-level
+                // model carries the right side's argument tree — the
+                // materialized side deciding nullability — as the join's
+                // approximation; an arg-wise LUB beyond it stays in the
+                // under-report posture.
+                Ty::Named {
+                    name: r,
+                    nullable: rn,
+                    args: ra,
+                }
+            }
             _ => return None,
         };
         (!matches!(face, Ty::Named { nullable: true, .. })).then_some(face)

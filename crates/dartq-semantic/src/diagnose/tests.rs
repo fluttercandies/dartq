@@ -11254,6 +11254,35 @@ fn ifnull_init_nullable_rhs_keeps_unchecked_row() {
     assert_eq!(rows[0].range.offset, offset_of(source, "v.flag") + 2);
 }
 
+/// Same-head operands with UNRELATED type arguments fold too: upstream's
+/// `LUB(NonNull(T1), T2)` lubs two instantiations of one generic head to
+/// that head instantiated (`List<TableColumn> ?? List<Column>.toList()`
+/// keeps a `List`, never `Object`) — the head's own members decide the
+/// reads. The mutual-assignability gate rejected these pairs and left the
+/// local unbound (`v.flag` reported unchecked where the oracle stays
+/// silent, drift's `compiler.dart` conflict-target face).
+/// Oracle probed: silent.
+#[test]
+fn ifnull_init_same_head_unrelated_args_folds() {
+    let source = "class Box<T> { bool get flag => false; }\n\
+         class A { }\n\
+         class B { }\n\
+         void f(Box<A>? target, Box<B> fb) {\n\
+           final v = target ?? fb;\n\
+           if (v.flag) {\n\
+             return;\n\
+           }\n\
+         }\n";
+    let report = report(source);
+    assert!(
+        !code_names(&report)
+            .iter()
+            .any(|name| *name == "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&report)
+    );
+}
+
 /// `true || b`: the row spans `[operator, rightOperand.end]` — the bare
 /// identifier operand ends at itself, never at the tiled follower token
 /// (oracle row 2:12 len 4).
