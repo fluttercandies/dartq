@@ -27,7 +27,11 @@ fn failed_launches_reap_the_child() {
     let exits = fake_dart(&dir, "exiting-dart", "echo no banner here\nexit 3");
 
     let mut config = LaunchConfig::new("main.dart");
-    config.launch_timeout = Duration::from_millis(500);
+    // Generous on purpose: a shebang script pays fork+exec+interpreter
+    // startup that can stretch past a few hundred milliseconds on a
+    // loaded or SIP-throttled host, and the test is about the error
+    // variant, not the timing.
+    config.launch_timeout = Duration::from_secs(5);
 
     // SAFETY: this test binary holds exactly one test, so nothing else
     // reads or writes the environment concurrently.
