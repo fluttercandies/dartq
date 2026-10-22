@@ -962,6 +962,14 @@ pub(crate) struct Interp<'o> {
     /// event stream marks at every value-consumer event.
     pub(crate) null_shorts: Vec<NullShort>,
 
+    /// The expression-stack depth each OPEN argument list began at — the
+    /// per-argument flush bound ([`Ev::ArgumentEnd`]): a `?.` short opened
+    /// inside one argument closes at that argument's own end, while a
+    /// caller-side short (`f()?.m(g()?.n)`'s outer `?`) stays open to the
+    /// chain's end. Pushed at [`Ev::ArgumentsBegin`], popped at
+    /// [`Ev::ArgumentsEnd`], truncated with a collect run's rollback.
+    pub(crate) args_bases: Vec<usize>,
+
     /// The executable-frame depth when the current variable initializer
     /// began; `None` outside one. The cast-type dead poll ([`Ev::AsBegin`])
     /// reads it: a poll that opens the interval directly inside the
@@ -997,6 +1005,8 @@ struct Snapshot {
     /// Open null-shorting contexts: pushed and joined inside the collect
     /// run's replay, so they roll back with it.
     null_shorts_len: usize,
+    /// Open argument-list bases roll back with the collect run too.
+    args_bases_len: usize,
 }
 
 /// The direct-construction default for [`Interp::top_level`]: no unit face.
@@ -1101,6 +1111,7 @@ impl<'o> Interp<'o> {
             exit_at: None,
             init_exec_depth: None,
             null_shorts: Vec::new(),
+            args_bases: Vec::new(),
             collect: None,
             snapshot: None,
         }
@@ -2098,6 +2109,7 @@ impl<'o> Interp<'o> {
             dead: self.dead,
             init_exec_depth: self.init_exec_depth,
             null_shorts_len: self.null_shorts.len(),
+            args_bases_len: self.args_bases.len(),
         };
         let outer = self.collect.replace(vec![Effects::default()]);
         let _ = self.snapshot.replace(snapshot);
@@ -2151,6 +2163,7 @@ impl<'o> Interp<'o> {
         self.dead = s.dead;
         self.init_exec_depth = s.init_exec_depth;
         self.null_shorts.truncate(s.null_shorts_len);
+        self.args_bases.truncate(s.args_bases_len);
         self.collect = outer;
         frames.into_iter().next().unwrap_or_default()
     }

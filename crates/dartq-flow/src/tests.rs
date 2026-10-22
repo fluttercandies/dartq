@@ -1153,6 +1153,29 @@ fn null_check_promotes_a_null_initialized_local() {
     promoted_name("void f() { final int? x = null; if (x != null) { int y = x; } }");
 }
 
+/// A `?.` in one argument finishes its null-shorting at ITS OWN boundary
+/// (official analyzes the list one expression at a time —
+/// `finishNullShorting` runs per argument before the next one starts), so
+/// a `!` in a LATER sibling argument keeps its promotion past the list's
+/// close. Joining every in-list short at the close demoted `w` against
+/// the pre-`?.` shortcut snapshot and left the trailing read unpromoted
+/// (drift wasm_setup.dart:257-263: `C(port: c?.port2, v: w!.version, …)`
+/// then `w.send`). Both argument orders promote.
+#[test]
+fn null_short_in_argument_ends_before_later_sibling_assert() {
+    let promoted = |source: &str| {
+        let promoted = promoted_tys(source);
+        assert_eq!(promoted.len(), 1, "{source:?}");
+        assert!(
+            matches!(promoted[0].base, crate::ty::Base::Name(_)),
+            "{source:?}"
+        );
+        assert!(!promoted[0].nullable, "{source:?}");
+    };
+    promoted("void f(P? p, W? w) { take(p?.port2, w!.version); w.send; }");
+    promoted("void f(P? p, W? w) { take(w!.version, p?.port2); w.send; }");
+}
+
 /// official `equalityOp(null != null) equivalent to false`
 /// (`flow_analysis_test.dart`): both operands null — `_equalityCheck`
 /// returns a known equal result, so the not-equal outcome is unreachable

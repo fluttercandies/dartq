@@ -1534,7 +1534,23 @@ impl Interp<'_> {
                     self.exprs.push(callee);
                 }
             }
-            Ev::ArgumentsBegin | Ev::ParenBegin | Ev::AwaitBegin { .. } => {}
+            Ev::ArgumentsBegin => {
+                self.args_bases.push(self.exprs.len());
+            }
+            Ev::ArgumentEnd => {
+                // This argument's expression is complete: rejoin the
+                // null-shorting IT opened, at its own boundary — official
+                // finishes each argument's shorting before the next one
+                // starts (`finishNullShorting` at the expression's end;
+                // the `?.` in `f(a?.b, c!)` must not join away the later
+                // sibling's `!` promotion at the list's close). A
+                // caller-side `?` (`f()?.m(g()?.n)`'s outer short) opened
+                // at or below the base and survives to its chain's end.
+                if let Some(&base) = self.args_bases.last() {
+                    self.flush_null_shorts_above(base);
+                }
+            }
+            Ev::ParenBegin | Ev::AwaitBegin { .. } => {}
             Ev::ParenEnd => {
                 // The parenthesized operand ended: rejoin the null-shorting
                 // it opened (`(x?.y)` — the chain's boundary is the `)`,
@@ -1542,11 +1558,15 @@ impl Interp<'_> {
                 self.flush_null_shorts_above(self.consumer_base(1));
             }
             Ev::ArgumentsEnd { count } => {
+                // The list closes: its base leaves the per-argument flush
+                // stack (before the `identical` fast path's early return).
+                self.args_bases.pop();
                 // The arguments are complete expressions: rejoin the
                 // null-shorting they opened — but not a caller-side `?`
                 // context (`f()?.m(g()?.n)`'s outer short opened before
                 // `ArgumentsBegin` and stays open to the chain's end;
-                // official `nullShortingTargetDepth` bound).
+                // official `nullShortingTargetDepth` bound). Shorts the
+                // per-argument boundary already closed leave nothing here.
                 self.flush_null_shorts_above(self.consumer_base(*count));
                 // The dart:core `identical(a, b)` face: the official
                 // resolver routes the invocation through

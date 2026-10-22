@@ -440,6 +440,16 @@ pub enum Ev {
     },
     SendNoArgs,
     ArgumentsBegin,
+    /// One argument's value expression is complete. Official analyzes an
+    /// argument list one expression at a time, and each argument's
+    /// null-shorting finishes at ITS own end (`finishNullShorting` at the
+    /// argument expression's boundary) — before the next argument runs.
+    /// Deferring every in-list short to the list's close would join a
+    /// pre-promotion shortcut snapshot against promotions a LATER sibling
+    /// argument established (`f(a?.b, c!)`: the `!` must survive — drift
+    /// wasm_setup.dart:258-263), so the boundary fires per argument,
+    /// named and positional alike.
+    ArgumentEnd,
     ArgumentsEnd {
         count: usize,
     },

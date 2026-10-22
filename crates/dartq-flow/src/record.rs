@@ -2416,7 +2416,13 @@ impl ParserListener for Flow<'_> {
     }
 
     fn handle_named_argument(&mut self, _colon: Token) {
-        // The named-argument marker rides the identifier event.
+        // The named-argument marker rides the identifier event; the value
+        // expression just completed is the argument boundary.
+        self.record(Ev::ArgumentEnd);
+    }
+
+    fn handle_positional_argument(&mut self, _token: Token) {
+        self.record(Ev::ArgumentEnd);
     }
 
     fn handle_throw_expression(&mut self, _throw: Token, _end: Token) {
