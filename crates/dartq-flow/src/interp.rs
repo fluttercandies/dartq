@@ -68,6 +68,18 @@ pub(crate) struct BindingUndo {
     prev: Option<u32>,
 }
 
+/// One open collection if-element: the arm anchors and the saved
+/// then-arm state (see [`Interp::coll_if`]).
+pub(crate) struct CollIfFrame {
+    /// The then-element's first token offset.
+    pub(crate) then_start: u32,
+    /// The else-element's first token offset, set at `ElseControlFlow`.
+    pub(crate) else_start: Option<u32>,
+    /// The then-arm's exit state, saved at `ElseControlFlow` (official
+    /// `_IfContext._afterThen`).
+    pub(crate) after_then: Option<State>,
+}
+
 /// Effect sets of one construct extent (official `AssignedVariablesNodeInfo`).
 #[derive(Default, Debug)]
 pub(crate) struct Effects {
@@ -856,6 +868,15 @@ pub(crate) struct Interp<'o> {
     /// value, so a re-pushed scope at a recycled depth never aliases a
     /// journal entry's target.
     pub(crate) scope_gen: u32,
+    /// Open collection if-elements, innermost last. Each entry carries the
+    /// arm anchors and the saved then-arm state (official
+    /// `ifStatement_elseBegin`'s `context._afterThen = _current`,
+    /// flow_analysis.dart:7111-7115) — the dead-arm rows anchor each arm's
+    /// own extent (official `handle_ifElement_thenEnd` / `elseEnd` →
+    /// `flowEnd(ifTrue)` / `flowEnd(ifFalse)`, type_analyzer.dart:1163-1173)
+    /// and the close joins `afterThen` with `afterElse`, not the branch
+    /// model.
+    pub(crate) coll_if: Vec<CollIfFrame>,
     /// The name-binding undo journal ([`BindingUndo`]): one entry per
     /// `bind_name`, replayed backwards by `collect_ranges`' rollback for
     /// entries past the snapshot point.
@@ -1050,6 +1071,7 @@ impl<'o> Interp<'o> {
             facts: Vec::new(),
             props: Vec::new(),
             scope_gen: 1,
+            coll_if: Vec::new(),
             binding_journal: Vec::new(),
             cond_split_var: None,
             cond_vars: std::collections::HashMap::new(),
@@ -1780,6 +1802,40 @@ impl<'o> Interp<'o> {
                     range: SourceRange {
                         offset: anchor.range.offset,
                         length: end - anchor.range.offset,
+                    },
+                },
+            });
+        }
+    }
+
+    /// The collection-if arm's own `flowEnd` (official
+    /// `flowEnd(ifTrue)` / `flowEnd(ifFalse)`, dead_code_verifier.dart:217-260):
+    /// the arm node contains the first dead node — the walk entered the
+    /// arm unreachable, so the first dead node IS the arm element — and
+    /// the row runs from the arm's first token to the arm's end, then
+    /// resets. This re-anchors past an interval whose poll opened inside
+    /// the arm (the event stream is post-order, so an inner poll can sit
+    /// later in the arm than the official's top-down first-dead node); an
+    /// interval opened BEFORE the arm keeps ownership — the arm only
+    /// extends its end, exactly `dead_expr_arm`'s fold.
+    pub(crate) fn dead_arm_row(&mut self, arm_start: u32, arm_end: u32) {
+        if self.reachable() {
+            return;
+        }
+        if let Some(window) = &mut self.dead {
+            if window.anchor.range.offset < arm_start {
+                window.extend(arm_end);
+                return;
+            }
+        }
+        self.dead = None;
+        if arm_end > arm_start {
+            self.emit(FlowFact::DeadCode {
+                span: TokenSpan {
+                    id: 0,
+                    range: SourceRange {
+                        offset: arm_start,
+                        length: arm_end - arm_start,
                     },
                 },
             });

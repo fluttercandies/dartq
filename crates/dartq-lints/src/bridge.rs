@@ -3192,8 +3192,8 @@ impl ParserListener for AstListener {
         self.b.leaf(NodeKind::ThenControlFlow, self.t(token.id));
     }
 
-    fn handle_else_control_flow(&mut self, token: TokenSpan) {
-        self.b.leaf(NodeKind::ElseControlFlow, self.t(token.id));
+    fn handle_else_control_flow(&mut self, else_kw: TokenSpan, _else_start: TokenSpan) {
+        self.b.leaf(NodeKind::ElseControlFlow, self.t(else_kw.id));
     }
 
     fn end_if_control_flow(&mut self, token: TokenSpan) {

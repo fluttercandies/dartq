@@ -2451,20 +2451,31 @@ impl ParserListener for Flow<'_> {
         self.record(Ev::IfControlFlowBegin);
     }
 
-    fn handle_then_control_flow(&mut self, _token: Token) {
-        self.record(Ev::ThenControlFlow);
+    fn handle_then_control_flow(&mut self, token: Token) {
+        self.record(Ev::ThenControlFlow {
+            arm_start: token.range.offset,
+        });
     }
 
-    fn handle_else_control_flow(&mut self, _token: Token) {
-        self.record(Ev::ElseControlFlow);
+    fn handle_else_control_flow(&mut self, else_kw: Token, else_start: Token) {
+        self.record(Ev::ElseControlFlow {
+            then_end: else_kw.range.offset,
+            else_start: else_start.range.offset,
+        });
     }
 
-    fn end_if_control_flow(&mut self, _token: Token) {
-        self.record(Ev::EndIfControlFlow { has_else: false });
+    fn end_if_control_flow(&mut self, token: Token) {
+        self.record(Ev::EndIfControlFlow {
+            has_else: false,
+            arm_end: token.range.offset,
+        });
     }
 
-    fn end_if_else_control_flow(&mut self, _token: Token) {
-        self.record(Ev::EndIfControlFlow { has_else: true });
+    fn end_if_else_control_flow(&mut self, token: Token) {
+        self.record(Ev::EndIfControlFlow {
+            has_else: true,
+            arm_end: token.range.offset,
+        });
     }
 
     fn begin_for_control_flow(&mut self, _await_kw: Option<Token>, _for_kw: Token) {

@@ -7,7 +7,7 @@ use dartq_source::SourceRange;
 use crate::ev::{BinOp, Ev};
 use crate::facts::{FlowFact, PropReceiver};
 pub(crate) use crate::interp::Expr;
-use crate::interp::{Frame, Interp, Resolved, THIS_RECEIVER};
+use crate::interp::{CollIfFrame, Frame, Interp, Resolved, THIS_RECEIVER};
 use crate::model::State;
 use crate::ty::{Base, Classification, Ty};
 
@@ -711,12 +711,13 @@ impl Interp<'_> {
                     // here: upstream reaches it only when
                     // `_getExpressionReference` returned null
                     // (:7190-7205), so a reference test never folds to
-                    // `true` on a mere subtype fact (`int x; x is num`
-                    // keeps the else live). The reference else-deadness
-                    // comes from the promotion split itself — a bottom
-                    // `factor(previous, tested)` marks the unmatched arm
-                    // unreachable (`tryPromoteForTypeCheck`'s
-                    // `ifFalseIsUnreachable`, :4156-4160), already
+                    // `true` as a boolean literal on a mere subtype fact
+                    // (`int x; x is num` keeps the else live). The
+                    // reference else-deadness comes from the promotion
+                    // split itself — a bottom `factor(previous, tested)`
+                    // marks the unmatched arm unreachable
+                    // (`tryPromoteForTypeCheck`'s `ifFalseIsUnreachable`,
+                    // :4156-4160), already
                     // [`Interp::branch_type_test`]'s face.
                     let declared =
                         self.vars.get(var as usize).map_or(Ty::UNKNOWN, |meta| meta.ty);
@@ -725,9 +726,40 @@ impl Interp<'_> {
                         let dead = cur.clone().set_unreachable(&mut self.reach);
                         expr.branches = Some(if is_not { (cur, dead) } else { (dead, cur) });
                     } else {
-                        let promoted = self.promotion_candidate(var, tested, tested_args);
-                        let (matched, unmatched) =
-                            self.branch_type_test(var, tested, tested_args, promoted);
+                        // The invalid-tested split: the official reference
+                        // path still takes `tryPromoteForTypeCheck`, where
+                        // `factor(previous, InvalidType)` is `Never` —
+                        // `subtype.dart:274` makes any relation with an
+                        // invalid type a subtype, so the factored type is
+                        // bottom and `ifFalseIsUnreachable` fires
+                        // (flow_analysis.dart:4156-4160, :4188-4190). No
+                        // promotion step exists to an invalid type (the
+                        // mutual-subtype guard rejects it), so the
+                        // test-true arm keeps the unpromoted state while
+                        // the test-false arm is unreachable — `is` deads
+                        // its else, `is!` its then (oracle-probed on
+                        // Dart 3.13.1: int/dynamic/invalid operands all
+                        // carry the dead-arm row alongside the
+                        // TYPE_TEST_WITH_UNDEFINED_NAME spelling row).
+                        let invalid_tested = self.ops.is_invalid_typed(
+                            tested,
+                            tested_args,
+                            self.args,
+                            self.names,
+                        );
+                        let promoted = if invalid_tested {
+                            None
+                        } else {
+                            self.promotion_candidate(var, tested, tested_args)
+                        };
+                        let (matched, unmatched) = if invalid_tested {
+                            (
+                                self.current.clone(),
+                                self.current.clone().set_unreachable(&mut self.reach),
+                            )
+                        } else {
+                            self.branch_type_test(var, tested, tested_args, promoted)
+                        };
                         let (if_true, if_false) = if is_not {
                             (unmatched, matched)
                         } else {
@@ -778,6 +810,18 @@ impl Interp<'_> {
                     // deadness rides the branch pair, and a value consumer
                     // that drops the expression never sees it.
                     else if self.is_test_guaranteed(operand.ty, operand.args, tested, tested_args)
+                        // The invalid-tested face: an unresolved spelling
+                        // is the official's `InvalidType` on the checked
+                        // side, and `subtype.dart:274` makes any relation
+                        // with it a subtype — the test is the succeed
+                        // literal. `is` keeps its then arm and deads the
+                        // else, `is!` deads its then (oracle-probed on
+                        // the analyzer corpus's unresolved-yaml file: the
+                        // positive `is` block stays live, the `is!` block
+                        // carries the dead-code row).
+                        || self
+                            .ops
+                            .is_invalid_typed(tested, tested_args, self.args, self.names)
                     {
                         let dead = cur.clone().set_unreachable(&mut self.reach);
                         expr.branches = Some(if is_not { (dead, cur) } else { (cur, dead) });
@@ -1646,7 +1690,7 @@ impl Interp<'_> {
                 // at the keyword), so the split waits for the condition's
                 // own `ThenControlFlow`.
             }
-            Ev::ThenControlFlow => {
+            Ev::ThenControlFlow { arm_start } => {
                 // The collection-if condition ended: rejoin its open
                 // null-shorting before the split.
                 self.flush_null_shorts_above(self.consumer_base(1));
@@ -1670,19 +1714,50 @@ impl Interp<'_> {
                     rhs_dead_entry: false,
                 });
                 self.current = if_true;
+                // The element's arm bookkeeping: the then-element runs
+                // next, from `arm_start`.
+                self.coll_if.push(CollIfFrame {
+                    then_start: *arm_start,
+                    else_start: None,
+                    after_then: None,
+                });
             }
-            Ev::ElseControlFlow => {
-                // The then-element is consumed; the else-element runs under
-                // the condition-false branch.
+            Ev::ElseControlFlow { then_end, else_start } => {
+                // The then-element is consumed: its exit state is saved
+                // (official `ifStatement_elseBegin`'s
+                // `context._afterThen = _current`, flow_analysis.dart:7111-
+                // 7115) and a dead then-arm reports its own extent
+                // (official `handle_ifElement_thenEnd` → `flowEnd(ifTrue)`,
+                // type_analyzer.dart:1163-1166) before the else-element
+                // runs under the condition-false branch.
                 self.exprs.pop();
+                if let Some(frame) = self.coll_if.last_mut() {
+                    frame.else_start = Some(*else_start);
+                    frame.after_then = Some(self.current.clone());
+                }
+                if let Some(then_start) = self.coll_if.last().map(|f| f.then_start) {
+                    self.dead_arm_row(then_start, *then_end);
+                }
                 if let Some(Frame::Branch { branch, .. }) = self.stack.last() {
                     self.current = branch.clone();
                 }
             }
-            Ev::EndIfControlFlow { has_else } => {
+            Ev::EndIfControlFlow { has_else, arm_end } => {
                 let _ = self.exprs.pop();
-                if *has_else {
-                    // The then-element was popped at ElseControlFlow.
+                // The last arm's `flowEnd` (official
+                // `handle_ifElement_thenEnd` at the elseless close /
+                // `handle_ifElement_elseEnd`, type_analyzer.dart:1163-1173):
+                // a dead arm reports its own extent, one row per arm.
+                let coll = self.coll_if.pop();
+                if !self.reachable()
+                    && let Some(frame) = &coll
+                {
+                    let anchor = if *has_else {
+                        frame.else_start.unwrap_or(frame.then_start)
+                    } else {
+                        frame.then_start
+                    };
+                    self.dead_arm_row(anchor, *arm_end);
                 }
                 let Some(Frame::Branch { branch, .. }) = self.stack.pop() else {
                     // A frame-less close (unbalanced recovery buffer): the
@@ -1690,7 +1765,16 @@ impl Interp<'_> {
                     self.exprs.push(Expr::trivial(Ty::UNKNOWN));
                     return true;
                 };
-                let joined = self.join(Some(branch), Some(self.current.clone()));
+                // The close joins the two arms' exit states (official
+                // `ifStatement_end`: `afterThen` saved at elseBegin,
+                // `afterElse` = current; the elseless arm joins the then
+                // exit with the branch model, flow_analysis.dart:7118-7127).
+                let after_then = coll.and_then(|f| f.after_then);
+                let joined = if *has_else && let Some(after_then) = after_then {
+                    self.join(Some(after_then), Some(self.current.clone()))
+                } else {
+                    self.join(Some(branch), Some(self.current.clone()))
+                };
                 self.current = joined;
                 // The element leaves its own value (every literal element
                 // nets exactly one).

@@ -352,11 +352,15 @@ fn identical_null_on_dynamic_keeps_both_branches() {
 
 // —— the keep-honest is-test ————————————————————————————————————————————
 
-/// A `dynamic` receiver against an undefined name never folds (the #2450
-/// dynamic face, the corpus's dominant `x is T` shape): the spelling's
-/// code reports and both branches stay live (probe p12_isdead).
+/// A `dynamic` receiver against an undefined name deads the test-false
+/// arm (the #2450 dynamic face, the corpus's dominant `x is T` shape):
+/// the spelling's code reports AND the else arm carries the dead row —
+/// 2026-10-22 re-probe (Dart 3.13.1, probe p12_isdead): the both-arms
+/// posture originally pinned here was wrong; the reference path's
+/// `factor(dynamic, InvalidType)` is `Never`, so `ifFalseIsUnreachable`
+/// fires (see ticket_2450_tests' (c) section for the mechanism).
 #[test]
-fn dynamic_receiver_undefined_test_keeps_both_arms() {
+fn dynamic_receiver_undefined_test_deads_the_else() {
     let source = concat!(
         "void f(dynamic x) {\n",
         "  if (x is Missing) {\n",
@@ -367,9 +371,17 @@ fn dynamic_receiver_undefined_test_keeps_both_arms() {
         "}\n",
     );
     let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    let else_start = source.find("else").unwrap() as u32;
+    assert_eq!(
+        dead.len(),
+        1,
+        "exactly the else arm carries the dead row: {:?}",
+        report.diagnostics
+    );
     assert!(
-        rows(&report, "dead_code").is_empty(),
-        "the dynamic receiver keeps both arms live: {:?}",
+        dead[0].0 > else_start,
+        "the dead row anchors inside the else arm: {:?}",
         report.diagnostics
     );
     assert!(

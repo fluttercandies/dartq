@@ -1415,10 +1415,14 @@ pub trait ParserListener {
     // —— collection control-flow elements (#20) ————————————————————————————
     /// `beginIfControlFlow(ifToken)` / `handleThenControlFlow(token)` /
     /// `handleElseControlFlow(elseToken)` / `endIfControlFlow(token)` /
-    /// `endIfElseControlFlow(token)` (C24).
+    /// `endIfElseControlFlow(token)` (C24). `handle_else_control_flow`
+    /// carries the else-element's first token as a second dartq-internal
+    /// face (the dead-arm row anchors the arm's own extent, official
+    /// `flowEnd(ifFalse)`; the official callback signature has only the
+    /// else token).
     fn begin_if_control_flow(&mut self, token: Token) {}
     fn handle_then_control_flow(&mut self, token: Token) {}
-    fn handle_else_control_flow(&mut self, token: Token) {}
+    fn handle_else_control_flow(&mut self, else_kw: Token, else_start: Token) {}
     fn end_if_control_flow(&mut self, token: Token) {}
     fn end_if_else_control_flow(&mut self, token: Token) {}
     /// `beginForControlFlow(awaitToken, forToken)` /

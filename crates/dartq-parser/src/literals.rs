@@ -199,7 +199,11 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         // `IfComplete.computeNext` → `IfElse` :248-251.
                         let else_kw = self.peek_span();
                         self.cursor.advance();
-                        self.listener.handle_else_control_flow(else_kw);
+                        // The peek now sits on the else-element's first
+                        // token — the dead-arm row's anchor face.
+                        let else_start = self.peek_span();
+                        self.listener
+                            .handle_else_control_flow(else_kw, else_start);
                         if !self.enter_depth() {
                             return Unwind::Done(self.peek_span());
                         }

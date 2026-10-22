@@ -149,15 +149,20 @@ fn rows(report: &FileReport, code: &str) -> Vec<(u32, u32)> {
 
 // —— dead_code: the InvalidType checked type ————————————————————————
 
-/// `x is Missing` reports the undefined-name code and keeps BOTH arms
-/// live (#2450 counter-finding): the oracle's flow bails on a tested
-/// type that resolves nowhere — `type_test_with_undefined_name` fires
-/// on the spelling and neither branch reports dead (probe pair
-/// `p12_isdead`, dart analyze). The pre-#2450 pins read the 0c vacuous
-/// arm (subtype.dart:274-276) as folding the test constant-true; the
-/// corpus differential showed that face over-reporting.
+// 2026-10-22 re-probe (Dart 3.13.1, `dart analyze --format=machine`): the
+// both-arms posture pinned here was wrong — the live oracle deads the
+// test-false arm of every undefined-tested is-check (int/dynamic/invalid
+// operand, both polarities). The mechanism is the reference path's
+// `factor(previous, InvalidType)` = `Never` (`subtype.dart:274` makes any
+// relation with an invalid type a subtype), so `ifFalseIsUnreachable`
+// fires inside `tryPromoteForTypeCheck` (flow_analysis.dart:4156-4160,
+// :4188-4190). The pre-#2450 constant-literal fold had the dead arm
+// right but the fold face wrong; these pins carry the split's posture.
+
+/// `x is Missing` reports the undefined-name code and deads the else
+/// arm: the dead row anchors inside the else block.
 #[test]
-fn is_test_with_undefined_name_keeps_both_arms() {
+fn is_test_with_undefined_name_deads_the_else() {
     let source = "void f(int x) {\n\
                       \x20 if (x is Missing) {\n\
                       \x20   x;\n\
@@ -166,9 +171,17 @@ fn is_test_with_undefined_name_keeps_both_arms() {
                       \x20 }\n\
                       }";
     let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    let else_start = source.find("else").unwrap() as u32;
+    assert_eq!(
+        dead.len(),
+        1,
+        "exactly the else arm carries the dead row: {:?}",
+        report.diagnostics
+    );
     assert!(
-        rows(&report, "dead_code").is_empty(),
-        "an undefined checked type never deads a branch: {:?}",
+        dead[0].0 > else_start,
+        "the dead row anchors inside the else arm: {:?}",
         report.diagnostics
     );
     assert!(
@@ -180,11 +193,10 @@ fn is_test_with_undefined_name_keeps_both_arms() {
     );
 }
 
-/// `x is! Missing` — the `is!` polarity of the same bail: the undefined
-/// name's code fires on the spelling, both arms stay live
-/// (`expressionInfo._invert()` never runs — no split exists).
+/// `x is! Missing` — the `is!` polarity of the same split: the test
+/// answers `true`, so the inverted then arm is the dead one.
 #[test]
-fn is_not_test_with_undefined_name_keeps_both_arms() {
+fn is_not_test_with_undefined_name_deads_the_then() {
     let source = "void f(int x) {\n\
                       \x20 if (x is! Missing) {\n\
                       \x20   x;\n\
@@ -193,9 +205,18 @@ fn is_not_test_with_undefined_name_keeps_both_arms() {
                       \x20 }\n\
                       }";
     let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    let test_start = source.find("is!").unwrap() as u32;
+    let else_start = source.find("else").unwrap() as u32;
+    assert_eq!(
+        dead.len(),
+        1,
+        "exactly the then arm carries the dead row: {:?}",
+        report.diagnostics
+    );
     assert!(
-        rows(&report, "dead_code").is_empty(),
-        "an undefined checked type never deads a branch: {:?}",
+        dead[0].0 > test_start && dead[0].0 < else_start,
+        "the dead row anchors inside the then arm: {:?}",
         report.diagnostics
     );
     assert!(
@@ -203,6 +224,41 @@ fn is_not_test_with_undefined_name_keeps_both_arms() {
             .iter()
             .any(|name| *name == "type_test_with_undefined_name"),
         "the undefined spelling reports its own code: {:?}",
+        report.diagnostics
+    );
+}
+
+/// A collection-if's dead else-arm reports its own extent — the arm
+/// element's start to its end, nothing after (official
+/// `handle_ifElement_elseEnd` → `flowEnd(ifFalse)`,
+/// type_analyzer.dart:1168-1171; oracle-probed on Dart 3.13.1: the
+/// `[if (x is Missing) 'a' else 'b', 'c']` world carries exactly
+/// `'b'`'s three-char row, and the element's join restores
+/// reachability so no later element reports).
+#[test]
+fn collection_if_dead_else_arm_rows_its_own_extent() {
+    let source = concat!(
+        "void f(int x) {\n",
+        "  var l = <String>[\n",
+        "    if (x is Missing) 'a' else 'b',\n",
+        "    'c',\n",
+        "  ];\n",
+        "  print(l);\n",
+        "}\n",
+    );
+    let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    let b = source.find("'b'").unwrap() as u32;
+    assert_eq!(
+        dead.len(),
+        1,
+        "exactly the else element carries the dead row: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(
+        dead[0],
+        (b, 3),
+        "the dead row spans the else element exactly: {:?}",
         report.diagnostics
     );
 }

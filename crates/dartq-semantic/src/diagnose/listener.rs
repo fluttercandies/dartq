@@ -7595,8 +7595,8 @@ impl ParserListener for DiagnoseListener<'_> {
             .handle_continue_statement(has_target, continue_kw, end);
     }
 
-    fn handle_else_control_flow(&mut self, token: Token) {
-        self.flow().handle_else_control_flow(token);
+    fn handle_else_control_flow(&mut self, else_kw: Token, else_start: Token) {
+        self.flow().handle_else_control_flow(else_kw, else_start);
     }
 
     fn handle_empty_function_body(&mut self, semicolon: Token) {

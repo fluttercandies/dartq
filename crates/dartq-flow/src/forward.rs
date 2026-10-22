@@ -2128,8 +2128,8 @@ impl ParserListener for SharedFlow<'_> {
         self.0.borrow_mut().handle_then_control_flow(token);
     }
 
-    fn handle_else_control_flow(&mut self, token: Token) {
-        self.0.borrow_mut().handle_else_control_flow(token);
+    fn handle_else_control_flow(&mut self, else_kw: Token, else_start: Token) {
+        self.0.borrow_mut().handle_else_control_flow(else_kw, else_start);
     }
 
     fn end_if_control_flow(&mut self, token: Token) {

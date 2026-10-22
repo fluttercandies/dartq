@@ -359,13 +359,22 @@ fn invalid_operand_is_not_check_deads_the_then() {
 
 // —— (c) the deleted always-true fold —————————————————————————————————
 
-/// The counter-finding face: an UNDEFINED tested type never folds — the
-/// oracle bails with `type_test_with_undefined_name` on the spelling and
-/// both branches stay live, even over an invalid operand (the pre-#2450
-/// rule folded `InvalidType is InvalidType` vacuously true and
-/// over-reported the else).
+// 2026-10-22 re-probe (Dart 3.13.1, `dart analyze --format=machine`): the
+// both-arms posture this section originally pinned was wrong — the live
+// oracle reports the dead-arm row for every undefined-tested shape
+// (int/dynamic/invalid operand, both polarities), anchored at the dead
+// arm's block. The official reference path never folds to a literal, but
+// `tryPromoteForTypeCheck`'s `factor(previous, InvalidType)` is `Never`
+// (`subtype.dart:274` makes any relation with an invalid type a
+// subtype), so `ifFalseIsUnreachable` fires and the test-false arm is
+// unreachable (flow_analysis.dart:4156-4160, :4188-4190).
+
+/// An UNDEFINED tested type keeps the spelling's own code AND deads the
+/// test-false arm, even over an invalid operand: `x is Missing` deads
+/// the else (the pre-#2450 constant fold over-reported through a
+/// boolean-literal face — the dead arm is real, the literal was not).
 #[test]
-fn invalid_operand_undefined_tested_keeps_both_arms() {
+fn invalid_operand_undefined_tested_deads_the_else() {
     let source = "void f(MissingAnn x) {\n\
                       \x20 if (x is Missing) {\n\
                       \x20   x = 1;\n\
@@ -374,9 +383,17 @@ fn invalid_operand_undefined_tested_keeps_both_arms() {
                       \x20 }\n\
                       }";
     let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    let else_start = source.find("else").unwrap() as u32;
+    assert_eq!(
+        dead.len(),
+        1,
+        "exactly the else arm carries the dead row: {:?}",
+        report.diagnostics
+    );
     assert!(
-        rows(&report, "dead_code").is_empty(),
-        "an undefined tested type never deads a branch: {:?}",
+        dead[0].0 > else_start,
+        "the dead row anchors inside the else arm: {:?}",
         report.diagnostics
     );
     assert!(
@@ -388,11 +405,11 @@ fn invalid_operand_undefined_tested_keeps_both_arms() {
     );
 }
 
-/// The deleted fold, `int` operand: `x is Missing` keeps both arms live
+/// The deleted fold, `int` operand: `x is Missing` deads the else arm
 /// and reports the undefined-name code on the spelling (the flipped
-/// dead-family posture, pinned here against the same rig).
+/// dead-family posture, re-pinned against the live oracle).
 #[test]
-fn int_operand_undefined_tested_keeps_both_arms() {
+fn int_operand_undefined_tested_deads_the_else() {
     let source = "void f(int x) {\n\
                       \x20 if (x is Missing) {\n\
                       \x20   x;\n\
@@ -401,9 +418,17 @@ fn int_operand_undefined_tested_keeps_both_arms() {
                       \x20 }\n\
                       }";
     let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    let else_start = source.find("else").unwrap() as u32;
+    assert_eq!(
+        dead.len(),
+        1,
+        "exactly the else arm carries the dead row: {:?}",
+        report.diagnostics
+    );
     assert!(
-        rows(&report, "dead_code").is_empty(),
-        "an undefined tested type never deads a branch: {:?}",
+        dead[0].0 > else_start,
+        "the dead row anchors inside the else arm: {:?}",
         report.diagnostics
     );
     assert!(
@@ -415,9 +440,10 @@ fn int_operand_undefined_tested_keeps_both_arms() {
     );
 }
 
-/// The deleted fold, `is!` polarity: no dead branch either way.
+/// The deleted fold, `is!` polarity: the test answers `true`, so the
+/// `is!` then arm is the dead one.
 #[test]
-fn is_not_undefined_tested_keeps_both_arms() {
+fn is_not_undefined_tested_deads_the_then() {
     let source = "void f(int x) {\n\
                       \x20 if (x is! Missing) {\n\
                       \x20   x;\n\
@@ -426,9 +452,18 @@ fn is_not_undefined_tested_keeps_both_arms() {
                       \x20 }\n\
                       }";
     let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    let test_start = source.find("is!").unwrap() as u32;
+    let else_start = source.find("else").unwrap() as u32;
+    assert_eq!(
+        dead.len(),
+        1,
+        "exactly the then arm carries the dead row: {:?}",
+        report.diagnostics
+    );
     assert!(
-        rows(&report, "dead_code").is_empty(),
-        "an undefined tested type never deads a branch: {:?}",
+        dead[0].0 > test_start && dead[0].0 < else_start,
+        "the dead row anchors inside the then arm: {:?}",
         report.diagnostics
     );
     assert!(

@@ -1909,7 +1909,7 @@ impl GapPass {
                 cond: NO_GUARD,
                 after_then: None,
             }),
-            Ev::ThenControlFlow => {
+            Ev::ThenControlFlow { .. } => {
                 let c = self.pop_val().guard;
                 let pre = match self.stack.last() {
                     Some(Frame::CollIf { pre, .. }) => *pre,
@@ -1922,7 +1922,7 @@ impl GapPass {
                     self.slots[i] = self.branch_entry(SIDES[i], pre[i], c[i], false, true, None);
                 }
             }
-            Ev::ElseControlFlow => {
+            Ev::ElseControlFlow { .. } => {
                 self.pop_val();
                 let (pre, c) = match self.stack.last() {
                     Some(Frame::CollIf { pre, cond, .. }) => (*pre, *cond),

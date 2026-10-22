@@ -486,10 +486,28 @@ pub enum Ev {
     Spread,
     NullAwareElement,
     IfControlFlowBegin,
-    ThenControlFlow,
-    ElseControlFlow,
+    /// `arm_start`: the then-element's first token offset (official
+    /// `handleThenControlFlow` fires right after the condition's `)`).
+    ThenControlFlow {
+        arm_start: u32,
+    },
+    /// `then_end`: the else keyword's offset (the then-element's
+    /// exclusive end); `else_start`: the else-element's first token
+    /// offset. Both are dartq-internal faces — the dead-arm row anchors
+    /// the arm's own extent (official `handle_ifElement_thenEnd` /
+    /// `handle_ifElement_elseEnd` → `flowEnd(ifTrue)` / `flowEnd(ifFalse)`,
+    /// type_analyzer.dart:1163-1173), and the parser hands the offsets to
+    /// the listener because the flow walker never sees tokens.
+    ElseControlFlow {
+        then_end: u32,
+        else_start: u32,
+    },
+    /// `arm_end`: the last element's exclusive end (the parser's peek
+    /// token offset at the close) — the then-element's end when
+    /// `has_else` is false, the else-element's end when true.
     EndIfControlFlow {
         has_else: bool,
+        arm_end: u32,
     },
     ForControlFlowBegin,
     ForControlFlowEnd {
