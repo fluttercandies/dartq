@@ -36,6 +36,11 @@ pub struct Flow<'t> {
     /// order (dense, one push per intern), so a later stage can recover
     /// `Base::Name(id)` spellings through [`Flow::name_lexeme`].
     names_by_id: Vec<Box<str>>,
+    /// The right operand's true end offset of the binary closing next:
+    /// `handle_binary_rhs_end` sets it, `end_binary_expression` consumes
+    /// it — the close's own `end` param is the send-tiling follower for a
+    /// bare-send operand, never `rightOperand.end`.
+    binary_rhs_end: Option<u32>,
     /// Open type-argument groups (nested annotations stack). Each group
     /// collects the argument rows recorded inside it; the parser fires
     /// `begin_type_arguments` at `<` and `end_type_arguments` immediately
@@ -241,6 +246,7 @@ impl<'t> Flow<'t> {
             source,
             names: FxHashMap::default(),
             names_by_id: Vec::new(),
+            binary_rhs_end: None,
             type_arg_groups: Vec::new(),
             type_args: vec![Vec::new()],
             non_promotions: vec![Vec::new()],
@@ -2182,10 +2188,19 @@ impl ParserListener for Flow<'_> {
         });
     }
 
+    fn handle_binary_rhs_end(&mut self, _operator: Token, rhs_last: Token) {
+        self.binary_rhs_end = Some(rhs_last.range.end());
+    }
+
     fn end_binary_expression(&mut self, operator: Token, end: Token) {
+        // The row's extent is `rightOperand.end` (the doc contract on
+        // `Ev::BinaryEnd::end`): the parser's `end` param tiles a bare-send
+        // operand through its follower, so prefer the true last token the
+        // pre-close hook just delivered.
+        let end = self.binary_rhs_end.take().unwrap_or(end.range.end());
         self.record(Ev::BinaryEnd {
             op: self.bin_op(operator),
-            end: end.range.end(),
+            end,
         });
     }
 

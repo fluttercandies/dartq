@@ -505,6 +505,14 @@ pub trait ParserListener {
     fn handle_non_null_assert_expression(&mut self, bang: Token) {}
     fn begin_binary_expression(&mut self, operator: Token) {}
     fn end_binary_expression(&mut self, operator: Token, end: Token) {}
+    /// The right operand's true last token, fired immediately before the
+    /// matching [`Self::end_binary_expression`]. The close event's `end`
+    /// parameter tiles a bare-send operand through its unconsumed follower
+    /// token (the send-leaf span tiling, `parse_send_from_identifier`); a
+    /// consumer that needs `rightOperand.end` — the official dead-RHS row
+    /// extent (`length = node.end - operator.offset`,
+    /// dead_code_verifier.dart:316-326) — reads it from here instead.
+    fn handle_binary_rhs_end(&mut self, operator: Token, rhs_last: Token) {}
     fn begin_const_expression(&mut self, const_keyword: Token) {}
     fn end_const_expression(&mut self, token: Token) {}
     fn begin_const_literal(&mut self, token: Token) {}

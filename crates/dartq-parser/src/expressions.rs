@@ -629,6 +629,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 self.listener.begin_binary_expression(operator);
                 self.cursor.advance();
                 let right = self.parse_precedence(level + 1, allow_cascades);
+                let rhs_last = self.last_consumed_span();
+                self.listener.handle_binary_rhs_end(operator, rhs_last);
                 self.listener.end_binary_expression(operator, right);
                 left = right;
                 lhs_ends_index = false;
@@ -734,6 +736,8 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 self.listener.begin_binary_expression(operator_span);
                 self.cursor.advance();
                 let right = self.parse_precedence(replacement_level + 1, allow_cascades);
+                let rhs_last = self.last_consumed_span();
+                self.listener.handle_binary_rhs_end(operator_span, rhs_last);
                 self.listener.end_binary_expression(operator_span, right);
                 return Some((right, replacement_level));
             }

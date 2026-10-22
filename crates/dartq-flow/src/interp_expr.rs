@@ -425,7 +425,31 @@ impl Interp<'_> {
                             op_span: *span,
                             rhs_dead_entry,
                         });
-                        self.current = taken;
+                        self.current = taken.clone();
+                        // The official `checkUnreachableNode(rightOperand)`
+                        // poll at `rightBegin`
+                        // (binary_expression_resolver.dart:287): a dead
+                        // entry marks the first-dead node at the right
+                        // operand itself, so the region is anchored
+                        // OUTSIDE every construct the operand contains —
+                        // inner `flowEnd`s then find the first dead node
+                        // not contained in them and stay silent, while
+                        // this binary's own close reports
+                        // `[operator, rightOperand.end]` and resets
+                        // (dead_code_verifier.dart:238-260, :311-326). The
+                        // mark rides the operator's end offset — every
+                        // emitted row re-anchors to the operator start, so
+                        // the anchor only feeds the inside/outside
+                        // comparison.
+                        if rhs_dead_entry {
+                            self.dead_code(TokenSpan {
+                                id: span.id,
+                                range: dartq_source::SourceRange {
+                                    offset: span.range.end(),
+                                    length: 0,
+                                },
+                            });
+                        }
                     }
                     BinOp::IfNull => {
                         // Official `ifNullExpression_rightBegin`
@@ -471,6 +495,20 @@ impl Interp<'_> {
                             op_span: *span,
                             rhs_dead_entry,
                         });
+                        // The `??` face of the dead-entry mark (the
+                        // official `checkUnreachableNode(rightOperand)`
+                        // poll runs for `??` operands too — the verifier's
+                        // `parent is IfNull` re-anchor presumes the first
+                        // dead node is the operand itself).
+                        if rhs_dead_entry {
+                            self.dead_code(TokenSpan {
+                                id: span.id,
+                                range: dartq_source::SourceRange {
+                                    offset: span.range.end(),
+                                    length: 0,
+                                },
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -491,7 +529,15 @@ impl Interp<'_> {
                     {
                         let (op_span, rhs_dead_entry) = (*op_span, *rhs_dead_entry);
                         if rhs_dead_entry {
-                            self.dead_expr_arm(op_span, *end);
+                            // The official `flowEnd(rightOperand)`
+                            // (binary_expression_resolver.dart:313): the
+                            // first dead node (marked at the dead entry)
+                            // is the right operand itself — its parent is
+                            // this binary, so the row re-anchors to the
+                            // operator and spans to the operand's end,
+                            // then resets. A region opened before the
+                            // operand keeps ownership (the fold).
+                            self.dead_arm_row(op_span.range.offset, *end);
                         }
                     }
                     let right = self.pop_value();
@@ -547,7 +593,10 @@ impl Interp<'_> {
                     if rhs_dead_entry
                         && let Some(op_span) = op_span
                     {
-                        self.dead_expr_arm(op_span, *end);
+                        // The `??` face of the same official re-anchor
+                        // (`parent is IfNull` → offset = operator,
+                        // dead_code_verifier.dart:316-318).
+                        self.dead_arm_row(op_span.range.offset, *end);
                     }
                     let right = self.pop_value();
                     let (right_if_true, right_if_false) = self.cond_split(&right);

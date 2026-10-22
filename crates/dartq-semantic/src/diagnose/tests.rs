@@ -11201,6 +11201,22 @@ fn ifnull_dead_code_and_dead_null_aware_coexist() {
     assert_eq!(rhs.range.length, 1);
 }
 
+/// `true || b`: the row spans `[operator, rightOperand.end]` — the bare
+/// identifier operand ends at itself, never at the tiled follower token
+/// (oracle row 2:12 len 4).
+#[test]
+fn dead_rhs_bare_send_ends_at_operand() {
+    let source = "void a(Object? b) {\n  if (true || b) {\n    b;\n  }\n}\n";
+    let report = report(source);
+    let rows: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "dead_code")
+        .map(|d| (d.range.offset, d.range.length))
+        .collect();
+    assert_eq!(rows, [(offset_of(source, "|| b"), 4)], "{:?}", code_names(&report));
+}
+
 /// Labels declare through the labeled-statement scope chain: a
 /// `break` into an outer scope spares that label, the unreferenced one
 /// reports at its own statement end.
@@ -16674,3 +16690,4 @@ fn non_constant_map_pattern_key_reports_at_the_key() {
     assert_eq!(rows.len(), 1, "{:?}", code_names(&rep));
     assert_eq!(rows[0].severity, Severity::Error);
 }
+

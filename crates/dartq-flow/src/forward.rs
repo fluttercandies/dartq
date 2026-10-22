@@ -379,6 +379,10 @@ impl ParserListener for SharedFlow<'_> {
         self.0.borrow_mut().end_binary_expression(operator, end);
     }
 
+    fn handle_binary_rhs_end(&mut self, operator: Token, rhs_last: Token) {
+        self.0.borrow_mut().handle_binary_rhs_end(operator, rhs_last);
+    }
+
     fn begin_const_expression(&mut self, const_keyword: Token) {
         self.0.borrow_mut().begin_const_expression(const_keyword);
     }

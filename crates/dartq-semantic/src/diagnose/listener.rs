@@ -3517,6 +3517,10 @@ impl ParserListener for DiagnoseListener<'_> {
         }
     }
 
+    fn handle_binary_rhs_end(&mut self, operator: Token, rhs_last: Token) {
+        self.flow().handle_binary_rhs_end(operator, rhs_last);
+    }
+
     fn end_binary_expression(&mut self, operator: Token, end: Token) {
         self.flow().end_binary_expression(operator, end);
 

@@ -542,3 +542,26 @@ fn extension_on_resolved_type_credits_members() {
         report.diagnostics
     );
 }
+
+/// The per-level report+reset of a dead right operand
+/// (`checkUnreachableNode(rightOperand)` marks the first-dead node at the
+/// operand at `rightBegin`; each level's `flowEnd(rightOperand)` then
+/// re-anchors to its own operator, reports, and resets —
+/// binary_expression_resolver.dart:274-316, dead_code_verifier.dart:238-339).
+/// An `is!`-chain: every level whose rhs ENTERS dead reports its own
+/// `[operator, rightOperand.end]` row, the inner live `||` rhs stays
+/// silent, and the whole then-arm row follows (oracle rows 2:21+22,
+/// 3:21+40, 4:39+22, 5:22+16).
+#[test]
+fn dead_rhs_chain_reports_per_level_with_reset() {
+    let source = "void f(Object? rules) {\n  if (rules is! Aaa &&\n      rules is! Bbb &&\n      (rules is! Ccc || rules is Ddd) &&\n      rules != null) {\n    rules;\n  }\n}\n";
+    let report = report_ops(source);
+    let rows = rows(&report, "dead_code");
+    let expected = [
+        (source.find("&&\n      rules is! Bbb").unwrap() as u32, 22),
+        (source.find("&&\n      (rules is! Ccc").unwrap() as u32, 40),
+        (source.find("&&\n      rules != null").unwrap() as u32, 22),
+        (source.find("{\n    rules;").unwrap() as u32, 16),
+    ];
+    assert_eq!(rows, expected, "{:?}", code_names(&report));
+}
