@@ -47,6 +47,13 @@
 //!   multi-root routing tag), `agentId` (the analyzed overlay
 //!   view), and `since` (delta mode), with the per-face visibility contract
 //!   documented in the `commands` module.
+//! * The `dartq/debug/*` family (daemon-native, no CLI mirror): launch and
+//!   attach debug sessions through `dartq-debug`, then drive them —
+//!   breakpoints, exception pause mode, resume/pause/step, stopped
+//!   snapshots with variables, and cursor-paged event/output reads.
+//!   These faces target the session's debug registry, never the analysis
+//!   engine, and answer at intake with synchronous, config-bounded
+//!   session calls (the `debug` module's notes).
 //! * Everything else: unknown requests answer `MethodNotFound`; unknown
 //!   notifications are ignored.
 //!
@@ -85,6 +92,7 @@
 
 pub mod codec;
 pub(crate) mod commands;
+mod debug;
 pub mod jsonrpc;
 pub(crate) mod plugins;
 pub mod session;
@@ -107,6 +115,7 @@ mod test_fixtures;
 mod server;
 
 pub use commands::METHODS;
+pub use debug::DEBUG_REQUESTS;
 pub use server::{EXIT_CLEAN, EXIT_PROTOCOL, INTAKE_REQUESTS, SERVED_NOTIFICATIONS, run};
 pub use session::{Publish, Session, SessionError, SessionRuntime, Turn};
 pub use watch::WatchOptions;

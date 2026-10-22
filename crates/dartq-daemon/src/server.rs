@@ -30,6 +30,7 @@ use dartq_commands::Verbosity;
 
 use crate::codec::{self, FrameError};
 use crate::commands;
+use crate::debug;
 use crate::jsonrpc::{self, Message, Notification, Request, Response, codes};
 use crate::session::{FixJob, Publish, Session, SessionError, Turn};
 use crate::watch::{WatchOptions, Watcher, is_config_input};
@@ -390,6 +391,12 @@ fn decode_body(body: &[u8]) -> Incoming {
 // `commands::METHODS` (the exhaustive request family): a new intake arm
 // serving an unlisted name — the asymmetry the gate existed to catch —
 // now requires extending `METHODS` too.
+//
+// The `dartq/debug/*` family is intercepted at intake as well, but as its
+// own closed table (`debug::DEBUG_REQUESTS`, guarded by
+// `debug::is_request`): those faces target the debug registry, not the
+// analysis engine, so they are not part of the CLI-mirror `METHODS`
+// family — the gate pins them with their own frozen copy instead.
 const OVERLAY_SET: &str = "dartq/overlay.set";
 const OVERLAY_COMMIT: &str = "dartq/overlay.commit";
 const OVERLAY_CLEAR: &str = "dartq/overlay.clear";
@@ -444,6 +451,29 @@ fn handle_request(session: &mut Session, request: Request) -> Option<Response> {
         ASSISTS => {
             let params = request.params.unwrap_or(Value::Null);
             assists_stage(session, &params, id)
+        }
+        // The debug faces answer at intake too: they hit the session's
+        // debug registry (their own Dart processes and VM connections),
+        // never the analysis engine — the overlay faces' posture, minus
+        // the scheduler entirely. The underlying calls are synchronous
+        // (child spawn, WebSocket round trips, bounded waits) and run
+        // inline on this loop; every wait is bounded by dartq-debug's
+        // own SessionConfig (30 s banner, 30 s per RPC, 30 s pause
+        // waits), so the loop is never held indefinitely — but a step
+        // or snapshot waiting on a pause does hold it until the pause
+        // lands or times out, and requests queued behind answer after.
+        // Debug traffic is inherently sequential per session (step,
+        // read, decide), so the inline posture is the honest shape.
+        method if debug::is_request(method) => {
+            let params = request.params.unwrap_or(Value::Null);
+            let root = session.workspace_root().to_path_buf();
+            Some(debug_response(
+                session.debug_registry(),
+                id,
+                method,
+                &params,
+                &root,
+            ))
         }
         method if commands::is_command(method) => {
             // Every `dartq/*` face queues onto the session's read task (the
@@ -539,6 +569,28 @@ fn overlay_response(
             }
             Err(message) => Response::error(Some(id), codes::INVALID_PARAMS, message),
         },
+    }
+}
+
+/// Answers one `dartq/debug/*` request against the session's debug
+/// registry: parameter decoding, the (possibly blocking) session call,
+/// and the DTO shaping all live in the debug module; this layer only maps
+/// the failure set onto the wire — the shared `INVALID_PARAMS` tier for a
+/// structural mismatch, one server-error code carrying a `DARTQ/DEBUG/*`
+/// machine prefix for the session domain.
+fn debug_response(
+    manager: &mut debug::DebugManager,
+    id: jsonrpc::RequestId,
+    method: &str,
+    params: &Value,
+    root: &Path,
+) -> Response {
+    match debug::handle(manager, method, params, root) {
+        Ok(result) => Response::ok(id, result),
+        Err(error) => {
+            let (code, message) = error.wire();
+            Response::error(Some(id), code, message)
+        }
     }
 }
 

@@ -15,6 +15,12 @@ pub mod codes {
     /// The server dropped the request before producing a result (its
     /// enqueue epoch was superseded).
     pub const REQUEST_CANCELLED: i64 = -32800;
+    /// A `dartq/debug/*` face failure (the debug session domain: no such
+    /// session, the session bound, or the underlying VM/process call).
+    /// The message carries a `DARTQ/DEBUG/*` machine-code prefix naming
+    /// the cause — the family shares one server-error code, the prefix
+    /// discriminates.
+    pub const DEBUG_SESSION: i64 = -32001;
 }
 
 /// A request id: integer or string (JSON-RPC 2.0); fractional numbers are

@@ -13,6 +13,10 @@ categories = ["development-tools"]
 [dependencies]
 crossbeam-channel = { workspace = true }
 dartq-commands = { workspace = true }
+# The `dartq/debug/*` faces ride dartq-debug's synchronous VM Service
+# client and session orchestration (launch/attach, breakpoints, steps,
+# stopped snapshots, bounded event/output rings).
+dartq-debug = { workspace = true }
 dartq-diagnostics = { workspace = true }
 dartq-engine = { workspace = true }
 # The `element_at` reverse-query rows (T4) read the engine's maintained

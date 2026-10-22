@@ -824,3 +824,87 @@ fn the_served_set_is_exactly_the_frozen_family() {
         );
     }
 }
+
+/// The frozen `dartq/debug/*` family: the daemon-native debug registry's
+/// 13-method request table, pinned the same way the analysis family is —
+/// an added, renamed, or removed method drifts the table and fails the
+/// gate. The family is deliberately NOT part of `METHODS` (that table is
+/// the CLI-mirror analysis family; the debug faces target the debug
+/// registry, never the analysis engine), so it carries its own frozen
+/// copy and its own disjointness pins.
+const FROZEN_DEBUG_METHODS: [&str; 13] = [
+    "dartq/debug/launch",
+    "dartq/debug/attach",
+    "dartq/debug/detach",
+    "dartq/debug/status",
+    "dartq/debug/breakpointAdd",
+    "dartq/debug/breakpointRemove",
+    "dartq/debug/exceptionPause",
+    "dartq/debug/resume",
+    "dartq/debug/pause",
+    "dartq/debug/step",
+    "dartq/debug/snapshot",
+    "dartq/debug/events",
+    "dartq/debug/output",
+];
+
+/// The debug-family drift gate: the served table equals the frozen copy
+/// exactly, stays disjoint from the analysis request family and the
+/// notification family, and every name is a live face — an empty-params
+/// request answers the shared `INVALID_PARAMS` intake verdict (or, for
+/// the all-optional `status`, a result), never `METHOD_NOT_FOUND`. The
+/// empty-params probe is chosen so no face reaches a live VM: `launch`
+/// and `attach` fail parameter decoding before any process or connection
+/// exists.
+#[test]
+fn the_debug_family_matches_the_frozen_table() {
+    assert_eq!(
+        dartq_daemon::DEBUG_REQUESTS.len(),
+        FROZEN_DEBUG_METHODS.len(),
+        "the debug request family grew or shrank"
+    );
+    for method in dartq_daemon::DEBUG_REQUESTS {
+        assert!(
+            FROZEN_DEBUG_METHODS.contains(&method),
+            "{method} is a live debug face but not in the frozen table"
+        );
+        assert!(
+            !dartq_daemon::METHODS.contains(&method),
+            "{method} must stay out of the analysis request family"
+        );
+        assert!(
+            !dartq_daemon::SERVED_NOTIFICATIONS.contains(&method),
+            "{method} is both a request and a notification"
+        );
+    }
+
+    let workspace = seeded_query_workspace();
+    let mut h = spawn(&workspace, &store_root("schema-debug-methods"));
+    for (id, method) in FROZEN_DEBUG_METHODS.iter().enumerate() {
+        let id = (id + 1) as i64;
+        h.step(&request(id, method, json!({})), 1);
+        let frame = h.wait_answer(id);
+        let code = frame["error"]["code"].as_i64();
+        assert_ne!(
+            code,
+            Some(-32601),
+            "{method} must be a live face, not METHOD_NOT_FOUND: {frame}"
+        );
+        assert!(
+            frame.get("error").is_none() || code == Some(-32602),
+            "{method} answers a result or its own intake verdict: {frame}"
+        );
+    }
+
+    // The family is closed: an unknown debug-spelled name answers
+    // METHOD_NOT_FOUND, and `status` over the empty registry lists empty.
+    h.step(&request(99, "dartq/debug/nope", json!({})), 1);
+    let frame = h.wait_answer(99);
+    assert_eq!(frame["error"]["code"], -32601, "the debug face set is closed");
+    h.step(&request(100, "dartq/debug/status", json!({})), 1);
+    assert_eq!(h.wait_answer(100)["result"], json!([]));
+
+    let (code, _) = h.join_ended();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+    fs::remove_dir_all(&workspace.root).ok();
+}

@@ -340,6 +340,7 @@ version = "1.0.0"
 dependencies = [
  "crossbeam-channel",
  "dartq-commands",
+ "dartq-debug",
  "dartq-diagnostics",
  "dartq-engine",
  "dartq-index",

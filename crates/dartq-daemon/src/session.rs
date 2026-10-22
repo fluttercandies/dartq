@@ -1009,6 +1009,12 @@ pub struct Session {
     fix_done: (Sender<FixMail>, Receiver<FixMail>),
     /// The dispatch budget (`FIX_TIME_BUDGET`; test seam overrides it).
     fix_budget: Duration,
+    /// The `dartq/debug/*` faces' session registry (launch/attach
+    /// debugging lives outside the analysis engine; the server answers
+    /// those methods at intake against this field). Empty until a
+    /// client launches or attaches; dropped sessions tear themselves
+    /// down.
+    debug: crate::debug::DebugManager,
     /// The shared mapped-content pool — `Some` only under
     /// [`SessionRuntime::pooled_mapped_store`]: every context's content
     /// store was rebound to it at assembly. Kept as the session's handle
@@ -1322,6 +1328,7 @@ impl Session {
             fix_running: None,
             fix_done: bounded(MAX_QUEUED_FIX_MAILS),
             fix_budget: FIX_TIME_BUDGET,
+            debug: crate::debug::DebugManager::default(),
             mapped_pool,
             snapshot: SnapshotSink {
                 store,
@@ -1848,6 +1855,12 @@ impl Session {
     /// The workspace root the session's context was assembled from.
     pub(crate) fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// The `dartq/debug/*` faces' session registry (the server answers
+    /// those requests at intake against it).
+    pub(crate) fn debug_registry(&mut self) -> &mut crate::debug::DebugManager {
+        &mut self.debug
     }
 
     /// `dartq/cancel`: cancels one queued request by id, precisely
