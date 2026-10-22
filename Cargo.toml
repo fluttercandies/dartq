@@ -25,6 +25,7 @@ members = [
     "crates/dartq-daemon",
     "crates/dartq-ai",
     "crates/dartq-cli",
+    "crates/dartq-debug",
     "crates/dartq-schema",
     "tests/harness",
     "tools/bench-corpus-gen",
@@ -42,6 +43,7 @@ repository = "https://github.com/fluttercandies/dartq"
 [workspace.dependencies]
 # One version decision per external dependency, made once here; member
 # crates consume them via `name = { workspace = true }`.
+base64 = "0.22"
 blake3 = "1"
 # The CLI binary's global allocator: segment-based, returns freed pages
 # promptly (the 100k cold peak is fragmentation-bound under the system
@@ -65,6 +67,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 thiserror = "2"
+# The VM Service Protocol is served over WebSocket; rustls-tls enables the
+# `wss:` scheme (TLS without pulling in platform-native TLS stacks).
+tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 
 # Internal crates: path plus version so member manifests consume them via
 # `dartq-xxx = { workspace = true }` (cargo publish requires a version on
@@ -73,6 +78,7 @@ dartq-ai = { path = "crates/dartq-ai", version = "1.0.0" }
 dartq-ast = { path = "crates/dartq-ast", version = "1.0.0" }
 dartq-commands = { path = "crates/dartq-commands", version = "1.0.0" }
 dartq-daemon = { path = "crates/dartq-daemon", version = "1.0.0" }
+dartq-debug = { path = "crates/dartq-debug", version = "1.0.0" }
 dartq-diagnostics = { path = "crates/dartq-diagnostics", version = "1.0.0" }
 dartq-engine = { path = "crates/dartq-engine", version = "1.0.0" }
 dartq-flow = { path = "crates/dartq-flow", version = "1.0.0" }
