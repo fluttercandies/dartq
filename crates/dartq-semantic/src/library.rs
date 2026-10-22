@@ -602,18 +602,29 @@ fn core_implements(core: &[(StringId, StringId)], ty: StringId, interface: Strin
 /// erasure face handles it — and an extension is not a type at all). The
 /// implicit `Object` root is outside the name-level model and never an
 /// edge, so the walk ends where the written chain ends.
-fn supertype_edges(container: &Container) -> impl Iterator<Item = StringId> + '_ {
+fn supertype_edges(container: &Container, strings: &StringTable) -> Vec<StringId> {
     let mixin_constraints = (container.kind == ContainerKind::Mixin)
         .then(|| container.on_clause.iter())
         .into_iter()
         .flatten();
-    container
+    let mut edges: Vec<StringId> = container
         .superclass
         .iter()
         .chain(container.with_clause.iter())
         .chain(container.implements_clause.iter())
         .chain(mixin_constraints)
         .copied()
+        .collect();
+    // An enum declaration implicitly implements `Enum` (the language's
+    // implicit interface — the spec makes it a compile-time error for an
+    // enum's interface not to include dart:core's `Enum`): a declared-edge
+    // walk never sees it, so the edge rides here. The spelling resolves
+    // through the ordinary namespace face like any written edge (a user
+    // `Enum` shadowing the core name routes through the same walk).
+    if container.kind == ContainerKind::Enum {
+        edges.push(strings.intern("Enum"));
+    }
+    edges
 }
 
 /// Whether `name` implements `interface` — the transitive supertype
@@ -732,7 +743,7 @@ pub(crate) fn implements_interface(
     queue.push((start, owner, start_lib, container));
     while let Some((current, current_owner, scope_lib, container)) = queue.pop() {
         let owner_lib = owner_library(graph, lib, current_owner, current).unwrap_or(scope_lib);
-        for edge in supertype_edges(container) {
+        for edge in supertype_edges(container, strings) {
             let resolved =
                 resolve_container(graph, namespaces, index, owner_lib, current_owner, edge);
             // Entity-level asks match the interface the moment the chain
