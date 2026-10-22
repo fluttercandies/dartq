@@ -228,6 +228,20 @@ impl<'a> Engine<'a> {
                     owner,
                     name,
                 )
+                // The dot-joined anchor (`io.File`, the intern table's
+                // one-head form the prefixed annotations arm): the bare
+                // probe misses by construction, the prefix-aware split
+                // owns it.
+                .or_else(|| {
+                    resolve_joined_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        scope_lib,
+                        self.strings,
+                        name,
+                    )
+                })
             } else {
                 self.resolve_clause_face(writer, owner, scope_lib, name)
             };

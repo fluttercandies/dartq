@@ -310,6 +310,31 @@ pub(crate) fn resolve_container<'a>(
     }
 }
 
+/// The dot-joined spelling's container (`io.File`, the intern table's
+/// one-head form the prefixed annotations arm): splits on the FIRST dot
+/// and resolves the leaf through the prefix's table — the same lookup
+/// [`crate::resolution::arm_type_prefix`]'s live prefix keys. A spelling
+/// with no dot, a dead prefix, or a non-container leaf answers `None`
+/// (the caller's own miss face decides).
+pub(crate) fn resolve_joined_container<'a>(
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &'a ElementIndex,
+    lib: LibraryId,
+    strings: &StringTable,
+    name: StringId,
+) -> Option<(&'a Container, FileId)> {
+    let (prefix, leaf) = strings.resolve(name).split_once('.')?;
+    prefixed_container(
+        graph,
+        namespaces,
+        index,
+        lib,
+        strings.intern(prefix),
+        strings.intern(leaf),
+    )
+}
+
 /// Resolves a container through an import prefix: `prefix` must be a
 /// registered `as` prefix of `lib` and `name` a name in its merged table —
 /// all same-prefix imports in directive order, combinator filtered,

@@ -1950,6 +1950,27 @@ impl<'a> Engine<'a> {
             None
         };
         self.invokes.push(callee);
+        // A zero-parameter alias-to-class callee (`typedef L = Real;
+        // L()`): the send is the aliased class's unnamed creation (the
+        // oracle resolves the constructor through the alias, the
+        // named-type resolver's typedef chase), so the callee row takes
+        // the folded class's container shape here — every
+        // container-gated face downstream (the creation fold, the close
+        // solver, the arity check) reads the class. The reshape rides
+        // only the invoked callee: a bare alias read (`L` as a value) is
+        // its own face, and a parameterized alias keeps the
+        // under-report (its substitution is unmodeled).
+        if let Some(index) = callee
+            && let Some(row) = self.rows.get(index)
+            && matches!(row.shape, RowShape::Bare(BareInfo::Plain { .. }))
+            && let Some((class, kind)) = self.alias_class_head(row.name)
+        {
+            self.used_names.insert(row.name);
+            self.rows[index].shape = RowShape::Bare(BareInfo::Container {
+                name: class,
+                kind,
+            });
+        }
         // The source-spelled fallback head: only when the row transport
         // dropped the callee outright. Strict adjacency (no trivia skip) —
         // the commented-head shape keeps the under-report posture. A

@@ -105,6 +105,7 @@ impl<'a> Engine<'a> {
             record_literal_names: Vec::new(),
             record_ty_stack: Vec::new(),
             type_prefix: None,
+            pending_prefixed: None,
             non_type_pos: 0,
             is_type_pos: 0,
             ctor_pos: 0,

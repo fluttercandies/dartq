@@ -1082,6 +1082,59 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The class head a zero-parameter alias-to-class spells
+    /// (`typedef L = Real;`): the folded right-hand side's non-nullable
+    /// named head, when the head resolves to an indexed container — the
+    /// invocation face's creation reshape (`L()` is `Real()`'s unnamed
+    /// creation through the alias). Everything else (a parameterized
+    /// alias, a function/record right-hand side, an unresolvable head)
+    /// answers `None` and keeps the alias's own face.
+    pub(crate) fn alias_class_head(&self, name: StringId) -> Option<(StringId, ContainerKind)> {
+        let decl = self.top_level_decl(name)?;
+        if decl.kind != MicroKind::TypeAlias || decl.type_params != 0 {
+            return None;
+        }
+        let Ty::Named {
+            name: head,
+            nullable: false,
+            ..
+        } = self.fold_alias_ty(decl.var_ty)
+        else {
+            return None;
+        };
+        // The model's prefixed spellings arrive dot-joined (`shared.Real`,
+        // the collector's one-head intern form): the class head the
+        // creation reshape carries is the LEAF — the container dispatch
+        // itself goes through the prefix-aware lookup.
+        let spelling = self.strings.resolve(head);
+        let (leaf, container) = match spelling.split_once('.') {
+            Some((prefix, leaf)) => {
+                let leaf = self.intern(leaf);
+                let (container, _) = prefixed_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.intern(prefix),
+                    leaf,
+                )?;
+                (leaf, container)
+            }
+            None => {
+                let (container, _) = resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    head,
+                )?;
+                (head, container)
+            }
+        };
+        Some((leaf, container.kind))
+    }
+
     /// The full formal table of a resolved member callee, walked from `recv`.
     /// A foreign find's table comes back owned ([`std::borrow::Cow::Owned`],
     /// cloned off the boundary's projected copy); a local find borrows the

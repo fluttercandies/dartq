@@ -763,6 +763,14 @@ impl<'a> Engine<'a> {
                 name,
                 kind: ContainerKind::Enum,
             } => Restriction::EnumValue(*name, last.name),
+            // The prefix-reached enum (`android_webview.Level.debug`): the
+            // coverage space keys on the declaration name — the bare leaf,
+            // the same spelling the scrutinee's type arms.
+            Receiver::PrefixedContainer {
+                name,
+                kind: ContainerKind::Enum,
+                ..
+            } => Restriction::EnumValue(*name, last.name),
             _ => Restriction::Unknown,
         }
     }

@@ -1657,6 +1657,16 @@ pub(crate) struct Engine<'a> {
     /// The M1 model's written-record face (F-R).
     pub(crate) record_ty_stack: Vec<RecordTyLevel>,
     pub(crate) type_prefix: Option<TypePrefix>,
+    /// A group-less prefixed type (`p.C`) awaiting its completion (#2523):
+    /// the prefix segment's token (the completing `handle_type` fires AT
+    /// the prefix token — the official `PrefixedType.parseType` protocol)
+    /// and the leaf segment's name plus span. The completion arms the
+    /// LEAF's name (`p.C` keeps `C`); the prefix's own lexeme would name
+    /// no container anywhere downstream.
+    pub(crate) pending_prefixed: Option<(
+        SourceRange,
+        Option<(StringId, SourceRange)>,
+    )>,
     /// Suppression depth inside `is`/`as` type operands.
     pub(crate) non_type_pos: u32,
     /// Suppression depth inside `is` type operands only (the usage

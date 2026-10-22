@@ -349,7 +349,8 @@ use crate::const_eval::{
 use crate::const_tracker::ConstTracker;
 use crate::library::{
     ElementIndex, ScopedHit, implements_interface, lookup_scoped, member_lookup_defining,
-    owner_library, prefixed_container, resolve_container, supertype_hop_dead,
+    owner_library, prefixed_container, resolve_container, resolve_joined_container,
+    supertype_hop_dead,
 };
 use crate::member_face::{
     COLLECTION_INTERFACE_ALIASES, CORE_CONST_CTOR, CORE_INTERFACE_MEMBERS, CORE_STATIC_RETURNS,
@@ -4664,6 +4665,8 @@ mod operand_face_tests;
 /// keeps the one diagnostic.
 #[cfg(test)]
 mod ticket_2521_tests;
+#[cfg(test)]
+mod ticket_2536_tests;
 
 /// The shared single-file rig with the resolved-type snapshot mounted
 /// (`report_ops`), the shape the per-ticket modules each carried.

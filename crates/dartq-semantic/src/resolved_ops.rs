@@ -460,6 +460,36 @@ impl LibraryTypes {
                 }
             }
         }
+        // The prefixed spellings' joined heads (`io.File`): the diagnose
+        // side arms import-qualified annotations dot-joined (the intern
+        // table's one-head form, the collector's own convention), so the
+        // registry answers those spellings too — every DIRECT prefixed
+        // import's exported container aliases its bare-keyed decl under
+        // `prefix.Name`. Combinator-hidden names never alias (the written
+        // spelling cannot legally name them; an alias would over-resolve
+        // the hide/show boundary).
+        for edge in graph.import_edges(lib) {
+            let (Some(target), Some(prefix)) = (edge.target, edge.prefix) else {
+                continue;
+            };
+            for (name, _) in graph.export_scope(target) {
+                if !edge.combinators.allows(name) {
+                    continue;
+                }
+                let Some(&decl) = registry.registry.get(&name) else {
+                    continue;
+                };
+                let joined = format!(
+                    "{}.{}",
+                    strings.resolve(prefix),
+                    strings.resolve(name)
+                );
+                registry
+                    .registry
+                    .entry(strings.intern(&joined))
+                    .or_insert(decl);
+            }
+        }
         // The alias RHS shapes flatten after every registration pass (the
         // library's units and the import sweep) — a co-alias chain needs
         // its target's registration first.
@@ -503,8 +533,15 @@ impl LibraryTypes {
         // climbs with). The name of each decl comes from the inverted
         // registry, built once (the registry is the snapshot's only
         // name→decl pairing).
-        let name_of_decl: FxHashMap<TypeDeclId, StringId> =
-            registry.iter().map(|(&name, &decl)| (decl, name)).collect();
+        // The joined alias keys (`file_state.X`) must not invert: the
+        // decl's declaration name (dot-free, the container index keys on
+        // it) is the only spelling that reaches `elements.container` —
+        // an inverted alias would strand the decl's supertype edges.
+        let name_of_decl: FxHashMap<TypeDeclId, StringId> = registry
+            .iter()
+            .filter(|kv| !strings.resolve(*kv.0).contains('.'))
+            .map(|(&name, &decl)| (decl, name))
+            .collect();
         let scope_of = |capture: &ClauseCapture, decl: TypeDeclId| {
             let params = decl_params.get(&decl).map_or(&[][..], Vec::as_slice);
             capture

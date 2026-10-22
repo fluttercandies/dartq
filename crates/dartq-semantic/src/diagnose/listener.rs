@@ -2009,11 +2009,21 @@ impl ParserListener for DiagnoseListener<'_> {
                     if !dead_prefix {
                         engine.arm_type_head(name, token.range);
                     }
+                    // The group-less prefixed shape's leaf (#2523): the
+                    // completion's armed type reads this name, never the
+                    // prefix token the closing `handle_type` fires at.
+                    if matches!(head, TypeHead::Continuation)
+                        && let Some((_, leaf)) = engine.pending_prefixed.as_mut()
+                        && leaf.is_none()
+                    {
+                        *leaf = Some((name, token.range));
+                    }
                 }
             }
             C::PrefixedTypeReference => {
                 if let Some(name) = name {
                     engine.arm_type_prefix(name, token.range);
+                    engine.pending_prefixed = Some((token.range, None));
                 }
             }
             // A constructor reference names a class: the guarded miss is the
@@ -2618,10 +2628,46 @@ impl ParserListener for DiagnoseListener<'_> {
         let Some(text) = engine.text_of(name) else {
             return;
         };
+        // The group-less prefixed completion (`p.C`): the official
+        // `PrefixedType.parseType` fires `handleType` at the PREFIX's
+        // token, so the lexeme above names the prefix — the armed type,
+        // the bound declared types, and every downstream face would read
+        // a container named after the import prefix (#2523). The leaf
+        // segment's name is the type (`p.C` keeps `C`); a completion
+        // whose token is not the latched prefix segment consumes the
+        // stale stash and completes normally.
+        let prefixed_leaf = engine
+            .pending_prefixed
+            .take()
+            .filter(|(prefix_range, _)| *prefix_range == name.range)
+            .and_then(|(_, leaf)| leaf);
+        let (text, leaf_id, head_id) = match prefixed_leaf {
+            // The armed head spells the DOT-JOINED form (`io.File`), the
+            // intern table's one-head convention the collector's own
+            // prefixed annotations use — a bare leaf would resolve a
+            // same-spelled unprefixed import's class (analyzer's own
+            // `FileSystemException` behind `io.FileSystemException`), and
+            // every container walk on the joined spelling goes through
+            // the prefix-aware lookup or misses. The bare leaf still
+            // feeds the faces keyed by the written segment (the bounds
+            // capture, the header spans).
+            Some((leaf_id, _)) => {
+                let joined = format!(
+                    "{}.{}",
+                    text,
+                    engine.strings.resolve(leaf_id)
+                );
+                let head_id = engine.strings.intern(&joined);
+                (joined, leaf_id, head_id)
+            }
+            None => {
+                let head_id = engine.strings.intern(text);
+                (text.to_string(), head_id, head_id)
+            }
+        };
         // The #610 capture: every completed type head is a leaf of the open
         // window (the parser re-fires a parameterized head after its group,
         // carrying the trailing `?` — the sink merges that completion).
-        let leaf_id = engine.strings.intern(text);
         engine.bounds.leaf(
             leaf_id,
             question.is_some(),
@@ -2653,11 +2699,11 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.note_header_type_span(name, question);
         // `dynamic` is a top type and `Null` is the null-type singleton —
         // both have dedicated [`Ty`] shapes.
-        let ty = match text {
+        let ty = match text.as_str() {
             "dynamic" => Ty::Dynamic,
             "Null" => Ty::Null,
             _ => Ty::Named {
-                name: engine.strings.intern(text),
+                name: head_id,
                 nullable: question.is_some(),
                 args: ArgListId::EMPTY,
             },
@@ -2773,7 +2819,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // completion (the re-fired parameterized head carries its written
         // arguments on the armed type by now).
         if let Some(ty) = engine.armed_ty {
-            let leaf = engine.strings.intern(text);
+            let leaf = leaf_id;
             engine.fn_capture_type(ty, leaf, name.range.offset);
             engine.call_args_feed(ty, leaf, name.range.offset);
             // #1758: the re-walked return annotation of an in-flight
@@ -2821,6 +2867,7 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.armed_ty = None;
         engine.armed_ty_unresolved = false;
         engine.armed_ty_span = None;
+        engine.pending_prefixed = None;
     }
 
     fn handle_void_keyword(&mut self, token: Token) {
