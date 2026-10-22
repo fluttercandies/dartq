@@ -727,13 +727,14 @@ dependency_overrides:
     }
 
     #[test]
-    fn duplicate_names_fold_to_the_first_entry_before_assembly() {
-        // A repeated name never reaches assembly as a second entry: parse
-        // folds it to the first, so the graph carries one instance rooted
-        // at the first entry's directory (package_config-3.0.0
-        // `package_config.dart:624-633`; the oracle never surfaces a
-        // repeated name as a diagnostic).
-        let config = config_from(
+    fn duplicate_names_floor_the_config_before_assembly() {
+        // A repeated name never reaches assembly: parse floors the whole
+        // config on the first repeat (config.rs `seen_names` — the
+        // loader's `_validatePackages` throws through the analyzer's
+        // default handler and the catch degrades to a silent
+        // `Packages.empty`; mixed-entry probe #2434), so the graph
+        // builder never sees one and there is no first entry to fold to.
+        let error = PackageConfig::parse(
             r#"{
               "configVersion": 2,
               "packages": [
@@ -742,30 +743,11 @@ dependency_overrides:
               ],
               "generator": "pub"
             }"#,
-        );
-        assert_eq!(config.packages.len(), 1, "folded at parse");
-        let lock = lock_from(LOCK);
-        let graph = build_graph(
-            &config,
-            &lock,
-            &root_pubspec(),
-            &BTreeMap::new(),
-            None,
-            Path::new("/proj/.dart_tool"),
         )
-        .expect("the folded config assembles");
-        let apps: Vec<_> = graph
-            .instances
-            .iter()
-            .filter(|i| i.name == "app")
-            .collect();
-        assert_eq!(apps.len(), 1, "one instance per folded name");
-        assert_eq!(
-            apps[0].source_ref,
-            SourceRef::Path {
-                path: Path::new("/proj").to_path_buf()
-            },
-            "the first entry's root wins"
+        .expect_err("duplicate names floor the config");
+        assert!(
+            error.to_string().contains("duplicate package name `app`"),
+            "unexpected error: {error}"
         );
     }
 }

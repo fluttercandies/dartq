@@ -137,11 +137,12 @@ pub enum DirectiveKind {
 /// layers onto `package:` targets (`.dart_tool/build/generated`).
 ///
 /// The lookup face is per-context (the pub universe separation): every
-/// nested self-resolved context root — a config entry whose package root
-/// carries its own `pubspec.yaml` together with its own
-/// `.dart_tool/package_config.json` — resolves against the package set that
-/// root's own config materializes, and files outside every nested root
-/// resolve against the root config AS WRITTEN (re-read from disk: the
+/// nested self-resolved context root — a config entry whose package root,
+/// STRICTLY INSIDE the context root, carries its own `pubspec.yaml`
+/// together with its own `.dart_tool/package_config.json` — resolves
+/// against the package set that root's own config materializes, and every
+/// other file (dependency files outside the analyzed tree included)
+/// resolves against the root config AS WRITTEN (re-read from disk: the
 /// assembly's nested-root extension joins entries pub never wrote into the
 /// root config, and those stay invisible outside their own context). The
 /// oracle splits the analyzed tree into exactly these context roots
@@ -155,11 +156,10 @@ pub enum DirectiveKind {
 /// the owning context's own map produces.
 ///
 /// Root/lib-dir resolution is [`PackageConfig::resolve`], dartq-pub's
-/// single shared face — duplicate names dedup at parse to their first entry
-/// (package_config's package-table builder), names follow the loose reader
-/// grammar, `packageUri` directories are normalized and subtree-validated —
-/// exactly the policies the identity table applies, so the two tables can
-/// never diverge.
+/// single shared face — duplicate names floor the whole config at parse,
+/// names follow the loose reader grammar, `packageUri` directories are
+/// normalized and subtree-validated — exactly the policies the identity
+/// table applies, so the two tables can never diverge.
 #[derive(Debug)]
 pub struct PackageTable {
     /// Package lib dirs with their names, sorted by component depth (deepest
@@ -173,8 +173,8 @@ pub struct PackageTable {
     lib_dirs: Vec<(PathBuf, Box<str>)>,
     /// Package name → position in `lib_dirs` — the per-directive hot path's
     /// O(1) `lib_dir` face without a second copy of any lib dir. Names are
-    /// unique (dartq-pub dedups repeated config names to the first entry at
-    /// parse), so one name owns one position.
+    /// unique (dartq-pub floors a whole config at parse on the first
+    /// repeated name), so one name owns one position.
     indices: FxHashMap<Box<str>, usize>,
     /// Directory holding `.dart_tool/` — the base of the generated-file
     /// fallback.
@@ -217,8 +217,8 @@ impl PackageTable {
     /// [`PubError`] when [`PackageConfig::resolve`] rejects the config — a
     /// broken `rootUri`, a name outside the reader grammar, or a
     /// `packageUri` escaping its root; a broken config, reported loudly.
-    /// Duplicate names never reach here: dartq-pub dedups them to the first
-    /// entry at parse.
+    /// Duplicate names never reach here: dartq-pub floors the whole config
+    /// at parse on the first repeat.
     pub fn new(config: &PackageConfig, config_dir: &Path) -> Result<Self, PubError> {
         let resolved = config.resolve(config_dir)?;
         let mut lib_dirs: Vec<(PathBuf, Box<str>)> = Vec::new();
@@ -234,9 +234,11 @@ impl PackageTable {
             .enumerate()
             .map(|(index, (_, name))| (name.clone(), index))
             .collect();
-        let workspace_root = config_dir
-            .parent()
-            .map_or_else(|| config_dir.to_path_buf(), Path::to_path_buf);
+        let workspace_root = canonical_dir(
+            &config_dir
+                .parent()
+                .map_or_else(|| config_dir.to_path_buf(), Path::to_path_buf),
+        );
         // Per-context universe discovery: a config entry whose package root
         // carries its own `pubspec.yaml` AND its own
         // `.dart_tool/package_config.json` is a separate context root (the
@@ -246,9 +248,27 @@ impl PackageTable {
         // entry, and a `--packages` run skips that extension (the oracle's
         // `_defaultPackageConfigFile` short-circuit) so no entry carries its
         // own config and the table stays one flat universe, exactly there.
+        //
+        // Containment: only a root STRICTLY INSIDE the context root
+        // (`workspace_root`) becomes a context. The oracle's locator walks
+        // the analysis roots and only those (`context_locator.dart`
+        // `locateRoots`/`_createContextRoots`: a directory outside the
+        // included paths never becomes a context root), and everything a
+        // context loads — dependencies included — resolves through that one
+        // context's package map. An entry outside the context root (a
+        // sibling/path dependency carrying its own leftover, possibly stale
+        // or empty, `.dart_tool`) is only ever a dependency here: without
+        // the gate its own config would hijack its files' `package:` URIs
+        // and sever the export edges the analyzed context's fresh map would
+        // have landed (every export-forwarded name reporting undefined).
+        // The context root itself needs no context: the root universe IS
+        // its map.
         let mut contexts: Vec<(PathBuf, ContextUniverse)> = Vec::new();
         for package in &resolved {
             let root = canonical_dir(&package.root);
+            if root == workspace_root || !root.strip_prefix(&workspace_root).is_ok() {
+                continue;
+            }
             let nested_dir = root.join(".dart_tool");
             let nested_config = nested_dir.join("package_config.json");
             if !root.join("pubspec.yaml").is_file() || !nested_config.is_file() {
@@ -2494,22 +2514,24 @@ mod tests {
         );
     }
 
-    /// The shared dartq-pub face applies to this table too: duplicate
-    /// config names dedup at parse to their first entry (dartq-pub
-    /// `config.rs` `seen_names`, package_config's package-table builder),
-    /// so the index sees unique names and `lib_dir` answers with the first
-    /// entry's lib dir.
+    /// The shared dartq-pub face applies to this table too: a repeated
+    /// name floors the WHOLE config at parse (dartq-pub `config.rs`
+    /// `seen_names` — the loader's `_validatePackages` throws through the
+    /// analyzer's default handler and the catch degrades to a silent
+    /// `Packages.empty`; mixed-entry probe #2434), so `PackageTable::new`
+    /// never sees one and answers nothing for either entry.
     #[test]
-    fn duplicate_names_dedup_first_entry_wins() {
-        let config = PackageConfig::parse(
+    fn duplicate_names_floor_the_whole_config() {
+        let error = PackageConfig::parse(
             r#"{"configVersion": 2, "packages": [
                 {"name": "a", "rootUri": "../x"},
                 {"name": "a", "rootUri": "../y"}]}"#,
         )
-        .expect("parses");
-        let table =
-            PackageTable::new(&config, Path::new("/p/.dart_tool")).expect("deduped config");
-        assert_eq!(table.lib_dir("a"), Some(Path::new("/p/x")));
+        .expect_err("duplicate names floor the config");
+        assert!(
+            error.to_string().contains("duplicate package name `a`"),
+            "unexpected error: {error}"
+        );
     }
 
     // ---- resolve_conditional: configurable directives under the oracle
@@ -2928,5 +2950,73 @@ mod tests {
             ResolutionCode::UriDoesNotExist,
             "the root package is outside dep's universe"
         );
+    }
+
+    /// A dependency OUTSIDE the context root is never its own context: the
+    /// oracle's locator walks only the analysis roots (`context_locator.dart`
+    /// `locateRoots`), and everything a context loads — dependencies
+    /// included — resolves through that one context's package map. So a
+    /// sibling dep carrying its own leftover `.dart_tool` (here the
+    /// `Packages.empty` floor — the stale-config kill shot) must not hijack
+    /// its files' `package:` URIs: they resolve through the analyzed
+    /// context's map, keeping the dep's export edges landed instead of
+    /// severed (every export-forwarded name reporting undefined).
+    #[test]
+    fn sibling_dep_outside_the_root_resolves_through_the_root_universe() {
+        let root = std::env::temp_dir().join(format!(
+            "dartq-resolution-nested-sibling-{}-{}",
+            std::process::id(),
+            NESTED_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let write = |relative: &str, content: &str| {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            fs::write(&path, content).expect("file");
+        };
+        write("app/lib/main.dart", "// fixture\n");
+        // The root config AS WRITTEN lists the sibling dep outside `app`.
+        write(
+            "app/.dart_tool/package_config.json",
+            r#"{"configVersion": 2, "packages": [{"name": "app", "rootUri": "../", "packageUri": "lib/"}, {"name": "dep", "rootUri": "../../dep", "packageUri": "lib/"}], "generator": "pub"}"#,
+        );
+        write("dep/pubspec.yaml", "name: dep\nenvironment:\n  sdk: ^3.2.0\n");
+        write("dep/lib/d.dart", "// fixture\n");
+        // The dep's own leftover config: parseable but empty — its own
+        // universe would resolve nothing.
+        write(
+            "dep/.dart_tool/package_config.json",
+            r#"{"configVersion": 2, "packages": [], "generator": "pub"}"#,
+        );
+        let root = root.canonicalize().expect("canonical root");
+        let config_dir = root.join("app/.dart_tool");
+        let config = PackageConfig::parse(
+            &fs::read_to_string(config_dir.join("package_config.json")).expect("config"),
+        )
+        .expect("valid config");
+        let table = PackageTable::new(&config, &config_dir).expect("indexable config");
+        let snapshot = SdkFixture::new().load();
+        let declared = FxHashMap::default();
+        let mut files = FileTable::new();
+        let app = files.intern(&root.join("app/lib/main.dart"));
+        let dep = files.intern(&root.join("dep/lib/d.dart"));
+        let mut resolver = UriResolver::new(&table, &snapshot, &declared, &mut files, &|_| false);
+        // The root context resolves the dep, as ever.
+        let from_root =
+            resolver.resolve(app, Some("package:dep/d.dart"), DirectiveKind::ImportExport);
+        assert_eq!(from_root.code, None, "the root config as written lists dep");
+        // The dep's OWN files resolve through the analyzed context's map —
+        // the empty leftover config never governs them.
+        let own = resolver.resolve(dep, Some("package:dep/d.dart"), DirectiveKind::ImportExport);
+        assert_eq!(
+            own.code,
+            None,
+            "a dependency outside the context root resolves through the root universe"
+        );
+        let ResolvedUri::Package { package, file, .. } = own.uri.clone() else {
+            panic!("expected a package target");
+        };
+        assert_eq!(package.as_ref(), "dep");
+        assert_eq!(file, root.join("dep/lib/d.dart"));
     }
 }
