@@ -1171,9 +1171,46 @@ impl<'a> Engine<'a> {
                 // the `Object?` recovery (the `Und`-schema pins' verdict —
                 // a receiver argument the file cannot name collapses to the
                 // same invalid face the unresolved head already carried).
+                // A schema head the CALLEE ITSELF declares as a method
+                // type parameter (the container's own parameters excluded —
+                // they are the receiver's to instantiate) is the oracle's
+                // fresh-`T` face: the literal's parameters infer before
+                // the call's inference completes, so greatestClosure sees
+                // the parameter unresolved and answers its bound —
+                // `Object?` (the binary writer's `writeOptionalObject<T>(
+                // T? object, void Function(T x) write)` callback formal
+                // reports the unchecked verdict the oracle reports). Every
+                // other head keeps the receiver-stand-in walk below.
+                let callee_own_param = match recv {
+                    Receiver::Typed { type_name: container, .. } => {
+                        matches!(self.walk_members(container, callee_name), Walk::Found(ref entry)
+                            if entry.kind == MemberKind::Method
+                                && entry.type_param_names.contains(&head))
+                    }
+                    _ => false,
+                };
+                if callee_own_param {
+                    return Some(self.object_question());
+                }
                 match recv {
                     Receiver::Typed { ty, .. } => {
                         match self.receiver_first_type_arg(ty) {
+                            // No written first argument — a receiver the
+                            // instantiation never parameterized (the
+                            // non-generic `DatabaseConnectionUser` callee
+                            // holder, the arg-less statement face). Nothing
+                            // invalid was written, so greatestClosure's
+                            // `Object?` collapse does not apply wholesale —
+                            // the schema head is valid but locally unnamed
+                            // (the container's own parameter, an import).
+                            // The entry's own nullability still decides:
+                            // `greatestClosure(S?)` keeps the nullable face
+                            // (an unnamed nullable parameter still owes the
+                            // unchecked verdict, the binary writer's
+                            // `writeOptionalObject` callback), while a
+                            // non-nullable entry keeps `dynamic` (the
+                            // under-report `None`).
+                            None => nullable.then_some(self.object_question()),
                             Some(Ty::Dynamic) => None,
                             Some(Ty::Named {
                                 name: arg_head,

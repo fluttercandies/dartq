@@ -383,6 +383,50 @@ fn valid_context_schema_never_infers() {
     );
 }
 
+/// A schema head that is valid but locally unnameable — an imported class,
+/// the declaring container's own parameter — under a NON-GENERIC receiver
+/// (no written type argument to substitute) never reaches
+/// `greatestClosure`'s `Object?` collapse either: that collapse is for
+/// types invalid AS WRITTEN (`T <: Null`, an unresolvable annotation), and
+/// nothing invalid was written. The formal keeps `dynamic` and the member
+/// use stays silent, exactly where the oracle binds the real type (drift's
+/// `db.batch((b) => b.insertAll(...))` — `Batch` through the import on the
+/// non-generic connection holder — and `stmt.map((row) => row.read(...))`
+/// — the container's `T` with no instantiation to read).
+#[test]
+fn non_generic_receiver_unnameable_schema_stays_dynamic() {
+    let source = "class Conn { void batch(void Function(Batch) f) {} }\n\
+                  void f(Conn db) {\n\
+                    db.batch((b) { b.insertAll(); });\n\
+                  }\n";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// The container's own parameter is the receiver's to instantiate — a
+/// receiver face carrying no written type arguments leaves the head
+/// unnameable, and the formal keeps `dynamic` (silent): never the
+/// fresh-parameter `Object?` face, which belongs to the callee's own
+/// parameters alone (drift's `Selectable<N> map<N>(N Function(T)
+/// mapper)` under the arg-less statement face).
+#[test]
+fn container_param_schema_under_argless_receiver_stays_dynamic() {
+    let source = "class Sel<T> { void map<N>(N Function(T row) mapper) {} }\n\
+                  void f(Sel sel) {\n\
+                  sel.map((row) { row.read(); });\n\
+                  }\n";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
 /// An annotated invalid formal is `InvalidType` itself — the
 /// `isInvalidBounded` arm answers before `isNullable` runs, so `x.foo()`
 /// stays silent. (`Und` still reports its own `undefined_class` face.)
