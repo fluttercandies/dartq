@@ -81,6 +81,16 @@ pub enum Error {
     #[error("dart process exited early (exit code {0:?})")]
     ProcessExited(Option<i32>),
 
+    /// A local deadline elapsed: an RPC round-trip, a full write queue,
+    /// or a wait for the isolate to pause. Distinct from [`Error::Rpc`]
+    /// so callers can tell "the VM refused" from "we stopped waiting".
+    #[error("timed out: {0}")]
+    Timeout(String),
+
+    /// The isolate a call was waiting on exited.
+    #[error("isolate {0} exited")]
+    IsolateExited(String),
+
     /// The connection was closed — either the peer hung up or the
     /// session was shut down; pending RPCs are answered with this.
     #[error("connection closed")]

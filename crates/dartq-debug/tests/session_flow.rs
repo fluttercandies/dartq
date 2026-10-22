@@ -219,7 +219,7 @@ fn wait_for_pause_times_out() {
     let error = session
         .wait_for_pause("isolates/1")
         .expect_err("no pause ever arrives");
-    assert!(matches!(error, Error::Rpc { code: -1, .. }), "got {error:?}");
+    assert!(matches!(error, Error::Timeout(_)), "got {error:?}");
 }
 
 #[test]
@@ -317,8 +317,11 @@ fn conditional_breakpoint_false_then_true_stops() {
     assert_eq!(resume.params["isolateId"], "isolates/1");
 }
 
+/// A condition that cannot be evaluated must not silently disarm its
+/// breakpoint: the stop is reported with the evaluation error and no
+/// auto-resume is issued.
 #[test]
-fn conditional_breakpoint_eval_error_auto_resumes() {
+fn conditional_breakpoint_eval_error_reports_condition_error() {
     let evaluations = Arc::new(AtomicUsize::new(0));
     let resumes = Arc::new(AtomicUsize::new(0));
     let eval_counter = Arc::clone(&evaluations);
@@ -356,9 +359,18 @@ fn conditional_breakpoint_eval_error_auto_resumes() {
         .expect("push first pause");
 
     let snapshot = session.wait_for_pause("isolates/1").expect("snapshot");
-    assert_eq!(snapshot.reason, StoppedReason::Interrupted);
-    assert_eq!(evaluations.load(Ordering::SeqCst), 2);
-    assert_eq!(resumes.load(Ordering::SeqCst), 2);
+    match snapshot.reason {
+        StoppedReason::ConditionError {
+            breakpoints,
+            message,
+        } => {
+            assert_eq!(breakpoints, ["breakpoints/1"]);
+            assert!(message.contains("113"), "message: {message}");
+        }
+        other => panic!("expected ConditionError, got {other:?}"),
+    }
+    assert_eq!(evaluations.load(Ordering::SeqCst), 1);
+    assert_eq!(resumes.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -604,7 +616,13 @@ fn expand_truncates_children_to_width_limit() {
     });
     let mut session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
     let children = session.expand(None, "objects/root").expect("expand");
-    assert_eq!(children.len(), 100);
+    // 100 fields plus the trailing "more" row.
+    assert_eq!(children.len(), 101);
+    assert_eq!(children[100].name, "[...]");
+    assert_eq!(children[100].value, "50 more");
+    let request = vm.expect_request("getObject");
+    assert_eq!(request.params["count"], 100);
+    assert_eq!(request.params["offset"], 0);
     assert_eq!(children[0].name, "f0");
     assert_eq!(children[0].value, "0");
     assert_eq!(children[0].handle.as_deref(), Some("objects/0"));
@@ -665,6 +683,7 @@ fn expand_graph_respects_depth_limit() {
         expand_limits: ExpandLimits {
             max_children: 100,
             max_depth: 3,
+            max_nodes: 500,
         },
         ..SessionConfig::default()
     };
@@ -752,24 +771,24 @@ fn events_since_marks_gap_and_keeps_cursor_monotonic() {
 
     session.stack(None, 1).expect("first barrier");
     session.poll_events().expect("poll events");
-    let first = session.events_since(0);
+    let first = session.events_since(0, usize::MAX);
     assert_eq!(first.dropped, 2);
     assert_eq!(first.events.len(), 3);
     assert_eq!(first.next_cursor, 5);
     let cursors: Vec<u64> = first.events.iter().map(|event| event.cursor).collect();
     assert_eq!(cursors, [2, 3, 4]);
-    assert_eq!(session.events_since(5).events.len(), 0);
+    assert_eq!(session.events_since(5, usize::MAX).events.len(), 0);
 
     session.stack(None, 1).expect("second barrier");
     session.poll_events().expect("poll events");
-    let second = session.events_since(5);
+    let second = session.events_since(5, usize::MAX);
     assert_eq!(second.dropped, 0);
     assert_eq!(second.events.len(), 2);
     assert_eq!(second.next_cursor, 7);
     let cursors: Vec<u64> = second.events.iter().map(|event| event.cursor).collect();
     assert_eq!(cursors, [5, 6]);
-    assert_eq!(session.events_since(0).dropped, 4);
-    assert_eq!(session.events_since(7).next_cursor, 7);
+    assert_eq!(session.events_since(0, usize::MAX).dropped, 4);
+    assert_eq!(session.events_since(7, usize::MAX).next_cursor, 7);
 }
 
 #[test]
@@ -794,11 +813,11 @@ fn client_feed_overrun_surfaces_in_events_since_dropped() {
     let mut session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
     session.stack(None, 1).expect("barrier rpc");
     session.poll_events().expect("poll events");
-    let batch = session.events_since(0);
+    let batch = session.events_since(0, usize::MAX);
     assert_eq!(batch.dropped, 3);
     assert_eq!(batch.events.len(), dartq_debug::EVENT_BUFFER_CAPACITY);
     // Subsequent reads keep reporting the accumulated gap.
-    assert_eq!(session.events_since(0).dropped, 3);
+    assert_eq!(session.events_since(0, usize::MAX).dropped, 3);
 }
 
 #[test]
@@ -857,19 +876,19 @@ fn attach_mode_write_events_feed_stdout_and_stderr() {
     let mut session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
     session.stack(None, 1).expect("barrier rpc");
     session.poll_events().expect("poll events");
-    assert_eq!(session.stdout_since(0).bytes, b"hello\n");
-    assert_eq!(session.stderr_since(0).bytes, b"oops!\n");
+    assert_eq!(session.stdout_since(0, usize::MAX).bytes, b"hello\n");
+    assert_eq!(session.stderr_since(0, usize::MAX).bytes, b"oops!\n");
 }
 
 #[test]
 fn output_batches_start_empty_for_attached_session() {
     let vm = MockVm::start_default();
     let session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
-    let stdout = session.stdout_since(0);
+    let stdout = session.stdout_since(0, usize::MAX);
     assert!(stdout.bytes.is_empty());
     assert_eq!(stdout.next_cursor, 0);
     assert_eq!(stdout.dropped, 0);
-    let stderr = session.stderr_since(0);
+    let stderr = session.stderr_since(0, usize::MAX);
     assert!(stderr.bytes.is_empty());
     assert_eq!(stderr.next_cursor, 0);
 }
@@ -889,7 +908,7 @@ fn event_payload_keeps_typed_shape_and_drops_raw_for_modeled_kinds() {
     let mut session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
     session.stack(None, 1).expect("barrier");
     session.poll_events().expect("poll events");
-    let batch = session.events_since(0);
+    let batch = session.events_since(0, usize::MAX);
     assert_eq!(batch.events.len(), 1);
     let event = &batch.events[0];
     assert_eq!(event.stream_id, "Debug");

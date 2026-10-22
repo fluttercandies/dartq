@@ -123,12 +123,12 @@ fn live_debug_session() {
     let stepped = session
         .step_and_package(None, Some(StepOption::Over))
         .expect("step over");
-    assert!(matches!(
-        stepped.reason,
-        StoppedReason::Breakpoint { .. } | StoppedReason::Interrupted
-    ));
+    // The VM reports a completed step as a breakpoint-less
+    // `PauseBreakpoint`, which the session surfaces as `Step`.
+    assert_eq!(stepped.reason, StoppedReason::Step, "step over landed on {stepped:?}");
+    assert_eq!(stepped.location.line, Some(7), "step over from line 6");
 
-    session.remove_breakpoint(&handle.id).expect("remove breakpoint");
+    session.remove_breakpoint(None, &handle.id).expect("remove breakpoint");
 
     // The remaining program output shows up in the stdout ring.
     session.resume(None).expect("final resume");
@@ -136,7 +136,7 @@ fn live_debug_session() {
     let mut output = Vec::new();
     while !output.windows(b"counter=1".len()).any(|window| window == b"counter=1") {
         session.poll_events().expect("poll output");
-        let batch = session.stdout_since(0);
+        let batch = session.stdout_since(0, usize::MAX);
         output = batch.bytes;
         if std::time::Instant::now() >= deadline {
             panic!(

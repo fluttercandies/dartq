@@ -44,6 +44,7 @@ fn config() -> SessionConfig {
         expand_limits: ExpandLimits {
             max_children: 100,
             max_depth: 4,
+            max_nodes: 500,
         },
         ..SessionConfig::default()
     }
@@ -358,7 +359,7 @@ fn complex_debug_session() {
 
     // ---- Phase 6: events/stdout rings + reload + remove + terminate ----
     session.poll_events().expect("poll events");
-    let events: EventBatch = session.events_since(0);
+    let events: EventBatch = session.events_since(0, usize::MAX);
     assert!(!events.events.is_empty(), "no events recorded");
 
     // Reload the (unchanged) sources — should succeed trivially.
@@ -367,7 +368,7 @@ fn complex_debug_session() {
 
     // remove_breakpoint on an unknown id is a no-op, not an error.
     session
-        .remove_breakpoint("breakpoints/9999")
+        .remove_breakpoint(None, "breakpoints/9999")
         .expect("remove unknown breakpoint should be a no-op");
 
     // Fire-and-forget resume to program end; collect stdout.
@@ -379,7 +380,7 @@ fn complex_debug_session() {
         .any(|w| w == b"list=1 sum=100")
     {
         session.poll_events().expect("poll output");
-        output = session.stdout_since(0).bytes;
+        output = session.stdout_since(0, usize::MAX).bytes;
         if Instant::now() >= deadline {
             panic!(
                 "program output never arrived; saw {:?}",

@@ -1,121 +1,138 @@
 //! A bounded ring buffer with a monotonic cursor: events and captured
 //! output stream in faster than any consumer drains them, and the
 //! session's memory discipline forbids unbounded growth — old entries
-//! are overwritten and the consumer learns about the hole via
-//! [`Ring::dropped`].
+//! are evicted and the consumer learns about the hole through the
+//! sequence space (a cursor whose entries are gone reads as dropped).
 
-/// Bounded FIFO: `capacity` slots; pushing past the end overwrites the
-/// oldest slot.
+use std::collections::VecDeque;
+
+/// Bounded FIFO keyed by a monotonic sequence number.
 ///
-/// A consumer holds a `u64` cursor (the sequence number of the next
-/// entry it wants — `0` means "from the first entry ever pushed") and
-/// calls [`Ring::since`]. Entries evicted before the cursor ever got
-/// read surface through [`Ring::dropped`] so the consumer can mark a
-/// gap rather than silently lose them.
+/// Every entry carries its sequence number, so the sequence space may
+/// contain holes: [`Ring::skip`] advances the cursor space for entries
+/// that were lost upstream (a full channel, a full pipe queue) without
+/// occupying a slot — the retained window is never shrunk by a gap.
+///
+/// Storage grows on demand up to `capacity`: an idle ring costs no
+/// slot memory, a full one exactly `capacity` entries.
 #[derive(Debug)]
 pub struct Ring<T> {
-    slots: Vec<Option<T>>,
-    /// Total entries ever pushed (== next sequence number).
-    pushed: u64,
-    /// Sequence watermark below which nothing can be served: pushed
-    /// entries overwritten by wrap-around, plus anything dropped by
-    /// [`Ring::clear`].
-    cleared_to: u64,
+    entries: VecDeque<(u64, T)>,
+    capacity: usize,
+    /// Next sequence number (== total sequence numbers ever issued,
+    /// pushed or skipped).
+    next: u64,
 }
 
 impl<T> Ring<T> {
-    /// Creates a ring holding at most `capacity` entries. `capacity`
-    /// of zero degrades to a counter-only ring (every push counts as
-    /// dropped).
+    /// Creates a ring retaining at most `capacity` entries. A capacity
+    /// of zero degrades to a counter-only ring (every push is dropped).
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            slots: std::iter::repeat_with(|| None).take(capacity).collect(),
-            pushed: 0,
-            cleared_to: 0,
+            entries: VecDeque::new(),
+            capacity,
+            next: 0,
         }
     }
 
-    /// Appends one entry, returning its sequence number.
+    /// Appends one entry, returning its sequence number; evicts the
+    /// oldest entry when full.
     pub fn push(&mut self, entry: T) -> u64 {
-        let seq = self.pushed;
-        self.pushed += 1;
-        if !self.slots.is_empty() {
-            let slot = (seq % self.slots.len() as u64) as usize;
-            self.slots[slot] = Some(entry);
+        let seq = self.next;
+        self.next += 1;
+        if self.capacity == 0 {
+            return seq;
         }
+        if self.entries.len() == self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((seq, entry));
         seq
     }
 
-    /// Total entries ever pushed (the sequence space end).
+    /// Advances the sequence space by `count` numbers that will never
+    /// hold an entry — they read as dropped to every cursor below them.
+    pub fn skip(&mut self, count: u64) {
+        self.next += count;
+    }
+
+    /// The next sequence number (the sequence space end).
     #[must_use]
     pub fn pushed(&self) -> u64 {
-        self.pushed
+        self.next
     }
 
     /// Number of entries currently retained.
     #[must_use]
     pub fn len(&self) -> usize {
-        (self.pushed - self.oldest_seq()) as usize
+        self.entries.len()
     }
 
-    /// Whether the ring is empty.
+    /// Whether the ring retains nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.entries.is_empty()
     }
 
-    /// Sequence number of the oldest retained entry — the smallest
-    /// cursor position that can still be served.
+    /// Sequence number of the oldest retained entry (the sequence end
+    /// when empty).
     #[must_use]
     pub fn oldest_seq(&self) -> u64 {
-        let retained = self.slots.len() as u64;
-        self.pushed.saturating_sub(retained).max(self.cleared_to)
+        self.entries.front().map_or(self.next, |(seq, _)| *seq)
     }
 
-    /// Entries dropped before ever being read — pushed minus retained.
+    /// Sequence numbers issued but not retained: evicted plus skipped.
     #[must_use]
     pub fn dropped(&self) -> u64 {
-        self.oldest_seq()
+        self.next - self.entries.len() as u64
     }
 
-    /// Returns retained entries with sequence numbers `>= start`,
-    /// oldest first. A cursor below the tail is clamped (callers see
-    /// [`Ring::dropped`] for the gap size).
-    pub fn since(&self, cursor: u64) -> Vec<&T> {
-        self.range(cursor.max(self.oldest_seq())).collect()
+    /// Retained entries with sequence numbers `>= cursor`, oldest
+    /// first. O(log n) to locate the cursor, no allocation.
+    pub fn since(&self, cursor: u64) -> impl Iterator<Item = &T> {
+        let start = self.entries.partition_point(|(seq, _)| *seq < cursor);
+        self.entries.range(start..).map(|(_, entry)| entry)
+    }
+
+    /// Retained `(sequence, entry)` pairs with sequence `>= cursor`,
+    /// oldest first.
+    pub fn entries_since(&self, cursor: u64) -> impl Iterator<Item = (u64, &T)> {
+        let start = self.entries.partition_point(|(seq, _)| *seq < cursor);
+        self.entries.range(start..).map(|(seq, entry)| (*seq, entry))
+    }
+
+    /// How many sequence numbers in `[start, end)` cannot be served
+    /// (evicted, cleared, or skipped) — the exact gap a page covering
+    /// that span has to report. Bounds clamp to the issued space.
+    #[must_use]
+    pub fn missing_in(&self, start: u64, end: u64) -> u64 {
+        let end = end.min(self.next);
+        let start = start.min(end);
+        let first = self.entries.partition_point(|(seq, _)| *seq < start);
+        let last = self.entries.partition_point(|(seq, _)| *seq < end);
+        (end - start) - (last - first) as u64
     }
 
     /// All retained entries, oldest first.
     pub fn iter(&self) -> impl Iterator<Item = &T> {
-        self.range(self.oldest_seq())
-    }
-
-    /// Sequence-to-slot mapping shared by `since` and `iter`; empty
-    /// for a zero-capacity ring.
-    fn range(&self, from: u64) -> impl Iterator<Item = &T> {
-        let slot_count = self.slots.len() as u64;
-        (from..self.pushed).filter_map(move |seq| {
-            if slot_count == 0 {
-                return None;
-            }
-            self.slots[(seq % slot_count) as usize].as_ref()
-        })
+        self.entries.iter().map(|(_, entry)| entry)
     }
 
     /// Removes every retained entry while keeping sequence numbers
     /// meaningful (consumers see the removed span as dropped).
     pub fn clear(&mut self) {
-        for slot in &mut self.slots {
-            *slot = None;
-        }
-        self.cleared_to = self.pushed;
+        self.entries.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Ring;
+
+    fn since<T: Copy>(ring: &Ring<T>, cursor: u64) -> Vec<T> {
+        ring.since(cursor).copied().collect()
+    }
 
     #[test]
     fn push_assigns_monotonic_sequences() {
@@ -133,9 +150,9 @@ mod tests {
         for value in 0..3 {
             ring.push(value);
         }
-        assert_eq!(ring.since(0), [&0, &1, &2]);
-        assert_eq!(ring.since(1), [&1, &2]);
-        assert_eq!(ring.since(3), Vec::<&i32>::new());
+        assert_eq!(since(&ring, 0), [0, 1, 2]);
+        assert_eq!(since(&ring, 1), [1, 2]);
+        assert_eq!(since(&ring, 3), Vec::<i32>::new());
         assert_eq!(ring.iter().copied().collect::<Vec<_>>(), [0, 1, 2]);
     }
 
@@ -147,10 +164,12 @@ mod tests {
         }
         assert_eq!(ring.oldest_seq(), 2);
         assert_eq!(ring.dropped(), 2);
-        assert_eq!(ring.since(0), [&2, &3, &4]);
-        assert_eq!(ring.since(2), [&2, &3, &4]);
-        assert_eq!(ring.since(4), [&4]);
+        assert_eq!(since(&ring, 0), [2, 3, 4]);
+        assert_eq!(since(&ring, 2), [2, 3, 4]);
+        assert_eq!(since(&ring, 4), [4]);
         assert_eq!(ring.len(), 3);
+        assert_eq!(ring.missing_in(0, u64::MAX), 2);
+        assert_eq!(ring.missing_in(2, u64::MAX), 0);
     }
 
     #[test]
@@ -159,9 +178,8 @@ mod tests {
         for value in 0..4 {
             ring.push(value);
         }
-        // A consumer that fell behind by more than the capacity sees
-        // only what is retained; `dropped()` tells it what it missed.
-        assert_eq!(ring.since(1), [&2, &3]);
+        assert_eq!(since(&ring, 1), [2, 3]);
+        assert_eq!(ring.missing_in(1, u64::MAX), 1);
         assert_eq!(ring.dropped(), 2);
     }
 
@@ -174,7 +192,8 @@ mod tests {
         assert_eq!(ring.pushed(), 2);
         assert_eq!(ring.oldest_seq(), 2);
         assert_eq!(ring.dropped(), 2);
-        assert_eq!(ring.since(0), Vec::<&&str>::new());
+        assert_eq!(ring.since(0).count(), 0);
+        assert_eq!(ring.missing_in(0, u64::MAX), 2);
         assert_eq!(ring.iter().count(), 0);
     }
 
@@ -188,9 +207,37 @@ mod tests {
         assert_eq!(ring.pushed(), 2);
         assert_eq!(ring.oldest_seq(), 2);
         assert_eq!(ring.dropped(), 2);
-        assert_eq!(ring.since(0), Vec::<&&str>::new());
+        assert_eq!(ring.since(0).count(), 0);
         ring.push("c");
-        assert_eq!(ring.since(2), [&"c"]);
+        assert_eq!(since(&ring, 2), ["c"]);
         assert_eq!(ring.push("d"), 3);
+    }
+
+    #[test]
+    fn skipped_sequences_read_as_dropped_without_evicting() {
+        let mut ring = Ring::new(3);
+        ring.push(0);
+        ring.push(1);
+        ring.skip(5); // seqs 2..7 lost upstream
+        assert_eq!(ring.push(7), 7);
+        // The gap occupies no slot: all three real entries survive.
+        assert_eq!(since(&ring, 0), [0, 1, 7]);
+        assert_eq!(ring.missing_in(0, u64::MAX), 5);
+        assert_eq!(ring.missing_in(2, u64::MAX), 5);
+        assert_eq!(ring.missing_in(7, u64::MAX), 0);
+        assert_eq!(since(&ring, 3), [7]);
+        assert_eq!(ring.dropped(), 5);
+        // A page ending inside the gap reports only its own share.
+        assert_eq!(ring.missing_in(0, 4), 2);
+        let pairs: Vec<(u64, i32)> = ring.entries_since(1).map(|(seq, v)| (seq, *v)).collect();
+        assert_eq!(pairs, [(1, 1), (7, 7)]);
+    }
+
+    #[test]
+    fn storage_grows_lazily_up_to_capacity() {
+        let mut ring: Ring<u8> = Ring::new(1_000_000);
+        assert_eq!(ring.entries.capacity(), 0, "an idle ring holds no slots");
+        ring.push(1);
+        assert!(ring.entries.capacity() < 1_000_000);
     }
 }

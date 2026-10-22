@@ -207,6 +207,25 @@ pub fn default_reply(request: &Request) -> Reply {
             "isolates": [isolate_ref("isolates/1", "1", "main")],
             "systemIsolates": [],
         })),
+        // A runnable, running isolate: no pause to seed at attach.
+        "getIsolate" => ok(json!({
+            "type": "Isolate",
+            "id": request.params["isolateId"],
+            "number": "1",
+            "name": "main",
+            "runnable": true,
+            "pauseEvent": {
+                "type": "Event",
+                "kind": "Resume",
+                "isolate": isolate_ref(
+                    request.params["isolateId"].as_str().unwrap_or_default(),
+                    "1",
+                    "main",
+                ),
+                "timestamp": 1_i64,
+            },
+            "breakpoints": [],
+        })),
         "streamListen" | "streamCancel" => success(),
         "resume" | "pause" => success(),
         "removeBreakpoint" | "setIsolatePauseMode" | "setExceptionPauseMode" => success(),

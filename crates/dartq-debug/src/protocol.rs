@@ -544,11 +544,12 @@ impl<'de> Deserialize<'de> for ValueOrSentinel {
                         value_as_string: None,
                     })
                 }),
-            Some(tag) if tag.contains("Instance") => serde_json::from_value(value)
-                .map(|i| Self::Instance(Box::new(i)))
-                .unwrap_or_else(|e| {
-                    Self::Other(Value::String(format!("unparseable instance: {e}")))
-                }),
+            // Parse from a borrow so a shape the model does not accept
+            // still reaches the caller verbatim.
+            Some(tag) if tag.contains("Instance") => match Instance::deserialize(&value) {
+                Ok(instance) => Self::Instance(Box::new(instance)),
+                Err(_) => Self::Other(value),
+            },
             _ => Self::Other(value),
         })
     }
@@ -1340,9 +1341,10 @@ impl VmObject {
                     .unwrap_or_default()
                     .to_owned(),
             },
-            tag if tag.ends_with("Instance") => serde_json::from_value(value)
-                .map(|i| Self::Instance(Box::new(i)))
-                .unwrap_or(Self::Other(Value::Null)),
+            tag if tag.ends_with("Instance") => match Instance::deserialize(&value) {
+                Ok(instance) => Self::Instance(Box::new(instance)),
+                Err(_) => Self::Other(value),
+            },
             _ => Self::Other(value),
         }
     }

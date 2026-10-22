@@ -533,11 +533,12 @@ fn vm_object_dispatches_on_the_type_tag() {
     }
 
     // An Instance-tagged value with a missing required field degrades
-    // to `Other` instead of panicking or failing the connection.
-    assert!(matches!(
-        VmObject::from_value(json!({"type": "@Instance", "valueAsString": "x"})),
-        VmObject::Other(Value::Null)
-    ));
+    // to `Other` carrying the raw payload, so the caller still sees
+    // what the VM sent.
+    match VmObject::from_value(json!({"type": "@Instance", "valueAsString": "x"})) {
+        VmObject::Other(Value::Object(raw)) => assert_eq!(raw["valueAsString"], "x"),
+        other => panic!("expected raw Other, got {other:?}"),
+    }
 }
 
 #[test]

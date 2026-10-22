@@ -132,7 +132,7 @@ fn attach_pause_step_rewind() {
     // events_since must carry at least the pause + breakpoint events
     // we already consumed.
     session.poll_events().expect("final poll");
-    let batch = session.events_since(0);
+    let batch = session.events_since(0, usize::MAX);
     assert!(
         !batch.events.is_empty(),
         "no events recorded after attach session"

@@ -365,6 +365,7 @@ version = "1.0.0"
 dependencies = [
  "base64",
  "crossbeam-channel",
+ "parking_lot",
  "rustc-hash",
  "serde",
  "serde_json",

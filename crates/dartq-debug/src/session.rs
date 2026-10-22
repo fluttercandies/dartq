@@ -18,6 +18,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, TrySendError, bounded};
@@ -37,9 +39,25 @@ const SUPPORTED_MAJOR: u64 = 4;
 
 /// Streams every session subscribes to before arming breakpoints:
 /// `Debug` carries pause/breakpoint events, `Isolate` the isolate
-/// lifecycle, `Stdout`/`Stderr` process output, `Logging`
-/// `dart:developer.log` records.
-const STREAMS: [&str; 5] = ["Debug", "Isolate", "Stdout", "Stderr", "Logging"];
+/// lifecycle, `Logging` `dart:developer.log` records.
+const CONTROL_STREAMS: [&str; 3] = ["Debug", "Isolate", "Logging"];
+
+/// Output streams an *attached* session subscribes to. A launched
+/// session already owns the child's pipes; subscribing as well would
+/// make the embedder forward every write a second time (the
+/// `ServiceStreamListenCallback` turns capture on) and duplicate each
+/// byte in the rings.
+const OUTPUT_STREAMS: [&str; 2] = ["Stdout", "Stderr"];
+
+/// Upper bound on one `WriteEvent` chunk stored in an output ring, so
+/// the ring's byte ceiling (`capacity × chunk`) holds in attach mode
+/// too — a single `print` of a huge string arrives as one event.
+const WRITE_EVENT_CHUNK: usize = PIPE_READ_SIZE;
+
+/// Longest line the pipe reader buffers while scanning for the
+/// service banner; longer lines cannot be the banner and are dropped
+/// from the scan (never from the captured output).
+const BANNER_LINE_LIMIT: usize = 4096;
 
 /// How many output chunks the stdout/stderr rings retain. A chunk is
 /// whatever one pipe read produced, so total bytes are bounded by
@@ -60,6 +78,11 @@ pub struct ExpandLimits {
     pub max_children: usize,
     /// Maximum levels `expand_graph` walks from the root.
     pub max_depth: usize,
+    /// Maximum rows `expand_graph` returns in total. Width and depth
+    /// alone allow `max_children^max_depth` rows (one RPC each for the
+    /// expandable ones); this budget keeps a wide graph to a bounded
+    /// number of `getObject` round-trips.
+    pub max_nodes: usize,
 }
 
 impl Default for ExpandLimits {
@@ -67,6 +90,7 @@ impl Default for ExpandLimits {
         Self {
             max_children: 100,
             max_depth: 3,
+            max_nodes: 500,
         }
     }
 }
@@ -253,6 +277,19 @@ pub enum StoppedReason {
         /// The VM breakpoint ids hit here.
         breakpoints: Vec<String>,
     },
+    /// Paused after a single step: the VM reports a step as a
+    /// `PauseBreakpoint` with no breakpoints.
+    Step,
+    /// Paused at a conditional breakpoint whose condition failed to
+    /// evaluate (it does not compile, or the RPC failed). The stop is
+    /// surfaced so a broken condition cannot silently disarm the
+    /// breakpoint.
+    ConditionError {
+        /// The VM breakpoint ids hit here.
+        breakpoints: Vec<String>,
+        /// The evaluation error.
+        message: String,
+    },
     /// Paused on an exception (mode-dependent).
     Exception,
     /// Paused by an explicit [`DebugSession::pause`].
@@ -338,8 +375,6 @@ enum PipeEvent {
     Stderr(Vec<u8>),
     /// The service URI found in either stream.
     Banner(String),
-    /// The stream ended.
-    Eof,
 }
 
 /// A live debug session: connection, process (when launched), isolate
@@ -352,10 +387,13 @@ pub struct DebugSession {
     isolates: FxHashMap<String, IsolateRef>,
     /// The default target: the first non-system isolate.
     main_isolate: Option<String>,
-    /// Breakpoints by VM id.
-    breakpoints: FxHashMap<String, BreakpointHandle>,
-    /// Most recent pause event per isolate.
-    pause_events: FxHashMap<String, Event>,
+    /// Breakpoints by `(isolate id, VM breakpoint id)`. Breakpoint ids
+    /// are numbered per isolate (`breakpoints/1` exists in every
+    /// isolate that has one), so the id alone is ambiguous.
+    breakpoints: FxHashMap<(String, String), BreakpointHandle>,
+    /// Most recent pause event per isolate, with its feed sequence
+    /// number (used to ignore pauses that predate a resume).
+    pause_events: FxHashMap<String, (u64, Event)>,
     /// Stream events ring (sequence == [`SessionEvent::cursor`]).
     events: Ring<SessionEvent>,
     /// Captured stdout chunks.
@@ -364,6 +402,11 @@ pub struct DebugSession {
     stderr: Ring<Vec<u8>>,
     /// Pipe reader feed (`None` when attached, not launched).
     pipe_feed: Option<Receiver<PipeEvent>>,
+    /// Chunks the pipe readers dropped because the feed was full, per
+    /// stream (`[stdout, stderr]`), and how many were already folded
+    /// into the rings as skipped sequence numbers.
+    pipe_drops: Option<Arc<[AtomicU64; 2]>>,
+    folded_pipe_drops: [u64; 2],
     /// Consecutive auto-resumes per isolate, without a reported stop.
     ///
     /// Invariant: an entry is *only* cleared when that isolate's own
@@ -375,13 +418,6 @@ pub struct DebugSession {
     /// different isolate toward `ConditionalResumeLimit` and surface
     /// a false stop.
     auto_resumes: FxHashMap<String, u32>,
-    /// Events the client-level feed dropped because its bounded
-    /// channel was full — accumulated into [`EventBatch::dropped`] so
-    /// agents see the true gap.
-    event_drops_from_client: u64,
-    /// The `dropped_events` watermark already folded into
-    /// `event_drops_from_client`.
-    last_seen_client_drops: u64,
     /// Root-library object id per isolate, resolved lazily by
     /// [`DebugSession::evaluate_in_root_lib`].
     root_libs: FxHashMap<String, String>,
@@ -434,42 +470,40 @@ impl DebugSession {
         })?;
 
         let (tx, rx) = bounded(PIPE_QUEUE_CAPACITY);
+        let drops = Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
         if let Some(stdout) = child.stdout.take() {
-            spawn_pipe_reader(stdout, PipeKind::Stdout, tx.clone());
+            spawn_pipe_reader(stdout, PipeKind::Stdout, tx.clone(), Arc::clone(&drops))?;
         }
         if let Some(stderr) = child.stderr.take() {
-            spawn_pipe_reader(stderr, PipeKind::Stderr, tx.clone());
+            spawn_pipe_reader(stderr, PipeKind::Stderr, tx.clone(), Arc::clone(&drops))?;
         }
         drop(tx);
 
-        let (service_uri, early_stdout, early_stderr) =
-            await_banner(&mut child, &rx, config.launch_timeout)?;
-        let ws_uri = service_uri_to_ws(&service_uri)?;
-        let client = VmClient::connect(&ws_uri)?;
-        let mut session = Self {
-            client,
-            process: Some(child),
-            events: Ring::new(settings.event_capacity),
-            stdout: Ring::new(settings.output_capacity),
-            stderr: Ring::new(settings.output_capacity),
-            config: settings,
-            isolates: FxHashMap::default(),
-            main_isolate: None,
-            breakpoints: FxHashMap::default(),
-            pause_events: FxHashMap::default(),
-            pipe_feed: Some(rx),
-            auto_resumes: FxHashMap::default(),
-            event_drops_from_client: 0,
-            last_seen_client_drops: 0,
-            root_libs: FxHashMap::default(),
+        // From here on any failure must not leak the spawned VM.
+        let connected = await_banner(&mut child, &rx, config.launch_timeout).and_then(
+            |(service_uri, early_stdout, early_stderr)| {
+                let client = VmClient::connect(&service_uri_to_ws(&service_uri)?)?;
+                Ok((client, early_stdout, early_stderr))
+            },
+        );
+        let (client, early_stdout, early_stderr) = match connected {
+            Ok(parts) => parts,
+            Err(error) => {
+                reap(&mut child);
+                return Err(error);
+            }
         };
+        let mut session = Self::new(client, Some(child), settings);
+        session.pipe_feed = Some(rx);
+        session.pipe_drops = Some(drops);
         for chunk in early_stdout {
             session.stdout.push(chunk);
         }
         for chunk in early_stderr {
             session.stderr.push(chunk);
         }
-        session.handshake()?;
+        // On failure `session` drops here, and its Drop reaps the child.
+        session.handshake(false)?;
         Ok(session)
     }
 
@@ -492,9 +526,15 @@ impl DebugSession {
     /// See [`DebugSession::attach`].
     pub fn attach_with(ws_uri: &str, settings: SessionConfig) -> Result<Self> {
         let client = VmClient::connect(ws_uri)?;
-        let mut session = Self {
+        let mut session = Self::new(client, None, settings);
+        session.handshake(true)?;
+        Ok(session)
+    }
+
+    fn new(client: VmClient, process: Option<Child>, settings: SessionConfig) -> Self {
+        Self {
             client,
-            process: None,
+            process,
             events: Ring::new(settings.event_capacity),
             stdout: Ring::new(settings.output_capacity),
             stderr: Ring::new(settings.output_capacity),
@@ -504,18 +544,18 @@ impl DebugSession {
             breakpoints: FxHashMap::default(),
             pause_events: FxHashMap::default(),
             pipe_feed: None,
+            pipe_drops: None,
+            folded_pipe_drops: [0; 2],
             auto_resumes: FxHashMap::default(),
-            event_drops_from_client: 0,
-            last_seen_client_drops: 0,
             root_libs: FxHashMap::default(),
-        };
-        session.handshake()?;
-        Ok(session)
+        }
     }
 
     /// Negotiates the protocol version, subscribes the session
-    /// streams, and seeds isolate tracking from `getVM`.
-    fn handshake(&mut self) -> Result<()> {
+    /// streams, seeds isolate tracking from `getVM`, and seeds each
+    /// isolate's current pause state — an isolate already paused when
+    /// the session attaches never re-sends its pause event.
+    fn handshake(&mut self, output_streams: bool) -> Result<()> {
         let version = self.client.get_version()?;
         if version.major != SUPPORTED_MAJOR {
             return Err(Error::VersionIncompatible {
@@ -527,15 +567,52 @@ impl DebugSession {
         // Subscribe before anything can pause so no early event is
         // lost; a duplicate subscription (103) is benign when another
         // client already listens on this VM.
-        for stream in STREAMS {
+        let outputs: &[&str] = if output_streams { &OUTPUT_STREAMS } else { &[] };
+        for stream in CONTROL_STREAMS.iter().chain(outputs) {
             match self.client.stream_listen(stream) {
                 Ok(()) | Err(Error::Rpc { code: 103, .. }) => {}
                 Err(error) => return Err(error),
             }
         }
         let vm = self.client.get_vm()?;
-        for isolate in vm.isolates.into_iter().chain(vm.system_isolates) {
+        // System isolates are tracked for completeness but are not
+        // debug targets; only user isolates get their pause state.
+        for isolate in vm.system_isolates {
             self.note_isolate(isolate);
+        }
+        for isolate in vm.isolates {
+            let id = isolate.id.clone();
+            self.note_isolate(isolate);
+            self.seed_pause_state(&id)?;
+        }
+        Ok(())
+    }
+
+    /// Records the isolate's current pause event (`getIsolate`'s
+    /// `pauseEvent`) unless a live event already superseded it. A
+    /// collected isolate is simply forgotten.
+    fn seed_pause_state(&mut self, isolate: &str) -> Result<()> {
+        let fetched: crate::protocol::Isolate = match self.client.call_typed(
+            "getIsolate",
+            json!({ "isolateId": isolate }),
+            self.config.rpc_timeout,
+        ) {
+            Ok(fetched) => fetched,
+            Err(Error::Sentinel { .. }) => {
+                self.forget_isolate(isolate);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(root) = fetched.root_lib {
+            self.root_libs.insert(isolate.to_owned(), root.id);
+        }
+        if let Some(event) = fetched.pause_event
+            && is_pause_kind(&event.kind)
+            && !self.pause_events.contains_key(isolate)
+        {
+            // Sequence 0: a seeded pause predates every live event.
+            self.pause_events.insert(isolate.to_owned(), (0, event));
         }
         Ok(())
     }
@@ -563,6 +640,10 @@ impl DebugSession {
     /// `addBreakpointWithScriptUri` so they can be armed before the
     /// script is loaded; the returned handle starts unresolved when the
     /// VM says so and flips on `BreakpointResolved`.
+    ///
+    /// Adding the same location twice returns the same VM breakpoint;
+    /// the session keeps one handle per breakpoint and the latest
+    /// condition wins.
     ///
     /// # Errors
     ///
@@ -597,31 +678,44 @@ impl DebugSession {
             )?,
         };
         let handle = BreakpointHandle {
-            id: breakpoint.id.clone(),
+            id: breakpoint.id,
             isolate,
             condition: spec.condition,
             resolved: breakpoint.resolved,
         };
-        self.breakpoints.insert(handle.id.clone(), handle.clone());
+        self.breakpoints.insert(
+            (handle.isolate.clone(), handle.id.clone()),
+            handle.clone(),
+        );
         Ok(handle)
     }
 
-    /// Removes a breakpoint by its VM id. Removing an unknown id is a
-    /// no-op (the breakpoint is already gone).
+    /// Removes a breakpoint by its VM id from `isolate` (`None` means
+    /// the main isolate). Removing an id the session does not track is
+    /// a no-op; a breakpoint whose isolate already exited is forgotten
+    /// without error (the VM dropped it with the isolate).
     ///
     /// # Errors
     ///
-    /// [`Error::Sentinel`] when the isolate is gone; [`Error::Rpc`]
-    /// when the VM rejects the removal.
-    pub fn remove_breakpoint(&mut self, breakpoint_id: &str) -> Result<()> {
-        let Some(handle) = self.breakpoints.remove(breakpoint_id) else {
+    /// [`Error::Rpc`] when the VM rejects the removal — the handle is
+    /// kept, so the caller can retry.
+    pub fn remove_breakpoint(&mut self, isolate: Option<&str>, breakpoint_id: &str) -> Result<()> {
+        let isolate = self.resolve_isolate(isolate)?;
+        let key = (isolate, breakpoint_id.to_owned());
+        if !self.breakpoints.contains_key(&key) {
             return Ok(());
-        };
-        self.client.call_unit(
+        }
+        match self.client.call_unit(
             "removeBreakpoint",
-            json!({ "isolateId": handle.isolate, "breakpointId": breakpoint_id }),
+            json!({ "isolateId": key.0, "breakpointId": key.1 }),
             self.config.rpc_timeout,
-        )
+        ) {
+            Ok(()) | Err(Error::Sentinel { .. }) => {
+                self.breakpoints.remove(&key);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Every breakpoint the session tracks.
@@ -642,22 +736,20 @@ impl DebugSession {
     ) -> Result<()> {
         let isolate = self.resolve_isolate(isolate)?;
         // `setExceptionPauseMode` is deprecated upstream in favor of
-        // `setIsolatePauseMode`; prefer the forward RPC and fall back
-        // only for VMs that predate it.
+        // `setIsolatePauseMode` (protocol 3.53); prefer the forward
+        // RPC and fall back only for VMs that predate it (-32601
+        // "method not found").
         match self.client.call_unit(
             "setIsolatePauseMode",
             json!({ "isolateId": isolate, "exceptionPauseMode": mode }),
             self.config.rpc_timeout,
         ) {
-            Ok(()) => Ok(()),
-            Err(Error::Rpc { code, .. }) if code == -32601 || code == 100 => {
-                self.client.call_unit(
-                    "setExceptionPauseMode",
-                    json!({ "isolateId": isolate, "mode": mode }),
-                    self.config.rpc_timeout,
-                )
-            }
-            Err(error) => Err(error),
+            Err(Error::Rpc { code: -32601, .. }) => self.client.call_unit(
+                "setExceptionPauseMode",
+                json!({ "isolateId": isolate, "mode": mode }),
+                self.config.rpc_timeout,
+            ),
+            other => other,
         }
     }
 
@@ -669,8 +761,9 @@ impl DebugSession {
     ///
     /// # Errors
     ///
-    /// [`Error::Rpc`] code 106 when the isolate is not paused; the
-    /// pause wait times out with [`Error::Rpc`] code -1.
+    /// [`Error::Rpc`] code 106 when the isolate is not paused;
+    /// [`Error::Timeout`] when no pause follows within the configured
+    /// pause timeout; [`Error::IsolateExited`] when the isolate exits.
     pub fn step_and_package(
         &mut self,
         isolate: Option<&str>,
@@ -681,28 +774,36 @@ impl DebugSession {
         if let Some(step) = step {
             params["step"] = json!(step.as_str());
         }
-        // A stale pause record from before this resume would be
-        // mistaken for the resume's result.
-        self.pause_events.remove(&isolate);
-        self.client
-            .call_unit("resume", params, self.config.rpc_timeout)?;
-        self.wait_for_pause(&isolate)
+        let mark = self.resume_marked(&isolate, params)?;
+        self.wait_for_pause_after(&isolate, mark)
     }
 
-    /// Resumes without waiting for the next stop (auto-resume and
-    /// fire-and-forget runs).
+    /// Resumes without waiting for the next stop (fire-and-forget
+    /// runs).
     ///
     /// # Errors
     ///
     /// [`Error::Sentinel`] when the isolate is gone; transport errors.
     pub fn resume(&mut self, isolate: Option<&str>) -> Result<()> {
         let isolate = self.resolve_isolate(isolate)?;
-        self.pause_events.remove(&isolate);
-        self.client.call_unit(
-            "resume",
-            json!({ "isolateId": isolate }),
-            self.config.rpc_timeout,
-        )
+        self.resume_marked(&isolate, json!({ "isolateId": isolate }))
+            .map(|_| ())
+    }
+
+    /// Issues `resume` and retires the isolate's pause record. Returns
+    /// the feed watermark taken just before the request went out:
+    /// every event delivered up to then has been folded, so a pause
+    /// record at or above the mark is a stop that follows this resume.
+    /// The watermark is taken *before* sending because the VM (and DDS
+    /// in front of it) gives no ordering guarantee between a response
+    /// and the events the request causes.
+    fn resume_marked(&mut self, isolate: &str, params: Value) -> Result<u64> {
+        self.poll_events()?;
+        self.pause_events.remove(isolate);
+        let mark = self.events.pushed();
+        let value = self.client.call("resume", params, self.config.rpc_timeout)?;
+        check_success(&value)?;
+        Ok(mark)
     }
 
     /// Interrupts a running isolate; the pause arrives as an event.
@@ -719,80 +820,87 @@ impl DebugSession {
         )
     }
 
-    /// Waits on the event feed until `isolate` pauses, then builds
-    /// the snapshot. Conditional breakpoints resolve here: a falsy
-    /// condition resumes and loops, bounded by the auto-resume
-    /// ceiling.
+    /// Waits until `isolate` is paused, then builds the snapshot. An
+    /// isolate that is already paused (and not yet resumed through
+    /// this session) reports immediately.
     ///
-    /// The wait is event-driven: after each drain the session blocks
-    /// on the client's bounded channel for up to 2 ms (or the
-    /// remaining deadline, whichever is shorter), instead of polling
-    /// on a fixed sleep. A pause event therefore wakes the waiter as
-    /// soon as the connection thread delivers it — typical wake
-    /// latency is channel-bound, not tick-bound — while the deadline
-    /// is still re-checked at least every 2 ms.
+    /// Conditional breakpoints resolve here: a falsy condition resumes
+    /// and loops, bounded by the auto-resume ceiling.
     ///
     /// # Errors
     ///
-    /// [`Error::Rpc`] code -1 when no pause arrives within the
-    /// configured timeout; [`Error::Closed`] when an attached
-    /// connection drops while waiting.
+    /// [`Error::Timeout`] when no pause arrives within the configured
+    /// pause timeout; [`Error::IsolateExited`] when the isolate exits
+    /// first; [`Error::ProcessExited`] when the launched process dies;
+    /// [`Error::Closed`] when the connection drops.
     pub fn wait_for_pause(&mut self, isolate: &str) -> Result<StoppedSnapshot> {
-        let isolate = isolate.to_owned();
-        let deadline = Instant::now() + self.config.pause_timeout;
-        /// Upper bound on one blocking wait: short enough that the
-        /// deadline is re-checked promptly, long enough that an idle
-        /// wait does not spin.
+        self.wait_for_pause_after(isolate, 0)
+    }
+
+    /// The wait loop shared by [`DebugSession::wait_for_pause`] and the
+    /// resume paths: only pause records with sequence `>= mark` count.
+    ///
+    /// The wait is event-driven: after each drain the session blocks
+    /// on the client's bounded channel for up to 2 ms (or the
+    /// remaining deadline, whichever is shorter), so a pause wakes the
+    /// waiter as soon as the connection thread delivers it while the
+    /// deadline and process liveness are still re-checked promptly.
+    fn wait_for_pause_after(&mut self, isolate: &str, mut mark: u64) -> Result<StoppedSnapshot> {
+        /// Upper bound on one blocking wait.
         const WAKE_QUANTUM: Duration = Duration::from_millis(2);
+        let deadline = Instant::now() + self.config.pause_timeout;
         loop {
             self.poll_events()?;
-            if let Some(event) = self.pause_events.get(&isolate).cloned() {
-                match self.classify_pause(&event) {
+            if let Some((seq, event)) = self.pause_events.get(isolate)
+                && *seq >= mark
+            {
+                let event = event.clone();
+                match self.classify_pause(isolate, &event) {
                     PauseOutcome::Report(reason) => {
-                        self.auto_resumes.remove(&isolate);
-                        return self.snapshot(&isolate, reason, &event);
+                        self.auto_resumes.remove(isolate);
+                        return self.snapshot(isolate, reason, &event);
                     }
                     PauseOutcome::AutoResume => {
-                        let consecutive =
-                            self.auto_resumes.entry(isolate.clone()).or_insert(0);
+                        let limit = self.config.conditional_resume_limit.max_auto_resumes;
+                        let consecutive = self.auto_resumes.entry(isolate.to_owned()).or_insert(0);
                         *consecutive += 1;
-                        if *consecutive > self.config.conditional_resume_limit.max_auto_resumes {
+                        if *consecutive > limit {
                             let reason = StoppedReason::ConditionalResumeLimit {
                                 auto_resumes: *consecutive,
                             };
-                            self.auto_resumes.remove(&isolate);
-                            return self.snapshot(&isolate, reason, &event);
+                            self.auto_resumes.remove(isolate);
+                            return self.snapshot(isolate, reason, &event);
                         }
-                        self.pause_events.remove(&isolate);
-                        self.client.call_unit(
-                            "resume",
-                            json!({ "isolateId": isolate }),
-                            self.config.rpc_timeout,
-                        )?;
+                        mark = self.resume_marked(isolate, json!({ "isolateId": isolate }))?;
                         continue;
                     }
                 }
             }
+            if !self.isolates.contains_key(isolate) {
+                return Err(Error::IsolateExited(isolate.to_owned()));
+            }
+            if let Some(child) = &mut self.process
+                && let Some(status) = child.try_wait()?
+            {
+                // Fold whatever the exiting process still had in
+                // flight before reporting.
+                self.poll_events()?;
+                return Err(Error::ProcessExited(status.code()));
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(Error::Rpc {
-                    code: -1,
-                    message: format!("timed out waiting for isolate {isolate} to pause"),
-                    details: None,
-                });
+                return Err(Error::Timeout(format!(
+                    "isolate {isolate} did not pause within {:?}",
+                    self.config.pause_timeout
+                )));
             }
             match self.client.next_event(remaining.min(WAKE_QUANTUM)) {
                 Ok(Some(event)) => self.absorb_event(event),
                 Ok(None) => {}
-                Err(Error::Closed) => {
-                    // Attached: the feed is gone, surface it. Launched:
-                    // the child may still be writing pipe output or be
-                    // about to exit — keep polling until the deadline,
-                    // but the channel never re-opens, so fall back to
-                    // a sleep instead of spinning on `next_event`.
-                    if self.process.is_none() {
-                        return Err(Error::Closed);
-                    }
+                // Launched: the VM may be mid-exit — the liveness check
+                // above reports it within one quantum. The channel never
+                // re-opens, so sleep rather than spin.
+                Err(Error::Closed) if self.process.is_some() => {
                     std::thread::sleep(remaining.min(WAKE_QUANTUM));
                 }
                 Err(error) => return Err(error),
@@ -802,26 +910,41 @@ impl DebugSession {
 
     /// Drains the connection's event feed into the session ring and
     /// updates isolate/breakpoint/pause state; pipe output feeds the
-    /// stdout/stderr rings.
+    /// stdout/stderr rings. Every lost event or output chunk is folded
+    /// in as a skipped sequence number, so cursors stay exact.
     ///
     /// # Errors
     ///
-    /// [`Error::Closed`] when an attached connection has dropped (a
-    /// launched session treats the same condition as process exit).
+    /// [`Error::Closed`] once an attached session's connection is down
+    /// and every event it delivered has been drained. A launched
+    /// session keeps draining its pipes after the VM exits, so it
+    /// reports process death through [`DebugSession::wait_for_pause`]
+    /// instead.
     pub fn poll_events(&mut self) -> Result<()> {
-        loop {
-            match self.client.next_event(Duration::from_millis(0)) {
+        // Read the settle mark *before* draining: every event below it
+        // is then either drained below or was dropped by the feed.
+        let settled = self.client.settled_events();
+        let closed = loop {
+            match self.client.next_event(Duration::ZERO) {
                 Ok(Some(event)) => self.absorb_event(event),
-                Ok(None) => break,
-                Err(Error::Closed) => {
-                    if self.process.is_none() {
-                        return Err(Error::Closed);
-                    }
-                    break;
-                }
+                Ok(None) => break false,
+                Err(Error::Closed) => break true,
                 Err(error) => return Err(error),
             }
+        };
+        if settled > self.events.pushed() {
+            self.events.skip(settled - self.events.pushed());
         }
+        self.drain_pipes();
+        if closed && self.process.is_none() {
+            return Err(Error::Closed);
+        }
+        Ok(())
+    }
+
+    /// Moves pipe output into the rings and folds reader-side drops in
+    /// as skipped chunk sequence numbers.
+    fn drain_pipes(&mut self) {
         if let Some(feed) = &self.pipe_feed {
             while let Ok(pipe) = feed.try_recv() {
                 match pipe {
@@ -831,45 +954,60 @@ impl DebugSession {
                     PipeEvent::Stderr(bytes) => {
                         self.stderr.push(bytes);
                     }
-                    // The launch banner was consumed during launch; a
-                    // late duplicate is harmless.
-                    PipeEvent::Banner(_) | PipeEvent::Eof => {}
+                    // The launch banner was consumed during launch.
+                    PipeEvent::Banner(_) => {}
                 }
             }
         }
-        // Events that never reached the session because the client
-        // feed was full still count as lost — fold them into the
-        // ring's drop accounting so `events_since` reports the gap.
-        let dropped = self.client.dropped_events();
-        self.event_drops_from_client += dropped.saturating_sub(self.last_seen_client_drops);
-        self.last_seen_client_drops = dropped;
-        Ok(())
-    }
-
-    /// Stream events at or after `cursor`.
-    #[must_use]
-    pub fn events_since(&self, cursor: u64) -> EventBatch {
-        EventBatch {
-            dropped: self
-                .events
-                .oldest_seq()
-                .saturating_sub(cursor)
-                .saturating_add(self.event_drops_from_client),
-            events: self.events.since(cursor).into_iter().cloned().collect(),
-            next_cursor: self.events.pushed(),
+        if let Some(drops) = &self.pipe_drops {
+            for (index, ring) in [&mut self.stdout, &mut self.stderr].into_iter().enumerate() {
+                let total = drops[index].load(Ordering::Relaxed);
+                ring.skip(total - self.folded_pipe_drops[index]);
+                self.folded_pipe_drops[index] = total;
+            }
         }
     }
 
-    /// Captured stdout at or after `cursor` (chunk sequence space).
+    /// Stream events at or after `cursor`, at most `limit` of them —
+    /// a cursor-based pull an agent can page through without one call
+    /// copying the whole ring.
+    ///
+    /// `dropped` counts the sequence numbers in the page's span
+    /// (`cursor..next_cursor`) that can no longer be served: evicted
+    /// from the ring or lost to a full feed. Pass `next_cursor` back to
+    /// continue; `next_cursor == cursor` means nothing new.
     #[must_use]
-    pub fn stdout_since(&self, cursor: u64) -> OutputBatch {
-        output_batch(&self.stdout, cursor)
+    pub fn events_since(&self, cursor: u64, limit: usize) -> EventBatch {
+        let mut events = Vec::new();
+        let mut next_cursor = self.events.pushed();
+        for (seq, event) in self.events.entries_since(cursor) {
+            if events.len() == limit {
+                next_cursor = seq;
+                break;
+            }
+            events.push(event.clone());
+        }
+        let start = cursor.min(next_cursor);
+        EventBatch {
+            dropped: self.events.missing_in(start, next_cursor),
+            events,
+            next_cursor,
+        }
     }
 
-    /// Captured stderr at or after `cursor`.
+    /// Captured stdout at or after `cursor` (chunk sequence space), at
+    /// most `max_bytes` (whole chunks; at least one chunk is returned
+    /// when any is available).
     #[must_use]
-    pub fn stderr_since(&self, cursor: u64) -> OutputBatch {
-        output_batch(&self.stderr, cursor)
+    pub fn stdout_since(&self, cursor: u64, max_bytes: usize) -> OutputBatch {
+        output_batch(&self.stdout, cursor, max_bytes)
+    }
+
+    /// Captured stderr at or after `cursor`; see
+    /// [`DebugSession::stdout_since`].
+    #[must_use]
+    pub fn stderr_since(&self, cursor: u64, max_bytes: usize) -> OutputBatch {
+        output_batch(&self.stderr, cursor, max_bytes)
     }
 
     /// The current stack of `isolate`, limited to `limit` frames.
@@ -1067,13 +1205,54 @@ impl DebugSession {
     /// [`Error::Sentinel`] for expired/collected handles;
     /// [`Error::Protocol`] when the object is not expandable.
     pub fn expand(&mut self, isolate: Option<&str>, handle: &str) -> Result<Vec<Variable>> {
-        let object = self.get_object(isolate, handle)?;
-        let VmObject::Instance(instance) = object else {
-            return Err(Error::Protocol(format!(
-                "handle {handle} is not an expandable instance"
-            )));
+        self.expand_page(isolate, handle, 0)
+    }
+
+    /// One page of an object's children starting at element `offset`
+    /// (`List`/`Set`/`Map`/typed data). The VM is asked for at most
+    /// [`ExpandLimits::max_children`] entries via `getObject`'s
+    /// `offset`/`count`, so a million-element list costs one bounded
+    /// response, not a full serialization. When more entries remain a
+    /// final `[...]` row says so and carries the next offset in its
+    /// value.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Sentinel`] for expired/collected handles;
+    /// [`Error::Protocol`] when the object is not expandable.
+    pub fn expand_page(
+        &mut self,
+        isolate: Option<&str>,
+        handle: &str,
+        offset: usize,
+    ) -> Result<Vec<Variable>> {
+        let isolate = self.resolve_isolate(isolate)?;
+        let max_children = self.config.expand_limits.max_children;
+        let value = self.client.call(
+            "getObject",
+            json!({
+                "isolateId": isolate,
+                "objectId": handle,
+                "offset": offset,
+                "count": max_children,
+            }),
+            self.config.rpc_timeout,
+        )?;
+        let instance = match VmObject::from_value(value) {
+            VmObject::Instance(instance) => instance,
+            VmObject::Sentinel(sentinel) => {
+                return Err(Error::Sentinel {
+                    kind: sentinel.kind.as_str().to_owned(),
+                    value_as_string: sentinel.value_as_string,
+                });
+            }
+            _ => {
+                return Err(Error::Protocol(format!(
+                    "handle {handle} is not an expandable instance"
+                )));
+            }
         };
-        Ok(children_of(&instance, self.config.expand_limits.max_children))
+        Ok(children_of(&instance, offset, max_children))
     }
 
     /// Walks the object graph from `handle` down to `max_depth` levels,
@@ -1088,18 +1267,35 @@ impl DebugSession {
     /// cannot fail the whole expansion.
     pub fn expand_graph(&mut self, isolate: Option<&str>, handle: &str) -> Result<Vec<Variable>> {
         let limits = self.config.expand_limits;
+        let isolate = Some(self.resolve_isolate(isolate)?);
+        let isolate = isolate.as_deref();
         let mut out = Vec::new();
+        // Each object is expanded once: cyclic graphs (`a.next.prev`)
+        // and shared nodes would otherwise re-fetch the same handle
+        // `max_children^depth` times.
+        let mut visited = rustc_hash::FxHashSet::default();
+        visited.insert(handle.to_owned());
         let mut level = self.expand(isolate, handle)?;
         let mut depth = 1;
         while !level.is_empty() {
             let mut next = Vec::new();
             for item in level {
-                let child_handle = item.handle.clone();
+                if out.len() >= limits.max_nodes {
+                    out.push(Variable {
+                        name: "<truncated>".to_owned(),
+                        value: format!("node budget of {} reached", limits.max_nodes),
+                        handle: None,
+                    });
+                    return Ok(out);
+                }
+                let expand_child = depth < limits.max_depth
+                    && item
+                        .handle
+                        .as_ref()
+                        .is_some_and(|child| visited.insert(child.clone()));
+                let child_handle = expand_child.then(|| item.handle.clone()).flatten();
                 let name = item.name.clone();
                 out.push(item);
-                if depth >= limits.max_depth {
-                    continue;
-                }
                 let Some(child_handle) = child_handle else {
                     continue;
                 };
@@ -1110,6 +1306,9 @@ impl DebugSession {
                             next.push(child);
                         }
                     }
+                    // A primitive or opaque child is a leaf, not an
+                    // error; only real failures get an error row.
+                    Err(Error::Protocol(_)) => {}
                     Err(error) => out.push(Variable {
                         name: format!("{name}.<error>"),
                         value: error.to_string(),
@@ -1131,6 +1330,8 @@ impl DebugSession {
     /// [`Error::Rpc`] codes 108/109/110 for reload-state conflicts.
     pub fn reload_sources(&mut self, isolate: Option<&str>, force: bool) -> Result<bool> {
         let isolate = self.resolve_isolate(isolate)?;
+        // A reload may replace the root library object.
+        self.root_libs.clear();
         let report: crate::protocol::ReloadReport = self.client.call_typed(
             "reloadSources",
             json!({ "isolateId": isolate, "force": force }),
@@ -1166,13 +1367,12 @@ impl DebugSession {
     pub fn terminate(&mut self) -> Result<()> {
         self.client.close();
         if let Some(mut child) = self.process.take() {
-            match child.kill() {
-                Ok(()) => {}
-                // Already exited — the kill is a no-op.
-                Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
-                Err(error) => return Err(Error::Io(error)),
+            // Already exited: the kill is a no-op on every platform
+            // once the child is reaped, and `wait` reaps it.
+            if child.try_wait()?.is_none() {
+                child.kill()?;
             }
-            let _ = child.wait();
+            child.wait()?;
         }
         Ok(())
     }
@@ -1180,97 +1380,106 @@ impl DebugSession {
     /// Records one event: ring entry, isolate table, breakpoint
     /// resolution, pause tracking, WriteEvent output capture.
     fn absorb_event(&mut self, stream: StreamEvent) {
-        let stream_id = stream.stream_id.clone();
-        let cursor = self.events.pushed();
+        // Keep the ring's sequence space aligned with the wire: events
+        // the bounded feed dropped become skipped numbers, so the hole
+        // sits where the loss happened.
+        if stream.seq > self.events.pushed() {
+            self.events.skip(stream.seq - self.events.pushed());
+        }
+        let cursor = stream.seq;
+        self.apply_event(&stream.stream_id, &stream.event, cursor);
+        // See `SessionEvent::raw` for the retention rule: modeled kinds
+        // drop the raw JSON (the typed event already carries it),
+        // unmodeled kinds keep it. The typed event moves, never clones.
+        let raw = match stream.event.kind {
+            EventKind::Other(_)
+            | EventKind::Inspect
+            | EventKind::Gc
+            | EventKind::CpuSamples
+            | EventKind::TimelineEvents => Some(stream.raw),
+            _ => None,
+        };
         self.events.push(SessionEvent {
             cursor,
             stream_id: stream.stream_id,
-            event: stream.event.clone(),
-            // See `SessionEvent::raw` for the retention rule: modeled
-            // kinds drop the raw JSON (the typed event already carries
-            // it), unmodeled kinds keep it.
-            raw: match stream.event.kind {
-                EventKind::Other(_)
-                | EventKind::Inspect
-                | EventKind::Gc
-                | EventKind::CpuSamples
-                | EventKind::TimelineEvents => Some(stream.raw),
-                _ => None,
-            },
+            event: stream.event,
+            raw,
         });
-        match stream.event.kind {
+    }
+
+    /// Applies one event to the session's derived state: isolate
+    /// table, breakpoint resolution, pause tracking, WriteEvent output.
+    fn apply_event(&mut self, stream_id: &str, event: &Event, seq: u64) {
+        let isolate_id = event.isolate.as_ref().map(|isolate| isolate.id.as_str());
+        match &event.kind {
             EventKind::IsolateStart | EventKind::IsolateRunnable | EventKind::IsolateUpdate => {
-                if let Some(reference) = stream.event.isolate {
-                    self.note_isolate(reference);
+                if let Some(reference) = &event.isolate {
+                    self.note_isolate(reference.clone());
                 }
             }
             EventKind::IsolateExit => {
-                if let Some(reference) = stream.event.isolate {
-                    self.isolates.remove(&reference.id);
-                    self.pause_events.remove(&reference.id);
-                    self.auto_resumes.remove(&reference.id);
-                    if self.main_isolate.as_deref() == Some(reference.id.as_str()) {
-                        self.main_isolate = self
-                            .isolates
-                            .values()
-                            .find(|isolate| !isolate.is_system_isolate)
-                            .map(|isolate| isolate.id.clone());
-                    }
+                if let Some(id) = isolate_id {
+                    self.forget_isolate(&id.to_owned());
                 }
             }
-            EventKind::BreakpointResolved | EventKind::BreakpointUpdated => {
-                if let Some(breakpoint) = &stream.event.breakpoint
-                    && let Some(handle) = self.breakpoints.get_mut(&breakpoint.id)
+            EventKind::IsolateReload => {
+                // Reload events are isolate-group scoped; every cached
+                // root library may have been replaced.
+                self.root_libs.clear();
+            }
+            EventKind::BreakpointAdded
+            | EventKind::BreakpointResolved
+            | EventKind::BreakpointUpdated => {
+                if let (Some(id), Some(breakpoint)) = (isolate_id, &event.breakpoint)
+                    && let Some(handle) = self
+                        .breakpoints
+                        .get_mut(&(id.to_owned(), breakpoint.id.clone()))
                 {
                     handle.resolved = breakpoint.resolved;
                 }
             }
             EventKind::BreakpointRemoved => {
-                if let Some(breakpoint) = &stream.event.breakpoint {
-                    self.breakpoints.remove(&breakpoint.id);
+                if let (Some(id), Some(breakpoint)) = (isolate_id, &event.breakpoint) {
+                    self.breakpoints
+                        .remove(&(id.to_owned(), breakpoint.id.clone()));
                 }
             }
-            EventKind::PauseStart
-            | EventKind::PauseBreakpoint
-            | EventKind::PauseInterrupted
-            | EventKind::PauseException
-            | EventKind::PauseExit
-            | EventKind::PausePostRequest => {
-                if let Some(reference) = &stream.event.isolate {
-                    self.pause_events
-                        .insert(reference.id.clone(), stream.event.clone());
+            kind if is_pause_kind(kind) => {
+                if let Some(id) = isolate_id {
+                    self.pause_events.insert(id.to_owned(), (seq, event.clone()));
                 }
             }
             EventKind::Resume => {
-                if let Some(reference) = &stream.event.isolate {
-                    self.pause_events.remove(&reference.id);
+                if let Some(id) = isolate_id {
+                    self.pause_events.remove(id);
                 }
             }
             // Attach-mode stdout/stderr: the VM forwards process output
-            // as base64 `WriteEvent`s on the Stdout/Stderr streams
-            // (launch mode captures the same bytes from the child
-            // pipes). The rings stay GLOBAL across isolates — identical
-            // semantics to the pipe capture — because the VM multiplexes
-            // all isolates onto one stream pair; per-isolate attribution
-            // is available in `events_since` via `event.isolate` for
-            // whoever needs it.
+            // as base64 `WriteEvent`s on the Stdout/Stderr streams. The
+            // rings stay GLOBAL across isolates — identical semantics to
+            // the pipe capture — because the VM multiplexes all
+            // isolates onto one stream pair; per-isolate attribution is
+            // available in `events_since` via `event.isolate`.
             EventKind::WriteEvent => {
                 use base64::Engine as _;
-                if let Some(bytes) = &stream.event.bytes
-                    && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(bytes)
-                {
-                    // Malformed base64 skips this event only — output
-                    // capture is best-effort and must not fail the
-                    // absorb.
-                    match stream_id.as_str() {
-                        "Stdout" => {
-                            self.stdout.push(decoded);
+                let ring = match stream_id {
+                    "Stdout" => &mut self.stdout,
+                    "Stderr" => &mut self.stderr,
+                    _ => return,
+                };
+                let Some(bytes) = &event.bytes else { return };
+                match base64::engine::general_purpose::STANDARD.decode(bytes) {
+                    // Chunked so the ring's byte ceiling holds for a
+                    // single huge write too.
+                    Ok(decoded) => {
+                        for chunk in decoded.chunks(WRITE_EVENT_CHUNK) {
+                            ring.push(chunk.to_vec());
                         }
-                        "Stderr" => {
-                            self.stderr.push(decoded);
-                        }
-                        _ => {}
                     }
+                    // Undecodable payload: record the loss as a gap in
+                    // the output cursor space rather than dropping it
+                    // silently.
+                    Err(_) => ring.skip(1),
                 }
             }
             _ => {}
@@ -1285,6 +1494,27 @@ impl DebugSession {
         self.isolates.insert(reference.id.clone(), reference);
     }
 
+    /// Drops every piece of per-isolate state: the VM discards an
+    /// exited isolate's breakpoints and objects, so keeping them would
+    /// grow the session for every isolate a long-running VM spawns.
+    fn forget_isolate(&mut self, id: &str) {
+        self.isolates.remove(id);
+        self.pause_events.remove(id);
+        self.auto_resumes.remove(id);
+        self.root_libs.remove(id);
+        self.breakpoints.retain(|(isolate, _), _| isolate != id);
+        if self.main_isolate.as_deref() == Some(id) {
+            // Deterministic re-election: the lowest-numbered user
+            // isolate (the VM numbers isolates in spawn order).
+            self.main_isolate = self
+                .isolates
+                .values()
+                .filter(|isolate| !isolate.is_system_isolate)
+                .min_by(|a, b| isolate_order(a).cmp(&isolate_order(b)))
+                .map(|isolate| isolate.id.clone());
+        }
+    }
+
     /// Resolves the target isolate: the explicit id, else the main
     /// isolate.
     fn resolve_isolate(&self, isolate: Option<&str>) -> Result<String> {
@@ -1296,10 +1526,10 @@ impl DebugSession {
             })
     }
 
-    /// Classifies a pause event: report it, or auto-resume it because
-    /// every breakpoint at this position has a falsy/failing
+    /// Classifies a pause event of `isolate`: report it, or auto-resume
+    /// it because every breakpoint at this position has a falsy
     /// condition.
-    fn classify_pause(&mut self, event: &Event) -> PauseOutcome {
+    fn classify_pause(&mut self, isolate: &str, event: &Event) -> PauseOutcome {
         match &event.kind {
             EventKind::PauseStart => PauseOutcome::Report(StoppedReason::Start),
             EventKind::PauseException => PauseOutcome::Report(StoppedReason::Exception),
@@ -1317,56 +1547,46 @@ impl DebugSession {
                 {
                     hits.push(breakpoint.id.clone());
                 }
-                // A breakpoint with no condition stops unconditionally
-                // (an untracked id — e.g. armed by another client —
-                // breaks unconditionally too).
-                let unconditional = hits.iter().any(|id| {
-                    self.breakpoints
-                        .get(id)
-                        .is_none_or(|handle| handle.condition.is_none())
-                });
-                if unconditional || hits.is_empty() {
-                    return PauseOutcome::Report(StoppedReason::Breakpoint {
-                        breakpoints: hits,
-                    });
+                // Spec: "while single-stepping, the VM sends a
+                // PauseBreakpoint event with no breakpoints".
+                if hits.is_empty() {
+                    return PauseOutcome::Report(StoppedReason::Step);
                 }
-                // The condition must evaluate against the isolate that
-                // actually paused — the event's own isolate ref — not
-                // the session's default (main) isolate. A conditional
-                // breakpoint hit on a worker isolate evaluated in the
-                // main isolate either reads the wrong frame's locals
-                // or fails outright (RPC 113).
-                let isolate_id = event
-                    .isolate
-                    .as_ref()
-                    .map(|reference| reference.id.clone())
-                    .or_else(|| self.main_isolate.clone());
-                // Collect the conditions once per pause, not once per
-                // hit: the borrow on `self.breakpoints` ends here so
-                // `condition_holds` (which calls into the client) can
-                // take `&mut self`, and each condition string is cloned
-                // exactly once regardless of how many hits share it.
-                let conditions: Vec<String> = hits
-                    .iter()
-                    .filter_map(|id| {
-                        self.breakpoints
-                            .get(id)
-                            .and_then(|handle| handle.condition.clone())
-                    })
-                    .collect();
-                let Some(isolate_id) = isolate_id else {
-                    // No isolate on the event and none elected yet —
-                    // cannot evaluate, so treat the stop as real.
-                    return PauseOutcome::Report(StoppedReason::Breakpoint {
-                        breakpoints: hits,
-                    });
-                };
-                // Every hit is conditional: any truthy condition stops.
+                // Collect conditions once; an untracked id (armed by
+                // another client) or an unconditional breakpoint stops
+                // unconditionally.
+                let mut conditions = Vec::with_capacity(hits.len());
+                for id in &hits {
+                    match self
+                        .breakpoints
+                        .get(&(isolate.to_owned(), id.clone()))
+                        .and_then(|handle| handle.condition.clone())
+                    {
+                        Some(condition) => conditions.push(condition),
+                        None => {
+                            return PauseOutcome::Report(StoppedReason::Breakpoint {
+                                breakpoints: hits,
+                            });
+                        }
+                    }
+                }
+                // Every hit is conditional: any truthy condition stops;
+                // a condition that cannot be evaluated stops too, with
+                // the error, so a typo never silently disarms it.
                 for condition in &conditions {
-                    if self.condition_holds(&isolate_id, condition) {
-                        return PauseOutcome::Report(StoppedReason::Breakpoint {
-                            breakpoints: hits,
-                        });
+                    match self.condition_holds(isolate, condition) {
+                        Ok(true) => {
+                            return PauseOutcome::Report(StoppedReason::Breakpoint {
+                                breakpoints: hits,
+                            });
+                        }
+                        Ok(false) => {}
+                        Err(message) => {
+                            return PauseOutcome::Report(StoppedReason::ConditionError {
+                                breakpoints: hits,
+                                message,
+                            });
+                        }
                     }
                 }
                 PauseOutcome::AutoResume
@@ -1376,26 +1596,25 @@ impl DebugSession {
     }
 
     /// Evaluates one breakpoint condition in the top frame of the
-    /// isolate that actually paused; a `true` Bool or a non-empty
-    /// String holds. Evaluation failures count as falsy — a condition
-    /// that cannot be evaluated must not trap the program.
-    fn condition_holds(&mut self, isolate: &str, condition: &str) -> bool {
+    /// isolate that actually paused. Truthiness follows the Dart DAP
+    /// adapter: `true`, or a non-zero `int`/`double`; everything else
+    /// (including `null` and strings) is falsy. `Err` carries why the
+    /// condition could not be evaluated.
+    fn condition_holds(&mut self, isolate: &str, condition: &str) -> std::result::Result<bool, String> {
         match self.evaluate_in_frame(Some(isolate), 0, condition) {
-            Ok(VmObject::Instance(instance)) => match instance.kind {
+            Ok(VmObject::Instance(instance)) => Ok(match instance.kind {
                 InstanceKind::Bool => instance.value_as_string.as_deref() == Some("true"),
-                InstanceKind::String => instance
-                    .value_as_string
-                    .as_deref()
-                    .is_some_and(|text| !text.is_empty()),
                 InstanceKind::Int | InstanceKind::Double => instance
                     .value_as_string
                     .as_deref()
                     .and_then(|text| text.parse::<f64>().ok())
                     .is_some_and(|number| number != 0.0),
-                InstanceKind::Null => false,
-                _ => true,
-            },
-            Ok(_) | Err(_) => false,
+                _ => false,
+            }),
+            Ok(VmObject::Error { kind, message }) => Err(format!("{kind}: {message}")),
+            Ok(VmObject::Sentinel(sentinel)) => Err(format!("sentinel {}", sentinel.kind.as_str())),
+            Ok(VmObject::Other(_)) => Ok(false),
+            Err(error) => Err(error.to_string()),
         }
     }
 
@@ -1494,12 +1713,16 @@ fn await_banner(
         }
         match feed.recv_timeout(remaining.min(Duration::from_millis(100))) {
             Ok(PipeEvent::Banner(banner)) => return Ok((banner, stdout, stderr)),
-            Ok(PipeEvent::Stdout(bytes)) => stdout.push(bytes),
-            Ok(PipeEvent::Stderr(bytes)) => stderr.push(bytes),
-            Ok(PipeEvent::Eof) => {}
+            // Pre-banner output is bounded like the rings: a child that
+            // floods output without ever announcing the service keeps
+            // only its latest chunks.
+            Ok(PipeEvent::Stdout(bytes)) => push_bounded(&mut stdout, bytes),
+            Ok(PipeEvent::Stderr(bytes)) => push_bounded(&mut stderr, bytes),
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            // Both pipes closed without a banner: the child is exiting.
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                return Err(Error::LaunchTimeout);
+                let status = child.wait()?;
+                return Err(Error::ProcessExited(status.code()));
             }
         }
     }
@@ -1507,39 +1730,46 @@ fn await_banner(
 
 /// Reads one child pipe to EOF, forwarding chunks and the first
 /// service-URI banner line. A full session queue drops chunks rather
-/// than blocking the child — the ring is the bounded record, but the
-/// pipe must keep draining or the child would block on write.
+/// than blocking the child — the pipe must keep draining or the child
+/// would block on write — and every dropped chunk is counted in
+/// `drops[kind]` so the session can report the gap.
 fn spawn_pipe_reader(
     mut pipe: impl std::io::Read + Send + 'static,
     kind: PipeKind,
     tx: crossbeam_channel::Sender<PipeEvent>,
-) {
-    let name = match kind {
-        PipeKind::Stdout => "dartq-debug-stdout",
-        PipeKind::Stderr => "dartq-debug-stderr",
+    drops: Arc<[AtomicU64; 2]>,
+) -> Result<()> {
+    let (name, slot) = match kind {
+        PipeKind::Stdout => ("dartq-debug-stdout", 0),
+        PipeKind::Stderr => ("dartq-debug-stderr", 1),
     };
-    let _ = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
-            let mut buffer = [0_u8; PIPE_READ_SIZE];
+            let mut buffer = vec![0_u8; PIPE_READ_SIZE];
             let mut line = Vec::new();
-            let mut banner_sent = false;
+            let mut banner_pending = true;
             loop {
                 let read = match pipe.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(read) => read,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 };
                 let chunk = &buffer[..read];
-                if !banner_sent {
-                    for byte in chunk {
-                        if *byte == b'\n' {
+                if banner_pending {
+                    for &byte in chunk {
+                        if byte == b'\n' {
                             if let Some(banner) = banner_in(&line) {
-                                banner_sent = true;
-                                let _ = tx.try_send(PipeEvent::Banner(banner));
+                                banner_pending = false;
+                                // The banner must not be lost to a full
+                                // queue: block for it (once per pipe).
+                                let _ = tx.send(PipeEvent::Banner(banner));
+                                break;
                             }
                             line.clear();
-                        } else {
-                            line.push(*byte);
+                        } else if line.len() < BANNER_LINE_LIMIT {
+                            line.push(byte);
                         }
                     }
                 }
@@ -1548,11 +1778,76 @@ fn spawn_pipe_reader(
                     PipeKind::Stderr => PipeEvent::Stderr(chunk.to_vec()),
                 };
                 match tx.try_send(event) {
-                    Ok(()) | Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {}
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        drops[slot].fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Session gone: keep draining so the child never
+                    // blocks on a full pipe while it is being killed.
+                    Err(TrySendError::Disconnected(_)) => {}
                 }
             }
-            let _ = tx.try_send(PipeEvent::Eof);
+        })
+        .map(|_| ())
+        .map_err(Error::Io)
+}
+
+/// Appends a pre-banner chunk, evicting the oldest past the ring cap.
+fn push_bounded(chunks: &mut Vec<Vec<u8>>, chunk: Vec<u8>) {
+    if chunks.len() == OUTPUT_CHUNK_CAPACITY {
+        chunks.remove(0);
+    }
+    chunks.push(chunk);
+}
+
+/// Kills and reaps a child whose session could not be established.
+fn reap(child: &mut Child) {
+    // Best effort: the launch error is what the caller needs; a kill
+    // failure here means the child is already gone.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Whether `kind` is one of the pause kinds a session tracks.
+fn is_pause_kind(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::PauseStart
+            | EventKind::PauseBreakpoint
+            | EventKind::PauseInterrupted
+            | EventKind::PauseException
+            | EventKind::PauseExit
+            | EventKind::PausePostRequest
+    )
+}
+
+/// Ordering key for main-isolate re-election: the VM's numeric isolate
+/// number, then the id for isolates without one.
+fn isolate_order(isolate: &IsolateRef) -> (u64, &str) {
+    let number = isolate
+        .number
+        .as_deref()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(u64::MAX);
+    (number, isolate.id.as_str())
+}
+
+/// Rejects a sentinel answer to an RPC that should return `Success`.
+fn check_success(value: &Value) -> Result<()> {
+    if value.get("type").and_then(Value::as_str) == Some("Sentinel") {
+        return Err(Error::Sentinel {
+            kind: value
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown")
+                .to_owned(),
+            value_as_string: value
+                .get("valueAsString")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         });
+    }
+    Ok(())
 }
 
 /// Extracts the service URI from a banner line:
@@ -1660,22 +1955,31 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// Builds an output page from one ring.
-fn output_batch(ring: &Ring<Vec<u8>>, cursor: u64) -> OutputBatch {
+fn output_batch(ring: &Ring<Vec<u8>>, cursor: u64, max_bytes: usize) -> OutputBatch {
     let mut bytes = Vec::new();
-    for chunk in ring.since(cursor) {
+    let mut next_cursor = ring.pushed();
+    for (seq, chunk) in ring.entries_since(cursor) {
+        if !bytes.is_empty() && bytes.len() + chunk.len() > max_bytes {
+            next_cursor = seq;
+            break;
+        }
         bytes.extend_from_slice(chunk);
     }
     OutputBatch {
         bytes,
-        next_cursor: ring.pushed(),
-        dropped: ring.oldest_seq().saturating_sub(cursor),
+        dropped: ring.missing_in(cursor.min(next_cursor), next_cursor),
+        next_cursor,
     }
 }
 
-/// Children of one instance, width-limited.
-fn children_of(instance: &Instance, max_children: usize) -> Vec<Variable> {
+/// Children of one instance, width-limited. `offset` is the element
+/// index the VM page starts at (it echoes it back as `offset`), so
+/// element rows carry absolute indices. When the instance has more
+/// entries than were returned, a final `[...]` row reports the next
+/// offset to pass to [`DebugSession::expand_page`].
+fn children_of(instance: &Instance, offset: usize, max_children: usize) -> Vec<Variable> {
     if !instance.fields.is_empty() {
-        return instance
+        let mut children: Vec<Variable> = instance
             .fields
             .iter()
             .take(max_children)
@@ -1685,10 +1989,16 @@ fn children_of(instance: &Instance, max_children: usize) -> Vec<Variable> {
                 handle: handle_of(field.value.as_ref()),
             })
             .collect();
+        if instance.fields.len() > max_children {
+            children.push(more_row(instance.fields.len() - max_children, None));
+        }
+        return children;
     }
-    if !instance.associations.is_empty() {
-        let mut children = Vec::new();
-        for (index, association) in instance.associations.iter().take(max_children).enumerate() {
+    let mut children = Vec::new();
+    let shown = if !instance.associations.is_empty() {
+        let shown = instance.associations.len().min(max_children);
+        for (index, association) in instance.associations.iter().take(shown).enumerate() {
+            let index = offset + index;
             children.push(Variable {
                 name: format!("[{index}].key"),
                 value: render_value(association.key.as_ref()),
@@ -1700,19 +2010,41 @@ fn children_of(instance: &Instance, max_children: usize) -> Vec<Variable> {
                 handle: handle_of(association.value.as_ref()),
             });
         }
-        return children;
+        shown
+    } else {
+        let shown = instance.elements.len().min(max_children);
+        children.extend(instance.elements.iter().take(shown).enumerate().map(
+            |(index, element)| Variable {
+                name: format!("[{}]", offset + index),
+                value: render_value(Some(element)),
+                handle: handle_of(Some(element)),
+            },
+        ));
+        shown
+    };
+    // `length` is the full collection size; the page ends at
+    // `offset + shown`.
+    let total = instance
+        .length
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(offset + shown);
+    let next = offset + shown;
+    if shown > 0 && total > next {
+        children.push(more_row(total - next, Some(next)));
     }
-    instance
-        .elements
-        .iter()
-        .take(max_children)
-        .enumerate()
-        .map(|(index, element)| Variable {
-            name: format!("[{index}]"),
-            value: render_value(Some(element)),
-            handle: handle_of(Some(element)),
-        })
-        .collect()
+    children
+}
+
+/// The trailing "more entries" row of a truncated expansion.
+fn more_row(remaining: usize, next_offset: Option<usize>) -> Variable {
+    Variable {
+        name: "[...]".to_owned(),
+        value: next_offset.map_or_else(
+            || format!("{remaining} more"),
+            |next| format!("{remaining} more (next offset {next})"),
+        ),
+        handle: None,
+    }
 }
 
 /// A field's display name: `name` is a string for ordinary fields and
@@ -1868,7 +2200,11 @@ mod tests {
     fn pipe_reader_forwards_banner_chunks_and_eof() {
         let (tx, rx) = crossbeam_channel::bounded(8);
         let input = format!("{BANNER}hello\n").into_bytes();
-        spawn_pipe_reader(Cursor::new(input), PipeKind::Stdout, tx);
+        let drops = std::sync::Arc::new([
+            std::sync::atomic::AtomicU64::new(0),
+            std::sync::atomic::AtomicU64::new(0),
+        ]);
+        spawn_pipe_reader(Cursor::new(input), PipeKind::Stdout, tx, drops).expect("spawn reader");
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut banner = None;
         let mut data = Vec::new();
@@ -1877,8 +2213,8 @@ mod tests {
             match rx.recv_timeout(remaining) {
                 Ok(PipeEvent::Banner(found)) => banner = Some(found),
                 Ok(PipeEvent::Stdout(chunk)) => data.extend_from_slice(&chunk),
-                Ok(PipeEvent::Eof) => break,
                 Ok(PipeEvent::Stderr(_)) => {}
+                // The reader thread exits at EOF and drops its sender.
                 Err(_) => break,
             }
         }

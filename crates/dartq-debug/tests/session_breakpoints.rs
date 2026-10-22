@@ -75,7 +75,9 @@ fn attach_performs_version_streams_then_vm() {
             "getVM",
         ]
     );
-    assert_eq!(streams, ["Debug", "Isolate", "Stdout", "Stderr", "Logging"]);
+    // Attach mode subscribes the output streams too (a launched
+    // session reads the child's pipes instead).
+    assert_eq!(streams, ["Debug", "Isolate", "Logging", "Stdout", "Stderr"]);
     assert_eq!(session.main_isolate(), Some("isolates/1"));
     assert_eq!(session.isolates().count(), 1);
     assert_eq!(session.config().pause_timeout, Duration::from_secs(5));
@@ -262,7 +264,7 @@ fn remove_breakpoint_sends_rpc_and_forgets_handle() {
     let mut session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
     let handle = session.add_breakpoint(line_spec(7)).expect("add breakpoint");
     session
-        .remove_breakpoint(&handle.id)
+        .remove_breakpoint(None, &handle.id)
         .expect("remove breakpoint");
     assert_eq!(session.breakpoints().count(), 0);
 
@@ -271,7 +273,7 @@ fn remove_breakpoint_sends_rpc_and_forgets_handle() {
     assert_eq!(request.params["isolateId"], "isolates/1");
 
     session
-        .remove_breakpoint("breakpoints/unknown")
+        .remove_breakpoint(None, "breakpoints/unknown")
         .expect("removing an unknown id is a no-op");
 }
 
@@ -505,7 +507,7 @@ fn unknown_direction_events_are_tolerated() {
     let mut session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
     session.stack(None, 1).expect("barrier rpc");
     session.poll_events().expect("unknown event must not fail");
-    let batch = session.events_since(0);
+    let batch = session.events_since(0, usize::MAX);
     assert_eq!(batch.events.len(), 1);
     assert_eq!(batch.events[0].stream_id, "Service");
     assert_eq!(batch.next_cursor, 1);

@@ -12,6 +12,7 @@ repository.workspace = true
 # a commodity decoder, not something this crate hand-rolls.
 base64.workspace = true
 crossbeam-channel.workspace = true
+parking_lot.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true

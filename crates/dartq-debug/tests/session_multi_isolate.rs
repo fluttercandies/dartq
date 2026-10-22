@@ -176,7 +176,7 @@ fn conditional_auto_resumes_are_isolated_per_isolate() {
         .wait_for_pause("isolates/1")
         .expect_err("A produces no further pause -> timeout");
     assert!(
-        matches!(error, dartq_debug::Error::Rpc { code: -1, .. }),
+        matches!(error, dartq_debug::Error::Timeout(_)),
         "got {error:?}"
     );
 
@@ -374,7 +374,7 @@ fn event_feed_saturation_accounts_for_every_event() {
     // dropped every frame — the count must converge to TOTAL.
     let deadline = std::time::Instant::now() + WAIT;
     loop {
-        let batch = session.events_since(0);
+        let batch = session.events_since(0, usize::MAX);
         let accounted = batch.events.len() as u64 + batch.dropped;
         if accounted == TOTAL as u64 {
             break;
@@ -386,7 +386,7 @@ fn event_feed_saturation_accounts_for_every_event() {
         session.poll_events().expect("poll events");
         std::thread::sleep(Duration::from_millis(1));
     }
-    let batch = session.events_since(0);
+    let batch = session.events_since(0, usize::MAX);
     assert_eq!(batch.events.len() as u64 + batch.dropped, TOTAL as u64);
     assert!(batch.dropped > 0, "the overrun must surface as drops");
 }
@@ -420,7 +420,7 @@ fn unknown_event_kinds_do_not_break_the_pump() {
     session.stack(None, 1).expect("barrier rpc");
     session.poll_events().expect("poll events");
 
-    let batch = session.events_since(0);
+    let batch = session.events_since(0, usize::MAX);
     assert_eq!(batch.events.len(), 2);
     assert_eq!(
         batch.events[0].event.kind,

@@ -87,7 +87,7 @@ fn perf_event_throughput() {
     session.stack(None, 1).expect("barrier rpc");
     loop {
         session.poll_events().expect("poll events");
-        let batch = session.events_since(0);
+        let batch = session.events_since(0, usize::MAX);
         let accounted = batch.events.len() as u64 + batch.dropped;
         if accounted >= TOTAL as u64 {
             break;
@@ -247,7 +247,7 @@ fn perf_absorb_mixed_events() {
     let drain_start = Instant::now();
     session.poll_events().expect("timed drain");
     let elapsed = drain_start.elapsed();
-    let batch = session.events_since(0);
+    let batch = session.events_since(0, usize::MAX);
     println!(
         "perf_absorb_mixed_events: {TOTAL} mixed events drained in {elapsed:?} -> {:.0} ns/event (ring {} retained, {} dropped)",
         elapsed.as_nanos() as f64 / TOTAL as f64,
@@ -280,7 +280,7 @@ fn perf_ring_eviction_consistency() {
     session.stack(None, 1).expect("barrier rpc");
     let batch = loop {
         session.poll_events().expect("poll events");
-        let batch = session.events_since(0);
+        let batch = session.events_since(0, usize::MAX);
         if batch.events.len() as u64 + batch.dropped >= TOTAL as u64 {
             break batch;
         }

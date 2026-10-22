@@ -82,10 +82,7 @@ fn rpc_timeout_is_reported_and_connection_survives() {
     let error = client
         .call("hang", json!({}), Duration::from_millis(150))
         .expect_err("silent peer must time out");
-    match error {
-        Error::Rpc { code, .. } => assert_eq!(code, -1),
-        other => panic!("expected timeout Rpc error, got {other:?}"),
-    }
+    assert!(matches!(error, Error::Timeout(_)), "got {error:?}");
     assert_eq!(client.get_version().expect("connection still alive").major, 4);
 }
 
