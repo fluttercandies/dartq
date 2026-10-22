@@ -908,6 +908,21 @@ impl<'a> Engine<'a> {
                 );
             }
         }
+        // The Object-face receiver record (#2521): a local receiver whose
+        // static type names no container (a function value, a record, a
+        // `dynamic`) merges as the Unknown dispatch and the receiver row
+        // folds away with it — the merge's own static-type answer is the
+        // only surviving witness of what `Object`'s member face resolves
+        // against downstream (`callback.toString()` types `String` through
+        // the function value's chain exactly as the official resolver
+        // does), so it rides this side table keyed by the member row.
+        if was_local
+            && matches!(recv, Receiver::Unknown)
+            && !matches!(merged_receiver_ty, Ty::Unknown | Ty::Void | Ty::Never)
+        {
+            self.member_recv_tys
+                .insert(member.range.offset, merged_receiver_ty);
+        }
         // The staged-join record (B5): the merged row's facts outlive pass
         // 2's stack take — one read event folds once, so the repeat insert
         // is a no-op.

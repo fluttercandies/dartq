@@ -622,6 +622,28 @@ pub(crate) const FINAL_PRIMITIVES: [&str; 5] = ["int", "double", "num", "bool", 
 pub(crate) const CORE_STATIC_RETURNS: [(&str, &str, &str); 1] =
     [("RangeError", "checkValidRange", "int")];
 
+/// The `Object` instance members' declared returns: the member face every
+/// instance receiver carries whatever its head (`sdk/lib/core/object.dart`
+/// — `String toString()`, `int get hashCode`, `Type get runtimeType`). A
+/// member walk that bottoms out without the spelling (an unindexed
+/// primitive's chain, a function-typed alias, a user class that simply does
+/// not redeclare it) still resolves through `Object`, so the send types
+/// exactly these returns (`s = t.toString()` writes `String`, the official
+/// resolver's answer through the `Object` chain). `noSuchMethod` (`dynamic`)
+/// and `==` (an operator) stay off — no spellable named return.
+pub(crate) const OBJECT_INSTANCE_RETURNS: [(&str, &str); 3] = [
+    ("toString", "String"),
+    ("hashCode", "int"),
+    ("runtimeType", "Type"),
+];
+
+/// The getter subset of [`OBJECT_INSTANCE_RETURNS`]: the member-READ face
+/// (`callback.hashCode` with no invocation) answers only these — a bare
+/// `toString` read is a method tear-off whose type is the function
+/// signature, never the declared return, so it stays off this table.
+pub(crate) const OBJECT_GETTER_RETURNS: [(&str, &str); 2] =
+    [("hashCode", "int"), ("runtimeType", "Type")];
+
 /// The SDK interface member faces the element index never carries:
 /// `dart:core`/`dart:async`/`dart:io` declarations resolve through the
 /// namespace but land on unindexed (external) units, so the `@override`

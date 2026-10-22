@@ -1674,10 +1674,45 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.var_infer_pending = None;
             if let Some((name, decl_range)) = engine.init_declarators.pop().flatten()
                 && let Some(mark) = engine.init_mark
-                && engine.rows.len() == mark + 1
+                && let Some(expr) = match engine.rows.len() {
+                    // The single-row window every fold-as-one shape keeps.
+                    count if count == mark + 1 => Some(mark),
+                    // The `[]` fold leaves the receiver's operator row plus
+                    // the result's value row (#2521): the initializer's
+                    // expression row is the value row — one past the
+                    // operator — so `var symbols = map[key]!` infers the
+                    // index result's type exactly like a plain read. Only
+                    // the assertion-decided NON-NULL face binds: a nullable
+                    // index result (`var h = headers[k]`, `var r =
+                    // byIndex[i]`) owes the null-check promotion and the
+                    // reassignment writes the staged faces re-decide
+                    // downstream, and binding it here fires the return/
+                    // unchecked/undefined verdicts before those re-decides
+                    // run (the analyzer corpus's map-inferred locals) —
+                    // the under-report stands until the write-side staging
+                    // carries them. The `!`-asserted face is the one shape
+                    // with no such question standing: the assertion itself
+                    // decided nullness, the type is the index result's own,
+                    // and no promotion re-decide can change it.
+                    count
+                        if count == mark + 2
+                            && matches!(
+                                engine.rows[mark].intent,
+                                Intent::Operator(op, _) if op == engine.intern("[]")
+                            )
+                            && matches!(engine.rows[mark + 1].shape, RowShape::Value)
+                            && engine.rows[mark + 1].ty != Ty::UNKNOWN
+                            && !Engine::is_nullable_ty(engine.rows[mark + 1].ty)
+                            && engine.byte_at(engine.rows[mark + 1].range.end())
+                                == Some(b'!') =>
+                    {
+                        Some(mark + 1)
+                    }
+                    _ => None,
+                }
                 && let Some(ty) = engine
-                    .initializer_static_ty(&engine.rows[mark])
-                    .map(|ty| engine.staged_read_ty(&engine.rows[mark]).unwrap_or(ty))
+                    .initializer_static_ty(&engine.rows[expr])
+                    .map(|ty| engine.staged_read_ty(&engine.rows[expr]).unwrap_or(ty))
                     .or_else(|| {
                         // The #2481 face: a member read the window's own
                         // faces leave `Unknown` still owns a static type —
@@ -1688,7 +1723,7 @@ impl ParserListener for DiagnoseListener<'_> {
                         // bind and the flow staging below ride it, so an
                         // extension use through the inferred local
                         // resolves and credits.
-                        let row = engine.rows[mark].clone();
+                        let row = engine.rows[expr].clone();
                         let derived = engine.initializer_read_ty(&row);
                         (derived != Ty::UNKNOWN).then_some(derived)
                     })
@@ -1700,8 +1735,8 @@ impl ParserListener for DiagnoseListener<'_> {
                 // holds `T`, nullability preserved.
                 let ty = if engine.await_operand_extents.iter().any(
                     |&(start, end)| {
-                        engine.rows[mark].range.offset >= start
-                            && engine.rows[mark].range.end() <= end
+                        engine.rows[expr].range.offset >= start
+                            && engine.rows[expr].range.end() <= end
                     },
                 ) {
                     engine.flatten(ty)
@@ -1710,7 +1745,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 };
                 // An explicit-argument creation's written arguments ride
                 // the head (`creation_args.rs`).
-                let ty = engine.with_explicit_creation_args(mark, ty);
+                let ty = engine.with_explicit_creation_args(expr, ty);
                 engine.bind_var_type(name, ty);
                 // The promotion face rides the flow layer's declared-type
                 // slot (#2140): a name-level type with no written
@@ -4590,6 +4625,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 ty if question.is_some() => Engine::nullable_form(ty),
                 ty => ty,
             };
+            
             // The operand rows leave the stack, but every operand still
             // owes its pass-2 resolution — the official resolves every
             // subexpression (`builder..foo[bar]`'s `bar` reports its

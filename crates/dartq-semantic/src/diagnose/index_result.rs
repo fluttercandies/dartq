@@ -27,7 +27,7 @@ impl Engine<'_> {
             self.file,
             name,
         ) else {
-            return Ty::UNKNOWN;
+            return self.core_index_result_ty(name, args);
         };
         let Some(entry) = container.members.get(&self.intern("[]")) else {
             return Ty::UNKNOWN;
@@ -49,5 +49,26 @@ impl Engine<'_> {
             return Ty::UNKNOWN;
         };
         self.fold_alias_ty(self.substitute_ty(declared, &keys))
+    }
+
+    /// The core generics' `[]` face on the unindexed SDK heads (#2521):
+    /// `Map<K, V>` declares `V? operator [](Object? key)` and `List<E>`
+    /// declares `E operator [](int index)` (upstream Dart SDK source,
+    /// sdk/lib/core/map.dart:288, list.dart:375), so the read substitutes
+    /// the receiver's written arguments — `numberFormatSymbols[name]!`
+    /// types `NumberSymbols` and the `var`-inferred local carries the
+    /// real type downstream. The map's return is `V?` whatever `V`
+    /// spells; the list's returns `E` as written. Every other head — and
+    /// a receiver without written arguments — keeps the unknown face (the
+    /// under-report direction).
+    fn core_index_result_ty(&self, name: StringId, args: ArgListId) -> Ty {
+        let written = self.boundary.pool().get(args).to_vec();
+        if self.intern("Map") == name && written.len() == 2 {
+            return Self::nullable_form(written[1]);
+        }
+        if self.intern("List") == name && written.len() == 1 {
+            return written[0];
+        }
+        Ty::UNKNOWN
     }
 }

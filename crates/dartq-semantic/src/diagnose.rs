@@ -353,7 +353,8 @@ use crate::library::{
 };
 use crate::member_face::{
     COLLECTION_INTERFACE_ALIASES, CORE_CONST_CTOR, CORE_INTERFACE_MEMBERS, CORE_STATIC_RETURNS,
-    CORE_TYPE_MEMBERS, EqualsCheck, MemberFace, NsmCheck, NsmShape,
+    CORE_TYPE_MEMBERS, EqualsCheck, MemberFace, NsmCheck, NsmShape, OBJECT_GETTER_RETURNS,
+    OBJECT_INSTANCE_RETURNS,
 };
 use crate::model::{
     ArgListId, ArgPool, ArityViolation, Container, ContainerKind, ExtensionFace, FileElements,
@@ -4655,6 +4656,14 @@ mod ticket_2508_tests;
 /// `double` branch, and `int - <dynamic>` is `num` at every sink.
 #[cfg(test)]
 mod operand_face_tests;
+
+/// The #2521 Object-face pins: an instance-member send on a receiver the
+/// classifier cannot name a container for (a function value, a `dynamic`)
+/// types `Object`'s declared return, so the write promotes the target and
+/// the staged argument verdict stays cleaned; the unpromoted control
+/// keeps the one diagnostic.
+#[cfg(test)]
+mod ticket_2521_tests;
 
 /// The shared single-file rig with the resolved-type snapshot mounted
 /// (`report_ops`), the shape the per-ticket modules each carried.

@@ -285,6 +285,7 @@ impl<'a> Engine<'a> {
             promoted_recv_reads: Vec::new(),
             prop_promotion_rows: PropPromotionStaging::default(),
             member_reads: Vec::new(),
+            member_recv_tys: FxHashMap::default(),
             call_ends: Vec::new(),
             non_promotions: Vec::new(),
             pending_non_promotion: Vec::new(),

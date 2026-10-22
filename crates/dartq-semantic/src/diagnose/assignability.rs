@@ -751,10 +751,50 @@ impl<'a> Engine<'a> {
                         {
                             answer(&entry)
                         }
-                        _ => Ty::UNKNOWN,
+                        _ => self.object_instance_read_ty(row),
                     },
-                    None => Ty::UNKNOWN,
+                    None => self.object_instance_read_ty(row),
                 }
+            }
+            _ => Ty::UNKNOWN,
+        }
+    }
+
+    /// The `Object` getter face for a member READ the container walk
+    /// cannot resolve (#2521): `hashCode`/`runtimeType` are `Object`'s own
+    /// getters, present on every receiver, so an unindexed head's walk
+    /// miss still types them (`callback.hashCode` answers `int` through
+    /// the function value's chain exactly as the official resolver does).
+    /// A method spelling never lands here — a bare `toString` read is a
+    /// tear-off typed by its signature, which this face cannot spell —
+    /// and the static class-head face (a `Container` receiver) keeps the
+    /// miss: statics are not inherited. An Unknown-classified local
+    /// receiver re-reads the merge's side-table static type for the same
+    /// face (a function value, a record, a `dynamic`).
+    fn object_instance_read_ty(&self, row: &Row) -> Ty {
+        let Some((_, head)) = OBJECT_GETTER_RETURNS
+            .iter()
+            .find(|(member, _)| *member == &self.strings.resolve(row.name)[..])
+        else {
+            return Ty::UNKNOWN;
+        };
+        match &row.shape {
+            RowShape::Member {
+                recv:
+                    Receiver::Typed { .. }
+                    | Receiver::This { .. }
+                    | Receiver::Super { .. }
+                    | Receiver::Created { .. },
+            } => Ty::named(self.intern(head)),
+            RowShape::Member {
+                recv: Receiver::Unknown,
+            } if let Some(declared) = self.member_recv_tys.get(&row.range.offset)
+                && !matches!(
+                    self.fold_alias_ty(*declared),
+                    Ty::Unknown | Ty::Void | Ty::Never
+                ) =>
+            {
+                Ty::named(self.intern(head))
             }
             _ => Ty::UNKNOWN,
         }
@@ -945,6 +985,56 @@ impl<'a> Engine<'a> {
             // user-declared same-spelled container never borrows the SDK
             // table.
             _ => {
+                // The universal `Object` face first: `toString`/
+                // `hashCode`/`runtimeType` exist on every instance
+                // receiver whatever its head, so a walk that bottoms out
+                // without the spelling — an unindexed primitive's chain,
+                // a function-typed alias, an indexed user class that
+                // simply does not redeclare it — still resolves through
+                // `Object` and the send types its declared return. The
+                // static class-head face (a `Container` receiver) keeps
+                // the miss: statics are not inherited, and `Object`
+                // declares no statics under these spellings.
+                if let RowShape::Member { recv } = &row.shape
+                    && matches!(
+                        recv,
+                        Receiver::Typed { .. }
+                            | Receiver::This { .. }
+                            | Receiver::Super { .. }
+                            | Receiver::Created { .. }
+                    )
+                    && let Some((_, head)) = OBJECT_INSTANCE_RETURNS
+                        .iter()
+                        .find(|(member, _)| *member == &self.strings.resolve(row.name)[..])
+                {
+                    return Ty::named(self.intern(head));
+                }
+                // The same face over the classifier's non-named dispatch: a
+                // local receiver the fold types as a function, record, or
+                // `dynamic` (`callback.toString()` on a typedef'd
+                // parameter, `d.toString()` on a dynamic one) merges as
+                // `Receiver::Unknown` — the payload names no container —
+                // yet the official resolver reaches `Object` there exactly
+                // the same way (probed 3.13.1: `s = d.toString()` promotes
+                // `s`, so the send types `String`, not `dynamic`). The
+                // merge's side table carries the receiver's static type —
+                // the row itself folded away — and only a typed entry arms
+                // the fallback; an unannotated receiver keeps the unknown
+                // face (the under-report direction).
+                if let RowShape::Member {
+                    recv: Receiver::Unknown,
+                } = &row.shape
+                    && let Some((_, head)) = OBJECT_INSTANCE_RETURNS
+                        .iter()
+                        .find(|(member, _)| *member == &self.strings.resolve(row.name)[..])
+                    && let Some(declared) = self.member_recv_tys.get(&row.range.offset)
+                    && !matches!(
+                        self.fold_alias_ty(*declared),
+                        Ty::Unknown | Ty::Void | Ty::Never
+                    )
+                {
+                    return Ty::named(self.intern(head));
+                }
                 let indexed = resolve_container(
                     self.graph,
                     self.namespaces,

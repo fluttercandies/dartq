@@ -2601,6 +2601,15 @@ pub(crate) struct Engine<'a> {
     /// the property-promotion substitution and the condition-face's
     /// property-access anchor both key on this record.
     pub(crate) member_reads: Vec<MemberRead>,
+    /// The local receivers whose member merge classified as `Unknown`
+    /// (#2521): the receiver's static type at the fold (a function value,
+    /// a record, a `dynamic` — the shapes that name no container), keyed
+    /// by the merged member row's offset. The receiver row itself folds
+    /// away in the merge, so the send typing re-reads the answer when the
+    /// `Object` member face (`toString`/`hashCode`/`runtimeType`) resolves
+    /// through it — the official resolver's chain for every one of these
+    /// heads.
+    pub(crate) member_recv_tys: FxHashMap<u32, Ty>,
     /// One record per completed send: the callee row's offset through the
     /// closing `)` (offset-keyed, kept sorted — nested calls complete
     /// inner-first, so pushes are not monotonic). The assignability emit
