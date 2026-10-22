@@ -419,3 +419,58 @@ int h(Num? n) {
         "the per-case face keeps its row: {cs:?}"
     );
 }
+
+/// The promotion-latched initializer's re-bind (#2539): `final v = n.value`
+/// inside an `is` promotion binds the accessor's return over the PROMOTED
+/// receiver — the subclass override's `double`, never the base interface's
+/// `Object` — so the downstream member read resolves on the re-bound face.
+/// The widening controls stay pinned: a `!`-asserted bind keeps its
+/// non-null face (the oracle's assert decided nullness) and an `as`-cast
+/// bind keeps the written cast face.
+#[test]
+fn promotion_latched_initializer_rebinds_the_accessor_face() {
+    let report = unit_report(
+        r#"
+sealed class Num {
+  Object get value;
+}
+
+final class DNum extends Num {
+  @override
+  DNum get value => this;
+  DNum get onlyHere => this;
+  Object get marker => this;
+}
+
+void onlyIs(Num n) {
+  if (n is DNum) {
+    final v = n.value;
+    final m = v.onlyHere;
+    final a = n.onlyHere;
+    final b = a.marker;
+    final c = b.value;
+  }
+}
+
+class Sdk {
+  Sdk? get next => null;
+  Sdk get languageVersion => this;
+}
+
+void keepsAssertFace(Sdk? sourceFactory) {
+  var sdk = sourceFactory!.next!;
+  final v = sdk.languageVersion;
+  final w = v.next;
+}
+
+"#,
+    );
+    let cs = codes(&report);
+    let family = cs
+        .iter()
+        .filter(|c| {
+            **c == "undefined_getter" || **c == "unchecked_use_of_nullable_value" || **c == "dead_code"
+        })
+        .collect::<Vec<_>>();
+    assert!(family.is_empty(), "faces leaked: {cs:?}");
+}

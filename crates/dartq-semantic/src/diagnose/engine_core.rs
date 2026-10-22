@@ -206,6 +206,8 @@ impl<'a> Engine<'a> {
             ctor_inits: FxHashMap::default(),
             pending_matched: Vec::new(),
             pending_switch_coverings: Vec::new(),
+            deferred_var_rebinds: Vec::new(),
+            rebound_locals: FxHashMap::default(),
             clause_anchor: None,
             primary_constructors_enabled,
             variance_enabled,

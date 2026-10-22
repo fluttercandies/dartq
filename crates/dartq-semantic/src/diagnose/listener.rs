@@ -1747,6 +1747,23 @@ impl ParserListener for DiagnoseListener<'_> {
                 // the head (`creation_args.rs`).
                 let ty = engine.with_explicit_creation_args(expr, ty);
                 engine.bind_var_type(name, ty);
+                // A promotion-latched initializer defers its re-bind
+                // (#2539): the member read's accessor return rides the
+                // UNPROMOTED declared receiver at this bind, and the
+                // promotion re-decision runs only in pass 2.
+                if let Some(expr_row) = engine.rows.get(expr)
+                    && engine
+                        .promoted_recv_reads
+                        .binary_search_by(|(member, _)| member.cmp(&expr_row.range.offset))
+                        .is_ok()
+                    && engine.locals.last().is_some_and(|decl| decl.name == name)
+                {
+                    engine.deferred_var_rebinds.push((
+                        engine.locals.len() as u32 - 1,
+                        expr_row.range.offset,
+                        ty,
+                    ));
+                }
                 // The promotion face rides the flow layer's declared-type
                 // slot (#2140): a name-level type with no written
                 // arguments stages as the flow declared type, keyed on

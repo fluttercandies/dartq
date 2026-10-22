@@ -2257,6 +2257,19 @@ pub(crate) struct Engine<'a> {
     /// matched type re-decides at the teardown join.
     pub(crate) pending_matched: Vec<PendingMatched>,
     pub(crate) pending_switch_coverings: Vec<PendingSwitchCovering>,
+    /// Inferred locals whose initializer is a promotion-latched member
+    /// read (#2539): the parse-time bind wrote the accessor's return over
+    /// the UNPROMOTED declared receiver, and the promotion re-decision —
+    /// a pass-2 face — cannot reach the bind. Each row defers the re-bind
+    /// (the local's name, the member row's offset, the parse-time type);
+    /// pass 2 recomputes the accessor over the re-derived receiver and
+    /// re-binds before any row resolves.
+    pub(crate) deferred_var_rebinds: Vec<(u32, u32, Ty)>,
+    /// The names a deferred re-bind actually retyped (#2539): the
+    /// receiver re-decision consults the frame's var-types for these
+    /// names when the flow read face carries no promotion — the local's
+    /// re-bound type is the receiver's re-derived static type.
+    pub(crate) rebound_locals: FxHashMap<u32, (Ty, Ty)>,
     /// The current case clause's `case` keyword anchor (the flow
     /// `MatchedType` fact's join key); a switch-expression alternative
     /// clears it (the parser delivers no keyword face there).

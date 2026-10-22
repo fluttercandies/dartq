@@ -260,7 +260,105 @@ impl<'a> Engine<'a> {
     /// promotions (#2241) ride beside the read types: the member walk's
     /// receiver verdict re-decides against them, exactly like the staged
     /// families' teardown join.
+    /// The pass-2 re-bind of a promotion-latched initializer (#2539):
+    /// each deferred local re-derives its initializer member's accessor
+    /// over the promoted receiver (the same re-decision
+    /// [`Engine::rederived_receiver`] makes for the member row itself)
+    /// and re-binds when the accessor's return names a different type
+    /// than the parse-time bind wrote. Runs before any row resolves, so
+    /// every later face — the re-bound local's own member reads, the
+    /// argument and return checks — reads the promoted accessor face.
+    fn apply_deferred_rebinds(&mut self) {
+        let deferred = std::mem::take(&mut self.deferred_var_rebinds);
+        for (local_index, member_offset, parse_ty) in deferred {
+            let Some(index) = self
+                .member_reads
+                .binary_search_by(|read| read.offset.cmp(&member_offset))
+                .ok()
+            else {
+                continue;
+            };
+            let read = self.member_reads[index];
+            let recv = self.rederived_receiver(member_offset, read.recv);
+            let Receiver::Typed { ty: recv_ty, .. } = recv else {
+                continue;
+            };
+            let Ty::Named {
+                name: recv_head, ..
+            } = recv_ty
+            else {
+                continue;
+            };
+            let Walk::Found(entry) = self.walk_members(recv_head, read.name) else {
+                continue;
+            };
+            let mut corrected = match entry.kind {
+                MemberKind::Field => self.fold_alias_ty(entry.var_ty),
+                _ => self.fold_alias_ty(entry.return_ty),
+            };
+            // The await flatten the parse-time bind applies (#2506): an
+            // initializer inside an await extent binds the FUTURE'S
+            // argument (`final db = await open();`), and the re-derived
+            // accessor face owes the same flatten — a raw `Future<T>`
+            // re-bind would un-flatten the local.
+            if self.await_operand_extents.iter().any(|&(start, end)| {
+                member_offset >= start && member_offset < end
+            }) {
+                corrected = self.flatten(corrected);
+            }
+            // The promotion direction gate: only a NARROWING re-bind is a
+            // promotion. The re-derived accessor's declared return can
+            // WIDEN the parse-time face — a `!`-asserted initializer's
+            // non-null bind, an `as`-cast bind — and the oracle keeps the
+            // written face there (the assert/cast decided it), so the
+            // re-bind must not replace it. `corrected` narrows `parse_ty`
+            // exactly when its head's supertype chain names `parse_ty`'s
+            // head and its nullability does not loosen.
+            let narrows = match (corrected, parse_ty) {
+                (
+                    Ty::Named {
+                        name: c_head,
+                        nullable: c_null,
+                        ..
+                    },
+                    Ty::Named {
+                        name: p_head,
+                        nullable: p_null,
+                        ..
+                    },
+                ) => {
+                    let nullability_ok = !c_null || p_null;
+                    // `Object` is the universal root: every named face
+                    // narrows it (the core heads' incomplete chains would
+                    // answer `Missing` on the walk the resolved world
+                    // cannot complete).
+                    if p_head == self.intern("Object") {
+                        nullability_ok && !c_null
+                    } else if c_head == p_head {
+                        nullability_ok
+                    } else {
+                        match self.walk_members(c_head, p_head) {
+                            Walk::Found(_) => true,
+                            // An unmodeled head (the core `double`, the
+                            // frozen faces) has no chain to walk — the
+                            // oracle resolves the real hierarchy; the
+                            // name-differing non-loosening shape is the
+                            // promotion direction's conservative accept.
+                            Walk::ChainBroken => nullability_ok && !c_null,
+                            Walk::Missing => false,
+                        }
+                    }
+                }
+                _ => false,
+            };
+            if corrected != Ty::UNKNOWN && corrected != parse_ty && narrows {
+                self.rebound_locals.insert(local_index, (parse_ty, corrected));
+            }
+        }
+    }
+
     pub(crate) fn resolve_rows(&mut self, promotions: &PromotionStaging) {
+        self.apply_deferred_rebinds();
         self.build_ur_sites();
         let rows = std::mem::take(&mut self.rows);
         // The #2459 cascade-index target latches: a first-section `..[` fold
@@ -359,11 +457,24 @@ impl<'a> Engine<'a> {
             RowShape::Bare(info) => self.resolve_bare_row(promotions, row, *info),
             RowShape::Member { recv } => {
                 let recv = self.cascade_recv_receiver(row, *recv);
-                let recv = self.tolerant_receiver(
-                    promotions,
-                    row,
-                    self.promoted_receiver(row.range.offset, recv),
-                );
+                let recv = self.promoted_receiver(row.range.offset, recv);
+                let recv =
+                    if matches!(recv, Receiver::Typed { .. })
+                        && self
+                            .member_reads
+                            .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+                            .is_ok()
+                        && let Some(face) = self.rebound_local_receiver(row.range.offset, &recv)
+                        && let Ty::Named { name, .. } = face
+                    {
+                        Receiver::Typed {
+                            type_name: name,
+                            ty: face,
+                        }
+                    } else {
+                        recv
+                    };
+                let recv = self.tolerant_receiver(promotions, row, recv);
                 self.resolve_member_row(promotions, row, recv);
             }
             RowShape::Receiver(recv) => self.resolve_receiver_row(row, *recv),
@@ -624,6 +735,21 @@ impl<'a> Engine<'a> {
             return recv;
         };
         let read_span = self.promoted_recv_reads[index].1;
+        // A re-bound local's face is authoritative (#2539): the flow read
+        // face still spells the parse-time bind — the staging predates the
+        // pass-2 promotion re-decision — so the re-decision below would
+        // clobber the promoted accessor face with the stale declared one.
+        if let Some(face) = self.rebound_local_ty(row.range.offset) {
+            if face == static_ty {
+                return recv;
+            }
+            if let Ty::Named { name, .. } = face {
+                return Receiver::Typed {
+                    type_name: name,
+                    ty: face,
+                };
+            }
+        }
         if let Some(redecided) = self.redecided_face(static_ty, self.read_type_at(read_span)) {
             return redecided;
         }
@@ -1677,7 +1803,9 @@ impl<'a> Engine<'a> {
                         face @ Ty::Named {
                             name: flow_head, ..
                         },
-                    ) = self.recv_expression_ty(read_span)
+                    ) = self
+                        .rebound_local_receiver(row.range.offset, &recv)
+                        .or_else(|| self.recv_expression_ty(read_span))
                 {
                     self.check_instance_member(
                         promotions,

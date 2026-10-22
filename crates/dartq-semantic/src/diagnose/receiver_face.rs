@@ -75,4 +75,41 @@ impl Engine<'_> {
             ty: face,
         }
     }
+
+    /// The re-bound local face (#2539): a receiver read whose identifier
+    /// names a promotion-latched initializer's local carries the re-bound
+    /// accessor return as its re-derived static type — the flow read face
+    /// still spells the parse-time bind (the staging predates the pass-2
+    /// promotion re-decision), so the re-bind map is the only holder of
+    /// the promoted accessor face.
+    pub(crate) fn rebound_local_receiver(&self, member_offset: u32, recv: &Receiver) -> Option<Ty> {
+        let Receiver::Typed { ty: static_ty, .. } = recv else {
+            return None;
+        };
+        let ty = self.rebound_local_ty(member_offset)?;
+        (ty != *static_ty).then_some(ty)
+    }
+
+    /// [`Self::rebound_local_face`]'s raw lookup: the re-bound type of
+    /// whichever local the read span's identifier names, without the
+    /// differs-from-static guard — the re-bind is authoritative for its
+    /// own reads.
+    pub(crate) fn rebound_local_ty(&self, member_offset: u32) -> Option<Ty> {
+        // The identity gate: the merged member row inherited the receiver
+        // read's lexical hit (the merge moves the entry to the member's
+        // own offset), and the hit names the exact local declaration —
+        // the same index the re-bind keyed. The flow face gate (the
+        // consumer read's own face still spelling the parse-time bind)
+        // keeps a coincidental index collision — or a same-named
+        // declaration the flat locals stack reuses — from retyping a
+        // foreign read.
+        let index = *self.local_hits.get(&member_offset)?;
+        let &(parse_ty, corrected) = self.rebound_locals.get(&index)?;
+        let recv_span = self
+            .member_reads
+            .binary_search_by(|read| read.offset.cmp(&member_offset))
+            .ok()
+            .map(|i| self.member_reads[i].recv_span)?;
+        (self.read_type_at(recv_span) == Some(parse_ty)).then_some(corrected)
+    }
 }
