@@ -1222,11 +1222,12 @@ impl<'a> Engine<'a> {
         // send-close face owns the slot). A positional list pairs against
         // the declaration's parameter order, which the foreign-declaration
         // recovery cannot vouch for, so those solutions stay open.
-        if ordered
+        if let Some(own) = ordered
             && let Some((_, explicit)) = self
                 .call_type_args
                 .iter()
                 .find(|(row, _)| *row == callee_row)
+            && explicit.len() == own
         {
             for ((slot, fixed), ty) in solutions.iter_mut().zip(fixed.iter_mut()).zip(explicit) {
                 *slot = Some(*ty);
@@ -1332,11 +1333,11 @@ impl<'a> Engine<'a> {
     /// declaration only carries an arity, so its recovered spellings are
     /// written order, not declaration order, and the list pairs against
     /// nothing.
-    fn closure_callee_params(
+    pub(crate) fn closure_callee_params(
         &self,
         recv: &Receiver,
         callee_name: StringId,
-    ) -> Option<(Vec<(StringId, Option<Ty>)>, Vec<(StringId, Ty)>, bool)> {
+    ) -> Option<(Vec<(StringId, Option<Ty>)>, Vec<(StringId, Ty)>, Option<usize>)> {
         // The member send's parameters (mirrors the send-close solver):
         // method type-parameter names are authoritative; the declaring
         // container's own parameters join only for the receiver's own
@@ -1350,6 +1351,7 @@ impl<'a> Engine<'a> {
             if let Walk::Found(entry) = self.walk_members(container, callee_name)
                 && entry.kind == MemberKind::Method
             {
+                let declaring = self.member_faces.last_origin().unwrap_or(container);
                 let own_member = resolve_container(
                     self.graph,
                     self.namespaces,
@@ -1364,6 +1366,11 @@ impl<'a> Engine<'a> {
                     .iter()
                     .map(|name| (*name, None))
                     .collect();
+                // The explicit list pairs against the member's OWN
+                // parameters only — and only when every declared one is
+                // spelled (a count-only payload would let `fold<P>(...)`'s
+                // `P` land on the container's `E`).
+                let own = (params.len() == usize::from(entry.type_params)).then_some(params.len());
                 let mut seeds: Vec<(StringId, Ty)> = Vec::new();
                 if own_member {
                     if let Some(container_params) = self.bounds.container_params(container) {
@@ -1397,8 +1404,19 @@ impl<'a> Engine<'a> {
                             params.push((param, None));
                         }
                     }
+                } else if let Some(recv_ty) = recv_ty
+                    && let Some(env) = self.member_recv_env(recv_ty, declaring, &entry)
+                {
+                    // An inherited member: the receiver viewed as an
+                    // instance of the declaring container spells the
+                    // environment (`Lst<Item>` calling `Itr<E>.map` binds
+                    // `E := Item` through the structural hierarchy).
+                    for (param, ty) in env {
+                        seeds.push((param, ty));
+                        params.push((param, None));
+                    }
                 }
-                return Some((params, seeds, true));
+                return Some((params, seeds, own));
             }
             return None;
         }
@@ -1406,13 +1424,15 @@ impl<'a> Engine<'a> {
         if let Some(params) = self.exec_bounds.get(&callee_name)
             && !params.is_empty()
         {
-            return Some((params.to_vec(), Vec::new(), true));
+            let own = params.len();
+            return Some((params.to_vec(), Vec::new(), Some(own)));
         }
         // A function-typed variable callee's written signature.
         if let Some(sig) = self.fn_var_sigs.get(&callee_name)
             && !sig.params.is_empty()
         {
-            return Some((sig.params.to_vec(), Vec::new(), true));
+            let own = sig.params.len();
+            return Some((sig.params.to_vec(), Vec::new(), Some(own)));
         }
         // A foreign top-level function: `type_params` is a bare count, so
         // the parameter names recover from the declaration's own types —
@@ -1436,7 +1456,7 @@ impl<'a> Engine<'a> {
         Some((
             names.into_iter().map(|name| (name, None)).collect(),
             Vec::new(),
-            false,
+            None,
         ))
     }
 

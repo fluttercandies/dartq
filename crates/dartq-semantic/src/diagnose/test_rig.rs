@@ -49,12 +49,28 @@ pub(super) fn report_ops(source: &str) -> FileReport {
     report_ops_bare(&format!("{CORE_PRELUDE}{source}"))
 }
 
+/// One imported library of a rig fixture: its `package:` URI, the import
+/// prefix the main unit binds it under (`None` for a plain import), and
+/// its source (prelude-free; it declares what it names).
+pub(super) struct RigImport<'a> {
+    pub(super) uri: &'a str,
+    pub(super) prefix: Option<&'a str>,
+    pub(super) source: &'a str,
+}
+
 /// Diagnoses `source` with the resolved-type snapshot mounted and no
 /// prelude — the fixture declares every member-bearing class it names.
 pub(super) fn report_ops_bare(source: &str) -> FileReport {
-    let strings = StringTable::new();
-    let mut files = FileTable::new();
-    let file = files.intern(Path::new("main.dart"));
+    report_ops_with(source, &[])
+}
+
+/// [`report_ops`] with `imports` mounted as sibling libraries the main
+/// unit imports (prefixed or plain); the prelude rides the main unit.
+pub(super) fn report_ops_imports(source: &str, imports: &[RigImport<'_>]) -> FileReport {
+    report_ops_with(&format!("{CORE_PRELUDE}{source}"), imports)
+}
+
+fn scan_fixture(source: &str, file: dartq_source::FileId) -> dartq_scanner::ScanResult {
     let scanned = dartq_scanner::scan(
         source,
         ScanConfig {
@@ -67,6 +83,14 @@ pub(super) fn report_ops_bare(source: &str) -> FileReport {
         scanned.diagnostics.is_empty(),
         "scanner diagnostics: {source:?}"
     );
+    scanned
+}
+
+fn report_ops_with(source: &str, imports: &[RigImport<'_>]) -> FileReport {
+    let strings = StringTable::new();
+    let mut files = FileTable::new();
+    let file = files.intern(Path::new("main.dart"));
+    let scanned = scan_fixture(source, file);
     let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
     let features = ParserFeatures::from_feature_set(set);
     let elements = collect(source, &scanned.tokens, features, &strings);
@@ -95,8 +119,6 @@ pub(super) fn report_ops_bare(source: &str) -> FileReport {
         }
         builder.declare(lib, name, file);
     }
-    let graph = builder.finish();
-    let namespaces = Namespaces::build(&graph);
     let mut clauses = ClauseTrees::empty();
     crate::capture_clause_trees(
         file,
@@ -106,6 +128,48 @@ pub(super) fn report_ops_bare(source: &str) -> FileReport {
         &strings,
         &mut clauses,
     );
+    for import in imports {
+        let dep_lib = builder.intern(import.uri);
+        let dep_file = files.intern(Path::new(import.uri));
+        let dep_scanned = scan_fixture(import.source, dep_file);
+        let dep_elements = collect(import.source, &dep_scanned.tokens, features, &strings);
+        index.insert(dep_file, dep_elements.clone());
+        builder.unit(dep_lib, dep_file);
+        for (name, decl) in dep_elements.declarations() {
+            if decl.kind == MicroKind::TypeParam {
+                continue;
+            }
+            builder.declare(dep_lib, name, dep_file);
+        }
+        builder.import(
+            dep_lib,
+            ImportEdge {
+                target: Some(core_lib),
+                prefix: None,
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        builder.import(
+            lib,
+            ImportEdge {
+                target: Some(dep_lib),
+                prefix: import.prefix.map(|prefix| strings.intern(prefix)),
+                deferred: false,
+                combinators: Combinators::unfiltered(),
+            },
+        );
+        crate::capture_clause_trees(
+            dep_file,
+            import.source,
+            &dep_scanned.tokens,
+            features,
+            &strings,
+            &mut clauses,
+        );
+    }
+    let graph = builder.finish();
+    let namespaces = Namespaces::build(&graph);
     let types = LibraryTypes::build_with_clauses(
         &graph,
         &namespaces,

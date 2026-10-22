@@ -5,7 +5,7 @@
 //!
 //! Oracle provenance (`dart analyze` 3.13.1): every shape is silent.
 
-use super::test_rig::{assert_silent, code_names, report_ops, rows};
+use super::test_rig::{assert_silent, code_names, report_ops, report_ops_imports, rows, RigImport};
 
 /// `priority.index` on an enum-typed receiver resolves through the
 /// enum's implicit `Enum` interface — in an operator operand (the
@@ -117,4 +117,159 @@ fn explicit_type_arguments_fix_closure_parameter_schemas() {
          int lens(Lst<Fo> fs) => fs.mapIt((f) => f.path.length);\n",
     );
     assert_silent(&report);
+}
+
+/// A generic callee's own parameter never escapes as the caller's static
+/// type: `var n = min(a, b)` is unknown here (the oracle infers `int`),
+/// so `off + n` is never refined to `double` and the `int` sinks stay
+/// silent; an explicit `min<int>(...)` instantiates `int`; the receiver's
+/// written arguments instantiate an own member's return (`Lst<int>`'s
+/// `firstOf()` answers `int`); inside the generic class its own `E` is a
+/// legitimate result type.
+#[test]
+fn a_callee_parameter_never_leaks_as_the_caller_type() {
+    let report = report_ops(
+        "T min<T extends num>(T a, T b) => a;\n\
+         class Bytes { void setRange(int a, int b, List<int> v) {} }\n\
+         class Lst<E> {\n\
+           E firstOf() => throw 0;\n\
+           E self() { var e = firstOf(); return e; }\n\
+         }\n\
+         void f(Bytes bytes, int off, int size, List<int> v, Lst<int> xs) {\n\
+           var n = min(v.length, size - off);\n\
+           bytes.setRange(off, off + n, v);\n\
+           var m = min<int>(v.length, size);\n\
+           bytes.setRange(off, off + m, v);\n\
+           int first = xs.firstOf();\n\
+           first;\n\
+         }\n",
+    );
+    assert_silent(&report);
+}
+
+/// The instantiated own-member return still reports a real mismatch:
+/// `Lst<String>`'s `firstOf()` into an `int` slot.
+#[test]
+fn an_instantiated_member_return_reports_a_real_mismatch() {
+    let report = report_ops(
+        "class Lst<E> { E firstOf() => throw 0; }\n\
+         void f(Lst<String> xs) { int first = xs.firstOf(); first; }\n",
+    );
+    assert_eq!(
+        code_names(&report),
+        vec!["invalid_assignment"],
+        "{:?}",
+        rows(&report)
+    );
+}
+
+/// An inherited generic member instantiates through the receiver viewed
+/// as an instance of the declaring container (`asInstanceOf`): `Lst<Item>`
+/// calling `Itr<E>.map` binds the closure's `item` to `Item`, and
+/// `Itr<E>.firstOf()` returns `Item` — never the `Object?` recovery or
+/// the raw `E`.
+#[test]
+fn inherited_generic_members_instantiate_through_the_hierarchy() {
+    let report = report_ops(
+        "class Itr<E> {\n\
+           Iterable<R> map<R>(R Function(E) f) => throw 0;\n\
+           Iterable<E> where(bool Function(E) t) => throw 0;\n\
+           E firstOf() => throw 0;\n\
+         }\n\
+         class Lst<E> extends Itr<E> {}\n\
+         class Item { int get id => 0; }\n\
+         void f(Lst<Item> items) {\n\
+           var ids = items.map((item) => item.id);\n\
+           ids;\n\
+           items.where((i) => i.id > 0);\n\
+           Item first = items.firstOf();\n\
+           first;\n\
+         }\n",
+    );
+    assert_silent(&report);
+    let mismatch = report_ops(
+        "class Itr<E> { E firstOf() => throw 0; }\n\
+         class Lst<E> extends Itr<E> {}\n\
+         class Item {}\n\
+         void f(Lst<Item> items) { int first = items.firstOf(); first; }\n",
+    );
+    assert_eq!(
+        code_names(&mismatch),
+        vec!["invalid_assignment"],
+        "{:?}",
+        rows(&mismatch)
+    );
+}
+
+/// The core primitives' closed lattice: a declared class is never an
+/// `int` and `int` never a declared class (both directions report), while
+/// an extension type over `int` stays undecided (it may implement `int`).
+#[test]
+fn a_declared_class_never_relates_to_a_core_primitive() {
+    let report = report_ops(
+        "class Item {}\n\
+         void f(Item i, int n) { int x = i; Item y = n; x; y; }\n",
+    );
+    assert_eq!(
+        code_names(&report),
+        vec!["invalid_assignment", "invalid_assignment"],
+        "{:?}",
+        rows(&report)
+    );
+    let extension_type = report_ops(
+        "extension type Id(int i) implements int {}\n\
+         void f(Id id) { int x = id; x; }\n",
+    );
+    assert_silent(&extension_type);
+}
+
+
+/// A class-head send resolves its named constructor before any member: the
+/// factory `MFT.read` IS the creation (silent, the created `MFT` flows),
+/// while the same selector through a subclass is an `undefined_method` —
+/// static members are not inherited (dart analyze 3.13.1 verdicts).
+#[test]
+fn a_named_constructor_outranks_members_and_statics_do_not_inherit() {
+    let report = report_ops(
+        "class MT { static MT read(int r) => MT(); }\n\
+         class MFT extends MT { factory MFT.read(int r) => MFT._(); MFT._(); }\n\
+         class Item { Item({required MFT functionType}); }\n\
+         Item f(int r) => Item(functionType: MFT.read(r));\n\
+         class Sub extends MT {}\n\
+         MT g(int r) => Sub.read(r);\n",
+    );
+    assert_eq!(
+        code_names(&report),
+        vec!["undefined_method"],
+        "{:?}",
+        rows(&report)
+    );
+}
+
+/// A prefix-resolved creation (`const fb.Reader().vTableGet(...)`, the
+/// unprefixed `fb.Reader()`): the created value rows stack over the whole
+/// written span, so a following member never pops the enclosing
+/// assignment's receiver — `b ??= fb.R().get(0)` reads `get` on the
+/// created `R`, never on `b` (dart analyze 3.13.1: silent).
+#[test]
+fn a_prefixed_creation_folds_a_value_row_under_its_members() {
+    let source = |call: &str| {
+        format!(
+            "class B {{ final int? v; B(this.v); }}\n\
+             void f(B? b) {{\n\
+               b ??= {call};\n\
+             }}\n"
+        )
+    };
+    for call in ["const fb.R().get(0)", "fb.R().get(0)"] {
+        let report = report_ops_imports(
+            &source(call),
+            &[RigImport {
+                uri: "package:probe/reader.dart",
+                prefix: Some("fb"),
+                source: "class R { int get(int i) => i; }\n",
+            }],
+        );
+        assert_silent(&report);
+    }
 }

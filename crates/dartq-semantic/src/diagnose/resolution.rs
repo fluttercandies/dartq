@@ -1282,7 +1282,16 @@ impl<'a> Engine<'a> {
         let Ty::Named { name, args, .. } = recv_ty else {
             return None;
         };
-        if name != container || args == ArgListId::EMPTY {
+        // An inherited member (`List<int>.map` declared on `Iterable<E>`):
+        // the receiver viewed as an instance of the declaring container
+        // (`asInstanceOf` over the structural hierarchy) spells the
+        // environment the clause hops compose — `E := int`.
+        if name != container {
+            return self
+                .ops?
+                .instance_env(recv_ty, container, &self.boundary.args);
+        }
+        if args == ArgListId::EMPTY {
             return None;
         }
         let written: Vec<Ty> = self.boundary.args.borrow().get(args).to_vec();

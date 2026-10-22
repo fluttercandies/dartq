@@ -843,12 +843,16 @@ impl<'a> Engine<'a> {
             {
                 let result = self.member_invoke_result(&entry);
                 if result != Ty::UNKNOWN {
-                    return result;
+                    let kind = self.container_kind_of(container).unwrap_or(ContainerKind::Class);
+                    let recv = Receiver::This { container, kind };
+                    return self.instantiate_call_return(row, &recv, result);
                 }
             }
             return self
                 .top_level_decl(row.name)
-                .map_or(Ty::UNKNOWN, |decl| decl.return_ty);
+                .map_or(Ty::UNKNOWN, |decl| {
+                    self.instantiate_call_return(row, &Receiver::Unknown, decl.return_ty)
+                });
         }
         let container = match &row.shape {
             RowShape::Member {
@@ -884,9 +888,54 @@ impl<'a> Engine<'a> {
         let Some(container) = container else {
             return Ty::UNKNOWN;
         };
+        // `C.name(...)` on a class head: a named constructor outranks any
+        // member (the oracle rewrites the creation first), and a static
+        // member must be the class's own — statics are not inherited, so
+        // the superclass walk never answers a static send.
+        if let RowShape::Member {
+            recv: Receiver::Container { .. },
+        } = &row.shape
+        
+            && let Some((found, owner)) = resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                container,
+            )
+        {
+            // A GENERIC class's constructor result needs the inference
+            // this name-level read cannot run (`List.of(ranges)` answers
+            // `List<RangeCharPredicate>` from the arguments) — the raw
+            // `List` would poison every downstream schema, so a generic
+            // head stays `Unknown` and the send-close solver's upward
+            // inference owns the answer.
+            if found.constructors.contains(&row.name) {
+                return (found.type_params == 0).then(|| Ty::named(container)).unwrap_or(Ty::UNKNOWN);
+            }
+            return match found.members.get(&row.name) {
+                Some(entry) if entry.is_static => {
+                    // The entry belongs to `owner`'s pool: project it before
+                    // its types flow (the same F1 rule the walk's Find arm
+                    // applies).
+                    let recv = Receiver::Container {
+                        name: container,
+                        kind: found.kind,
+                    };
+                    let projected = self.boundary.member(owner, container, row.name, entry);
+                    self.instantiate_call_return(row, &recv, projected.return_ty)
+                }
+                _ => Ty::UNKNOWN,
+            };
+        }
         match self.walk_members(container, row.name) {
             Walk::Found(entry) if matches!(entry.kind, MemberKind::Method | MemberKind::Getter) => {
-                entry.return_ty
+                let recv = match &row.shape {
+                    RowShape::Member { recv } => *recv,
+                    _ => Receiver::Unknown,
+                };
+                self.instantiate_call_return(row, &recv, entry.return_ty)
             }
             // The unindexed dart:core container's static face
             // ([`CORE_STATIC_RETURNS`]): the member walk chain-breaks on
@@ -2956,7 +3005,12 @@ impl<'a> Engine<'a> {
             return Some(false);
         }
         if !from_primitive || !to_primitive {
-            return None;
+            // One side a core primitive, the other a declared container:
+            // the primitives' closed lattice decides the negative
+            // ([`Self::declared_outside_core`]); anything else stays
+            // undecided.
+            let other = if from_primitive { to_name } else { from_name };
+            return self.declared_outside_core(other).then_some(false);
         }
         let (int, double, num) = (
             self.members.primitive_ids[0],

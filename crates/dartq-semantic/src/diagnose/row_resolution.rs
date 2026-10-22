@@ -3232,9 +3232,21 @@ impl<'a> Engine<'a> {
     /// y` types `bool`, never `bool?` — so the upgrade leaves both alone.
     pub(crate) fn expression_row_ty(&self, row: &Row) -> Ty {
         // An invocation row stores its callee's declared type; the
-        // expression's type is the send's result
-        // ([`Self::invoked_callee_result`]).
-        let ty = self.invoked_callee_result(row).unwrap_or(row.ty);
+        // expression's type is the send's result — a function-typed
+        // callee's signature return ([`Self::invoked_callee_result`]),
+        // else the resolved callee's declared return
+        // ([`Self::callee_return_ty`], the same face the write staging
+        // reads).
+        // A stored send type stands (a folded creation's instance, the
+        // null-assert rewrite `f()!` left on the row); only a send whose
+        // row carries nothing resolves its callee here.
+        let ty = match self.invoked_callee_result(row) {
+            Some(ty) => ty,
+            None if row.intent == Intent::Invoke && row.ty == Ty::UNKNOWN => {
+                self.callee_return_ty(row)
+            }
+            None => row.ty,
+        };
         if self.null_aware_members.contains(&row.range.offset)
             && !matches!(row.intent, Intent::Operator(..))
             && !self.bool_decided_covers(row)

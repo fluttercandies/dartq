@@ -265,6 +265,7 @@ impl<'a> Engine<'a> {
             if !skip_own && let Some(entry) = found.members.get(&member) {
                 // F1: the found entry belongs to `found_owner`'s pool —
                 // project it before it flows into rows or message text.
+                self.member_faces.found_origin.set(Some(name));
                 return Walk::Found(self.boundary.member(found_owner, name, member, entry));
             }
             skip_own = false;
@@ -303,6 +304,7 @@ impl<'a> Engine<'a> {
                             )),
                             Instantiated::Unchanged | Instantiated::Undecidable => projected,
                         };
+                    self.member_faces.found_origin.set(Some(*mixin));
                     return Walk::Found(found_entry);
                 }
             }
@@ -408,6 +410,7 @@ impl<'a> Engine<'a> {
             if let Some(entry) = face_container.members.get(&member)
                 && !entry.is_static
             {
+                self.member_faces.found_origin.set(Some(face));
                 return Walk::Found(self.boundary.member(
                     face_container_owner,
                     face,

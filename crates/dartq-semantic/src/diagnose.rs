@@ -375,6 +375,7 @@ use dartq_types::{
 
 mod assignability;
 mod const_eval_faces;
+mod call_result;
 mod collection_literal;
 mod creation_args;
 mod engine_core;
@@ -383,6 +384,7 @@ mod index_result;
 mod listener;
 mod never_send;
 mod pattern_scope;
+mod primitive_lattice;
 mod receiver_face;
 mod send_result;
 mod operand_face;

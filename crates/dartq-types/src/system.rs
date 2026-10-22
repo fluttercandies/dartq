@@ -571,7 +571,7 @@ impl<'a> TypeSystem<'a> {
     /// edges with live substitution — `None` when `target` is not a
     /// supertype of `from`. Iterative with a visited set; claims a pooled
     /// walk unit like [`TypeSystem::interface_subtype`].
-    fn as_instance_of(&self, from: TypeId, target: TypeDeclId) -> Option<TypeId> {
+    pub fn as_instance_of(&self, from: TypeId, target: TypeDeclId) -> Option<TypeId> {
         let TypeKind::Interface {
             decl: from_decl,
             args: from_args,

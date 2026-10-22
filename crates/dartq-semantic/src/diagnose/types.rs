@@ -904,6 +904,14 @@ pub(crate) enum Walk<'a> {
 #[derive(Default)]
 pub(crate) struct FaceMemo<'a> {
     pub(crate) walks: RefCell<FxHashMap<(StringId, StringId, bool), Walk<'a>>>,
+    /// The declaring container of each memoized `Found` outcome — the hop
+    /// the climb found the member on (`List.map` declares on `Iterable`),
+    /// the key the receiver-instantiation environment composes against.
+    pub(crate) origins: RefCell<FxHashMap<(StringId, StringId, bool), StringId>>,
+    /// The declaring container the climb in flight recorded for its
+    /// `Found` return; read back by [`Self::walk`] into `origins`, and by
+    /// the caller as the probe's origin.
+    pub(crate) found_origin: std::cell::Cell<Option<StringId>>,
     /// The prefixed supertype-clause faces of the diagnosing file's
     /// container headers, scanned once per pass on the first prefixed-face
     /// question (`(writer container, face local name)` → the written prefix
@@ -929,11 +937,23 @@ impl<'a> FaceMemo<'a> {
     ) -> Walk<'a> {
         let key = (container, member, super_walk);
         if let Some(hit) = self.walks.borrow().get(&key) {
+            self.found_origin
+                .set(self.origins.borrow().get(&key).copied());
             return hit.clone();
         }
+        self.found_origin.set(None);
         let walk = climb();
+        if let Some(origin) = self.found_origin.get() {
+            self.origins.borrow_mut().insert(key, origin);
+        }
         self.walks.borrow_mut().insert(key, walk.clone());
         walk
+    }
+
+    /// The declaring container of the most recent probe's `Found` outcome
+    /// (memoized or fresh); `None` for a miss or a broken chain.
+    pub(crate) fn last_origin(&self) -> Option<StringId> {
+        self.found_origin.get()
     }
 }
 

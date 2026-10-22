@@ -163,6 +163,12 @@ pub struct LibraryTypes {
     /// resolve registers no entry and keeps the opaque face (the
     /// under-report direction).
     typedef_shapes: FxHashMap<StringId, TypedefShape>,
+    /// Each registered container's own parameter ids → their declared
+    /// spellings, in declaration order (`List`'s first id → `E`): the
+    /// receiver-instantiation environment ([`ResolvedTypeOps::instance_env`])
+    /// spells an instantiated supertype's arguments back onto the names
+    /// the declaring container's member signatures use.
+    param_names: FxHashMap<TypeParamId, StringId>,
     /// Type-parameter spellings → a synthetic parameter id each
     /// (`MicroKind::TypeParam` declarations). Declaration-scoped in the
     /// official element model but name-keyed here exactly like the flow
@@ -324,6 +330,7 @@ impl LibraryTypes {
         let type_params: FxHashMap<StringId, TypeParamId> = FxHashMap::default();
         let mut next_decl = FIRST_BUILTIN_RAW;
         let mut next_param = 2_u32;
+        let mut param_names: FxHashMap<TypeParamId, StringId> = FxHashMap::default();
 
         // —— the builtin face ————————————————————————————————————————
         // Fresh parameter ids per builtin; `Object`'s edge arrives
@@ -337,10 +344,11 @@ impl LibraryTypes {
             let decl = TypeDeclId::from_raw(next_decl);
             next_decl += 1;
             let mut param_ids = Vec::with_capacity(params.len());
-            for _ in params {
+            for &param in params {
                 let id = TypeParamId::from_raw(next_param);
                 next_param += 1;
                 param_ids.push(id);
+                param_names.insert(id, strings.intern(param));
                 facts.set(
                     id,
                     ParamFacts {
@@ -398,6 +406,7 @@ impl LibraryTypes {
             typedef_shapes: FxHashMap::default(),
             aliases: Vec::new(),
             type_params,
+            param_names,
             facts,
             next_decl: FIRST_CONTAINER_RAW,
             next_param,
@@ -463,6 +472,7 @@ impl LibraryTypes {
             typedef_targets,
             typedef_shapes,
             type_params,
+            param_names,
             mut facts,
             ..
         } = registry;
@@ -643,6 +653,7 @@ impl LibraryTypes {
             non_containers,
             typedef_targets,
             typedef_shapes,
+            param_names,
             type_params,
         }
     }
@@ -718,6 +729,8 @@ struct Registry {
     /// `TypeKind::TypeParameter` map the adapter answers instead of
     /// `Invalid` for a `T`-shaped name (#2186 S4-C).
     type_params: FxHashMap<StringId, TypeParamId>,
+    /// See [`LibraryTypes::param_names`].
+    param_names: FxHashMap<TypeParamId, StringId>,
     facts: ParamFactsTable,
     next_decl: u32,
     next_param: u32,
@@ -769,10 +782,13 @@ impl Registry {
             let decl = TypeDeclId::from_raw(self.next_decl);
             self.next_decl += 1;
             let mut param_ids = Vec::with_capacity(usize::from(container.type_params));
-            for _ in 0..container.type_params {
+            for position in 0..usize::from(container.type_params) {
                 let id = TypeParamId::from_raw(self.next_param);
                 self.next_param += 1;
                 param_ids.push(id);
+                if let Some(&spelling) = container.type_param_names.get(position) {
+                    self.param_names.insert(id, spelling);
+                }
                 self.facts.set(
                     id,
                     ParamFacts {
@@ -1371,6 +1387,13 @@ pub struct ResolvedTypeOps<'a> {
     /// rather than one shared argument-less declaration (#2288's spurious
     /// `is`-check dead rows).
     opaque: RefCell<FxHashMap<(StringId, usize), TypeDeclId>>,
+    /// The registry inverted (`TypeDeclId` → declared spelling), built on
+    /// the first structural answer that maps back into the diagnosing
+    /// pool ([`Self::instance_env`]).
+    decl_names: RefCell<Option<FxHashMap<TypeDeclId, StringId>>>,
+    /// The parameter registry inverted (`TypeParamId` → spelling); the
+    /// registry is name-keyed, so the inversion is exact.
+    param_names: RefCell<Option<FxHashMap<TypeParamId, StringId>>>,
     dynamic: TypeId,
     null: TypeId,
     void: TypeId,
@@ -1390,6 +1413,8 @@ impl<'a> ResolvedTypeOps<'a> {
             name_ty: RefCell::new(Vec::new()),
             closed: RefCell::new(FxHashMap::default()),
             opaque: RefCell::new(FxHashMap::default()),
+            decl_names: RefCell::new(None),
+            param_names: RefCell::new(None),
             dynamic: table.intern(UninternedType::Dynamic, false),
             null: table.intern(UninternedType::Null, false),
             void: table.intern(UninternedType::Void, false),
@@ -4903,4 +4928,105 @@ fn non_nullable_of(table: &TypeTable, ty: TypeId) -> TypeId {
         }
     };
     table.intern(uninterned, false)
+}
+
+impl ResolvedTypeOps<'_> {
+    /// `recv` viewed as an instance of the container `target` (the official
+    /// `asInstanceOf`, element.dart `InterfaceTypeImpl.asInstanceOf`):
+    /// `target`'s type parameters paired with the instantiated arguments
+    /// (`List<int>` as `Iterable` reads `E := int`), mapped back into the
+    /// diagnosing pool. `None` when the receiver does not map into the
+    /// snapshot, `target` is unregistered, the receiver is not an instance
+    /// of it, or an argument carries a shape the pool cannot spell.
+    pub(crate) fn instance_env(
+        &self,
+        recv: Ty,
+        target: StringId,
+        pool: &RefCell<ArgPool>,
+    ) -> Option<Vec<(StringId, Ty)>> {
+        let from = self.map_ty_strict(recv, &pool.borrow())?;
+        let &decl = self
+            .snapshot
+            .registry
+            .get(&target)
+            .filter(|_| !self.snapshot.non_containers.contains(&target))?;
+        let instance = self.system.as_instance_of(from, decl)?;
+        let TypeKind::Interface { args, .. } = self.snapshot.table.get(instance).kind() else {
+            return None;
+        };
+        let params = self.snapshot.decl_params.get(&decl)?;
+        let args = self.snapshot.table.args(args);
+        if args.len() != params.len() {
+            return None;
+        }
+        let mut env = Vec::with_capacity(args.len());
+        for (&param, &arg) in params.iter().zip(args.iter()) {
+            env.push((self.param_name(param)?, self.unmap_ty(arg, pool)?));
+        }
+        Some(env)
+    }
+
+    /// A snapshot type spelled back into the diagnosing pool: interfaces
+    /// and type parameters through the inverted registries, the atoms as
+    /// themselves. Function and record shapes answer `None` (their
+    /// re-interning is not a question any consumer asks yet).
+    fn unmap_ty(&self, id: TypeId, pool: &RefCell<ArgPool>) -> Option<Ty> {
+        let ty = self.snapshot.table.get(id);
+        let nullable = ty.is_nullable();
+        match ty.kind() {
+            TypeKind::Dynamic => Some(Ty::Dynamic),
+            TypeKind::Void => Some(Ty::Void),
+            TypeKind::Null => Some(Ty::Null),
+            TypeKind::Never => Some(if nullable { Ty::Null } else { Ty::Never }),
+            TypeKind::Invalid | TypeKind::Function { .. } | TypeKind::Record { .. } => None,
+            TypeKind::TypeParameter { parameter } => Some(Ty::Named {
+                name: self.param_name(parameter)?,
+                nullable,
+                args: ArgListId::EMPTY,
+            }),
+            TypeKind::FutureOr { base } => {
+                let base = self.unmap_ty(base, pool)?;
+                let head = self.strings.intern("FutureOr");
+                Some(pool.borrow_mut().named(head, nullable, &[base]))
+            }
+            TypeKind::Interface { decl, args } => {
+                let name = self.decl_name(decl)?;
+                let ids = self.snapshot.table.args(args);
+                let mut mapped = Vec::with_capacity(ids.len());
+                for id in ids {
+                    mapped.push(self.unmap_ty(id, pool)?);
+                }
+                Some(pool.borrow_mut().named(name, nullable, &mapped))
+            }
+        }
+    }
+
+    fn decl_name(&self, decl: TypeDeclId) -> Option<StringId> {
+        let mut cache = self.decl_names.borrow_mut();
+        let names = cache.get_or_insert_with(|| {
+            self.snapshot
+                .registry
+                .iter()
+                .map(|(&name, &decl)| (decl, name))
+                .collect()
+        });
+        names.get(&decl).copied()
+    }
+
+    /// A container's own parameter spelling, or the name-keyed synthetic
+    /// parameter's (the element-model `TypeParam` declarations).
+    fn param_name(&self, param: TypeParamId) -> Option<StringId> {
+        if let Some(&name) = self.snapshot.param_names.get(&param) {
+            return Some(name);
+        }
+        let mut cache = self.param_names.borrow_mut();
+        let names = cache.get_or_insert_with(|| {
+            self.snapshot
+                .type_params
+                .iter()
+                .map(|(&name, &param)| (param, name))
+                .collect()
+        });
+        names.get(&param).copied()
+    }
 }

@@ -1591,8 +1591,9 @@ impl<'a> Engine<'a> {
         {
             return None;
         }
+        // The walked span `[start, open)` is one contiguous identifier.
         Some((
-            self.intern(&self.source[start..end]),
+            self.intern(&self.source[start..self.byte_of(open)]),
             SourceRange {
                 offset: self.utf16_of(start),
                 length: open - self.utf16_of(start),
@@ -2072,56 +2073,83 @@ impl<'a> Engine<'a> {
             } else if self.keyword_creation_head(head_range.offset)
                 && matches!(self.type_resolution(head).0, TypeResolution::Type)
             {
-                let open = self.creation_open_offset(head_range.end());
-                let kept = self.rows.partition_point(|row| row.range.offset < open);
-                for row in self.rows.drain(kept..) {
-                    self.deferred_miss_rows.push(row);
-                }
-                let range = SourceRange {
-                    offset: head_range.offset,
-                    length: close.end().saturating_sub(head_range.offset),
-                };
-                self.ur_register_creation(head_range.offset, range, head);
-                // The written type arguments instantiate the created type
-                // (upstream Dart SDK source,
-                // pkg/analyzer/lib/src/generated/resolver.dart,
-                // visitInstanceCreationExpression — the static type is the
-                // constructor's return with the resolved type arguments):
-                // `const ListEquality<Attr>().hash(...)` resolves `hash` on
-                // `ListEquality<Attr>`, never on the enclosing context's
-                // face. A group the segment parser cannot spell (a
-                // function-typed argument) keeps the raw head — the
-                // under-report posture the no-group spelling shares.
-                let ty = self
-                    .type_arg_group_end(head_range.end())
-                    .and_then(|group_end| {
-                        let token = Token {
-                            id: 0,
-                            range: SourceRange {
-                                offset: group_end,
-                                length: 1,
-                            },
-                        };
-                        self.literal_group_args(token)
-                    })
-                    .map_or_else(
-                        || Ty::named(head),
-                        |args| self.boundary.args.borrow_mut().named(head, false, &args),
-                    );
-                self.rows.push(Row {
-                    name: head,
-                    range,
-                    qualified: false,
-                    shape: RowShape::Receiver(Receiver::Created {
-                        name: head,
-                        kind: ContainerKind::Class,
-                    }),
-                    intent: Intent::Read,
-                    write_op: None,
-                    ty,
-                });
+                self.fold_unnamed_creation_row(head_range.offset, head_range, close.end(), head, ContainerKind::Class);
+            }
+            // The prefix-resolved creation (`const fb.Reader().vTableGet`,
+            // the unprefixed-spelled `fb.Reader(...)`): the constructor
+            // reference `p.C` resolves the head as a type use behind the
+            // prefix, so no callee row transports and the same stale-pop
+            // the keyword arm folds. The resolved container's own face is
+            // the created type; the member verdicts on the folded row
+            // under-report through the bare scope the same way the
+            // non-keyword prefixed send already does (the class name sits
+            // behind the prefix table).
+            else if let Some((prefix, prefix_offset)) = self.written_prefix_before(head_range.offset)
+                && let Some((resolved, _)) =
+                    prefixed_container(self.graph, self.namespaces, self.index, self.lib, prefix, head)
+            {
+                self.fold_unnamed_creation_row(prefix_offset, head_range, close.end(), head, resolved.kind);
             }
         }
+    }
+
+    /// The unnamed creation fold's shared body ([`Engine::close_arguments`]):
+    /// drains the group's argument rows to their pass-2 obligations and
+    /// stacks the creation's value row over the whole written span, from the
+    /// `start` the creation's written spelling begins at (the keyword's head
+    /// token, or the prefix identifier of `p.C`) through the group's close.
+    fn fold_unnamed_creation_row(
+        &mut self,
+        start: u32,
+        head_range: SourceRange,
+        close_end: u32,
+        head: StringId,
+        kind: ContainerKind,
+    ) {
+        let open = self.creation_open_offset(head_range.end());
+        let kept = self.rows.partition_point(|row| row.range.offset < open);
+        for row in self.rows.drain(kept..) {
+            self.deferred_miss_rows.push(row);
+        }
+        let range = SourceRange {
+            offset: start,
+            length: close_end.saturating_sub(start),
+        };
+        self.ur_register_creation(start, range, head);
+        // The written type arguments instantiate the created type (upstream
+        // Dart SDK source, pkg/analyzer/lib/src/generated/resolver.dart,
+        // visitInstanceCreationExpression — the static type is the
+        // constructor's return with the resolved type arguments):
+        // `const ListEquality<Attr>().hash(...)` resolves `hash` on
+        // `ListEquality<Attr>`, never on the enclosing context's face. A
+        // group the segment parser cannot spell (a function-typed argument)
+        // keeps the raw head — the under-report posture the no-group
+        // spelling shares.
+        let ty = self
+            .type_arg_group_end(head_range.end())
+            .and_then(|group_end| {
+                let token = Token {
+                    id: 0,
+                    range: SourceRange {
+                        offset: group_end,
+                        length: 1,
+                    },
+                };
+                self.literal_group_args(token)
+            })
+            .map_or_else(
+                || Ty::named(head),
+                |args| self.boundary.args.borrow_mut().named(head, false, &args),
+            );
+        self.rows.push(Row {
+            name: head,
+            range,
+            qualified: false,
+            shape: RowShape::Receiver(Receiver::Created { name: head, kind }),
+            intent: Intent::Read,
+            write_op: None,
+            ty,
+        });
     }
 
     /// Starts a new argument in the open argument list (the row window the
