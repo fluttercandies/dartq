@@ -71,12 +71,6 @@ pub(crate) fn is_request(method: &str) -> bool {
     DEBUG_REQUESTS.contains(&method)
 }
 
-/// How many debug sessions may be live at once. Each session owns a Dart
-/// child process (or an attached VM connection), a reader thread, and
-/// bounded rings; the cap keeps a single daemon's debug footprint bounded
-/// (the 5-parallel-instance product ceiling leaves headroom at 8).
-pub(crate) const MAX_SESSIONS: usize = 8;
-
 /// A debug face failure, mapped to the wire by [`DebugError::wire`].
 #[derive(Debug)]
 pub(crate) enum DebugError {
@@ -85,10 +79,11 @@ pub(crate) enum DebugError {
     InvalidParams(String),
     /// The request named a session id that is not live.
     NoSuchSession(u32),
-    /// The registry is at [`MAX_SESSIONS`] live sessions.
-    SessionLimit,
     /// The underlying debug session call failed (transport, VM RPC,
-    /// process, or timeout — dartq-debug's typed failure set).
+    /// process, or timeout — dartq-debug's typed failure set). Resource
+    /// exhaustion (process table, fds, memory) surfaces here as the OS's
+    /// own error, not a daemon-side quota — the registry itself is
+    /// unbounded.
     Vm(dartq_debug::Error),
 }
 
@@ -103,12 +98,6 @@ impl DebugError {
             Self::NoSuchSession(id) => (
                 codes::DEBUG_SESSION,
                 format!("DARTQ/DEBUG/NO_SUCH_SESSION: session {id} is not live"),
-            ),
-            Self::SessionLimit => (
-                codes::DEBUG_SESSION,
-                format!(
-                    "DARTQ/DEBUG/SESSION_LIMIT: at most {MAX_SESSIONS} concurrent debug sessions"
-                ),
             ),
             Self::Vm(error) => (codes::DEBUG_SESSION, format!("DARTQ/DEBUG/VM: {error}")),
         }
@@ -132,8 +121,12 @@ struct ManagedSession {
 }
 
 /// The session registry: monotonic ids (never reused within a daemon
-/// life) and a bounded live set. Hangs off the daemon [`Session`] and is
-/// touched only from the main loop, like every other piece of it.
+/// life) and an unbounded live set — resource exhaustion (process table,
+/// fds, memory) surfaces through `DebugSession::launch`/`attach`'s own
+/// error rather than a daemon-side quota, so the ceiling is whatever
+/// the host can actually run, not a hardcoded guess. Hangs off the
+/// daemon [`Session`] and is touched only from the main loop, like
+/// every other piece of it.
 #[derive(Default)]
 pub(crate) struct DebugManager {
     sessions: FxHashMap<u32, ManagedSession>,
@@ -141,15 +134,11 @@ pub(crate) struct DebugManager {
 }
 
 impl DebugManager {
-    /// Registers a live session under the next monotonic id, or refuses
-    /// at the concurrent-session bound.
-    fn register(&mut self, origin: Origin, session: DebugSession) -> Result<u32, DebugError> {
-        if self.sessions.len() >= MAX_SESSIONS {
-            return Err(DebugError::SessionLimit);
-        }
+    /// Registers a live session under the next monotonic id.
+    fn register(&mut self, origin: Origin, session: DebugSession) -> u32 {
         self.next_id += 1;
         self.sessions.insert(self.next_id, ManagedSession { origin, session });
-        Ok(self.next_id)
+        self.next_id
     }
 
     /// The named session, or the machine-coded miss.
@@ -359,18 +348,13 @@ pub(crate) fn handle(
                     "script must be a non-empty path".into(),
                 ));
             }
-            // Refuse at the bound before spawning a child the registry
-            // would then reject.
-            if manager.sessions.len() >= MAX_SESSIONS {
-                return Err(DebugError::SessionLimit);
-            }
             let mut config = LaunchConfig::new(resolve(root, decoded.script.clone()));
             config.args = decoded.args;
             config.vm_flags = decoded.vm_flags;
             config.pause_on_start = decoded.pause_on_start;
             config.cwd = decoded.cwd.map(|cwd| resolve(root, cwd));
             let session = DebugSession::launch(config).map_err(DebugError::Vm)?;
-            let id = manager.register(Origin::Launch(decoded.script), session)?;
+            let id = manager.register(Origin::Launch(decoded.script), session);
             Ok(session_opened_row(id, &manager.get(id).expect("just registered").session))
         }
         DEBUG_ATTACH => {
@@ -379,11 +363,8 @@ pub(crate) fn handle(
             if decoded.ws_uri.is_empty() {
                 return Err(DebugError::InvalidParams("wsUri must be a non-empty string".into()));
             }
-            if manager.sessions.len() >= MAX_SESSIONS {
-                return Err(DebugError::SessionLimit);
-            }
             let session = DebugSession::attach(&decoded.ws_uri).map_err(DebugError::Vm)?;
-            let id = manager.register(Origin::Attach(decoded.ws_uri), session)?;
+            let id = manager.register(Origin::Attach(decoded.ws_uri), session);
             Ok(session_opened_row(id, &manager.get(id).expect("just registered").session))
         }
         DEBUG_DETACH => {
