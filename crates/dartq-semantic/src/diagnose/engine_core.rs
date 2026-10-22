@@ -205,6 +205,7 @@ impl<'a> Engine<'a> {
             ctor_init_pending: Vec::new(),
             ctor_inits: FxHashMap::default(),
             pending_matched: Vec::new(),
+            pending_switch_coverings: Vec::new(),
             clause_anchor: None,
             primary_constructors_enabled,
             variance_enabled,

@@ -5383,6 +5383,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 space,
                 guarded: when.is_some(),
                 anchor: case_kw.range,
+                flow_anchor: case_kw.range,
                 head_colon: Some(colon.range),
                 body: None,
             });
@@ -5530,6 +5531,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 space,
                 guarded: when.is_some(),
                 anchor: arrow.range,
+                flow_anchor: begin.range,
                 head_colon: None,
                 body: None,
             });

@@ -126,6 +126,55 @@ fn double_import_report(main_source: &str, dependency: &str, prefix: Option<&str
     )
 }
 
+/// The single-file no-import rig (the `operand_face_tests` shape): the
+/// wave's function-typed-callee and covering faces live in one unit.
+fn unit_report(source: &str) -> FileReport {
+    let strings = StringTable::new();
+    let mut files = FileTable::new();
+    let file = files.intern(Path::new("main.dart"));
+    let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+    let features = ParserFeatures::from_feature_set(set);
+    let scanned = dartq_scanner::scan(
+        source,
+        ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        },
+        file,
+    );
+    assert!(
+        scanned.diagnostics.is_empty(),
+        "scanner diagnostics: {source:?}"
+    );
+    let elements = collect(source, &scanned.tokens, features, &strings);
+    let mut builder = LibraryGraphBuilder::new(&strings);
+    let lib = builder.intern("package:t/main.dart");
+    for (name, decl) in elements.declarations() {
+        if decl.kind == MicroKind::TypeParam {
+            continue;
+        }
+        builder.declare(lib, name, file);
+    }
+    let graph = builder.finish();
+    let namespaces = Namespaces::build(&graph);
+    let mut index = ElementIndex::default();
+    index.insert(file, elements);
+    diagnose_with(
+        source,
+        &scanned.tokens,
+        features,
+        &strings,
+        file,
+        lib,
+        &graph,
+        &namespaces,
+        &index,
+        StrictModes::default(),
+        &LibraryClassModifiers::default(),
+        set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+    )
+}
+
 fn codes(report: &FileReport) -> Vec<&'static str> {
     report.diagnostics.iter().map(|d| d.code.name).collect()
 }
@@ -292,5 +341,81 @@ final class WithUri extends WithString {}
         !codes(&report).contains(&"dead_code"),
         "dead_code leaked: {:?}",
         codes(&report)
+    );
+}
+
+/// The function-typed callee's own shape (#2536): the invocation yields
+/// the shape's return type — a typedef-typed field, a typedef-typed
+/// parameter, and a raw inline function-typed parameter all type the
+/// call's result as the return face, never the whole function type.
+#[test]
+fn function_typed_callee_returns_the_shapes_return() {
+    let report = unit_report(
+        r#"
+typedef Handler = String Function(int x);
+
+class Widget {
+  final Handler handler;
+  const Widget(this.handler);
+
+  String invoke(int x) {
+    return handler(x);
+  }
+}
+
+num useMapper(num Function(String s) m, String s) {
+  return m(s);
+}
+"#,
+    );
+    let cs = codes(&report);
+    assert!(
+        !cs.contains(&"return_of_invalid_type"),
+        "return face leaked: {cs:?}"
+    );
+}
+
+/// The null-checked scrutinee's covering verdict (#2538): the
+/// `if (n == null) return;` promotion strips the null witness, so both
+/// the statement switch and the `return switch` expression stay
+/// exhaustive — no `non_exhaustive` row; the per-case reachability face
+/// (`Num()` after `IntNum()`) keeps its row.
+#[test]
+fn null_promoted_scrutinee_decides_the_covering_gap() {
+    let report = unit_report(
+        r#"
+sealed class Num {}
+final class IntNum extends Num {}
+
+int g(Num? n) {
+  if (n == null) return 0;
+  int r = 0;
+  switch (n) {
+    case IntNum():
+      r = 1;
+    case Num():
+      r = 2;
+  }
+  return r;
+}
+
+int h(Num? n) {
+  if (n == null) return 0;
+  return switch (n) {
+    IntNum() => 1,
+    Num() => 2,
+  };
+}
+"#,
+    );
+    let cs = codes(&report);
+    assert!(
+        !cs.contains(&"non_exhaustive_switch_statement")
+            && !cs.contains(&"non_exhaustive_switch_expression"),
+        "covering leaked: {cs:?}"
+    );
+    assert!(
+        cs.contains(&"unreachable_switch_case"),
+        "the per-case face keeps its row: {cs:?}"
     );
 }

@@ -5928,6 +5928,20 @@ impl<'a> Engine<'a> {
         {
             self.rows[callee].ty = call_ret;
         }
+        // A function-typed callee's own shape: the invocation yields the
+        // shape's return type (`handler(x)` over `typedef H = String
+        // Function(int)`, a field/param/local spelled either through the
+        // alias or the raw function type) — never the whole function type
+        // the declared row carries. A nullable callee keeps its face (the
+        // unchecked-use verdict owns the value then).
+        if let Some(&Ty::Function {
+            shape,
+            nullable: false,
+        }) = self.rows.get(callee).map(|row| &row.ty)
+        {
+            let ret = self.boundary.pool().function_shape(shape).return_ty;
+            self.rows[callee].ty = ret;
+        }
         // The function-position face (`function_expression_invocation_
         // resolver.dart:131`): the invoked expression's own static type —
         // pre-invocation, so no callee-result enrichment here.

@@ -1669,6 +1669,21 @@ pub fn fold_unit_with_ops<'t>(
             ));
         }
     }
+    // The deferred switch-covering verdicts (#2538): the nullable
+    // scrutinee's parse-time row re-decides against the flow's matched
+    // type — a promotion that strips the null witness drops the row, a
+    // still-uncovered refined value re-renders it.
+    let pending_coverings = std::mem::take(&mut engine.pending_switch_coverings);
+    for pending in &pending_coverings {
+        let matched = matched_types
+            .iter()
+            .rev()
+            .find(|(range, _)| range.offset == pending.first_anchor.offset)
+            .map(|(_, ty)| *ty);
+        if let Some(row) = engine.teardown_covering(pending, matched) {
+            report.usage.push(row);
+        }
+    }
     let survivors = engine.filter_staged(&promotions, &condition_types, &prop_promotions);
     report.diagnostics = merge_source_ordered(report.diagnostics, survivors);
     // The flow layer's dead-code facts join the source-ordered tail of the

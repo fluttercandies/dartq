@@ -2656,14 +2656,38 @@ impl<'a> Engine<'a> {
                 // the first witness's correction text (diagnostic.g.dart
                 // :13018/:13079, constant_verifier.dart:1104-1120); the
                 // diagnostic carries it in the correction slot.
-                self.report.diagnostics.push(Diagnostic::new(
+                let row = Diagnostic::new(
                     code.severity(),
                     code.code_info(),
                     code.message3(&ty_text, &unmatched, &suggested),
                     self.file,
                     ctx.switch_kw,
                     code.correction_message(&suggested),
-                ));
+                );
+                // A nullable scrutinee defers (#2538): the flow layer's
+                // per-clause matched type may promote the scrutinee
+                // (`if (n == null) return;` strips the null witness the
+                // parse-time row reports), and that fact drains only at
+                // the teardown join — stage the row for the re-decision
+                // there instead of reporting now. A non-nullable or
+                // clause-less switch keeps today's immediate face.
+                if Self::is_nullable_ty(ctx.scrutinee)
+                    && let Some(first) = ctx.cases.first()
+                {
+                    self.pending_switch_coverings.push(PendingSwitchCovering {
+                        code,
+                        kw: ctx.switch_kw,
+                        first_anchor: first.flow_anchor,
+                        scrutinee: ctx.scrutinee,
+                        ty_text,
+                        unmatched,
+                        suggested,
+                        spaces: ctx.cases.iter().map(|c| c.space.clone()).collect(),
+                        guarded: ctx.cases.iter().map(|c| c.guarded).collect(),
+                    });
+                } else {
+                    self.report.diagnostics.push(row);
+                }
             }
         } else if must_be_exhaustive && let Some(default_at) = ctx.default_kw {
             // The cases already cover the scrutinee, so the `default`
@@ -2671,6 +2695,63 @@ impl<'a> Engine<'a> {
             // defaultNode != null && mustBeExhaustive`,
             // constant_verifier.dart:1141-1148).
             self.emit(SemanticCode::UnreachableSwitchDefault, default_at, "", "");
+        }
+    }
+
+
+    /// The deferred covering verdict's teardown half (#2538): the staged
+    /// row re-decides against the flow's matched type. `matched` is the
+    /// first case clause's `FlowFact::MatchedType` row (`None` — a
+    /// complex scrutinee, no bare promotion key): the fallback keeps the
+    /// parse-time verdict verbatim. A refinement that decides the
+    /// covering gap away drops the row; anything else re-renders against
+    /// the refined value's witness.
+    pub(crate) fn teardown_covering(
+        &self,
+        pending: &PendingSwitchCovering,
+        matched: Option<Ty>,
+    ) -> Option<Diagnostic> {
+        let refined = match matched {
+            Some(ty) if ty != pending.scrutinee => NameTy::from_semantic(ty),
+            _ => {
+                return Some(Diagnostic::new(
+                    pending.code.severity(),
+                    pending.code.code_info(),
+                    pending.code
+                        .message3(&pending.ty_text, &pending.unmatched, &pending.suggested),
+                    self.file,
+                    pending.kw,
+                    pending.code.correction_message(&pending.suggested),
+                ));
+            }
+        };
+        let world = self.name_world();
+        let cases: Vec<Case<NameTy>> = pending
+            .spaces
+            .iter()
+            .zip(pending.guarded.iter())
+            .map(|(space, guarded)| Case {
+                space: case_space(&world, space, refined),
+                guarded: *guarded,
+            })
+            .collect();
+        match compute(&world, &refined, &cases).exhaustiveness {
+            Exhaustiveness::Exhaustive => None,
+            Exhaustiveness::NonExhaustive(witnesses) => {
+                let first = witnesses.first();
+                let ty_text = self.ty_display(matched.unwrap_or(pending.scrutinee));
+                let unmatched =
+                    first.map_or(String::new(), |w: &EngineWitness<NameTy>| w.as_witness(&world));
+                let suggested = first.map_or(String::new(), |w| w.as_correction(&world));
+                Some(Diagnostic::new(
+                    pending.code.severity(),
+                    pending.code.code_info(),
+                    pending.code.message3(&ty_text, &unmatched, &suggested),
+                    self.file,
+                    pending.kw,
+                    pending.code.correction_message(&suggested),
+                ))
+            }
         }
     }
 

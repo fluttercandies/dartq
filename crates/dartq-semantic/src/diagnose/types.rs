@@ -2256,6 +2256,7 @@ pub(crate) struct Engine<'a> {
     /// check ran against the declared scrutinee; the flow's promoted
     /// matched type re-decides at the teardown join.
     pub(crate) pending_matched: Vec<PendingMatched>,
+    pub(crate) pending_switch_coverings: Vec<PendingSwitchCovering>,
     /// The current case clause's `case` keyword anchor (the flow
     /// `MatchedType` fact's join key); a switch-expression alternative
     /// clears it (the parser delivers no keyword face there).
@@ -3472,6 +3473,33 @@ pub(crate) struct PendingMatched {
     pub(crate) at: SourceRange,
     /// The clause's `case` keyword anchor (the flow fact's join key).
     pub(crate) clause: SourceRange,
+}
+
+/// A deferred switch-covering verdict (#2538): the parse-time pass
+/// computed `non_exhaustive` over a NULLABLE scrutinee, but the flow
+/// layer's per-clause matched type (`FlowFact::MatchedType`, the
+/// official `getMatchedValueType`) may promote the scrutinee (an
+/// `if (n == null) return;` before the switch strips the null witness
+/// the parse-time verdict reports). The row stages here instead of
+/// reporting, and the teardown join re-decides it against the refined
+/// matched type: exhaustive after refinement drops the row, anything
+/// else re-renders it against the refined value.
+pub(crate) struct PendingSwitchCovering {
+    /// The covering code (statement vs expression face).
+    pub(crate) code: SemanticCode,
+    /// The `switch` keyword (the row's anchor).
+    pub(crate) kw: SourceRange,
+    /// The first case clause's anchor (the flow fact's join key).
+    pub(crate) first_anchor: SourceRange,
+    /// The parse-time scrutinee (the unrefined verdict's value).
+    pub(crate) scrutinee: Ty,
+    /// The parse-time row's rendered arguments.
+    pub(crate) ty_text: String,
+    pub(crate) unmatched: String,
+    pub(crate) suggested: String,
+    /// The case roots, re-decided against the refined value at teardown.
+    pub(crate) spaces: Vec<crate::switch_tracker::Restriction>,
+    pub(crate) guarded: Vec<bool>,
 }
 
 /// The promoted-read staging (#477 S1): the flow facts' promotion rows as

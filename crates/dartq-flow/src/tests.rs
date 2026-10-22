@@ -8458,3 +8458,24 @@ fn switch_expr_non_null_case_values_bind_no_nullable_face() {
     );
 }
 
+
+/// The expression-switch scrutinee's promotion key survives the
+/// `return switch (n)` shape (#2538): every alternative emits its
+/// matched-type row (the teardown covering join's feed), the promoted
+/// non-null type after the null-check early return.
+#[test]
+fn return_switch_expression_scrutinee_latches_matched_types() {
+    let source = "abstract class Num {}\nclass IntNum extends Num {}\nint g(Num? n) { if (n == null) return 0; return switch (n) { IntNum() => 1, Num() => 2 }; }";
+    let matched: Vec<_> = facts_of(source)
+        .into_iter()
+        .filter_map(|fact| match fact {
+            FlowFact::MatchedType { ty, .. } => Some(ty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(matched.len(), 2, "both alternatives emit");
+    assert!(
+        matched.iter().all(|ty| !ty.nullable),
+        "matched rows carry the promoted non-null face: {matched:?}"
+    );
+}

@@ -373,6 +373,12 @@ pub(crate) struct NameCase {
     pub(crate) space: Restriction,
     pub(crate) guarded: bool,
     pub(crate) anchor: SourceRange,
+    /// The flow `MatchedType` fact's join key: the `case` keyword for a
+    /// statement clause, the alternative's first token on the
+    /// switch-expression path (the parser delivers no keyword face there,
+    /// `end_switch_expression_case`'s `begin`) — distinct from `anchor`,
+    /// the diagnostic's own token (`=>` for an alternative).
+    pub(crate) flow_anchor: SourceRange,
     pub(crate) head_colon: Option<SourceRange>,
     pub(crate) body: Option<SourceRange>,
 }
