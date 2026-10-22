@@ -311,3 +311,45 @@ fn an_extension_getter_argument_types_the_foreign_helper_closure_formals() {
     );
     assert_silent(&report);
 }
+
+/// Two accessible extensions declaring the same getter over one head with
+/// DISJOINT bounds (the analyzer corpus's paired `withOriginDeclaration`
+/// getters: a concrete `on Bag<Fragment>` beside a generic
+/// `on Bag<T extends Other>` — the element classes never meet, so exactly
+/// one face applies to any receiver): the read's static type survives the
+/// multiplicity — a face whose `on` arguments cannot match the receiver
+/// never applies. The former single-declarer bail left the read `Unknown`
+/// and every closure formal over it collapsed to the `Object?` recovery.
+#[test]
+fn paired_extension_declarers_type_the_read_through_applicability() {
+    let report = report_ops_imports(
+        "class Fragment { void setCodeRange(int a) {} }\n\
+         class Info { int codeOffset = 0; }\n\
+         class Other {}\n\
+         extension on Bag<Fragment> {\n\
+           Bag<Fragment> get withOriginDeclaration => this;\n\
+         }\n\
+         extension BagListOf<T extends Other> on Bag<T> {\n\
+           Bag<T> get withOriginDeclaration => this;\n\
+         }\n\
+         void apply(Bag<Fragment> fragmentList, Bag<Info> infoList) {\n\
+           forCorrespondingPairs(fragmentList.withOriginDeclaration, infoList, (\n\
+             fragment,\n\
+             info,\n\
+           ) {\n\
+             fragment.setCodeRange(info.codeOffset);\n\
+           });\n\
+         }\n",
+        &[RigImport {
+            uri: "package:probe/coll.dart",
+            prefix: None,
+            source: "class Bag<T> {}\n\
+                     void forCorrespondingPairs<T1, T2>(\n\
+                       Bag<T1> list1,\n\
+                       Bag<T2> list2,\n\
+                       void Function(T1, T2) f,\n\
+                     ) {} \n",
+        }],
+    );
+    assert_silent(&report);
+}

@@ -3335,73 +3335,146 @@ impl<'a> Engine<'a> {
             .filter(|(face, _)| face.members.contains_key(&row.name))
             .copied()
             .collect();
-        if declarers.len() != 1 {
+        if declarers.is_empty() {
             return None;
         }
         match self.extension_application(head, receiver_ty, row.name, false, receiver_nullable) {
             ExtensionApp::Single | ExtensionApp::UnsafeSingle => {}
             _ => return None,
         }
-        let (face, face_file) = declarers[0];
-        let entry = face.members.get(&row.name)?;
-        let declared = match entry.kind {
-            MemberKind::Getter => entry.return_ty,
-            MemberKind::Field => entry.var_ty,
-            _ => return None,
-        };
-        let ty = self.boundary.ty(face_file, declared);
-        // A generic extension's declared return still spells its own type
-        // parameters (`Iterable<T>` under `extension E<T> on List<T>`); the
-        // oracle instantiates the extended type against the receiver before
-        // answering, so the `on` type's bare-parameter arguments pair with
-        // the receiver's arguments positionally (`List<X>` binds `T := X`)
-        // and the declared return substitutes through. An argument-less
-        // `on` type or a non-parameter argument keeps the declared return.
-        // The face's `on` type is a foreign-file payload (its argument
-        // list is interned in the extension's own pool) — project it
-        // through the boundary before any argument read, the same
-        // cross-pool discipline the declared return takes.
-        let on_ty = self.boundary.ty(face_file, face.on_ty);
-        let map: Vec<(StringId, Ty)> = match (on_ty, receiver_ty) {
-            (
-                Ty::Named {
-                    args: on_args, ..
-                },
-                Ty::Named {
-                    args: recv_args, ..
-                },
-            ) if on_args != ArgListId::EMPTY
-                && recv_args != ArgListId::EMPTY
-                && !face.type_param_names.is_empty() =>
-            {
-                let on_list = self.boundary.pool().get(on_args).to_vec();
-                let recv_list = self.boundary.pool().get(recv_args).to_vec();
-                on_list
-                    .into_iter()
-                    .zip(recv_list)
-                    .filter_map(|(on_arg, recv_arg)| {
-                        let Ty::Named {
-                            name,
-                            args: ArgListId::EMPTY,
-                            ..
-                        } = on_arg
-                        else {
-                            return None;
-                        };
-                        face.type_param_names
-                            .contains(&name)
-                            .then_some((name, recv_arg))
-                    })
-                    .collect()
+        // Several accessible extensions can declare the spelling over one
+        // head (the analyzer corpus's paired `withOriginDeclaration`
+        // getters: a concrete `on List<ConstructorFragmentImpl>` beside a
+        // generic `on List<T extends …>`); the oracle resolves by
+        // applicability, and for the read's static type every declarer
+        // that CAN apply to this receiver instantiates to the same answer
+        // — the concrete face names the receiver's own argument, the
+        // generic one binds its parameter to it. A face whose `on`
+        // arguments cannot match (a different concrete element) never
+        // applies; disagreement among the viable faces stays the
+        // under-report (`None`).
+        let mut answer: Option<Ty> = None;
+        for (face, face_file) in declarers {
+            let Some(entry) = face.members.get(&row.name) else {
+                continue;
+            };
+            let declared = match entry.kind {
+                MemberKind::Getter => entry.return_ty,
+                MemberKind::Field => entry.var_ty,
+                _ => continue,
+            };
+            // The face's types are foreign-file payloads (argument lists
+            // interned in the extension's own pool) — project through the
+            // boundary before any argument read, the same cross-pool
+            // discipline everywhere else.
+            let on_ty = self.boundary.ty(face_file, face.on_ty);
+            if !self.extension_on_applies(on_ty, receiver_ty, &face.type_param_names) {
+                continue;
             }
-            _ => Vec::new(),
+            let ty = self.boundary.ty(face_file, declared);
+            // A generic extension's declared return still spells its own
+            // type parameters (`Iterable<T>` under `extension E<T> on
+            // List<T>`); the oracle instantiates the extended type against
+            // the receiver before answering, so the `on` type's
+            // bare-parameter arguments pair with the receiver's arguments
+            // positionally (`List<X>` binds `T := X`) and the declared
+            // return substitutes through.
+            let map: Vec<(StringId, Ty)> = match (on_ty, receiver_ty) {
+                (
+                    Ty::Named {
+                        args: on_args, ..
+                    },
+                    Ty::Named {
+                        args: recv_args, ..
+                    },
+                ) if on_args != ArgListId::EMPTY
+                    && recv_args != ArgListId::EMPTY
+                    && !face.type_param_names.is_empty() =>
+                {
+                    let on_list = self.boundary.pool().get(on_args).to_vec();
+                    let recv_list = self.boundary.pool().get(recv_args).to_vec();
+                    on_list
+                        .into_iter()
+                        .zip(recv_list)
+                        .filter_map(|(on_arg, recv_arg)| {
+                            let Ty::Named {
+                                name,
+                                args: ArgListId::EMPTY,
+                                ..
+                            } = on_arg
+                            else {
+                                return None;
+                            };
+                            face.type_param_names
+                                .contains(&name)
+                                .then_some((name, recv_arg))
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            let ty = if map.is_empty() {
+                ty
+            } else {
+                self.subst_params(ty, &map).unwrap_or(ty)
+            };
+            let ty = self.fold_alias_ty(ty);
+            match answer {
+                None => answer = Some(ty),
+                Some(kept) if kept == ty => {}
+                Some(_) => return None,
+            }
+        }
+        answer
+    }
+
+    /// Whether an extension's `on` type can apply to `receiver`: heads
+    /// equal, and each `on` argument either equals the receiver's argument
+    /// or is one of the extension's own bare type parameters (instantiable
+    /// against whatever the receiver carries). The read face's per-face
+    /// viability filter — a face whose concrete arguments differ from the
+    /// receiver's can never be the oracle's resolution, whatever the
+    /// specificity ordering among the survivors.
+    fn extension_on_applies(
+        &self,
+        on_ty: Ty,
+        receiver: Ty,
+        type_params: &[StringId],
+    ) -> bool {
+        let (
+            Ty::Named {
+                name: on_head,
+                args: on_args,
+                ..
+            },
+            Ty::Named {
+                name: recv_head,
+                args: recv_args,
+                ..
+            },
+        ) = (on_ty, receiver)
+        else {
+            return false;
         };
-        let ty = if map.is_empty() {
-            ty
-        } else {
-            self.subst_params(ty, &map).unwrap_or(ty)
-        };
-        Some(self.fold_alias_ty(ty))
+        if on_head != recv_head
+            || (on_args == ArgListId::EMPTY) != (recv_args == ArgListId::EMPTY)
+        {
+            return false;
+        }
+        if on_args == ArgListId::EMPTY {
+            return true;
+        }
+        let on_list = self.boundary.pool().get(on_args).to_vec();
+        let recv_list = self.boundary.pool().get(recv_args).to_vec();
+        on_list.len() == recv_list.len()
+            && on_list.iter().zip(recv_list.iter()).all(|(on_arg, recv_arg)| {
+                on_arg == recv_arg
+                    || matches!(on_arg, Ty::Named {
+                        name,
+                        args: ArgListId::EMPTY,
+                        ..
+                    } if type_params.contains(&name))
+            })
     }
 
     /// The operator application on a known receiver type (`c + d`, `c[i]`,
