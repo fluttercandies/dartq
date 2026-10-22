@@ -198,6 +198,7 @@ impl<'a> Engine<'a> {
             var_infer_pending: None,
             init_declarators: Vec::new(),
             staged_write_tys: FxHashMap::default(),
+            stmt_block_depth: 0,
             next_exec_serial: 0,
             enum_element_open: false,
             const_string_begins: Vec::new(),

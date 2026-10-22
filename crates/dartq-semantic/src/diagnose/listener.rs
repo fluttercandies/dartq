@@ -3445,14 +3445,26 @@ impl ParserListener for DiagnoseListener<'_> {
                 // assignment's expression type is `LUB(NonNull(T1), T2)`,
                 // not the bare `T2` this feed carries.
                 if text == "=" {
-                    engine.staged_write_tys.insert(
-                        engine.rows[target].name,
-                        (
-                            engine.rows[target].range.offset,
-                            engine.exec_serial(),
-                            from_ty,
-                        ),
-                    );
+                    // A write inside a nested statement block sits on a
+                    // conditional arm: the variable's type at any later join
+                    // is the arms' join, never this arm's write, so the feed
+                    // must not claim it — the entry drops (poisoning an
+                    // earlier unconditional write's claim too) and the
+                    // static face decides.
+                    if engine.stmt_block_depth == 0 {
+                        engine.staged_write_tys.insert(
+                            engine.rows[target].name,
+                            (
+                                engine.rows[target].range.offset,
+                                engine.exec_serial(),
+                                from_ty,
+                            ),
+                        );
+                    } else {
+                        engine
+                            .staged_write_tys
+                            .remove(&engine.rows[target].name);
+                    }
                 }
                 // The flow face: the head's lexeme plus the written-argument
                 // tree. A tree with a non-named entry (an invalid or dynamic
@@ -6755,6 +6767,9 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_block(&mut self, token: Token, kind: BlockKind) {
         self.flow().begin_block(token, kind);
+        if !matches!(kind, BlockKind::FunctionBody) {
+            self.engine.stmt_block_depth += 1;
+        }
 
         // A statement list opens its duplicate scope (`checkStatements` per
         // `visitBlock` — the try/catch/finally kinds included; the switch
@@ -6977,6 +6992,9 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn end_block(&mut self, count: usize, begin: Token, end: Token, kind: BlockKind) {
         self.flow().end_block(count, begin, end, kind);
+        if !matches!(kind, BlockKind::FunctionBody) {
+            self.engine.stmt_block_depth = self.engine.stmt_block_depth.saturating_sub(1);
+        }
 
         // The catch clause fact's body anchor: `handle_catch_block` fires
         // right after the clause body's block ends, so the last block end

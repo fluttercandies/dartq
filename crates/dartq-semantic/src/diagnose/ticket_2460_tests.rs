@@ -420,3 +420,42 @@ void f(Box? x) {
         codes(&report)
     );
 }
+
+/// The conditional-write join face (the analyzer
+/// `method_invocation_resolver.dart:112/115` family, #2556): a write
+/// inside a nested statement block sits on a conditional arm, so the
+/// variable's type at any later join is the arms' join — never that
+/// one arm's write. The flat `staged_write_tys` feed used to let the
+/// arm's `MDE` claim the `var y = x` inference, binding `y` non-null
+/// and silencing the join's nullable read; the poison (the write drops
+/// the entry instead of staging it) keeps the declared face in charge
+/// (probe: `dart analyze` reports exactly
+/// `UNCHECKED_USE_OF_NULLABLE_VALUE` at the `y.id` read).
+#[test]
+fn conditional_write_does_not_claim_the_inference_feed() {
+    let source = "\
+class bool {}
+class Elem {
+  Elem get id => this;
+}
+class MDE implements Elem {
+  Elem get id => this;
+}
+
+void f(bool c, MDE m) {
+  Elem? x;
+  if (c) {
+    x = m;
+  }
+  var y = x;
+  y.id;
+}
+";
+    let report = unit_report(source);
+    assert_eq!(
+        codes(&report),
+        vec!["unchecked_use_of_nullable_value"],
+        "conditional-write join: {:#?}",
+        codes(&report)
+    );
+}

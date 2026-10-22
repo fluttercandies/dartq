@@ -2232,6 +2232,13 @@ pub(crate) struct Engine<'a> {
     /// wrote it (#2460 A2c) — two executables at the same frame depth
     /// never share a face.
     pub(crate) staged_write_tys: FxHashMap<StringId, (u32, usize, Ty)>,
+    /// Statement-block depth inside the innermost executable (0 at the
+    /// function body's own top level — the body block rides its own event).
+    /// A write staged at depth > 0 sits on a conditional arm: the variable's
+    /// type at any later join is the arms' join, never this arm's write, so
+    /// the [`Engine::staged_write_tys`] feed must not claim it (the entry
+    /// drops and the static face decides).
+    pub(crate) stmt_block_depth: u32,
     /// The next executable serial handed to a pushed [`Frame`]
     /// ([`Frame::serial`]).
     pub(crate) next_exec_serial: usize,
