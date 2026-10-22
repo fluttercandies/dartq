@@ -229,6 +229,7 @@ impl<'a> Engine<'a> {
             locals: Vec::new(),
             frame_local_marks: Vec::new(),
             local_hits: FxHashMap::default(),
+            local_index_at_read: FxHashMap::default(),
             pattern_group_open: None,
             pattern_group_seq: 0,
             pattern_bind_vars: Vec::new(),

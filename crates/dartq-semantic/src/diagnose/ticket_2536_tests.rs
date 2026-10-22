@@ -580,3 +580,45 @@ void f(Box box) {
         "collect rollback leaked a binding into the real walk: {cs:?}"
     );
 }
+
+/// The override-precision deferred re-bind (Wave L, #2553): a `var` local
+/// initialized from a member read on an `is`-promoted receiver re-binds to
+/// the subclass's own covariant member type in pass 2 — `Impl.element`'s
+/// field `Sub2`, never the base getter's `Sub?`. Two seams held the fix:
+/// the narrowing gate's cross-head arm must ask subtype-ness (the supertype
+/// closure), not a member lookup — no member is SPELLED `Sub` — and the
+/// consumer's local identity must key on the receiver read's own span (the
+/// non-moving roster), because the member row's fold-chased `local_hits`
+/// entry can name the outer declarator (`var n = c.m().k()`). The rig is
+/// the analyzer corpus's `driver.dart`/`element.dart` shape at unit scale:
+/// no unchecked on the narrowed read, nothing else either.
+#[test]
+fn promoted_receiver_member_rebinds_to_override_face() {
+    let report = unit_report(
+        r#"
+class Sub {
+  List<int> typeParameters = [];
+}
+class Sub2 extends Sub {
+  List<int> typeParameters = [];
+}
+class Base {
+  Sub? get element => null;
+}
+class Impl extends Base {
+  final Sub2 element = Sub2();
+}
+void f(Base b) {
+  var t = b;
+  if (t is! Impl) return;
+  var c = t.element;
+  var n = c.typeParameters.length;
+}
+"#,
+    );
+    let cs = codes(&report);
+    assert!(
+        !cs.contains(&"unchecked_use_of_nullable_value"),
+        "override-precision re-bind did not land: {cs:?}"
+    );
+}

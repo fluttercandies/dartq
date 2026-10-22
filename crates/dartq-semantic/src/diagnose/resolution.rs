@@ -2393,6 +2393,7 @@ impl<'a> Engine<'a> {
         if let Some(hit) = self.resolve_local(name) {
             let hit = hit as usize;
             self.locals[hit].uses += 1;
+            self.local_index_at_read.insert(range.offset, hit as u32);
             self.local_hits.insert(range.offset, hit as u32);
         }
         // The official self-reference exclusions (`_useIdentifierElement`):

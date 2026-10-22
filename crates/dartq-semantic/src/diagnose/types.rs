@@ -2293,6 +2293,13 @@ pub(crate) struct Engine<'a> {
     /// useless-read cancellations and the receiver merge (the row stack
     /// shifts, so rows carry no back-pointer).
     pub(crate) local_hits: FxHashMap<u32, u32>,
+    /// The non-moving twin of [`Engine::local_hits`]: each bare read's
+    /// offset to its resolved local index, never relocated by the merge
+    /// folds. The fold-chased `local_hits` entry on a member row can
+    /// belong to an OUTER declarator (the whole initializer chain folds
+    /// into the declaration's own row), so identity questions key on the
+    /// receiver read's own span here.
+    pub(crate) local_index_at_read: FxHashMap<u32, u32>,
     /// The open pattern-variable-declaration group window: the group id
     /// every pattern-declared variable joins until the window closes (one
     /// used member spares the whole group; official

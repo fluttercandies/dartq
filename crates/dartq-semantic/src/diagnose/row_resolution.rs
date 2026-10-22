@@ -377,16 +377,29 @@ impl<'a> Engine<'a> {
                     } else if c_head == p_head {
                         nullability_ok
                     } else {
-                        match self.walk_members(c_head, p_head) {
-                            Walk::Found(_) => true,
-                            // An unmodeled head (the core `double`, the
-                            // frozen faces) has no chain to walk — the
-                            // oracle resolves the real hierarchy; the
-                            // name-differing non-loosening shape is the
-                            // promotion direction's conservative accept.
-                            Walk::ChainBroken => nullability_ok && !c_null,
-                            Walk::Missing => false,
-                        }
+                        // The cross-head promotion question is subtype-ness
+                        // — whether `c_head`'s supertype closure names
+                        // `p_head` — never a member lookup: a subclass
+                        // field's covariant override (`Impl.element`'s
+                        // `Sub2` against the base getter's `Sub?`) has no
+                        // member SPELLED `Sub`, so the member walk answered
+                        // `Missing` and dropped every override-precision
+                        // re-bind. `declared_subtype_negative`'s `None`
+                        // covers subtype-or-undecidable (the conservative
+                        // accept the old `ChainBroken` arm took); only a
+                        // proven non-subtype rejects.
+                        let non_null = |name: StringId| Ty::Named {
+                            name,
+                            nullable: false,
+                            args: ArgListId::EMPTY,
+                        };
+                        !matches!(
+                            self.declared_subtype_negative(
+                                &non_null(c_head),
+                                &non_null(p_head)
+                            ),
+                            Some(false)
+                        )
                     }
                 }
                 _ => false,

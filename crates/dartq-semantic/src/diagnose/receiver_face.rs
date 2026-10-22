@@ -103,7 +103,23 @@ impl Engine<'_> {
         // keeps a coincidental index collision — or a same-named
         // declaration the flat locals stack reuses — from retyping a
         // foreign read.
-        let index = *self.local_hits.get(&member_offset)?;
+        // The receiver read's own span keys the non-moving roster: the
+        // member row's `local_hits` entry rides the fold chain and can
+        // name an outer declarator (`var n = c.m().k()` moves n's own
+        // hit onto c's member row), while the deferred stage keyed the
+        // initializer's declared local — the receiver read's index at
+        // push time is that same local.
+        let index = self
+            .member_reads
+            .binary_search_by(|read| read.offset.cmp(&member_offset))
+            .ok()
+            .and_then(|i| {
+                let span = self.member_reads[i].recv_span;
+                self.local_index_at_read
+                    .get(&span.offset)
+                    .copied()
+                    .or_else(|| self.local_hits.get(&member_offset).copied())
+            })?;
         let &(parse_ty, corrected) = self.rebound_locals.get(&index)?;
         let recv_span = self
             .member_reads
