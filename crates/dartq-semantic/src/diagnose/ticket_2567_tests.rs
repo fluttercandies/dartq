@@ -231,3 +231,36 @@ fn foreign_param_recovery_ignores_same_file_type_param_decls() {
         messages(&report)
     );
 }
+
+/// A `??=` whose right side is a numeric binary (`length ??= 5 -
+/// offset`) promotes the target: the fold's left operand is a literal
+/// row typed from its own token bytes, the binary's result reaches the
+/// write staging, and the join writes the non-null face (the corpus
+/// `min((end - first) * pageSize, ...)` / `length ??= 5 - offset`
+/// family). The rig seeds the implicit dart:core names (the bare rig
+/// would report `int` itself undefined).
+#[test]
+fn if_null_rhs_binary_promotes_target() {
+    let report = report(
+        "class Sink { void take(int x) {} }\n\
+         void f(int? offset, int? length) {\n\
+           offset ??= 0;\n\
+           length ??= 5 - offset;\n\
+           Sink().take(length);\n\
+           Sink().take(offset + length);\n\
+         }\n",
+    );
+    let report = FileReport {
+        diagnostics: report
+            .diagnostics
+            .into_iter()
+            .filter(|d| d.code.name != "undefined_class")
+            .collect(),
+        ..report
+    };
+    assert!(
+        report.diagnostics.is_empty(),
+        "??= binary-RHS promotion missing: {:?}",
+        messages(&report)
+    );
+}

@@ -2510,7 +2510,49 @@ impl<'a> Engine<'a> {
         {
             return Ty::named(name);
         }
-        self.receiver_static_ty(row)
+        let ty = self.receiver_static_ty(row);
+        // A literal operand's row carries no type at push
+        // ([`Self::push_value_row`] types only `null`): the token's own
+        // bytes name the primitive — `5 - offset`'s left operand answers
+        // `int`, the fold resolves the operator signature, and the
+        // assignment staging reads the binary's result type (the `??=`
+        // promotion family: `length ??= 5 - offset` left the target
+        // unpromoted because the fold's result stayed unknown and the
+        // write fell to the invalid-RHS no-promotion face).
+        if ty == Ty::UNKNOWN
+            && matches!(row.shape, RowShape::Value)
+            && row.range.length > 0
+            && let Some(lit) = self.numeric_literal_face(row.range)
+        {
+            return lit;
+        }
+        ty
+    }
+
+    /// The primitive face of a token whose bytes spell a numeric literal:
+    /// `int` for a hex or plain-digit run, `double` once a `.`, `e`, or
+    /// `E` marker appears outside the hex prefix. The digit-first gate
+    /// keeps every word-shaped token (`true`, `null`, identifiers) out;
+    /// anything else answers `None` (the unknown face stands).
+    fn numeric_literal_face(&self, range: SourceRange) -> Option<Ty> {
+        let mut bytes = Vec::with_capacity(range.length.min(64) as usize);
+        for i in range.offset..range.end() {
+            bytes.push(self.byte_at(i)?);
+        }
+        if !bytes.first().is_some_and(|b| b.is_ascii_digit())
+            || !bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_'))
+        {
+            return None;
+        }
+        let is_hex = bytes.len() > 2 && bytes[0] == b'0' && (bytes[1] | 0x20) == b'x';
+        let has_double_marker = !is_hex && bytes.iter().any(|b| matches!(b, b'.' | b'e' | b'E'));
+        Some(Ty::named(if has_double_marker {
+            self.members.primitive_ids[1]
+        } else {
+            self.members.primitive_ids[0]
+        }))
     }
 
     /// The `==`/`!=` invocation's right-operand face (`_resolveEqual`'s
