@@ -2363,12 +2363,14 @@ mod tests {
         );
     }
 
-    /// An extension type erases to its representation type for the
-    /// interface check (`extensionTypeErasure`): a wrapper over `List`
-    /// answers through the core face, its own `implements` clause never
-    /// enters, and an unmodeled representation shape stays open.
+    /// An extension type's STATIC interface is its declared `implements`
+    /// closure — never the representation type (`extensionTypeErasure` is
+    /// the RUNTIME `is` face, which this question never answers): a
+    /// clause-less wrapper implements nothing, a declared clause walks
+    /// like any class interface, and the representation shape is
+    /// irrelevant to the static answer.
     #[test]
-    fn implements_core_interface_erases_extension_types() {
+    fn implements_core_interface_walks_extension_type_clauses() {
         let source = "extension type Wrapper(List<int> it) {} \
                       extension type Eager(int it) implements Iterable<int> {} \
                       extension type Fn(void Function() it) {}";
@@ -2378,15 +2380,18 @@ mod tests {
         let asks = |name: &str| {
             analysis.implements_core_interface(Ty::named(strings.intern(name)), iterable)
         };
-        // The representation type answers: `List` is core-`Iterable`.
-        assert_eq!(asks("Wrapper"), Some(true));
-        // Erasure ignores the declared clause: the erased `int` sits
-        // outside the core face — open, though the oracle's core graph
-        // would answer `false` (the under-report direction).
-        assert_eq!(asks("Eager"), None);
-        // A function-typed representation captures `Unknown` — no name to
-        // erase to, the question stays open.
-        assert_eq!(asks("Fn"), None);
+        // A clause-less extension type's supertype closure is empty: the
+        // representation `List` is NOT a static supertype (the oracle
+        // rejects `for (var x in wrapper)` — the representation only
+        // erases at runtime checks).
+        assert_eq!(asks("Wrapper"), Some(false));
+        // The declared clause answers: `Iterable<int>` reaches the core
+        // face through the unindexed SDK edge, exactly like a class's
+        // `implements`.
+        assert_eq!(asks("Eager"), Some(true));
+        // A function-typed representation is as irrelevant as any other:
+        // clause-less means the empty closure — a definite miss.
+        assert_eq!(asks("Fn"), Some(false));
     }
 
     /// `import_shadows` answers the import face and nothing else: a

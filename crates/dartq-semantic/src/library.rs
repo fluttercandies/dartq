@@ -712,29 +712,17 @@ pub(crate) fn implements_interface(
         .iter()
         .map(|(ty, iface)| (strings.intern(ty), strings.intern(iface)))
         .collect();
-    // The seed: the name as the diagnosing scope resolves it, erased
-    // through the representation type for an extension type. An unindexed
-    // seed is answered by the core face alone — the name could implement
-    // anything else.
+    // The seed: the name as the diagnosing scope resolves it. An extension
+    // type seeds its own declaration — the STATIC subtype question walks
+    // the declared `implements` closure (`supertype_edges`), never the
+    // representation type: `extension type CB._(int _) implements IA`
+    // makes `CB <: IA` while `CB <: int` stays false (the representation
+    // is a static supertype of nothing; `typeForInterfaceCheck`'s
+    // `extensionTypeErasure` is the RUNTIME `is` face, which this walk
+    // never answers). An unindexed seed is answered by the core face
+    // alone — the name could implement anything else.
     let seed: (StringId, FileId, LibraryId);
     match resolve_container(graph, namespaces, index, lib, file, name) {
-        Some((container, owner)) if container.kind == ContainerKind::ExtensionType => {
-            // Extension-type erasure: the interface check runs against the
-            // representation type, not the declared clause
-            // (`typeForInterfaceCheck`'s `extensionTypeErasure`,
-            // extensions.dart:295). An uncaptured or unnameable
-            // representation formal leaves the question open.
-            let Some(Ty::Named { name: rep_name, .. }) =
-                container.primary_formals.first().map(|r| r.formal.ty)
-            else {
-                return None;
-            };
-            seed = (
-                rep_name,
-                owner,
-                owner_library(graph, lib, owner, name).unwrap_or(lib),
-            );
-        }
         Some((_, owner)) => seed = (name, owner, lib),
         None => {
             return core_implements(&core, name, interface).then_some(true);

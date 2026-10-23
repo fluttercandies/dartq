@@ -4255,7 +4255,9 @@ impl<'a> Engine<'a> {
     /// library yields ([`prefixed_container`]) — and never falls back to the
     /// bare scope (a same-named local must not shadow the written face).
     /// A bare spelling keeps [`resolve_container`]. Only this file's headers
-    /// carry prefix facts; foreign writers keep the bare path.
+    /// carry prefix facts; a foreign writer whose bare face misses recovers
+    /// the clause's prefix through the writing library's own prefix set
+    /// ([`Self::foreign_prefixed_clause`]).
     fn resolve_clause_face(
         &self,
         writer: StringId,
@@ -4269,14 +4271,57 @@ impl<'a> Engine<'a> {
             let lib = self.graph.library_of_file(file).unwrap_or(scope_lib);
             return prefixed_container(self.graph, self.namespaces, self.index, lib, prefix, face);
         }
-        resolve_container(
+        let bare = resolve_container(
             self.graph,
             self.namespaces,
             self.index,
             scope_lib,
             file,
             face,
-        )
+        );
+        if bare.is_some() || file == self.file {
+            return bare;
+        }
+        self.foreign_prefixed_clause(file, face)
+    }
+
+    /// A foreign writer's prefixed clause face. The collector stores the
+    /// clause's bare leaf (`extends base.SummaryClass` keeps `SummaryClass`),
+    /// so when the leaf is visible in the writing file's scope ONLY through
+    /// the prefix it was written with, the bare walk misses by construction
+    /// and the prefix is unrecoverable from the diagnosing scanner (it
+    /// covers `self.file` alone). Probe the writing library's own prefix
+    /// set: exactly one bound element answers. Zero hits (no prefix
+    /// exports the leaf — the genuine undefined face) or two distinct
+    /// elements (two prefixes, an ambiguity the spelling cannot decide)
+    /// keep the bare miss — the under-report posture the bare face already
+    /// paid; prefixes agreeing on one element (`p` and `q` aliasing one
+    /// library) resolve that element.
+    fn foreign_prefixed_clause(
+        &self,
+        file: FileId,
+        face: StringId,
+    ) -> Option<(&'a Container, FileId)> {
+        let lib = self.graph.library_of_file(file)?;
+        let mut found: Option<(&'a Container, FileId)> = None;
+        let mut tried: Vec<StringId> = Vec::new();
+        for prefix in self.graph.import_edges(lib).iter().filter_map(|e| e.prefix) {
+            if tried.contains(&prefix) {
+                continue;
+            }
+            tried.push(prefix);
+            let Some(hit) =
+                prefixed_container(self.graph, self.namespaces, self.index, lib, prefix, face)
+            else {
+                continue;
+            };
+            match found {
+                Some((_, owner)) if owner != hit.1 => return None,
+                Some(_) => {}
+                None => found = Some(hit),
+            }
+        }
+        found
     }
 
     /// The dead-edge probe for a clause face ([`supertype_hop_dead`]'s
