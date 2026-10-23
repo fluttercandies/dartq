@@ -1803,7 +1803,24 @@ impl<'a> Engine<'a> {
             offset: self.utf16_of(cursor),
             length: self.utf16_of(end) - self.utf16_of(cursor),
         };
-        let name = self.bare_creation_head_name(range)?;
+        // A dot-preceded head (`p.C<T>(`) is the prefixed unnamed
+        // creation: the no-selector guard [`Engine::bare_creation_head_name`]
+        // rejects it, but the close's arms own the face — arm 1's
+        // dot-segment must resolve as a type, else arm 3's prefix table
+        // does (`const fb.ListReader<idl.X>(…)` folds through `fb`). Every
+        // other left-guard (`?.`, `..`) and a bad identifier shape keep
+        // `None` — the walk's span is already a plain identifier run, so
+        // only the head character needs re-checking.
+        let bytes = self.source.as_bytes();
+        let name = if cursor > 0
+            && bytes[cursor - 1] == b'.'
+            && !(cursor >= 2 && (bytes[cursor - 2] == b'?' || bytes[cursor - 2] == b'.'))
+            && (bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_')
+        {
+            self.intern(&self.source[cursor..end])
+        } else {
+            self.bare_creation_head_name(range)?
+        };
         Some((name, range))
     }
 
@@ -2061,6 +2078,7 @@ impl<'a> Engine<'a> {
             closures: Vec::new(),
             enum_const,
             named_labels: Vec::new(),
+            unnamed_head: bare_head.filter(|&(_, range)| self.unnamed_creation_head(range)),
         });
     }
 
@@ -2075,7 +2093,15 @@ impl<'a> Engine<'a> {
         self.flush_argument();
         let levels = self.arg_levels.pop();
         let enum_const = levels.as_ref().is_some_and(|level| level.enum_const);
-        let bare_head = self.pending_bare_creation;
+        // Re-arm this level's own creation head: the engine slot is single,
+        // so a nested argument group's open overwrote it with the inner
+        // head (and the inner close's `report_bare_creation_miss` path may
+        // have consumed it) — the fold below must see the creation it
+        // belongs to (`const C<T>(inner())` folds the outer creation, never
+        // the inner head the interleaving left in the slot).
+        let bare_head = self
+            .pending_bare_creation
+            .or_else(|| levels.as_ref().and_then(|level| level.unnamed_head));
         self.check_arguments(levels, positional, close);
         self.pending_send = self
             .invokes
@@ -2121,15 +2147,15 @@ impl<'a> Engine<'a> {
         if self.pending_send.is_none()
             && !enum_const
             && let Some((head, head_range)) = bare_head
-        {
-            if let Some((class, class_offset)) = self.creation_class_before(head_range)
-                && matches!(self.type_resolution(class).0, TypeResolution::Type)
             {
-                let open = self.creation_open_offset(head_range.end());
-                let kept = self.rows.partition_point(|row| row.range.offset < open);
-                for row in self.rows.drain(kept..) {
-                    self.deferred_miss_rows.push(row);
-                }
+                if let Some((class, class_offset)) = self.creation_class_before(head_range)
+                    && matches!(self.type_resolution(class).0, TypeResolution::Type)
+                {
+                    let open = self.creation_open_offset(head_range.end());
+                    let kept = self.rows.partition_point(|row| row.range.offset < open);
+                    for row in self.rows.drain(kept..) {
+                        self.deferred_miss_rows.push(row);
+                    }
                 let range = SourceRange {
                     offset: class_offset,
                     length: close.end().saturating_sub(class_offset),
@@ -2168,6 +2194,24 @@ impl<'a> Engine<'a> {
                 self.fold_unnamed_creation_row(prefix_offset, head_range, close.end(), head, resolved.kind);
             }
         }
+    }
+
+    /// Whether a latched creation head names the unnamed creation
+    /// posture: the `const`/`new` keyword before the head (or before its
+    /// `p.` prefix segment), or a written type-argument group between the
+    /// head and the argument list (`C<T>(`). The named-selector spellings
+    /// (`C.named(`, `C<T>.named(`) answer false — their group's arguments
+    /// can span whole closures and their fold stays with the callee
+    /// transport.
+    fn unnamed_creation_head(&self, range: SourceRange) -> bool {
+        if self.keyword_creation_head(range.offset) {
+            return true;
+        }
+        if self.type_arg_group_end(range.end()).is_some() {
+            return true;
+        }
+        self.written_prefix_before(range.offset)
+            .is_some_and(|(_, prefix_offset)| self.keyword_creation_head(prefix_offset))
     }
 
     /// The unnamed creation fold's shared body ([`Engine::close_arguments`]):

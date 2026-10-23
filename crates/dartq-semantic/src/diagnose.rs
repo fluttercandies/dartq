@@ -4832,6 +4832,15 @@ mod ticket_2473_tests;
 #[cfg(test)]
 mod ticket_2508_tests;
 
+/// The #2564 pins: the nesting-safe creation-head latch — a keyword
+/// creation whose argument list contains its own invocation
+/// (`const C<T>(inner())`) keeps its own head through the inner group's
+/// open/close cycle, folds to the created type instantiated with the
+/// written type arguments, and a genuine miss names the constructor's
+/// type, never the nested argument's head.
+#[cfg(test)]
+mod ticket_2564_tests;
+
 
 /// The operand-face pins: the numeric refinement reads an operand the
 /// engine cannot type as a gap that suppresses the fold (an untyped

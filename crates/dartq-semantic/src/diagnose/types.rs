@@ -543,6 +543,15 @@ pub(crate) struct ArgLevel {
     /// `(name, label range)` per named argument, in source order — the
     /// `undefined_named_parameter` face anchors at the label, not the value.
     pub(crate) named_labels: Vec<(StringId, SourceRange)>,
+    /// This level's own head when it spells the UNNAMED creation posture
+    /// (`const C<T>(`, `const p.C(`): the engine slot is single, so a
+    /// nested argument group's open overwrites it and its close's report
+    /// path may consume it — the unnamed arms re-read the latch here,
+    /// level-scoped and invisible to every other slot consumer. A
+    /// named-selector head (`C.named(…)`, whose arguments can span whole
+    /// function literals) never latches: its fold stays with the callee
+    /// transport.
+    pub(crate) unnamed_head: Option<(StringId, SourceRange)>,
 }
 
 /// One open function literal's written signature capture

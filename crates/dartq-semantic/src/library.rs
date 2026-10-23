@@ -58,7 +58,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use crate::model::{Container, ContainerKind, FileElements, MemberEntry, MicroKind, TopDecl, Ty};
+use crate::model::{Container, ContainerKind, FileElements, MemberEntry, MicroKind, TopDecl};
 
 /// Per-file element models, keyed by file. Sized by the analyzed file set.
 ///
