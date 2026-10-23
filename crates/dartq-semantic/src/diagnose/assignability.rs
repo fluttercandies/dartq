@@ -168,13 +168,39 @@ impl<'a> Engine<'a> {
         if cursor < 2 || bytes[cursor - 1] != b'>' || bytes[cursor - 2] == b'=' {
             return;
         }
-        // The nearest type reference ending before the bracket is the
-        // element type (every bare type reference ships `(span, name)`).
+        // The nearest type reference ending before the bracket names the
+        // element type's GROUP — but a generic element type
+        // (`<Map<K, V>>[…]`) ends with its LAST inner argument, not the
+        // head. The group's own `<…>` span is walked back from the `>`
+        // (angle-balanced), and the FIRST use inside the group is the
+        // head — `Map`, not `V` — with the raw face the pool's
+        // covariant element rule answers against the written arguments.
+        let mut depth = 1usize;
+        let mut group_open = cursor - 1;
+        while group_open > 0 {
+            match bytes[group_open - 1] {
+                b'>' => depth += 1,
+                b'<' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            group_open -= 1;
+        }
+        if depth != 0 {
+            return;
+        }
+        let head_start = group_open;
         let Some((name_range, name)) = self
             .type_uses
             .iter()
-            .rev()
-            .find(|(range, _)| range.end() <= left.range.offset)
+            .filter(|(range, _)| {
+                range.offset as usize >= head_start && range.end() as usize <= cursor - 1
+            })
+            .min_by_key(|(range, _)| range.offset)
             .copied()
         else {
             return;
@@ -230,6 +256,12 @@ impl<'a> Engine<'a> {
             if seg_text.trim_start().starts_with('?') {
                 continue;
             }
+            // A spread element (`...elements`) contributes the spread
+            // operand's ELEMENT type (`List<Directive>` spreads
+            // `Directive`s): the official's element loop reads the
+            // spread's flattened element (type_analyzer.dart's
+            // spread-element resolution), never the iterable whole.
+            let spread = seg_text.trim_start().starts_with("...");
             let Some(row) = self.rows.iter().rev().find(|row| {
                 row.ty != Ty::UNKNOWN
                     && row.range.offset >= start as u32
@@ -237,8 +269,17 @@ impl<'a> Engine<'a> {
             }) else {
                 continue;
             };
-            if self.assignable(row.ty, declared, false) == Some(false) {
-                let (a0, a1) = (self.ty_display(row.ty), self.ty_display(declared));
+            let mut element_ty = row.ty;
+            if spread
+                && let Ty::Named { name, args, .. } = row.ty
+                && (name == self.intern("List") || name == self.intern("Iterable"))
+                && let Some(first) = self.boundary.pool().get(args).first().copied()
+                && first != Ty::UNKNOWN
+            {
+                element_ty = first;
+            }
+            if self.assignable(element_ty, declared, false) == Some(false) {
+                let (a0, a1) = (self.ty_display(element_ty), self.ty_display(declared));
                 let range = row.range;
                 self.emit(SemanticCode::ListElementTypeNotAssignable, range, &a0, &a1);
             }
