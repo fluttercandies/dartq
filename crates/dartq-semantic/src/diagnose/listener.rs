@@ -1778,19 +1778,21 @@ impl ParserListener for DiagnoseListener<'_> {
                 // A promotion-latched initializer defers its re-bind
                 // (#2539): the member read's accessor return rides the
                 // UNPROMOTED declared receiver at this bind, and the
-                // promotion re-decision runs only in pass 2.
+                // promotion re-decision runs only in pass 2. The entry
+                // keys the declaring local's NAME-TOKEN offset — the
+                // scoped locals-stack index aliases across scopes once
+                // the frames close, and the re-bind map must stay
+                // per-declaration.
                 if let Some(expr_row) = engine.rows.get(expr)
                     && engine
                         .promoted_recv_reads
                         .binary_search_by(|(member, _)| member.cmp(&expr_row.range.offset))
                         .is_ok()
-                    && engine.locals.last().is_some_and(|decl| decl.name == name)
+                    && let Some(decl) = engine.locals.last().filter(|decl| decl.name == name)
                 {
-                    engine.deferred_var_rebinds.push((
-                        engine.locals.len() as u32 - 1,
-                        expr_row.range.offset,
-                        ty,
-                    ));
+                    engine
+                        .deferred_var_rebinds
+                        .push((decl.range.offset, expr_row.range.offset, ty));
                 }
                 // The promotion face rides the flow layer's declared-type
                 // slot (#2140): a name-level type with no written

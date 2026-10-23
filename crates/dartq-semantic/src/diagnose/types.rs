@@ -1227,6 +1227,20 @@ pub(crate) enum TypeHead {
 /// the routing at frame close follows the official
 /// `_visitLocalVariableElement` split (`unused_local_elements_verifier.dart`:
 /// 1259-1280).
+/// One deferred closure-formal re-bind: the formal's declaration
+/// name-token offset (the `rebound_locals` key), the pass-1 bound face,
+/// and the ingredients [`Engine::closure_context_schema`] re-runs over
+/// the re-derived receiver face (the callee's row is re-found by range —
+/// fold pops shift row indices between the passes).
+pub(crate) struct DeferredClosureFormal {
+    pub(crate) decl_offset: u32,
+    pub(crate) parse_ty: Ty,
+    pub(crate) callee_name: StringId,
+    pub(crate) slot: super::scopes_bodies::SchemaSlot,
+    pub(crate) formal: super::scopes_bodies::SchemaSlot,
+    pub(crate) below: SourceRange,
+}
+
 pub(crate) struct LocalDecl {
     pub(crate) name: StringId,
     /// The name token's span (the diagnostic anchor).
@@ -2372,10 +2386,17 @@ pub(crate) struct Engine<'a> {
     /// read (#2539): the parse-time bind wrote the accessor's return over
     /// the UNPROMOTED declared receiver, and the promotion re-decision —
     /// a pass-2 face — cannot reach the bind. Each row defers the re-bind
-    /// (the local's name, the member row's offset, the parse-time type);
-    /// pass 2 recomputes the accessor over the re-derived receiver and
-    /// re-binds before any row resolves.
+    /// (the declaring local's NAME-TOKEN offset — file-unique, unlike the
+    /// scoped locals-stack index — the member row's offset, the parse-time
+    /// type); pass 2 recomputes the accessor over the re-derived receiver
+    /// and re-binds before any row resolves.
     pub(crate) deferred_var_rebinds: Vec<(u32, u32, Ty)>,
+    /// An implicitly typed closure formal whose context schema derived
+    /// from a staged receiver row (`rebound.fragments.where((f) => …)`'s
+    /// `f`): pass 1 freezes the schema entry over the unre-derived
+    /// receiver face, so the ingredients defer and the re-bind pass
+    /// recomputes the schema over the re-derived link face.
+    pub(crate) deferred_closure_formals: Vec<DeferredClosureFormal>,
     /// Deferred invocation faces (#2547): a bare-local callee the
     /// parse-time pass typed as non-callable may stand flow-promoted at
     /// the send (a switch-case pattern promoted the local to a `call`
@@ -2386,7 +2407,11 @@ pub(crate) struct Engine<'a> {
     /// The names a deferred re-bind actually retyped (#2539): the
     /// receiver re-decision consults the frame's var-types for these
     /// names when the flow read face carries no promotion — the local's
-    /// re-bound type is the receiver's re-derived static type.
+    /// re-bound type is the receiver's re-derived static type. Keyed by
+    /// the declaring local's NAME-TOKEN offset: the locals stack is
+    /// scoped (truncated as frames close), so a stack index aliases
+    /// across scopes and a flat index key would let one scope's re-bind
+    /// clobber another's.
     pub(crate) rebound_locals: FxHashMap<u32, (Ty, Ty)>,
     /// The current case clause's `case` keyword anchor (the flow
     /// `MatchedType` fact's join key); a switch-expression alternative
@@ -2405,12 +2430,21 @@ pub(crate) struct Engine<'a> {
     /// shifts, so rows carry no back-pointer).
     pub(crate) local_hits: FxHashMap<u32, u32>,
     /// The non-moving twin of [`Engine::local_hits`]: each bare read's
-    /// offset to its resolved local index, never relocated by the merge
-    /// folds. The fold-chased `local_hits` entry on a member row can
-    /// belong to an OUTER declarator (the whole initializer chain folds
-    /// into the declaration's own row), so identity questions key on the
-    /// receiver read's own span here.
-    pub(crate) local_index_at_read: FxHashMap<u32, u32>,
+    /// offset to its resolved local's DECLARATION name-token offset,
+    /// never relocated by the merge folds. The value is the declaration's
+    /// own span offset (file-unique), not the scoped locals-stack index —
+    /// the stack truncates as frames close, so an index read in pass 2
+    /// aliases across scopes. The fold records the twin at the member
+    /// row's offset too (the merge's hit move), so identity questions key
+    /// on the receiver read's own span here and on the member row there.
+    pub(crate) local_decl_at_read: FxHashMap<u32, u32>,
+    /// The fold's twin of [`Engine::local_decl_at_read`]: each member
+    /// row's offset to the receiver read's local declaration offset. The
+    /// receiver re-bind fallback keys it (the receiver read's own span is
+    /// the primary entry's key); the receiver-expression faces must NOT
+    /// consult it — a member row's span names the LINK node, whose face
+    /// the chain leg re-derives, never the receiver's own local.
+    pub(crate) local_decl_at_member: FxHashMap<u32, u32>,
     /// The open pattern-variable-declaration group window: the group id
     /// every pattern-declared variable joins until the window closes (one
     /// used member spares the whole group; official

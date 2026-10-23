@@ -301,16 +301,22 @@ impl<'a> Engine<'a> {
     }
 
     /// The pass-2 re-bind of a promotion-latched initializer (#2539):
-    /// each deferred local re-derives its initializer member's accessor
-    /// over the promoted receiver (the same re-decision
+    /// each deferred local re-derives its initializer member's static
+    /// type over the promoted receiver (the same re-decision
     /// [`Engine::rederived_receiver`] makes for the member row itself)
-    /// and re-binds when the accessor's return names a different type
-    /// than the parse-time bind wrote. Runs before any row resolves, so
-    /// every later face — the re-bound local's own member reads, the
-    /// argument and return checks — reads the promoted accessor face.
+    /// and re-binds when the answer names a different type than the
+    /// parse-time bind wrote. Runs before any row resolves, so every
+    /// later face — the re-bound local's own member reads, the argument
+    /// and return checks — reads the promoted accessor face. The answer
+    /// rides [`Engine::receiver_static_ty`] on a synthetic row (the same
+    /// single source the chained faces consult): an accessor read
+    /// instantiates the declared return against the re-derived receiver,
+    /// and an invoked member (`var l = c.fragments.toList()`) answers
+    /// the instantiated SEND result, never the raw schema a bare
+    /// `return_ty` read would leak.
     fn apply_deferred_rebinds(&mut self) {
         let deferred = std::mem::take(&mut self.deferred_var_rebinds);
-        for (local_index, member_offset, parse_ty) in deferred {
+        for (decl_offset, member_offset, parse_ty) in deferred {
             let Some(index) = self
                 .member_reads
                 .binary_search_by(|read| read.offset.cmp(&member_offset))
@@ -323,19 +329,37 @@ impl<'a> Engine<'a> {
             let Receiver::Typed { ty: recv_ty, .. } = recv else {
                 continue;
             };
-            let Ty::Named {
-                name: recv_head, ..
-            } = recv_ty
-            else {
+            if !matches!(recv_ty, Ty::Named { .. }) {
                 continue;
+            }
+            // The invoked-member probe (the same byte test the chained
+            // faces take): a member token directly followed by `(` is a
+            // send, so the initializer's static type is the callee's
+            // result face, not the accessor's declared return.
+            let name = self.strings.resolve(read.name);
+            let units: u32 = if name.is_ascii() {
+                name.len() as u32
+            } else {
+                name.chars().map(char::len_utf16).sum::<usize>() as u32
             };
-            let Walk::Found(entry) = self.walk_members(recv_head, read.name) else {
-                continue;
+            let invoked = self.byte_at(read.offset + units) == Some(b'(');
+            let row = Row {
+                name: read.name,
+                range: SourceRange {
+                    offset: read.offset,
+                    length: 0,
+                },
+                qualified: true,
+                shape: RowShape::Member { recv },
+                intent: if invoked {
+                    Intent::Invoke
+                } else {
+                    Intent::Read
+                },
+                write_op: None,
+                ty: Ty::UNKNOWN,
             };
-            let mut corrected = match entry.kind {
-                MemberKind::Field => self.fold_alias_ty(entry.var_ty),
-                _ => self.fold_alias_ty(entry.return_ty),
-            };
+            let mut corrected = self.receiver_static_ty(&row);
             // The await flatten the parse-time bind applies (#2506): an
             // initializer inside an await extent binds the FUTURE'S
             // argument (`final db = await open();`), and the re-derived
@@ -405,7 +429,73 @@ impl<'a> Engine<'a> {
                 _ => false,
             };
             if corrected != Ty::UNKNOWN && corrected != parse_ty && narrows {
-                self.rebound_locals.insert(local_index, (parse_ty, corrected));
+                self.rebound_locals.insert(decl_offset, (parse_ty, corrected));
+            }
+        }
+        // The deferred closure formals: the context schema recomputes over
+        // the re-derived receiver face (a promotion-latched link below the
+        // callee — `rebound.fragments.where((f) => f.isComplete)` — freezes
+        // the stale schema entry at pass 1), and the corrected entry joins
+        // the same `rebound_locals` map the var re-binds ride, so every
+        // read of the formal re-derives through the re-bound face.
+        let deferred_formals = std::mem::take(&mut self.deferred_closure_formals);
+        for entry in deferred_formals {
+            let Some(face) = self.recv_expression_ty(entry.below) else {
+                continue;
+            };
+            let Ty::Named { name: head, .. } = face else {
+                continue;
+            };
+            let recv = Receiver::Typed {
+                type_name: head,
+                ty: face,
+            };
+            // The row keeps its member-token offset across the merge (the
+            // fold tiles the length, never the start), so the offset pairs
+            // the captured callee identity.
+            let corrected =
+                self.closure_context_schema(recv, entry.callee_name, None, entry.slot, entry.formal);
+            let Some(corrected) = corrected.filter(|ty| *ty != Ty::UNKNOWN && *ty != entry.parse_ty)
+            else {
+                continue;
+            };
+            // The same narrowing gate the var re-binds apply: the schema
+            // entry must narrow the frozen pass-1 face, never widen it.
+            let narrows = match (corrected, entry.parse_ty) {
+                (
+                    Ty::Named {
+                        name: c_head,
+                        nullable: c_null,
+                        ..
+                    },
+                    Ty::Named {
+                        name: p_head,
+                        nullable: p_null,
+                        ..
+                    },
+                ) => {
+                    let nullability_ok = !c_null || p_null;
+                    if p_head == self.intern("Object") {
+                        nullability_ok && !c_null
+                    } else if c_head == p_head {
+                        nullability_ok
+                    } else {
+                        let non_null = |name: StringId| Ty::Named {
+                            name,
+                            nullable: false,
+                            args: ArgListId::EMPTY,
+                        };
+                        !matches!(
+                            self.declared_subtype_negative(&non_null(c_head), &non_null(p_head)),
+                            Some(false)
+                        )
+                    }
+                }
+                _ => false,
+            };
+            if narrows {
+                self.rebound_locals
+                    .insert(entry.decl_offset, (entry.parse_ty, corrected));
             }
         }
     }
@@ -512,13 +602,18 @@ impl<'a> Engine<'a> {
             RowShape::Member { recv } => {
                 let recv = self.cascade_recv_receiver(row, *recv);
                 let recv = self.promoted_receiver(row.range.offset, recv);
+                let rebound_face = if matches!(recv, Receiver::Typed { .. })
+                    && self
+                        .member_reads
+                        .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+                        .is_ok()
+                {
+                    self.rebound_local_receiver(row.range.offset, &recv)
+                } else {
+                    None
+                };
                 let recv =
-                    if matches!(recv, Receiver::Typed { .. })
-                        && self
-                            .member_reads
-                            .binary_search_by(|read| read.offset.cmp(&row.range.offset))
-                            .is_ok()
-                        && let Some(face) = self.rebound_local_receiver(row.range.offset, &recv)
+                    if let Some(face) = rebound_face
                         && let Ty::Named { name, .. } = face
                     {
                         Receiver::Typed {
@@ -1584,6 +1679,18 @@ impl<'a> Engine<'a> {
     /// [`Self::recv_expression_ty`] before the trailing null-assert: the
     /// flow read face, then the chained-member face.
     fn recv_expression_face(&self, read_span: SourceRange) -> Option<Ty> {
+        // The re-bound local's corrected face outranks the raw flow read:
+        // the flow layer's declared slot staged the parse-time bind
+        // (#2140) and pass 2's re-bind (#2539) is the only holder of the
+        // promoted accessor face — without this layer a `var` chain
+        // (`var a = f.element; var b = a.m`) re-derives `b`'s initializer
+        // against `a`'s stale parse face and the whole chain rides the
+        // base declaration. The helper's own gate keeps a genuinely
+        // promoted read (a flow face past the parse bind) on its flow
+        // face.
+        if let Some(ty) = self.rebound_read_face(read_span) {
+            return Some(ty);
+        }
         if let Some(ty) = self.read_type_at(read_span) {
             return Some(ty);
         }

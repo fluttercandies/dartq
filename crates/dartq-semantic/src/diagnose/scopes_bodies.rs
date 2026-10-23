@@ -32,7 +32,7 @@ const CHAIN_PRODUCER_GETTERS: [(&str, &str, usize, &str); 2] = [
 /// (`_inferFormalParameters`'s positional iterators and its
 /// `namedParameterTypes` map).
 #[derive(Clone, Copy)]
-enum SchemaSlot {
+pub(crate) enum SchemaSlot {
     Positional(usize),
     Named(StringId),
 }
@@ -1036,11 +1036,13 @@ impl<'a> Engine<'a> {
         // `holder.items.map(…)`) carries no receiver face of its own — the
         // chained call's receiver is the access *result*, which
         // [`Self::chain_link_receiver`] types.
+        let mut below_span = None;
         let recv = if callee.qualified {
             callee_row
                 .checked_sub(1)
                 .and_then(|below| self.rows.get(below))
                 .map_or(Receiver::Unknown, |below| {
+                    below_span = Some(below.range);
                     let recv = self.argument_receiver(below);
                     if matches!(recv, Receiver::Unknown) {
                         self.chain_link_receiver(below)
@@ -1051,11 +1053,46 @@ impl<'a> Engine<'a> {
         } else {
             Receiver::Unknown
         };
-        // The callee's parameter type at the literal's slot is the context
-        // type the literal's own schema came from. The element formals
-        // answer first; a function-typed variable callee's captured
-        // signature closes.
         let callee_name = callee.name;
+        let schema = self.closure_context_schema(recv, callee_name, Some(callee_row), slot, formal);
+        // The pass-2 deferral: the context face derives from the below
+        // row's staged classification, which pass 1 cannot re-derive (a
+        // promotion-latched receiver below it — `rebound.fragments.where(
+        // (f) => …)` — re-binds only in pass 2), so the formal's slot
+        // freezes the stale schema entry. Record the ingredients; the
+        // re-bind pass recomputes the schema over the re-derived link
+        // face and corrects the formal's reads through the same
+        // `rebound_locals` map the var re-binds ride.
+        if let (Some(below), Some(parse_ty)) = (below_span, schema)
+            && let Some(decl) = self.locals.last().filter(|decl| decl.name == name)
+        {
+            self.deferred_closure_formals.push(DeferredClosureFormal {
+                decl_offset: decl.range.offset,
+                parse_ty,
+                callee_name,
+                slot,
+                formal,
+                below,
+            });
+        }
+        return schema;
+    }
+
+    /// [`Self::closure_param_context_ty`]'s schema tail: the callee's
+    /// parameter type at the literal's slot is the context type the
+    /// literal's own schema came from. Shared by the pass-1 bind and the
+    /// pass-2 re-bind (the deferral re-runs it over the re-derived
+    /// receiver face). The element formals answer first; a
+    /// function-typed variable callee's captured signature closes.
+    pub(crate) fn closure_context_schema(
+        &mut self,
+        recv: Receiver,
+        callee_name: StringId,
+        // `None` on the pass-2 re-bind (see `closure_schema_instantiate`).
+        callee_row: Option<usize>,
+        slot: SchemaSlot,
+        formal: SchemaSlot,
+    ) -> Option<Ty> {
         let slot_ty = match slot {
             SchemaSlot::Positional(index) => self
                 .callee_formals(&recv, callee_name)
@@ -1287,7 +1324,13 @@ impl<'a> Engine<'a> {
         ty: Ty,
         recv: &Receiver,
         callee_name: StringId,
-        callee_row: usize,
+        // `callee_row` is the pass-1 row index; `None` on the pass-2
+        // re-bind, where the fold may have retired the row and the
+        // argument-list state is gone — the receiver-seeded substitution
+        // stands alone there (the oracle's receiver instantiation is the
+        // face a re-derived receiver changes; the upward face ran at bind
+        // time over arguments the re-bind never retypes).
+        callee_row: Option<usize>,
     ) -> Option<Ty> {
         let Some((params, seeds, ordered)) = self.closure_callee_params(recv, callee_name) else {
             return None;
@@ -1307,7 +1350,7 @@ impl<'a> Engine<'a> {
         // send-close face owns the slot). A positional list pairs against
         // the declaration's parameter order, which the foreign-declaration
         // recovery cannot vouch for, so those solutions stay open.
-        if let Some(own) = ordered
+        if let (Some(own), Some(callee_row)) = (ordered, callee_row)
             && let Some((_, explicit)) = self
                 .call_type_args
                 .iter()
@@ -1328,9 +1371,17 @@ impl<'a> Engine<'a> {
             }
         }
         // Upward face: the arguments already typed at bind time unify
-        // against the callee's formals for the still-open slots.
-        let formals = self.callee_formals(recv, callee_name)?;
-        let level_args = self.arg_levels.last()?.args.clone();
+        // against the callee's formals for the still-open slots. The
+        // pass-2 re-bind skips it (the argument list closed with pass 1;
+        // the seeds below carry the receiver face it re-derived).
+        let formals = match callee_row {
+            Some(_) => Some(self.callee_formals(recv, callee_name)?),
+            None => None,
+        };
+        let level_args = match callee_row {
+            Some(_) => self.arg_levels.last()?.args.clone(),
+            None => Vec::new(),
+        };
         let mut candidates: Vec<(StringId, Ty)> = Vec::new();
         let mut positional_index = 0usize;
         for (name, ty, _literal, range) in &level_args {
@@ -1396,9 +1447,9 @@ impl<'a> Engine<'a> {
                 }
             };
             let formal = match name {
-                Some(n) => formals.named_formal(*n),
+                Some(n) => formals.as_ref().and_then(|f| f.named_formal(*n)),
                 None => {
-                    let formal = formals.positional.get(positional_index);
+                    let formal = formals.as_ref().and_then(|f| f.positional.get(positional_index));
                     positional_index += 1;
                     formal
                 }

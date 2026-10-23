@@ -383,9 +383,17 @@ impl<'a> Engine<'a> {
                         .push((op_range.offset, chain_end, recv_span));
                 }
                 // The receiver's read counts for the local it resolved to
-                // (`v.m` reads `v`): the member row inherits the hit.
+                // (`v.m` reads `v`): the member row inherits the hit. The
+                // decl-keyed twin rides the move while the frame is still
+                // open (the pass-2 re-bind lookups key on the
+                // declaration's name-token offset — the scoped index
+                // aliases once the frames close).
                 if let Some(hit) = self.local_hits.remove(&popped.range.offset) {
                     self.local_hits.insert(member.range.offset, hit);
+                    if let Some(decl) = self.locals.get(hit as usize) {
+                        self.local_decl_at_member
+                            .insert(member.range.offset, decl.range.offset);
+                    }
                 }
                 // The receiver's own reference marks its name used (the
                 // official `members` face, and `unused_import`'s
@@ -1150,11 +1158,15 @@ impl<'a> Engine<'a> {
             // span; the chained latch's zero-length span keys the receiver
             // read's entry instead (its face is the chain's settled
             // result). A face the walk cannot name (`dynamic`, unknown)
-            // keeps the frozen row — the under-report posture.
+            // keeps the frozen row — the under-report posture. The head
+            // arm reads the re-bound local face first (#2539): the flow
+            // read still spells the parse-time bind, so a settled chain
+            // through a re-bound local (`var a = f.element; a.m`) would
+            // otherwise re-type every link on the stale base declaration.
             let face = if span.length == 0 {
                 derived.get(&span.offset).copied()
             } else {
-                self.read_type_at(span)
+                self.rebound_read_face(span).or_else(|| self.read_type_at(span))
             };
             let Some(face @ Ty::Named { name, .. }) = face else {
                 continue;

@@ -4841,6 +4841,12 @@ mod ticket_2508_tests;
 #[cfg(test)]
 mod ticket_2564_tests;
 
+/// The #2565 pins: the promotion-latched initializer's re-bind
+/// propagating down a `var` chain, the re-bind map's scope-safe keys,
+/// and the implicitly typed closure formal's context re-bind.
+#[cfg(test)]
+mod ticket_2565_tests;
+
 
 /// The operand-face pins: the numeric refinement reads an operand the
 /// engine cannot type as a gap that suppresses the fold (an untyped

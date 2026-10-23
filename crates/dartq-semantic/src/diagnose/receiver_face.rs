@@ -95,37 +95,61 @@ impl Engine<'_> {
     /// differs-from-static guard — the re-bind is authoritative for its
     /// own reads.
     pub(crate) fn rebound_local_ty(&self, member_offset: u32) -> Option<Ty> {
-        // The identity gate: the merged member row inherited the receiver
-        // read's lexical hit (the merge moves the entry to the member's
-        // own offset), and the hit names the exact local declaration —
-        // the same index the re-bind keyed. The flow face gate (the
-        // consumer read's own face still spelling the parse-time bind)
-        // keeps a coincidental index collision — or a same-named
-        // declaration the flat locals stack reuses — from retyping a
-        // foreign read.
-        // The receiver read's own span keys the non-moving roster: the
-        // member row's `local_hits` entry rides the fold chain and can
-        // name an outer declarator (`var n = c.m().k()` moves n's own
-        // hit onto c's member row), while the deferred stage keyed the
-        // initializer's declared local — the receiver read's index at
-        // push time is that same local.
-        let index = self
+        // The identity gate: the declaring local's NAME-TOKEN offset keys
+        // the re-bind map (a file-unique identity — the scoped
+        // locals-stack index aliases across scopes once the frames close,
+        // and a flat index key let one scope's re-bind clobber another's).
+        // The receiver read's own span keys the non-moving roster; the
+        // fold records its twin at the member row's offset for the
+        // shapes whose recv span keys nothing (the entry can name an
+        // outer declarator — `var n = c.m().k()` moves n's own hit onto
+        // c's member row). The flow face gate (the consumer read's own
+        // face still spelling the parse-time bind) keeps a foreign
+        // re-bind from retyping an unrelated read.
+        let decl = self
             .member_reads
             .binary_search_by(|read| read.offset.cmp(&member_offset))
             .ok()
             .and_then(|i| {
                 let span = self.member_reads[i].recv_span;
-                self.local_index_at_read
+                self.local_decl_at_read
                     .get(&span.offset)
                     .copied()
-                    .or_else(|| self.local_hits.get(&member_offset).copied())
+                    .or_else(|| self.local_decl_at_member.get(&member_offset).copied())
             })?;
-        let &(parse_ty, corrected) = self.rebound_locals.get(&index)?;
+        let &(parse_ty, corrected) = self.rebound_locals.get(&decl)?;
         let recv_span = self
             .member_reads
             .binary_search_by(|read| read.offset.cmp(&member_offset))
             .ok()
             .map(|i| self.member_reads[i].recv_span)?;
-        (self.read_type_at(recv_span) == Some(parse_ty)).then_some(corrected)
+        // A flow face past the parse bind (a promotion, a widened join)
+        // keeps itself; no flow row at all means nothing stands between
+        // the read and the re-bind — an implicitly typed closure formal
+        // stages no flow row of its own, and the correction is
+        // authoritative there.
+        match self.read_type_at(recv_span) {
+            Some(ty) if ty != parse_ty => None,
+            _ => Some(corrected),
+        }
+    }
+
+    /// [`Self::rebound_local_ty`]'s span-keyed face: the re-bound type of
+    /// whichever local the read span names, gated on the flow read still
+    /// spelling the parse-time bind. This is the layering every
+    /// receiver-expression face reads BEFORE the raw flow type: the flow
+    /// layer's declared slot staged the parse-time face (#2140) and no
+    /// promotion rewrites it, so a promotion-latched initializer's
+    /// pass-2 re-bind (#2539) is the only holder of the corrected face —
+    /// `var a = f.element; a.m` re-types `a`'s receiver reads with the
+    /// re-bound face, while a genuinely promoted read (a flow face past
+    /// the parse bind) keeps its flow face through the gate.
+    pub(crate) fn rebound_read_face(&self, span: SourceRange) -> Option<Ty> {
+        let decl = self.local_decl_at_read.get(&span.offset).copied()?;
+        let &(parse_ty, corrected) = self.rebound_locals.get(&decl)?;
+        match self.read_type_at(span) {
+            Some(ty) if ty != parse_ty => None,
+            _ => Some(corrected),
+        }
     }
 }
