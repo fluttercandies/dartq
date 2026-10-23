@@ -1463,6 +1463,13 @@ impl Interp<'_> {
                 // covers a NON-aware selector inside an open shorted tail
                 // (`x?.a.b(throw _)`'s `.b`) — the innermost open short owns
                 // this region and its skip path rejoins the continuation.
+                // An exit the access ITSELF produced (the selector's
+                // invocation returned Never — `Error.throwWithStackTrace(..)`
+                // in the post-order stream fires this poll after its own
+                // `Ev::Exit`) is the statement's own death at or after the
+                // selector's span: the access was live when the official's
+                // pre-order poll ran, so the next node anchors — the same
+                // `exit_at` boundary the statement wrapper applies.
                 if self
                     .null_shorts
                     .last()
@@ -1470,7 +1477,10 @@ impl Interp<'_> {
                 {
                     // Interior death — the skip path rejoins at the chain's
                     // boundary and carries the continuation's reachability.
-                } else {
+                } else if !self
+                    .exit_at
+                    .is_some_and(|at| at >= member.range.offset)
+                {
                     self.dead_code(*member);
                 }
                 // The member identifier's own entry sits on top (every

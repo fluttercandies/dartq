@@ -456,3 +456,27 @@ fn function_typed_scrutinee_suppresses_exhaustiveness() {
         messages(&report)
     );
 }
+
+/// A Never-returning invocation does not anchor its own dead-code row:
+/// the member-access node poll runs post-order (after the invocation's
+/// own `Ev::Exit`), and the official's pre-order `checkUnreachableNode`
+/// saw the access live — the statement's own death stays silent (the
+/// next node anchors; a call ending its block reports nothing). Without
+/// the `exit_at` boundary the poll self-anchored at the call's closing
+/// `);` (the throwWithStackTrace/Isolate.exit family — 10 oracle-silent
+/// rows across drift/dio/http/riverpod).
+#[test]
+fn never_call_does_not_anchor_the_dead_row_on_itself() {
+    let report = super::test_rig::report_ops_bare(
+        "class E { static Never exit() => throw StateError('x'); }\n\
+         void g() {\n\
+           E.exit();\n\
+         }\n\
+         ",
+    );
+    assert!(
+        count_code(&report, "dead_code") == 0,
+        "a Never member call ending its block reports nothing: {:?}",
+        messages(&report)
+    );
+}
