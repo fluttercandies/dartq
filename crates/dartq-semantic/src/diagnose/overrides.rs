@@ -322,16 +322,29 @@ impl<'a> Engine<'a> {
                     return Walk::Found(found_entry);
                 }
             }
-            if !found.implements_clause.is_empty() {
-                pending_faces.push(
-                    found
-                        .implements_clause
-                        .iter()
-                        .map(|face| (*face, found_owner, name))
-                        .collect(),
-                );
+            // A mixin's `on` clause is its superclass face: the application
+            // `S with M` constrains `S` below every `on` head, so a receiver
+            // typed as the mixin answers through the on-types before its
+            // `implements` faces — the on-position shadows the interface
+            // position exactly like a superclass does (the official
+            // interface build treats `on A, B` as the superclass `A` plus
+            // the additional constraint faces `B`). The first head rides
+            // the superclass climb; the remaining heads join this level's
+            // faces ahead of the interfaces.
+            let mixin_on_head = (found.kind == ContainerKind::Mixin)
+                .then(|| found.on_clause.split_first().map(|(head, _)| *head))
+                .flatten();
+            let mut level: Vec<(StringId, FileId, StringId)> = found
+                .on_clause
+                .iter()
+                .skip(usize::from(mixin_on_head.is_none()))
+                .chain(found.implements_clause.iter())
+                .map(|face| (*face, found_owner, name))
+                .collect();
+            if !level.is_empty() {
+                pending_faces.push(std::mem::take(&mut level));
             }
-            let Some(superclass) = found.superclass else {
+            let Some(superclass) = found.superclass.or(mixin_on_head) else {
                 // An enum's implicit superinterface (`Enum`, dart:core —
                 // every enum declaration implements it, so `index` and the
                 // `EnumName` extension's receiver resolve through it): the

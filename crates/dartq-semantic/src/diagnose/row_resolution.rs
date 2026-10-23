@@ -1661,6 +1661,28 @@ impl<'a> Engine<'a> {
             ty: Ty::UNKNOWN,
         };
         let ty = self.receiver_static_ty(&row);
+        // An invoked callee's chain node is the SEND, not the read: a
+        // member token followed by `(` (the same byte probe the
+        // redirect-edge face takes) makes the node's value the
+        // implicit-`call` dispatch, so the send's static type is the
+        // `call` method's return — never the accessor's own declared
+        // type (`entry.key(context)` reads `XPathSequence` through
+        // `XPathExpression.call`, not the `key` field's own class).
+        let name = self.strings.resolve(read.name);
+        let units: u32 = if name.is_ascii() {
+            name.len() as u32
+        } else {
+            name.chars().map(char::len_utf16).sum::<usize>() as u32
+        };
+        let invoked = self.byte_at(read.offset + units) == Some(b'(');
+        let ty = if invoked && !self.is_never_ty(ty) {
+            match self.implicit_call_face(ty) {
+                Some((_, call_ret, _)) => call_ret,
+                None => ty,
+            }
+        } else {
+            ty
+        };
         (ty != Ty::UNKNOWN).then_some(ty)
     }
 
@@ -2731,7 +2753,7 @@ impl<'a> Engine<'a> {
                     row.range,
                     name_text,
                     &type_text,
-                );
+                )
             }
             Intent::Write | Intent::ReadWrite => {
                 // A compound write checks the read face first (the oracle

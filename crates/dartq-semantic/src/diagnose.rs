@@ -353,9 +353,9 @@ use crate::library::{
     supertype_hop_dead,
 };
 use crate::member_face::{
-    COLLECTION_INTERFACE_ALIASES, CORE_CONST_CTOR, CORE_INTERFACE_MEMBERS, CORE_STATIC_RETURNS,
-    CORE_TYPE_MEMBERS, EqualsCheck, MemberFace, NsmCheck, NsmShape, OBJECT_GETTER_RETURNS,
-    OBJECT_INSTANCE_RETURNS,
+    COLLECTION_INTERFACE_ALIASES, CORE_CONST_CTOR, CORE_CONTAINER_PARAMS, CORE_INTERFACE_MEMBERS,
+    CORE_STATIC_RETURNS, CORE_TYPE_MEMBERS, EqualsCheck, MemberFace, NsmCheck, NsmShape,
+    OBJECT_GETTER_RETURNS, OBJECT_INSTANCE_RETURNS,
 };
 use crate::model::{
     ArgListId, ArgPool, ArityViolation, Container, ContainerKind, ExtensionFace, FileElements,

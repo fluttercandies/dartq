@@ -622,6 +622,29 @@ pub(crate) const FINAL_PRIMITIVES: [&str; 5] = ["int", "double", "num", "bool", 
 pub(crate) const CORE_STATIC_RETURNS: [(&str, &str, &str); 1] =
     [("RangeError", "checkValidRange", "int")];
 
+/// The dart:core generic containers' own type parameters, in declaration
+/// order (`sdk/lib/core/map.dart`'s `abstract class Map<K, V>`, …). The
+/// accessor static face instantiates a resolved getter's declared return
+/// with the receiver's written arguments (`_executeGetter`), which needs
+/// the DECLARING container's parameter order; a cross-unit declaration's
+/// capture lives in that unit's own parse, so the dart:core heads ride
+/// this table instead (their declarations are frozen by the SDK's own
+/// stability guarantees).
+pub(crate) const CORE_CONTAINER_PARAMS: &[(&str, &[&str])] = &[
+    ("Map", &["K", "V"]),
+    ("MapEntry", &["K", "V"]),
+    ("List", &["E"]),
+    ("Set", &["E"]),
+    ("Iterable", &["E"]),
+    ("Iterator", &["E"]),
+    ("Future", &["T"]),
+    ("Stream", &["T"]),
+    ("ListMixin", &["E"]),
+    ("SetMixin", &["E"]),
+    ("MapMixin", &["K", "V"]),
+    ("IterableMixin", &["E"]),
+];
+
 /// The `Object` instance members' declared returns: the member face every
 /// instance receiver carries whatever its head (`sdk/lib/core/object.dart`
 /// — `String toString()`, `int get hashCode`, `Type get runtimeType`). A

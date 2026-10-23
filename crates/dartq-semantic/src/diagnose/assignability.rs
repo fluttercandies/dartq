@@ -749,7 +749,7 @@ impl<'a> Engine<'a> {
                         Walk::Found(entry)
                             if matches!(entry.kind, MemberKind::Getter | MemberKind::Field) =>
                         {
-                            answer(&entry)
+                            self.instantiate_accessor_static(container, recv, answer(&entry))
                         }
                         _ => self.object_instance_read_ty(row),
                     },
@@ -758,6 +758,66 @@ impl<'a> Engine<'a> {
             }
             _ => Ty::UNKNOWN,
         }
+    }
+
+    /// Instantiates a resolved accessor's declared type with the
+    /// receiver's written type arguments — the official `_executeGetter`
+    /// face (`property_element_resolver.dart`): the getter's return
+    /// carries the receiver's instantiation, so `Map<K, V>.values` under
+    /// a `Map<String, ClassItem>` receiver answers `Iterable<ClassItem>`.
+    /// A container without parameters keeps the declared face verbatim; a
+    /// receiver the model cannot instantiate (no written arguments, an
+    /// arity the declaration rejects) keeps the under-report — the RAW
+    /// schema must never leak as the read's static type (its
+    /// type-parameter spellings are unprovable in the caller's scope and
+    /// starve every downstream solve into the `Object?` recovery).
+    pub(crate) fn instantiate_accessor_static(&self, container: StringId, recv: &Receiver, declared: Ty) -> Ty {
+        // The declaring container's parameter list: this unit's own capture
+        // first, the dart:core table for the SDK heads whose capture lives
+        // in their own unit's parse. An EMPTY capture never claims the
+        // authority — a head the index met cross-unit (the distilled core
+        // face's container rows carry no parameter spellings) must fall
+        // through to the table, else the raw schema leaks as the read's
+        // static type (a `MapEntry.key` answering the bare `K`).
+        let own_params = self
+            .bounds
+            .container_params(container)
+            .filter(|params| !params.is_empty());
+        let core_params = own_params.is_none().then(|| {
+            CORE_CONTAINER_PARAMS
+                .iter()
+                .find(|(head, ..)| *head == self.strings.resolve(container))
+                .map(|(_, params)| {
+                    params
+                        .iter()
+                        .map(|p| (self.intern(p), None, false))
+                        .collect::<Vec<_>>()
+                })
+        });
+        let params = match own_params.or_else(|| core_params.flatten()) {
+            Some(params) if !params.is_empty() => params,
+            _ => return declared,
+        };
+        let receiver_ty = match recv {
+            Receiver::Typed { ty, .. } => *ty,
+            // `this` carries the enclosing face's own instantiation.
+            Receiver::This { container, kind } => self.this_static_ty(*container, *kind),
+            Receiver::Created { name, kind: ContainerKind::Class } => Ty::named(*name),
+            _ => return Ty::UNKNOWN,
+        };
+        let Ty::Named { args, .. } = receiver_ty else {
+            return Ty::UNKNOWN;
+        };
+        let recv_args = self.boundary.pool().get(args).to_vec();
+        if recv_args.len() != params.len() {
+            return Ty::UNKNOWN;
+        }
+        let map: Vec<(StringId, Ty)> = params
+            .iter()
+            .zip(recv_args.iter())
+            .map(|((param, ..), arg)| (*param, *arg))
+            .collect();
+        self.subst_params(declared, &map).unwrap_or(Ty::UNKNOWN)
     }
 
     /// The `Object` getter face for a member READ the container walk

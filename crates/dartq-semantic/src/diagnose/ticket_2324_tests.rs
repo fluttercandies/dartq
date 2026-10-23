@@ -515,6 +515,40 @@ fn callee_own_solve_binds_class_feeding_assignability() {
     );
 }
 
+/// The accessor static face instantiates a resolved getter's declared
+/// return with the receiver's written type arguments (the official
+/// `_executeGetter`): `Map<K, V>.values` under a `Map<String, ClassItem>`
+/// receiver answers `Iterable<ClassItem>`, never the raw schema — a raw
+/// `Iterable<V>` leak starves the chained closure solve into the `Object?`
+/// recovery and reports unchecked where the oracle types the element
+/// (requirements.dart's `declaredClasses.values.map((item) => item.id)`
+/// family). Probed 3.15: the analyzer's answer drives
+/// `INVALID_ASSIGNMENT` on `It<Other> mismatch = items;` — `It<Item>`, the
+/// substituted face, not the declaration's raw `It<V>`.
+#[test]
+fn accessor_static_instantiates_receiver_type_arguments() {
+    let source = "class It<E> { void each(void Function(E e) f) {} }\n\
+                  class Box<K, V> { It<V> get vals => throw 0; }\n\
+                  class Item { int get id => 1; }\n\
+                  class Other {}\n\
+                  void f(Box<String, Item> box) {\n\
+                  var items = box.vals;\n\
+                  It<Other> mismatch = items;\n\
+                  items.each((e) { e.id; });\n\
+                  }\n";
+    let rep = report(source);
+    assert!(
+        has_code(&rep, "invalid_assignment"),
+        "{:?}",
+        code_names(&rep)
+    );
+    assert!(
+        !has_code(&rep, "unchecked_use_of_nullable_value"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
 /// An annotated invalid formal is `InvalidType` itself — the
 /// `isInvalidBounded` arm answers before `isNullable` runs, so `x.foo()`
 /// stays silent. (`Und` still reports its own `undefined_class` face.)
@@ -905,4 +939,55 @@ fn invalid_element_argument_keeps_the_object_question_recovery() {
         "{:?}",
         code_names(&rep)
     );
+}
+
+/// A mixin's `on` clause is its superclass face (the analyzer
+/// `element.formalParameters` chain, `method_invocation_resolver` family):
+/// a receiver typed as the mixin answers through the on-types before its
+/// `implements` faces — the on-position declaration (`Sub get probe`)
+/// shadows the interface's wider spelling, exactly like a superclass. The
+/// walk used to consult the `implements` faces first (a mixin anchor's
+/// `on` clause never climbed), so the read answered the interface face and
+/// `m.probe.subOnly()` reported the interface's missing member (probe:
+/// `dart analyze` is silent on this exact source — `m.probe` is `Sub`).
+#[test]
+fn mixin_on_clause_shadows_implements_faces() {
+    let source = "class Super {} \
+                  class Sub implements Super { Sub subOnly() => this; } \
+                  mixin OnFace { Sub get probe => Sub(); } \
+                  abstract class IFace { Super get probe; } \
+                  mixin M on OnFace implements IFace {} \
+                  void f(M m) { m.probe.subOnly(); }";
+    let rep = report(source);
+    assert!(
+        !has_code(&rep, "undefined_method"),
+        "{:?}",
+        code_names(&rep)
+    );
+}
+
+/// A for-in variable over an instantiated container field chains a field
+/// read into an implicit-`call` invocation and on through the result
+/// (xml 19:41, `entry.key(context).atomize()`): the loop variable binds
+/// `Pair` (the staged `List<Pair>` element), `entry.key` instantiates the
+/// field's schema at the receiver (`Expr`, never the raw type parameter),
+/// the invocation retypes to `Expr.call`'s return (`Seq`) both at the
+/// merge fold and at the pass-2 chained receiver re-decision, and
+/// `.atomize()` resolves on `Seq` — `dart analyze` is silent on this exact
+/// source. The rig's local `List` declares no `implements Iterable`, so
+/// `for_in_of_invalid_type` is rig-only noise the assertion skips over.
+#[test]
+fn for_in_field_implicit_call_chain_reads_call_return() {
+    let source = "class Ctx {} class List<T> {} \
+                  class Seq { Seq atomize() => this; } \
+                  class Expr { Seq call(Ctx c) => Seq(); } \
+                  class Pair { Expr key = Expr(); Expr value = Expr(); } \
+                  class Holder { List<Pair> entries = []; \
+                    void f(Ctx context) { \
+                      for (final entry in entries) { \
+                        entry.key(context).atomize(); \
+                      } \
+                    } }";
+    let rep = report(source);
+    assert!(!has_code(&rep, "undefined_method"), "{:?}", code_names(&rep));
 }

@@ -859,7 +859,18 @@ impl<'a> Engine<'a> {
                     }
                 }
                 Receiver::Typed { type_name, .. } => {
-                    self.member_declared_ty(*type_name, member.name)
+                    let declared = self.member_declared_ty(*type_name, member.name);
+                    // The field's written schema must never ride raw: a
+                    // generic container's field (`MapEntry.key` writes `K`)
+                    // carries the RECEIVER's instantiation (the official
+                    // `_executeGetter`/field-read face), so the bare `K`
+                    // would leak into every downstream member solve — an
+                    // uninstantiable receiver keeps `Unknown` (under-report).
+                    if declared == Ty::UNKNOWN {
+                        declared
+                    } else {
+                        self.instantiate_accessor_static(*type_name, &recv, declared)
+                    }
                 }
                 // A record-typed receiver (`config.strict`, `pair.$1`): the
                 // field getter's type is the shape's own field type (records
@@ -976,6 +987,24 @@ impl<'a> Engine<'a> {
                 self.null_aware_members.insert(member.range.offset);
             }
         }
+        // The implicit-`call` retype at the fold: the send's own
+        // `consume_send` retype runs BEFORE this merge folds the row (the
+        // parser completes the argument group ahead of the dot-expression
+        // reduction), so the callee row it read was still the
+        // information-less selector row — the merged row is where the
+        // member's read type first exists, and an invoked member whose type
+        // names a callable class answers the `call` method's return (the
+        // same face `consume_send` applies, `XPathExpression`'s `call`
+        // making `entry.key(context)` read `XPathSequence`, never the
+        // field's own class). A `Never`-typed member keeps its own face.
+        let ty = if member.intent == Intent::Invoke && !self.is_never_ty(ty) {
+            match self.implicit_call_face(ty) {
+                Some((_, call_ret, _)) => call_ret,
+                None => ty,
+            }
+        } else {
+            ty
+        };
         self.push_row(Row {
             name: member.name,
             range: member.range,
@@ -4816,14 +4845,6 @@ impl<'a> Engine<'a> {
         let mut implicit_call: Option<(Ty, Box<[StringId]>)> = None;
         let formals = formals.or_else(|| {
             let row = self.rows.get(callee)?;
-            // The callee VALUE's static type: `receiver_static_ty` composes
-            // the row's postfix-upgraded face (`key!`'s rewrite) and the
-            // bare read's push-time payload (`Plain{ty}` — a field/local's
-            // declared type; `row.ty` alone is the information-less face a
-            // push leaves, which silenced the whole bare spelling). The
-            // getter's declared return answers through the accessor face
-            // and a top-level *function* keeps the gated tear-off unknown —
-            // the same answers the merge-time member face reads.
             let ty = self.receiver_static_ty(row);
             let (formals, ret, params) = self.implicit_call_face(ty)?;
             implicit_call = Some((ret, params));
