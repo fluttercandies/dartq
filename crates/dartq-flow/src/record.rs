@@ -2083,6 +2083,26 @@ impl ParserListener for Flow<'_> {
             | IdentifierContext::CatchParameter
             | IdentifierContext::LocalVariableDeclaration => {
                 let name = self.name(token);
+                // The implicit-`this` transport: a bare read inside an
+                // extension member reads the written `on` type
+                // (`member` == `this.member`), so the flow's
+                // unresolved-read face needs the on-type at the read's
+                // own offset. Staged into the `this` map (offset-keyed;
+                // bare-read offsets never collide with `this` tokens)
+                // exactly like `handle_this_expression` — the consumer
+                // gates on the invalid face, a resolved on-type keeps
+                // the unknown-read posture (the member's own type is an
+                // element question this layer cannot answer).
+                if context == IdentifierContext::Expression
+                    && let Some((head, false)) = self.extension_on_head
+                {
+                    self.staged_this.entry(token.range.offset).or_insert(
+                        crate::ty::Ty {
+                            base: crate::ty::Base::Name(head),
+                            nullable: false,
+                        },
+                    );
+                }
                 self.record(Ev::Ident {
                     name,
                     token,

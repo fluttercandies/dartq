@@ -59,6 +59,9 @@ impl Interp<'_> {
                         // An if-case's scrutinee expression is on the stack.
                         let scrutinee = self.exprs.pop().and_then(|e| e.reference);
                         let unmatched = self.current.clone().set_unreachable(&mut self.reach);
+                        self.vacuous_object = None;
+                        self.vacuous_fields.clear();
+                        self.pattern_binds.clear();
                         self.pattern = Some(PatternState {
                             kind: PatternKind::Decl,
                             unmatched,
@@ -304,6 +307,11 @@ impl Interp<'_> {
                     pattern.pending_decls.push((*name, *is_final));
                     pattern.shadowed.push((*name, shadowed));
                 }
+                // The pattern's bind buffer: the event stream is
+                // post-order, so a property sub-pattern's shorthand bind
+                // arrives BEFORE its object pattern's own event — the
+                // defer snapshots the binds seen so far.
+                self.pattern_binds.push(*name);
                 // A typed declared-variable pattern at the top level IS the
                 // pattern's type test (`case int n` — official
                 // `promoteForPattern` over `analyzeDeclaredVariablePattern`):
@@ -337,7 +345,20 @@ impl Interp<'_> {
                             self.names,
                         ) {
                             self.join_unmatched(unmatched_arm);
+                        } else if self.ops.is_invalid_typed(
+                            matched_ty,
+                            matched_args,
+                            self.args,
+                            self.names,
+                        ) {
+                            // The vacuous cover (see
+                            // [`Interp::vacuous_cover_kills_chain`]): the
+                            // matched type is the invalid face, so the
+                            // cannot-fail verdict rides the 0c arm.
+                            self.vacuous_cover_kills_chain();
                         }
+                    } else {
+                        self.non_var_invalid_scrutinee_covers();
                     }
                 }
             }
@@ -388,7 +409,20 @@ impl Interp<'_> {
                             self.names,
                         ) {
                             self.join_unmatched(unmatched_arm);
+                        } else if self.ops.is_invalid_typed(
+                            matched_ty,
+                            matched_args,
+                            self.args,
+                            self.names,
+                        ) {
+                            // The vacuous cover (see
+                            // [`Interp::vacuous_cover_kills_chain`]): the
+                            // matched type is the invalid face, so the
+                            // cannot-fail verdict rides the 0c arm.
+                            self.vacuous_cover_kills_chain();
                         }
+                    } else {
+                        self.non_var_invalid_scrutinee_covers();
                     }
                 }
             }
@@ -445,6 +479,16 @@ impl Interp<'_> {
             return;
         }
         let Some(var) = self.pattern_scrutinee() else {
+            // The non-reference scrutinee's vacuous cover defers exactly
+            // like the reference one below: the property sub-patterns
+            // decide at the pattern's close.
+            if let Some((ty, frame_args)) = self.frame_scrutinee_ty()
+                && self
+                    .ops
+                    .is_invalid_typed(ty, frame_args, self.args, self.names)
+            {
+                self.defer_vacuous_object_cover(name);
+            }
             return;
         };
         let model = self.current.model(var);
@@ -480,6 +524,49 @@ impl Interp<'_> {
             self.names,
         ) {
             self.join_unmatched(unmatched_arm);
+        } else if self
+            .ops
+            .is_invalid_typed(matched, matched_args, self.args, self.names)
+        {
+            // The vacuous cover: the matched type is the invalid face, so
+            // the cannot-fail verdict rides the 0c arm — the case leaves
+            // the chain dead for every later alternative. The verdict
+            // DEFERS: a property sub-pattern whose own required type is
+            // the invalid face may fail (official `promoteForPattern`
+            // refuses it), so the close re-decides with the collected
+            // fields.
+            self.defer_vacuous_object_cover(name);
+        }
+    }
+
+    /// Latches the object pattern's vacuous cover for the pattern close to
+    /// re-decide ([`Interp::resolve_vacuous_object_cover`]): the head-time
+    /// state survives as the may-fail arm should any property's required
+    /// type be the invalid face, and the property sub-patterns' bound
+    /// names collect as the close's query set (the shorthand `:var name`
+    /// binds the member's own name; an explicit label's bound name misses
+    /// the member table and keeps the cover — the under-report direction).
+    fn defer_vacuous_object_cover(&mut self, owner: u32) {
+        self.vacuous_object = Some((owner, self.current.clone()));
+        self.vacuous_fields = self.pattern_binds.clone();
+    }
+
+    /// Decides a deferred object-pattern vacuous cover at the pattern's
+    /// close: any property sub-pattern whose required type is the invalid
+    /// face may fail (official `promoteForPattern`'s outright refusal,
+    /// `flow_analysis.dart:7720-7723`), so its head-time arm rejoins the
+    /// unmatched chain instead of the cover's kill.
+    fn resolve_vacuous_object_cover(&mut self) {
+        let Some((owner, state)) = self.vacuous_object.take() else {
+            return;
+        };
+        let fields = std::mem::take(&mut self.vacuous_fields);
+        if fields.iter().any(|&field| {
+            self.ops.object_property_invalid(owner, field, self.names)
+        }) {
+            self.join_unmatched(state);
+        } else {
+            self.vacuous_cover_kills_chain();
         }
     }
 
@@ -507,6 +594,58 @@ impl Interp<'_> {
         let cur = self.current.clone();
         self.join_unmatched(cur);
         true
+    }
+
+    /// The statement-switch frame's latched scrutinee type (the scrutinee
+    /// value's own ty at `SwitchBlockBegin`), with its written arguments.
+    fn frame_scrutinee_ty(&self) -> Option<(Ty, u32)> {
+        self.switch_frame().and_then(|index| match &self.stack[index] {
+            Frame::Switch {
+                scrutinee_ty,
+                scrutinee_args,
+                ..
+            } => Some((*scrutinee_ty, *scrutinee_args)),
+            _ => None,
+        })
+    }
+
+    /// The official `_pushPattern` starts every case's working unmatched
+    /// chain UNREACHABLE (flow_analysis.dart:9376-9380), and an
+    /// alternative whose pattern provably covers leaves it that way —
+    /// later alternatives and the post-switch state run unreachable. The
+    /// switch-case contexts init the chain from the frame instead (the
+    /// live-init keeps every coverage-less pattern face's chain alive),
+    /// so a VACUOUS cover — the matched type IS the invalid face, whose
+    /// every subtype relation holds (the oracle's invalid-type leniency,
+    /// oracle-probed on t/u/v/w shapes: statement and expression
+    /// switches, bare and fielded object patterns, declared-variable
+    /// patterns) — must kill the chain explicitly. Guards still join
+    /// their false arm at the pattern exit, reviving the chain exactly
+    /// like the official's guard-may-fail alternative. Statement
+    /// switches only: the expression alternatives' dead rows are the
+    /// semantic synthesizer's face (a flow window there would anchor on
+    /// the arm's member polls).
+    fn vacuous_cover_kills_chain(&mut self) {
+        if let Some(pattern) = self.pattern.as_mut()
+            && matches!(pattern.kind, PatternKind::Switch)
+        {
+            pattern.unmatched = pattern.unmatched.clone().set_unreachable(&mut self.reach);
+        }
+    }
+
+    /// A typed pattern over a NON-reference scrutinee (a select, a call):
+    /// the official's `promoteForPattern` still answers the coverage
+    /// question on the scrutinee's static type. When that type IS the
+    /// invalid face, the pattern covers vacuously and the case's
+    /// unmatched chain dies; every other scrutinee type keeps the
+    /// live-init posture (the may-fail question has no flow-visible
+    /// answer without a promotable reference).
+    fn non_var_invalid_scrutinee_covers(&mut self) {
+        if let Some((ty, args)) = self.frame_scrutinee_ty()
+            && self.ops.is_invalid_typed(ty, args, self.args, self.names)
+        {
+            self.vacuous_cover_kills_chain();
+        }
     }
 
     /// The matched value's variable — the key every matched-type question
@@ -573,6 +712,9 @@ impl Interp<'_> {
     /// pattern context opens for the clause. `is_expr` selects the
     /// switch-expression variant (no body lookahead, no `case_open`).
     pub(crate) fn case_pattern_begin(&mut self, is_expr: bool) {
+        self.vacuous_object = None;
+        self.vacuous_fields.clear();
+        self.pattern_binds.clear();
         let chain = self
             .switch_frame()
             .and_then(|frame_index| match &self.stack[frame_index] {
@@ -601,6 +743,7 @@ impl Interp<'_> {
     /// plus the combined group state update in the switch frame (official
     /// `switch_endAlternative`).
     pub(crate) fn case_pattern_end(&mut self, has_guard: bool) {
+        self.resolve_vacuous_object_cover();
         let Some(pattern) = self.pattern.take() else {
             return;
         };
@@ -639,6 +782,7 @@ impl Interp<'_> {
     /// (official `switch_endAlternative`,
     /// flow_analysis.dart:8008-8039).
     pub(crate) fn case_pattern_end_expr(&mut self) {
+        self.resolve_vacuous_object_cover();
         let Some(pattern) = self.pattern.take() else {
             return;
         };
@@ -678,6 +822,7 @@ impl Interp<'_> {
     /// here: a switch context belongs to its clause machinery, and an
     /// `IfCase` context is consumed by `ThenBegin`.
     pub(crate) fn close_standalone_pattern(&mut self) {
+        self.resolve_vacuous_object_cover();
         let Some(pattern) = self.pattern.take() else {
             return;
         };

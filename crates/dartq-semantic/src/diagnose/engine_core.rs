@@ -2373,6 +2373,14 @@ impl<'a> Engine<'a> {
         } else {
             operand.ty
         };
+        // An invalid-typed operand suspends the nullability question: the
+        // official's classification over `InvalidType` answers nothing —
+        // no `unnecessary_null_comparison`, no constant verdict, no
+        // promotion (oracle-probed: `Und x` and `Und? x` both silent on
+        // `x == null` / `x != null`).
+        if self.written_ty_invalid(operand_ty) {
+            return;
+        }
         // A type-parameter read decides through its written bound (the
         // official `isStrictlyNonNullable(TypeParameterType)` reads the
         // bound): a nullable bound (`T extends AstNodeImpl?`) and the

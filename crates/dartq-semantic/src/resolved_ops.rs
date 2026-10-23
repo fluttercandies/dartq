@@ -69,7 +69,7 @@ use dartq_types::{
 
 use crate::bounds::TypeTree;
 use crate::library::ElementIndex;
-use crate::model::{ArgListId, ArgPool, ContainerKind, MicroKind, Ty};
+use crate::model::{ArgListId, ArgPool, ContainerKind, MemberKind, MicroKind, Ty};
 
 /// Core-declaration raw ids (the hierarchy requires `Object`, `Future`,
 /// and bare `Function`). Each snapshot owns its id space.
@@ -190,6 +190,15 @@ pub struct LibraryTypes {
     /// under-report direction — the call keeps `Unknown` and its
     /// `is`-tests stay decidable-agnostic, never a false dead arm.
     invokable_members: FxHashSet<StringId>,
+    /// Own-declared `(container, member)` pairs whose property's required
+    /// type head — a field's declared type, a getter's return type —
+    /// resolves nowhere in this snapshot's universe (registry, alias, or
+    /// type parameter; the builtins register first, so a core head always
+    /// resolves). The official's `promoteForPattern` refuses an invalid
+    /// known type (`flow_analysis.dart:7720-7723`), so an object pattern's
+    /// property sub-pattern over such a member may fail and its case
+    /// cannot cover vacuously.
+    invalid_property_tys: FxHashSet<(StringId, StringId)>,
 }
 
 /// One container's parse-time supertype capture: the type-parameter
@@ -417,6 +426,7 @@ impl LibraryTypes {
             type_params,
             param_names,
             invokable_members: FxHashSet::default(),
+            property_ty_heads: Vec::new(),
             facts,
             next_decl: FIRST_CONTAINER_RAW,
             next_param,
@@ -514,9 +524,25 @@ impl LibraryTypes {
             type_params,
             param_names,
             invokable_members,
+            property_ty_heads,
             mut facts,
             ..
         } = registry;
+        // The object-pattern property gate's set: a collected member's
+        // type head is the official's invalid face exactly when no
+        // registered container, alias, or type parameter spells it (the
+        // builtins registered first, so core heads always resolve).
+        let invalid_property_tys: FxHashSet<(StringId, StringId)> = property_ty_heads
+            .into_iter()
+            .filter(|&(_, _, head)| {
+                !registry.contains_key(&head)
+                    && !non_containers.contains(&head)
+                    && !typedef_targets.contains_key(&head)
+                    && !typedef_shapes.contains_key(&head)
+                    && !type_params.contains_key(&head)
+            })
+            .map(|(owner, member, _)| (owner, member))
+            .collect();
 
         // —— supertype edges —————————————————————————————————————————
         // The builtins' written edges (`Comparable<num>`, `Iterable<E>`)
@@ -704,6 +730,7 @@ impl LibraryTypes {
             param_names,
             type_params,
             invokable_members,
+            invalid_property_tys,
         }
     }
 }
@@ -782,6 +809,12 @@ struct Registry {
     param_names: FxHashMap<TypeParamId, StringId>,
     /// See [`LibraryTypes::invokable_members`].
     invokable_members: FxHashSet<StringId>,
+    /// Own-declared `(container, member, type-head)` triples collected
+    /// during registration — filtered into
+    /// [`LibraryTypes::invalid_property_tys`] once every name has
+    /// registered (a member typed by a later-registered container must
+    /// not read unresolved mid-build).
+    property_ty_heads: Vec<(StringId, StringId, StringId)>,
     facts: ParamFactsTable,
     next_decl: u32,
     next_param: u32,
@@ -856,6 +889,20 @@ impl Registry {
             // `call_head_unresolved` refuses on (an instance or static
             // member spelling somewhere beats the unresolved-call face).
             self.invokable_members.extend(container.members.keys().copied());
+            // The property-type heads for the object-pattern coverage
+            // gate: a field's declared type / a getter's return type
+            // whose head resolves nowhere makes the property sub-pattern
+            // may-fail (see `LibraryTypes::invalid_property_tys`).
+            for (member, entry) in container.members.iter() {
+                let ty = match entry.kind {
+                    MemberKind::Field => entry.var_ty,
+                    MemberKind::Getter | MemberKind::Method => entry.return_ty,
+                    MemberKind::Setter => continue,
+                };
+                if let Ty::Named { name: head, .. } = ty {
+                    self.property_ty_heads.push((name, *member, head));
+                }
+            }
             actions.push(DeclAction::Decl(decl, param_ids));
             if container.sealed {
                 actions.push(DeclAction::Sealed(decl));
@@ -2886,6 +2933,24 @@ impl TypeOps for ResolvedTypeOps<'_> {
         !(self.snapshot.registry.contains_key(&name)
             || self.snapshot.non_containers.contains(&name)
             || self.snapshot.invokable_members.contains(&name))
+    }
+
+    /// The object-pattern property face ([`TypeOps::object_property_invalid`]):
+    /// the member's own declared/returned type head resolves nowhere in
+    /// the snapshot's universe — the precomputed
+    /// `invalid_property_tys` pair set (own-declared members only; an
+    /// absent or inherited spelling answers `false`, the under-report
+    /// direction).
+    fn object_property_invalid(&self, owner: u32, field: u32, names: &[Box<str>]) -> bool {
+        self.observe_names(names);
+        let (Some(owner), Some(field)) = (
+            names.get(owner as usize),
+            names.get(field as usize),
+        ) else {
+            return false;
+        };
+        let pair = (self.strings.intern(owner), self.strings.intern(field));
+        self.snapshot.invalid_property_tys.contains(&pair)
     }
 
     /// [`NameTypeOps::factor`] over the instantiated forms: both operand

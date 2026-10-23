@@ -282,6 +282,21 @@ pub trait TypeOps {
         false
     }
 
+    /// Whether an object pattern's property sub-pattern carries an invalid
+    /// required type: the member `field`'s own declared (a field) or
+    /// returned (a getter) type head on the owner `owner` resolves
+    /// nowhere. The official's `promoteForPattern` refuses the invalid
+    /// known type outright (`flow_analysis.dart:7720-7723`), so the
+    /// sub-pattern may fail and its case cannot cover vacuously however
+    /// invalid the scrutinee (`C1(:var name)` with `name`'s type broken
+    /// keeps the later clauses live; oracle-probed on the getter and field
+    /// variants). The default answers `false`: the name-level lattice has
+    /// no resolution.
+    fn object_property_invalid(&self, owner: u32, field: u32, names: &[Box<str>]) -> bool {
+        let _ = (owner, field, names);
+        false
+    }
+
     /// [`TypeOps::factor`] with the operand spellings' written-argument
     /// trees: `from_args`/`what_args` are arena indices into `arena`
     /// ([`EMPTY_ARGS`] when argument-less) and `names` the recorder's

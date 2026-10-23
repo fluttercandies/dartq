@@ -568,7 +568,12 @@ impl ParserListener for DiagnoseListener<'_> {
             .clause_trailing_feed(count, ClauseTag::OnConstraint);
     }
 
-    fn begin_class_or_mixin_or_extension_body(&mut self, _kind: DeclarationKind, _token: Token) {
+    fn begin_class_or_mixin_or_extension_body(&mut self, kind: DeclarationKind, token: Token) {
+        // The flow recorder's extension-header window closes with the
+        // body (its `extension_on_head` latch must not race the members'
+        // own annotations — `this` staging and the implicit-`this`
+        // transport read the on-type long after the header parsed).
+        self.flow().begin_class_or_mixin_or_extension_body(kind, token);
         self.engine.bounds.finish_header();
         self.engine.var_finish_header();
         // The header's clause spans are complete: the deferred use-site

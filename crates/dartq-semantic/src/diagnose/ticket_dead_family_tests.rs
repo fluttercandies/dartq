@@ -193,6 +193,180 @@ fn is_test_with_undefined_name_deads_the_else() {
     );
 }
 
+/// The dead TAIL of the undefined-name is-test anchors at the statement
+/// begin: the always-true test makes the then arm's return unconditional,
+/// and the tail statement's inner dot-access member polls (the post-order
+/// event stream runs the expression before the statement wrapper) must not
+/// fragment the row onto the member's follower token — the official
+/// verifier walks top-down, so the statement itself is the first dead node
+/// (dead_code_verifier.dart:183-189; oracle-probed on Dart 3.13.1: the
+/// row spans `return d.e(a.b);`, `;` included).
+#[test]
+fn undefined_name_is_test_dead_tail_anchors_the_statement() {
+    let source = "class A { String get b => ''; }\n\
+                  \x20 String? f(A a, dynamic d) {\n\
+                  \x20 if (a is Missing) {\n\
+                  \x20 return '';\n\
+                  \x20 }\n\
+                  \x20 return d.e(a.b);\n\
+                  \x20}";
+    let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    let tail = source.find("return d.e").unwrap();
+    assert_eq!(
+        dead.len(),
+        1,
+        "exactly the tail statement carries the dead row: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(
+        dead[0],
+        (tail as u32, "return d.e(a.b);".len() as u32),
+        "the row spans the whole tail statement: {:?}",
+        report.diagnostics
+    );
+}
+
+// —— dead_code: the InvalidType scrutinee/operand family (#2560) ————
+
+/// A member read on an invalid-typed receiver (an unresolved written
+/// annotation) is the official's `InvalidType`, so the local it infers
+/// keeps every `is`-test vacuously true (subtype.dart's 0c arm): the
+/// `is!` then arm dies (oracle-probed on Dart 3.13.1: `return null;`
+/// carries the row).
+#[test]
+fn invalid_receiver_member_read_deads_the_is_not_arm() {
+    let source = "int? f(Unresolved node) {\n\
+                  \x20 var value = node.value;\n\
+                  \x20 if (value is! String) return null;\n\
+                  \x20 return 1;\n\
+                  }";
+    let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    let ret = source.find("return null").unwrap();
+    assert_eq!(
+        dead,
+        [(ret as u32, "return null;".len() as u32)],
+        "the is-not arm carries the row: {:?}",
+        report.diagnostics
+    );
+}
+
+/// The `is` polarity of the same face: the else arm dies and the then
+/// arm's return leaves the tail dead (oracle: the tail row).
+#[test]
+fn invalid_receiver_member_read_is_test_deads_the_tail() {
+    let source = "int? f(Unresolved node) {\n\
+                  \x20 var value = node.value;\n\
+                  \x20 if (value is String) {\n\
+                  \x20 return 0;\n\
+                  \x20 }\n\
+                  \x20 return 1;\n\
+                  }";
+    let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    let tail = source.rfind("return 1").unwrap();
+    assert_eq!(
+        dead,
+        [(tail as u32, "return 1;".len() as u32)],
+        "the tail carries the row: {:?}",
+        report.diagnostics
+    );
+}
+
+/// A switch over an invalid-typed scrutinee (an unresolved parameter
+/// annotation) covers every typed pattern vacuously — the official
+/// `promoteForPattern` relation with `InvalidType` (subtype.dart's 0c
+/// arm, flow_analysis.dart:7708-7768) — so the first unguarded typed
+/// clause absorbs and every later clause plus the post-switch tail die
+/// (oracle-probed: the second head keyword row, its body row, and the
+/// tail row).
+#[test]
+fn invalid_scrutinee_switch_deads_later_clauses_and_tail() {
+    let source = "int? f(Unresolved node) {\n\
+                  \x20 switch (node) {\n\
+                  \x20 case bool v:\n\
+                  \x20 return 0;\n\
+                  \x20 case String v:\n\
+                  \x20 return 1;\n\
+                  \x20 }\n\
+                  \x20 return 2;\n\
+                  }";
+    let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    let head2 = source.find("case String").unwrap();
+    let body2 = source.find("return 1").unwrap();
+    let tail = source.rfind("return 2").unwrap();
+    assert_eq!(
+        dead,
+        [
+            (head2 as u32, 4),
+            (body2 as u32, "return 1;".len() as u32),
+            (tail as u32, "return 2;".len() as u32),
+        ],
+        "the second clause head, its body, and the tail carry rows: {:?}",
+        report.diagnostics
+    );
+}
+
+/// The switch-EXPRESSION polarity: the arms after the vacuously covering
+/// first arm die with the arm's own extent (oracle: the `_ => 'b'` row,
+/// pattern through the arm expression, trailing `,` excluded).
+#[test]
+fn invalid_scrutinee_switch_expression_deads_later_arms() {
+    let source = "String f(Unresolved node) {\n\
+                  \x20 return switch (node) {\n\
+                  \x20 Foo() => 'a',\n\
+                  \x20 _ => 'b',\n\
+                  \x20 };\n\
+                  }\n\
+                  class Foo {}";
+    let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    let arm = source.find("_ =>").unwrap();
+    assert_eq!(
+        dead,
+        [(arm as u32, "_ => 'b'".len() as u32)],
+        "the wildcard arm carries the row: {:?}",
+        report.diagnostics
+    );
+}
+
+/// The unresolved-extension `on` type face: a bare member read inside the
+/// extension is an implicit `this.member` whose static type is the
+/// official's `InvalidType` (the on-type resolves nowhere), so a switch
+/// over it covers every typed clause vacuously — the later clauses and
+/// the tail die (oracle-probed: head keyword, body, and tail rows).
+#[test]
+fn unresolved_on_type_scrutinee_deads_later_clauses_and_tail() {
+    let source = "extension E on YamlScalar {\n\
+                  \x20 int? toBool() {\n\
+                  \x20 switch (value) {\n\
+                  \x20 case bool v:\n\
+                  \x20 return 0;\n\
+                  \x20 case String v:\n\
+                  \x20 return 1;\n\
+                  \x20 }\n\
+                  \x20 return 2;\n\
+                  \x20 }\n\
+                  }";
+    let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    let head2 = source.find("case String").unwrap();
+    let body2 = source.find("return 1").unwrap();
+    let tail = source.rfind("return 2").unwrap();
+    assert_eq!(
+        dead,
+        [
+            (head2 as u32, 4),
+            (body2 as u32, "return 1;".len() as u32),
+            (tail as u32, "return 2;".len() as u32),
+        ],
+        "the second clause head, its body, and the tail carry rows: {:?}",
+        report.diagnostics
+    );
+}
+
 /// `x is! Missing` — the `is!` polarity of the same split: the test
 /// answers `true`, so the inverted then arm is the dead one.
 #[test]
@@ -599,4 +773,107 @@ fn always_true_conditional_rows_the_else_operand_whole() {
     let rows = rows(&report, "dead_code");
     let start = source.find("typeName as Q").unwrap() as u32;
     assert_eq!(rows, vec![(start, 13)], "{:?}", code_names(&report));
+}
+
+/// A non-reference is-check operand (a member read over an invalid
+/// receiver) never carries the operand-side verdict: the official's
+/// `isExpression_end` folds (`booleanLiteral`) decide through
+/// `_isTypeCheckGuaranteedToSucceed...`, whose subtype question is strict
+/// on the invalid operand — only a trackable reference operand gets the
+/// lenient 0c verdict (oracle-probed: `x.foo is String` keeps both arms,
+/// `x.foo.bar is String` too).
+#[test]
+fn member_operand_is_test_keeps_both_arms() {
+    let source = "class C {}\nvoid f(Und x) {\n  if (x.foo is C) {\n    print(1);\n  } else {\n    print(2);\n  }\n}\n";
+    let report = report_ops(source);
+    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
+}
+
+/// The `is!` polarity of the same non-reference face: the then arm stays
+/// live (oracle-probed: silent).
+#[test]
+fn member_operand_is_not_test_keeps_then_arm() {
+    let source = "void f(Und x) {\n  if (x.foo is! String) {\n    print(1);\n  }\n  print(2);\n}\n";
+    let report = report_ops(source);
+    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
+}
+
+/// A null comparison on an invalid-typed operand is open: the official
+/// suspends the nullability question over `InvalidType` (no
+/// `unnecessary_null_comparison`, no arm verdict, no promotion).
+#[test]
+fn null_comparison_on_invalid_operand_is_open() {
+    let source = "void f(Und x) {\n  if (x == null) {\n    print(1);\n  }\n  print(2);\n}\n";
+    let report = report_ops(source);
+    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
+    assert!(
+        rows(&report, "unnecessary_null_comparison").is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
+}
+
+/// The chained polarity: a `!= null` over an invalid operand promotes
+/// nothing, so a later `== null` stays open too (the ast_builder chain,
+/// oracle-probed silent on both rows).
+#[test]
+fn null_comparison_chain_on_invalid_is_open() {
+    let source = "void f(Und x) {\n  if (x != null) {\n    if (x == null) {\n      print(1);\n    }\n    print(2);\n  }\n}\n";
+    let report = report_ops(source);
+    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
+    assert!(
+        rows(&report, "unnecessary_null_comparison").is_empty(),
+        "{:?}",
+        code_names(&report)
+    );
+}
+
+/// A write of an invalid-typed value promotes nothing — the official's
+/// `_tryPromoteToTypeOfInterest` refuses the invalid written type outright
+/// ("If the written type is invalid, we assume no promotion",
+/// flow_analysis.dart:4966-4969), so a nullable-declared local stays
+/// nullable and `== null` keeps both arms (oracle-probed: only the
+/// undefined-function row fires).
+#[test]
+fn invalid_written_value_keeps_null_question_open() {
+    let source = "void f() {\n  String? s;\n  s = xfoo();\n  if (s == null) {\n    print(1);\n  }\n  print(2);\n}\n";
+    let report = report_ops(source);
+    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
+}
+
+/// The ast_builder shape: the invalid written value rides a member read
+/// over an invalid receiver inside a vacuous `is` arm — the write still
+/// promotes nothing, so the null question stays open (oracle-probed: the
+/// only dead row is the vacuous test's own else arm).
+#[test]
+fn invalid_member_write_keeps_null_question_open() {
+    let source = "class SuffixImpl {}\nclass Data {\n  final SuffixImpl member;\n  Data(this.member);\n}\nvoid f() {\n  var d = pop();\n  SuffixImpl? s;\n  if (d is Data) {\n    s = d.member;\n  } else {\n    print(0);\n  }\n  if (s == null) {\n    print(1);\n  }\n  print(2);\n}\n";
+    let report = report_ops(source);
+    let dead = rows(&report, "dead_code");
+    assert_eq!(dead.len(), 1, "{:?}", code_names(&report));
+    let line = source[..dead[0].0 as usize].matches('\n').count();
+    assert_eq!(line, 10, "the vacuous else arm's brace at 1-based line 11");
+}
+
+/// An object pattern whose property's own type is unresolved may fail:
+/// the official's `promoteForPattern` refuses the invalid known type
+/// (`flow_analysis.dart:7720-7723`), so the case does not cover and the
+/// later clauses stay live (oracle-probed on the getter and field
+/// variants: silent).
+#[test]
+fn object_pattern_property_invalid_keeps_default_live() {
+    let source = "abstract class C1 {\n  MissingTok get name;\n}\nvoid f(Und node) {\n  switch (node) {\n    case C1(:var name):\n      print(1);\n    default:\n      print(2);\n  }\n}\n";
+    let report = report_ops(source);
+    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
+}
+
+/// A for-in (record-pattern bind) whose body carries an inner switch must
+/// not corrupt the enclosing switch's clause chain: no clause covers (the
+/// null constant may fail, the unresolved object head may fail), so the
+/// outer `default` stays live (oracle-probed: silent).
+#[test]
+fn for_in_inner_switch_keeps_outer_default_live() {
+    let source = "class Keys {\n  static const String a = 'a';\n}\nvoid report(Object? x) {}\nvoid f(YamlNode? x) {\n  switch (x) {\n    case null:\n      break;\n    case YamlMap():\n      for (var (:keyNode, :valueNode) in x.entries) {\n        switch (keyNode.value) {\n          case Keys.a:\n            break;\n          default:\n            report(keyNode);\n        }\n      }\n    default:\n      report(3);\n  }\n}\n";
+    let report = report_ops(source);
+    assert!(rows(&report, "dead_code").is_empty(), "{:?}", code_names(&report));
 }

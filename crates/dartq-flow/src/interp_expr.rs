@@ -204,6 +204,29 @@ impl Interp<'_> {
                             } else {
                                 Ty::UNKNOWN_NULLABLE
                             };
+                            // The implicit-`this` invalid face: inside an
+                            // extension whose written `on` type resolves
+                            // nowhere (the recorder staged it at this
+                            // token), the member read's static type is the
+                            // official's `InvalidType` — spelled as the
+                            // on-type's own name so the resolved back-end's
+                            // existing unresolved-spelling map answers it
+                            // (subtype.dart's 0c arm makes every relation
+                            // with it vacuous: a switch over the read
+                            // covers every typed pattern, and an `is`-test
+                            // on the local it feeds always succeeds).
+                            if !promoted
+                                && let Some(this_ty) =
+                                    self.staged_this.get(&token.range.offset)
+                                && self.ops.is_invalid_typed(
+                                    *this_ty,
+                                    crate::ty::EMPTY_ARGS,
+                                    self.args,
+                                    self.names,
+                                )
+                            {
+                                expr.ty = *this_ty;
+                            }
                             expr.prop = Some(slot);
                             expr.name = Some(*name);
                             expr.read_span = Some(*token);
@@ -844,6 +867,19 @@ impl Interp<'_> {
                     }
                 } else {
                     let cur = self.current.clone();
+                    // The operand-side verdict folds are strict on the
+                    // invalid face: the official's two folds
+                    // (`_isTypeCheckGuaranteedToFail...` /
+                    // `...ToSucceed...`, flow_analysis.dart:7184-7205)
+                    // answer the subtype question with the invalid operand
+                    // excluded — a member read over an invalid receiver
+                    // keeps both arms (oracle-probed: `x.foo is String`
+                    // and `x.foo.bar is String` stay silent), while a
+                    // REFERENCE operand's promotion split carries the
+                    // lenient 0c verdict above. The invalid-TESTED face
+                    // below stays ungated: error recovery makes the test
+                    // itself the succeed literal whatever the operand.
+                    let operand_invalid = operand.non_reference_invalid;
                     // The non-reference guaranteed-fail face (official
                     // `isExpression_end`'s first arm — upstream Dart SDK
                     // source, pkg/_fe_analyzer_shared/lib/src/flow_analysis/
@@ -856,7 +892,7 @@ impl Interp<'_> {
                     // like the succeed face: the deadness rides the branch
                     // pair, and a value consumer that drops the expression
                     // never sees it.
-                    if self.is_test_guaranteed_fail(operand.ty, tested) {
+                    if !operand_invalid && self.is_test_guaranteed_fail(operand.ty, tested) {
                         let dead = cur.clone().set_unreachable(&mut self.reach);
                         expr.branches = Some(if is_not { (cur, dead) } else { (dead, cur) });
                     }
@@ -873,19 +909,23 @@ impl Interp<'_> {
                     // (the official's `_current` is untouched): the
                     // deadness rides the branch pair, and a value consumer
                     // that drops the expression never sees it.
-                    else if self.is_test_guaranteed(operand.ty, operand.args, tested, tested_args)
-                        // The invalid-tested face: an unresolved spelling
-                        // is the official's `InvalidType` on the checked
-                        // side, and `subtype.dart:274` makes any relation
-                        // with it a subtype — the test is the succeed
-                        // literal. `is` keeps its then arm and deads the
-                        // else, `is!` deads its then (oracle-probed on
-                        // the analyzer corpus's unresolved-yaml file: the
-                        // positive `is` block stays live, the `is!` block
-                        // carries the dead-code row).
-                        || self
-                            .ops
-                            .is_invalid_typed(tested, tested_args, self.args, self.names)
+                    else if !operand_invalid
+                        && (self.is_test_guaranteed(operand.ty, operand.args, tested, tested_args)
+                            // The invalid-tested face: an unresolved spelling
+                            // is the official's `InvalidType` on the checked
+                            // side, and `subtype.dart:274` makes any relation
+                            // with it a subtype — the test is the succeed
+                            // literal. `is` keeps its then arm and deads the
+                            // else, `is!` deads its then (oracle-probed on
+                            // the analyzer corpus's unresolved-yaml file: the
+                            // positive `is` block stays live, the `is!` block
+                            // carries the dead-code row).
+                            || self.ops.is_invalid_typed(
+                                tested,
+                                tested_args,
+                                self.args,
+                                self.names,
+                            ))
                     {
                         let dead = cur.clone().set_unreachable(&mut self.reach);
                         expr.branches = Some(if is_not { (dead, cur) } else { (cur, dead) });
@@ -1537,10 +1577,30 @@ impl Interp<'_> {
                     expr.branches = self.null_short_branches();
                 } else if let Some(inner) = self.exprs.last().and_then(|e| e.chain_base) {
                     // A non-aware selector chained onto a null-shorted
-                    // receiver (`x?.y.z`) is inside the same shorted region
-                    // — propagate the base so the consumer flushes the whole
-                    // chain.
+                    // receiver (`x?.y.z`) is inside the same shorted
+                    // region — propagate the base so the consumer flushes
+                    // the whole chain.
                     expr.chain_base = Some(inner);
+                }
+                // The invalid-receiver member read (the member twin of the
+                // unresolved-call head): a receiver whose type IS the
+                // invalid face — an unresolved written annotation, an
+                // unresolved `on` type, another invalid read — reads every
+                // member as the official's `InvalidType`, spelled as the
+                // receiver's own ty so the resolved back-end's existing
+                // unresolved-spelling map answers it (subtype.dart's 0c
+                // arm makes every relation with it vacuous: the local
+                // this read feeds keeps `x is T` always-true with the
+                // failing arm dead, and a switch over it vacuously covers
+                // every typed pattern).
+                if let Some(recv) = self.exprs.last()
+                    && self
+                        .ops
+                        .is_invalid_typed(recv.ty, recv.args, self.args, self.names)
+                {
+                    expr.ty = recv.ty;
+                    expr.args = recv.args;
+                    expr.non_reference_invalid = true;
                 }
                 // The receiver pops unless it is the innermost cascade's
                 // target (same discipline as IndexAccess's).
@@ -1614,6 +1674,10 @@ impl Interp<'_> {
                                 base: Base::Name(name),
                                 nullable: false,
                             };
+                            // A call is never a reference operand — its
+                            // invalid face blocks the is-check folds
+                            // (`nowheresfn() is C` keeps both arms).
+                            callee.non_reference_invalid = true;
                         } else {
                             callee.ty = Ty::UNKNOWN;
                         }

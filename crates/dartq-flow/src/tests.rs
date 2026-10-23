@@ -247,6 +247,37 @@ fn live_after_if_without_else_return() {
     assert!(dead_snippets(source).is_empty());
 }
 
+// —— dead statement wrappers vs inner expression polls (#2560 face 2) ——
+
+/// A began-dead statement is the official first dead node (the verifier
+/// walks top-down, dead_code_verifier.dart:183-189), so the row anchors at
+/// the statement even when its expression's post-order polls (the
+/// dot-access member poll) ran first and opened the interval on a
+/// sub-statement node. Oracle-probed on Dart 3.13.1: each row spans the
+/// whole statement, `;` included.
+#[test]
+fn dead_statement_with_member_poll_anchors_the_statement() {
+    let source = "void f() { throw 0; g().foo(); }";
+    assert_eq!(dead_snippets(source), ["g().foo();"]);
+}
+
+/// The one-row fold survives: a later dead statement with member polls
+/// extends the interval opened by the earlier dead statement — the row
+/// starts at the FIRST dead statement, never re-anchored.
+#[test]
+fn dead_member_poll_statement_folds_into_earlier_row() {
+    let source = "void f() { throw 0; 1; g().foo(); }";
+    assert_eq!(dead_snippets(source), ["1; g().foo();"]);
+}
+
+/// The return wrapper face of the same rule: the dead tail return's row
+/// spans the whole statement, not the member's follower fragment.
+#[test]
+fn dead_return_with_member_poll_anchors_the_statement() {
+    let source = "void f() { throw 0; return g().foo(); }";
+    assert_eq!(dead_snippets(source), ["return g().foo();"]);
+}
+
 // —— W3 dead-code oracle faces (#868, the W3 dead-code probes) ——
 
 /// Wholly-dead branch face (probe table B): the anchor IS the dead branch's

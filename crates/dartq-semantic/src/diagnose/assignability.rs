@@ -1417,7 +1417,7 @@ impl<'a> Engine<'a> {
     /// argument recursion). An invalid side asks no assignability question
     /// (`isAssignableTo` answers true the moment either side is invalid),
     /// so every assignability face gates before its matrix.
-    fn written_ty_invalid(&self, ty: Ty) -> bool {
+    pub(crate) fn written_ty_invalid(&self, ty: Ty) -> bool {
         let Ty::Named { name, args, .. } = ty else {
             return false;
         };

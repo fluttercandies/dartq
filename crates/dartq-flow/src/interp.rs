@@ -467,6 +467,15 @@ pub(crate) struct Expr {
     /// type is a proper subtype of any named declared non-null form, the
     /// face the promotion's written-type gate admits (#2401).
     pub literal: bool,
+    /// The expression's invalid face arrived through a NON-reference
+    /// shape — a member read over an invalid receiver, an unresolved
+    /// call's result. The official's is-check folds are strict on such
+    /// an operand (only a trackable reference — a local, or the bare
+    /// implicit-`this` read the resolver treats as one — carries the
+    /// lenient vacuous verdict; oracle-probed: `x.foo is String` stays
+    /// silent while the extension's bare `foo is String` deads its
+    /// else).
+    pub non_reference_invalid: bool,
 }
 
 impl Expr {
@@ -484,6 +493,7 @@ impl Expr {
             name: None,
             chain_base: None,
             literal: false,
+            non_reference_invalid: false,
         }
     }
 
@@ -501,6 +511,7 @@ impl Expr {
             name: None,
             chain_base: None,
             literal: false,
+            non_reference_invalid: false,
         }
     }
 
@@ -738,6 +749,25 @@ impl DeadWindow {
         }
     }
 
+    /// Re-anchors the interval to a statement wrapper whose span begins
+    /// at or before the current anchor (the wrapper's statement IS the
+    /// official first dead node — the verifier walks top-down, so the
+    /// statement precedes every child whose inner poll opened this
+    /// interval). A pending do-while split tail that the same statement
+    /// interior anchored moves with it.
+    pub(crate) fn reanchor_to(&mut self, span: TokenSpan) {
+        self.anchor = span;
+        if self.split_start.is_some_and(|start| start >= span.range.offset) {
+            self.split_start = Some(span.range.offset);
+        }
+    }
+
+    /// Whether the interval's anchor starts at or after `offset` (the
+    /// wrapper's own statement begin — the anchor sits inside it).
+    pub(crate) fn anchor_from(&self, offset: u32) -> bool {
+        self.anchor.range.offset >= offset
+    }
+
     /// Attaches the do-while's `while (c);` part and records whether a
     /// break makes the post-do tail reachable (official
     /// `hasBreakStatement`).
@@ -959,6 +989,20 @@ pub(crate) struct Interp<'o> {
     /// that skips the RHS. An RHS that exits (`x ??= throw e`) restores
     /// its snapshot at the write, the official's post-state.
     pub(crate) if_null_skips: Vec<(u32, State)>,
+    /// A deferred object-pattern vacuous cover (see
+    /// [`crate::patterns`]' `resolve_vacuous_object_cover`): the owner
+    /// name id and the head-time state — the may-fail arm should the
+    /// close find an invalid-typed property sub-pattern, else the cover's
+    /// kill. Cleared at every pattern-context open and decided at every
+    /// close.
+    pub(crate) vacuous_object: Option<(u32, State)>,
+    /// The deferred cover's collected property sub-pattern names (the
+    /// shorthand binds' names — the member's own spelling).
+    pub(crate) vacuous_fields: Vec<u32>,
+    /// The open pattern context's bind buffer (post-order: a property's
+    /// bind precedes its object pattern's own event) — the defer's
+    /// snapshot source. Cleared at every pattern-context open.
+    pub(crate) pattern_binds: Vec<u32>,
 
     /// Open null-shorting contexts (official `_NullAwareAccessContext`
     /// stack, flow_analysis.dart:9664): each entry is the skip-path state
@@ -1121,6 +1165,9 @@ impl<'o> Interp<'o> {
             stmt_began_dead: false,
             exit_at: None,
             if_null_skips: Vec::new(),
+            vacuous_object: None,
+            vacuous_fields: Vec::new(),
+            pattern_binds: Vec::new(),
             init_exec_depth: None,
             null_shorts: Vec::new(),
             args_bases: Vec::new(),
@@ -1677,6 +1724,29 @@ impl<'o> Interp<'o> {
     /// (`LUB(InvalidType, String)` = `String`) instead of the unknown
     /// face the plain `is_subtype` order would keep.
     pub(crate) fn name_lub(&self, a: Ty, b: Ty) -> Ty {
+        // The oracle's LUB ignores an invalid operand wholesale
+        // (upstream least_upper_bound: the invalid side is dropped, never
+        // joined — `LUB(InvalidType, X) = X`): a spelling the resolved
+        // back-end maps invalid loses to any other face, so the join
+        // lands on the spelled side, or falls to the unknown face for the
+        // semantic layer's staged type to fill. Keeping the invalid name
+        // instead typed every `?? `-joined inferred local with the
+        // invalid face and deaded switch arms the oracle keeps live.
+        let a_invalid =
+            self.ops
+                .is_invalid_typed(a, crate::ty::EMPTY_ARGS, self.args, self.names);
+        let b_invalid =
+            self.ops
+                .is_invalid_typed(b, crate::ty::EMPTY_ARGS, self.args, self.names);
+        if a_invalid && !b_invalid {
+            return b;
+        }
+        if b_invalid && !a_invalid {
+            return a;
+        }
+        if a_invalid && b_invalid {
+            return Ty::UNKNOWN;
+        }
         if a.base == Base::Unknown {
             return b;
         }

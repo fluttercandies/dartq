@@ -488,7 +488,16 @@ impl State {
         // The rebuilt chain id before type-of-interest re-promotion (see
         // the no-change early return below).
         let post_demote = promoted;
+        // An invalid written type promotes nothing (official
+        // `_tryPromoteToTypeOfInterest`'s first gate — "If the written
+        // type is invalid, we assume no promotion",
+        // flow_analysis.dart:4966-4969): error recovery's unresolved
+        // value must not certify a non-null step. `T? v; v = missing();`
+        // keeps `v == null` a live question (oracle-probed: silent on
+        // both the dead-code and null-comparison rows). The name level
+        // answers `false` — no `Invalid` lives in that lattice.
         if promote_to_interest
+            && !ops.is_invalid_typed(written, written_args, arena, names)
             && !promoted_is(ops, lists, promoted, written, written_args, arena, names)
         {
             // Types of interest: the declared type's non-null form, then the

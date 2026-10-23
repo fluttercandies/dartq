@@ -348,9 +348,9 @@ use crate::const_eval::{
 };
 use crate::const_tracker::ConstTracker;
 use crate::library::{
-    ElementIndex, ScopedHit, implements_interface, lookup_scoped, member_lookup_defining,
-    owner_library, prefixed_container, resolve_container, resolve_joined_container,
-    supertype_hop_dead,
+    ElementIndex, ScopedHit, implements_interface, lookup_scoped, member_lookup,
+    member_lookup_defining, owner_library, prefixed_container, resolve_container,
+    resolve_joined_container, supertype_hop_dead,
 };
 use crate::member_face::{
     COLLECTION_INTERFACE_ALIASES, CORE_CONST_CTOR, CORE_CONTAINER_PARAMS, CORE_INTERFACE_MEMBERS,
@@ -3306,7 +3306,20 @@ fn synthesize_invalid_scrutinee_dead_cases(
             let name = strings.intern(tokens.lexeme(source, p));
             if *resolvable.entry(name).or_insert_with(|| {
                 resolve_container(graph, namespaces, index, lib, file, name).is_some()
-            }) {
+            }) && !object_pattern_property_invalid(
+                slice,
+                tokens,
+                source,
+                strings,
+                p,
+                graph,
+                namespaces,
+                index,
+                file,
+                lib,
+                name,
+                &mut resolvable,
+            ) {
                 absorber = Some(idx);
                 break;
             }
@@ -3438,6 +3451,107 @@ struct SwitchClause {
 /// read is the RECEIVER's, so only the written-annotation face fires
 /// there — and only for switch expressions, whose rows the statement arm
 /// above never produced; the statement face stays that arm's exclusive.
+/// Whether the spelling names a dart:core type — the always-resolving face
+/// the container lookup cannot see in an analysis rig that carries no core
+/// library (`Object` in a switch-expression scrutinee must never take the
+/// unresolved-annotation dead-arm face).
+fn resolves_as_core_type(lexeme: &str) -> bool {
+    crate::member_face::CORE_TYPE_MEMBERS
+        .iter()
+        .any(|(name, _)| *name == lexeme)
+        || super::diagnose::types::EXTERNAL_CORE_TYPE_PARAMS.iter().any(|(name, _)| *name == lexeme)
+}
+
+/// Whether an object-pattern clause (`C1(:var name)`) carries a property
+/// sub-pattern whose required type resolves nowhere: the official's
+/// `promoteForPattern` refuses the invalid known type outright
+/// (`flow_analysis.dart:7720-7723`), so the property sub-pattern may fail
+/// and the clause cannot absorb vacuously however invalid the scrutinee
+/// (oracle-probed on the getter and field variants: the later clauses stay
+/// live). `head` indexes the pattern's owner identifier; the property list
+/// is the balanced paren group right after it. Non-shorthand labels and
+/// unparsable shapes answer `false` — the under-report direction.
+fn object_pattern_property_invalid(
+    slice: &[dartq_scanner::Token],
+    tokens: &TokenTable,
+    source: &str,
+    strings: &StringTable,
+    head: usize,
+    graph: &LibraryGraph,
+    namespaces: &Namespaces,
+    index: &ElementIndex,
+    file: FileId,
+    lib: LibraryId,
+    owner: StringId,
+    resolvable: &mut FxHashMap<StringId, bool>,
+) -> bool {
+    let Some(open) = slice.get(head + 1) else {
+        return false;
+    };
+    if open.kind != dartq_scanner::TokenKind::OpenParen {
+        return false;
+    }
+    let Some(close) = tokens.matching_end(head + 1) else {
+        return false;
+    };
+    // The property segments: depth-0 comma splits inside the group.
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let mut start = head + 2;
+    let mut depth = 0i32;
+    for j in head + 2..close {
+        depth += group_depth_step(slice[j].kind);
+        if depth == 0 && slice[j].kind == dartq_scanner::TokenKind::Comma {
+            segments.push((start, j));
+            start = j + 1;
+        }
+    }
+    segments.push((start, close));
+    for &(lo, hi) in &segments {
+        if lo >= hi {
+            continue;
+        }
+        // The member name: a shorthand `:var name` binds the member's own
+        // name (the LAST identifier of the segment); an explicit
+        // `name: <sub-pattern>` carries it first.
+        let member = if slice[lo].kind == dartq_scanner::TokenKind::Colon {
+            slice[lo + 1..hi]
+                .iter()
+                .rposition(|t| t.kind == dartq_scanner::TokenKind::Identifier)
+                .map(|at| lo + 1 + at)
+        } else if slice[lo].kind == dartq_scanner::TokenKind::Identifier
+            && slice
+                .get(lo + 1)
+                .is_some_and(|t| t.kind == dartq_scanner::TokenKind::Colon)
+        {
+            Some(lo)
+        } else {
+            None
+        };
+        let Some(member) = member else {
+            continue;
+        };
+        let member_name = strings.intern(tokens.lexeme(source, member));
+        let Some(entry) = member_lookup(graph, namespaces, index, lib, file, owner, member_name)
+        else {
+            continue;
+        };
+        let ty = match entry.kind {
+            MemberKind::Field => entry.var_ty,
+            MemberKind::Getter | MemberKind::Method => entry.return_ty,
+            MemberKind::Setter => continue,
+        };
+        if let Ty::Named { name, .. } = ty
+            && !*resolvable.entry(name).or_insert_with(|| {
+                resolve_container(graph, namespaces, index, lib, file, name).is_some()
+            })
+            && !resolves_as_core_type(strings.resolve(name))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Whether an undefined-name row anchors inside the bare scrutinee
 /// identifier's value chain — its nearest declaring initializer
 /// (`name = expr;`, a later assignment shadowing an earlier declaration) or
@@ -3608,6 +3722,18 @@ fn synthesize_unknown_scrutinee_dead_cases(
         if clauses.is_empty() {
             continue;
         }
+        // A type parameter spelling is neither a container nor a core type,
+        // but the oracle holds a real `TypeParameter` static type there —
+        // never the invalid face (oracle-probed: xml's
+        // `visit<T extends XmlHasVisitor>(T node) => switch (node)` keeps
+        // every typed arm live). Both Named arms below must refuse it.
+        let head_type_param = match read_types[join].1 {
+            Ty::Named { name, .. } => index.get(file).is_some_and(|els| {
+                els.declarations()
+                    .any(|(n, decl)| n == name && decl.kind == MicroKind::TypeParam)
+            }),
+            _ => false,
+        };
         let fires = match read_types[join].1 {
             Ty::Unknown => {
                 !head_is_receiver
@@ -3620,14 +3746,32 @@ fn synthesize_unknown_scrutinee_dead_cases(
             // RESOLVED type (a field read the chain merely fed, a
             // resolvable annotation) keeps every clause live no matter
             // what undefined reference sits in its initializer chain.
+            // The no-chain face beside it: a scrutinee whose WRITTEN type
+            // (a parameter annotation) resolves nowhere is the oracle's
+            // `InvalidType` too — `promoteForPattern`'s 0c relation
+            // (subtype.dart:274) makes the first resolvable unguarded
+            // clause cover vacuously and every later arm die. The
+            // statement shape of that face belongs to the first
+            // synthesizer above (its undefined-chain gate delegates
+            // there); only the switch EXPRESSION reaches here with no
+            // chain.
             Ty::Named { name, .. } if !head_is_receiver => {
-                undefined_in_scrutinee_chain(diagnostics, tokens, source, slice, i)
+                !head_type_param
+                    && (undefined_in_scrutinee_chain(diagnostics, tokens, source, slice, i)
+                        // A written annotation that resolves nowhere is the
+                        // invalid face in a switch EXPRESSION too — but a
+                        // dart:core spelling always resolves (the analysis
+                        // rigs carry no core library, so the container lookup
+                        // alone would misread `Object` as unresolved).
+                        || (!statement
+                            && !resolves_as_core_type(strings.resolve(name))))
                     && !*resolvable.entry(name).or_insert_with(|| {
                         resolve_container(graph, namespaces, index, lib, file, name).is_some()
                     })
             }
             Ty::Named { name, .. } => {
                 head_is_receiver
+                    && !head_type_param
                     && !statement
                     && !*resolvable.entry(name).or_insert_with(|| {
                         resolve_container(graph, namespaces, index, lib, file, name).is_some()
@@ -3876,7 +4020,10 @@ fn switch_clause_absorber(
         let name = strings.intern(tokens.lexeme(source, p));
         if *resolvable.entry(name).or_insert_with(|| {
             resolve_container(graph, namespaces, index, lib, file, name).is_some()
-        }) {
+        }) && !object_pattern_property_invalid(
+            slice, tokens, source, strings, p, graph, namespaces, index, file, lib, name,
+            resolvable,
+        ) {
             return Some(idx);
         }
     }

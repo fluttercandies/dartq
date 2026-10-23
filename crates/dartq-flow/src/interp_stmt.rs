@@ -775,6 +775,9 @@ impl Interp<'_> {
                 default_kw,
                 statement_count: _,
             } => {
+                if self.collecting() {
+                    return true;
+                }
                 // Latch the group's default (if any) for the next group's
                 // opening (probe table G rules 1-2); a default whose
                 // head-time member row already fired is latched reported so
@@ -1267,6 +1270,25 @@ impl Interp<'_> {
                             // certified answer, not a fold guess.
                             meta.ty = rhs.ty;
                             meta.args = rhs.args;
+                        } else if matches!(rhs.ty.base, crate::ty::Base::Name(_))
+                            && self.ops.is_invalid_typed(
+                                rhs.ty,
+                                rhs.args,
+                                self.args,
+                                self.names,
+                            )
+                        {
+                            // The invalid-initializer face (the member-read
+                            // twin of the unresolved-call face above): a
+                            // member read on an invalid-typed receiver
+                            // carries the official's `InvalidType`, and the
+                            // back-end certifies the spelling resolves
+                            // nowhere as a type — `_inferLocalVariable`
+                            // types the declared slot with it, so every
+                            // `is`-test on the local succeeds vacuously
+                            // (the 0c arm) and deads the failing arm.
+                            meta.ty = rhs.ty;
+                            meta.args = rhs.args;
                         } else if rhs.ty.nullable
                             && matches!(
                                 rhs.ty.base,
@@ -1477,11 +1499,31 @@ impl Interp<'_> {
     /// after the exit (`boom(); g();` anchors at `g();`); an exit at or
     /// after the begin is the statement's own death and stays silent.
     fn wrapper_dead_check(&mut self, span: TokenSpan) {
-        if self.stmt_began_dead
-            || (!self.reachable() && self.exit_at.is_some_and(|at| at < span.range.offset))
-        {
-            self.dead_code(span);
+        // The began-dead face, or an exit drained past the statement's own
+        // `StmtEnd` whose snapshot refresh still read live: either way the
+        // statement started after flow died, and a live current state makes
+        // the whole check a no-op (the `dead_code` reachability gate).
+        let began_dead = self.stmt_began_dead
+            || (!self.reachable() && self.exit_at.is_some_and(|at| at < span.range.offset));
+        if !began_dead || self.reachable() {
+            return;
         }
+        // A began-dead statement is itself the official first dead node
+        // (the verifier walks top-down, so the statement precedes every
+        // child, dead_code_verifier.dart:183-189). Inner expression polls
+        // (the dot-access member poll, the cast-type poll) ran EARLIER in
+        // this post-order stream and may have opened the interval on a
+        // sub-statement node — re-anchor it to the statement. An interval
+        // whose anchor sits before the statement belongs to an earlier
+        // dead statement (the one-row fold) and keeps ownership, as does a
+        // do-while split whose anchor is its `while` part.
+        if let Some(window) = &mut self.dead {
+            if window.anchor_from(span.range.offset) {
+                window.reanchor_to(span);
+                return;
+            }
+        }
+        self.dead_code(span);
     }
 
     /// The switch member's keyword row: the official
