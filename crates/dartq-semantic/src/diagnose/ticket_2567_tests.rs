@@ -503,3 +503,121 @@ fn super_accessor_read_types_against_the_super_declaration() {
         messages(&report)
     );
 }
+
+/// SDK stub member faces answer through the frozen rows: dart:isolate's
+/// names-only `ReceivePort` (an empty member map, an unindexed
+/// `implements Stream` clause) resolves `sendPort` on its own row and
+/// `first` through the SDK super-face alias — and an unknown member still
+/// reports (the frozen consult's Known/Absent split). The pre-fix walk
+/// answered a clean `Missing` on the resolved stub and reported every
+/// legal member (the file_byte_store/drift `response.sendPort` /
+/// The SDK-stub member seam (dart:isolate's names-only `ReceivePort`):
+/// the stub unit registers as its `dart:` node's unit with a bare
+/// declaration and no element model — production's face-file shape
+/// (`<dart:isolate>`, `pipeline`'s names-only SDK arm) — so a member
+/// access walks to `Missing` and the frozen rows decide. The stub's own
+/// face (`sendPort`) and its `implements Stream` super-face (`first`,
+/// the `SDK_SUPER_FACES` alias) answer defined; a name no face carries
+/// keeps the miss's own row with the stub's spelling in the message.
+/// The package-side twin (a names-only NON-dart: unit) stays the
+/// under-report consult — pinned by `unindexed_interface_receiver_
+/// reports_absent_members` (the dep-closure shape) — and the unit-less
+/// local twin (the bare rig's own files) never consults — pinned by
+/// the #2497 `same_head_parameter_bound_decides` local `Iterable`.
+#[test]
+fn sdk_stub_member_face_answers_through_frozen_rows() {
+    let source = "import 'stub';\n\
+                  void f(ReceivePort p) {\n\
+                    p.sendPort.send(1);\n\
+                    p.first;\n\
+                    p.nope;\n\
+                  }\n";
+    let strings = StringTable::new();
+    let mut files = FileTable::new();
+    let file = files.intern(Path::new("main.dart"));
+    let stub_file = files.intern(Path::new("<dart:isolate>"));
+    let scanned = dartq_scanner::scan(
+        source,
+        ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        },
+        file,
+    );
+    assert!(
+        scanned.diagnostics.is_empty(),
+        "scanner diagnostics: {source:?}"
+    );
+    let stub_source = "abstract class ReceivePort {}\n";
+    let scanned_stub = dartq_scanner::scan(
+        stub_source,
+        ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        },
+        stub_file,
+    );
+    let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+    let features = ParserFeatures::from_feature_set(set);
+    let elements = collect(source, &scanned.tokens, features, &strings);
+    // Production's stub units carry an empty element model beside the
+    // bare declaration: resolve_container succeeds, the member walk
+    // misses cleanly, and the frozen consult owns the verdict.
+    let stub_elements = collect(stub_source, &scanned_stub.tokens, features, &strings);
+    let mut builder = LibraryGraphBuilder::new(&strings);
+    let lib = builder.intern("package:t/main.dart");
+    let stub_lib = builder.intern("dart:isolate");
+    for (name, decl) in elements.declarations() {
+        if decl.kind == MicroKind::TypeParam {
+            continue;
+        }
+        builder.declare(lib, name, file);
+    }
+    // The names-only stub: a unit of its node, `ReceivePort` declared on
+    // it, no index entry — resolve_container finds the spelling but no
+    // member model.
+    builder.unit(stub_lib, stub_file);
+    builder.declare(stub_lib, strings.intern("ReceivePort"), stub_file);
+    builder.import(
+        lib,
+        ImportEdge {
+            target: Some(stub_lib),
+            prefix: None,
+            deferred: false,
+            combinators: dartq_resolution::Combinators::unfiltered(),
+        },
+    );
+    let graph = builder.finish();
+    let namespaces = Namespaces::build(&graph);
+    let mut index = ElementIndex::default();
+    index.insert(file, elements);
+    index.insert(stub_file, stub_elements);
+    let fold = fold_unit(
+        source,
+        &scanned.tokens,
+        features,
+        &strings,
+        file,
+        lib,
+        &graph,
+        &namespaces,
+        &index,
+        StrictModes::default(),
+        &LibraryClassModifiers::default(),
+        set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+    );
+    let mut report = fold.report;
+    report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+    let getters: Vec<&str> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "undefined_getter")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        getters,
+        ["The getter 'nope' isn't defined for the type 'ReceivePort'."],
+        "{:?}",
+        messages(&report)
+    );
+}

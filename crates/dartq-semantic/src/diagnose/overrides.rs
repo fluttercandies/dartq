@@ -377,7 +377,8 @@ impl<'a> Engine<'a> {
                 // level first (a superclass interface already merged its
                 // `implements` faces, so it shadows the implementor's). The
                 // shared face-list climb then expands each face's own
-                // supertypes transitively. No faces at all is the clean miss.
+                // supertypes transitively. No faces at all is the clean
+                // miss — an SDK-stub anchor routes to the frozen consult.
                 if pending_faces.is_empty() {
                     return Walk::Missing;
                 }

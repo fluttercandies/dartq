@@ -50,7 +50,20 @@ pub(crate) const SDK_FACES_EXTRA: &[(&str, &[&str])] = &[(
         "transform",
         "where",
     ],
-)];
+),
+    // dart:isolate's own faces (sdk/lib/isolate/isolate.dart:849/:931) —
+    // `ReceivePort implements Stream<dynamic>`, so its frozen row is the
+    // whole instance face: own declarations beside the Stream's the
+    // unindexed edge cannot traverse (the same rule CORE_INTERFACE_
+    // MEMBERS rows follow; `SDK_SUPER_FACES` joins the Stream row).
+    ("ReceivePort", &["close", "listen", "sendPort"]),
+    ("SendPort", &["send"]),
+];
+
+/// The unindexed `implements` edges between SDK faces the frozen verdict
+/// joins: `ReceivePort implements Stream<dynamic>` makes the Stream row's
+/// members answer for a ReceivePort-anchored climb.
+const SDK_SUPER_FACES: &[(&str, &[&str])] = &[("ReceivePort", &["Stream"])];
 
 /// The frozen-face member verdict (`Engine::frozen_member_verdict`): the
 /// three answers a [`Walk::ChainBroken`] member walk can still decide
@@ -2766,6 +2779,32 @@ impl<'a> Engine<'a> {
             self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
         }
+
+        // An SDK-stub anchor's clean MISS suppresses when the frozen rows
+        // define the member — dart:isolate's names-only `ReceivePort` (an
+        // indexed empty container with an unindexed `implements Stream`
+        // clause) walks to `Missing`, and `first`/`sendPort` are defined
+        // by the stub faces (`SDK_FACES_EXTRA`/`SDK_SUPER_FACES`). Every
+        // other verdict keeps the miss's own reporting path — the
+        // stub-face ABSENT answer must flow through the unchanged arm
+        // (the message's type face and the rig pins depend on it).
+        else if matches!(self.walk_members(container, row.name), Walk::Missing)
+            && matches!(
+                self.frozen_member_verdict(container, row.name),
+                FrozenFace::Defined
+            )
+        {
+            self.check_member_unused_result(
+                row,
+                container,
+                &Receiver::Typed {
+                    type_name: container,
+                    ty: Ty::UNKNOWN,
+                },
+                false,
+            );
+            return;
+        }
         let Some(kind) = self.container_kind_of(container) else {
             // The external-root face: an unindexable receiver type (the
             // core primitives in the CLI world, an undeclared name in the
@@ -3202,6 +3241,7 @@ impl<'a> Engine<'a> {
         let frozen_hit = |name: &str| {
             let aliases: &[&str] = COLLECTION_INTERFACE_ALIASES
                 .iter()
+                .chain(SDK_SUPER_FACES.iter())
                 .find(|(alias, _)| name == *alias)
                 .map_or(&[][..], |(_, aliases)| aliases);
             CORE_INTERFACE_MEMBERS
@@ -3293,6 +3333,27 @@ impl<'a> Engine<'a> {
             at_anchor = false;
             if let Some(entry) = found.members.get(&spelling)
                 && !entry.is_static
+            {
+                return FrozenFace::Defined;
+            }
+            // A RESOLVED dart: stub container (the SDK projection's
+            // names-only units — an empty member map, no modelled
+            // clauses) is the frozen rows' face too: the unindexed arm
+            // above answers the unresolvable spelling, this one the
+            // indexed-but-empty stub (dart:isolate's `ReceivePort`,
+            // whose `first` rides `implements Stream`). Membership in a
+            // `dart:` library is the whole test: a stub file registers
+            // as its node's unit (`library_of_file` answers it), and a
+            // unit-less file (the bare rig's single file, a local
+            // declaration the diagnosing file itself carries) is never
+            // an SDK face — its member face is exactly what the index
+            // resolved above, so a local `class Iterable {}` keeps
+            // reporting a missing `first`.
+            if self
+                .graph
+                .library_of_file(found_owner)
+                .is_some_and(|lib| self.graph.uri(lib).starts_with("dart:"))
+                && frozen_hit(self.strings.resolve(name))
             {
                 return FrozenFace::Defined;
             }
