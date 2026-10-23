@@ -25,7 +25,7 @@ impl<'a> Engine<'a> {
         let guard = UndefinedGuard::build(graph, lib);
         let identical_id = strings.intern("identical");
         let unit_args = index.get(file).map(FileElements::type_args);
-        let boundary = Boundary::new(index, file, unit_args);
+        let boundary = Boundary::new(index, file, lib, unit_args, graph, namespaces, strings);
         Self {
             graph,
             namespaces,

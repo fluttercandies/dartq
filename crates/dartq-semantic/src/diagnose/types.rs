@@ -665,14 +665,28 @@ pub(crate) struct Boundary<'a> {
     pub(crate) origins: RefCell<FxHashMap<*const crate::model::MemberEntry, FileId>>,
     /// The diagnosing file — same-file values never project.
     pub(crate) own: FileId,
+    /// The diagnosing library — the scope a canonicalized `prefix.Name`
+    /// head re-resolves in (the same-element guard, [`Boundary::ty`]).
+    own_lib: LibraryId,
     pub(crate) index: &'a ElementIndex,
+    /// The resolution context a foreign `prefix.Name` head canonicalizes
+    /// through (`Boundary::ty`): the owner file's own library answers the
+    /// prefix's export scope, which the diagnosing library cannot spell.
+    graph: &'a LibraryGraph,
+    namespaces: &'a Namespaces,
+    strings: &'a StringTable,
 }
 
 impl<'a> Boundary<'a> {
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         index: &'a ElementIndex,
         own: FileId,
+        own_lib: LibraryId,
         unit_args: Option<&crate::model::ArgPool>,
+        graph: &'a LibraryGraph,
+        namespaces: &'a Namespaces,
+        strings: &'a StringTable,
     ) -> Self {
         Self {
             args: RefCell::new(unit_args.cloned().unwrap_or_default()),
@@ -681,7 +695,11 @@ impl<'a> Boundary<'a> {
             decls: RefCell::new(FxHashMap::default()),
             origins: RefCell::new(FxHashMap::default()),
             own,
+            own_lib,
             index,
+            graph,
+            namespaces,
+            strings,
         }
     }
 
@@ -768,8 +786,27 @@ impl<'a> Boundary<'a> {
         else {
             return ty;
         };
+        // A `prefix.Name` head (`ast.AstNode` of a foreign signature's
+        // declared type) interned its qualified spelling as ONE name — the
+        // collector's `join_qualified` one-head form. In the diagnosing
+        // file that name resolves nowhere (the `ast` prefix lives in the
+        // owner file's own imports, not here): the subtype lattice and the
+        // flow promotion gate both read it as an unresolvable head, so a
+        // value typed `ast.AstNode?` never promotes through `is
+        // ClassDeclaration` and the arg check compares the declared face.
+        // Canonicalize to the element's bare name — the leaf after `.` is
+        // the declaration the prefix's export scope resolves, identical to
+        // the unqualified `AstNode` the diagnosing file imports (oracle
+        // semantics: the element, never the import spelling). Only a head
+        // whose prefix is a REAL import prefix of `owner`'s library is
+        // rewritten; an undecidable prefix keeps the qualified face.
+        let name = self.canonical_head(owner, name);
         if args == crate::model::ArgListId::EMPTY {
-            return ty;
+            return Ty::Named {
+                name,
+                nullable,
+                args,
+            };
         }
         if let Some(&local) = self.slots.borrow().get(&(owner, args)) {
             return Ty::Named {
@@ -792,6 +829,57 @@ impl<'a> Boundary<'a> {
             nullable,
             args: local,
         }
+    }
+
+    /// The element's bare name for a foreign `prefix.Name` head — the
+    /// leaf after the `.`, but only when it denotes the SAME declaration
+    /// the diagnosing file spells bare. A dotted `Ty::Named` head is
+    /// always a prefixed type-use (Dart has no `Outer.Inner` type
+    /// reference), never `Class.member`; the leaf the prefix's export
+    /// scope returns is one element. Stripping the prefix hands the
+    /// subtype lattice and flow a bare `StringId` that re-resolves in the
+    /// DIAGNOSING file's scope — safe only when that scope binds the leaf
+    /// to the identical declaration file (`ast.AstNode` and `AstNode`
+    /// naming `ast.dart`'s one `AstNode`). A different binding — drift's
+    /// own `SharedWorker` vs `web.SharedWorker` — would silently retarget
+    /// the type onto a foreign element, so the qualified head stays.
+    ///
+    /// `None`-direction guards: the prefix registers no `Decl` in
+    /// `owner`'s library, the owner has no library row, the name carries
+    /// no `.`, or the bare leaf resolves to a different (or no) container
+    /// in the diagnosing scope — all keep the written head, the
+    /// under-report posture the qualified face already paid.
+    fn canonical_head(&self, owner: FileId, name: StringId) -> StringId {
+        let text = self.strings.resolve(name);
+        let Some((prefix, leaf)) = text.rsplit_once('.') else {
+            return name;
+        };
+        let Some(owner_lib) = self.graph.library_of_file(owner) else {
+            return name;
+        };
+        let leaf_id = self.strings.intern(leaf);
+        let foreign = self.namespaces.lookup_prefixed(
+            self.graph,
+            owner_lib,
+            self.strings.intern(prefix),
+            leaf_id,
+        );
+        let Lookup::Found(NamespaceEntry::Decl(foreign_file)) = foreign else {
+            return name;
+        };
+        // The same-element guard: the diagnosing file must reach the
+        // identical declaration file spelling the leaf bare — a local
+        // container or an unqualified import binding to `foreign_file`.
+        let same = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.own_lib,
+            self.own,
+            leaf_id,
+        )
+        .is_some_and(|(_, own_file)| own_file == foreign_file);
+        if same { leaf_id } else { name }
     }
 
     /// Projects a member entry found in `owner`'s container `container`
