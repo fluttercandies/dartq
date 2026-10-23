@@ -70,6 +70,13 @@ pub enum Ev {
     NoInitializer,
     InitializerBegin,
     InitializerEnd,
+    /// A local function statement's name (fired at the name token, before
+    /// the body parses): the interp's local-callable set — a bare-head
+    /// invocation of one of these names resolves, so the unresolved-call
+    /// `InvalidType` face never answers for it.
+    LocalFnName {
+        name: u32,
+    },
     PatternVarDeclStmt {
         span: TokenSpan,
     },
@@ -346,6 +353,13 @@ pub enum Ev {
         /// (official `parent is LogicalAnd/LogicalOr/IfNull`,
         /// dead_code_verifier.dart:311-322).
         span: TokenSpan,
+    },
+    /// The `??=` RHS begins (official `ifNullExpression_rightBegin` runs
+    /// the RHS on the null path alone — the flattened replay snapshots the
+    /// skip path here instead): `op` is the operator token, so an exiting
+    /// RHS (`x ??= throw e`) restores the live skip path at the write.
+    IfNullAssignBegin {
+        op: TokenSpan,
     },
     BinaryEnd {
         op: BinOp,

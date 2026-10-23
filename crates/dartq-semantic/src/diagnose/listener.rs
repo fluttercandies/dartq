@@ -1316,7 +1316,11 @@ impl ParserListener for DiagnoseListener<'_> {
     /// expressions share the identifier context but carry
     /// `is_function_expression` — the official face is
     /// `visitFunctionDeclaration` only, so they must not patch.
-    fn end_function_name(&mut self, begin: Token, _end: Token, is_function_expression: bool) {
+    fn end_function_name(&mut self, begin: Token, end: Token, is_function_expression: bool) {
+        // The flow recorder's local-function name latch rides this hook
+        // ([`dartq_flow::ev::Ev::LocalFnName`]) — the call-resolution face
+        // must see function-local names before the body's events run.
+        self.flow().end_function_name(begin, end, is_function_expression);
         if is_function_expression {
             return;
         }
@@ -3260,6 +3264,12 @@ impl ParserListener for DiagnoseListener<'_> {
         }
     }
 
+    fn begin_if_null_assignment_rhs(&mut self, operator: Token) {
+        // The `??=` RHS split's skip-path snapshot rides the flow face
+        // ([`dartq_flow::ev::Ev::IfNullAssignBegin`]).
+        self.flow().begin_if_null_assignment_rhs(operator);
+    }
+
     fn handle_assignment_expression(&mut self, operator: Token, end: Token) {
         // #2174/#2360: a spellable write's resolved RHS type stages into the
         // flow layer before the assignment folds there — the name-level flow
@@ -3791,6 +3801,23 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.nsm_poison();
         engine.const_capture.conditional_colon();
+    }
+
+    /// The then-arm boundary face ([`ParserListener::
+    /// end_conditional_expression_then_arm`]): the flow recorder latches
+    /// the arm's span here for the colon's dead-arm row — missing this
+    /// forward left the latch empty and the (0, 0) fallback resetting any
+    /// open dead window at the colon (the unresolved-annotation
+    /// `c ? a : b` initializer face).
+    fn end_conditional_expression_then_arm(
+        &mut self,
+        question: Token,
+        then_begin: Token,
+        colon: Token,
+        then_end: Token,
+    ) {
+        self.flow()
+            .end_conditional_expression_then_arm(question, then_begin, colon, then_end);
     }
 
     fn end_conditional_expression(&mut self, question: Token, colon: Token, end: Token) {

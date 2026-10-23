@@ -871,6 +871,8 @@ impl GapPass {
             | Ev::AsOperator
             | Ev::NoInitializer
             | Ev::InitializerBegin
+            | Ev::LocalFnName { .. }
+            | Ev::IfNullAssignBegin { .. }
             | Ev::PatternVarDeclStmt { .. }
             | Ev::IfCaseCondition
             | Ev::Wildcard { .. }

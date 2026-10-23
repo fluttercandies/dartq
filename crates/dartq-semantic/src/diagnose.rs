@@ -396,7 +396,7 @@ mod row_resolution;
 mod scopes_bodies;
 mod strict_faces;
 mod type_capture;
-mod types;
+pub(crate) mod types;
 mod unused_finalization;
 
 /// The W7 `non_const_call_to_literal_constructor` producer tests (#749).
@@ -3211,6 +3211,14 @@ fn synthesize_invalid_scrutinee_dead_cases(
         }) {
             continue;
         }
+        // The unresolved-CALL chain face (`var x = nowheresfn();` — the
+        // flow's invalid-call typing latches the callee's own head as the
+        // row) belongs to the joined synthesizer below, whose
+        // undefined-chain verdict owns the initializer face; a plain
+        // written annotation has no initializer chain and stays here.
+        if undefined_in_scrutinee_chain(diagnostics, tokens, source, slice, i) {
+            continue;
+        }
         if !slice
             .get(close + 1)
             .is_some_and(|t| t.kind == dartq_scanner::TokenKind::OpenCurly)
@@ -3604,6 +3612,19 @@ fn synthesize_unknown_scrutinee_dead_cases(
             Ty::Unknown => {
                 !head_is_receiver
                     && undefined_in_scrutinee_chain(diagnostics, tokens, source, slice, i)
+            }
+            // The unresolved-call initializer's flow row latches the
+            // callee's own head (the invalid-call face): the same
+            // undefined-chain verdict admits it, and the row's own head
+            // must resolve nowhere as a type — a var whose row names a
+            // RESOLVED type (a field read the chain merely fed, a
+            // resolvable annotation) keeps every clause live no matter
+            // what undefined reference sits in its initializer chain.
+            Ty::Named { name, .. } if !head_is_receiver => {
+                undefined_in_scrutinee_chain(diagnostics, tokens, source, slice, i)
+                    && !*resolvable.entry(name).or_insert_with(|| {
+                        resolve_container(graph, namespaces, index, lib, file, name).is_some()
+                    })
             }
             Ty::Named { name, .. } => {
                 head_is_receiver

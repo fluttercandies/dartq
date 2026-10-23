@@ -458,7 +458,15 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 // (3.13.1 ships with triple shift on, and the scanner lexes
                 // `>>>=` natively then).
                 let operator = self.peek_span();
+                let is_if_null = self.peek_kind() == TokenKind::QuestionQuestionEq;
                 self.cursor.advance();
+                // The `??=` RHS split's begin face (official
+                // `ifNullExpression_rightBegin`): the RHS runs on the null
+                // path alone, so the flow snapshots the live skip path
+                // before the RHS's events run.
+                if is_if_null {
+                    self.listener.begin_if_null_assignment_rhs(operator);
+                }
                 let end = if self.peek_kind() == TokenKind::Keyword(Keyword::Throw) {
                     self.parse_throw_expression(allow_cascades)
                 } else {

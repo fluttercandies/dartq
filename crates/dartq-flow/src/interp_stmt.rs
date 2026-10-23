@@ -1178,6 +1178,9 @@ impl Interp<'_> {
                 // semantic as-cast tail face.
                 self.init_exec_depth = Some(self.exec_frame_depth());
             }
+            Ev::LocalFnName { name } => {
+                self.local_fns.insert(*name);
+            }
             Ev::InitializerEnd => {
                 self.init_exec_depth = None;
                 // The initializer expression ends: rejoin null-shorting
@@ -1247,6 +1250,23 @@ impl Interp<'_> {
                         if let Some((staged, staged_args)) = staged {
                             meta.ty = staged;
                             meta.args = staged_args;
+                        } else if rhs.name.is_some_and(|name| {
+                            matches!(rhs.ty.base, crate::ty::Base::Name(id) if id == name)
+                                && self.ops.call_head_unresolved(name, self.names)
+                        }) {
+                            // The unresolved-call initializer face: the
+                            // send's result is the official's
+                            // `InvalidType` — the resolved back-end
+                            // certified the head resolves nowhere, and
+                            // `_inferLocalVariable` types the declared
+                            // slot with it, so every `is`-test on the
+                            // local succeeds vacuously (the 0c arm) and
+                            // deads the failing arm. The #2243 guard keeps
+                            // every OTHER non-nullable name face out of
+                            // the slot; this one is the back-end's
+                            // certified answer, not a fold guess.
+                            meta.ty = rhs.ty;
+                            meta.args = rhs.args;
                         } else if rhs.ty.nullable
                             && matches!(
                                 rhs.ty.base,

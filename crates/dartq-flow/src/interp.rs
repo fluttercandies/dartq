@@ -860,6 +860,11 @@ pub(crate) struct Interp<'o> {
     /// captured write-version check stands in the official's
     /// `ValueVersion` rebasing).
     pub(crate) cond_vars: std::collections::HashMap<u32, CondVarEntry>,
+    /// Local-function names declared in the unit ([`crate::ev::Ev::
+    /// LocalFnName`] feed): a bare-head invocation of one resolves in scope,
+    /// so the unresolved-call `InvalidType` face must skip it — the
+    /// library-level back-end cannot see function-local names.
+    pub(crate) local_fns: FxHashSet<u32>,
     /// Property key → slot, the resolve-or-insert side of
     /// [`Interp::prop_slot`].
     prop_slots: FxHashMap<(u32, u32), u32>,
@@ -949,6 +954,11 @@ pub(crate) struct Interp<'o> {
     /// still reads a live state, so a following statement compares the
     /// exit position with its own begin.
     pub(crate) exit_at: Option<u32>,
+    /// Open `??=` skip-path snapshots (paired with [`crate::ev::Ev::
+    /// IfNullAssignBegin`]): the state at the operator — the live path
+    /// that skips the RHS. An RHS that exits (`x ??= throw e`) restores
+    /// its snapshot at the write, the official's post-state.
+    pub(crate) if_null_skips: Vec<(u32, State)>,
 
     /// Open null-shorting contexts (official `_NullAwareAccessContext`
     /// stack, flow_analysis.dart:9664): each entry is the skip-path state
@@ -1085,6 +1095,7 @@ impl<'o> Interp<'o> {
             binding_journal: Vec::new(),
             cond_split_var: None,
             cond_vars: std::collections::HashMap::new(),
+            local_fns: FxHashSet::default(),
             prop_slots: FxHashMap::default(),
             decl: DeclCtx::default(),
             decl_stack: Vec::new(),
@@ -1109,6 +1120,7 @@ impl<'o> Interp<'o> {
             dead: None,
             stmt_began_dead: false,
             exit_at: None,
+            if_null_skips: Vec::new(),
             init_exec_depth: None,
             null_shorts: Vec::new(),
             args_bases: Vec::new(),
@@ -1791,34 +1803,6 @@ impl<'o> Interp<'o> {
         }
     }
 
-    /// The expression-construct dead face (dead right operand of
-    /// `&&`/`||`/`??`, dead `?:` arm): the official reports at the
-    /// construct's own `flowEnd` — one row from the re-anchored start
-    /// (operator token / arm's first token) to the arm's end — and resets
-    /// (dead_code_verifier.dart:311-322, `type_analyzer.dart:2588/:2616`).
-    /// An already-open interval folds instead: the outer anchor owns the
-    /// reporting and the arm only grows its end.
-    pub(crate) fn dead_expr_arm(&mut self, anchor: TokenSpan, end: u32) {
-        if self.reachable() {
-            return;
-        }
-        if let Some(window) = &mut self.dead {
-            window.extend(end);
-            return;
-        }
-        if end > anchor.range.offset {
-            self.emit(FlowFact::DeadCode {
-                span: TokenSpan {
-                    id: anchor.id,
-                    range: SourceRange {
-                        offset: anchor.range.offset,
-                        length: end - anchor.range.offset,
-                    },
-                },
-            });
-        }
-    }
-
     /// The collection-if arm's own `flowEnd` (official
     /// `flowEnd(ifTrue)` / `flowEnd(ifFalse)`, dead_code_verifier.dart:217-260):
     /// the arm node contains the first dead node — the walk entered the
@@ -1834,7 +1818,10 @@ impl<'o> Interp<'o> {
             return;
         }
         if let Some(window) = &mut self.dead {
-            if window.anchor.range.offset < arm_start {
+            // An empty arm range is a recovery artifact (no arm span was
+            // recorded): it can neither re-anchor nor report, so any open
+            // interval keeps ownership with the arm as a no-op.
+            if arm_end <= arm_start || window.anchor.range.offset < arm_start {
                 window.extend(arm_end);
                 return;
             }

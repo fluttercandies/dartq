@@ -2529,7 +2529,7 @@ impl<'a> Engine<'a> {
         // signature (`void print(Object? object)`) — the same precedence
         // the unqualified invocation face applies (member, top-level, then
         // the core namespace).
-        if self.strings.resolve(row.name) == "print"
+        if super::types::CORE_TOP_LEVEL_FNS.contains(&self.strings.resolve(row.name))
             && !self.frames.iter().any(|f| f.locals.contains(&row.name))
             && !self
                 .container_context()

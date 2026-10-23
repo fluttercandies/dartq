@@ -175,6 +175,21 @@ pub struct Flow<'t> {
     /// clears the latch (its own return/parameter rows must not leak), so
     /// an untyped or function-typed header answers unknown.
     top_last_type: Option<(crate::ty::Ty, u32)>,
+    /// The head token of the most recent [`ParserListener::handle_type`]
+    /// row (the annotation's first token — a qualified chain keys its
+    /// first element). [`ParserListener::handle_no_type`] clears it. Read
+    /// at `begin_variables_declaration`: the declaration statement's node
+    /// begins at its earliest header token (`late`? modifier or annotation
+    /// head), and the official's first-dead-node anchor for a dead
+    /// declaration statement spans from there, not from the first
+    /// declared name (dead_code_verifier's node offset — the `Token` of
+    /// `Token token = ...;`, oracle-probed).
+    type_head: Option<Token>,
+    /// Inside a local-function statement (between its `begin` and `end`
+    /// hooks): gates [`Ev::LocalFnName`] to the statement's own name —
+    /// the name event fires before the body, so nested declarations
+    /// latch correctly even though the flag is a plain bool.
+    in_local_fn: bool,
     /// The captured header face of the top-level variables declaration
     /// now open (`begin_variables_declaration` .. `end_variables_declaration`);
     /// every declarator of the list reads it.
@@ -273,6 +288,8 @@ impl<'t> Flow<'t> {
             tv_in_record: false,
             top_level: FxHashMap::default(),
             top_last_type: None,
+            type_head: None,
+            in_local_fn: false,
             top_decl: None,
             container_depth: 0,
             closed: crate::ty::ClosedNames::default(),
@@ -955,13 +972,27 @@ impl ParserListener for Flow<'_> {
 
     fn begin_local_function_declaration(&mut self, _token: Token) {
         self.exec_begin(true);
+        // The name latch (see [`Flow::in_local_fn`]): the name event fires
+        // between this and the matching end, before the body's own nested
+        // declarations.
+        self.in_local_fn = true;
     }
 
     fn end_local_function_declaration(&mut self, end: Token) {
+        self.in_local_fn = false;
         self.exec_end(false, end);
         self.record(Ev::StmtEnd {
             end: end.range.end(),
         });
+    }
+
+    fn end_function_name(&mut self, begin: Token, _end: Token, is_function_expression: bool) {
+        // Only the local-function statement's name latches (a function
+        // expression's name is not a callable binding).
+        if self.in_local_fn && !is_function_expression {
+            let name = self.name(begin);
+            self.record(Ev::LocalFnName { name });
+        }
     }
 
     fn begin_function_expression(&mut self, _token: Token) {
@@ -1270,10 +1301,24 @@ impl ParserListener for Flow<'_> {
                 ))
             )
         });
+        // The statement-head anchor: the official's first-dead node for a
+        // dead declaration list is the statement itself, whose offset is
+        // the earliest header token — `late`, the `var`/`final`/`const`
+        // keyword, or the annotation head (the grammar's
+        // `finalConstVarOrType` always fires `handle_type` or
+        // `handle_no_type` immediately before this hook, so the latched
+        // head is fresh here). The event's span feeds only the dead-code
+        // window's anchor; anchoring at the first declared name instead
+        // landed the row at the name (oracle: the statement head).
+        let head = [late_kw, var_final_or_const, self.type_head, Some(token)]
+            .into_iter()
+            .flatten()
+            .min_by_key(|token| token.range.offset)
+            .unwrap_or(token);
         self.record(Ev::VarDeclBegin {
             late: late_kw.is_some(),
             is_final,
-            span: token,
+            span: head,
         });
         // Top-level capture: outside any executable and outside every
         // class-like container the list declares top-level variables — its
@@ -1400,6 +1445,13 @@ impl ParserListener for Flow<'_> {
             nullable,
             args,
         });
+        // The statement-head latch (see [`Flow::type_head`]): every
+        // declaration's `finalConstVarOrType` fires its type row (or
+        // `handle_no_type`) immediately before `begin_variables_declaration`,
+        // so the most recent head is the annotation of the declaration now
+        // starting — a qualified chain's outermost head fires last and keys
+        // its first token.
+        self.type_head = Some(name);
         // The top-level header latch (see `top_last_type`): a declaration
         // outside any executable reads the row that immediately precedes
         // it.
@@ -1443,6 +1495,10 @@ impl ParserListener for Flow<'_> {
 
     fn handle_no_type(&mut self, _last_consumed: Token) {
         self.record(Ev::NoType);
+        // The statement-head latch (see [`Flow::type_head`]) clears with the
+        // header's own absence — an untyped declaration anchors at its
+        // modifier or name.
+        self.type_head = None;
         // An untyped header answers unknown (the latch clears).
         if self.buffer.is_none() {
             self.top_last_type = None;
@@ -2247,6 +2303,10 @@ impl ParserListener for Flow<'_> {
             end: end.range.end(),
             field_init: false,
         });
+    }
+
+    fn begin_if_null_assignment_rhs(&mut self, operator: Token) {
+        self.record(Ev::IfNullAssignBegin { op: operator });
     }
 
     fn begin_initializer(&mut self, _token: Token) {

@@ -9,6 +9,13 @@ use super::*;
 pub(crate) const CORE_TOP_LEVEL_ANNOTATIONS: [&str; 4] =
     ["Deprecated", "deprecated", "override", "pragma"];
 
+/// The dart:core top-level function facade — the names the unqualified
+/// invocation face resolves through the implicit core import (the
+/// signature stand `fn_var_sig`'s `print` arm) and the flow layer's
+/// resolved back-end refuses to treat as an unresolved-call face
+/// (`call_head_unresolved`) — the same fact, one table.
+pub(crate) const CORE_TOP_LEVEL_FNS: [&str; 1] = ["print"];
+
 /// The external dart: type-parameter counts, keyed by the spellings the
 /// member face keeps ([`crate::member_face::CORE_TYPE_MEMBERS`]'s ten rows —
 /// `sdk/lib/core/int.dart`, `double.dart`, `num.dart`, `string.dart`,

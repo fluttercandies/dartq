@@ -266,6 +266,22 @@ pub trait TypeOps {
         let _ = names;
     }
 
+    /// Whether a bare-head invocation's spelling (`name` an id into
+    /// `names`) resolves nowhere — the callee-side `InvalidType` face: an
+    /// unresolved call's result is the official's `InvalidType`, so the
+    /// write it feeds types invalid, and every `is`-test on it succeeds
+    /// vacuously (the 0c arm) deading the failing arm — `var t = nowhere();
+    /// if (t is C) … else …` reports the else as dead code exactly like
+    /// the analyzer does. The default answers `false`: the name-level
+    /// lattice cannot know resolution, and `Unknown` keeps every test
+    /// decidable-agnostic (the refusal trio's posture); only a resolved
+    /// back-end that can prove the spelling answers as nothing invokable
+    /// may answer `true`.
+    fn call_head_unresolved(&self, name: u32, names: &[Box<str>]) -> bool {
+        let _ = (name, names);
+        false
+    }
+
     /// [`TypeOps::factor`] with the operand spellings' written-argument
     /// trees: `from_args`/`what_args` are arena indices into `arena`
     /// ([`EMPTY_ARGS`] when argument-less) and `names` the recorder's

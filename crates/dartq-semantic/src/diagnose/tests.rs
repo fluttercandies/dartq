@@ -9268,16 +9268,19 @@ fn dead_code_reports_one_row_per_dead_interval() {
     );
 }
 
-/// A dead local declaration reports at the declared name (the fact
-/// layer's declaration anchor), not the declaration's head token.
+/// A dead local declaration reports at the statement's first header
+/// token (`var`), the official's first-dead node — the declared name
+/// carries only the unused-variable row (oracle-probed: `DEAD_CODE` at
+/// `var x = 1;` from the keyword, `UNUSED_LOCAL_VARIABLE` at `x`).
 #[test]
 fn dead_local_declaration_emits_at_its_name() {
     let source = "void f() { return; var x = 1; }";
     let report = report(source);
     // The dead declaration's `x` is also never read (the official
-    // read-only use rule); both rows anchor at `x`, dead_code first.
+    // read-only use rule); dead_code anchors at the header, the unused
+    // row at the name.
     assert_eq!(code_names(&report), ["dead_code", "unused_local_variable"]);
-    assert_eq!(dead_code_offsets(&report), [offset_of(source, "x")]);
+    assert_eq!(dead_code_offsets(&report), [offset_of(source, "var")]);
 }
 
 /// A closure body's own dead code reports inside the closure; the

@@ -599,6 +599,11 @@ pub trait ParserListener {
     fn handle_throw_expression(&mut self, throw: Token, end: Token) {}
     /// `handleAssignmentExpression(operator, end)` (C7).
     fn handle_assignment_expression(&mut self, operator: Token, end: Token) {}
+    /// Fired immediately before a `??=` assignment's RHS parses (official
+    /// `ifNullExpression_rightBegin` runs the RHS on the null path alone);
+    /// `operator` is the `??=` token. No official counterpart; the flow
+    /// face snapshots the live skip path here.
+    fn begin_if_null_assignment_rhs(&mut self, _operator: Token) {}
     /// `beginCascade(operator)` / `handleCascadeAccess(operator, end,
     /// isNullAware)` / `endCascade` (C8).
     fn begin_cascade(&mut self, operator: Token) {}

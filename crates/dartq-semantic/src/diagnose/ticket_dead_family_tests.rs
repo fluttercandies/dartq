@@ -565,3 +565,38 @@ fn dead_rhs_chain_reports_per_level_with_reset() {
     ];
     assert_eq!(rows, expected, "{:?}", code_names(&report));
 }
+
+/// A nowhere-resolving bare-head call's result is the oracle's
+/// `InvalidType` — `_inferLocalVariable` types the declared slot with it,
+/// so every `is`-test on the local succeeds vacuously (subtype.dart's 0c
+/// arm) and the failing arm is dead code. The resolved back-end's
+/// `call_head_unresolved` answers the head (the flow's unresolved-call
+/// face), and the corpus's broken-import files carry this shape by the
+/// dozen (`var t = pop(); if (t is _CascadeBuilder) … else …` —
+/// ast_builder.dart:214; oracle-probed: DEAD_CODE spans the else block,
+/// no `unnecessary_type_check` rides along).
+#[test]
+fn unresolved_call_initializer_deads_the_else_arm() {
+    let source = "class Cb {}\nvoid f() {\n  var t = nowheresfn();\n  if (t is Cb) {\n    t.hashCode;\n  } else {\n    print(2);\n  }\n}\n";
+    let report = report_ops(source);
+    let rows = rows(&report, "dead_code");
+    let start = source.find("print(2)").unwrap() as u32 - 6;
+    assert_eq!(rows, vec![(start, 19)], "{:?}", code_names(&report));
+}
+
+/// An always-true conditional (`c ? a : e` whose test a promotion already
+/// decides) rows its else operand whole — the official
+/// `flowEnd(elseExpression)` re-anchors past any poll an inner node
+/// opened (the as-cast's type poll): the first dead node is the arm
+/// expression itself (type_analyzer.dart:2616; oracle-probed:
+/// `typeName is Q ? typeName.name : typeName as Q` inside the promotion
+/// reports DEAD_CODE at exactly the `typeName as Q` operand and
+/// `unnecessary_cast` beside it).
+#[test]
+fn always_true_conditional_rows_the_else_operand_whole() {
+    let source = "class Q { int name = 1; }\nvoid h(dynamic typeName) {\n  if (typeName is Q) {\n    var x = typeName is Q ? typeName.name : typeName as Q;\n    print(x);\n  }\n}\n";
+    let report = report_ops(source);
+    let rows = rows(&report, "dead_code");
+    let start = source.find("typeName as Q").unwrap() as u32;
+    assert_eq!(rows, vec![(start, 13)], "{:?}", code_names(&report));
+}

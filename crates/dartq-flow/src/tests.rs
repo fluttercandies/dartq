@@ -3635,15 +3635,15 @@ fn dead_interval_labeled_statement_runs_to_the_tail() {
 
 /// A dead local declaration as the covering list's last statement: the
 /// row runs to its `;` (official `node.end`,
-/// dead_code_verifier.dart:326-332). The row STARTS at the declared
-/// name — the fact layer's declaration anchor (the parser delivers the
-/// name token to `beginVariablesDeclaration`), the documented divergence
-/// the semantic twin pin `dead_local_declaration_emits_at_its_name`
-/// fixes at the name, not the declaration head.
+/// dead_code_verifier.dart:326-332). The row STARTS at the statement's
+/// first header token — `var`, the annotation head, or `late` (the
+/// recorder's statement-head anchor); the official's first-dead node is
+/// the statement itself, so `dart analyze` reports `var x = 1;` from the
+/// keyword, not from the declared name.
 #[test]
 fn dead_interval_declaration_widens_to_the_semicolon() {
     let source = "void f() { return; var x = 1; }";
-    assert_eq!(dead_snippets(source), ["x = 1;"]);
+    assert_eq!(dead_snippets(source), ["var x = 1;"]);
 }
 
 /// The covering list's last statement without a trailing `;` — a block
@@ -8502,3 +8502,4 @@ fn return_switch_expression_scrutinee_latches_matched_types() {
         "matched rows carry the promoted non-null face: {matched:?}"
     );
 }
+

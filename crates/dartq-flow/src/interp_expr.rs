@@ -770,7 +770,22 @@ impl Interp<'_> {
                     // [`Interp::branch_type_test`]'s face.
                     let declared =
                         self.vars.get(var as usize).map_or(Ty::UNKNOWN, |meta| meta.ty);
-                    if self.is_test_guaranteed_fail(declared, tested) {
+                    // The fail fold's nullability disjointness is a
+                    // name-level question — the official's 0c arm
+                    // suppresses it the moment either spelling maps to the
+                    // invalid face (`Token? target is CommentToken` under a
+                    // broken import: both are `InvalidType`, the relation
+                    // is vacuously true, and the else — not the then — is
+                    // the dead arm). The guard asks the back-end before
+                    // the fold decides; the name-level default keeps
+                    // today's posture.
+                    let invalid_face = |ty: Ty, args: u32| {
+                        self.ops.is_invalid_typed(ty, args, self.args, self.names)
+                    };
+                    if self.is_test_guaranteed_fail(declared, tested)
+                        && !invalid_face(declared, self.vars.get(var as usize).map_or(crate::ty::EMPTY_ARGS, |meta| meta.args))
+                        && !invalid_face(tested, tested_args)
+                    {
                         let cur = self.current.clone();
                         let dead = cur.clone().set_unreachable(&mut self.reach);
                         expr.branches = Some(if is_not { (cur, dead) } else { (dead, cur) });
@@ -977,6 +992,13 @@ impl Interp<'_> {
                     );
                 }
             }
+            Ev::IfNullAssignBegin { op } => {
+                // The `??=` skip-path snapshot (official
+                // `ifNullExpression_rightBegin`'s split, flattened): the
+                // RHS runs inline below, so the live pre-RHS state is
+                // parked here for the exiting-RHS restore at the write.
+                self.if_null_skips.push((op.range.end(), self.current.clone()));
+            }
             Ev::Assign {
                 plain,
                 if_null,
@@ -987,6 +1009,34 @@ impl Interp<'_> {
                 let rhs = self.pop_value();
                 let rhs_literal = rhs.literal;
                 let mut target = self.pop_value();
+                // The `??=` RHS runs on the null path alone (official
+                // `ifNullExpression_rightBegin`'s split); the flattened
+                // replay runs it inline, so an RHS that EXITS (`x ??=
+                // throw e`) must not leak its unreachability — the
+                // post-state is the skip path (live; the write's own
+                // non-null LUB promotion carries the null-aware face). A
+                // dead window the exit's polls opened inside the RHS drops
+                // with the restore: the skip path was never dead.
+                // The `??=` RHS runs on the null path alone (official
+                // `ifNullExpression_rightBegin`'s split); the flattened
+                // replay runs it inline, so an RHS that EXITS (`x ??=
+                // throw e`) must not leak its unreachability — the
+                // post-state is the skip path (live; the write's own
+                // non-null LUB promotion carries the null-aware face).
+                // Restoring unconditionally-under-unreachable is sound:
+                // a skip path that was already dead restores dead, and
+                // a dead window the exit's polls opened inside the RHS
+                // drops with a live restore — that path was never dead.
+                if *if_null
+                    && let Some((_, skip)) = self.if_null_skips.pop()
+                    && !self.reachable()
+                {
+                    self.current = skip;
+                    if self.reachable() {
+                        self.exit_at = None;
+                        self.dead = None;
+                    }
+                }
                 // A condition-valued plain `=` RHS (`v = a != null;`) is a
                 // plain value: its split rejoins (see
                 // [`Interp::rejoin_value_split`]). Compound operators and
@@ -1242,7 +1292,13 @@ impl Interp<'_> {
                     _ => false,
                 };
                 if then_dead_entry {
-                    self.dead_expr_arm(*then_begin, *then_end);
+                    // The arm row re-anchors past any interval a poll
+                    // opened inside the arm (an as-cast's type poll, a
+                    // nested dead expression): official `flowEnd` reports
+                    // the ARM node's range, the first dead node being the
+                    // arm expression itself — the same re-anchor
+                    // `dead_arm_row` gives the collection-if arms.
+                    self.dead_arm_row(then_begin.range.offset, *then_end);
                 }
                 // The then arm ended: rejoin its open null-shorting before
                 // the state swap.
@@ -1276,7 +1332,14 @@ impl Interp<'_> {
                     _ => false,
                 };
                 if else_dead_entry {
-                    self.dead_expr_arm(*else_begin, *arm_end);
+                    // `flowEnd(elseExpression)` (type_analyzer.dart:2616)
+                    // with the same re-anchor as the then arm above: an
+                    // interval a poll opened inside the else operand (the
+                    // as-cast's type poll — `c ? a : x as T` on an
+                    // always-true test) is the arm's own subspan, and the
+                    // official's first dead node is the whole arm
+                    // expression, so the row spans the operand whole.
+                    self.dead_arm_row(else_begin.range.offset, *arm_end);
                 }
                 // The else arm ended: rejoin its open null-shorting before
                 // the arm join.
@@ -1526,6 +1589,31 @@ impl Interp<'_> {
                                 nullable: false,
                             };
                             callee.args = *args;
+                        } else if !self.local_fns.contains(&name)
+                            && self.ops.call_head_unresolved(name, self.names)
+                        {
+                            // A nowhere-resolving head's result is the
+                            // official's `InvalidType` — spelled as the
+                            // head's own name so the RESOLVED back-end's
+                            // existing unresolved-spelling map answers it
+                            // (a name that resolves as no type reads
+                            // `Invalid`, and `subtype.dart`'s 0c arm makes
+                            // every relation with it vacuous: a var this
+                            // send feeds keeps `x is T` always-true and
+                            // the failing arm dead, exactly the oracle's
+                            // dead-else row). A local-function name
+                            // resolves in scope, so it never takes this
+                            // face — its call keeps the unknown return the
+                            // `??` widening gate reads (`int? x = a ??
+                            // localFn()` stays nullable). At the name
+                            // level the same spelling answers
+                            // conservatively — not top, not promotable,
+                            // its factor keeps it — so both arms stay
+                            // live there.
+                            callee.ty = Ty {
+                                base: Base::Name(name),
+                                nullable: false,
+                            };
                         } else {
                             callee.ty = Ty::UNKNOWN;
                         }

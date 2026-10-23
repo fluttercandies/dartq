@@ -181,6 +181,15 @@ pub struct LibraryTypes {
     /// the id — reflexive `T <: T` answers `true` either way, the only
     /// question identity changes.
     type_params: FxHashMap<StringId, TypeParamId>,
+    /// Every member name of every registered container — the
+    /// bare-head-invocation over-approximation
+    /// ([`TypeOps::call_head_unresolved`]): a spelling here may resolve as
+    /// an instance or static member somewhere the library can see, so it
+    /// is NOT an unresolved-call face. Deliberately coarse (name-keyed,
+    /// not scope-keyed): a same-named member elsewhere only costs the
+    /// under-report direction — the call keeps `Unknown` and its
+    /// `is`-tests stay decidable-agnostic, never a false dead arm.
+    invokable_members: FxHashSet<StringId>,
 }
 
 /// One container's parse-time supertype capture: the type-parameter
@@ -407,6 +416,7 @@ impl LibraryTypes {
             aliases: Vec::new(),
             type_params,
             param_names,
+            invokable_members: FxHashSet::default(),
             facts,
             next_decl: FIRST_CONTAINER_RAW,
             next_param,
@@ -503,6 +513,7 @@ impl LibraryTypes {
             typedef_shapes,
             type_params,
             param_names,
+            invokable_members,
             mut facts,
             ..
         } = registry;
@@ -692,6 +703,7 @@ impl LibraryTypes {
             typedef_shapes,
             param_names,
             type_params,
+            invokable_members,
         }
     }
 }
@@ -768,6 +780,8 @@ struct Registry {
     type_params: FxHashMap<StringId, TypeParamId>,
     /// See [`LibraryTypes::param_names`].
     param_names: FxHashMap<TypeParamId, StringId>,
+    /// See [`LibraryTypes::invokable_members`].
+    invokable_members: FxHashSet<StringId>,
     facts: ParamFactsTable,
     next_decl: u32,
     next_param: u32,
@@ -837,6 +851,11 @@ impl Registry {
             self.registry.insert(name, decl);
             self.decl_params.insert(decl, param_ids.clone());
             self.decl_owner.insert(decl, (file, owner));
+            // Every registered container's member names join the
+            // invokable face as a whole — the over-approximation
+            // `call_head_unresolved` refuses on (an instance or static
+            // member spelling somewhere beats the unresolved-call face).
+            self.invokable_members.extend(container.members.keys().copied());
             actions.push(DeclAction::Decl(decl, param_ids));
             if container.sealed {
                 actions.push(DeclAction::Sealed(decl));
@@ -2844,6 +2863,29 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// ops to the same world).
     fn observe_names(&self, names: &[Box<str>]) {
         ResolvedTypeOps::observe_names(self, names);
+    }
+
+    /// The bare-head invocation face ([`TypeOps::call_head_unresolved`]):
+    /// a spelling resolves as nothing invokable when it names no
+    /// registered container (the constructor face), no resolved
+    /// non-container declaration (a top-level function, variable or
+    /// getter — own unit or import-swept), and no member of any
+    /// registered container (the instance/static member face, name-keyed
+    /// over-approximation — [`LibraryTypes::invokable_members`]). A
+    /// dart:core top-level facade name (`print`) refuses the same way:
+    /// a call the official types through core is never the invalid face.
+    fn call_head_unresolved(&self, name: u32, names: &[Box<str>]) -> bool {
+        self.observe_names(names);
+        let Some(lexeme) = names.get(name as usize) else {
+            return false;
+        };
+        if crate::diagnose::types::CORE_TOP_LEVEL_FNS.contains(&lexeme.as_ref()) {
+            return false;
+        }
+        let name = self.strings.intern(lexeme);
+        !(self.snapshot.registry.contains_key(&name)
+            || self.snapshot.non_containers.contains(&name)
+            || self.snapshot.invokable_members.contains(&name))
     }
 
     /// [`NameTypeOps::factor`] over the instantiated forms: both operand
