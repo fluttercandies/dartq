@@ -1615,6 +1615,17 @@ impl<'a> Engine<'a> {
             }
             return None;
         }
+        // A prefixed callee reads the prefix's import table — never this
+        // unit's unprefixed tables (a local `min` must not bind `math.min`).
+        if let Receiver::Prefix { name: prefix } = *recv {
+            let dartq_resolution::Lookup::Found(dartq_resolution::NamespaceEntry::Decl(file)) =
+                self.namespaces.lookup_prefixed(self.graph, self.lib, prefix, callee_name)
+            else {
+                return None;
+            };
+            let decl = self.index.get(file).and_then(|f| f.decl(callee_name))?;
+            return self.foreign_decl_params(&self.boundary.top(file, callee_name, decl));
+        }
         // A same-file executable's captured bounds.
         if let Some(params) = self.exec_bounds.get(&callee_name)
             && !params.is_empty()
@@ -1629,11 +1640,21 @@ impl<'a> Engine<'a> {
             let own = sig.params.len();
             return Some((sig.params.to_vec(), Vec::new(), Some(own)));
         }
-        // A foreign top-level function: `type_params` is a bare count, so
-        // the parameter names recover from the declaration's own types —
-        // every bare leaf the caller's scope cannot prove is a type, in
-        // written order, capped at the declared arity.
-        let decl = self.top_level_decl(callee_name)?;
+        // A foreign top-level function's recovered spellings.
+        self.top_level_decl(callee_name)
+            .and_then(|decl| self.foreign_decl_params(&decl))
+    }
+
+    /// A foreign generic top-level function's inference-parameter
+    /// spellings, recovered from its projected declaration (a bare-count
+    /// `type_params` carries no names): every bare leaf of its written
+    /// types the caller's scope cannot prove is a type, in written order,
+    /// capped at the declared arity, with no positional pairing (recovered
+    /// order is written order, not declaration order).
+    fn foreign_decl_params(
+        &self,
+        decl: &TopDecl,
+    ) -> Option<(Vec<(StringId, Option<Ty>)>, Vec<(StringId, Ty)>, Option<usize>)> {
         if decl.kind != MicroKind::TopLevelFn || decl.type_params == 0 {
             return None;
         }

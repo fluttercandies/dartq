@@ -1,0 +1,202 @@
+//! The #2567 pins: assignability matrix sweep — fill in as roots close. The rig
+//! declares no imports, so every pin spells custom types only.
+
+use super::*;
+use crate::collector::collect;
+use dartq_language::{FeatureSet, LanguageVersion};
+use dartq_resolution::LibraryGraphBuilder;
+use dartq_scanner::ScanConfig;
+use dartq_source::FileTable;
+use std::path::Path;
+
+/// Diagnoses `source` as the sole file of a library with no imports —
+/// the single-file rig (`ticket_2564_tests`' shape).
+fn report(source: &str) -> FileReport {
+    let strings = StringTable::new();
+    let mut files = FileTable::new();
+    let file = files.intern(Path::new("main.dart"));
+    let scanned = dartq_scanner::scan(
+        source,
+        ScanConfig {
+            enable_triple_shift: true,
+            enable_augmentations: true,
+        },
+        file,
+    );
+    assert!(
+        scanned.diagnostics.is_empty(),
+        "scanner diagnostics: {source:?}"
+    );
+    let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+    let features = ParserFeatures::from_feature_set(set);
+    let elements = collect(source, &scanned.tokens, features, &strings);
+    let mut builder = LibraryGraphBuilder::new(&strings);
+    let lib = builder.intern("package:t/main.dart");
+    let mut index = ElementIndex::default();
+    index.insert(file, elements.clone());
+    for (name, decl) in elements.declarations() {
+        if decl.kind == MicroKind::TypeParam {
+            continue;
+        }
+        builder.declare(lib, name, file);
+    }
+    let graph = builder.finish();
+    let namespaces = Namespaces::build(&graph);
+    let fold = fold_unit(
+        source,
+        &scanned.tokens,
+        features,
+        &strings,
+        file,
+        lib,
+        &graph,
+        &namespaces,
+        &index,
+        StrictModes::default(),
+        &LibraryClassModifiers::default(),
+        set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+    );
+    let mut report = fold.report;
+    report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+    report
+}
+
+fn count_code(report: &FileReport, name: &str) -> usize {
+    report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == name)
+        .count()
+}
+
+fn messages(report: &FileReport) -> Vec<String> {
+    report
+        .diagnostics
+        .iter()
+        .map(|d| format!("{}: {}", d.code.name, d.message))
+        .collect()
+}
+
+
+/// The two-file rig: `main_src` imports `other_src` under the prefix
+/// `p` — the prefixed-callee seam (`p.f(x)` resolving through the
+/// import table into the other unit's element model).
+fn report_prefixed(other_src: &str, main_src: &str) -> FileReport {
+    let strings = StringTable::new();
+    let mut files = FileTable::new();
+    let file = files.intern(Path::new("main.dart"));
+    let other_file = files.intern(Path::new("other.dart"));
+    let scan = |src: &str| {
+        let scanned = dartq_scanner::scan(
+            src,
+            ScanConfig {
+                enable_triple_shift: true,
+                enable_augmentations: true,
+            },
+            file,
+        );
+        assert!(scanned.diagnostics.is_empty(), "scanner diagnostics: {src:?}");
+        scanned
+    };
+    let set = FeatureSet::for_language_version(LanguageVersion::new(3, 15));
+    let features = ParserFeatures::from_feature_set(set);
+    let scanned = scan(main_src);
+    let other_scanned = scan(other_src);
+    let elements = collect(main_src, &scanned.tokens, features, &strings);
+    let other_elements = collect(other_src, &other_scanned.tokens, features, &strings);
+    let mut builder = LibraryGraphBuilder::new(&strings);
+    let lib = builder.intern("package:t/main.dart");
+    let other_lib = builder.intern("package:t/other.dart");
+    let mut index = ElementIndex::default();
+    index.insert(file, elements.clone());
+    index.insert(other_file, other_elements.clone());
+    for (name, decl) in elements.declarations() {
+        if decl.kind == MicroKind::TypeParam {
+            continue;
+        }
+        builder.declare(lib, name, file);
+    }
+    for (name, decl) in other_elements.declarations() {
+        if decl.kind == MicroKind::TypeParam {
+            continue;
+        }
+        builder.declare(other_lib, name, other_file);
+    }
+    builder.import(
+        lib,
+        dartq_resolution::library_graph::ImportEdge {
+            target: Some(other_lib),
+            prefix: Some(strings.intern("p")),
+            deferred: false,
+            combinators: dartq_resolution::library_graph::Combinators::unfiltered(),
+        },
+    );
+    let graph = builder.finish();
+    let namespaces = Namespaces::build(&graph);
+    let fold = fold_unit(
+        main_src,
+        &scanned.tokens,
+        features,
+        &strings,
+        file,
+        lib,
+        &graph,
+        &namespaces,
+        &index,
+        StrictModes::default(),
+        &LibraryClassModifiers::default(),
+        set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+    );
+    let mut report = fold.report;
+    report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+    report
+}
+
+/// The corpus `??=` shape (`filename ??= path.basename(file.path)` —
+/// archive's zip encoder): a prefixed callee's concrete return types
+/// the assignment compatible — no invalid-assignment face, and the
+/// prefix itself never leaks as the RHS type face.
+#[test]
+fn prefixed_callee_return_feeds_the_assign_rebind() {
+    let report = report_prefixed(
+        "class Payload { }\nPayload pick(Payload n) => n;\n",
+        "import 'other.dart' as p;\n\
+         class Holder {\n\
+           p.Payload? field;\n\
+           void f(p.Payload n) {\n\
+             field ??= p.pick(n);\n\
+             field.missing;\n\
+           }\n\
+         }\n",
+    );
+    assert!(
+        report.diagnostics.is_empty(),
+        "prefixed-callee ??= mis-reports: {:?}",
+        messages(&report)
+    );
+}
+
+/// A generic prefixed callee's free inference parameter never escapes
+/// as the caller-scope type: `field ??= p.pick(a, b)` answers the
+/// unknown face (the under-report direction until call-site inference
+/// solves it), so no downstream sink reports against the raw `T`
+/// spelling (the analyzer `math.min` family).
+#[test]
+fn prefixed_generic_callee_frees_to_unknown() {
+    let report = report_prefixed(
+        "class Payload { }\nT pick<T extends num>(T a, T b) => a;\n",
+        "import 'other.dart' as p;\n\
+         class Holder {\n\
+           p.Payload? field;\n\
+           void f(p.Payload a, p.Payload b) {\n\
+             field ??= p.pick(a, b);\n\
+             field.missing;\n\
+           }\n\
+         }\n",
+    );
+    assert!(
+        !messages(&report).iter().any(|m| m.contains("'T'")),
+        "raw schema spelling visible: {:?}",
+        messages(&report)
+    );
+}

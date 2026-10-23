@@ -4847,6 +4847,26 @@ mod ticket_2564_tests;
 #[cfg(test)]
 mod ticket_2565_tests;
 
+/// The #2566 pins: UNDEFINED_* member-resolution sweep.
+#[cfg(test)]
+mod ticket_2566_tests;
+
+/// The #2567 pins: assignability matrix sweep.
+#[cfg(test)]
+mod ticket_2567_tests;
+
+/// The #2568 pins: nullable-usage sweep.
+#[cfg(test)]
+mod ticket_2568_tests;
+
+/// The #2569 pins: dead-code and switch-exhaustiveness sweep.
+#[cfg(test)]
+mod ticket_2569_tests;
+
+/// The #2570 pins: usage-cluster and misc tail sweep.
+#[cfg(test)]
+mod ticket_2570_tests;
+
 
 /// The operand-face pins: the numeric refinement reads an operand the
 /// engine cannot type as a gap that suppresses the fold (an untyped

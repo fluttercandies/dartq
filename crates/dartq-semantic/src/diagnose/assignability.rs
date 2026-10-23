@@ -954,6 +954,29 @@ impl<'a> Engine<'a> {
                     self.instantiate_call_return(row, &Receiver::Unknown, decl.return_ty)
                 });
         }
+        // A prefixed top-level callee (`path.basename(p)`): the prefix's
+        // import table resolves the declaration directly — there is no
+        // container to walk, and the below-row fallback would name the
+        // prefix itself as the head. The declared return types the send
+        // exactly like the unqualified top-level arm (through the
+        // projected declaration, so a generic callee's free parameter
+        // collapses to the unknown face rather than leaking its raw
+        // spelling); an unresolved prefix hit keeps the unknown face
+        // (its own miss row reports).
+        if let RowShape::Member {
+            recv: Receiver::Prefix { name: prefix },
+        } = &row.shape
+            && let dartq_resolution::Lookup::Found(NamespaceEntry::Decl(file)) =
+                self.namespaces.lookup_prefixed(self.graph, self.lib, *prefix, row.name)
+            && let Some(decl) = self.index.get(file).and_then(|f| f.decl(row.name))
+        {
+            let decl = self.boundary.top(file, row.name, decl);
+            return self.instantiate_call_return(
+                row,
+                &Receiver::Prefix { name: *prefix },
+                decl.return_ty,
+            );
+        }
         let container = match &row.shape {
             RowShape::Member {
                 recv:
