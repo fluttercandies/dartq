@@ -200,3 +200,34 @@ fn prefixed_generic_callee_frees_to_unknown() {
         messages(&report)
     );
 }
+
+/// A foreign generic callee's parameter spelling is recovered even when
+/// an unrelated declaration in THIS file declares a type parameter of
+/// the same name: `pick`'s `T` is not `acc<T>`'s `T` — the recovery
+/// proves leaves from the call site's scope (the frame latch), never the
+/// file's global declaration table, so the free parameter still
+/// collapses to the unknown face (analyzer's `single_file_byte_store`
+/// `min` family: the file's own `withExclusiveAccess<T>` methods
+/// emptied the recovery and the raw `T` leaked into every sink).
+#[test]
+fn foreign_param_recovery_ignores_same_file_type_param_decls() {
+    let report = report_prefixed(
+        "class Payload { }\nT pick<T extends num>(T a, T b) => a;\n",
+        "import 'other.dart' as p;\n\
+         class Unrelated {\n\
+           T acc<T>(T Function() f) => f();\n\
+         }\n\
+         class Pool {\n\
+           void read() {\n\
+             var n = p.pick(1, 2);\n\
+             int o = 3 + n;\n\
+             print(o);\n\
+           }\n\
+         }\n",
+    );
+    assert!(
+        !messages(&report).iter().any(|m| m.contains("'T'")),
+        "raw schema spelling visible: {:?}",
+        messages(&report)
+    );
+}

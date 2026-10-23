@@ -1688,7 +1688,7 @@ impl<'a> Engine<'a> {
         match ty {
             Ty::Named { name, args, .. } => {
                 if args == ArgListId::EMPTY {
-                    if !self.named_type_is_type(name) && !out.contains(&name) {
+                    if !self.leaf_is_caller_type(name) && !out.contains(&name) {
                         out.push(name);
                     }
                     return;
@@ -1724,6 +1724,55 @@ impl<'a> Engine<'a> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The recovery's stricter face of [`Engine::named_type_is_type`]: a
+    /// type-parameter declaration elsewhere in this unit proves nothing at
+    /// the call. The annotation gate reads the file-global declaration
+    /// table (a same-file parameter spelling is never an undefined class),
+    /// but the foreign-callee parameter recovery asks what the CALL site
+    /// can prove: `min`'s `T` is not `acc<T>`'s `T`, and counting the
+    /// latter provable empties the recovery — the declared return then
+    /// leaks its raw parameter spelling into every sink downstream. Only
+    /// the frame latch's in-scope parameters prove; a `TypeParam`
+    /// declaration hit through either lookup layer never does.
+    fn leaf_is_caller_type(&self, name: StringId) -> bool {
+        if self.members.primitive_ids.contains(&name)
+            || self.type_params.contains(&name)
+            || self.pending_type_params.contains(&name)
+        {
+            return true;
+        }
+        if let Some((container, _)) = self.container_context()
+            && self
+                .index
+                .get(self.file)
+                .and_then(|f| f.container(container))
+                .is_some_and(|c| c.members.get(&name).is_some())
+        {
+            return false;
+        }
+        match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::Local(decl) => {
+                decl.kind != MicroKind::TypeParam && Self::decl_is_type(decl.kind)
+            }
+            ScopedHit::Found(NamespaceEntry::Decl(file)) => self
+                .index
+                .get(file)
+                .and_then(|f| f.decl(name))
+                .map_or(true, |decl| {
+                    decl.kind != MicroKind::TypeParam && Self::decl_is_type(decl.kind)
+                }),
+            ScopedHit::Found(NamespaceEntry::Prefix) | ScopedHit::Ambiguous(_) => false,
+            ScopedHit::NotFound => false,
         }
     }
 
