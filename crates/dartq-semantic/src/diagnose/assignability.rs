@@ -2573,6 +2573,22 @@ impl<'a> Engine<'a> {
         if ctx.scrutinee == Ty::Unknown {
             return;
         }
+        // A record- or function-typed scrutinee joins the name-level
+        // world as a shape-keyed unknown sentinel (`NameTy::from_semantic`
+        // — no name-level decomposition exists for the shape columns),
+        // and the official's unknown-scrutinee face applies to it alike:
+        // `createUnknownSpace`'s matched value "is matched by nothing"
+        // (shared.dart:310-320), so no row set can prove or refute — the
+        // whole-check suppression. Without it every case row failed the
+        // `ty <: single` filter and the switch reported a spurious
+        // covering gap (the nullable-function-typed field scrutinee of
+        // `switch (where) { null => .., final where => .. }`).
+        if matches!(
+            NameTy::from_semantic(ctx.scrutinee),
+            NameTy::Unknown(key) if key >= (1 << 41)
+        ) {
+            return;
+        }
         let world = self.name_world();
         let value = NameTy::from_semantic(ctx.scrutinee);
         let cases: Vec<Case<NameTy>> = ctx

@@ -427,3 +427,32 @@ fn raw_pattern_infers_through_intermediate_sealed_layer() {
         messages(&report)
     );
 }
+
+/// A record- or function-typed switch scrutinee suppresses the
+/// exhaustiveness check whole — the name-level world decomposes no shape
+/// columns, so the matched value joins as a shape-keyed unknown sentinel
+/// the official treats as matched-by-nothing (shared.dart:310-320); the
+/// binding-pattern row set can neither prove nor refute. Without the
+/// suppression every such switch reported a spurious covering gap
+/// (drift's `switch (where) { null => .., final where => .. }` over a
+/// nullable function-typed field).
+#[test]
+fn function_typed_scrutinee_suppresses_exhaustiveness() {
+    let report = super::test_rig::report_ops(
+        "class W {}\n\
+         class C {\n\
+           W? Function(int, int)? where;\n\
+           Object? f() {\n\
+             return switch (where) {\n\
+               null => null,\n\
+               final w => w(1, 2),\n\
+             };\n\
+           }\n\
+         }\n",
+    );
+    assert!(
+        count_code(&report, "non_exhaustive_switch_expression") == 0,
+        "function scrutinee reported: {:?}",
+        messages(&report)
+    );
+}
