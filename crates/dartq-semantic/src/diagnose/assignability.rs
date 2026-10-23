@@ -786,14 +786,28 @@ impl<'a> Engine<'a> {
                     _ => None,
                 };
                 match container {
-                    Some(container) => match self.walk_members(container, row.name) {
-                        Walk::Found(entry)
-                            if matches!(entry.kind, MemberKind::Getter | MemberKind::Field) =>
-                        {
-                            self.instantiate_accessor_static(container, recv, answer(&entry))
+                    Some(container) => {
+                        // A `super.member` read resolves against the SUPER
+                        // declaration, never the enclosing override — the
+                        // override's own covariant type would make a legal
+                        // `super.member!` read unnecessary (the official's
+                        // super property lookup starts past the enclosing
+                        // class's own member map, the same face
+                        // `walk_from(skip_own)` owns for `super.m` formals).
+                        let found = if matches!(recv, Receiver::Super { .. }) {
+                            self.walk_from(container, row.name, true)
+                        } else {
+                            self.walk_members(container, row.name)
+                        };
+                        match found {
+                            Walk::Found(entry)
+                                if matches!(entry.kind, MemberKind::Getter | MemberKind::Field) =>
+                            {
+                                self.instantiate_accessor_static(container, recv, answer(&entry))
+                            }
+                            _ => self.object_instance_read_ty(row),
                         }
-                        _ => self.object_instance_read_ty(row),
-                    },
+                    }
                     None => self.object_instance_read_ty(row),
                 }
             }

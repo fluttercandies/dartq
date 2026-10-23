@@ -480,3 +480,26 @@ fn never_call_does_not_anchor_the_dead_row_on_itself() {
         messages(&report)
     );
 }
+
+/// A `super.member` accessor read types against the SUPER declaration,
+/// never the enclosing override — the override's own covariant face made
+/// a legal `super.member!` read unnecessary (the element.dart
+/// `LibraryElementImpl get library => super.library!;` family).
+#[test]
+fn super_accessor_read_types_against_the_super_declaration() {
+    let report = super::test_rig::report_ops_bare(
+        "class Child {}\n\
+         class Base {\n\
+           Child? get child => null;\n\
+         }\n\
+         class Sub extends Base {\n\
+           @override\n\
+           Child get child => super.child!;\n\
+         }\n",
+    );
+    assert!(
+        count_code(&report, "unnecessary_non_null_assertion") == 0,
+        "super accessor read typed on the override: {:?}",
+        messages(&report)
+    );
+}
