@@ -2116,6 +2116,7 @@ impl<'a> Engine<'a> {
             && let Some(row) = self.rows.get(callee).cloned()
         {
             self.solve_call_params(callee, &row, &level.args);
+            self.refine_numeric_call_return(callee, &row, &level.args);
         }
         // Re-arm this level's own creation head: the engine slot is single,
         // so a nested argument group's open overwrote it with the inner

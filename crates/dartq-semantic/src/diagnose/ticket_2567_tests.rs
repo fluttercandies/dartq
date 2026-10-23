@@ -324,3 +324,37 @@ fn if_null_rhs_numeric_const_promotes_target() {
         messages(&report)
     );
 }
+
+/// `e1.clamp(e2, e3)` on an `int` receiver with `int` arguments answers
+/// `int` — the numeric-call refinement
+/// (`_refineNumericInvocationTypeNullSafe`'s `clamp` sibling,
+/// type_system.dart:2122-2160) — so the write to the `int` field checks
+/// clean (the corpus input_memory_stream.dart 92/99 family), while a
+/// non-`num` receiver's own `remainder` keeps its declared return (the
+/// BigInt regression guard).
+#[test]
+fn clamp_refines_to_int_on_int_operands() {
+    let report = report(
+        "class C {\n\
+           int _position = 0;\n\
+           int _length = 10;\n\
+           void rewind(int length) {\n\
+             _position -= length;\n\
+             _position = _position.clamp(0, _length);\n\
+           }\n\
+         }\n",
+    );
+    let report = FileReport {
+        diagnostics: report
+            .diagnostics
+            .into_iter()
+            .filter(|d| d.code.name != "undefined_class")
+            .collect(),
+        ..report
+    };
+    assert!(
+        report.diagnostics.is_empty(),
+        "clamp numeric-call refinement missing: {:?}",
+        messages(&report)
+    );
+}

@@ -2107,6 +2107,14 @@ pub(crate) struct Engine<'a> {
     /// oracle's call-site inference, replacing the free-parameter
     /// under-report stand-in.
     pub(crate) solved_call_params: FxHashMap<u32, Vec<(StringId, Ty)>>,
+    /// The numeric-call refinement's return (`e1.clamp(e2, e3)`,
+    /// `e1.remainder(e2)`), keyed by the callee row's range offset —
+    /// computed at the argument group's close where the typed arguments
+    /// are live, adopted by [`Engine::callee_return_ty`]
+    /// (`_refineNumericInvocationTypeNullSafe`, type_system.dart:2058-
+    /// 2165: `int` when every operand reads `int?`, `double` when all
+    /// read `double?`, the declared return otherwise).
+    pub(crate) refined_call_returns: FxHashMap<u32, Ty>,
     /// The open call-site type-argument capture (the written member types
     /// of one `<...>` group at an invocation).
     pub(crate) call_args_capture: Option<CallArgsCapture>,

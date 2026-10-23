@@ -299,6 +299,7 @@ impl<'a> Engine<'a> {
             member_recv_tys: FxHashMap::default(),
             call_ends: Vec::new(),
             solved_call_params: FxHashMap::default(),
+            refined_call_returns: FxHashMap::default(),
             non_promotions: Vec::new(),
             pending_non_promotion: Vec::new(),
             string_row_marks: Vec::new(),
@@ -2754,6 +2755,98 @@ impl<'a> Engine<'a> {
     /// bound — a user `extends num` class refines identically — so the
     /// call is unconditional on the resolved signature; non-`num`
     /// receivers and the other operators keep the declared return.
+    /// The numeric CALL refinement (`_refineNumericInvocationTypeNullSafe`
+    /// and its `clamp` sibling, type_system.dart:2058-2165): a member
+    /// invoke of `remainder` follows the binary ladder over its one
+    /// argument, and `clamp(e2, e3)` answers `int` when the receiver and
+    /// both arguments all read `int?` (the `?`-checked error-recovery
+    /// equivalence), `double` when all read `double?`, the declared
+    /// `num` otherwise — the receiver must be `num?`-family for any of
+    /// it. The typed arguments are live exactly at the argument group's
+    /// close, so the refined return stashes there (keyed on the callee
+    /// row's range offset) and [`Self::callee_return_ty`] adopts it.
+    pub(crate) fn refine_numeric_call_return(
+        &mut self,
+        callee: usize,
+        row: &Row,
+        args: &[(Option<StringId>, Ty, bool, SourceRange)],
+    ) {
+        let name = self.strings.resolve(row.name);
+        if !matches!(name, "clamp" | "remainder") {
+            return;
+        }
+        // The receiver's static type: the pre-merge callee's receiver row
+        // sits directly below (`_position.clamp(...)`), typed by its
+        // declared face.
+        let Some(below) = callee
+            .checked_sub(1)
+            .and_then(|index| self.rows.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let recv = match &below.shape {
+            RowShape::Bare(info) => Engine::receiver_of_bare(*info),
+            RowShape::Member { recv } => *recv,
+            _ => return,
+        };
+        let recv_ty = match recv {
+            Receiver::Typed { ty, .. } => ty,
+            _ => return,
+        };
+        let positional: Vec<Ty> = args
+            .iter()
+            .filter(|(label, ..)| label.is_none())
+            .map(|(_, ty, ..)| *ty)
+            .collect();
+        let (int, double, num) = (
+            self.members.primitive_ids[0],
+            self.members.primitive_ids[1],
+            self.members.primitive_ids[2],
+        );
+        let named_q = |head| Ty::Named {
+            name: head,
+            nullable: true,
+            args: ArgListId::EMPTY,
+        };
+        // The ladder owns `num`-family receivers only — a `BigInt
+        // .remainder` or a user class's own `remainder` keeps the member
+        // walk's declared return (`_refineNumericInvocationTypeNullSafe`'s
+        // `T <: num?` gate; the `num`-typed `remainder` of a non-`num`
+        // receiver is never this face's answer).
+        if !self.name_subtype(recv_ty, named_q(num)) {
+            return;
+        }
+        let refined = match name {
+            "remainder" if positional.len() == 1 => {
+                let declared = Ty::named(num);
+                self.refine_numeric_binary(
+                    "remainder",
+                    recv_ty,
+                    OperandFace::Typed(positional[0]),
+                    declared,
+                )
+            }
+            "clamp" if positional.len() == 2 => {
+                let all = |tys: &[Ty], head| {
+                    tys.iter().all(|t| *t != Ty::Never && self.name_subtype(*t, named_q(head)))
+                };
+                let operands = [recv_ty, positional[0], positional[1]];
+                if all(&operands, int) {
+                    Ty::named(int)
+                } else if all(&operands, double) {
+                    Ty::named(double)
+                } else {
+                    Ty::named(num)
+                }
+            }
+            _ => return,
+        };
+        if refined != Ty::UNKNOWN {
+            self.refined_call_returns.insert(row.range.offset, refined);
+        }
+    }
+
     pub(crate) fn refine_numeric_binary(
         &self,
         op: &str,
@@ -2761,7 +2854,7 @@ impl<'a> Engine<'a> {
         right: OperandFace,
         declared: Ty,
     ) -> Ty {
-        if !matches!(op, "+" | "-" | "*" | "%") {
+        if !matches!(op, "+" | "-" | "*" | "%" | "remainder") {
             return declared;
         }
         let (int, double, num) = (

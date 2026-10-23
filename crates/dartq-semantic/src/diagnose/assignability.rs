@@ -890,6 +890,12 @@ impl<'a> Engine<'a> {
     /// walks the container its merged receiver names. Unresolvable shapes
     /// suppress.
     pub(crate) fn callee_return_ty(&self, row: &Row) -> Ty {
+        // The numeric-call refinement's answer (`clamp`, `remainder`)
+        // wins over the member walk's declared return — it stashed at the
+        // argument group's close, where the typed arguments were live.
+        if let Some(refined) = self.refined_call_returns.get(&row.range.offset) {
+            return *refined;
+        }
         if !row.qualified {
             if self
                 .frames
