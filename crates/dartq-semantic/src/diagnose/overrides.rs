@@ -280,7 +280,26 @@ impl<'a> Engine<'a> {
                 // F1: the found entry belongs to `found_owner`'s pool —
                 // project it before it flows into rows or message text.
                 self.member_faces.found_origin.set(Some(name));
-                return Walk::Found(self.boundary.member(found_owner, name, member, entry));
+                let projected = self.boundary.member(found_owner, name, member, entry);
+                // An ancestor hop's found entry reads through the writer's
+                // written clause arguments — `class B extends A<int>`
+                // finds `A`'s `T get value` as `int` — the same
+                // application-site substitution the mixin hop runs, keyed
+                // on this climb's own edge (`writer extends name<Args>`).
+                // The anchor's own members need no hop; an undecidable or
+                // unchanged face keeps the raw entry (the under-report
+                // posture).
+                if name != container {
+                    let found_entry =
+                        match self.mixin_env(writer, name, found_owner, &projected, &mut facts) {
+                            Instantiated::Applied(env) => Projected::Foreign(std::rc::Rc::new(
+                                self.substitute_entry(&projected, &env),
+                            )),
+                            Instantiated::Unchanged | Instantiated::Undecidable => projected,
+                        };
+                    return Walk::Found(found_entry);
+                }
+                return Walk::Found(projected);
             }
             skip_own = false;
             // The stacked applications, later first: each shadows the members
