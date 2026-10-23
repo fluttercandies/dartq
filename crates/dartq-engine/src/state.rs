@@ -417,6 +417,7 @@ impl UnitFacts {
 /// override applied — `l1::scan_unit`'s output). A pure function of the
 /// `FactsKey` inputs, so the cache entry serves every consumer that would
 /// otherwise re-derive it per dirty library or per query.
+#[derive(Clone)]
 pub struct ScannedFace {
     /// The settled token table (override rescans included).
     pub tokens: TokenTable,

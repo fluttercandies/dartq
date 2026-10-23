@@ -351,9 +351,41 @@ pub(crate) fn analyze(
         let captured: Vec<dartq_semantic::ClauseTrees> = gated
             .par_iter()
             .filter_map(|&file| {
-                let face = state.settled_face(file)?;
-                let bytes = state.store.get(state.residency[&file].content())?;
-                let text = std::str::from_utf8(bytes).ok()?;
+                // The persisted face when a cold recompute stored one; a
+                // warm-started or not-yet-folded file re-derives the pure
+                // face locally — the same fallback `class_modifiers_of`
+                // runs. The capture must not depend on fold order: the
+                // analyzed package's own files are exactly the ones no
+                // earlier fold has cached yet, and dropping them here left
+                // every in-package supertype edge on the name-level
+                // to-bounds face (`Parser<dynamic>`), losing the `is`
+                // promotions that ride the written clause arguments.
+                let face = state.settled_face(file).map(|face| (*face).clone());
+                let (face, text) = match face {
+                    Some(face) => {
+                        let content = state.residency[&file].content;
+                        let bytes = state.store.get(content)?;
+                        let text = std::str::from_utf8(bytes).ok()?;
+                        (face, text)
+                    }
+                    None => {
+                        let content = state.residency[&file].content;
+                        let bytes = state.store.get(content)?;
+                        let text = std::str::from_utf8(bytes).ok()?;
+                        let version =
+                            l1::language_version_for(&state.packages, &state.files, file);
+                        let (feature_set, settled, scanned, _) =
+                            l1::scan_unit(text, version, file, &state.grants());
+                        (
+                            crate::state::ScannedFace {
+                                tokens: scanned.tokens,
+                                features: feature_set,
+                                version: settled,
+                            },
+                            text,
+                        )
+                    }
+                };
                 let mut trees = dartq_semantic::ClauseTrees::empty();
                 dartq_semantic::capture_clause_trees(
                     file,

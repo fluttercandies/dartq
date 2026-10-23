@@ -613,7 +613,8 @@ impl LibraryTypes {
                 let Some(tree) = bound_tree else {
                     continue;
                 };
-                let bound = clause_arg_ty(&table, &registry, &decl_params, &facts, &scope, tree);
+                let bound =
+                    clause_arg_ty(strings, &table, &registry, &decl_params, &facts, &scope, tree);
                 facts.set(
                     param_id,
                     ParamFacts {
@@ -645,7 +646,7 @@ impl LibraryTypes {
                 let scope = scope_of(capture, decl);
                 for tree in &capture.supers {
                     if let Some(ty) =
-                        clause_tree_ty(&table, &registry, &decl_params, &facts, &scope, tree)
+                        clause_tree_ty(strings, &table, &registry, &decl_params, &facts, &scope, tree)
                         && matches!(
                             table.get(ty).kind(),
                             TypeKind::Interface { .. }
@@ -1332,7 +1333,28 @@ fn clause_head_instantiation(
 /// `crate::bounds`'s unmodelable-face suppression). A bare generic head
 /// (`extends S` under `S<T>`) instantiates to bounds exactly like the
 /// clause-name arm.
+/// A clause leaf's builtin spelling: `Never`, `Null`, `void` and
+/// `dynamic` intern as their unit kinds, not registry declarations —
+/// `class Failure extends Result<Never>` rides its `Never` argument, and
+/// an unregistered-name miss would drop the whole edge where the oracle
+/// carries `Result<Never>` (making `Failure <: S` undecidable). The
+/// per-node `?` is honored for `Never` only (`Never?` interns as `Null`,
+/// type.dart:1207-1209; `Null`/`void`/`dynamic` are always non-`?`).
+fn clause_builtin_ty(table: &TypeTable, head: &str, nullable: bool) -> Option<TypeId> {
+    let uninterned = match head {
+        "Never" => {
+            return Some(table.intern(UninternedType::Never, nullable));
+        }
+        "Null" => UninternedType::Null,
+        "void" => UninternedType::Void,
+        "dynamic" => UninternedType::Dynamic,
+        _ => return None,
+    };
+    Some(table.intern(uninterned, false))
+}
+
 fn clause_tree_ty(
+    strings: &StringTable,
     table: &TypeTable,
     registry: &FxHashMap<StringId, TypeDeclId>,
     decl_params: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
@@ -1353,6 +1375,11 @@ fn clause_tree_ty(
             table.intern(UninternedType::TypeParameter { parameter }, false),
         );
     }
+    if tree.args.is_empty()
+        && let Some(builtin) = clause_builtin_ty(table, strings.resolve(tree.head), false)
+    {
+        return Some(builtin);
+    }
     let &decl = registry.get(&tree.head)?;
     let args = if tree.args.is_empty() {
         instantiate_type_formals_to_bounds(
@@ -1372,7 +1399,7 @@ fn clause_tree_ty(
             // tree nullable at ITS root maps nullable (subtype.dart's
             // argument nullability is per-node), so the `tree.nullable`
             // gate above is root-only.
-            args.push(clause_arg_ty(table, registry, decl_params, facts, scope, arg)?);
+            args.push(clause_arg_ty(strings, table, registry, decl_params, facts, scope, arg)?);
         }
         args
     };
@@ -1383,6 +1410,7 @@ fn clause_tree_ty(
 /// `nullable` honored per node (a `T?` argument is legal where the
 /// supertype root is not).
 fn clause_arg_ty(
+    strings: &StringTable,
     table: &TypeTable,
     registry: &FxHashMap<StringId, TypeDeclId>,
     decl_params: &FxHashMap<TypeDeclId, Vec<TypeParamId>>,
@@ -1400,6 +1428,11 @@ fn clause_arg_ty(
             table.intern(UninternedType::TypeParameter { parameter }, tree.nullable),
         );
     }
+    if tree.args.is_empty()
+        && let Some(builtin) = clause_builtin_ty(table, strings.resolve(tree.head), tree.nullable)
+    {
+        return Some(builtin);
+    }
     let &decl = registry.get(&tree.head)?;
     let args = if tree.args.is_empty() {
         instantiate_type_formals_to_bounds(
@@ -1415,7 +1448,7 @@ fn clause_arg_ty(
         }
         let mut args = Vec::with_capacity(tree.args.len());
         for arg in &tree.args {
-            args.push(clause_arg_ty(table, registry, decl_params, facts, scope, arg)?);
+            args.push(clause_arg_ty(strings, table, registry, decl_params, facts, scope, arg)?);
         }
         args
     };

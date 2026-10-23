@@ -358,3 +358,33 @@ fn clamp_refines_to_int_on_int_operands() {
         messages(&report)
     );
 }
+
+/// A supertype clause's `Never` argument carries into the edge —
+/// `class Failure extends Result<Never>` keeps its supertype, so
+/// `limiter is Failure` promotes and `return limiter` satisfies
+/// `Result<List<int>>` (Never is bottom; the unregistered-name miss
+/// dropped the whole edge and both the promotion and the return went
+/// red — the greedy.dart 94/97 family, oracle-silent).
+#[test]
+fn never_clause_argument_keeps_the_supertype_edge() {
+    let report = super::test_rig::report_ops(
+        "class Parser<R> { Result<R> parseOn(Object c) => throw 0; }\n\
+         class Result<R> {}\n\
+         class Failure extends Result<Never> {}\n\
+         class Picky extends Parser<int> {\n\
+           Result<List<int>> parseOn(Object c) {\n\
+             Parser<void> limit = throw 0;\n\
+             final limiter = limit.parseOn(c);\n\
+             if (limiter is Failure) {\n\
+               return limiter;\n\
+             }\n\
+             throw 0;\n\
+           }\n\
+         }\n",
+    );
+    assert!(
+        count_code(&report, "return_of_invalid_type") == 0,
+        "Never clause edge dropped: {:?}",
+        messages(&report)
+    );
+}
