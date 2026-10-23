@@ -291,3 +291,36 @@ fn if_null_rhs_generic_call_promotes_target() {
         messages(&report)
     );
 }
+
+/// A `??=` whose right side reads an unannotated numeric `static const`
+/// (`bufferSize ??= OutputFileStream.kDefaultBufferSize`) promotes the
+/// target: the collector's declaration-site inference types the const's
+/// member table entry from its arithmetic-literal initializer, the read
+/// stages `int`, and the join writes the non-null face (the corpus
+/// extract_archive_to_disk.dart 136 family).
+#[test]
+fn if_null_rhs_numeric_const_promotes_target() {
+    let report = report(
+        "class C {\n\
+           static const kDefault = 1024 * 1024;\n\
+         }\n\
+         void take(int v) {}\n\
+         void f(int? x) {\n\
+           x ??= C.kDefault;\n\
+           take(x);\n\
+         }\n",
+    );
+    let report = FileReport {
+        diagnostics: report
+            .diagnostics
+            .into_iter()
+            .filter(|d| d.code.name != "undefined_class")
+            .collect(),
+        ..report
+    };
+    assert!(
+        report.diagnostics.is_empty(),
+        "??= numeric-const-RHS promotion missing: {:?}",
+        messages(&report)
+    );
+}

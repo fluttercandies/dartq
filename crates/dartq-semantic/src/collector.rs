@@ -716,6 +716,68 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         self.field_group_ty.expect("latched above")
     }
 
+    /// The primitive face of an unannotated declarator's initializer when
+    /// the whole initializer is an arithmetic expression over numeric
+    /// literals — the declaration-site inference the oracle runs
+    /// (`static const kDefaultBufferSize = 1024 * 1024` answers `int`,
+    /// `final half = 1.5 * size` answers `double`). The byte scan after
+    /// the name accepts only numeric literals and the arithmetic operator
+    /// spellings up to the `;`/`,` that closes the declarator; any other
+    /// token (an identifier, a string, a member access — the run's own
+    /// shape decides validity) keeps the unknown face, the under-report
+    /// direction for initializers this face cannot read.
+    fn numeric_initializer_ty(&self, name_end: u32) -> Option<Ty> {
+        let bytes = self.source.as_bytes();
+        let mut i = name_end as usize;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'=') {
+            return None;
+        }
+        i += 1;
+        let mut saw_literal = false;
+        let mut saw_double = false;
+        loop {
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            match bytes.get(i)? {
+                b';' | b',' => break,
+                b'+' | b'-' | b'*' | b'/' | b'%' | b'~' | b'|' | b'^' | b'&'
+                | b'(' | b')' => i += 1,
+                b'<' | b'>' => {
+                    let run = bytes[i..].iter().take_while(|&&b| b == b'<' || b == b'>').count();
+                    if run > 3 {
+                        return None;
+                    }
+                    i += run;
+                }
+                b'0'..=b'9' => {
+                    let start = i;
+                    while i < bytes.len()
+                        && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i], b'_' | b'.'))
+                    {
+                        i += 1;
+                    }
+                    match numeric_literal_shape(&bytes[start..i])? {
+                        LiteralShape::Int => saw_literal = true,
+                        LiteralShape::Double => {
+                            saw_literal = true;
+                            saw_double = true;
+                        }
+                    }
+                }
+                _ => return None,
+            }
+        }
+        if !saw_literal {
+            return None;
+        }
+        let name = if saw_double { "double" } else { "int" };
+        Some(Ty::named(self.strings.intern(name)))
+    }
+
     /// Latches the head identifier of the annotation being parsed (the
     /// star binds to whatever declaration follows, top-level or member —
     /// the claim points decide the face it lands on; the W7 constructor
@@ -2075,7 +2137,18 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             IdentifierContext::TopLevelVariableDeclaration
             | IdentifierContext::FieldDeclaration => {
                 if let Some((name, range)) = name_with_range {
-                    let ty = builder.field_group_ty();
+                    let mut ty = builder.field_group_ty();
+                    // An unannotated declarator's initializer infers its
+                    // type at the declaration site — the numeric face the
+                    // collector can read from the bytes alone (the
+                    // buffer-size idiom `static const kDefaultBufferSize
+                    // = 1024 * 1024` answers `int`; every use site's
+                    // member table then carries it).
+                    if ty == Ty::UNKNOWN
+                        && let Some(inferred) = builder.numeric_initializer_ty(range.end())
+                    {
+                        ty = inferred;
+                    }
                     let is_static = builder.field_static.unwrap_or(false);
                     let is_abstract = builder.field_abstract;
                     let is_external = builder.field_external;
@@ -4426,4 +4499,48 @@ mod tests {
         );
         assert_eq!(restored.type_args().len(), 2);
     }
+}
+
+/// The shape of one numeric literal run: `int` for a plain-digit or hex
+/// spelling, `double` once a `.`, `e`, or `E` marker appears outside the
+/// hex prefix. Anything else (a member access glued to a literal, an
+/// invalid suffix letter) is not a literal this face can type.
+enum LiteralShape {
+    Int,
+    Double,
+}
+
+fn numeric_literal_shape(bytes: &[u8]) -> Option<LiteralShape> {
+    let is_hex = bytes.len() > 2 && bytes[0] == b'0' && (bytes[1] | 0x20) == b'x';
+    if is_hex {
+        let hex_only = bytes[2..]
+            .iter()
+            .all(|b| b.is_ascii_hexdigit() || *b == b'_');
+        return hex_only.then_some(LiteralShape::Int);
+    }
+    let mut saw_dot = false;
+    let mut saw_exp = false;
+    for (index, &b) in bytes.iter().enumerate() {
+        match b {
+            b'0'..=b'9' | b'_' => {}
+            b'.' if !saw_dot && !saw_exp => saw_dot = true,
+            b'e' | b'E' if !saw_exp && index > 0 => saw_exp = true,
+            _ => return None,
+        }
+    }
+    // An exponent marker without a following digit (`1e`) is not a
+    // literal this face claims; the leading position rules out `e`
+    // starting the run (the digit-first caller guarantees it).
+    if saw_exp
+        && !bytes
+            .iter()
+            .any(|&b| b.is_ascii_digit() && b != b'_')
+    {
+        return None;
+    }
+    Some(if saw_dot || saw_exp {
+        LiteralShape::Double
+    } else {
+        LiteralShape::Int
+    })
 }
