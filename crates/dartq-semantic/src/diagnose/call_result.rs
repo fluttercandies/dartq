@@ -26,6 +26,16 @@ impl Engine<'_> {
             return declared;
         }
         let mut keys: FxHashMap<StringId, Ty> = seeds.into_iter().collect();
+        // The send-close upward inference's solution joins after the
+        // fixing slots (explicit type arguments, receiver seeds): the
+        // oracle infers what the call site leaves free, and the stashed
+        // bindings are exactly that face — `math.max(0, n - 1)` answers
+        // `int` instead of the free-parameter `Unknown` stand-in.
+        if let Some(solved) = self.solved_call_params.get(&row.range.offset) {
+            for (param, ty) in solved {
+                keys.entry(*param).or_insert(*ty);
+            }
+        }
         // The explicit type-argument list pairs against the declaration's
         // own parameter order; a recovered (unordered) spelling set pairs
         // against nothing.

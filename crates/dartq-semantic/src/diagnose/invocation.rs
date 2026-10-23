@@ -2105,6 +2105,18 @@ impl<'a> Engine<'a> {
         self.flush_argument();
         let levels = self.arg_levels.pop();
         let enum_const = levels.as_ref().is_some_and(|level| level.enum_const);
+        // The send-close upward inference: the argument types close with
+        // this level, so the callee's inference parameters the call solves
+        // from them unify exactly here — every later return read (the
+        // assignment staging, the `var` window) adopts the stashed
+        // solution through [`Engine::instantiate_call_return`].
+        if let Some(level) = levels.as_ref()
+            && !enum_const
+            && let Some(Some(callee)) = self.invokes.last().copied()
+            && let Some(row) = self.rows.get(callee).cloned()
+        {
+            self.solve_call_params(callee, &row, &level.args);
+        }
         // Re-arm this level's own creation head: the engine slot is single,
         // so a nested argument group's open overwrote it with the inner
         // head (and the inner close's `report_bare_creation_miss` path may

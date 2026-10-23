@@ -264,3 +264,30 @@ fn if_null_rhs_binary_promotes_target() {
         messages(&report)
     );
 }
+
+/// A `??=` whose right side is a generic call the site solves
+/// (`x ??= pick(a, b)` over `T pick<T>(T a, T b)`) promotes the target:
+/// the send-close upward inference binds `T := W` from the typed
+/// arguments, the instantiated return reaches the write staging, and
+/// the join writes the non-null face (the corpus `math.max(0, n - 1)`
+/// family — same-file spelling here; the prefixed face rides the same
+/// solver through the import table). `W y = x` observably needs the
+/// promotion — an unpromoted `W?` writes `invalid_assignment`.
+#[test]
+fn if_null_rhs_generic_call_promotes_target() {
+    let report = report(
+        "class W {}\n\
+         T pick<T>(T a, T b) => a;\n\
+         W sink(W v) => v;\n\
+         void f(W? x, W a, W b) {\n\
+           x ??= pick(a, b);\n\
+           W y = x;\n\
+           sink(y);\n\
+         }\n",
+    );
+    assert!(
+        report.diagnostics.is_empty(),
+        "??= generic-call-RHS promotion missing: {:?}",
+        messages(&report)
+    );
+}

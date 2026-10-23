@@ -1494,6 +1494,120 @@ impl<'a> Engine<'a> {
 (out != ty && self.schema_type_is_decidable(out)).then_some(out)
     }
 
+    /// The send-close upward face: unify the call's typed arguments
+    /// against the callee's formals, solving the callee's inference
+    /// parameters (`math.max(0, n - 1)` binds `T := int`) for the return
+    /// read. The bind-time solver ([`Self::closure_schema_instantiate`])
+    /// runs the same unification for closure formals while the send is
+    /// open; the return's consumers (the assignment staging, the `var`
+    /// window) read after the levels close, so the solution stashes keyed
+    /// on the callee row's range offset — stable while row indexes churn
+    /// under the folds. Conflicting candidates poison the slot and the
+    /// solved types must stay decidable in the caller's scope, the same
+    /// rules the bind-time solver applies; anything less keeps the
+    /// free-parameter under-report stand-in.
+    pub(crate) fn solve_call_params(
+        &mut self,
+        callee: usize,
+        row: &Row,
+        args: &[(Option<StringId>, Ty, bool, SourceRange)],
+    ) {
+        let recv = match &row.shape {
+            RowShape::Member { recv } => *recv,
+            RowShape::Bare(info) => {
+                let recv = Engine::receiver_of_bare(*info);
+                // A pre-merge qualified callee (`math.max(...)` at the
+                // group's close — the member merge that retypes the row
+                // to `Member` runs after the send): the receiver row sits
+                // directly below, and its bare face names it.
+                if row.qualified
+                    && matches!(recv, Receiver::Unknown)
+                    && let Some(below) = callee
+                        .checked_sub(1)
+                        .and_then(|index| self.rows.get(index))
+                    && let RowShape::Bare(info) = below.shape
+                {
+                    Engine::receiver_of_bare(info)
+                } else {
+                    recv
+                }
+            }
+            _ => return,
+        };
+        let Some((params, _, _)) = self.closure_callee_params(&recv, row.name) else {
+            return;
+        };
+        if params.is_empty() {
+            return;
+        }
+        // The prefixed callee's formals live in the foreign declaration —
+        // projected into the diagnosing pool before any unification reads
+        // them (the same cross-pool discipline `closure_callee_params`'
+        // prefix arm applies). Every other receiver keeps the shared
+        // formal table face.
+        let formals = match &recv {
+            Receiver::Prefix { name: prefix } => {
+                let dartq_resolution::Lookup::Found(dartq_resolution::NamespaceEntry::Decl(file)) =
+                    self.namespaces.lookup_prefixed(self.graph, self.lib, *prefix, row.name)
+                else {
+                    return;
+                };
+                let Some(decl) = self.index.get(file).and_then(|f| f.decl(row.name)) else {
+                    return;
+                };
+                let decl = self.boundary.top(file, row.name, decl);
+                decl.formals.as_deref().cloned()
+            }
+            _ => self.callee_formals(&recv, row.name),
+        };
+        let Some(formals) = formals else {
+            return;
+        };
+        let mut candidates: Vec<(StringId, Ty)> = Vec::new();
+        let mut positional_index = 0usize;
+        for (name, ty, _, _) in args {
+            let formal = match name {
+                Some(label) => formals.named_formal(*label),
+                None => {
+                    let formal = formals.positional.get(positional_index);
+                    positional_index += 1;
+                    formal
+                }
+            };
+            if let (Some(formal), true) = (formal, *ty != Ty::Unknown) {
+                self.closure_unify_upward(formal.ty, *ty, &params, &mut candidates);
+            }
+        }
+        let param_index =
+            |name: StringId| params.iter().position(|(param, _)| *param == name);
+        let mut solutions: Vec<Option<Ty>> = vec![None; params.len()];
+        let mut poisoned: FxHashSet<usize> = FxHashSet::default();
+        for (param, ty) in candidates {
+            let Some(index) = param_index(param) else {
+                continue;
+            };
+            if poisoned.contains(&index) {
+                continue;
+            }
+            match solutions[index] {
+                None if self.schema_type_is_decidable(ty) => solutions[index] = Some(ty),
+                Some(kept) if kept == ty => {}
+                _ => {
+                    poisoned.insert(index);
+                    solutions[index] = None;
+                }
+            }
+        }
+        let map: Vec<(StringId, Ty)> = params
+            .iter()
+            .zip(solutions.iter())
+            .filter_map(|((param, _), solution)| solution.map(|ty| (*param, ty)))
+            .collect();
+        if !map.is_empty() {
+            self.solved_call_params.insert(row.range.offset, map);
+        }
+    }
+
     /// Whether a substituted schema entry is a type the caller's scope can
     /// name: `dynamic` never infers, and a named type is decidable only
     /// when its head and every written type argument prove as types. Every

@@ -298,6 +298,7 @@ impl<'a> Engine<'a> {
             member_reads: Vec::new(),
             member_recv_tys: FxHashMap::default(),
             call_ends: Vec::new(),
+            solved_call_params: FxHashMap::default(),
             non_promotions: Vec::new(),
             pending_non_promotion: Vec::new(),
             string_row_marks: Vec::new(),
@@ -2695,34 +2696,50 @@ impl<'a> Engine<'a> {
             if entry.kind != MemberKind::Method {
                 return None;
             }
-            let formals = entry.formals.as_deref()?;
-            let formal = formals.positional.first()?;
-            return Some((formal.ty, entry.return_ty));
+            // A method entry with no positional formal cannot serve the
+            // BINARY invocation — `int` declares only the unary
+            // `int operator -()` (the binary `-` is inherited from `num`),
+            // so a formal-less hit is a unary-face miss for this lookup:
+            // the `int`/`double` receivers fall through to the `num`
+            // fiction below instead of the whole signature answering
+            // `None` (`output.length - startDataLength` folded unknown).
+            if let Some(formals) = entry.formals.as_deref()
+                && let Some(formal) = formals.positional.first()
+            {
+                return Some((formal.ty, entry.return_ty));
+            }
         }
         // The core-fiction arm: `int`/`double` inherit `num`'s arithmetic
-        // and relational face (the SDK declarations are external,
-        // unreachable by the member walk — the `num.+` signature answers
-        // `1 + x` on `int` receivers too); `String`/`bool` are not `num`
-        // receivers and never take this fallback. A head shadowed by an
-        // in-scope container declaration skips the fiction — upstream's
-        // property resolution on the shadowed type misses and the node
-        // answers invalid, so the fold stays silent.
-        if (recv_text == "int" || recv_text == "double")
-            && resolve_container(
-                self.graph,
-                self.namespaces,
-                self.index,
-                self.lib,
-                self.file,
-                name,
-            )
-            .is_none()
-        {
-            if let Some((_, _, param, ret)) = CORE_BINARY_OPERATORS
-                .iter()
-                .find(|(recv, o, ..)| *o == op && *recv == "num")
-            {
-                return Some((Ty::named(self.intern(*param)), Ty::named(self.intern(*ret))));
+        // and relational face (the SDK declarations are external, the
+        // member walk stops at the receiver's own most-derived hit —
+        // dart:core `int` declares only the unary `int operator -()`, so
+        // the binary `-` never reaches `num`'s declaration through the
+        // walk; the `num.-` signature answers `x - y` on `int` receivers
+        // here); `String`/`bool` are not `num` receivers and never take
+        // this fallback. The gate is the precise shadow test
+        // ([`Self::refine_numeric_binary`]'s memo): the fiction serves the
+        // head unless a USER container shadows the core name while `num`
+        // itself is absent (`class int {}` subtypes nothing numeric) — the
+        // real dart:core pair resolves both names, and the earlier
+        // any-resolution gate would skip the fiction in every real package
+        // (dart:core auto-import resolves `int`), folding every `int`
+        // subtraction unknown.
+        if recv_text == "int" || recv_text == "double" {
+            let num_id = self.members.primitive_ids[2];
+            let container = |head| {
+                resolve_container(
+                    self.graph, self.namespaces, self.index, self.lib, self.file, head,
+                )
+            };
+            let shadowed = container(name).is_some()
+                && (name == num_id || container(num_id).is_none());
+            if !shadowed {
+                if let Some((_, _, param, ret)) = CORE_BINARY_OPERATORS
+                    .iter()
+                    .find(|(recv, o, ..)| *o == op && *recv == "num")
+                {
+                    return Some((Ty::named(self.intern(*param)), Ty::named(self.intern(*ret))));
+                }
             }
         }
         None
@@ -2973,6 +2990,37 @@ impl<'a> Engine<'a> {
             }
         };
         let _ = op_range;
+        // The marked left row anchors at its own member token (`node
+        // .selector.end`'s `.end` row; the receiver rows a merge absorbs
+        // never reach the fold), while the expression's true head sits in
+        // the source bytes — a dotted chain of identifiers joined by `.`
+        // or `?.`. Walk it back so the folded row spans the whole binary
+        // expression: the oracle's argument/assignment rows anchor there
+        // (`node.selector.end - …` at the expression head, never at a
+        // mid-chain member token).
+        let is_ident_byte =
+            |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        let mut expr_start = left.range.offset;
+        loop {
+            let Some(mut gap) = expr_start.checked_sub(1) else {
+                break;
+            };
+            match self.byte_at(gap) {
+                Some(b'.') => gap -= 1,
+                Some(b'?') if gap >= 2 && self.byte_at(gap - 1) == Some(b'.') => gap -= 2,
+                _ => break,
+            }
+            let mut head = gap;
+            while head > 0
+                && self.byte_at(head - 1).is_some_and(is_ident_byte)
+            {
+                head -= 1;
+            }
+            if head == gap {
+                break;
+            }
+            expr_start = head;
+        }
         // Fold: the operands defer to pass 2 (their uses, misses, and
         // operator-definedness verdicts ride `deferred_miss_rows`), the
         // node's own row answers the enclosing check. A `mark_operator`
@@ -2984,8 +3032,8 @@ impl<'a> Engine<'a> {
         self.rows.push(Row {
             name: self.intern(""),
             range: SourceRange {
-                offset: left.range.offset,
-                length: right.range.end().saturating_sub(left.range.offset),
+                offset: expr_start,
+                length: right.range.end().saturating_sub(expr_start),
             },
             qualified: false,
             shape: RowShape::Value,

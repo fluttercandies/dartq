@@ -2098,6 +2098,15 @@ pub(crate) struct Engine<'a> {
     /// index (pushed at the group's close, consumed by the argument check
     /// or the tear-off/implicit-creation faces).
     pub(crate) call_type_args: Vec<(usize, Box<[Ty]>)>,
+    /// The send-close upward inference's solved parameters, keyed by the
+    /// callee row's range offset (stable while row indexes churn under the
+    /// folds): a generic call's typed arguments unify against the callee's
+    /// formals once at the argument group's close (`math.max(0, n - 1)`
+    /// binds `T := int`), and every later return read
+    /// ([`Engine::instantiate_call_return`]) adopts the solution — the
+    /// oracle's call-site inference, replacing the free-parameter
+    /// under-report stand-in.
+    pub(crate) solved_call_params: FxHashMap<u32, Vec<(StringId, Ty)>>,
     /// The open call-site type-argument capture (the written member types
     /// of one `<...>` group at an invocation).
     pub(crate) call_args_capture: Option<CallArgsCapture>,
