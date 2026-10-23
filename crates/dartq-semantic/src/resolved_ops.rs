@@ -3202,28 +3202,66 @@ impl TypeOps for ResolvedTypeOps<'_> {
             .registry
             .get(&from_name)
             .filter(|_| !self.snapshot.non_containers.contains(&from_name))?;
-        // The superclass hop spelling the matched declaration. The
+        // The superclass-hop CHAIN spelling the matched declaration. The
         // declared-ness gate keeps `supertypes`'s panic contract.
         if self.snapshot.hierarchy.decl(tested_decl).is_none() {
             return None;
         }
-        let hop = self
-            .snapshot
-            .hierarchy
-            .supertypes(tested_decl)
-            .iter()
-            .copied()
-            .find(|ty| {
-                matches!(
-                    self.snapshot.table.get(*ty).kind(),
-                    TypeKind::Interface { decl, .. } if decl == from_decl
-                )
-            })?;
-        let TypeKind::Interface { args: hop_range, .. } = self.snapshot.table.get(hop).kind()
-        else {
-            return None;
+        // The official `downwardInferObjectPatternRequiredType` walks the
+        // superclass chain step by step — `final class AD<T> extends
+        // AR<T>` under `sealed class AR<T> extends AV<T>` reaches `AV` in
+        // two hops, each hop's clause arguments instantiated against the
+        // substitution the walk carries. A direct-edges-only scan solved
+        // just the one-hop children and refused every grandchild (the raw
+        // spelling then failed the promotion gate and the scrutinee kept
+        // its declared type through the case body). The first path that
+        // reaches the matched declaration decides, in edge order — the
+        // order the direct scan's `find` used.
+        let mut queue: std::collections::VecDeque<(TypeDeclId, TypeId)> =
+            std::collections::VecDeque::new();
+        for &edge in self.snapshot.hierarchy.supertypes(tested_decl) {
+            queue.push_back((tested_decl, edge));
+        }
+        let mut visited: FxHashSet<(TypeDeclId, TypeId)> = FxHashSet::default();
+        let hop_args: Vec<TypeId> = loop {
+            let Some((owner, edge)) = queue.pop_front() else {
+                return None;
+            };
+            if !visited.insert((owner, edge)) {
+                continue;
+            }
+            if visited.len() > 512 {
+                return None;
+            }
+            let TypeKind::Interface { decl, args: range } = self.snapshot.table.get(edge).kind()
+            else {
+                continue;
+            };
+            if decl == from_decl {
+                break self.snapshot.table.args(range).to_vec();
+            }
+            // Extend the path: this hop's own supertype edges, their
+            // clause arguments instantiated against the arguments the
+            // walk carries for the hop — the hop IS `decl` instantiated
+            // as `args(range)`, so the substitution keys are the TARGET
+            // declaration's own formals (its edges are spelled over
+            // them), not the source's.
+            let Some(target_params) = self.snapshot.decl_params.get(&decl) else {
+                continue;
+            };
+            let map: Vec<(TypeParamId, TypeId)> = target_params
+                .iter()
+                .copied()
+                .zip(self.snapshot.table.args(range).iter().copied())
+                .collect();
+            if self.snapshot.hierarchy.decl(decl).is_none() {
+                continue;
+            }
+            for &next in self.snapshot.hierarchy.supertypes(decl) {
+                let substituted = self.snapshot.table.substitute(next, &map);
+                queue.push_back((decl, substituted));
+            }
         };
-        let hop_args = self.snapshot.table.args(hop_range);
         // Every hop argument is the tested declaration's own parameter
         // position, in declaration order, and the matched spelling writes
         // exactly that many — the inferred tree is then the matched tree

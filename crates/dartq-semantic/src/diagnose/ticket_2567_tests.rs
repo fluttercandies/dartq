@@ -388,3 +388,42 @@ fn never_clause_argument_keeps_the_supertype_edge() {
         messages(&report)
     );
 }
+
+/// A raw object pattern's downward inference walks the superclass CHAIN,
+/// not the direct edges: `final class AD<T> extends AR<T>` under
+/// `sealed class AR<T> extends AV<T>` narrows an `AV<T>` scrutinee to
+/// `AD<T>` in the case body (official `downwardInferObjectPattern
+/// RequiredType`'s step-by-step instantiation). The direct-only scan
+/// refused every grandchild and the case body's argument kept the
+/// declared `AV<T>` (riverpod async_value.dart map/when family — 6
+/// oracle-silent rows).
+#[test]
+fn raw_pattern_infers_through_intermediate_sealed_layer() {
+    let report = super::test_rig::report_ops(
+        "sealed class AsyncValue<T> {}\n\
+         sealed class AsyncResult<T> extends AsyncValue<T> {}\n\
+         final class AsyncData<T> extends AsyncResult<T> {}\n\
+         final class AsyncError<T> extends AsyncResult<T> {}\n\
+         final class AsyncLoading<T> extends AsyncValue<T> {}\n\
+         String pick<T>(\n\
+           AsyncValue<T> v, {\n\
+           required String Function(AsyncData<T> data) onData,\n\
+           required String Function(AsyncError<T> error) onError,\n\
+           required String Function(AsyncLoading<T> loading) onLoading,\n\
+         }) {\n\
+           switch (v) {\n\
+             case AsyncData():\n\
+               return onData(v);\n\
+             case AsyncError():\n\
+               return onError(v);\n\
+             case AsyncLoading():\n\
+               return onLoading(v);\n\
+           }\n\
+         }\n",
+    );
+    assert!(
+        count_code(&report, "argument_type_not_assignable") == 0,
+        "grandchild pattern inference dropped: {:?}",
+        messages(&report)
+    );
+}
