@@ -993,3 +993,36 @@ fn foreign_element_type_callback_formal_is_not_nullable() {
         .collect();
     assert!(unchecked.is_empty(), "unchecked rows: {:?}", unchecked);
 }
+
+/// A cascade section's receiver reads the target's flow-PROMOTED face:
+/// `if (v != null) v..a()..b()` resolves every section against
+/// `cascade.target2`'s promoted type (type_analyzer.dart's
+/// `cascadeReceiver`), so neither section reports
+/// `unchecked_use_of_nullable_value` (the corpus rows riverpod
+/// element.dart:126/127, analyzer ast_builder.dart:1349/1350, archive
+/// zip_decoder.dart:72/73). Only the pure null-stripping promotion
+/// substitutes — a `?..` section keeps its nullable latched face.
+#[test]
+fn cascade_section_receiver_reads_promoted_target() {
+    let r = super::test_rig::report_ops(concat!(
+        "class Fut { void ignore() {} }\n",
+        "class C { final Fut future; C(this.future); void completeError(Object e) {} }\n",
+        "class Holder { C? c;\n",
+        "  void m() {\n",
+        "    final v = c;\n",
+        "    if (v != null) {\n",
+        "      v\n",
+        "        ..future.ignore()\n",
+        "        ..completeError(0);\n",
+        "    }\n",
+        "  }\n",
+        "}\n",
+    ));
+    let unchecked: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "unchecked_use_of_nullable_value")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(unchecked, Vec::<&str>::new(), "{:?}", messages(&r));
+}

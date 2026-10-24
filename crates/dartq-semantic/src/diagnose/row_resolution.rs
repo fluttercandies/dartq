@@ -826,6 +826,54 @@ impl<'a> Engine<'a> {
     /// merge-time record byte for byte.
     fn cascade_recv_receiver(&self, row: &Row, recv: Receiver) -> Receiver {
         if self.cascade_sections.contains(&row.range.offset) {
+            // The section's receiver reads the latched target's PROMOTED
+            // face when one stands (`if (v != null) v..m()`: the oracle
+            // resolves every section against `cascade.target2`'s
+            // flow-promoted type, type_analyzer.dart's `cascadeReceiver`).
+            // The promotion face alone substitutes — same head, null
+            // stripped — never a rename or a widening (a `?..` section's
+            // target read stays nullable and keeps the latched face). Only
+            // the FIRST section's record carries the target's own span —
+            // a later section's recv_span is the previous section's RHS —
+            // so the scan walks back over this cascade's contiguous
+            // sections (the `;` boundary ends it) to the first one.
+            let mut target_span = None;
+            for read in self.member_reads.iter().rev() {
+                if read.offset > row.range.offset || !self.cascade_sections.contains(&read.offset)
+                {
+                    continue;
+                }
+                if self.semicolon_between(read.offset, row.range.offset) {
+                    break;
+                }
+                target_span = Some(read.recv_span);
+            }
+            if let Some(span) = target_span
+                && let Receiver::Typed {
+                    ty:
+                        Ty::Named {
+                            name: static_name,
+                            nullable: true,
+                            ..
+                        },
+                    ..
+                } = recv
+                && let Some(Ty::Named {
+                    name: face_name,
+                    nullable: false,
+                    ..
+                }) = self.recv_expression_ty(span)
+                && face_name == static_name
+            {
+                return Receiver::Typed {
+                    type_name: static_name,
+                    ty: Ty::Named {
+                        name: face_name,
+                        nullable: false,
+                        args: ArgListId::EMPTY,
+                    },
+                };
+            }
             return recv;
         }
         let Some(src) = self.member_reads.iter().rev().find(|read| {
