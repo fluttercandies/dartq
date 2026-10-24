@@ -4142,14 +4142,26 @@ impl<'a> Engine<'a> {
             // applied through a nullable `on` extension face never
             // dereferences (the applicability test already accepted the
             // nullable type), and a `?.` access unwrapped the receiver —
-            // both stay silent here.
+            // both stay silent here. The nullable-`on` extension wins over
+            // the instance member even when the class DECLARES the name:
+            // the receiver's nullable type resolves the access through the
+            // applicable extension, never the unsafe instance dereference
+            // (`extension E on C? { m }` keeps `C? x; x.m()` silent beside
+            // `C`'s own instance `m` — the oracle's applicable-extension
+            // consult runs against the nullable type first).
             if receiver_nullable {
-                let name_text = self.strings.resolve(row.name);
-                self.emit_corrected(
-                    SemanticCode::UncheckedUseOfNullableValue,
-                    row.range,
-                    name_text,
+                let extension_wins = matches!(
+                    self.extension_application(container, receiver_ty, row.name, write, true),
+                    ExtensionApp::Single
                 );
+                if !extension_wins {
+                    let name_text = self.strings.resolve(row.name);
+                    self.emit_corrected(
+                        SemanticCode::UncheckedUseOfNullableValue,
+                        row.range,
+                        name_text,
+                    );
+                }
             }
             return true;
         }
@@ -4165,8 +4177,7 @@ impl<'a> Engine<'a> {
                 .get(self.file)
                 .is_some_and(|f| f.has_extension_member(row.name));
         }
-        match self.extension_application(container, receiver_ty, row.name, write, receiver_nullable)
-        {
+        match self.extension_application(container, receiver_ty, row.name, write, receiver_nullable) {
             ExtensionApp::None => false,
             ExtensionApp::Single => true,
             // The member resolved through a non-nullable `on` face against a

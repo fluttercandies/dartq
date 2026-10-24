@@ -1182,3 +1182,33 @@ fn element_constructor_rhs_instantiates_from_the_write_context() {
         .collect();
     assert_eq!(miss, Vec::<&str>::new(), "{:?}", messages(&r));
 }
+
+/// A nullable-`on` extension member wins over the class's own instance
+/// member on a nullable receiver (#2567, the manifest_item shape): the
+/// oracle's applicable-extension consult runs against the nullable
+/// receiver type, and `extension E on E?` resolves the access without a
+/// dereference — `x.match(...)` stays silent even though the class also
+/// declares an instance `match` (the unsafe instance read never runs).
+
+#[test]
+fn nullable_on_extension_wins_over_instance_member() {
+    let r = super::test_rig::report_ops(concat!(
+        "class Z {\n",
+        "  bool match(Object other) => false;\n",
+        "}\n",
+        "extension EE on Z? {\n",
+        "  bool match(Object? other) => true;\n",
+        "}\n",
+        "class W {\n",
+        "  final Z? x;\n",
+        "  W(this.x);\n",
+        "  bool f() => x.match(null);\n",
+        "}\n",
+    ));
+    let miss: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .map(|d| d.code.name)
+        .collect();
+    assert_eq!(miss, Vec::<&str>::new(), "{:?}", messages(&r));
+}
