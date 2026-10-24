@@ -3572,9 +3572,19 @@ impl<'a> Engine<'a> {
             // [`Engine::argument_verdict`]: the matrix, the prefix-projection
             // gate, and the declared name lattice on the matrix's `None` cut
             // (unrelated in-file heads with no edge reject).
-            let rejects = self.argument_verdict(*ty, formal.ty, *literal) == Some(false);
+            // The flow read's re-bound or promoted face outranks the
+            // parse-time capture — the oracle checks the argument's static
+            // type at the send (`uriSource` past `if (uriSource is
+            // InSummarySource)` reads `InSummarySource`, never the declared
+            // `Source?`); a divergent or absent read keeps the captured
+            // face.
+            let flow_ty = self
+                .rebound_read_face(*range)
+                .or_else(|| self.read_type_at(*range))
+                .unwrap_or(*ty);
+            let rejects = self.argument_verdict(flow_ty, formal.ty, *literal) == Some(false);
             if rejects {
-                let from_text = self.ty_display(*ty);
+                let from_text = self.ty_display(flow_ty);
                 let to_text = self.ty_display(formal.ty);
                 // The const-constructor face precedes the assignability row —
                 // the oracle's constant evaluator runs the invocation's
@@ -4021,9 +4031,19 @@ impl<'a> Engine<'a> {
             };
             // [`Engine::argument_verdict`] — the same relation the enum
             // constant's walk and the staged teardown consult.
-            let rejects = self.argument_verdict(*ty, formal.ty, *literal) == Some(false);
+            // The flow read's re-bound or promoted face outranks the
+            // parse-time capture — the oracle checks the argument's static
+            // type at the send (`uriSource` past `if (uriSource is
+            // InSummarySource)` reads `InSummarySource`, never the declared
+            // `Source?`); a divergent or absent read keeps the captured
+            // face.
+            let flow_ty = self
+                .rebound_read_face(*range)
+                .or_else(|| self.read_type_at(*range))
+                .unwrap_or(*ty);
+            let rejects = self.argument_verdict(flow_ty, formal.ty, *literal) == Some(false);
             if rejects {
-                let from_text = self.ty_display(*ty);
+                let from_text = self.ty_display(flow_ty);
                 let to_text = self.ty_display(formal.ty);
                 let message =
                     SemanticCode::ArgumentTypeNotAssignable.message3(&from_text, &to_text, "");
