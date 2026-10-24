@@ -902,3 +902,32 @@ fn cross_file_inferred_scrutinee_keeps_arms_live() {
         .collect();
     assert!(dead.is_empty(), "arms died: {:?} ALL: {:?}", dead, messages(&r));
 }
+
+/// A callback formal over a receiver whose element type is a FOREIGN
+/// but real class (spelled by another graph unit, never imported into
+/// the diagnosing file — `List<Reference>.map((e) => e.uriString)`'s
+/// `_fe_analyzer_shared` `Reference`) is that class, not the `Object?`
+/// invalid recovery: the member read on the formal stays silent (the
+/// corpus driver.dart:2868 row — the unchecked verdict the recovery
+/// produced).
+#[test]
+fn foreign_element_type_callback_formal_is_not_nullable() {
+    let other = ["class Ref {}"].join("\n");
+    let main = [
+        "void f(List<p.Ref> refs) {",
+        "  refs.map((e) => e.uriString);",
+        "}",
+    ].join("\n");
+    let r = super::test_rig::report_ops_imports(&main, &[super::test_rig::RigImport {
+        uri: "package:t/other.dart",
+        prefix: Some("p"),
+        source: &other,
+    }]);
+    let unchecked: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "unchecked_use_of_nullable_value")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert!(unchecked.is_empty(), "unchecked rows: {:?}", unchecked);
+}

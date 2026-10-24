@@ -1293,7 +1293,19 @@ impl<'a> Engine<'a> {
                                 name: arg_head,
                                 nullable: false,
                                 args: arg_args,
-                            }) if self.named_type_is_type(arg_head)
+                            }) if (self.named_type_is_type(arg_head)
+                                // A foreign-but-real element type (the
+                                // receiver's first argument spelling a class
+                                // another graph unit declares — `List<
+                                // Reference>.map((e) => …)`'s foreign
+                                // `Reference`, never imported into the
+                                // diagnosing file): the oracle's element
+                                // model holds the resolved class, the
+                                // callback formal is that class — not the
+                                // `Object?` invalid recovery. Only a head
+                                // the whole graph fails to declare is
+                                // invalid.
+                                || !self.graph.declaring_libraries(arg_head).is_empty())
                                 && self.args_are_types(arg_args) =>
                             {
                                 None
