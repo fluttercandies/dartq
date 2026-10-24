@@ -1170,7 +1170,27 @@ impl Interp<'_> {
                 // carries the read-type row, and it is the write's target
                 // all the same (a compound operator keeps its rows — the
                 // read-modify-write target is also a read).
-                if *plain && let Some(span) = target.read_span {
+                //
+                // A cascade SECTION's write is the exception: its popped
+                // target is the cascade TARGET's own read (`builder..
+                // leftBracket = lb` writes the property, and the read at
+                // the frame's base is the RECEIVER use — the official keeps
+                // the target read promoted across a section write, and the
+                // pass-2 re-decision reads the promotion). The frame
+                // arithmetic answers which write this is: section values
+                // live at or above the cascade frame's base, so a stack
+                // BELOW the base means the popped target was the cascade
+                // target itself — a nested plain assign inside a section's
+                // arguments (`x..a = (y = 1)`) keeps its rows above the
+                // base and retracts normally.
+                let cascade_target_write = match self.stack.last() {
+                    Some(Frame::Cascade { exprs_base, .. }) => self.exprs.len() < *exprs_base,
+                    _ => false,
+                };
+                if *plain
+                    && !cascade_target_write
+                    && let Some(span) = target.read_span
+                {
                     self.facts.retain(|fact| {
                         !matches!(
                             fact,

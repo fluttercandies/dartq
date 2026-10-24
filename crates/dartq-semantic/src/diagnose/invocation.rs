@@ -469,6 +469,31 @@ impl<'a> Engine<'a> {
                             .insert(index, (member_offset, recv_span));
                     }
                 }
+                // The FIRST cascade section's selector re-reads the cascade
+                // target (`builder..a = x`'s `..a` reads `builder` exactly
+                // as a plain access does): it latches on the target's own
+                // read span, so the flow's promotion of the target read
+                // answers the receiver verdict (`var builder = _b;
+                // if (builder != null) builder..a = x` stays clean,
+                // ast_builder.dart:1349). Later sections keep the latched
+                // cascade-target classification (S4-B below) — keying them
+                // here would race the leftover receiver's own re-decision
+                // (the previous section's RHS read), which types the
+                // section against the RHS's face.
+                if self.in_cascade
+                    && is_section
+                    && cascade_recv.is_none()
+                    && let Some(target_span) = self.cascade_target_spans.last().copied()
+                {
+                    let member_offset = member.range.offset;
+                    if let Err(index) = self
+                        .promoted_recv_reads
+                        .binary_search_by(|(member, _)| member.cmp(&member_offset))
+                    {
+                        self.promoted_recv_reads
+                            .insert(index, (member_offset, target_span));
+                    }
+                }
                 // The chained-read candidate (#2283): a member folded over a
                 // promotion-latched member receiver freezes its receiver
                 // classification from the UNPROMOTED result face (`a.value`

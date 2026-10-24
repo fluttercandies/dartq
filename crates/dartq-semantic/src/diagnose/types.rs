@@ -2609,6 +2609,13 @@ pub(crate) struct Engine<'a> {
     /// extension-applicability nullability gate must read the receiver as
     /// non-nullable — a non-nullable `on C` face still applies.
     pub(crate) null_aware_members: FxHashSet<u32>,
+    /// The cascade targets' read spans, pushed at each `..`/`?..` and
+    /// popped at the cascade's close: every section selector of that
+    /// cascade re-reads this span (`builder..a = x`'s `..a` reads
+    /// `builder` exactly as a plain access does), so the promoted-receiver
+    /// re-decision latch keys every section on it — the flow's promotion
+    /// of the target read answers the receiver verdict.
+    pub(crate) cascade_target_spans: Vec<SourceRange>,
     /// A null-aware RECORD-field read (`result?.read` on
     /// `({M read, …})?`): the record arm bakes the shorted `?` into the
     /// row's stored face (its consumers read the written nullable), so

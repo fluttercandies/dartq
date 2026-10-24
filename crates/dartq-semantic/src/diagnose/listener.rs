@@ -4646,6 +4646,13 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.cascade_null_aware_op =
             (engine.text_of(operator) == Some("?..")).then_some(operator.range);
         engine.const_capture.begin_opaque_group();
+        // The cascade target's own read row: every section selector of
+        // this cascade re-reads it, and the promoted-receiver latch keys
+        // the sections on this span (the flow's promotion of the target
+        // read answers each section's receiver verdict).
+        if let Some(target) = engine.rows.last() {
+            engine.cascade_target_spans.push(target.range);
+        }
         let _ = operator;
     }
 
@@ -4653,6 +4660,7 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().end_cascade();
 
         let engine = &mut self.engine;
+        engine.cascade_target_spans.pop();
         engine.nsm_poison();
         // The sections are not uses (the official `CascadeExpression` arm
         // spares only the target).

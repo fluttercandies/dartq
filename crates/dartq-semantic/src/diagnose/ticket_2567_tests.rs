@@ -1437,3 +1437,43 @@ fn record_short_field_chain_continuation_stays_clean() {
     }
 }
 
+
+/// A cascade section's write no longer retracts the cascade target's own
+/// read facts: the first section's selector latches on the target's read
+/// span, so the flow's promotion of the target read answers the receiver
+/// verdict (`var builder = _b; if (builder != null) builder..a = x..b = y`
+/// stays clean through every section — the official keeps the target read
+/// promoted across section writes, ast_builder.dart:1349-1350).
+#[test]
+fn cascade_sections_on_promoted_local_stay_clean() {
+    let src = concat!(
+        "class B {\n",
+        "  int? leftBracket;\n",
+        "  int? rightBracket;\n",
+        "}\n",
+        "class W {\n",
+        "  B? _b;\n",
+        "  void f(int lb, int rb) {\n",
+        "    var builder = _b;\n",
+        "    if (builder != null) {\n",
+        "      builder\n",
+        "        ..leftBracket = lb\n",
+        "        ..rightBracket = rb;\n",
+        "    }\n",
+        "  }\n",
+        "}\n",
+    );
+    let r = super::test_rig::report_ops(src);
+    for d in &r.diagnostics {
+        assert_ne!(
+            d.code.name, "unchecked_use_of_nullable_value",
+            "the promoted target read answers every section's receiver: {}",
+            d.message
+        );
+        assert_ne!(
+            d.code.name, "undefined_setter",
+            "the sections resolve on the cascade target's own class: {}",
+            d.message
+        );
+    }
+}
