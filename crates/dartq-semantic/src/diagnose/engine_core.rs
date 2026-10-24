@@ -1958,6 +1958,15 @@ impl<'a> Engine<'a> {
                     args: ArgListId::EMPTY,
                 };
             }
+            // A record (or function) `on` type has NO honest name — the
+            // interned `on_ty` is the only spelling `this` owns, and the
+            // extension body's record accessors (`that.$1`) resolve through
+            // it exactly like the named face above.
+            if let Some(face) = face
+                && face.on_ty != Ty::Unknown
+            {
+                return face.on_ty;
+            }
         }
         Ty::named(container)
     }

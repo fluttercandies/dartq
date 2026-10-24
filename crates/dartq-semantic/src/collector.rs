@@ -2170,10 +2170,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         // A top-level record annotation arms itself: no `handle_type` head
         // ever fires for it (the record is the whole type), so the root
         // moves onto the armed slot here — `take_armed` interns it like a
-        // completed named tree.
+        // completed named tree. The just-completed record is the LAST
+        // root: an extension header's type-parameter group (`<T>` before
+        // `on (T,)?`) leaves its own roots beside it, and requiring a
+        // single-root window dropped every record `on` type into
+        // `Ty::Unknown` (the extension body's `this` then read `Object`).
         if let Some(site) = builder.capture.as_mut()
             && site.stack.is_empty()
-            && site.done.len() == 1
+            && !site.done.is_empty()
         {
             let mut site = builder.capture.take().expect("checked above");
             let tree = site.done.pop().expect("one root");

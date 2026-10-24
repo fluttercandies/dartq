@@ -1804,11 +1804,27 @@ impl<'o> Interp<'o> {
         if b.base == Base::Unknown {
             return a;
         }
+        // The official LUB joins the nullability suffix (`least_upper_bound`
+        // over the nullability-aware lattice): `LUB(Null, T) = T?` — a
+        // switch-expression arm folding `_ => null` with instance arms must
+        // keep the expression nullable, or a `?? ` over the assigned value
+        // folds its right side dead.
+        let either_null = a.base == Base::Null || b.base == Base::Null;
+        let nullable_join = a.nullable || b.nullable || either_null;
+        let with_join = |mut ty: Ty| -> Ty {
+            if ty.base != Base::Null {
+                ty.nullable = ty.nullable || nullable_join;
+            }
+            ty
+        };
+        if a.base == Base::Null && b.base == Base::Null {
+            return a;
+        }
         if self.ops.is_subtype(a, b) {
-            return b;
+            return with_join(b);
         }
         if self.ops.is_subtype(b, a) {
-            return a;
+            return with_join(a);
         }
         Ty::UNKNOWN
     }
@@ -1909,6 +1925,9 @@ impl<'o> Interp<'o> {
                 window.split_start = Some(span.range.offset);
             }
             return;
+        }
+        if std::env::var_os("DQ_PROBE_DEAD").is_some() {
+            eprintln!("DQ_PROBE_DEAD window opens at {}", span.range.offset);
         }
         self.dead = Some(DeadWindow::at(self.stack.len(), span));
     }
