@@ -255,6 +255,7 @@ impl<'a> Engine<'a> {
             ur_arg_base: Vec::new(),
             cascade_sections: FxHashSet::default(),
             null_aware_members: FxHashSet::default(),
+            record_short_fields: FxHashMap::default(),
             cascade_null_aware_op: None,
             used_names: FxHashSet::default(),
             import_used: FxHashSet::default(),

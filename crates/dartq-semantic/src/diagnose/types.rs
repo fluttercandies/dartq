@@ -2609,6 +2609,13 @@ pub(crate) struct Engine<'a> {
     /// extension-applicability nullability gate must read the receiver as
     /// non-nullable — a non-nullable `on C` face still applies.
     pub(crate) null_aware_members: FxHashSet<u32>,
+    /// A null-aware RECORD-field read (`result?.read` on
+    /// `({M read, …})?`): the record arm bakes the shorted `?` into the
+    /// row's stored face (its consumers read the written nullable), so
+    /// the field's own non-null face rides this map — the chain
+    /// continuation's null-aware latch (`result?.read.icc`) reads it the
+    /// way the class-member design reads the row's non-nullable type.
+    pub(crate) record_short_fields: FxHashMap<u32, Ty>,
     /// A `?..` cascade whose FIRST section has not yet merged: the
     /// null-aware check's operator range (`f()?..[i]`'s index section
     /// parses as `handle_indexed_expression` with no `?` — the `?` rode

@@ -883,9 +883,19 @@ impl<'a> Engine<'a> {
                 // A record-typed receiver (`config.strict`, `pair.$1`): the
                 // field getter's type is the shape's own field type (records
                 // carry no interface members besides `Object`'s, which stay
-                // `Unknown`); a `?.` read joins the null-aware `?`.
+                // `Unknown`); a `?.` read joins the null-aware `?` — and the
+                // field's own face rides the shorted-face map so a chain
+                // continuation (`result?.read.icc`) reads the member the way
+                // the class design reads the row's non-nullable type (the
+                // baked `?` is the SHORT's null, not the field's — the
+                // continuation latches off it, never dereferences it).
                 _ => match self.record_field_ty(merged_receiver_ty, member.name, is_null_aware) {
-                    Some(field) if is_null_aware => Self::nullable_form(field),
+                    Some(field) if is_null_aware => {
+                        if !Self::is_nullable_ty(field) {
+                            self.record_short_fields.insert(member.range.offset, field);
+                        }
+                        Self::nullable_form(field)
+                    }
                     Some(field) => field,
                     None => Ty::UNKNOWN,
                 },
@@ -985,12 +995,21 @@ impl<'a> Engine<'a> {
             // on `B?`) keeps the continuation's own
             // `unchecked_use_of_nullable_value` verdict, which the
             // receiver-side `!null_aware_members.contains` exclusion would
-            // otherwise silence. Cascade sections stay out — their own
-            // `?..` merge latches the first section, and a section's member
-            // row is never the cascade's value (the target is).
+            // otherwise silence. A null-aware RECORD-field receiver is the
+            // one folded face that reads nullable while its field reads
+            // non-null — the record arm bakes the SHORT's `?` into the
+            // stored face, so the shorted-field map answers the same
+            // question the row type answers for classes. Cascade sections
+            // stay out — their own `?..` merge latches the first section,
+            // and a section's member row is never the cascade's value (the
+            // target is).
+            let record_short = self
+                .record_short_fields
+                .get(&receiver_offset)
+                .is_some_and(|field| !Self::is_nullable_ty(*field));
             if !self.in_cascade
                 && self.null_aware_members.contains(&receiver_offset)
-                && !Self::is_nullable_ty(merged_receiver_ty)
+                && (!Self::is_nullable_ty(merged_receiver_ty) || record_short)
             {
                 self.null_aware_members.insert(member.range.offset);
             }

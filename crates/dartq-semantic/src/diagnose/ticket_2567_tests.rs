@@ -1398,3 +1398,42 @@ fn promoted_field_read_rhs_promotes_the_write_target() {
         );
     }
 }
+
+/// A null-aware RECORD-field read's chain continuation stays clean:
+/// `result?.read.icc` on `({M read, …})?` latches the continuation the
+/// way the class-member design does — the record arm bakes the short's
+/// `?` into the stored face, so the field's own face rides the
+/// shorted-field map and the continuation never dereferences the short's
+/// null (assignment_expression_resolver.dart:686/693/694).
+#[test]
+fn record_short_field_chain_continuation_stays_clean() {
+    let src = concat!(
+        "class M {\n",
+        "  final int icc = 0;\n",
+        "  final int eor = 1;\n",
+        "}\n",
+        "({M read, M write})? resolve() => null;\n",
+        "void f() {\n",
+        "  var result = resolve();\n",
+        "  var x = result?.read.icc;\n",
+        "  var y = result?.read.eor;\n",
+        "  var z = result?.write.eor;\n",
+        "  g(x ?? 0); g(y ?? 0); g(z ?? 0);\n",
+        "}\n",
+        "void g(int v) {}\n",
+    );
+    let r = super::test_rig::report_ops(src);
+    for d in &r.diagnostics {
+        assert_ne!(
+            d.code.name, "unchecked_use_of_nullable_value",
+            "the shorted field's chain continuation never dereferences the short: {}",
+            d.message
+        );
+        assert_ne!(
+            d.code.name, "argument_type_not_assignable",
+            "the chain node keeps the short's nullability for the enclosing read: {}",
+            d.message
+        );
+    }
+}
+
