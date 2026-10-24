@@ -1026,3 +1026,29 @@ fn cascade_section_receiver_reads_promoted_target() {
         .collect();
     assert_eq!(unchecked, Vec::<&str>::new(), "{:?}", messages(&r));
 }
+
+/// A write through an index-bang or getter-bang RHS types the assigned
+/// local: `command = commands[name]!` and `argResults = argResults
+/// .command!` both promote the nullable local for later reads (the args
+/// command_runner.dart:188-196 idiom — the oracle's write promotion over
+/// a null-asserted RHS).
+#[test]
+fn bang_rhs_write_promotes_the_local() {
+    let r = super::test_rig::report_ops(concat!(
+        "class Cmd { final sub = <String, Cmd>{}; final name = 'x'; Cmd? get command => null; }\n",
+        "void f(Map<String, Cmd> commands, Cmd argResults) {\n",
+        "  Cmd? command;\n",
+        "  command = commands[argResults.name]!;\n",
+        "  command.name;\n",
+        "  argResults = argResults.command!;\n",
+        "  argResults.name;\n",
+        "}\n",
+    ));
+    let unchecked: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "unchecked_use_of_nullable_value")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(unchecked, Vec::<&str>::new(), "{:?}", messages(&r));
+}
