@@ -2189,6 +2189,15 @@ impl<'a> Engine<'a> {
         let mut seen: Vec<ConstantValue> = Vec::new();
         for part in &parts {
             if let Verdict::Value(v) = eval(part, self) {
+                // The Instance sentinel is a value UNKNOWN to this subset
+                // (a deferred field — a cross-file const the in-file index
+                // cannot fold): equality over unknowns proves nothing, and
+                // two distinct records `(N.x, 'ol')`/`(N.x, 'ul')` both
+                // collapsing to it would report a duplicate the oracle's
+                // resolved values never equal.
+                if matches!(v, ConstantValue::Instance(_)) {
+                    continue;
+                }
                 if seen.contains(&v) {
                     self.emit_with_correction(code, part.span);
                 } else {
@@ -2231,6 +2240,12 @@ impl<'a> Engine<'a> {
         let mut seen: Vec<ConstantValue> = Vec::new();
         for part in &parts {
             if let Verdict::Value(v) = eval(part, self) {
+                // The Instance sentinel's value is unknown to this subset
+                // (a deferred field): it proves no equality (see
+                // [`Self::check_const_duplicates`]).
+                if matches!(v, ConstantValue::Instance(_)) {
+                    continue;
+                }
                 if seen.contains(&v) {
                     self.emit_with_correction(code, part.span);
                 } else {

@@ -1865,12 +1865,19 @@ impl Interp<'_> {
         // stream. A missing context is a producer contract break — skip the
         // branch instead of panicking inside the interpreter (async_gap's
         // let-else return posture).
-        let Some(pattern) = self.pattern.take() else {
+        let Some(mut pattern) = self.pattern.take() else {
             return;
         };
         let mut matched = self.current.clone();
         if let Some(guard) = pattern.guard {
-            let (if_true, _) = self.cond_split(&guard);
+            let (if_true, if_false) = self.cond_split(&guard);
+            // The guard's false arm is an UNMATCHED path (official
+            // `_handleGuard` joins it into the same `_unmatched` chain the
+            // pattern's failures feed): dropping it folds the else arm
+            // dead whenever the pattern itself cannot fail (`case P p when
+            // p.g` over an exact scrutinee leaves `return false` after the
+            // if reachable in the oracle).
+            pattern.unmatched = self.join(Some(pattern.unmatched.clone()), Some(if_false));
             matched = if_true;
         }
         self.stack.push(Frame::If {

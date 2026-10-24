@@ -201,9 +201,13 @@ impl Interp<'_> {
                 // `_unmatched` accumulates every refutable shape's failure
                 // arm (flow_analysis.dart's pattern dispatch). Nested
                 // instances constrain their own field, not the scrutinee —
-                // the depth gate keeps them out (their failure folds into
-                // the enclosing pattern's own may-fail join).
-                if self.pattern_depth == 1
+                // but under a vacuous enclosing head (an exact scrutinee
+                // type) the nested failure is the ONLY unmatched path, so
+                // every depth joins (the pre-test state is the
+                // nested-failure posture for the else arm; when the
+                // enclosing head itself is refutable its own join already
+                // carried the same state and the LUB is unchanged).
+                if !self.collecting()
                     && let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone())
                 {
                     let cur = self.current.clone();
@@ -375,6 +379,28 @@ impl Interp<'_> {
                         }
                     } else {
                         self.non_var_invalid_scrutinee_covers();
+                    }
+                } else if !self.collecting()
+                    && self.pattern_depth > 1
+                    && declared != Ty::UNKNOWN
+                    && let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone())
+                {
+                    // A typed sub-pattern nested in an object pattern tests
+                    // its own PROPERTY (`Obj(:NamedType f)` over a nullable
+                    // field) and can fail on that value alone — official
+                    // `analyzeObjectPattern` runs sub-patterns against the
+                    // shared `_unmatched` chain. When the enclosing head's
+                    // test is vacuous (an exact scrutinee type joins
+                    // nothing), this join is the ONLY unmatched path: skip
+                    // it and the else arm after `if (x case Obj(:T f))`
+                    // folds dead. The pre-test state joins (reachability —
+                    // the property variable is scoped to the matched arm,
+                    // so the else arm keeps the scrutinee's unpromoted
+                    // face, exactly the nested-failure posture).
+                    let cur = self.current.clone();
+                    let joined = self.join(Some(chain), Some(cur));
+                    if let Some(pattern) = self.pattern.as_mut() {
+                        pattern.unmatched = joined;
                     }
                 }
             }
