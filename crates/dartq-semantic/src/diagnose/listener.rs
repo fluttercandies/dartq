@@ -5415,6 +5415,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let engine = &mut self.engine;
         engine.switch.case_sink_open = true;
+        engine.switch_member_head_begin();
         // The clause anchor latches at the HEAD's opening, before its
         // pattern parses: a constant-pattern candidate inside the head
         // defers to the teardown join keyed on this anchor (#1351), and
@@ -5463,6 +5464,7 @@ impl ParserListener for DiagnoseListener<'_> {
             }
         }
         let root = engine.close_case_sink();
+        engine.switch_member_head_done();
         let space = engine.substitute_root(root);
         if let Some(ctx) = engine.switch.switches.last_mut() {
             ctx.cases.push(NameCase {
@@ -5510,6 +5512,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // it), a case head's colon latched on the case itself.
         let engine = &mut self.engine;
         engine.switch.case_sink_open = false;
+        engine.switch_member_end();
         let body_start = if expression_count > 0 {
             engine
                 .switch
@@ -5573,6 +5576,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let engine = &mut self.engine;
         engine.switch.case_sink_open = true;
+        engine.switch_member_head_begin();
         // The parser delivers no keyword face for an alternative (the
         // flow fact anchors at its first token); the stale clause anchor
         // must not join a foreign clause — the alternatives' candidates
@@ -5604,6 +5608,7 @@ impl ParserListener for DiagnoseListener<'_> {
             .end_switch_expression_case(begin, when, arrow, end);
 
         let engine = &mut self.engine;
+        engine.switch_member_end();
         // `SwitchExpression` is in the official used set.
         engine.ur_seal_used();
         let space = engine

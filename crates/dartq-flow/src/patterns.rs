@@ -744,13 +744,14 @@ impl Interp<'_> {
     /// `switch_endAlternative`).
     pub(crate) fn case_pattern_end(&mut self, has_guard: bool) {
         self.resolve_vacuous_object_cover();
-        let Some(pattern) = self.pattern.take() else {
+        let Some(mut pattern) = self.pattern.take() else {
             return;
         };
         let PatternKind::Switch = pattern.kind else {
             self.pattern = Some(pattern);
             return;
         };
+        let pattern_shadowed = std::mem::take(&mut pattern.shadowed);
         let unmatched = self.apply_pattern_exit(pattern, has_guard);
         if let Some(frame_index) = self.switch_frame() {
             let combined = self.current.clone();
@@ -759,10 +760,14 @@ impl Interp<'_> {
                     unmatched: slot,
                     group_combined,
                     case_open,
+                    case_shadowed,
                     ..
                 } => {
                     *slot = unmatched;
                     *case_open = true;
+                    // The head's binders shadow only inside this member —
+                    // the member's close (`switch_after_case`) restores.
+                    case_shadowed.extend(pattern_shadowed);
                     group_combined.take()
                 }
                 _ => None,
@@ -783,20 +788,24 @@ impl Interp<'_> {
     /// flow_analysis.dart:8008-8039).
     pub(crate) fn case_pattern_end_expr(&mut self) {
         self.resolve_vacuous_object_cover();
-        let Some(pattern) = self.pattern.take() else {
+        let Some(mut pattern) = self.pattern.take() else {
             return;
         };
         let PatternKind::SwitchExpr = pattern.kind else {
             self.pattern = Some(pattern);
             return;
         };
+        let pattern_shadowed = std::mem::take(&mut pattern.shadowed);
         let unmatched = self.apply_pattern_exit(pattern, false);
         if let Some(frame_index) = self.switch_frame()
             && let Frame::Switch {
-                unmatched: slot, ..
+                unmatched: slot,
+                case_shadowed,
+                ..
             } = &mut self.stack[frame_index]
         {
             *slot = unmatched;
+            case_shadowed.extend(pattern_shadowed);
         }
     }
 

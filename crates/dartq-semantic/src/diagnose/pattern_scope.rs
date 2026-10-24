@@ -17,6 +17,71 @@ impl Engine<'_> {
             .last()
             .and_then(|frame| frame.var_types.get(&name).copied());
         self.pattern_shadows.push((name, prev));
+        // An open switch member records the same pair in its own scope:
+        // the binder shadows only inside its member. A member whose head
+        // never fired (`default:` bodies, switch-expression arms) opens
+        // lazily here — the recording IS the first evidence the member
+        // is taking binders.
+        let depth = self.switch.switches.len();
+        if self
+            .switch_arm_scopes
+            .last()
+            .is_none_or(|top| top.depth != depth)
+        {
+            self.switch_arm_scopes.push(SwitchArmScope {
+                depth,
+                head_done: false,
+                shadows: Vec::new(),
+            });
+        }
+        if let Some(top) = self.switch_arm_scopes.last_mut() {
+            if !top.shadows.iter().any(|(n, _)| *n == name) {
+                top.shadows.push((name, prev));
+            }
+        }
+    }
+
+    /// A case head opens: a fresh member of the innermost open switch,
+    /// unless the top scope is this switch's member mid-head-group
+    /// (shared-body `case A: case B:` heads run back to back).
+    pub(crate) fn switch_member_head_begin(&mut self) {
+        let depth = self.switch.switches.len();
+        if self
+            .switch_arm_scopes
+            .last()
+            .is_none_or(|top| top.depth != depth || top.head_done)
+        {
+            self.switch_arm_scopes.push(SwitchArmScope {
+                depth,
+                head_done: false,
+                shadows: Vec::new(),
+            });
+        }
+    }
+
+    /// One case head completed: another `begin_case_expression` belongs
+    /// to the NEXT member of the same switch.
+    pub(crate) fn switch_member_head_done(&mut self) {
+        if let Some(top) = self.switch_arm_scopes.last_mut() {
+            top.head_done = true;
+        }
+    }
+
+    /// A switch member closes (`end_switch_case`/one switch-expression
+    /// arm): its binders go out of scope and the shadowed spellings read
+    /// their outer types again. Only the member of the closing switch
+    /// pops — an outer member stays open behind a nested switch.
+    pub(crate) fn switch_member_end(&mut self) {
+        let depth = self.switch.switches.len();
+        if self
+            .switch_arm_scopes
+            .last()
+            .is_some_and(|top| top.depth == depth)
+        {
+            let member = self.switch_arm_scopes.pop().expect("checked");
+            let shadows = member.shadows;
+            self.restore_var_types(&shadows);
+        }
     }
 
     /// An `if` condition opens: only patterns inside it belong to the

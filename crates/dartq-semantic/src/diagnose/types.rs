@@ -1357,6 +1357,18 @@ pub(crate) struct PendingInitVariable {
     pub(crate) is_final: bool,
 }
 
+/// One open switch member's case scope: `depth` is the open `switch`
+/// context count at open time (the member belongs to that switch — a
+/// nested switch inside a member body carries `depth + 1`), `head_done`
+/// marks a completed head (a second `begin_case_expression` opens a NEW
+/// member, not another head of the same one), and `shadows` holds the
+/// frame types the member's pattern binders overwrote.
+pub(crate) struct SwitchArmScope {
+    pub(crate) depth: usize,
+    pub(crate) head_done: bool,
+    pub(crate) shadows: Vec<(StringId, Option<Ty>)>,
+}
+
 /// F-C: a folded `super.`-selector candidate in the open
 /// constructor-initializer list, awaiting its shape — only an argument
 /// group makes it the super-constructor reference; an assignment
@@ -2162,6 +2174,11 @@ pub(crate) struct Engine<'a> {
     /// The open `if` statements' case scopes, innermost last; restored
     /// when the then statement ends.
     pub(crate) if_case_scopes: Vec<Vec<(StringId, Option<Ty>)>>,
+    /// The open switch members' case scopes, innermost last (the arm
+    /// counterpart of [`Self::if_case_scopes`]): a `case Sub x:` binder
+    /// shadows only inside its own member — later members' reads of the
+    /// scrutinee spelling resolve on the outer declaration again.
+    pub(crate) switch_arm_scopes: Vec<SwitchArmScope>,
     /// F-C: the folded `super.`-selector candidates of the open list
     /// ([`PendingInitSuper`]); drained at `end_initializers`, where the
     /// invocation shape decides

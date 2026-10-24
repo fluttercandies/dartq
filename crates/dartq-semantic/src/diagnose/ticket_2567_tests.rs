@@ -621,3 +621,41 @@ fn sdk_stub_member_face_answers_through_frozen_rows() {
         messages(&report)
     );
 }
+
+/// A `case T x:` binder shadows only inside its own member: the
+/// scrutinee spelling reads the OUTER declaration again in later
+/// members — the arm's binder must not retype it (the
+/// `bundle_writer.dart` `case SubstitutedElementImpl element:` family,
+/// where later members' `localId`/`reference` reads resolved on the
+/// binder's type and false-reported). The switch-expression arm twin
+/// scopes the same way.
+#[test]
+fn case_binder_scopes_to_its_member() {
+    let stmt = report(
+        "class Element {} class Sub extends Element {}\n\
+         class Pre extends Element { int get localId => 1; }\n\
+         void f(Element element) {\n\
+         \x20 switch (element) {\n\
+         \x20   case Sub element:\n\
+         \x20     break;\n\
+         \x20   case Pre():\n\
+         \x20     var x = element.localId;\n\
+         \x20     break;\n\
+         \x20   default:\n\
+         \x20     break;\n\
+         \x20 }\n\
+         \x20 var after = element;\n\
+         }",
+    );
+    assert_eq!(count_code(&stmt, "undefined_getter"), 0, "{:?}", messages(&stmt));
+    let expr = report(
+        "class Element {} class Sub extends Element {}\n\
+         class Pre extends Element { int get localId => 1; }\n\
+         int f(Element element) => switch (element) {\n\
+         \x20 Sub element => 0,\n\
+         \x20 Pre() => element.localId,\n\
+         \x20 _ => 0,\n\
+         };",
+    );
+    assert_eq!(count_code(&expr, "undefined_getter"), 0, "{:?}", messages(&expr));
+}

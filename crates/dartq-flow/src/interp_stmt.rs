@@ -648,6 +648,7 @@ impl Interp<'_> {
                     previous: self.current.clone(),
                     unmatched: self.current.clone(),
                     break_model: None,
+                    case_shadowed: Vec::new(),
                     scrutinee,
                     scrutinee_ty,
                     scrutinee_args,
@@ -839,6 +840,7 @@ impl Interp<'_> {
                     previous: self.current.clone(),
                     unmatched: self.current.clone(),
                     break_model: None,
+                    case_shadowed: Vec::new(),
                     scrutinee,
                     scrutinee_ty: Ty::UNKNOWN,
                     scrutinee_args: crate::ty::EMPTY_ARGS,
@@ -968,8 +970,18 @@ impl Interp<'_> {
                     };
                     let combined = self.current.clone();
                     let joined = self.join(prior, Some(combined));
-                    if let Frame::Switch { group_combined, .. } = &mut self.stack[frame_index] {
+                    if let Frame::Switch {
+                        group_combined,
+                        case_shadowed,
+                        ..
+                    } = &mut self.stack[frame_index]
+                    {
                         *group_combined = Some(joined);
+                        // The alternative's binders leave their scope with
+                        // the arm (official `switch_endAlternative`'s
+                        // member close).
+                        let shadowed = std::mem::take(case_shadowed);
+                        self.restore_bindings(&shadowed);
                     }
                 }
             }
@@ -993,6 +1005,7 @@ impl Interp<'_> {
                     ),
                     _ => return true,
                 };
+                self.switch_scope_close(frame_index);
                 self.stack.remove(frame_index);
                 // Exhaustiveness of switch expressions is unmounted (needs
                 // the resolver); an unmatched-hole joins nothing. A
@@ -1772,11 +1785,14 @@ impl Interp<'_> {
         if let Frame::Switch {
             body_depth,
             group_combined,
+            case_shadowed,
             ..
         } = &mut self.stack[frame_index]
         {
             *body_depth = None;
             *group_combined = None;
+            let shadowed = std::mem::take(case_shadowed);
+            self.restore_bindings(&shadowed);
         }
     }
 
@@ -1790,6 +1806,19 @@ impl Interp<'_> {
     /// unreachable body-completion silence upstream's
     /// `checkForBodyMayCompleteNormally` reads through `isReachable`
     /// (type_analyzer.dart:647-652).
+    /// The switch's own scope close: any binder an empty-bodied or
+    /// recovered member left open restores here (a well-formed member
+    /// already restored at its close).
+    fn switch_scope_close(&mut self, frame_index: usize) {
+        let shadowed = match &mut self.stack[frame_index] {
+            Frame::Switch {
+                case_shadowed, ..
+            } => std::mem::take(case_shadowed),
+            _ => return,
+        };
+        self.restore_bindings(&shadowed);
+    }
+
     fn switch_statement_end(&mut self, switch_index: usize) {
         let (unmatched, previous, break_model, exhaustive) = match &self.stack[switch_index] {
             Frame::Switch {
@@ -1807,6 +1836,7 @@ impl Interp<'_> {
             ),
             _ => return,
         };
+        self.switch_scope_close(switch_index);
         self.stack.remove(switch_index);
         let exit = if exhaustive {
             // No implicit fall-through default joins the unmatched chain

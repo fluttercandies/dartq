@@ -284,6 +284,12 @@ pub(crate) enum Frame {
         /// A `CaseExprEnd` was seen: the group awaits its first body event
         /// (one-event lookahead closes the alternatives there).
         case_open: bool,
+        /// The open member's pattern binders' shadowed bindings (the arm
+        /// counterpart of [`Frame::If::shadowed`]): a `case Sub x:` binder
+        /// shadows only inside its own member — the member's close
+        /// restores the outer binding so later members' reads of the
+        /// spelling resolve the scrutinee again.
+        case_shadowed: Vec<(u32, Option<u32>)>,
         group_labels: bool,
         group_default: bool,
         group_combined: Option<State>,
