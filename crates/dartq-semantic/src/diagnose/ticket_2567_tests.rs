@@ -1197,6 +1197,37 @@ fn element_constructor_rhs_instantiates_from_the_write_context() {
 /// `T1/T2 := Object?`, a nullable face) neither re-solves nor poisons the
 /// written instantiation. The oracle runs no inference over an explicit
 /// argument list (instance_member_inferrer.dart:511-521).
+
+/// A field whose initializer is a typed collection literal carries the
+/// literal's written arguments as its declared face (`final _commands =
+/// <String, Command<T>>{}` declares `Map<String, Command<T>>`), so the
+/// `var`-inferred local over it, its index read, and the trailing-`!`
+/// write all promote — the member accesses on the written local stay
+/// clean (args command_runner.dart:73/156/189-196).
+#[test]
+fn typed_literal_field_face_carries_through_index_bang_write() {
+    let source = concat!(
+        "class Cmd<T> { int x = 0; }\n",
+        "class R<T> {\n",
+        "  final _cmds = <String, Cmd<T>>{};\n",
+        "  void f() {\n",
+        "    var m = _cmds;\n",
+        "    Cmd? command;\n",
+        "    command = m['k']!;\n",
+        "    command.x = 1;\n",
+        "  }\n",
+        "}\n",
+    );
+    let r = super::test_rig::report_ops(source);
+    let unchecked: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name.contains("unchecked"))
+        .map(|d| d.code.name)
+        .collect();
+    assert_eq!(unchecked, Vec::<&str>::new(), "{:?}", messages(&r));
+}
+
 #[test]
 fn explicit_type_arguments_fix_foreign_callee_closure_formals() {
     let main = concat!(

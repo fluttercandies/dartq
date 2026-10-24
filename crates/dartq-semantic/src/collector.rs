@@ -234,6 +234,16 @@ struct PendingTop {
     formals: Option<Box<Formals>>,
 }
 
+/// One conservatively parsed type spelling of a typed collection
+/// literal's argument list ([`Builder::typed_literal_initializer_ty`]):
+/// a dot-joined identifier head, its own written arguments, and a
+/// trailing `?` — interned into a `Ty` after the whole group parses.
+struct LiteralTypeSpelling {
+    head: String,
+    nullable: bool,
+    args: Vec<LiteralTypeSpelling>,
+}
+
 /// A typedef between `begin_typedef` and `end_typedef`.
 struct PendingTypedef {
     name: Option<(StringId, SourceRange)>,
@@ -777,6 +787,152 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         }
         let name = if saw_double { "double" } else { "int" };
         Some(Ty::named(self.strings.intern(name)))
+    }
+
+    /// The face of an unannotated declarator whose initializer is a typed
+    /// collection literal — `final _commands = <String, Command<T>>{};`
+    /// declares `Map<String, Command<T>>` (the literal's written
+    /// arguments ARE its inference; every use site's member table then
+    /// carries the face). The same declaration-site byte-scan posture as
+    /// [`Self::numeric_initializer_ty`]: a conservative type grammar
+    /// (dot-joined identifiers, nested angle groups, trailing `?`)
+    /// between `= <` and the literal's opening brace/bracket, two
+    /// arguments making a map and one a set (`{`) or list (`[`); anything
+    /// else — `void`/`dynamic` spellings, function-typed arguments —
+    /// keeps the unknown face, the under-report direction.
+    fn typed_literal_initializer_ty(&mut self, name_end: u32) -> Option<Ty> {
+        let bytes = self.source.as_bytes().to_vec();
+        let mut i = name_end as usize;
+        Self::skip_literal_ws(&bytes, &mut i);
+        if bytes.get(i) != Some(&b'=') {
+            return None;
+        }
+        i += 1;
+        Self::skip_literal_ws(&bytes, &mut i);
+        // A `const` keyword may ride the literal (`= const <int>[]`).
+        if bytes.get(i..i + 5) == Some("const".as_bytes())
+            && bytes
+                .get(i + 5)
+                .is_some_and(|b| b.is_ascii_whitespace())
+        {
+            i += 5;
+            Self::skip_literal_ws(&bytes, &mut i);
+        }
+        if bytes.get(i) != Some(&b'<') {
+            return None;
+        }
+        let spellings = Self::parse_literal_spellings(&bytes, &mut i)?;
+        Self::skip_literal_ws(&bytes, &mut i);
+        let head = match (bytes.get(i)?, spellings.len()) {
+            (b'{', 2) => "Map",
+            (b'{', 1) => "Set",
+            (b'[', 1) => "List",
+            _ => return None,
+        };
+        let args: Vec<Ty> = spellings
+            .into_iter()
+            .map(|spelling| self.literal_spelling_ty(spelling))
+            .collect();
+        Some(self.type_args.named(self.strings.intern(head), false, &args))
+    }
+
+    fn skip_literal_ws(bytes: &[u8], i: &mut usize) {
+        while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+    }
+
+    /// Parses `<t1, t2, ...>` (the opening `<` at `*i`) into its
+    /// top-level spellings, leaving `*i` past the closing `>`.
+    fn parse_literal_spellings(
+        bytes: &[u8],
+        i: &mut usize,
+    ) -> Option<Vec<LiteralTypeSpelling>> {
+        *i += 1;
+        let mut spellings = Vec::new();
+        loop {
+            spellings.push(Self::parse_literal_spelling(bytes, i)?);
+            Self::skip_literal_ws(bytes, i);
+            match bytes.get(*i)? {
+                b',' => *i += 1,
+                b'>' => {
+                    *i += 1;
+                    return Some(spellings);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// One conservatively parsed type spelling: a dot-joined identifier
+    /// head with optional type arguments and a trailing `?`. `None` on
+    /// any byte the grammar does not accept, and on the spellings that
+    /// are not named faces (`void`, `dynamic`).
+    fn parse_literal_spelling(bytes: &[u8], i: &mut usize) -> Option<LiteralTypeSpelling> {
+        Self::skip_literal_ws(bytes, i);
+        let mut head = String::new();
+        loop {
+            let start = *i;
+            if !bytes
+                .get(start)
+                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+            {
+                return None;
+            }
+            let mut end = start;
+            while bytes
+                .get(end)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            {
+                end += 1;
+            }
+            if !head.is_empty() {
+                head.push('.');
+            }
+            head.push_str(std::str::from_utf8(&bytes[start..end]).ok()?);
+            *i = end;
+            if bytes.get(*i) == Some(&b'.')
+                && bytes
+                    .get(*i + 1)
+                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+            {
+                *i += 1;
+            } else {
+                break;
+            }
+        }
+        if head == "void" || head == "dynamic" {
+            return None;
+        }
+        let mut args = Vec::new();
+        if bytes.get(*i) == Some(&b'<') {
+            args = Self::parse_literal_spellings(bytes, i)?;
+        }
+        Self::skip_literal_ws(bytes, i);
+        let nullable = if bytes.get(*i) == Some(&b'?') {
+            *i += 1;
+            true
+        } else {
+            false
+        };
+        Some(LiteralTypeSpelling {
+            head,
+            nullable,
+            args,
+        })
+    }
+
+    /// Interns one parsed spelling into a `Ty`: the head through the
+    /// string table (dot-joined spellings intern whole), the argument
+    /// list through the canonical pool.
+    fn literal_spelling_ty(&mut self, spelling: LiteralTypeSpelling) -> Ty {
+        let args: Vec<Ty> = spelling
+            .args
+            .into_iter()
+            .map(|arg| self.literal_spelling_ty(arg))
+            .collect();
+        self.type_args
+            .named(self.strings.intern(&spelling.head), spelling.nullable, &args)
     }
 
     /// Latches the head identifier of the annotation being parsed (the
@@ -2148,10 +2304,15 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     // type at the declaration site — the numeric face the
                     // collector can read from the bytes alone (the
                     // buffer-size idiom `static const kDefaultBufferSize
-                    // = 1024 * 1024` answers `int`; every use site's
-                    // member table then carries it).
+                    // = 1024 * 1024` answers `int`), and the typed
+                    // collection literal's written arguments (`final
+                    // _commands = <String, Command<T>>{}` answers
+                    // `Map<String, Command<T>>`; every use site's member
+                    // table then carries it).
                     if ty == Ty::UNKNOWN
-                        && let Some(inferred) = builder.numeric_initializer_ty(range.end())
+                        && let Some(inferred) = builder
+                            .numeric_initializer_ty(range.end())
+                            .or_else(|| builder.typed_literal_initializer_ty(range.end()))
                     {
                         ty = inferred;
                     }
