@@ -1190,6 +1190,57 @@ fn element_constructor_rhs_instantiates_from_the_write_context() {
 /// dereference — `x.match(...)` stays silent even though the class also
 /// declares an instance `match` (the unsafe instance read never runs).
 
+
+/// Explicit type arguments at a call to a generic top-level function
+/// declared in ANOTHER file fix its inference parameters outright — the
+/// upward face (here: `List<Object?>` arguments, which alone would solve
+/// `T1/T2 := Object?`, a nullable face) neither re-solves nor poisons the
+/// written instantiation. The oracle runs no inference over an explicit
+/// argument list (instance_member_inferrer.dart:511-521).
+#[test]
+fn explicit_type_arguments_fix_foreign_callee_closure_formals() {
+    let main = concat!(
+        "import 'helper.dart';\n",
+        "class P {\n",
+        "  int type = 0;\n",
+        "}\n",
+        "void f(List<Object?> xs) {\n",
+        "  forCorrespondingPairs<P, P>(\n",
+        "    xs,\n",
+        "    xs,\n",
+        "    (parameter, baseParameter) {\n",
+        "      parameter.type = baseParameter.type;\n",
+        "    },\n",
+        "  );\n",
+        "}\n",
+    );
+    let helper = concat!(
+        "void forCorrespondingPairs<T1, T2>(\n",
+        "  Iterable<T1> list1,\n",
+        "  Iterable<T2> list2,\n",
+        "  void Function(T1, T2) f,\n",
+        ") {\n",
+        "  var i1 = list1.iterator;\n",
+        "  var i2 = list2.iterator;\n",
+        "  while (i1.moveNext() && i2.moveNext()) {\n",
+        "    f(i1.current, i2.current);\n",
+        "  }\n",
+        "}\n",
+    );
+    let r = super::test_rig::report_ops_imports(main, &[super::test_rig::RigImport {
+        uri: "helper.dart",
+        prefix: None,
+        source: helper,
+    }]);
+    let unchecked: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name.contains("unchecked"))
+        .map(|d| d.code.name)
+        .collect();
+    assert_eq!(unchecked, Vec::<&str>::new(), "{:?}", messages(&r));
+}
+
 #[test]
 fn nullable_on_extension_wins_over_instance_member() {
     let r = super::test_rig::report_ops(concat!(

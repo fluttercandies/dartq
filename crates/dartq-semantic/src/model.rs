@@ -1581,10 +1581,13 @@ pub struct TopDecl {
     /// The declaration's own type parameters; 0 when non-generic.
     pub type_params: u16,
     /// The declaration's own type-parameter spellings, in declaration
-    /// order — a type alias only (`typedef P<T, U> = ...` keeps `[T, U]`):
-    /// the use-site written arguments substitute into the captured right
-    /// hand side positionally against this list. Every other kind keeps it
-    /// empty (executables carry the count only).
+    /// order. A type alias keeps them for the use-site substitution
+    /// (`typedef P<T, U> = ...` keeps `[T, U]`: written arguments
+    /// substitute into the captured right-hand side positionally); a
+    /// generic top-level function keeps them so the cross-file
+    /// closure-formal solver pairs the call's explicit type arguments
+    /// against the declaration's parameter order. Every other kind keeps
+    /// the list empty.
     pub type_param_names: Box<[StringId]>,
     /// Declared type of a top-level variable (executables:
     /// [`Ty::Unknown`]). For a type alias: the right-hand side as written

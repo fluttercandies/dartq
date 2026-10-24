@@ -229,6 +229,7 @@ struct PendingMember {
 struct PendingTop {
     name: Option<(StringId, SourceRange)>,
     type_params: u16,
+    type_param_names: Vec<StringId>,
     return_ty: Ty,
     formals: Option<Box<Formals>>,
 }
@@ -1379,6 +1380,11 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             std::mem::take(&mut self.type_var_bounds);
         } else if let Some(pending) = &mut self.pending_top {
             pending.type_params = count;
+            // A generic top-level function's spellings ride the declaration
+            // in declaration order — the cross-file closure-formal solver
+            // pairs explicit type arguments against them positionally.
+            pending.type_param_names = std::mem::take(&mut self.type_var_group);
+            std::mem::take(&mut self.type_var_bounds);
         } else if let Some(pending) = &mut self.pending_typedef {
             pending.type_params = count;
         } else if let Some(open) = self.containers.last_mut() {
@@ -2576,6 +2582,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.pending_top = Some(PendingTop {
             name: None,
             type_params: 0,
+            type_param_names: Vec::new(),
             return_ty: Ty::UNKNOWN,
             formals: None,
         });
@@ -2624,7 +2631,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 TopDecl {
                     kind: MicroKind::TopLevelFn,
                     type_params: pending.type_params,
-                    type_param_names: Box::new([]),
+                    type_param_names: pending.type_param_names.into_boxed_slice(),
                     var_ty: Ty::UNKNOWN,
                     return_ty: pending.return_ty,
                     formals: pending.formals,

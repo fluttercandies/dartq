@@ -1772,11 +1772,14 @@ impl<'a> Engine<'a> {
     }
 
     /// A foreign generic top-level function's inference-parameter
-    /// spellings, recovered from its projected declaration (a bare-count
-    /// `type_params` carries no names): every bare leaf of its written
-    /// types the caller's scope cannot prove is a type, in written order,
-    /// capped at the declared arity, with no positional pairing (recovered
-    /// order is written order, not declaration order).
+    /// spellings, recovered from its projected declaration: the declared
+    /// spellings, when the collector carried them, are authoritative —
+    /// declaration order, positional pairing, explicit type arguments fix
+    /// against them. Otherwise (a bare-count `type_params` payload with no
+    /// names): every bare leaf of its written types the caller's scope
+    /// cannot prove is a type, in written order, capped at the declared
+    /// arity, with no positional pairing (recovered order is written
+    /// order, not declaration order).
     fn foreign_decl_params(
         &self,
         decl: &TopDecl,
@@ -1785,7 +1788,18 @@ impl<'a> Engine<'a> {
             return None;
         }
         let arity = usize::from(decl.type_params);
-        let mut names: Vec<StringId> = Vec::new();
+
+        if decl.type_param_names.len() == arity {
+            return Some((
+                decl.type_param_names
+                    .iter()
+                    .map(|name| (*name, None))
+                    .collect(),
+                Vec::new(),
+                Some(arity),
+            ));
+        }
+                let mut names: Vec<StringId> = Vec::new();
         if let Some(formals) = decl.formals.as_deref() {
             for formal in formals.positional.iter().chain(formals.named.iter()) {
                 self.unprovable_leaves(formal.ty, &mut names, arity);
