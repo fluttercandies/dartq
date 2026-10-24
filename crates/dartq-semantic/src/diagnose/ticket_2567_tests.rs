@@ -1204,6 +1204,63 @@ fn element_constructor_rhs_instantiates_from_the_write_context() {
 /// `var`-inferred local over it, its index read, and the trailing-`!`
 /// write all promote — the member accesses on the written local stay
 /// clean (args command_runner.dart:73/156/189-196).
+/// A closure formal's schema entry spelled through an import prefix
+/// (`List<idl.IndexSyntheticElementKind>`'s element head interns
+/// dot-joined) stays decidable: the closure-formal solver resolves the
+/// prefixed head through the import prefix instead of collapsing it to
+/// `Object?`, so the formal's member reads stay clean under a negated
+/// disjunction guard (`!(eks == null || eks.isEmpty)` — the guard's
+/// non-null promotion plus the solved formal keep `b.index` and the
+/// guarded read clean; format.dart:1479/1560/1585).
+#[test]
+fn demorgan_guard_promotes_prefixed_element_closure_formal() {
+    let idl = concat!(
+        "class K {\n",
+        "  final int index = 0;\n",
+        "}\n",
+    );
+    let main = concat!(
+        "import 'idl.dart' as idl;\n",
+        "class W {\n",
+        "  List<idl.K>? _eks;\n",
+        "  int f() {\n",
+        "    var eks = _eks;\n",
+        "    if (!(eks == null || eks.isEmpty)) {\n",
+        "      return eks.map((b) => b.index).length;\n",
+        "    }\n",
+        "    return 0;\n",
+        "  }\n",
+        "}\n",
+    );
+    let r = super::test_rig::report_ops_imports(main, &[super::test_rig::RigImport {
+        uri: "idl.dart",
+        prefix: Some("idl"),
+        source: idl,
+    }]);
+    // The rig's core stubs carry no `List.map`/`List.isEmpty` element
+    // model, so those two rows report as unresolved getters — the pinned
+    // faces are the guard's promotion (no unchecked nullable use) and
+    // the solved closure formal (`b.index` resolves on `idl.K`, and no
+    // argument mismatch rides the guarded reads).
+    for d in &r.diagnostics {
+        assert_ne!(
+            d.code.name, "unchecked_use_of_nullable_value",
+            "demorgan guard must promote the guarded local: {}",
+            d.message
+        );
+        assert_ne!(
+            d.code.name, "argument_type_not_assignable",
+            "solved formal must carry the prefixed element face: {}",
+            d.message
+        );
+        assert!(
+            !d.message.contains("getter 'index'"),
+            "closure formal must resolve through the prefixed element head: {}",
+            d.message
+        );
+    }
+}
+
 #[test]
 fn typed_literal_field_face_carries_through_index_bang_write() {
     let source = concat!(

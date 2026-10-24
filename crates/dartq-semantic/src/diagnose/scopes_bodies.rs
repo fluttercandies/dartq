@@ -1305,7 +1305,12 @@ impl<'a> Engine<'a> {
                                 // `Object?` invalid recovery. Only a head
                                 // the whole graph fails to declare is
                                 // invalid.
-                                || !self.graph.declaring_libraries(arg_head).is_empty())
+                                || !self.graph.declaring_libraries(arg_head).is_empty()
+                                // A prefixed element spelling (`List<
+                                // idl.IndexRelationKind>.map`) interns the
+                                // head dot-joined; it resolves through the
+                                // import prefix, not the bare name tables.
+                                || self.prefixed_element_head_resolves(arg_head))
                                 && self.args_are_types(arg_args) =>
                             {
                                 None
@@ -1634,6 +1639,29 @@ impl<'a> Engine<'a> {
             }
             _ => false,
         }
+    }
+
+    /// A dot-joined element head (`idl.IndexRelationKind`, interned whole
+    /// by the prefixed type capture) resolves through its import prefix:
+    /// the segment before the last dot names an import prefix of this
+    /// library and the tail a declaration it brings. A head with no dot,
+    /// an unknown prefix, or a prefixed miss keeps `false` — the bare-name
+    /// tables own those.
+    fn prefixed_element_head_resolves(&self, head: StringId) -> bool {
+        let spelling = self.strings.resolve(head);
+        let Some((prefix, tail)) = spelling.rsplit_once('.') else {
+            return false;
+        };
+        if prefix.is_empty() || tail.is_empty() {
+            return false;
+        }
+        let prefix = self.intern(prefix);
+        let tail = self.intern(tail);
+        matches!(
+            self.namespaces
+                .lookup_prefixed(self.graph, self.lib, prefix, tail),
+            dartq_resolution::Lookup::Found(dartq_resolution::NamespaceEntry::Decl(_))
+        )
     }
 
     /// The callee's inference parameters and receiver-side seeds at bind
