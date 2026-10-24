@@ -218,6 +218,7 @@ impl Interp<'_> {
                     cond_false: None,
                     break_model: None,
                     continue_model: None,
+                    for_in: false,
                 });
             }
             Ev::WhileBodyBegin => {
@@ -278,6 +279,7 @@ impl Interp<'_> {
                     cond_false: None,
                     break_model: None,
                     continue_model: None,
+                    for_in: false,
                 });
             }
             Ev::DoBodyEnd => {

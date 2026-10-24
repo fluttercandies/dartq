@@ -223,6 +223,11 @@ pub(crate) enum Frame {
         cond_false: Option<State>,
         break_model: Option<State>,
         continue_model: Option<State>,
+        /// A for-in loop closes with the `forEach_end` formula — the
+        /// body's fall-through joins the exit beside the head state —
+        /// unlike `whileStatement_end`/`for_end`, which join only the
+        /// condition-false and break models.
+        for_in: bool,
     },
     TryCatch {
         /// The pre-split state (the combined try-finally's `beforeTry`).
@@ -2774,12 +2779,27 @@ impl Interp<'_> {
         let Frame::While {
             cond_false,
             break_model,
+            for_in,
             ..
         } = frame
         else {
             return;
         };
-        let exit = self.join(cond_false.clone(), break_model);
+        // A for-in closes with the `forEach_end` formula
+        // (`flow_analysis.dart:6954-6959`): the body's fall-through
+        // joins the exit beside the head state — unlike
+        // `whileStatement_end`/`for_end`, which join only the
+        // condition-false and break models. (The official context there
+        // never reads its own break model; the head's conservative join
+        // already widened every body-written local, so keeping our
+        // accumulated break states is a harmless reachability superset.)
+        let exit = if for_in {
+            let fall = self.current.clone();
+            let breaks = self.join(Some(fall), break_model);
+            self.join(cond_false.clone(), Some(breaks))
+        } else {
+            self.join(cond_false.clone(), break_model)
+        };
         self.current = exit
             .unsplit(&mut self.reach)
             .inherit_tested(&self.current, &mut self.lists);
@@ -2861,6 +2881,7 @@ impl Interp<'_> {
             cond_false: None,
             break_model: None,
             continue_model: None,
+            for_in: false,
         });
         let frame = self.stack.len() - 1;
         // The init→condition part boundary: header parts carry no statement
@@ -3140,11 +3161,21 @@ impl Interp<'_> {
                     .map(|arg| (Ty { base: arg.base, nullable: arg.nullable }, arg.args))
             })
             .unwrap_or((Ty::UNKNOWN, crate::ty::EMPTY_ARGS));
-        // The zero-iteration state (the loop head's cond-false arm) is the
-        // state BEFORE the loop variable's per-iteration write: official
-        // `forEach_bodyBegin` writes on the body path only, so a loop that
-        // runs zero times leaves a declared loop variable definitely
-        // unassigned at the exit.
+        let body_start = (i..end).find(|&j| matches!(events[j], Ev::ForInBodyBegin));
+        let body = match body_start {
+            Some(start) => start..end,
+            None => i + 1..end,
+        };
+        let effects = self.collect_ranges(events, body, match_of);
+        // The loop head is official `forEach_bodyBegin`
+        // (`flow_analysis.dart:6941-6952`): the state splits and
+        // conservatively joins the body's writes in ONE step, and the
+        // context saves THAT joined state as its `previous` — the
+        // zero-iteration arm the exit joins carries the body's writes as
+        // maybe, so a local the body assigns reads possibly- (not
+        // definitely-) unassigned after the loop.
+        self.split_cur();
+        self.cjoin(&effects.written, &effects.captured);
         let previous = self.current.clone();
         // A declared head's loop variable is initialized before the body
         // (analyzer for_resolver.dart:222-226 `declare(initialized: true)`
@@ -3210,14 +3241,6 @@ impl Interp<'_> {
             // local — the top-level face never reaches this write.)
             self.apply_write(var, element_ty.0, element_ty.1, false, None, false);
         }
-        let body_start = (i..end).find(|&j| matches!(events[j], Ev::ForInBodyBegin));
-        let body = match body_start {
-            Some(start) => start..end,
-            None => i + 1..end,
-        };
-        let effects = self.collect_ranges(events, body, match_of);
-        self.split_cur();
-        self.cjoin(&effects.written, &effects.captured);
         let checkpoint = self.reach.parent(self.current.reach);
         self.stack.push(Frame::While {
             collection,
@@ -3225,6 +3248,7 @@ impl Interp<'_> {
             cond_false: Some(previous),
             break_model: None,
             continue_model: None,
+            for_in: true,
         });
     }
 

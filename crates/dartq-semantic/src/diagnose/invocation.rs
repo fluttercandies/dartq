@@ -2737,7 +2737,33 @@ impl<'a> Engine<'a> {
                     args: self.boundary.intern_list(&out),
                 })
             }
-            Ty::Record { .. } => None,
+            Ty::Record { shape, nullable } => {
+                // A record-typed member face (`typedef R<T> = (T, {S? s})`
+                // declared on a generic container) substitutes through its
+                // fields exactly as the function face does: each positional
+                // and named field carries the declaring container's
+                // parameters, and the substituted fields re-intern
+                // canonically. Any field the map cannot spell keeps the
+                // whole face unsubstituted (the `?` chain) — the previous
+                // wholesale `None` starved every record-returning accessor
+                // on a generic receiver into `Unknown` (`b.rec?.copyWith()`
+                // lost the receiver face and the extension-use credit).
+                let pool_shape = {
+                    let pool = self.boundary.pool();
+                    pool.record_shape(shape).clone()
+                };
+                let positional = pool_shape
+                    .positional
+                    .iter()
+                    .map(|ty| self.subst_params(*ty, map))
+                    .collect::<Option<Vec<_>>>()?;
+                let named = pool_shape
+                    .named
+                    .iter()
+                    .map(|(name, ty)| Some((*name, self.subst_params(*ty, map)?)))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(self.boundary.args.borrow_mut().record(&positional, &named, nullable))
+            }
             Ty::Function { shape, nullable } => {
                 // A function-typed member face (`FutureOr<T> Function(T)`
                 // on a generic container) substitutes through its parts:

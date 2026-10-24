@@ -1026,9 +1026,28 @@ impl<'a> Engine<'a> {
                 let Intent::Operator(_, op_range) = row.intent else {
                     return;
                 };
+                // An extension may own the operator (`JSObject()..['k'] = v`
+                // resolves `[]=`/`[]` through the js_interop faces over the
+                // extension-type head — the same implicit application the
+                // plain member tail runs, operator spellings included).
+                let operator_defined = |engine: &mut Self, spelling: StringId| {
+                    matches!(
+                        engine.walk_members(name, spelling),
+                        Walk::Found(_)
+                    ) || matches!(
+                        engine.extension_application(
+                            name,
+                            Ty::named(name),
+                            spelling,
+                            true,
+                            false,
+                        ),
+                        ExtensionApp::Single | ExtensionApp::UnsafeSingle
+                    )
+                };
                 let mut missing: Vec<String> = Vec::new();
                 for spelling in [read, write].into_iter().flatten() {
-                    if matches!(self.walk_members(name, spelling), Walk::Missing) {
+                    if !operator_defined(self, spelling) {
                         missing.push(self.strings.resolve(spelling).to_string());
                     }
                 }
@@ -1409,6 +1428,28 @@ impl<'a> Engine<'a> {
                                     );
                                 }
                             }
+                            self.record_miss(row.name, row.range, false, NameUse::Invoke);
+                            return;
+                        }
+                        // The implicit-`this` extension application: an
+                        // unqualified invocation inside an instance member
+                        // may resolve through an extension over `this`'s
+                        // type (`extension on M` applied inside a class
+                        // implementing `M` — the same implicit application
+                        // a qualified send reads; the application credits
+                        // the member and import the same way).
+                        if let Some(container) = this_type
+                            && matches!(
+                                self.extension_application(
+                                    container,
+                                    Ty::named(container),
+                                    row.name,
+                                    false,
+                                    false,
+                                ),
+                                ExtensionApp::Single | ExtensionApp::UnsafeSingle
+                            )
+                        {
                             self.record_miss(row.name, row.range, false, NameUse::Invoke);
                             return;
                         }
@@ -2216,23 +2257,34 @@ impl<'a> Engine<'a> {
                         .binary_search_by(|read| read.offset.cmp(&row.range.offset))
                         .ok()
                         .map(|index| self.member_reads[index].recv_span)
-                    && let Some(
-                        face @ Ty::Named {
-                            name: flow_head, ..
-                        },
-                    ) = self
+                {
+                    match self
                         .rebound_local_receiver(row.range.offset, &recv)
                         .or_else(|| self.recv_expression_ty(read_span))
-                {
-                    self.check_instance_member(
-                        promotions,
-                        row,
-                        Receiver::Typed {
-                            type_name: flow_head,
-                            ty: face,
-                        },
-                    );
-                    return;
+                    {
+                        Some(face @ Ty::Named { name: flow_head, .. }) => {
+                            self.check_instance_member(
+                                promotions,
+                                row,
+                                Receiver::Typed {
+                                    type_name: flow_head,
+                                    ty: face,
+                                },
+                            );
+                            return;
+                        }
+                        // A record face has no container head for the
+                        // instance-member walk: the extension application
+                        // over the record's shape IS the whole resolution
+                        // (the parse-time `record_recv_tys` credit's pass-2
+                        // twin — a getter-chained receiver whose face only
+                        // this arm re-derives, `prev._value?.copyWith()`).
+                        Some(face @ Ty::Record { .. }) => {
+                            self.credit_record_extension_use(face, row.name, row.range.offset);
+                            return;
+                        }
+                        _ => {}
+                    }
                 }
                 // The record-receiver extension face: a receiver whose
                 // static type is a RECORD (a `(BoxedT,)?` sentinel, a

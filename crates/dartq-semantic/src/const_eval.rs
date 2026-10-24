@@ -1724,6 +1724,12 @@ pub struct ConstCapture {
     /// `(stack len at begin, depth)` per open conditional.
     cond_latches: Vec<(usize, u32)>,
     args: Vec<ArgLevel>,
+    /// Operand-stack length at each open `(` (a parenthesized expression
+    /// or a record literal): [`Self::record_literal`]'s field pops clamp
+    /// above the record's own open, so a trailing-comma-inflated field
+    /// count cannot eat the operand below it (the map key an enclosing
+    /// entry already staged).
+    record_stack_marks: Vec<usize>,
     /// Per open string literal: the collected `${...}` operands.
     string_interps: Vec<Vec<Node>>,
     /// Operand-stack length at each `begin_literal_string`.
@@ -1748,6 +1754,12 @@ pub struct ConstCapture {
     /// The selector flag the next `begin_arguments` latches onto its
     /// level (the just-pushed callee ident was a dot selector).
     selector_callee: bool,
+    /// The callee operands an armed literal-ctor window drained at its
+    /// open ([`Self::open_literal_ctor`]): the level's callee hands them
+    /// back, or the head's idents sit below the window's base as debris
+    /// and every later pairing (a map entry's key pop) reads one operand
+    /// past its value.
+    pending_ctor_callee: Option<Node>,
     /// The explicit `const C(...)` creation spans (`const` keyword
     /// through the closing token): an argument value folded inside one
     /// belongs to the creation, not to the enclosing call — the
@@ -1814,10 +1826,12 @@ impl ConstCapture {
             args: Vec::new(),
             string_interps: Vec::new(),
             string_marks: Vec::new(),
+            record_stack_marks: Vec::new(),
             opaque_marks: Vec::new(),
             staged_dups: Vec::new(),
             annotation_leaves: Vec::new(),
             selector_callee: false,
+            pending_ctor_callee: None,
             creation_spans: Vec::new(),
         }
     }
@@ -1897,6 +1911,39 @@ impl ConstCapture {
                 kind: WindowKind::NonConstDup | WindowKind::LiteralCtor,
                 ..
             }) => {
+                // The armed head's operands leave the parent's stack HERE:
+                // the window's base latches at the current length, so a
+                // head left staged would sit below the base as debris
+                // forever (the level's pops clamp at the new base) and
+                // every later pairing — a map entry's key pop, a record's
+                // field pop — reads one operand past its value. The drain
+                // hands the operands to the level's callee so the
+                // candidate keeps its head (`Point(`'s `Point`,
+                // `BigInt.parse(`'s merged member).
+                let base = self.base();
+                let mut drained = None;
+                if self.selector_callee {
+                    let sel = self.pop_clamped(base);
+                    let recv = self.pop_clamped(base);
+                    if let (Some(sel), Some(recv)) = (sel, recv)
+                        && let Expr::Ident(name) = sel.expr
+                    {
+                        let span = SourceRange {
+                            offset: recv.span.offset,
+                            length: sel.span.end().saturating_sub(recv.span.offset),
+                        };
+                        drained = Some(Node {
+                            expr: Expr::Member {
+                                recv: Box::new(recv),
+                                name,
+                            },
+                            span,
+                        });
+                    }
+                } else {
+                    drained = self.pop_clamped(base);
+                }
+                self.pending_ctor_callee = drained;
                 self.open_window(WindowKind::LiteralCtor);
                 true
             }
@@ -2608,7 +2655,7 @@ impl ConstCapture {
             return None;
         }
         self.apply_unaries_at(self.depth);
-        if self.fold_literal_ctor_element(count, span, Expr::List) {
+        if self.fold_literal_ctor_element(count, span, Expr::List, self.base()) {
             return None;
         }
         Some(self.pop_operands(count))
@@ -2628,12 +2675,13 @@ impl ConstCapture {
         count: usize,
         span: SourceRange,
         build: impl FnOnce(Vec<Node>) -> Expr,
+        floor: usize,
     ) -> bool {
         if !self.top_is_literal_ctor() {
             return false;
         }
         let has_ctl = self.windows.last().is_some_and(|w| w.ctl_elements > 0);
-        let elements = self.pop_operands(count);
+        let elements = self.pop_operands_at(count, floor);
         let expr = if has_ctl { Expr::Other } else { build(elements) };
         self.push(Node { expr, span }, true);
         true
@@ -2664,7 +2712,7 @@ impl ConstCapture {
                 SetOrMap::Set(elements) => Expr::Set(elements),
                 SetOrMap::Map(entries) => Expr::Map(entries),
             }
-        }) {
+        }, self.base()) {
             return None;
         }
         let staged = self.pop_operands(count);
@@ -2817,24 +2865,41 @@ impl ConstCapture {
         if !self.open() {
             return None;
         }
+        // The record's own `(` is the pop floor: a trailing comma
+        // inflates the parser's `count` past the staged fields, and an
+        // unclamped pop eats the operand below (the map key an enclosing
+        // entry staged — the shifted pairing fed duplicate-check keys
+        // that were never keys).
+        let floor = self
+            .base()
+            .max(self.record_stack_marks.last().copied().unwrap_or(0));
         if self.top_is_non_const_dup() {
             self.apply_unaries_at(self.depth);
-            self.pop_operands(count);
+            self.pop_operands_at(count, floor);
+            self.record_stack_marks.pop();
             self.non_const_dup_placeholder(span);
             return None;
         }
         self.apply_unaries_at(self.depth);
-        if self.fold_literal_ctor_element(count, span, Expr::Record) {
+        if self.fold_literal_ctor_element(count, span, Expr::Record, floor) {
+            self.record_stack_marks.pop();
             return None;
         }
-        Some(self.pop_operands(count))
+        let fields = self.pop_operands_at(count, floor);
+        self.record_stack_marks.pop();
+        Some(fields)
     }
 
     fn pop_operands(&mut self, count: usize) -> Vec<Node> {
-        let base = self.base();
+        self.pop_operands_at(count, self.base())
+    }
+
+    /// [`Self::pop_operands`] with an explicit floor: a record literal's
+    /// fields pop above `max(base, mark)` — the record's own open.
+    fn pop_operands_at(&mut self, count: usize, floor: usize) -> Vec<Node> {
         let mut nodes = Vec::new();
         for _ in 0..count {
-            if let Some(node) = self.pop_clamped(base) {
+            if let Some(node) = self.pop_clamped(floor) {
                 nodes.push(node);
             }
         }
@@ -2862,17 +2927,25 @@ impl ConstCapture {
             .opaque_marks
             .last()
             .is_none_or(|&mark| self.stack.len() > mark);
+        let selector = std::mem::take(&mut self.selector_callee);
         if callee_pushed && self.stack.len() > base {
             self.stack.pop();
         }
+        let callee = callee.filter(|_| callee_pushed);
+        // An armed candidate's head was drained at its window's open —
+        // the level's callee is that drained node (nothing remains on the
+        // stack to pop). Every other callee keeps the bare shape #2194
+        // pins: the receiver stays below for the close's span extension,
+        // the dot merge following it.
+        let callee = self.pending_ctor_callee.take().or(callee);
         self.args.push(ArgLevel {
-            callee: callee.filter(|_| callee_pushed),
+            callee,
             mark: self.stack.len(),
             named_pending: false,
             args: Vec::new(),
             named: Vec::new(),
             window_seq: self.windows.len(),
-            selector_callee: std::mem::take(&mut self.selector_callee),
+            selector_callee: selector,
         });
     }
 
@@ -3347,6 +3420,7 @@ impl ConstCapture {
     pub fn parenthesized_begin(&mut self) {
         if self.open() {
             self.depth += 1;
+            self.record_stack_marks.push(self.stack.len());
         }
     }
 
@@ -3354,6 +3428,7 @@ impl ConstCapture {
         if self.open() {
             self.apply_unaries_at(self.depth - 1);
             self.depth -= 1;
+            self.record_stack_marks.pop();
         }
     }
 
