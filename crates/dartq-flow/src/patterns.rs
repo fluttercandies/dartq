@@ -378,7 +378,7 @@ impl Interp<'_> {
                             self.vacuous_cover_kills_chain();
                         }
                     } else {
-                        self.non_var_invalid_scrutinee_covers();
+                        self.non_var_invalid_scrutinee_covers(declared, declared_args);
                     }
                 } else if !self.collecting()
                     && self.pattern_depth > 1
@@ -464,7 +464,7 @@ impl Interp<'_> {
                             self.vacuous_cover_kills_chain();
                         }
                     } else {
-                        self.non_var_invalid_scrutinee_covers();
+                        self.non_var_invalid_scrutinee_covers(declared, declared_args);
                     }
                 }
             }
@@ -806,11 +806,32 @@ impl Interp<'_> {
     /// unmatched chain dies; every other scrutinee type keeps the
     /// live-init posture (the may-fail question has no flow-visible
     /// answer without a promotable reference).
-    fn non_var_invalid_scrutinee_covers(&mut self) {
+    fn non_var_invalid_scrutinee_covers(&mut self, declared: Ty, declared_args: u32) {
         if let Some((ty, args)) = self.frame_scrutinee_ty()
             && self.ops.is_invalid_typed(ty, args, self.args, self.names)
         {
             self.vacuous_cover_kills_chain();
+            return;
+        }
+        // A property scrutinee's type test is refutable like a variable's
+        // (the non-var face joins the same `_unmatched` —
+        // [`Self::matched_object_pattern`]'s covered gate): a frame-latched
+        // type that is not the pattern type's subtype may fail, and
+        // nothing else feeds the chain when this pattern is the whole
+        // case (`member.namePart case PrimaryConstructorDeclarationImpl c`
+        // folds its else dead without the join). No latched type at all
+        // may always fail, so it joins too.
+        if self.pattern.is_some() {
+            let covered = self
+                .frame_scrutinee_ty()
+                .is_some_and(|(ty, frame_args)| {
+                    self.ops
+                        .is_subtype_typed(ty, frame_args, declared, declared_args, self.args, self.names)
+                });
+            if !covered {
+                let cur = self.current.clone();
+                self.join_unmatched(cur);
+            }
         }
     }
 
