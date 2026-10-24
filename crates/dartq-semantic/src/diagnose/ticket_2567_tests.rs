@@ -859,3 +859,46 @@ fn foreign_container_return_instantiated_from_receiver() {
     );
 }
 
+
+/// A switch-expression scrutinee read through a receiver whose Named
+/// type arrived from CROSS-FILE inference (the callee's own library
+/// spells the return type; the consuming file never imports the name)
+/// is not the InvalidType face: the oracle's element model carries the
+/// resolved element (`var result = typePropertyResolver.resolve()`
+/// types the scrutinee `ResolutionResult` and keeps every arm live —
+/// the corpus property_element_resolver.dart:1615 rows). Only a head
+/// the whole graph fails to declare is the invalid face.
+#[test]
+fn cross_file_inferred_scrutinee_keeps_arms_live() {
+    let other = [
+        "class Ext {}",
+        "class Res {",
+        "  final Ext? getter2;",
+        "  const Res(this.getter2);",
+        "}",
+        "Res resolve() => const Res(null);",
+    ].join("\n");
+    let main = [
+        "class MethodEl {}",
+        "Object f() {",
+        "  var result = p.resolve();",
+        "  return switch (result.getter2) {",
+        "    MethodEl(:var type) => 0,",
+        "    p.Ext(:var returnType) => 1,",
+        "    _ => 2,",
+        "  };",
+        "}",
+    ].join("\n");
+    let r = super::test_rig::report_ops_imports(&main, &[super::test_rig::RigImport {
+        uri: "package:t/other.dart",
+        prefix: Some("p"),
+        source: &other,
+    }]);
+    let dead: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "dead_code")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert!(dead.is_empty(), "arms died: {:?} ALL: {:?}", dead, messages(&r));
+}

@@ -3773,6 +3773,17 @@ fn synthesize_unknown_scrutinee_dead_cases(
                 head_is_receiver
                     && !head_type_param
                     && !statement
+                    // A receiver's Named head arrives from inference (a
+                    // cross-file member's return, spelled in ITS library —
+                    // the consuming file never imports the name, and the
+                    // oracle's element model carries the resolved element
+                    // anyway: `var result = typePropertyResolver.resolve()`
+                    // types the scrutinee `ResolutionResult` with every arm
+                    // live). Only a head the WHOLE graph fails to declare is
+                    // the invalid face; a written-unresolved receiver
+                    // annotation (`Nowhere x; switch (x.y)`) declares
+                    // nowhere graph-wide and keeps firing.
+                    && graph.declaring_libraries(name).is_empty()
                     && !*resolvable.entry(name).or_insert_with(|| {
                         resolve_container(graph, namespaces, index, lib, file, name).is_some()
                     })

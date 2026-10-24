@@ -15,6 +15,7 @@ use crate::model::MicroKind;
 use crate::resolved_ops::{ClauseTrees, LibraryTypes, ResolvedTypeOps};
 use dartq_language::{Feature, FeatureSet, LanguageVersion};
 use dartq_parser::ParserFeatures;
+use dartq_resolution::ClassModifiers;
 use dartq_resolution::{
     Combinators, ImportEdge, LibraryClassModifiers, LibraryGraphBuilder, Namespaces,
 };
@@ -117,7 +118,14 @@ fn report_ops_with(source: &str, imports: &[RigImport<'_>]) -> FileReport {
         if decl.kind == MicroKind::TypeParam {
             continue;
         }
-        builder.declare(lib, name, file);
+        if matches!(
+            decl.kind,
+            MicroKind::Class | MicroKind::Enum | MicroKind::Mixin
+        ) {
+            builder.declare_class(lib, name, file, ClassModifiers::default());
+        } else {
+            builder.declare(lib, name, file);
+        }
     }
     let mut clauses = ClauseTrees::empty();
     crate::capture_clause_trees(
@@ -139,7 +147,14 @@ fn report_ops_with(source: &str, imports: &[RigImport<'_>]) -> FileReport {
             if decl.kind == MicroKind::TypeParam {
                 continue;
             }
-            builder.declare(dep_lib, name, dep_file);
+            if matches!(
+                decl.kind,
+                MicroKind::Class | MicroKind::Enum | MicroKind::Mixin
+            ) {
+                builder.declare_class(dep_lib, name, dep_file, ClassModifiers::default());
+            } else {
+                builder.declare(dep_lib, name, dep_file);
+            }
         }
         builder.import(
             dep_lib,
