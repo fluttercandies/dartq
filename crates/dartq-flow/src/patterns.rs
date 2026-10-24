@@ -22,6 +22,8 @@ impl Interp<'_> {
                     | Ev::ObjectPattern { .. }
                     | Ev::ShapePattern
                     | Ev::NullCheckPattern
+                    | Ev::BinaryOrPatternBegin
+                    | Ev::BinaryOrPatternEnd
                     | Ev::GuardBegin
                     | Ev::GuardEnd
             )
@@ -30,6 +32,8 @@ impl Interp<'_> {
         }
         match ev {
             Ev::ObjectPattern { name, args } => self.matched_object_pattern(*name, *args),
+            Ev::BinaryOrPatternBegin => self.or_pattern_begin(),
+            Ev::BinaryOrPatternEnd => self.or_pattern_end(),
             Ev::PatternBegin => {
                 self.pattern_depth += 1;
                 if self.pattern_depth == 1 {
@@ -464,11 +468,84 @@ impl Interp<'_> {
     /// clause and the post-switch state see the unpromoted variable. A
     /// nullability-disjoint pair kills the matched path (official
     /// `cannotMatch` → `setUnreachable`): the case body is dead.
+    /// A logical-or alternation opens (`A() || ...` at the top level of
+    /// a refutable pattern): latch the scrutinee's promoted face — the
+    /// LEFT branch's parse already promoted it, and the close needs the
+    /// pre-right face to tell a differing right promotion from an
+    /// identical one.
+    fn or_pattern_begin(&mut self) {
+        self.or_pattern_latch = None;
+        self.or_operand_depth = None;
+        self.or_right_face = None;
+        if self.pattern_depth != 1 {
+            return;
+        }
+        // The right operand's own pattern node parses one level deeper;
+        // its object pattern still constrains the scrutinee.
+        self.or_operand_depth = Some(self.pattern_depth + 1);
+        let Some(pattern) = self.pattern.as_ref() else {
+            return;
+        };
+        let Some(var) = pattern.scrutinee else {
+            return;
+        };
+        let model = self.current.model(var);
+        let ty = self.promoted_type_of(var, &model);
+        let args = self.promoted_args_of(var, &model);
+        self.or_pattern_latch = Some((var, ty, args));
+    }
+
+    /// The alternation closes: the right branch's promotion decides. An
+    /// unchanged face against the open's latch keeps the shared
+    /// promotion (`A() || A()`); a changed face is the union of two
+    /// distinct promotions, which the name-level model cannot spell —
+    /// the pre-pattern face restores (official
+    /// `analyzeLogicalOrPattern` joins the branches' promotions, and a
+    /// join of two distinct faces is no single promotion).
+    fn or_pattern_end(&mut self) {
+        self.or_operand_depth = None;
+        let (var, lty, largs) = match self.or_pattern_latch.take() {
+            Some(latch) => latch,
+            None => {
+                self.or_right_face = None;
+                return;
+            }
+        };
+        let Some(pattern) = self.pattern.as_ref() else {
+            self.or_right_face = None;
+            return;
+        };
+        let entry = pattern.unmatched.model(var);
+        let entry_face = (
+            self.promoted_type_of(var, &entry),
+            self.promoted_args_of(var, &entry),
+        );
+        // The join: both branches must promote, and to the same face —
+        // anything else is a union the name level cannot spell, and the
+        // pre-pattern face restores.
+        let left = (entry_face != (lty, largs)).then_some((lty, largs));
+        let right = self
+            .or_right_face
+            .flatten()
+            .filter(|face| *face != entry_face);
+        let joined = left.is_some() && right == left;
+        self.or_right_face = None;
+        if !joined {
+            let mut now_state = self.current.clone();
+            now_state = now_state.with_model(var, entry);
+            self.current = now_state;
+        }
+    }
+
     pub(crate) fn matched_object_pattern(&mut self, name: u32, args: u32) {
         // A top-level pattern constrains the matched value; a field's
         // sub-pattern constrains that field (the official sub-pattern face
         // runs under pushPropertySubpattern) and promotes nothing here.
-        if self.pattern_depth != 1 {
+        // A direct operand of an open top-level OR alternation runs one
+        // level deep (the operand is its own pattern node) but still
+        // constrains the SCRUTINEE — its promotion joins the alternation
+        // at the close (`or_pattern_end`).
+        if self.pattern_depth != 1 && Some(self.pattern_depth) != self.or_operand_depth {
             return;
         }
         let known = Ty {
@@ -509,9 +586,34 @@ impl Interp<'_> {
         } else {
             (known, args)
         };
+        let or_operand = Some(self.pattern_depth) == self.or_operand_depth;
+        let latch_face = or_operand
+            .then(|| self.or_pattern_latch.map(|(_, ty, args)| (ty, args)))
+            .flatten();
+        let or_before = or_operand.then_some(latch_face);
         let candidate = self.pattern_promotion_candidate(var, known, args);
         let (matched_arm, unmatched_arm) = self.branch_type_test(var, known, args, candidate);
         self.current = matched_arm;
+        if let Some((lty, largs)) = or_before.flatten() {
+            let m = self.current.model(var);
+            let after = (
+                self.promoted_type_of(var, &m),
+                self.promoted_args_of(var, &m),
+            );
+            // The candidate's presence is the promotion attempt: an
+            // applied test that lands on the face already standing is the
+            // vacuous same-face promotion (a valid join arm). A rejected
+            // candidate still counts when the pattern's own face IS the
+            // face the left branch promoted to (`Top() || Top()`) — the
+            // test was vacuous, not absent; anything else promoted
+            // nothing.
+            let face = if candidate.is_some() {
+                Some(after)
+            } else {
+                ((lty, largs) == (known, args)).then_some((lty, largs))
+            };
+            self.or_right_face = Some(face);
+        }
         if self.disjoint_by_nullability(matched, known) {
             self.unreachable_cur();
         }

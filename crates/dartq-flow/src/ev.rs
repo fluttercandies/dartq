@@ -557,6 +557,18 @@ pub enum Ev {
     },
     ConstantPatternBegin,
     ConstantPatternEnd,
+    /// A logical-or alternation's open (`A() || ...` — the operator seen
+    /// AFTER the left operand parsed): latches the scrutinee's model so
+    /// the close can tell a differing right-branch promotion from an
+    /// identical one (official `analyzeLogicalOrPattern` joins the
+    /// branches' promotions; a name-level model spells the join only
+    /// when both branches promote to the same face).
+    BinaryOrPatternBegin,
+    /// The alternation's close: a right branch that changed the
+    /// scrutinee's model against the open's latch leaves a union the
+    /// model cannot spell — the pre-pattern model restores (no
+    /// promotion); an unchanged model keeps the shared promotion.
+    BinaryOrPatternEnd,
     /// A pattern shape whose match can fail without pinning a named type:
     /// record, list, map, and relational patterns. At the top level of a
     /// refutable context the failure arm joins the pattern context's

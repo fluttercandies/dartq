@@ -681,3 +681,80 @@ fn bare_initializer_infers_the_promoted_type() {
     let r = report(&source);
     assert_eq!(count_code(&r, "undefined_getter"), 0, "{:?}", messages(&r));
 }
+
+#[test]
+fn tmp_cast_assign() {
+    let plain = [
+        "class Element {}",
+        "class Internal extends Element { String get sig => ''; bool get st => true; }",
+        "void f(Element x) {",
+        "  x = x as Internal;",
+        "  var a = x.sig;",
+        "  var b = x.st;",
+        "}",
+    ].join("\n");
+    let r = report(&plain);
+    assert_eq!(count_code(&r, "undefined_getter"), 0, "{:?}", messages(&r));
+    let in_if_case = [
+        "class Element {}",
+        "class Top extends Element {}",
+        "class Meth extends Element {}",
+        "class Internal extends Element { String get sig => ''; bool get st => true; }",
+        "void f(Element x) {",
+        "  if (x case Top() || Meth()) {",
+        "    x = x as Internal;",
+        "    var a = x.sig;",
+        "    var b = x.st;",
+        "  }",
+        "}",
+    ].join("\n");
+    let r2 = report(&in_if_case);
+    assert_eq!(count_code(&r2, "undefined_getter"), 0, "{:?}", messages(&r2));
+}
+
+/// A top-level logical-or alternation joins its branches' promotions
+/// (official `analyzeLogicalOrPattern`): two branches promoting the
+/// scrutinee to distinct faces are a union the type model cannot spell
+/// — no promotion stands, and a member read names the declared type;
+/// identical branch promotions keep the shared face. The `ffi_verifier`
+/// family (`if (x case TopLevelFunctionElement() || MethodElement())`)
+/// over-promoted to the last operand and silenced member reads the
+/// oracle reports.
+#[test]
+fn or_alternation_joins_branch_promotions() {
+    // Both branches declare `sig` — any single-branch promotion would
+    // resolve it silently; only the restore to the declared face reports.
+    let differing = [
+        "class Element {}",
+        "class Top extends Element { String get sig => ''; }",
+        "class Meth extends Element { String get sig => ''; }",
+        "void f(Element x) {",
+        "  if (x case Top() || Meth()) {",
+        "    var a = x.sig;",
+        "  }",
+        "}",
+    ].join("\n");
+    let r = report(&differing);
+    assert_eq!(
+        count_code(&r, "undefined_getter"),
+        1,
+        "differing OR promotions must not promote: {:?}",
+        messages(&r)
+    );
+    let shared = [
+        "class Element {}",
+        "class Top extends Element { String get sig => ''; }",
+        "void f(Element x) {",
+        "  if (x case Top() || Top()) {",
+        "    var a = x.sig;",
+        "  }",
+        "}",
+    ].join("\n");
+    let r2 = report(&shared);
+    assert_eq!(
+        count_code(&r2, "undefined_getter"),
+        0,
+        "identical OR promotions keep the promotion: {:?}",
+        messages(&r2)
+    );
+}

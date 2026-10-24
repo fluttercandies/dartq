@@ -4863,6 +4863,7 @@ impl ParserListener for DiagnoseListener<'_> {
     }
 
     fn begin_binary_pattern(&mut self, operator: Token) {
+        self.flow().begin_binary_pattern(operator);
         let engine = &mut self.engine;
         // The operand pattern parses next; its bracket frame inherits the
         // binary context (the scrutinee stays the matched type).
@@ -4878,7 +4879,9 @@ impl ParserListener for DiagnoseListener<'_> {
         }
     }
 
-    fn end_binary_pattern(&mut self, _operator: Token) {}
+    fn end_binary_pattern(&mut self, operator: Token) {
+        self.flow().end_binary_pattern(operator);
+    }
 
     fn handle_cast_pattern(&mut self, operator: Token) {
         let engine = &mut self.engine;

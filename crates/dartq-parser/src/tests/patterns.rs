@@ -243,3 +243,15 @@ fn keyword_blocker_inside_map_pattern_spawns_entry_recovery() {
         "map blocker"
     );
 }
+
+#[test]
+fn logical_or_object_operands_fire_object_patterns() {
+    let mut p = setup("Top() || Meth()");
+    let _ = p.parse_pattern_entry(PatternContext::Matching);
+    p.listener.assert_sequence(&[
+        ("handle", "object_pattern"),
+        ("begin", "binary_pattern"),
+        ("handle", "object_pattern"),
+        ("end", "binary_pattern"),
+    ]);
+}

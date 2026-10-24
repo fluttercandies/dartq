@@ -942,6 +942,21 @@ pub(crate) struct Interp<'o> {
     pub(crate) pending_decl_bases: Vec<usize>,
     pub(crate) pattern: Option<PatternState>,
     pub(crate) pattern_depth: usize,
+    /// The open logical-or alternation's latch (depth-1 refutable
+    /// context, bare-read scrutinee): the scrutinee's promoted face
+    /// after the LEFT branch parsed — the close compares the right
+    /// branch's face against it (same → the shared promotion stands,
+    /// differing → a union the name level cannot spell restores the
+    /// pre-pattern face).
+    pub(crate) or_pattern_latch: Option<(u32, Ty, u32)>,
+    /// The pattern depth at which an open top-level OR alternation's
+    /// right operand parses (its object pattern's promotion gate).
+    pub(crate) or_operand_depth: Option<usize>,
+    /// The open OR alternation's right-branch promotion face: `None`
+    /// until the right operand's object pattern runs, then `Some(None)`
+    /// when it promoted nothing and `Some(Some(face))` when it did —
+    /// the close's join decision (`or_pattern_end`).
+    pub(crate) or_right_face: Option<Option<(Ty, u32)>>,
     pub(crate) type_test_pending: Option<(bool, Ty, u32)>,
     pub(crate) as_cast_pending: Option<Ty>,
     /// The type currently being parsed (test/cast/formal consumers).
@@ -1155,6 +1170,9 @@ impl<'o> Interp<'o> {
             pending_decl_bases: Vec::new(),
             pattern: None,
             pattern_depth: 0,
+            or_pattern_latch: None,
+            or_operand_depth: None,
+            or_right_face: None,
             type_test_pending: None,
             as_cast_pending: None,
             tested_ty: None,

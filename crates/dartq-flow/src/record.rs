@@ -388,6 +388,13 @@ impl<'t> Flow<'t> {
         self.intern_args(entries)
     }
 
+    /// One token's lexeme, when the token table carries it.
+    fn token_text(&self, token: TokenSpan) -> Option<&str> {
+        self.tokens
+            .get(token.id as usize)
+            .map(|_| self.tokens.lexeme(self.source, token.id as usize))
+    }
+
     /// Interns a name token's lexeme to a dense id. Synthetic tokens
     /// (parser-inserted) get a unique id keyed on the token handle.
     fn name(&mut self, token: TokenSpan) -> u32 {
@@ -2630,6 +2637,18 @@ impl ParserListener for Flow<'_> {
 
     fn handle_wildcard_pattern(&mut self, _keyword: Option<Token>, wildcard: Token) {
         self.record(Ev::Wildcard { token: wildcard });
+    }
+
+    fn begin_binary_pattern(&mut self, operator: Token) {
+        if self.token_text(operator) == Some("||") {
+            self.record(Ev::BinaryOrPatternBegin);
+        }
+    }
+
+    fn end_binary_pattern(&mut self, operator: Token) {
+        if self.token_text(operator) == Some("||") {
+            self.record(Ev::BinaryOrPatternEnd);
+        }
     }
 
     fn begin_pattern_guard(&mut self, _when: Token) {
