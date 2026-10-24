@@ -2516,6 +2516,12 @@ pub(crate) struct Engine<'a> {
     /// object-pattern shorthand field (`:var x`) reads the getter the
     /// variable names (the oracle's `field.pattern.variablePattern?.name`).
     pub(crate) last_pattern_variable: Option<(StringId, SourceRange)>,
+    /// A null-check pattern (`p?`) completed since the last pattern-field
+    /// boundary over the variable it wrapped: the object-pattern shorthand
+    /// (`:final x?`) binds `x` to the property type's non-null projection.
+    /// The latch carries the wrapped variable's name so a stale latch from
+    /// another sub-pattern never projects an unrelated field's binder.
+    pub(crate) pending_pattern_null_check: Option<StringId>,
     /// Object-pattern field reads awaiting the file-tail verdict
     /// (`resolveObjectPatternPropertyGet`, type_analyzer.dart:1669-1715):
     /// `(head type, getter, anchor)`.

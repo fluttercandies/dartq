@@ -758,3 +758,38 @@ fn or_alternation_joins_branch_promotions() {
         messages(&r2)
     );
 }
+
+/// An object-pattern shorthand binder takes the property's declared
+/// return (`Head(:var x)` binds the getter's face, official
+/// `resolveObjectPatternPropertyGet`): a member the face lacks reports
+/// NAMING the face — the untyped binder suppressed (the unknown receiver
+/// never reports) — and the chained property read resolves through it,
+/// so the `utilities.dart` `GetterInvocationResolution(:var element)`
+/// family's downstream guard promotions decide on the real face.
+#[test]
+fn object_pattern_binder_takes_property_type() {
+    let src = [
+        "class Node { Node2 get resolution => throw 0; }",
+        "class Node2 { VarEl get element => throw 0; }",
+        "class VarEl { bool get isConst => false; }",
+        "void f(Node node) {",
+        "  if (node.resolution case Node2(:var element)) {",
+        "    var q = element.nope;",
+        "    var variable = element.isConst;",
+        "  }",
+        "}",
+    ].join("\n");
+    let r = report(&src);
+    let getters: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "undefined_getter")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        getters,
+        ["The getter 'nope' isn't defined for the type 'VarEl'."],
+        "{:?}",
+        messages(&r)
+    );
+}

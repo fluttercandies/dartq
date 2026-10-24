@@ -298,6 +298,18 @@ impl Interp<'_> {
                 // back-end's promotion gate keys on it.
                 let declared = self.pending_ty.take().unwrap_or(Ty::UNKNOWN);
                 let declared_args = std::mem::take(&mut self.pending_ty_args);
+                // The shorthand binder's staged face (#2567): the semantic
+                // layer resolved the property's declared return — a bare
+                // `var x` binder in an object pattern adopts it exactly
+                // like an inferred initializer's slot.
+                let (declared, declared_args) = if declared == Ty::UNKNOWN {
+                    self.inferred_locals
+                        .get(&token.range.offset)
+                        .copied()
+                        .map_or((declared, declared_args), |(ty, args)| (ty, args))
+                } else {
+                    (declared, declared_args)
+                };
                 let meta = VarMeta {
                     ty: declared,
                     args: declared_args,

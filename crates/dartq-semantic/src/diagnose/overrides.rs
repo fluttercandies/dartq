@@ -215,10 +215,14 @@ impl<'a> Engine<'a> {
         // (the `with M<Arg>` edge living in another unit) stays undecidable
         // and the raw entry passes through — the under-report direction.
         let mut facts: Option<FxHashMap<StringId, HeaderClause>> = None;
+        // The unique-declaration re-anchor bypasses the seen gate once
+        // (the anchor's spelling re-resolves in its declaring library).
+        let mut retried = false;
         loop {
-            if !seen.insert(name) {
+            if !retried && !seen.insert(name) {
                 return Walk::ChainBroken;
             }
+            retried = false;
             let found = if at_anchor {
                 resolve_container(
                     self.graph,
@@ -247,6 +251,21 @@ impl<'a> Engine<'a> {
             };
             let Some((found, found_owner)) = found else {
                 if at_anchor {
+                    // A receiver head that arrived through a resolved
+                    // member signature (a foreign getter's declared
+                    // return, never spelled in this file) resolves in its
+                    // DECLARING library's scope — the oracle walks the
+                    // declaring scope, not the use site's. The re-anchor
+                    // bypasses the seen gate once.
+                    if let Some((file, lib)) =
+                        self.unique_declared_elsewhere(name, scope_lib)
+                    {
+                        owner = file;
+                        scope_lib = lib;
+                        at_anchor = false;
+                        retried = true;
+                        continue;
+                    }
                     // The receiver-type spelling itself unresolvable is the
                     // oracle's InvalidType: member reads ride dynamic and
                     // stay silent (the broken chain).

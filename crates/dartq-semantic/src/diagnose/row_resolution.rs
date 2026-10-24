@@ -327,6 +327,34 @@ impl<'a> Engine<'a> {
     /// and an invoked member (`var l = c.fragments.toList()`) answers
     /// the instantiated SEND result, never the raw schema a bare
     /// `return_ty` read would leak.
+    /// An object-pattern shorthand binder's declared type
+    /// (`Head(:var x)`): the getter's declared return on the head, bare
+    /// named faces only — the oracle's `resolveObjectPatternPropertyGet`
+    /// types the bound variable from the property. A parametric return
+    /// (the boundary's argument projection is not engaged here), an
+    /// unresolved getter, and a non-accessor member answer `None` (the
+    /// under-report direction: the binder keeps the raw unknown).
+    pub(crate) fn object_pattern_binder_ty(
+        &self,
+        head: StringId,
+        getter: StringId,
+    ) -> Option<Ty> {
+        match self.walk_members(head, getter) {
+            Walk::Found(entry)
+                if matches!(entry.kind, MemberKind::Getter | MemberKind::Field)
+                    && !entry.is_static =>
+            {
+                match Self::member_result_ty(&entry) {
+                    Ty::Named { args, .. } if args == ArgListId::EMPTY => {
+                        Some(Self::member_result_ty(&entry))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The shared re-bind direction gate: only a NARROWING face is a
     /// promotion (see the member arm's inline twin for the full
     /// rationale — the `!`/`as` widening binds keep their written face).
@@ -3242,7 +3270,7 @@ impl<'a> Engine<'a> {
     /// for a receiver type the diagnosing library's scope does not carry
     /// (`XmlNodeList` reached unimported through a member's declared type).
     /// Any non-unique answer stays `None`: the climb must not guess.
-    fn unique_declared_elsewhere(
+    pub(crate) fn unique_declared_elsewhere(
         &self,
         name: StringId,
         scope_lib: LibraryId,

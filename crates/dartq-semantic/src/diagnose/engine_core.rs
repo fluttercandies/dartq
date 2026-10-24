@@ -241,6 +241,7 @@ impl<'a> Engine<'a> {
             pattern_bind_records: 0,
             pattern_bind_dirty: false,
             last_pattern_variable: None,
+            pending_pattern_null_check: None,
             pending_pattern_getters: Vec::new(),
             open_exec_site: None,
             decl_sites: Vec::new(),

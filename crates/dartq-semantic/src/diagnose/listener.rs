@@ -4935,6 +4935,12 @@ impl ParserListener for DiagnoseListener<'_> {
         // matched arm non-null and joins the null arm into the unmatched
         // chain (official `_handleNullCheckPattern`).
         self.flow().handle_null_check_pattern(question);
+        // Only a null-check directly wrapping a latched variable (the
+        // shorthand `:final x?`) carries the non-null projection to the
+        // field boundary; a wrapper on a completed field leaves no live
+        // latch, and a stale bit must not leak into the next field.
+        self.engine.pending_pattern_null_check =
+            self.engine.last_pattern_variable.map(|(name, _)| name);
         // `p?` = the subpattern space ∩ nonNull (official
         // `createNullCheckSpace`, upstream Dart SDK source,
         // pkg/_fe_analyzer_shared/lib/src/exhaustiveness/shared.dart:780-786;
@@ -5241,6 +5247,7 @@ impl ParserListener for DiagnoseListener<'_> {
             let required = Ty::named(head);
             engine.check_pattern_never_matches(first_identifier.range, required);
         }
+        let mut staged_binders: Vec<(Ty, SourceRange)> = Vec::new();
         let fields = engine
             .switch
             .pattern_stack
@@ -5251,11 +5258,60 @@ impl ParserListener for DiagnoseListener<'_> {
                 if let Some((getter, at)) = field.getter {
                     engine.pending_pattern_getters.push((head, getter, at));
                 }
+                // The shorthand binder's declared type: `:var x` reads the
+                // getter on the head, and the oracle's
+                // `resolveObjectPatternPropertyGet` types the bound
+                // variable from the property's declared return
+                // (`GetterInvocationResolution(:var element)` binds
+                // `GetterElement`, never the raw unknown) — the binder's
+                // downstream member reads and case-guard promotions decide
+                // on the real face. A bare named return only: a parametric
+                // or unresolvable face keeps the under-report (the
+                // boundary's argument projection is not engaged here).
+                // A typed sub-pattern (`:T x`) keeps its written annotation
+                // (only a still-unknown slot takes the fill), and a
+                // null-check suffix (`:final x?`) projects the face non-null
+                // (the arm's promotion applies to the bound variable).
+                if let (Some((binder, binder_span)), Some((getter, _))) =
+                    (field.binder, field.getter)
+                    && engine
+                        .local_declared_ty(binder)
+                        .map_or(true, |slot| slot == Ty::UNKNOWN)
+                    && let Some(mut ty) = engine.object_pattern_binder_ty(head, getter)
+                {
+                    if field.binder_non_null && let Ty::Named { nullable, .. } = &mut ty {
+                        *nullable = false;
+                    }
+                    engine.bind_var_type(binder, ty.clone());
+                    staged_binders.push((ty, binder_span));
+                }
             }
         }
         engine.close_object_fields(head, &fields);
         // An object pattern's fields are member reads, not record slots.
         engine.pattern_bind_dirty = true;
+        // The bound variables' flow slots take the same declared face
+        // (the #2140 staging, keyed on the binder's name token): the
+        // flow's own `DeclaredVarPattern` typed the raw unknown.
+        for (ty, span) in staged_binders {
+            if let Ty::Named {
+                name: ty_name,
+                nullable,
+                ..
+            } = ty
+            {
+                let lexeme = self.engine.strings.resolve(ty_name).to_string();
+                let base = self.flow().intern_name(&lexeme);
+                self.flow().stage_inferred_local(
+                    span.offset,
+                    FlowTy {
+                        base: FlowBase::Name(base),
+                        nullable,
+                    },
+                    Vec::new(),
+                );
+            }
+        }
     }
 
     fn handle_pattern_field(&mut self, colon: Option<Token>) {
@@ -5274,11 +5330,23 @@ impl ParserListener for DiagnoseListener<'_> {
         // latch is consumed per field so a positional field never reads a
         // stale one.
         let latched = engine.last_pattern_variable.take();
+        let mut binder = None;
+        let mut binder_non_null = false;
         let getter = match (colon, name) {
             (Some(token), Some(name)) if engine.text_of(token) != Some(":") => {
                 Some((name, token.range))
             }
-            (Some(_), _) => latched,
+            (Some(_), _) => {
+                // The shorthand's variable IS the bound pattern variable —
+                // its declared type rides the getter's return below. The
+                // pending null-check projects the face non-null only when
+                // it wrapped THIS field's variable.
+                binder = latched;
+                binder_non_null = engine
+                    .pending_pattern_null_check
+                    .is_some_and(|checked| binder.is_some_and(|(name, _)| name == checked));
+                latched
+            }
             (None, _) => None,
         };
         // A named field (`:a` / `a: p`) is never a positional record slot —
@@ -5297,6 +5365,11 @@ impl ParserListener for DiagnoseListener<'_> {
                 name: getter.map(|(name, _)| name).or(name),
                 leaves,
                 getter,
+                binder,
+                binder_non_null: {
+                    engine.pending_pattern_null_check.take();
+                    binder_non_null
+                },
             });
         }
     }

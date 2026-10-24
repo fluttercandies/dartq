@@ -444,6 +444,16 @@ pub(crate) struct ObjectField {
     /// oracle's `resolveObjectPatternPropertyGet` name token. `None` for a
     /// positional field.
     pub(crate) getter: Option<(StringId, SourceRange)>,
+    /// The shorthand's bound variable (`:var x` / `:x` binds `x`): the
+    /// binder's name and declaration span, taken with the getter (the
+    /// variable latch). `None` for written-name fields (`x: p` — the
+    /// sub-pattern's own binder is not the getter) and positional fields.
+    pub(crate) binder: Option<(StringId, SourceRange)>,
+    /// The shorthand's null-check suffix (`:final x?`): the oracle binds
+    /// `x` to the property type's NON-NULL projection (the null-check
+    /// arm's promotion applies to the bound variable, official
+    /// `_handleNullCheckPattern`), not the raw property face.
+    pub(crate) binder_non_null: bool,
 }
 
 /// The name-level coverage a pattern leaf contributes (the space-building
