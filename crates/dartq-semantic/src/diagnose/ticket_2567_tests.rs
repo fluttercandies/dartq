@@ -1052,3 +1052,68 @@ fn bang_rhs_write_promotes_the_local() {
         .collect();
     assert_eq!(unchecked, Vec::<&str>::new(), "{:?}", messages(&r));
 }
+
+/// A prefixed import never shadows the bare namespace (#2567, the
+/// blaze_watcher shape): the unit imports `other.dart` bare — its own
+/// `File` carrying the members — beside a PREFIXED import of `sdk.dart`
+/// exporting a different, member-less `File`. The flat registry answers
+/// the bare spelling with the bare import's declaration, `is File`
+/// promotes over `Resource`, and the promoted reads
+/// (`modificationStamp`, `lengthSync`) resolve. The import sweep's old
+/// first-writer-wins walk registered the prefixed chain's `File`
+/// instead, refused the promotion, and reported both reads as
+/// `undefined_getter`.
+#[test]
+fn prefixed_import_does_not_shadow_bare_registration() {
+    let r = super::test_rig::report_ops_imports(
+        concat!(
+            "class W {\n",
+            "  final Provider _provider;\n",
+            "  W(this._provider);\n",
+            "  int? poll(String path) {\n",
+            "    try {\n",
+            "      var pathResource = _provider.getResource(path);\n",
+            "      var symlinkTarget = pathResource.resolveSymbolicLinksSync().path;\n",
+            "      var resolvedResource = _provider.getResource(symlinkTarget);\n",
+            "      if (resolvedResource is File) {\n",
+            "        var timestamp = resolvedResource.modificationStamp;\n",
+            "        var length = resolvedResource.lengthSync;\n",
+            "        return timestamp + length;\n",
+            "      } else if (resolvedResource is Folder) {\n",
+            "        return 0;\n",
+            "      } else {\n",
+            "        return null;\n",
+            "      }\n",
+            "    } on FileSystemException catch (_) {\n",
+            "      return null;\n",
+            "    }\n",
+            "  }\n",
+            "}\n",
+        ),
+        &[
+            super::test_rig::RigImport {
+                uri: "package:t/other.dart",
+                prefix: None,
+                source: concat!(
+                    "abstract class Resource { Resource resolveSymbolicLinksSync(); String get path; }\n",
+                    "abstract class File implements Resource { final int modificationStamp = 0; final int lengthSync = 0; }\n",
+                    "abstract class Folder implements Resource { final String path = ''; }\n",
+                    "class FileSystemException implements Exception {}\n",
+                    "abstract class Provider { Resource getResource(String path); }\n",
+                ),
+            },
+            super::test_rig::RigImport {
+                uri: "package:t/sdk.dart",
+                prefix: Some("io"),
+                source: "class File { int get unrelated => 0; }\n",
+            },
+        ],
+    );
+    let miss: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "undefined_getter")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(miss, Vec::<&str>::new(), "{:?}", messages(&r));
+}

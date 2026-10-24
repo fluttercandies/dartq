@@ -142,6 +142,12 @@ pub struct LibraryTypes {
     /// function or variable): a spelling that resolves to one maps
     /// `Invalid` rather than borrowing a same-named builtin.
     non_containers: FxHashSet<StringId>,
+    /// Spellings a PREFIXED import target exports: the flow layer's
+    /// bare-head type question cannot say which class the source named
+    /// (`io.File` beside — or in place of — a bare-registered `File`),
+    /// so the adapter's verdict gates keep the name-level default's
+    /// answer over them ([`ResolvedTypeOps::head_overloaded`]).
+    lossy_overloads: FxHashSet<StringId>,
     /// `typedef` name → the aliased head name plus its own `?` flag —
     /// captured only when the element model carried the RHS as a bare
     /// `Ty::Named` with no written arguments and the alias declares no
@@ -264,6 +270,41 @@ impl ClauseTrees {
         self.trees.get(&(file, name))
     }
 }
+
+/// The `dart:` SDK libraries' public type names — the flat fallback the
+/// lossy-spelling overload set reads for a PREFIXED SDK import whose
+/// target carries no element model (the SDK is not part of the census's
+/// element index, so `export_scope` answers nothing for it). The names
+/// matter exactly as overload markers: the flow layer's bare-head type
+/// question can never say the source meant `io.File` rather than the
+/// bare-registered `File`, so the verdict gates keep the name-level
+/// answer over these spellings. Extend per library as the corpora
+/// prefix-import more of the SDK.
+
+const SDK_LIBRARY_TYPE_NAMES: &[(&str, &[&str])] = &[(
+    "dart:io",
+    &[
+        "CompressionOptions", "ContentType", "Cookie", "Directory", "File",
+        "FileLock", "FileMode", "FileStat", "FileSystemEntity",
+        "FileSystemEvent", "FileSystemException", "GZipCodec", "HttpBody",
+        "HttpCompressionOptions", "HttpConnectionsInfo", "HttpDate",
+        "HttpHeaders", "HttpClient", "HttpClientBadResponseCertificate",
+        "HttpClientBasicCredentials", "HttpClientCredentials",
+        "HttpClientDigestCredentials", "HttpClientRequest",
+        "HttpClientResponse", "HttpOverrides", "HttpRequest", "HttpResponse",
+        "HttpServer", "HttpSession", "HttpStatus", "InternetAddress",
+        "InternetAddressType", "IOException", "IOSink", "Link",
+        "NetworkInterface", "OSError", "Process", "ProcessException",
+        "ProcessInfo", "ProcessMode", "ProcessResult", "ProcessSignal",
+        "RandomAccessFile", "RawDatagramSocket", "RawSecureServerSocket",
+        "RawSecureSocket", "RawSocket", "RawSocketEvent",
+        "RawSynchronousSocket", "SecureServerSocket", "SecurityContext",
+        "ServerSocket", "Socket", "SocketDirection", "SocketException",
+        "SocketOption", "Stdin", "StdioType", "Stdout", "WebSocket",
+        "WebSocketException", "WebSocketStatus", "WebSocketTransformer",
+        "X509Certificate", "ZLibCodec", "ZLibOption",
+    ],
+)];
 
 impl LibraryTypes {
     /// [`LibraryTypes::build`] over the name-level clause names only —
@@ -439,43 +480,50 @@ impl LibraryTypes {
             }
         }
 
-
-        // The import reachability sweep: BFS over import edges from
-        // `lib`, each target's export scope contributing the names the
-        // unit's resolves see (re-exports ride the same edges — the
-        // scope the names resolve through is exactly `export_scope`'s).
-        let mut seen: FxHashSet<u32> = FxHashSet::default();
-        seen.insert(lib.index());
-        let mut queue: Vec<LibraryId> = vec![lib];
-        while let Some(current) = queue.pop() {
-            for edge in graph.import_edges(current) {
-                let Some(target) = edge.target else {
-                    continue;
-                };
-                if !seen.insert(target.index()) {
+        // The direct-import registration: the unit's OWN import edges'
+        // targets contribute their export-scope names — the graph's
+        // export fixpoint has already folded re-exports into that scope,
+        // so one hop is the exact visibility. A PREFIXED import
+        // contributes nothing to the bare namespace (its names live only
+        // under the `prefix.Name` aliases below), and the directive's
+        // show/hide filters what it does contribute. Deeper import edges
+        // never leak: a library's private imports are invisible to its
+        // importers (the official namespace build,
+        // `library_analyzer.dart`'s import scopes) — walking them
+        // transitively once let a prefixed `dart:io as io` register the
+        // SDK's `File` bare and shadow the imported one, refusing the
+        // `is File` promotion the oracle makes (the census's
+        // blaze_watcher rows: first-writer-wins made the wrong `File`
+        // answer `is_subtype(File, Resource)` false).
+        for edge in graph.import_edges(lib) {
+            let Some(target) = edge.target else {
+                continue;
+            };
+            if edge.prefix.is_some() {
+                continue;
+            }
+            for (name, entry) in graph.export_scope(target) {
+                if !edge.combinators.allows(name) {
                     continue;
                 }
-                queue.push(target);
-                for (name, entry) in graph.export_scope(target) {
-                    if registry.registry.contains_key(&name)
-                        || registry.non_containers.contains(&name)
-                    {
-                        continue;
+                if registry.registry.contains_key(&name)
+                    || registry.non_containers.contains(&name)
+                {
+                    continue;
+                }
+                match index.get(entry.file).map(|els| els.container(name)) {
+                    Some(Some(_)) => {
+                        registry.register_file(index, entry.file, target, &mut actions);
+                        for action in actions.drain(..) {
+                            builder = action.apply(builder, &table, core_enum);
+                        }
                     }
-                    match index.get(entry.file).map(|els| els.container(name)) {
-                        Some(Some(_)) => {
-                            registry.register_file(index, entry.file, target, &mut actions);
-                            for action in actions.drain(..) {
-                                builder = action.apply(builder, &table, core_enum);
-                            }
-                        }
-                        Some(None) | None => {
-                            // The name resolves but its declaring file
-                            // carries no model, or the model holds no
-                            // container under it — suppress, never
-                            // borrow a same-named decl.
-                            registry.non_containers.insert(name);
-                        }
+                    Some(None) | None => {
+                        // The name resolves but its declaring file
+                        // carries no model, or the model holds no
+                        // container under it — suppress, never
+                        // borrow a same-named decl.
+                        registry.non_containers.insert(name);
                     }
                 }
             }
@@ -508,6 +556,142 @@ impl LibraryTypes {
                     .registry
                     .entry(strings.intern(&joined))
                     .or_insert(decl);
+            }
+        }
+        // —— the supertype closure ————————————————————————————————————————
+        // Name visibility above is exact (own units + direct unprefixed
+        // imports), but the HIERARCHY answers over chains through
+        // containers the unit cannot spell — an imported file's private
+        // import of the interface its class implements (`XPathMap`
+        // reaching `XPathItem` through `XPathFunctionItem`). Every
+        // registered declaration's clause spellings must therefore
+        // resolve — in the DECLARING library's own scope, the same
+        // `namespaces.lookup` the edge pass consults — or the edge pass
+        // drops the hop and `is_subtype` breaks mid-chain. The worklist
+        // registers each file a clause spelling names; its own clauses
+        // join the next round until a pass adds nothing. First-writer
+        // -wins keeps the visible spelling's declaration authoritative:
+        // a closure entry only ever fills an absent slot, never retypes
+        // a name the unit itself resolves.
+        loop {
+            let mut grew = false;
+            let mut scan: Vec<(FileId, LibraryId)> = Vec::new();
+            let mut scanned: FxHashSet<(FileId, LibraryId)> = FxHashSet::default();
+            for &(file, owner) in registry.decl_owner.values() {
+                if scanned.insert((file, owner)) {
+                    scan.push((file, owner));
+                }
+            }
+            for (file, owner) in scan {
+                let Some(elements) = index.get(file) else {
+                    continue;
+                };
+                // The clause spellings of every container in the file:
+                // the written trees' heads (recursively — a written
+                // argument's head rides the same edge) beside the
+                // element model's name-level clause lists. A member's
+                // declared type head rides the same closure: the
+                // recorder spells a member-typed variable's type bare,
+                // and the oracle resolves that spelling in the
+                // DECLARING file's context — a name the reading unit
+                // never imports (`InternalVariableElement`, spelled by
+                // src/dart/ast/ast.dart's property while the reader
+                // imports no element-model src file) still answers
+                // through its real declaration instead of collapsing
+                // to `Invalid`'s vacuous arms.
+                let mut heads: Vec<StringId> = Vec::new();
+                for &name in elements.container_order() {
+                    if let Some(capture) = clauses.get(file, name) {
+                        for tree in &capture.supers {
+                            collect_tree_heads(tree, &mut heads);
+                        }
+                    }
+                    if let Some(container) = elements.container(name) {
+                        heads.extend(
+                            container
+                                .superclass
+                                .iter()
+                                .chain(container.with_clause.iter())
+                                .chain(container.implements_clause.iter())
+                                .chain(
+                                    (container.kind == ContainerKind::Mixin)
+                                        .then(|| container.on_clause.iter())
+                                        .into_iter()
+                                        .flatten(),
+                                )
+                                .copied(),
+                        );
+                        for entry in container.members.values() {
+                            let ty = match entry.kind {
+                                MemberKind::Field => entry.var_ty,
+                                MemberKind::Getter | MemberKind::Method => entry.return_ty,
+                                MemberKind::Setter => continue,
+                            };
+                            if let Ty::Named { name: head, .. } = ty {
+                                heads.push(head);
+                            }
+                        }
+                    }
+                }
+                for head in heads {
+                    if registry.registry.contains_key(&head)
+                        || registry.non_containers.contains(&head)
+                        || registry.type_params.contains_key(&head)
+                    {
+                        continue;
+                    }
+                    let Lookup::Found(NamespaceEntry::Decl(target_file)) =
+                        namespaces.lookup(graph, owner, head)
+                    else {
+                        continue;
+                    };
+                    if !index
+                        .get(target_file)
+                        .is_some_and(|els| els.container(head).is_some())
+                    {
+                        continue;
+                    }
+                    let target_lib = graph.library_of_file(target_file).unwrap_or(owner);
+                    registry.register_file(index, target_file, target_lib, &mut actions);
+                    for action in actions.drain(..) {
+                        builder = action.apply(builder, &table, core_enum);
+                    }
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        // —— the lossy-spelling overloads —————————————————————————————————
+        // The flow layer spells every qualified type reference by its bare
+        // head (`io.File` reads `File`), so a spelling a PREFIXED import
+        // target exports names a class the bare question can never point
+        // at — whether the unit also resolves it bare (`File` beside
+        // `file_system.File`) or resolves it nowhere the snapshot sees
+        // (`io.FileSystemEntity` mapping `Invalid`, whose vacuous subtype
+        // arm would dead the `is io.File` arm the oracle keeps live).
+        // Those spellings carry no resolved verdict: the adapter's
+        // verdict gates keep the name-level default's answer over them
+        // ([`ResolvedTypeOps::head_overloaded`]).
+        let mut lossy_overloads: FxHashSet<StringId> = FxHashSet::default();
+        for edge in graph.import_edges(lib) {
+            let (Some(target), Some(_)) = (edge.target, edge.prefix) else {
+                continue;
+            };
+            for (name, _) in graph.export_scope(target) {
+                if edge.combinators.allows(name) {
+                    lossy_overloads.insert(name);
+                }
+            }
+            // A prefixed SDK import carries no element model, so its
+            // export scope answers nothing — the static table stands in
+            // ([`SDK_LIBRARY_TYPE_NAMES`]).
+            let uri = graph.uri(target);
+            for (sdk_uri, names) in SDK_LIBRARY_TYPE_NAMES {
+                if uri == *sdk_uri {
+                    lossy_overloads.extend(names.iter().map(|n| strings.intern(n)));
+                }
             }
         }
         // The alias RHS shapes flatten after every registration pass (the
@@ -726,6 +910,7 @@ impl LibraryTypes {
             facts,
             decl_params,
             non_containers,
+            lossy_overloads,
             typedef_targets,
             typedef_shapes,
             param_names,
@@ -1300,6 +1485,21 @@ fn builtin_super(
 /// declaration keeps its remaining edges plus the implicit `Object` the
 /// builder adds (the open direction).
 #[expect(clippy::too_many_arguments)] // one operand per snapshot face the resolution reads
+/// Collects every named head a written supertype tree mentions — the
+/// root head beside each written argument's — feeding the supertype
+/// closure's registration worklist. A record/function-shaped node can
+/// never map to an edge (`clause_tree_ty` refuses the shape wholesale),
+/// so its subtrees carry no edge to protect.
+fn collect_tree_heads(tree: &crate::capture::TypeTree, heads: &mut Vec<StringId>) {
+    if tree.record.is_some() || tree.function.is_some() {
+        return;
+    }
+    heads.push(tree.head);
+    for arg in &tree.args {
+        collect_tree_heads(arg, heads);
+    }
+}
+
 fn clause_head_instantiation(
     table: &TypeTable,
     registry: &FxHashMap<StringId, TypeDeclId>,
@@ -1506,6 +1706,11 @@ pub struct ResolvedTypeOps<'a> {
     /// answers `Invalid` (the suppress face), matching today's
     /// unknown-is-top posture.
     name_ty: RefCell<Vec<(TypeId, TypeId)>>,
+    /// Flow-layer name ids whose spelling is a lossy overload — extended
+    /// beside the `name_ty` cache in `observe_names`: the arg-less ops
+    /// (`is_subtype`, `factor`, `try_promote_to`) carry no `names`
+    /// slice, so this set is the only overload face they can read.
+    overload_ids: RefCell<FxHashSet<u32>>,
     /// `TypeDeclId` → memoized "sealed or enum" answer — the
     /// `is_always_exhaustive` per-decl verdict, stable across the
     /// corpus's switch-end probes.
@@ -1547,6 +1752,7 @@ impl<'a> ResolvedTypeOps<'a> {
             strings,
             system: TypeSystem::new(&snapshot.table, &snapshot.hierarchy),
             name_ty: RefCell::new(Vec::new()),
+            overload_ids: RefCell::new(FxHashSet::default()),
             closed: RefCell::new(FxHashMap::default()),
             opaque: RefCell::new(FxHashMap::default()),
             decl_names: RefCell::new(None),
@@ -1605,7 +1811,10 @@ impl<'a> ResolvedTypeOps<'a> {
             return;
         }
         cache.reserve(names.len() - start);
-        for lexeme in &names[start..] {
+        for (offset, lexeme) in names[start..].iter().enumerate() {
+            if self.snapshot.lossy_overloads.contains(&self.strings.intern(lexeme)) {
+                self.overload_ids.borrow_mut().insert((start + offset) as u32);
+            }
             let name = self.strings.intern(lexeme);
             let pair = if let Some(&param) = self.snapshot.type_params.get(&name) {
                 (
@@ -2532,6 +2741,33 @@ impl<'a> ResolvedTypeOps<'a> {
         }
     }
 
+    /// Whether one spelled head is a lossy overload — a spelling a
+    /// prefixed import target exports, which the flow layer's bare-head
+    /// type question can never attribute (`io.File` reads `File`). Such
+    /// spellings carry no resolved verdict: whichever declaration the
+    /// bare registry holds (or none — the vacuous `Invalid`), the
+    /// source may have meant the prefixed class, so the verdict gates
+    /// keep the name-level default's answer instead.
+    fn head_overloaded(&self, ty: FlowTy, names: &[Box<str>]) -> bool {
+        let Base::Name(id) = ty.base else {
+            return false;
+        };
+        names.get(id as usize).is_some_and(|lexeme| {
+            self.snapshot
+                .lossy_overloads
+                .contains(&self.strings.intern(lexeme))
+        })
+    }
+
+    /// [`Self::head_overloaded`]'s id-keyed face for the arg-less ops:
+    /// the id set `observe_names` extended beside the name cache.
+    fn id_overloaded(&self, ty: FlowTy) -> bool {
+        let Base::Name(id) = ty.base else {
+            return false;
+        };
+        self.overload_ids.borrow().contains(&id)
+    }
+
     /// Maps one `ArgTy` node (recursion for `FutureOr`); `names` and
     /// `arena` are the live faces `is_always_exhaustive` carries. A node
     /// whose name resolves to nothing maps `invalid` — the argument the
@@ -2776,6 +3012,14 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// pre-mount answer and a resolved pair gains the real hierarchy
     /// (`Resource` <: `Object`, `File` <: `Resource` cross-file).
     fn is_subtype(&self, left: FlowTy, right: FlowTy) -> bool {
+        // A lossy-overload id answers name-level
+        // ([`Self::overload_ids`]): the resolved verdict would ride
+        // whichever class registered bare — or the vacuous `Invalid`
+        // of an unregistered spelling — and the source may have meant
+        // the prefixed class.
+        if self.id_overloaded(left) || self.id_overloaded(right) {
+            return NameTypeOps.is_subtype(left, right);
+        }
         match (self.map_base(left), self.map_base(right)) {
             (Some(l), Some(r)) => self.system.is_subtype(l, r),
             _ => NameTypeOps.is_subtype(left, right),
@@ -2918,6 +3162,12 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// type. The flow layer then skips the type test and joins the live
     /// state into the unmatched chain instead of letting
     /// `factor(any, Invalid)` dead the body.
+    ///
+    /// A lossy-overload head never answers `Invalid`: the bare spelling
+    /// names a class a PREFIXED import target exports (the graph carries
+    /// no element model for it), so the oracle's world resolves it — the
+    /// "resolves nowhere" claim needs the bare spelling to be the
+    /// resolved one, and the name-level default (`false`) stands.
     fn is_invalid_typed(
         &self,
         ty: FlowTy,
@@ -2926,6 +3176,9 @@ impl TypeOps for ResolvedTypeOps<'_> {
         names: &[Box<str>],
     ) -> bool {
         self.observe_names(names);
+        if self.id_overloaded(ty) {
+            return false;
+        }
         matches!(
             self.snapshot
                 .table
@@ -3021,6 +3274,14 @@ impl TypeOps for ResolvedTypeOps<'_> {
         if self.tested_head_undefined(what, names) {
             return from;
         }
+        // A lossy-overload head factors name-level
+        // ([`Self::head_overloaded`]) — the resolved remainder would
+        // bottom over `Invalid`'s vacuous subtype arm and dead a branch
+        // the oracle keeps live. An unresolved `from` against a
+        // resolved `what` delegates the same way.
+        if self.head_overloaded(from, names) || self.head_overloaded(what, names) {
+            return NameTypeOps.factor_typed(from, from_args, what, what_args, arena, names);
+        }
         self.observe_names(names);
         let f = self.map_scrutinee(from, from_args, arena, names);
         let w = self.map_tested(what, what_args, arena, names);
@@ -3082,6 +3343,15 @@ impl TypeOps for ResolvedTypeOps<'_> {
         if self.tested_head_undefined(right, names) {
             return false;
         }
+
+        // A lossy-overload head answers name-level
+        // ([`Self::head_overloaded`]) — the resolved verdict would ride
+        // the wrong class half the time, and its `Invalid` face would
+        // vacuously dead branches the oracle keeps live. An unresolved
+        // left side against a resolved right delegates the same way.
+        if self.head_overloaded(left, names) || self.head_overloaded(right, names) {
+            return NameTypeOps.is_subtype_typed(left, left_args, right, right_args, arena, names);
+        }
         self.observe_names(names);
         // Two signature-less function spellings: the flow layer records
         // every function type as the bare `Base::Function` head (no
@@ -3106,20 +3376,6 @@ impl TypeOps for ResolvedTypeOps<'_> {
         self.system.is_subtype(l, r)
     }
 
-    /// `tryPromoteToType` over the instantiated spellings — the oracle
-    /// gate verbatim: `Some(to)` exactly when `to <: from`
-    /// (type_system.dart:1739-1741), `None` otherwise. Both sides map
-    /// with their written arguments, so a strict narrowing
-    /// (`x is Response<T>` after `x is Response` — `Response<T> <:
-    /// Response<dynamic>` holds) promotes, where the bare-`Ty` coverage
-    /// test would veto it. An `Invalid` arm (an unresolved head) answers
-    /// through the same gate — subtype.dart's 0c arm makes both
-    /// directions vacuously true, so the strict gate refuses the step
-    /// exactly as the oracle's `isValidPromotionStep` refuses an
-    /// `InvalidType` promotion (mutual subtypes are no step). The tested
-    /// side's arity veto recovers instead ([`Self::map_tested`]) — the
-    /// official promotes to its `Response<InvalidType>` face (probed:
-    /// `x.data` reads in the then branch, dart analyze 3.13.1).
     fn try_promote_to_typed(
         &self,
         to: FlowTy,
@@ -3135,6 +3391,15 @@ impl TypeOps for ResolvedTypeOps<'_> {
         // `type_test_with_undefined_name` on.
         if self.tested_head_undefined(to, names) {
             return None;
+        }
+
+        // A lossy-overload head promotes name-level
+        // ([`Self::head_overloaded`]) — the resolved strict gate would
+        // consult the wrong class half the time, forcing or refusing
+        // steps the oracle decides otherwise; the name-level default's
+        // posture stands over the spelling.
+        if self.head_overloaded(to, names) || self.head_overloaded(from, names) {
+            return NameTypeOps.try_promote_to_typed(to, to_args, from, from_args, arena, names);
         }
         self.observe_names(names);
         let t = self.map_tested(to, to_args, arena, names);
