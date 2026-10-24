@@ -2812,14 +2812,63 @@ impl<'a> Engine<'a> {
     /// `reader.readEnum(...)`, `box.get()`, `this.adopt(...)`: the found
     /// method's own type-parameter names ([`MemberEntry::type_param_names`])
     /// join the declaring container's captured parameters
-    /// ([`Bounds::container_params`], in-file only — a foreign container's
-    /// parameter names are unmodeled, the under-report direction). The
+    /// ([`Bounds::container_params`], in-file; a uniquely-declared foreign
+    /// container answers through [`Self::foreign_container_params`]). The
     /// receiver's written instantiation (`box: Box<int>`) seeds the
     /// container parameters only when the member lives on the receiver's
     /// own head — an inherited member declares its signatures in the
     /// supertype's parameter spellings, whose instantiation this
     /// name-level model cannot map (`C<T> extends B<String>` must not
     /// seed `B`'s `T` from `C<int>`).
+
+    /// Whether a formal face mentions the callee's parameter spelling —
+    /// the compound-substitution gate (only faces naming a solvable slot
+    /// need the map; everything else keeps its written face byte-identical).
+    fn formal_mentions_param(&self, ty: Ty, param: StringId) -> bool {
+        match ty {
+            Ty::Named { name, args, .. } => {
+                if name == param {
+                    return true;
+                }
+                let list = self.boundary.pool().get(args).to_vec();
+                list.iter().any(|&arg| self.formal_mentions_param(arg, param))
+            }
+            Ty::Function { shape, .. } => {
+                let pool_shape = {
+                    let pool = self.boundary.pool();
+                    pool.function_shape(shape).clone()
+                };
+                self.formal_mentions_param(pool_shape.return_ty, param)
+                    || pool_shape
+                        .positional
+                        .iter()
+                        .any(|&arg| self.formal_mentions_param(arg, param))
+                    || pool_shape
+                        .named
+                        .iter()
+                        .any(|&(_, arg)| self.formal_mentions_param(arg, param))
+            }
+            _ => false,
+        }
+    }
+    /// A cross-file container's parameter names (the SDK's `Stream<T>` in
+    /// a user unit): the unique declaring library's unit carries the
+    /// declaration, and its `type_param_names` are the send-inference
+    /// domain when this-file bounds hold no capture.
+    fn foreign_container_params(&self, name: StringId) -> Option<Vec<StringId>> {
+        let libs = self.graph.declaring_libraries(name);
+        if libs.len() != 1 {
+            return None;
+        }
+        let file = self.graph.unit_files(libs[0]).iter().copied().find(|&f| {
+            self.index
+                .get(f)
+                .is_some_and(|unit| unit.container(name).is_some())
+        })?;
+        let names = self.index.get(file)?.container(name)?.type_param_names.to_vec();
+        (!names.is_empty()).then_some(names)
+    }
+
     fn member_send_params(
         &self,
         recv: &Receiver,
@@ -2858,8 +2907,17 @@ impl<'a> Engine<'a> {
         // a solution the oracle never derives). With no seed the foreign
         // member's bare-parameter formal binds nothing (the formal spells
         // a name outside this param list, so `unify_upward` declines it).
-        let container_params = if own_member {
-            self.bounds.container_params(container).unwrap_or_default()
+        let container_params: Vec<(StringId, Option<crate::bounds::TypeTree>, bool)> = if own_member {
+            match self.bounds.container_params(container) {
+                Some(params) if !params.is_empty() => params,
+                // The SDK's own containers (`Stream<T>` from a user unit)
+                // hold no this-file capture; their names still seed the
+                // receiver's written instantiation.
+                _ => self
+                    .foreign_container_params(container)
+                    .map(|names| names.into_iter().map(|name| (name, None, false)).collect())
+                    .unwrap_or_default(),
+            }
         } else {
             Vec::new()
         };
@@ -5577,7 +5635,13 @@ impl<'a> Engine<'a> {
                 }
             }
             // The substituted parameter type (the substitution keeps
-            // every non-type-parameter callee byte-identical).
+            // every non-type-parameter callee byte-identical). A bare
+            // parameter leaf maps to its solved slot; a COMPOUND face
+            // (`Stream.transform`'s `StreamTransformer<T, S>` over the
+            // receiver-seeded `T` and the argument-solved `S`) substitutes
+            // the whole solved map through `subst_params` — an unsolved
+            // parameter maps to its own spelling, so only solved slots
+            // move.
             let formal_ty = match (&exec_params, formal.ty) {
                 (
                     Some(params),
@@ -5591,6 +5655,19 @@ impl<'a> Engine<'a> {
                     .position(|(p, _)| *p == param)
                     .map(|index| effective[index])
                     .unwrap_or(formal.ty),
+                (Some(params), formal_ty)
+                    if !matches!(formal_ty, Ty::Unknown)
+                        && params
+                            .iter()
+                            .any(|(p, _)| self.formal_mentions_param(formal_ty, *p)) =>
+                {
+                    let map: Vec<(StringId, Ty)> = params
+                        .iter()
+                        .zip(effective.iter())
+                        .map(|((param, _), ty)| (*param, *ty))
+                        .collect();
+                    self.subst_params(formal_ty, &map).unwrap_or(formal_ty)
+                }
                 _ => formal.ty,
             };
             if self.argument_verdict(*ty, formal_ty, *literal) == Some(false) {

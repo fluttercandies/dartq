@@ -826,3 +826,36 @@ fn callback_return_mismatch_still_reports() {
         messages(&r)
     );
 }
+
+/// A foreign container's member send still instantiates with the
+/// receiver's written arguments: the cross-file `Box<T>`'s parameters
+/// answer through its declaring library's unit (the receiver-seed face
+/// [`Engine::foreign_container_params`] feeds when this-file bounds hold
+/// no capture — the SDK seam the corpus rides), and the member's return
+/// face carries them (`b.pick()` is `Box<A>`, not the raw `Box<T>` — the
+/// corpus `selectable.dart:176` `watch` result row: `Stream<T>.transform`'s
+/// return must carry the receiver's element type).
+#[test]
+fn foreign_container_return_instantiated_from_receiver() {
+    let r = super::test_rig::report_ops_imports(
+        "void f(Box<A> b) {\n  b.take(b.pick());\n}\n",
+        &[super::test_rig::RigImport {
+            uri: "package:t/other.dart",
+            prefix: None,
+            source: "class A {}\nclass B {}\nclass Box<T> { Box<T> pick() => throw 0; void take(Box<B> x) {} }\n",
+        }],
+    );
+    let args: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "argument_type_not_assignable")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        args,
+        ["The argument type 'Box<A>' can't be assigned to the parameter type 'Box<B>'. "],
+        "{:?}",
+        messages(&r)
+    );
+}
+
