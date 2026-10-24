@@ -598,16 +598,34 @@ pub(crate) fn supertype_has_instance_members(
 /// The `dart:core` interface-membership face for names outside the indexed
 /// set: `(type, interface)` pairs whose membership is definitional —
 /// `Iterable` is itself, and the direct supertype of `List` and `Set`
-/// (upstream Dart SDK source, sdk/lib/core/{iterable,list,set}.dart). An
-/// unindexed name is answered only when it appears here as implementing
-/// `interface`; every other unindexed name (an unanalyzed dependency, an
-/// SDK type absent from the table) leaves the question open. The table
-/// carries no negative facts: an unindexed name never answers `false`,
-/// only the open direction.
-const CORE_INTERFACE_IMPLS: [(&str, &str); 3] = [
+/// (upstream Dart SDK source, sdk/lib/core/{iterable,list,set}.dart). The
+/// same face answers the `dart:collection`/`dart:convert` bases whose
+/// clause heads live in unindexed SDK units: the typedef aliases
+/// (`IterableBase`/`IterableMixin` are `Iterable` itself, `SetMixin` is
+/// `SetBase`, `MapMixin` is `MapBase`, the two `*SinkBase` names their
+/// sink — sdk/lib/collection/iterable.dart:11,18, set.dart:322,
+/// maps.dart:204, sdk/lib/convert/{string_conversion,byte_conversion}
+/// .dart:162,38), the `implements` clauses the alias targets carry
+/// (set.dart:23, maps.dart:21), and `SplayTreeSet`'s `with Iterable<E>,
+/// SetMixin<E>` application (splay_tree.dart:998) whose private `_SplayTree`
+/// superclass never resolves outside the SDK. An unindexed name is answered
+/// only when it appears here as implementing `interface`; every other
+/// unindexed name (an unanalyzed dependency, an SDK type absent from the
+/// table) leaves the question open. The table carries no negative facts:
+/// an unindexed name never answers `false`, only the open direction.
+const CORE_INTERFACE_IMPLS: [(&str, &str); 12] = [
     ("Iterable", "Iterable"),
     ("List", "Iterable"),
     ("Set", "Iterable"),
+    ("IterableMixin", "Iterable"),
+    ("IterableBase", "Iterable"),
+    ("SetMixin", "Set"),
+    ("SetBase", "Set"),
+    ("MapMixin", "Map"),
+    ("MapBase", "Map"),
+    ("SplayTreeSet", "Set"),
+    ("StringConversionSinkBase", "StringConversionSink"),
+    ("ByteConversionSinkBase", "ByteConversionSink"),
 ];
 
 /// Whether the name implements the interface, per

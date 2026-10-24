@@ -859,6 +859,39 @@ fn foreign_container_return_instantiated_from_receiver() {
     );
 }
 
+/// A class clause reaching an unmodeled `dart:collection`/`dart:convert`
+/// base unfolds through the SDK alias face (`IterableBase` IS `Iterable`,
+/// `SetMixin` IS `SetBase implements Set`, `SplayTreeSet` applies
+/// `SetMixin` — upstream sdk/lib/collection + convert typedefs): the
+/// creation returned as the core interface stays silent (the corpus rows
+/// xml ancestors.dart:8, petitparser matches.dart:27, collection
+/// priority_queue.dart:314), while a base the SDK never declares (`Nope`)
+/// stays the dead InvalidType edge that reports.
+#[test]
+fn sdk_collection_alias_face_reaches_core_interface() {
+    let r = super::test_rig::report_ops(concat!(
+        "class Warn {}\n",
+        "class Anc extends IterableBase<Warn> {}\n",
+        "Iterable<Warn> ancestors() => Anc();\n",
+        "class Mine extends SetMixin<Warn> {}\n",
+        "Set<Warn> make() => Mine();\n",
+        "Set<Warn> splay() { var s = SplayTreeSet<Warn>(); return s; }\n",
+        "class Dead extends Nope {}\n",
+        "Iterable<Warn> dead() => Dead();\n",
+    ));
+    let returns: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "return_of_invalid_type")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        returns.len(),
+        1,
+        "only the dead-edge return reports: {:?}",
+        messages(&r)
+    );
+}
 
 /// A switch-expression scrutinee read through a receiver whose Named
 /// type arrived from CROSS-FILE inference (the callee's own library
