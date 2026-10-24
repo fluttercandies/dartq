@@ -969,6 +969,87 @@ impl<'a> Engine<'a> {
         self.rederived_receiver(member_offset, recv)
     }
 
+    /// [`Self::callee_return_ty`] widened with the builtin core member
+    /// face — the ASSIGNMENT-RHS staging's resolver alone (the flow
+    /// write's promotion needs the resolved return; every other send
+    /// consumer keeps the unknown-suppress posture over receivers the
+    /// graph carries no element model for, where a wrong face would
+    /// fire rows the oracle never reports).
+    pub(crate) fn callee_return_ty_for_write(&self, row: &Row) -> Ty {
+        let resolved = self.callee_return_ty(row);
+        if resolved != Ty::UNKNOWN {
+            return resolved;
+        }
+        let container = match &row.shape {
+            RowShape::Member {
+                recv:
+                    Receiver::This { container, .. }
+                    | Receiver::Super { container, .. }
+                    | Receiver::Container {
+                        name: container, ..
+                    }
+                    | Receiver::Typed {
+                        type_name: container,
+                        ..
+                    },
+            } => Some(*container),
+            _ => None,
+        }
+        .or_else(|| {
+            let index = self
+                .rows
+                .partition_point(|probe| probe.range.offset < row.range.offset);
+            let receiver = self.rows.get(index.checked_sub(1)?)?;
+            (receiver.range.end() <= row.range.offset).then_some(receiver.name)
+        });
+        let Some(container) = container else {
+            return Ty::UNKNOWN;
+        };
+        // A builtin core receiver's member send: the SDK libraries carry
+        // no element model, so the container walk below cannot resolve
+        // the declared return — the static face table answers instead
+        // (`s.substring(..)` reads `String`; a collection transform
+        // re-heads the receiver's own arguments, `xs.toList()` answering
+        // the `List` of what `xs` is; a member whose element type rides
+        // the callee's inference answers the bare head, keeping the
+        // question decidable). The lookup keys the receiver head's
+        // spelling, so a container the graph element-models (a user
+        // class, however spelled) never hits; constructors stay out of
+        // the table and keep their own face below.
+        if let Some(face) = crate::member_face::core_member_return(
+            self.strings.resolve(container),
+            self.strings.resolve(row.name),
+        ) {
+            let head = |spelling: &str| self.members.core_ret_id(spelling);
+            let receiver_args = || {
+                let index = self
+                    .rows
+                    .partition_point(|probe| probe.range.offset < row.range.offset);
+                self.rows.get(index.checked_sub(1)?).and_then(|recv| {
+                    match recv.ty {
+                        Ty::Named { args, .. } if recv.range.end() <= row.range.offset => {
+                            Some(args)
+                        }
+                        _ => None,
+                    }
+                })
+            };
+            return match face {
+                crate::member_face::CoreRet::Fixed(h) => head(h).map(Ty::named),
+                crate::member_face::CoreRet::BareHead(h) => head(h).map(Ty::named),
+                crate::member_face::CoreRet::RecvHead(h) => head(h).and_then(|name| {
+                    receiver_args().map(|args| Ty::Named {
+                        name,
+                        nullable: false,
+                        args,
+                    })
+                }),
+            }
+            .unwrap_or(Ty::UNKNOWN);
+        }
+        Ty::UNKNOWN
+    }
+
     /// The declared return type of an invoked callee row (a completed
     /// send's result type): a bare callee resolves through the top-level
     /// namespace — a same-named local shadows it (suppress; its declared
@@ -1103,6 +1184,7 @@ impl<'a> Engine<'a> {
         let Some(container) = container else {
             return Ty::UNKNOWN;
         };
+
         // `C.name(...)` on a class head: a named constructor outranks any
         // member (the oracle rewrites the creation first), and a static
         // member must be the class's own — statics are not inherited, so

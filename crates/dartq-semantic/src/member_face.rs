@@ -61,6 +61,189 @@ pub(crate) const ENUM_SYNTH_MEMBERS: [&str; 3] = ["values", "index", "name"];
 /// Builtin type names: always defined, independent of any import.
 pub(crate) const BUILTIN_TYPES: [&str; 1] = ["dynamic"];
 
+/// A `dart:core` member's declared return face, for receivers the graph
+/// carries no element model for (the SDK libraries): a fixed head
+/// (`String.substring` reads `String`), the receiver's own arguments
+/// re-headed (a collection transform — `xs.toList()` answers the `List`
+/// of what `xs` is), or an argument-less head where the official's
+/// element type rides an inference this face cannot spell (`map`'s
+/// `Iterable<S>` — the bare `Iterable` keeps the question decidable).
+#[derive(Clone, Copy)]
+pub(crate) enum CoreRet {
+    Fixed(&'static str),
+    RecvHead(&'static str),
+    BareHead(&'static str),
+}
+
+/// The core members whose official signatures are unambiguous at this
+/// face — every entry pins the exact declared return (upstream Dart SDK
+/// source, `sdk/lib/core/{string,int,double,num,bool,iterable,list,map}
+/// .dart`); members whose element type rides the callee's type
+/// parameters (`first`, `single`) or whose return is `void` stay out
+/// (an entry is a claim, not a guess).
+pub(crate) const CORE_MEMBER_RETURNS: &[(&str, &str, CoreRet)] = &[
+    // string.dart
+    ("String", "codeUnitAt", CoreRet::Fixed("int")),
+    ("String", "compareTo", CoreRet::Fixed("int")),
+    ("String", "contains", CoreRet::Fixed("bool")),
+    ("String", "endsWith", CoreRet::Fixed("bool")),
+    ("String", "startsWith", CoreRet::Fixed("bool")),
+    ("String", "isEmpty", CoreRet::Fixed("bool")),
+    ("String", "isNotEmpty", CoreRet::Fixed("bool")),
+    ("String", "indexOf", CoreRet::Fixed("int")),
+    ("String", "lastIndexOf", CoreRet::Fixed("int")),
+    ("String", "length", CoreRet::Fixed("int")),
+    ("String", "substring", CoreRet::Fixed("String")),
+    ("String", "toLowerCase", CoreRet::Fixed("String")),
+    ("String", "toUpperCase", CoreRet::Fixed("String")),
+    ("String", "trim", CoreRet::Fixed("String")),
+    ("String", "trimLeft", CoreRet::Fixed("String")),
+    ("String", "trimRight", CoreRet::Fixed("String")),
+    ("String", "padLeft", CoreRet::Fixed("String")),
+    ("String", "padRight", CoreRet::Fixed("String")),
+    ("String", "replaceAll", CoreRet::Fixed("String")),
+    ("String", "replaceFirst", CoreRet::Fixed("String")),
+    ("String", "replaceFirstMapped", CoreRet::Fixed("String")),
+    ("String", "replaceAllMapped", CoreRet::Fixed("String")),
+    ("String", "replaceRange", CoreRet::Fixed("String")),
+    ("String", "splitMapJoin", CoreRet::Fixed("String")),
+    ("String", "toString", CoreRet::Fixed("String")),
+    ("String", "fromCharCode", CoreRet::Fixed("int")),
+    ("String", "fromCharCodes", CoreRet::Fixed("int")),
+    // int.dart / num.dart — the shared numeric face
+    ("int", "toString", CoreRet::Fixed("String")),
+    ("int", "compareTo", CoreRet::Fixed("int")),
+    ("int", "isEven", CoreRet::Fixed("bool")),
+    ("int", "isOdd", CoreRet::Fixed("bool")),
+    ("int", "isNaN", CoreRet::Fixed("bool")),
+    ("int", "isFinite", CoreRet::Fixed("bool")),
+    ("int", "isInfinite", CoreRet::Fixed("bool")),
+    ("int", "isNegative", CoreRet::Fixed("bool")),
+    ("int", "bitLength", CoreRet::Fixed("int")),
+    ("int", "toDouble", CoreRet::Fixed("double")),
+    ("int", "toInt", CoreRet::Fixed("int")),
+    ("int", "toStringAsFixed", CoreRet::Fixed("String")),
+    ("int", "toStringAsExponential", CoreRet::Fixed("String")),
+    ("int", "toStringAsPrecision", CoreRet::Fixed("String")),
+    ("double", "toString", CoreRet::Fixed("String")),
+    ("double", "compareTo", CoreRet::Fixed("int")),
+    ("double", "isNaN", CoreRet::Fixed("bool")),
+    ("double", "isFinite", CoreRet::Fixed("bool")),
+    ("double", "isInfinite", CoreRet::Fixed("bool")),
+    ("double", "isNegative", CoreRet::Fixed("bool")),
+    ("double", "toInt", CoreRet::Fixed("int")),
+    ("double", "toDouble", CoreRet::Fixed("double")),
+    ("double", "ceil", CoreRet::Fixed("int")),
+    ("double", "floor", CoreRet::Fixed("int")),
+    ("double", "round", CoreRet::Fixed("int")),
+    ("double", "truncate", CoreRet::Fixed("int")),
+    ("double", "ceilToDouble", CoreRet::Fixed("double")),
+    ("double", "floorToDouble", CoreRet::Fixed("double")),
+    ("double", "roundToDouble", CoreRet::Fixed("double")),
+    ("double", "truncateToDouble", CoreRet::Fixed("double")),
+    ("double", "toStringAsFixed", CoreRet::Fixed("String")),
+    ("double", "toStringAsExponential", CoreRet::Fixed("String")),
+    ("double", "toStringAsPrecision", CoreRet::Fixed("String")),
+    ("num", "toString", CoreRet::Fixed("String")),
+    ("num", "compareTo", CoreRet::Fixed("int")),
+    ("num", "isNaN", CoreRet::Fixed("bool")),
+    ("num", "isFinite", CoreRet::Fixed("bool")),
+    ("num", "isInfinite", CoreRet::Fixed("bool")),
+    ("num", "isNegative", CoreRet::Fixed("bool")),
+    ("num", "toInt", CoreRet::Fixed("int")),
+    ("num", "toDouble", CoreRet::Fixed("double")),
+    // bool.dart
+    ("bool", "toString", CoreRet::Fixed("String")),
+    // iterable.dart — the transforms
+    ("Iterable", "toList", CoreRet::RecvHead("List")),
+    ("Iterable", "join", CoreRet::Fixed("String")),
+    ("Iterable", "length", CoreRet::Fixed("int")),
+    ("Iterable", "isEmpty", CoreRet::Fixed("bool")),
+    ("Iterable", "isNotEmpty", CoreRet::Fixed("bool")),
+    ("Iterable", "contains", CoreRet::Fixed("bool")),
+    ("Iterable", "any", CoreRet::Fixed("bool")),
+    ("Iterable", "every", CoreRet::Fixed("bool")),
+    ("Iterable", "toString", CoreRet::Fixed("String")),
+    ("Iterable", "followedBy", CoreRet::RecvHead("Iterable")),
+    ("Iterable", "map", CoreRet::BareHead("Iterable")),
+    ("Iterable", "expand", CoreRet::BareHead("Iterable")),
+    ("Iterable", "where", CoreRet::RecvHead("Iterable")),
+    ("Iterable", "skip", CoreRet::RecvHead("Iterable")),
+    ("Iterable", "take", CoreRet::RecvHead("Iterable")),
+    // list.dart
+    ("List", "unmodifiable", CoreRet::RecvHead("List")),
+    ("List", "filled", CoreRet::RecvHead("List")),
+    ("List", "of", CoreRet::RecvHead("List")),
+    ("List", "from", CoreRet::RecvHead("List")),
+    ("List", "generate", CoreRet::RecvHead("List")),
+    ("List", "cast", CoreRet::RecvHead("List")),
+    ("List", "sublist", CoreRet::RecvHead("List")),
+    ("List", "getRange", CoreRet::BareHead("Iterable")),
+    ("List", "reversed", CoreRet::BareHead("Iterable")),
+    ("List", "toList", CoreRet::RecvHead("List")),
+    ("List", "join", CoreRet::Fixed("String")),
+    ("List", "length", CoreRet::Fixed("int")),
+    ("List", "isEmpty", CoreRet::Fixed("bool")),
+    ("List", "isNotEmpty", CoreRet::Fixed("bool")),
+    ("List", "contains", CoreRet::Fixed("bool")),
+    ("List", "indexOf", CoreRet::Fixed("int")),
+    ("List", "lastIndexOf", CoreRet::Fixed("int")),
+    ("List", "indexWhere", CoreRet::Fixed("int")),
+    ("List", "lastIndexWhere", CoreRet::Fixed("int")),
+    ("List", "map", CoreRet::BareHead("Iterable")),
+    ("List", "expand", CoreRet::BareHead("Iterable")),
+    ("List", "where", CoreRet::RecvHead("Iterable")),
+    ("List", "skip", CoreRet::RecvHead("Iterable")),
+    ("List", "take", CoreRet::RecvHead("Iterable")),
+    ("List", "toString", CoreRet::Fixed("String")),
+    // map.dart — the face queries; `keys`/`values` ride `K`/`V`'s
+    // inference, so the bare `Iterable` keeps them decidable
+    ("Map", "length", CoreRet::Fixed("int")),
+    ("Map", "isEmpty", CoreRet::Fixed("bool")),
+    ("Map", "isNotEmpty", CoreRet::Fixed("bool")),
+    ("Map", "containsKey", CoreRet::Fixed("bool")),
+    ("Map", "containsValue", CoreRet::Fixed("bool")),
+    ("Map", "keys", CoreRet::BareHead("Iterable")),
+    ("Map", "values", CoreRet::BareHead("Iterable")),
+    ("Map", "toString", CoreRet::Fixed("String")),
+];
+
+/// The [`CORE_MEMBER_RETURNS`] lookup — a linear scan over the small
+/// table on the send-return miss path (a resolved member never consults
+/// it).
+
+/// The distinct head spellings of [`CORE_MEMBER_RETURNS`], interned once
+/// per engine ([`MemberFace::new`]).
+fn core_ret_head_ids(strings: &StringTable) -> FxHashMap<&'static str, StringId> {
+    let mut ids = FxHashMap::default();
+    for head in CORE_MEMBER_RETURNS.iter().flat_map(|(h, _, ret)| {
+        let ret_head = match ret {
+            CoreRet::Fixed(h) | CoreRet::RecvHead(h) | CoreRet::BareHead(h) => *h,
+        };
+        [*h, ret_head]
+    }) {
+        ids.entry(head).or_insert_with(|| strings.intern(head));
+    }
+    ids
+}
+
+impl MemberFace {
+    /// The interned id of a [`CORE_MEMBER_RETURNS`] head spelling — the
+    /// send-return hook's face construction resolves through this; a
+    /// spelling outside the table has no id and the hook keeps the
+    /// unknown face.
+    pub(crate) fn core_ret_id(&self, spelling: &str) -> Option<StringId> {
+        self.core_ret_ids.get(spelling).copied()
+    }
+}
+
+pub(crate) fn core_member_return(head: &str, member: &str) -> Option<CoreRet> {
+    CORE_MEMBER_RETURNS
+        .iter()
+        .find(|(h, m, _)| *h == head && *m == member)
+        .map(|(_, _, ret)| *ret)
+}
+
 /// The dart:core primitive types whose member face the engine answers
 /// directly: their declarations are external (the library graph carries
 /// their top-level names only), so a member walk chain-breaks — but the
@@ -1036,6 +1219,10 @@ pub(crate) struct MemberFace {
     pub(crate) object_members: [StringId; OBJECT_MEMBERS.len()],
     pub(crate) enum_synth_members: [StringId; ENUM_SYNTH_MEMBERS.len()],
     pub(crate) builtin_types: [StringId; BUILTIN_TYPES.len()],
+    /// The distinct head spellings of [`CORE_MEMBER_RETURNS`] (the fixed
+    /// returns and the re-heads), interned once — the send-return hook
+    /// resolves through these ids; the engine borrows the table read-only.
+    pub(crate) core_ret_ids: FxHashMap<&'static str, StringId>,
     /// `name` → `name=` lookup spellings already interned (write targets
     /// repeat across a unit; the cache is bounded by their distinct names).
     pub(crate) setter_ids: FxHashMap<StringId, StringId>,
@@ -1140,6 +1327,7 @@ impl MemberFace {
             object_members: OBJECT_MEMBERS.map(|m| strings.intern(m)),
             enum_synth_members: ENUM_SYNTH_MEMBERS.map(|m| strings.intern(m)),
             builtin_types: BUILTIN_TYPES.map(|m| strings.intern(m)),
+            core_ret_ids: core_ret_head_ids(strings),
             setter_ids: FxHashMap::default(),
             primitive_ids: FINAL_PRIMITIVES.map(|m| strings.intern(m)),
             core_supertypes: CORE_SUPERTYPES.map(|(b, p)| (strings.intern(b), strings.intern(p))),

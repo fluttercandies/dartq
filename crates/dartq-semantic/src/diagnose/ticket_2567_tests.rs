@@ -1117,3 +1117,34 @@ fn prefixed_import_does_not_shadow_bare_registration() {
         .collect();
     assert_eq!(miss, Vec::<&str>::new(), "{:?}", messages(&r));
 }
+
+/// A core-member call right side stages the write's type (#2567, the
+/// xml qname shape): `String.substring` has no element model in the
+/// graph (the SDK libraries), so the send's return used to fold the
+/// unknown face — `final String? prefix; prefix = s.substring(..);`
+/// never promoted, and the later read reported
+/// `argument_type_not_assignable` where the oracle resolves through
+/// dart:core. The builtin core member face (`callee_return_ty_for_write`)
+/// answers the assignment-RHS staging alone: `prefix` promotes to
+/// `String` and the argument check passes.
+#[test]
+fn core_member_rhs_stages_the_write_promotion() {
+    let r = super::test_rig::report_ops(concat!(
+        "void g(String s) {}\n",
+        "class Q {\n",
+        "  void f(String paramQName, int colonIndex) {\n",
+        "    final String? prefix;\n",
+        "    prefix = paramQName.substring(0, colonIndex);\n",
+        "    if (!g2(prefix)) { throw \'\'; }\n",
+        "  }\n",
+        "  bool g2(String s) => true;\n",
+        "}\n",
+    ));
+    let miss: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "argument_type_not_assignable")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(miss, Vec::<&str>::new(), "{:?}", messages(&r));
+}
