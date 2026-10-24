@@ -893,6 +893,35 @@ fn sdk_collection_alias_face_reaches_core_interface() {
     );
 }
 
+/// The `yield*` implied type is the RAW expression type
+/// (`impliedReturnType = expressionType` for the isYieldEach ask,
+/// yield_statement_resolver.dart — the live oracle prints 'String', never
+/// a 'Stream<String>' wrap). A sequence subtype carrying its own fixed
+/// instantiation (`Seq extends Iterable<Item>`) answers through its
+/// clause and stays silent (the corpus rows xml xpath sequence.dart);
+/// a raw non-sequence value reports against the declared head.
+#[test]
+fn yield_star_implied_type_is_raw_expression_type() {
+    let r = super::test_rig::report_ops(concat!(
+        "class Item {}\n",
+        "class Seq extends Iterable<Item> {}\n",
+        "Iterable<Item> ok() sync* { Seq s = Seq(); yield* s; }\n",
+        "Iterable<Item> bad() sync* { yield* 'x'; }\n",
+    ));
+    let yields: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "yield_of_invalid_type")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        yields,
+        ["The type 'String' implied by the 'yield*' expression must be assignable to 'Iterable<Item>'."],
+        "{:?}",
+        messages(&r)
+    );
+}
+
 /// A switch-expression scrutinee read through a receiver whose Named
 /// type arrived from CROSS-FILE inference (the callee's own library
 /// spells the return type; the consuming file never imports the name)

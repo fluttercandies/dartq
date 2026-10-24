@@ -248,7 +248,10 @@ class Some {
 
 /// The generator shape from the census: `yield* body(ctx)` over a
 /// `call`-bearing field — the send's `Seq` (a `Base`) is the yield-star
-/// operand, and the oracle reports nothing.
+/// operand, and the live oracle reports the raw-face row (probed:
+/// "The type 'Seq' implied by the 'yield*' expression must be assignable
+/// to 'IterableLike'." — `impliedReturnType = expressionType`, the
+/// send's resolved type, never a sequence wrap).
 #[test]
 fn yield_star_implicit_call_send_resolves() {
     let source = "\
@@ -285,7 +288,18 @@ class IterableLike {
 }
 ";
     let report = report(source);
-    assert!(report.diagnostics.is_empty(), "{:?}", messages(&report));
+    let yields: Vec<&str> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "yield_of_invalid_type")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        yields,
+        ["The type 'Seq' implied by the 'yield*' expression must be assignable to 'IterableLike'."],
+        "{:?}",
+        messages(&report)
+    );
 }
 
 /// The arity face over the implicit-call formals: `body()` misses `call`'s

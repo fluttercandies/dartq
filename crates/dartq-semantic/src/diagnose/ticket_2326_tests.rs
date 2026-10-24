@@ -669,9 +669,13 @@ fn generator_yield_checks_against_the_sequence_element() {
         "{:?}",
         code_names(&rep)
     );
+    // The implied type is the RAW expression type —
+    // `impliedReturnType = expressionType` for the isYieldEach ask
+    // (yield_statement_resolver.dart; the live oracle prints 'String',
+    // never a 'Stream<String>' wrap).
     assert_eq!(
         rep.diagnostics[0].message,
-        "The type 'Stream<String>' implied by the 'yield*' expression must be assignable to 'Stream<int>'."
+        "The type 'String' implied by the 'yield*' expression must be assignable to 'Stream<int>'."
     );
 
     for src in [

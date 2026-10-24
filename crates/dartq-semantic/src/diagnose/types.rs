@@ -3701,14 +3701,17 @@ pub(crate) enum StagedKind {
     /// row reads the expression's flow-aware static type,
     /// `yield_statement_resolver.dart`'s `expression.staticType`).
     Yield,
-    /// The `yield*` face: the star arm's parse-time wrap stands for the
-    /// no-fact re-decision (byte-identical to the parse-time face), while
-    /// a promoted-read fact on the source substitutes the promoted type
-    /// itself — the official implied type IS the expression's resolved
-    /// static type (`yield_statement_resolver.dart` reads
-    /// `expression.typeOrThrow` after the shared analyzer's yield-star
-    /// rewrite, so a null-guard promotion cleans the verdict).
-    YieldEach { seq_head: StringId },
+    /// The `yield*` face: the star arm's parse-time raw type stands for
+    /// the no-fact re-decision (byte-identical to the parse-time face),
+    /// while a promoted-read fact on the source substitutes the promoted
+    /// type itself — the official implied type IS the expression's
+    /// resolved static type, unwrapped
+    /// (`yield_statement_resolver.dart` `_checkForYieldOfInvalidType`
+    /// sets `impliedReturnType = expressionType` for the isYieldEach ask,
+    /// so a null-guard promotion cleans the verdict and a subtype head
+    /// with its own fixed sequence instantiation answers through its
+    /// clause).
+    YieldEach,
 }
 
 /// A passing constant-pattern candidate (#1351): the parse-time check ran

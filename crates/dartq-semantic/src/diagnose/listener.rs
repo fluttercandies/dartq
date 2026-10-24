@@ -9087,26 +9087,21 @@ impl Engine<'_> {
         let stream = self.intern("Stream");
         let seq_head = if is_sync { iterable } else { stream };
         if star.is_some() {
-            let implied = self
-                .boundary
-                .args
-                .borrow_mut()
-                .named(seq_head, false, &[expr_ty]);
-            if self.assignable(implied, ret.ty, false) == Some(false) {
+            // The yield-each ask is the RAW expression type against the
+            // declared return (`_checkForYieldOfInvalidType`'s isYieldEach
+            // face: `impliedReturnType = expressionType` — no sequence
+            // wrap). A subtype head carrying its own fixed instantiation
+            // (`XPathSequence extends Iterable<XPathItem>`) answers through
+            // its clause, while a wrap would ask the element-vs-element
+            // covariance question the oracle never asks.
+            if self.assignable(expr_ty, ret.ty, false) == Some(false) {
                 // Staged, not emitted: the oracle's verdict reads the
                 // source's flow-aware static type
                 // (`yield_statement_resolver.dart` `expression.typeOrThrow`
                 // — probe2484: a null-guard-promoted `yield* src` stays
                 // silent), so the promoted read re-decides at the teardown
-                // join with the promoted type as the implied sequence; the
-                // no-fact face re-decides on this parse-time wrap.
-                self.stage(
-                    StagedKind::YieldEach { seq_head },
-                    range,
-                    expr_ty,
-                    ret.ty,
-                    false,
-                );
+                // join with the promoted type as the implied return.
+                self.stage(StagedKind::YieldEach, range, expr_ty, ret.ty, false);
             }
             return;
         }

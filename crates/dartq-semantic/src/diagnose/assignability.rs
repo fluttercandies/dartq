@@ -262,9 +262,40 @@ impl<'a> Engine<'a> {
             // spread's flattened element (type_analyzer.dart's
             // spread-element resolution), never the iterable whole.
             let spread = seg_text.trim_start().starts_with("...");
+            // A control element (`if (…) e` / `for (…) e`) contributes the
+            // BODY's type, never the condition/header's — the oracle's
+            // element resolver resolves the element expression alone, so a
+            // row search falling back onto the condition would ask the
+            // wrong question entirely (a promoted `bool` condition read
+            // against the element type). The search window opens after the
+            // header's balanced closing paren; a body with no typed row
+            // contributes nothing.
+            let mut window_start = start as u32;
+            let trimmed = seg_text.trim_start();
+            if trimmed.starts_with("if") || trimmed.starts_with("for") {
+                if let Some(open) = seg_text.find('(') {
+                    let mut depth = 0usize;
+                    let bytes_head = seg_text.as_bytes();
+                    let mut j = open;
+                    while j < bytes_head.len() {
+                        match bytes_head[j] {
+                            b'(' => depth += 1,
+                            b')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    window_start = start as u32 + j as u32 + 1;
+                }
+            }
             let Some(row) = self.rows.iter().rev().find(|row| {
                 row.ty != Ty::UNKNOWN
-                    && row.range.offset >= start as u32
+                    && row.range.offset >= window_start
                     && row.range.end() <= stop as u32
             }) else {
                 continue;
@@ -3358,11 +3389,19 @@ impl<'a> Engine<'a> {
         // collection-against-primitive pair decides negatively (a
         // `List<dynamic>` source against an `int` host — `int f() => []` —
         // is the return check's decidable rejection, not a blind spot).
+        // The async heads carry the same disjointness (`Stream`/`Future`
+        // are SDK-declared interfaces, so [`Engine::declared_outside_core`]
+        // leaves them open — but `int`/`String`/`bool` are final and never
+        // a `Stream` or `Future`; the yield-each raw face
+        // `isAssignableTo('String', 'Stream<int>')` is the oracle's
+        // definite rejection).
         let from_primitive = self.members.primitive_ids.contains(&from_name);
         let to_primitive = self.members.primitive_ids.contains(&to_name);
         let collections = &self.collection_heads;
+        let async_heads = [self.intern("Stream"), self.intern("Future")];
         if (collections.contains(&from_name) && to_primitive)
-            || (from_primitive && collections.contains(&to_name))
+            || (from_primitive
+                && (collections.contains(&to_name) || async_heads.contains(&to_name)))
         {
             return Some(false);
         }
