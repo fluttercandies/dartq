@@ -2136,6 +2136,14 @@ pub(crate) struct Engine<'a> {
     /// oracle's call-site inference, replacing the free-parameter
     /// under-report stand-in.
     pub(crate) solved_call_params: FxHashMap<u32, Vec<(StringId, Ty)>>,
+    /// The last completed send's resolved return beside its callee row's
+    /// range offset (#2567 R18): `consume_send` computes the static type
+    /// for its `Never` exit check; the listener stages the same answer
+    /// into the flow recorder (`stage_call_result`) so the send fold —
+    /// whose own callee read is an unknown face — adopts the real return
+    /// (a switch over the call then answers the always-exhaustive
+    /// verdict). Single slot, taken by the listener at the same event.
+    pub(crate) send_return_staging: Option<(u32, Ty)>,
     /// The numeric-call refinement's return (`e1.clamp(e2, e3)`,
     /// `e1.remainder(e2)`), keyed by the callee row's range offset —
     /// computed at the argument group's close where the typed arguments

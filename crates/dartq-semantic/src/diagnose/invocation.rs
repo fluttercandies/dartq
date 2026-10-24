@@ -878,6 +878,30 @@ impl<'a> Engine<'a> {
         // `pending_send_ty` creation fold's same hole, member-side).
         let ty = if member.ty != Ty::UNKNOWN && member.intent == Intent::Invoke {
             member.ty
+        } else if member.name == self.intern("values")
+            && let Some(container) = match &recv {
+                Receiver::Container {
+                    name,
+                    kind: ContainerKind::Enum,
+                } => Some(*name),
+                Receiver::This {
+                    container,
+                    kind: ContainerKind::Enum,
+                } => Some(*container),
+                _ => None,
+            }
+        {
+            // The enum's synthetic `values` static getter (`Tag.values`):
+            // the constant list's fixed face `List<Tag>` — the member walk
+            // cannot serve it (the synthetic member is no declared field),
+            // and the untyped under-report starves the call-site inference
+            // (`readEnum(Tag.values)` binds `T := Tag` from exactly this
+            // element face). A non-enum container (an SDK `Map.values`
+            // instance read) never takes this arm.
+            self.boundary
+                .args
+                .borrow_mut()
+                .named(self.intern("List"), false, &[Ty::named(container)])
         } else {
             match &recv {
                 Receiver::This { container, .. } => {
@@ -6227,6 +6251,17 @@ impl<'a> Engine<'a> {
                 .rows
                 .get(callee)
                 .map_or(Ty::UNKNOWN, |row| self.callee_return_ty(row));
+            // The same resolved return stages for the flow send fold
+            // (#2567 R18): the listener picks the slot up at this event
+            // and stages it into the recorder, so the name-level fold —
+            // whose own callee read is an unknown face — adopts the real
+            // return (the send-close inference's parameter solution
+            // included, `readEnum(Tag.values)` answering the enum).
+            if ret != Ty::UNKNOWN {
+                if let Some(row) = self.rows.get(callee) {
+                    self.send_return_staging = Some((row.range.offset, ret));
+                }
+            }
             (self.is_never_ty(ret)).then_some(SendExit::Result)
         };
         // The needs-getter face (`function_expression_invocation_resolver

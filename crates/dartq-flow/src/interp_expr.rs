@@ -1544,7 +1544,37 @@ impl Interp<'_> {
                 // through this event with the target under the section
                 // frame's base). The entry is peeked, never popped.
                 let member_value = self.pop_value();
+                // The post-send tile: a completed dotted send's stream
+                // re-accesses at the send's tiled end (`x.m()` fires
+                // DotAccess again immediately AFTER the Send event, #585's
+                // tiled-end contract) — the popped top is then the send's
+                // OWN result, never a selector entry (a real selector's
+                // access always follows the selector's identifier event,
+                // never a send). The tile keeps the access build intact
+                // (the chain/branch arms below, the receiver pop) and only
+                // restores the send's result type at the end, so a send
+                // whose callee adopted a staged return keeps it as the
+                // chain's value.
+                let post_send_tile = match events.get(i.wrapping_sub(1)) {
+                    Some(Ev::Send { .. } | Ev::SendNoArgs) => !matches!(
+                        // A bare leaf's own send (`c` of `c._b`) fires
+                        // between the leaf and the chain's next selector —
+                        // an Ident directly under the send marks the
+                        // leaf-send, and the access above it is a real
+                        // chain selector, never the tile.
+                        events.get(i.wrapping_sub(2)),
+                        Some(Ev::Ident { .. })
+                    ),
+                    _ => false,
+                };
                 let mut expr = Expr::trivial(Ty::UNKNOWN);
+                // The member's own token rides the access row as its
+                // callee role (#2567 R18): a following send keys the
+                // staged invocation-result lookup on it. The read-span
+                // faces (write retraction, condition queries) stay
+                // untouched — the callee role is a dedicated field no
+                // other consumer reads.
+                expr.callee_span = member_value.read_span;
                 // The property-read face (#1409): a plain-identifier
                 // member on a promotable receiver (a bare local read or
                 // `this` — official `ExpressionPropertyTarget`'s reference
@@ -1554,10 +1584,12 @@ impl Interp<'_> {
                 // official `isPropertyPromotable` verdict) is the
                 // semantic layer's question — the flow layer tracks every
                 // promotable-shaped read and the consumer gates the rows.
-                if let (Some(field), Some(receiver)) = (
-                    member_value.name,
-                    self.exprs.last().and_then(|e| e.prop_receiver()),
-                ) {
+                if !post_send_tile
+                    && let (Some(field), Some(receiver)) = (
+                        member_value.name,
+                        self.exprs.last().and_then(|e| e.prop_receiver()),
+                    )
+                {
                     let slot = self.prop_slot(receiver, field);
                     let promoted = self.prop_promoted(receiver, slot);
                     // The promoted-read row at the member name's own
@@ -1656,7 +1688,8 @@ impl Interp<'_> {
                 // this read feeds keeps `x is T` always-true with the
                 // failing arm dead, and a switch over it vacuously covers
                 // every typed pattern).
-                if let Some(recv) = self.exprs.last()
+                if !post_send_tile
+                    && let Some(recv) = self.exprs.last()
                     && self
                         .ops
                         .is_invalid_typed(recv.ty, recv.args, self.args, self.names)
@@ -1664,6 +1697,20 @@ impl Interp<'_> {
                     expr.ty = recv.ty;
                     expr.args = recv.args;
                     expr.non_reference_invalid = true;
+                }
+                // The tile's one payload: the send's own result type
+                // stands (the adopted staged return included) — the fresh
+                // access build around it (chain bases, branches, the
+                // receiver pop) is exactly what the post-send position
+                // owes the chain.
+                if post_send_tile
+                    && !matches!(
+                        member_value.ty,
+                        Ty::UNKNOWN | Ty::UNKNOWN_NULLABLE
+                    )
+                {
+                    expr.ty = member_value.ty;
+                    expr.args = member_value.args;
                 }
                 // The receiver pops unless it is the innermost cascade's
                 // target (same discipline as IndexAccess's).
@@ -1744,6 +1791,42 @@ impl Interp<'_> {
                         } else {
                             callee.ty = Ty::UNKNOWN;
                         }
+                        callee.prop = None;
+                    }
+                    // The staged invocation result (#2567 R18): the
+                    // semantic layer resolved the send's return at the
+                    // close (the send-close inference's parameter
+                    // solution included — `readEnum(Tag.values)` answers
+                    // the enum), where this layer's own callee read is an
+                    // unknown face. Adopt it so a switch whose scrutinee
+                    // is the call answers the always-exhaustive verdict
+                    // on the real return. A null-shorted chain stays out:
+                    // the official `?.`-call result carries the short's
+                    // own `?` on top of the declared return, a face the
+                    // staged row does not spell — keeping the unknown
+                    // under-reports exactly as before.
+                    let callee_key = callee.callee_span.or(callee.read_span);
+                    if callee.chain_base.is_none()
+                        && matches!(callee.ty, Ty::UNKNOWN | Ty::UNKNOWN_NULLABLE)
+                        && let Some(span) = callee_key
+                        && let Some(&(ty, args)) = self.staged_calls.get(&span.range.offset)
+                    {
+                        // An open null-short whose depth covers the callee
+                        // (`x?.m()`, the receiver's split still unclosed)
+                        // makes the call's static type nullable — the
+                        // short's own `?` rides the declared return
+                        // (upstream's short-circuit result face), so the
+                        // adopted return joins it rather than the raw
+                        // non-null declaration.
+                        let shorted = self
+                            .null_shorts
+                            .last()
+                            .is_some_and(|short| short.exprs_depth <= self.exprs.len() + 1);
+                        callee.ty = Ty {
+                            nullable: ty.nullable || shorted,
+                            ..ty
+                        };
+                        callee.args = args;
                         callee.prop = None;
                     }
                     self.exprs.push(callee);
@@ -2133,6 +2216,16 @@ impl Interp<'_> {
         }
         if let Some(head) = self.exprs.last_mut() {
             head.literal = true;
+            // The literal's own face is the collection, never the
+            // element: the collapsed tail row is the last element's
+            // value row reused for the LIFO pop, and its (possibly
+            // nullable) element type must not stand as the
+            // collection's type (`[stream.char()]`'s `String?`
+            // element leaking into the inferred local — UNCHECKED on
+            // every later member access). The empty literal's unknown
+            // face is the consistent under-report.
+            head.ty = Ty::UNKNOWN;
+            head.args = crate::ty::EMPTY_ARGS;
         }
     }
 

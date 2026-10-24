@@ -88,6 +88,15 @@ pub struct Flow<'t> {
     /// type. Entries whose assignment never folds are inert (bounded by
     /// the unit's write count).
     staged_rhs: FxHashMap<u32, (crate::ty::Ty, u32)>,
+    /// Invocation-result types keyed on the callee identifier token's
+    /// offset (#2567 R18): the semantic layer's resolved send returns
+    /// (the send-close inference's `T` solution included), staged before
+    /// the executable's replay. The send fold adopts one when its own
+    /// callee read is an unknown face — a switch whose scrutinee is a
+    /// resolved call then answers the always-exhaustive verdict on the
+    /// real return. Entries whose send never folds are inert (bounded by
+    /// the unit's send count).
+    staged_calls: FxHashMap<u32, (crate::ty::Ty, u32)>,
     /// `this`-read types keyed on the `this` token's offset (#2292): the
     /// semantic layer's resolved extended type for a `this` read inside an
     /// extension/extension-type member, staged before the executable's
@@ -268,6 +277,7 @@ impl<'t> Flow<'t> {
             pending_type_args: crate::ty::EMPTY_ARGS,
             inferred_locals: FxHashMap::default(),
             staged_rhs: FxHashMap::default(),
+            staged_calls: FxHashMap::default(),
             staged_this: FxHashMap::default(),
             extension_on_head: None,
             in_extension_header: false,
@@ -730,6 +740,24 @@ impl<'t> Flow<'t> {
         self.staged_rhs.insert(target_offset, (ty, args));
     }
 
+    /// Stages one invocation's resolved result type beside its written
+    /// argument tree (#2567 R18): the semantic layer's send-close answer
+    /// for a callee the name-level fold reads as unknown — a generic
+    /// method's inferred return (`readEnum(Tag.values)` answering the
+    /// enum) — keyed on the callee identifier token's offset. The send
+    /// fold adopts it at `Ev::Send`/`Ev::SendNoArgs`; shapes the flow
+    /// lattice cannot spell never arrive (the stager drops them, the
+    /// unknown-result face stands).
+    pub fn stage_call_result(
+        &mut self,
+        callee_offset: u32,
+        ty: crate::ty::Ty,
+        args: Vec<crate::ty::StagedArg>,
+    ) {
+        let args = self.intern_staged_args(&args);
+        self.staged_calls.insert(callee_offset, (ty, args));
+    }
+
     /// Stages one `this` read's static type (#2292): the semantic layer's
     /// resolved type for a `this` expression the event stream leaves
     /// unknown — an extension or extension-type instance member's extended
@@ -839,8 +867,12 @@ impl<'t> Flow<'t> {
         // adopted at `Ev::Assign` when the fold's own answer is unknown.
         interp.staged_rhs = &self.staged_rhs;
         // The staged `this` read types (#2292) — read-only here, adopted
-        // at `Ev::This` when the fold's own answer is unknown.
+        // at `Ev::This` when the fold's own answer is the unknown face.
         interp.staged_this = &self.staged_this;
+        // The staged invocation-result types (#2567 R18) — read-only
+        // here, adopted at the send fold when its own callee read is an
+        // unknown face.
+        interp.staged_calls = &self.staged_calls;
         // The interned name lexemes: the send fold's class-head face reads
         // the callee's spelling (`x = C()` vs a lowercase function call).
         interp.names = &self.names_by_id;

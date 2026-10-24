@@ -454,6 +454,11 @@ pub(crate) struct Expr {
     /// one: a plain assignment target retracts the read's fact (the
     /// identifier is the write, not a read).
     pub read_span: Option<TokenSpan>,
+    /// The callee identifier's token when this access row is a following
+    /// send's callee (`x.m(...)`'s `m`): the key the staged
+    /// invocation-result lookup reads (#2567 R18). No other consumer —
+    /// the read-span faces stay untouched by the callee role.
+    pub callee_span: Option<TokenSpan>,
     /// The interned name when this expression came from an identifier
     /// event: the member face of a property read (`c._b`'s `_b` — the
     /// property key's field half).
@@ -496,6 +501,7 @@ impl Expr {
             branches: None,
             test_split: false,
             read_span: None,
+            callee_span: None,
             name: None,
             chain_base: None,
             literal: false,
@@ -514,6 +520,7 @@ impl Expr {
             branches: None,
             test_split: false,
             read_span: None,
+            callee_span: None,
             name: None,
             chain_base: None,
             literal: false,
@@ -851,6 +858,15 @@ pub(crate) struct Interp<'o> {
     /// real type. Entries whose `this` never folds are inert (bounded by
     /// the unit's `this`-read count).
     pub(crate) staged_this: &'o FxHashMap<u32, crate::ty::Ty>,
+    /// The staged invocation-result types the semantic layer resolved for
+    /// this unit (#2567 R18), beside their written-argument arena index,
+    /// keyed on the callee identifier token's offset — adopted at
+    /// `Ev::Send`/`Ev::SendNoArgs` when the fold's own callee read is an
+    /// unknown face, so a switch whose scrutinee is a resolved call
+    /// (`readEnum(Tag.values)`'s generic return) answers the
+    /// always-exhaustive verdict on the real type. Read-only for the
+    /// replay.
+    pub(crate) staged_calls: &'o FxHashMap<u32, (crate::ty::Ty, u32)>,
     /// The recorder's interned name lexemes, mounted at replay time: the
     /// class-head face (`x = C()`) reads the callee's spelling — a
     /// lowercase head is a function/getter call, not an implicit creation.
@@ -1106,6 +1122,11 @@ static NO_STAGED_RHS: std::sync::LazyLock<FxHashMap<u32, (crate::ty::Ty, u32)>> 
 static NO_STAGED_THIS: std::sync::LazyLock<FxHashMap<u32, crate::ty::Ty>> =
     std::sync::LazyLock::new(FxHashMap::default);
 
+/// The direct-construction default for [`Interp::staged_calls`]: no staged
+/// invocation results — every send keeps the fold's own callee face.
+static NO_STAGED_CALLS: std::sync::LazyLock<FxHashMap<u32, (crate::ty::Ty, u32)>> =
+    std::sync::LazyLock::new(FxHashMap::default);
+
 /// The direct-construction default for [`Interp::names`]: no lexemes —
 /// every invocation head reads as a non-class call.
 static NO_NAMES: std::sync::LazyLock<Vec<Box<str>>> = std::sync::LazyLock::new(Vec::new);
@@ -1140,6 +1161,7 @@ impl<'o> Interp<'o> {
             inferred_locals: &NO_INFERRED_LOCALS,
             staged_rhs: &NO_STAGED_RHS,
             staged_this: &NO_STAGED_THIS,
+            staged_calls: &NO_STAGED_CALLS,
             names: &NO_NAMES,
             reach: ReachArena::new(),
             lists: Lists::default(),

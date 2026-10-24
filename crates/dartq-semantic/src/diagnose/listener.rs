@@ -3269,6 +3269,43 @@ impl ParserListener for DiagnoseListener<'_> {
         // then the expression-level bottom check at the expression's end
         // (`type_analyzer.dart:815-819`).
         let exit = self.engine.consume_send(end);
+        // The resolved send return stages into the flow recorder (#2567
+        // R18): the name-level fold reads the callee as an unknown face,
+        // so a switch whose scrutinee is the call misses the
+        // always-exhaustive verdict without the real return. Only the
+        // spellable named shapes ride (the same tree posture the
+        // assignment-RHS staging applies); anything else keeps the
+        // unknown-result under-report.
+        let staged_call = self.engine.send_return_staging.take().and_then(
+            |(offset, ty)| {
+                let Ty::Named {
+                    name,
+                    nullable,
+                    args,
+                } = ty
+                else {
+                    return None;
+                };
+                let tree = staged_arg_tree(
+                    &self.engine.boundary.args.borrow(),
+                    &self.engine.strings,
+                    args,
+                )?;
+                let lexeme = self.engine.strings.resolve(name).to_string();
+                Some((offset, nullable, lexeme, tree))
+            },
+        );
+        if let Some((offset, nullable, lexeme, tree)) = staged_call {
+            let base = self.flow().intern_name(&lexeme);
+            self.flow().stage_call_result(
+                offset,
+                FlowTy {
+                    base: FlowBase::Name(base),
+                    nullable,
+                },
+                tree,
+            );
+        }
         // The exit records at the next forward ([`Self::flow`]) — never
         // ahead of the send's own statement wrapper.
         match exit {

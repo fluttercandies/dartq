@@ -304,6 +304,7 @@ impl<'a> Engine<'a> {
             member_recv_tys: FxHashMap::default(),
             call_ends: Vec::new(),
             solved_call_params: FxHashMap::default(),
+            send_return_staging: None,
             refined_call_returns: FxHashMap::default(),
             non_promotions: Vec::new(),
             pending_non_promotion: Vec::new(),

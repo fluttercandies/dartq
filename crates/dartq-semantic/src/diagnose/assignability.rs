@@ -1215,7 +1215,33 @@ impl<'a> Engine<'a> {
                 .rows
                 .partition_point(|probe| probe.range.offset < row.range.offset);
             let receiver = self.rows.get(index.checked_sub(1)?)?;
-            (receiver.range.end() <= row.range.offset).then_some(receiver.name)
+            (receiver.range.end() <= row.range.offset).then(|| {
+                // An UNQUALIFIED implicit-this receiver (`_reader
+                // .readEnum(...)`, the callee row still the pre-merge
+                // selector at this send-close read): the bare scope
+                // resolves the receiver name to the enclosing
+                // container's member, whose WRITTEN declared type heads
+                // the container the member walk resolves on — and only
+                // when the walk finds the callee there (a foreign or
+                // stub head walks nowhere). Locals resolve to non-member
+                // targets and qualified receivers
+                // (`_sourceTable.$primaryKey`, a chain-computed face)
+                // keep the bare-name path (the SDK static head,
+                // `RangeError.checkValidRange`).
+                if !receiver.qualified {
+                    if let (_, RefTarget::Member { container }) =
+                        self.resolve_bare(receiver.name)
+                    {
+                        if let Ty::Named { name, .. } =
+                            self.member_declared_ty(container, receiver.name)
+                            && matches!(self.walk_members(name, row.name), Walk::Found(_))
+                        {
+                            return name;
+                        }
+                    }
+                }
+                receiver.name
+            })
         });
         let Some(container) = container else {
             return Ty::UNKNOWN;
@@ -1266,7 +1292,18 @@ impl<'a> Engine<'a> {
             Walk::Found(entry) if matches!(entry.kind, MemberKind::Method | MemberKind::Getter) => {
                 let recv = match &row.shape {
                     RowShape::Member { recv } => *recv,
-                    _ => Receiver::Unknown,
+                    // The pre-merge callee selector row (a dot-spelled
+                    // send read at its own close): the container the
+                    // below-row fallback resolved stands in as the
+                    // receiver, so the return instantiation reads the
+                    // method's own parameters and the send-close
+                    // solution (`_reader.readEnum(Tag.values)`'s `T`).
+                    _ => Receiver::This {
+                        container,
+                        kind: self
+                            .container_kind_of(container)
+                            .unwrap_or(ContainerKind::Class),
+                    },
                 };
                 self.instantiate_call_return(row, &recv, entry.return_ty)
             }

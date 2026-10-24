@@ -1533,20 +1533,45 @@ impl<'a> Engine<'a> {
             RowShape::Member { recv } => *recv,
             RowShape::Bare(info) => {
                 let recv = Engine::receiver_of_bare(*info);
-                // A pre-merge qualified callee (`math.max(...)` at the
-                // group's close — the member merge that retypes the row
-                // to `Member` runs after the send): the receiver row sits
-                // directly below, and its bare face names it.
-                if row.qualified
-                    && matches!(recv, Receiver::Unknown)
-                    && let Some(below) = callee
-                        .checked_sub(1)
-                        .and_then(|index| self.rows.get(index))
-                    && let RowShape::Bare(info) = below.shape
-                {
-                    Engine::receiver_of_bare(info)
+                if row.qualified {
+                    // A pre-merge qualified callee (`math.max(...)` at the
+                    // group's close — the member merge that retypes the row
+                    // to `Member` runs after the send): the receiver row sits
+                    // directly below, and its bare face names it.
+                    if matches!(recv, Receiver::Unknown)
+                        && let Some(below) = callee
+                            .checked_sub(1)
+                            .and_then(|index| self.rows.get(index))
+                        && let RowShape::Bare(info) = below.shape
+                    {
+                        Engine::receiver_of_bare(info)
+                    } else {
+                        recv
+                    }
                 } else {
-                    recv
+                    // An unqualified implicit-this callee (`readEnum(...)`
+                    // inside the declaring class): the bare scope resolves
+                    // the name to the enclosing container's member, whose
+                    // method type parameters the solve unifies against
+                    // (`T readEnum<T extends Enum>(List<T> values)` binding
+                    // `T` from the argument's element — the same
+                    // implicit-this walk `callee_return_ty`'s bare arm
+                    // applies).
+                    match recv {
+                        Receiver::Unknown => {
+                            if let (_, RefTarget::Member { container }) =
+                                self.resolve_bare(row.name)
+                            {
+                                let kind = self
+                                    .container_kind_of(container)
+                                    .unwrap_or(ContainerKind::Class);
+                                Receiver::This { container, kind }
+                            } else {
+                                Receiver::Unknown
+                            }
+                        }
+                        other => other,
+                    }
                 }
             }
             _ => return,

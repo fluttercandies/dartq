@@ -1477,3 +1477,67 @@ fn cascade_sections_on_promoted_local_stay_clean() {
         );
     }
 }
+
+/// A switch whose scrutinee is a generic call's return —
+/// `readEnum(Tag.values)` with `T readEnum<T extends Enum>(List<T> values)`
+/// returns the ENUM, so the two-case switch is exhaustive and the body
+/// cannot complete normally (the corpus ast_binary_reader.dart:435/:864/
+/// :880/:966/:1096/:1150/:1170 and bundle_reader.dart:1515/:1631 rows —
+/// the staged invocation result feeds the always-exhaustive verdict; the
+/// dot-spelled `_reader.readEnum(...)` callee takes the same staging).
+#[test]
+fn generic_enum_call_scrutinee_exhausts() {
+    let r = super::test_rig::report_ops(concat!(
+        "enum Tag { a, b }\n",
+        "class R {\n",
+        "  T readEnum<T extends Enum>(List<T> values) => values[0];\n",
+        "  String read() {\n",
+        "    switch (readEnum(Tag.values)) {\n",
+        "      case Tag.a:\n",
+        "        return 'a';\n",
+        "      case Tag.b:\n",
+        "        return 'b';\n",
+        "    }\n",
+        "  }\n",
+        "}\n",
+    ));
+    let body: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name.starts_with("body_might_complete_normally"))
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(body, Vec::<&str>::new(), "{:?}", messages(&r));
+}
+
+/// The dot-spelled twin of [`generic_enum_call_scrutinee_exhausts`]: the
+/// callee is a member row (`_reader.readEnum(Tag.values)`), whose access
+/// carries the callee token the staged result keys on.
+#[test]
+fn member_generic_enum_call_scrutinee_exhausts() {
+    let r = super::test_rig::report_ops(concat!(
+        "enum Tag { a, b }\n",
+        "class Reader {\n",
+        "  T readEnum<T extends Enum>(List<T> values) => values[0];\n",
+        "}\n",
+        "class R {\n",
+        "  final Reader _reader;\n",
+        "  R(this._reader);\n",
+        "  String read() {\n",
+        "    switch (_reader.readEnum(Tag.values)) {\n",
+        "      case Tag.a:\n",
+        "        return 'a';\n",
+        "      case Tag.b:\n",
+        "        return 'b';\n",
+        "    }\n",
+        "  }\n",
+        "}\n",
+    ));
+    let body: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name.starts_with("body_might_complete_normally"))
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(body, Vec::<&str>::new(), "{:?}", messages(&r));
+}
