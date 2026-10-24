@@ -311,6 +311,7 @@ impl<'a> Engine<'a> {
             string_row_marks: Vec::new(),
             interpolation_child_rows: FxHashSet::default(),
             read_types: Vec::new(),
+            cast_rewrites: Vec::new(),
             query_type_rows: Vec::new(),
             unnamed_extension_faces_opened: 0,
             initializer_locals: FxHashSet::default(),
@@ -728,17 +729,35 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let staged_promotion = promotions.promoted(check.range);
-            let from = match staged_promotion {
-                // The opaque-head promotion (#2174 — a signature-less
-                // function-typed declared type, or an unknown-written
-                // slot): the flow lattice carried only the nullability
-                // decision, so the re-decision substitutes the parse-time
-                // declared type with its `?` stripped — the real promoted
-                // type that decision produces.
-                Some(Ty::Unknown) => Self::non_null_form(check.from),
-                staged => staged
-                    .or_else(|| self.promotable_field_substitution(props, check.range, check.from))
-                    .unwrap_or(check.from),
+            // An `as` expression's static type is its resolved target — a
+            // staged check anchored inside a cast's whole span reads the
+            // rewritten face outright (`g(v?.element as El)` offers `El`,
+            // never the operand's nullable parse-time capture); the cast
+            // outranks every promotion the operand might carry.
+            let from = if let Some(ty) = self
+                .cast_rewrites
+                .iter()
+                .find(|(span, _)| {
+                    span.offset <= check.range.offset && check.range.end() <= span.end()
+                })
+                .map(|(_, ty)| *ty)
+            {
+                ty
+            } else {
+                match staged_promotion {
+                    // The opaque-head promotion (#2174 — a signature-less
+                    // function-typed declared type, or an unknown-written
+                    // slot): the flow lattice carried only the nullability
+                    // decision, so the re-decision substitutes the parse-time
+                    // declared type with its `?` stripped — the real promoted
+                    // type that decision produces.
+                    Some(Ty::Unknown) => Self::non_null_form(check.from),
+                    staged => staged
+                        .or_else(|| {
+                            self.promotable_field_substitution(props, check.range, check.from)
+                        })
+                        .unwrap_or(check.from),
+                }
             };
             if matches!(check.kind, StagedKind::NeverReceiver) {
                 // One row at the receiver span per `Never` receiver

@@ -2933,6 +2933,11 @@ pub(crate) struct Engine<'a> {
     /// pass 2 for the member re-decision, re-homed into the [`UnitFold`]
     /// product at teardown.
     pub(crate) read_types: Vec<(SourceRange, Ty)>,
+    /// The `as` expressions' whole spans with their resolved cast targets,
+    /// in arrival order — a staged verdict anchored inside a cast's span
+    /// reads the rewritten static type (`AsExpression.staticType`), never
+    /// the operand's parse-time capture.
+    pub(crate) cast_rewrites: Vec<(SourceRange, Ty)>,
     /// The semantic-side query-type rows (#1869-2): spans whose static
     /// type the walk itself knows but the flow layer cannot answer — the
     /// `this` keyword (the enclosing container's type) and the

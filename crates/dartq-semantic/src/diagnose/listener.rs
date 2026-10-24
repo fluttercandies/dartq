@@ -4048,6 +4048,12 @@ impl ParserListener for DiagnoseListener<'_> {
                     }
                 })
                 .unwrap_or(operator.range);
+            // The cast's whole span pairs with its resolved target — the
+            // staged teardown's rewrite face (a check anchored inside the
+            // cast reads the target, the expression's static type).
+            if let Some(ty) = cast_ty.filter(|ty| *ty != Ty::UNKNOWN) {
+                engine.cast_rewrites.push((cast_span, ty));
+            }
             engine.check_unnecessary_cast(cast_span, operand, cast_ty);
             // `visitAsExpression`'s cast face
             // (best_practices_verifier.dart:180-190): the same pair decides
