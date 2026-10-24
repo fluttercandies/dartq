@@ -5139,6 +5139,19 @@ impl<'a> Engine<'a> {
                 if sdk_origin[other] != sdk_origin[index] {
                     return !sdk_origin[other];
                 }
+                // A re-exported platform extension answers under every
+                // exporting library (`dart:core` re-exports `dart:
+                // collection`'s `IterableExtensions`, core.dart:182), so
+                // the projection registers one declaration as a face per
+                // library — two same-named same-`on` platform faces are
+                // that declaration's aliases, never a competing pair. The
+                // earlier entry survives (a stable positional tiebreak).
+                if sdk_origin[index]
+                    && other_face.name == face.name
+                    && other_face.on_type == face.on_type
+                {
+                    return other < index;
+                }
                 if on_subtype(other_on_ty, on_ty) {
                     if !on_subtype(on_ty, other_on_ty) {
                         // Steps 3-4: the instantiated `on` types order.
