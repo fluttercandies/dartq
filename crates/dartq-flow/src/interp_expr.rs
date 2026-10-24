@@ -1941,7 +1941,18 @@ impl Interp<'_> {
             Ev::Rethrow => {
                 self.unreachable_cur();
             }
-            Ev::RecordLitEnd { count } | Ev::ListLitEnd { count } => {
+            Ev::RecordLitEnd { count } => {
+                // The record's fields are complete expressions: rejoin
+                // the null-shorting they opened (the receiver-chain `?`
+                // outside the literal stays open to the enclosing
+                // expression's end). The record keeps the collapsed
+                // tail's face — a record scrutinee's exhaustiveness
+                // (`(previous, next)` deciding a switch) reads it, and
+                // the collection-element strip below must not erase it.
+                self.flush_null_shorts_above(self.consumer_base(*count));
+                self.literal_value_keep_ty(*count)
+            }
+            Ev::ListLitEnd { count } => {
                 // The literal's elements are complete expressions: rejoin
                 // the null-shorting they opened (the receiver-chain `?`
                 // outside the literal stays open to the enclosing
@@ -2207,6 +2218,18 @@ impl Interp<'_> {
     /// element netted exactly one, so the last is the literal's own value
     /// for the enclosing consumer's LIFO pop and the earlier ones drop; an
     /// empty literal carries a trivial value.
+    fn literal_value_keep_ty(&mut self, count: usize) {
+        if count > 0 {
+            self.exprs
+                .truncate(self.exprs.len().saturating_sub(count - 1));
+        } else {
+            self.exprs.push(Expr::trivial(Ty::UNKNOWN));
+        }
+        if let Some(head) = self.exprs.last_mut() {
+            head.literal = true;
+        }
+    }
+
     fn literal_value(&mut self, count: usize) {
         if count > 0 {
             self.exprs
