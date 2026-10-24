@@ -1121,6 +1121,39 @@ impl Interp<'_> {
                             Some(meta) if staged_ty == meta.ty && rhs.ty != meta.ty => {
                                 Some((rhs.ty, rhs_args))
                             }
+                            // A promoted PROPERTY read's fold has no variable
+                            // meta to compare against: its flow face is the
+                            // property-slot marker (`UNKNOWN_NULLABLE`, its
+                            // non-null form the null check records), while
+                            // the staged face is the semantic layer's
+                            // resolved declared head. When the fold carries
+                            // the non-null promotion marker beside a staged
+                            // nullable named head, the read the write copies
+                            // is promoted — the staged head minus its
+                            // nullability is the write's type (the oracle's
+                            // static type of a promoted field read IS the
+                            // promoted face), so `file = _defaultFile` under
+                            // `_defaultFile != null` promotes the target the
+                            // same way the variable-meta arm promotes
+                            // `b = a`. The `prop` slot discriminates the
+                            // property read from every other unknown-typed
+                            // fold (an unresolved call's staged nullable
+                            // return keeps the write unpromoted). A plain
+                            // `=` alone: the `??=` write
+                            // joins the staged face into its own
+                            // non-null-always LUB below, and overriding the
+                            // staged face here would promote what the
+                            // oracle's `_computeIfNullType` leaves nullable
+                            // (a staged nullable call RHS keeps the receiver
+                            // unpromoted).
+                            _ if *plain
+                                && rhs.prop.is_some()
+                                && rhs.ty == crate::ty::Ty::UNKNOWN
+                                && staged_ty.nullable
+                                && matches!(staged_ty.base, crate::ty::Base::Name(_)) =>
+                            {
+                                Some((staged_ty.non_null(), staged_args))
+                            }
                             _ => Some((staged_ty, staged_args)),
                         }
                     })

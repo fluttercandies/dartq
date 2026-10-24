@@ -1351,3 +1351,50 @@ fn nullable_on_extension_wins_over_instance_member() {
         .collect();
     assert_eq!(miss, Vec::<&str>::new(), "{:?}", messages(&r));
 }
+
+/// A write whose right-hand side is a promoted property read keeps the
+/// promotion: `file = _defaultFile` under `_defaultFile != null` writes
+/// the promoted face, so the target local promotes exactly like the
+/// variable-meta arm's `b = a` — the flow fold of a property read is the
+/// non-null promotion marker beside the semantic layer's staged nullable
+/// declared head, and the staged head minus its nullability is the
+/// write's type (context_locator.dart:215-216's `file.parent` reads stay
+/// clean).
+#[test]
+fn promoted_field_read_rhs_promotes_the_write_target() {
+    let src = concat!(
+        "class F {\n",
+        "  F get parent => this;\n",
+        "}\n",
+        "class W {\n",
+        "  final F? _defaultFile;\n",
+        "  W(this._defaultFile);\n",
+        "  F? _find(F f) => f;\n",
+        "  void f() {\n",
+        "    F? file;\n",
+        "    if (_defaultFile != null) {\n",
+        "      file = _defaultFile;\n",
+        "      var x = _find(file.parent) ?? file.parent;\n",
+        "      g(x);\n",
+        "    }\n",
+        "  }\n",
+        "  void g(F x) {}\n",
+        "}\n",
+    );
+    let r = super::test_rig::report_ops(src);
+    // The pinned faces are the write's promotion: both `file.parent`
+    // reads stay clean (no unchecked nullable use) and the guarded reads
+    // carry no argument mismatch.
+    for d in &r.diagnostics {
+        assert_ne!(
+            d.code.name, "unchecked_use_of_nullable_value",
+            "the promoted field read's write must promote the target: {}",
+            d.message
+        );
+        assert_ne!(
+            d.code.name, "argument_type_not_assignable",
+            "the promoted read keeps its face through the write: {}",
+            d.message
+        );
+    }
+}
