@@ -793,3 +793,36 @@ fn object_pattern_binder_takes_property_type() {
         messages(&r)
     );
 }
+
+/// The inference-site guard is NARROW: only a `FutureOr<R>` return over
+/// a name the diagnosing file cannot spell (the callee's own inference
+/// parameter, `then<R>`'s callback formal — the corpus `xz_decoder.dart`
+/// `onDone` row) skips the return-covariance check. A callback whose
+/// mismatched return is fully decidable in scope still reports — the
+/// guard must never silence a checkable disagreement.
+#[test]
+fn callback_return_mismatch_still_reports() {
+    let src = [
+        "class A {}",
+        "class B {}",
+        "class C {",
+        "  void m(A Function(A) g) {}",
+        "}",
+        "void f(C c, B Function(B) h) {",
+        "  c.m(h);",
+        "}",
+    ].join("\n");
+    let r = report(&src);
+    let args: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "argument_type_not_assignable")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(
+        args,
+        ["The argument type 'B Function(B)' can't be assigned to the parameter type 'A Function(A)'. "],
+        "{:?}",
+        messages(&r)
+    );
+}

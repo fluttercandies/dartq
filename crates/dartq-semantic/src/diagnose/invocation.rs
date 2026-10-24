@@ -2651,7 +2651,37 @@ impl<'a> Engine<'a> {
                     args: self.boundary.intern_list(&out),
                 })
             }
-            Ty::Record { .. } | Ty::Function { .. } => None,
+            Ty::Record { .. } => None,
+            Ty::Function { shape, nullable } => {
+                // A function-typed member face (`FutureOr<T> Function(T)`
+                // on a generic container) substitutes through its parts:
+                // the return and each formal carry the declaring
+                // container's parameters, and the substituted parts
+                // re-intern canonically. Any part the map cannot spell
+                // keeps the whole face unsubstituted (the `?` chain).
+                let pool_shape = {
+                    let pool = self.boundary.pool();
+                    pool.function_shape(shape).clone()
+                };
+                let return_ty = self.subst_params(pool_shape.return_ty, map)?;
+                let positional = pool_shape
+                    .positional
+                    .iter()
+                    .map(|ty| self.subst_params(*ty, map))
+                    .collect::<Option<Vec<_>>>()?;
+                let named = pool_shape
+                    .named
+                    .iter()
+                    .map(|(name, ty)| Some((*name, self.subst_params(*ty, map)?)))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(self.boundary.intern_function_ty(
+                    pool_shape.type_params,
+                    return_ty,
+                    &positional,
+                    &named,
+                    nullable,
+                ))
+            }
             other => Some(other),
         }
     }

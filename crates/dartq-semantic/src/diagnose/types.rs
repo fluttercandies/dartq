@@ -985,6 +985,23 @@ impl<'a> Boundary<'a> {
     pub(crate) fn intern_list(&self, args: &[Ty]) -> crate::model::ArgListId {
         self.args.borrow_mut().intern(args)
     }
+
+    /// Interns a substituted function shape into the diagnosing pool —
+    /// the substitution's `Ty::Function` leg re-interns its parts through
+    /// the same canonical pool every written shape lives in, so derived
+    /// equality on the substituted face stays structural.
+    pub(crate) fn intern_function_ty(
+        &self,
+        type_params: u16,
+        return_ty: Ty,
+        positional: &[Ty],
+        named: &[(StringId, Ty)],
+        nullable: bool,
+    ) -> Ty {
+        self.args
+            .borrow_mut()
+            .function(type_params, return_ty, positional, named, nullable)
+    }
 }
 
 /// The member-walk outcome: found, genuinely absent after a clean walk, or a

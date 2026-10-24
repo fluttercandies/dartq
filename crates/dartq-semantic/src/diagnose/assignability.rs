@@ -2985,7 +2985,15 @@ impl<'a> Engine<'a> {
     }
 
     pub(crate) fn fn_sig_subtype(&self, from: &FnVarSig, to: &FnVarSig) -> Option<bool> {
-        if to.return_ty != Ty::Void {
+        // A target return face naming a type this file cannot spell (a
+        // generic callee's own inference parameter — `then<R>`'s
+        // `FutureOr<R> Function(T)`) is an inference-site constraint, not
+        // a checkable face: the official solves the parameter from the
+        // argument at the call (a `void Function(T)` callback infers `R`
+        // and type-checks, subtype.dart's left-top `void` leg); the
+        // name-level model cannot solve it, and the return-covariance
+        // check stays undecided — the under-report direction.
+        if to.return_ty != Ty::Void && !self.return_face_undecidable(to.return_ty) {
             match self.slot_subtype(from.return_ty, to.return_ty) {
                 Some(false) => return Some(false),
                 Some(true) => {}
@@ -3019,6 +3027,29 @@ impl<'a> Engine<'a> {
             }
         }
         Some(true)
+    }
+
+    /// Whether a target face is the generic-callback inference shape —
+    /// `FutureOr<R>` over a name this file cannot spell (the callee's own
+    /// inference parameter, `then<R>`'s callback formal): the official
+    /// solves `R` from the argument at the call, and the name-level model
+    /// cannot, so the return-covariance check stays undecided. Any other
+    /// face — including an unspellable head the oracle resolves through
+    /// the import graph (`Future`) — keeps the ordinary check.
+    fn return_face_undecidable(&self, ty: Ty) -> bool {
+        let Ty::Named { name, args, .. } = ty else {
+            return false;
+        };
+        if name != self.intern("FutureOr") {
+            return false;
+        }
+        let list = self.boundary.pool().get(args).to_vec();
+        list.first().is_some_and(|arg| match arg {
+            Ty::Named {
+                name: arg_name, ..
+            } => !self.named_type_is_type(*arg_name),
+            _ => false,
+        })
     }
 
     /// The written function-type display for the message slots: the
