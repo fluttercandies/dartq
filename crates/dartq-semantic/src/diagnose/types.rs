@@ -2501,6 +2501,21 @@ pub(crate) struct Engine<'a> {
     /// row's offset too (the merge's hit move), so identity questions key
     /// on the receiver read's own span here and on the member row there.
     pub(crate) local_decl_at_read: FxHashMap<u32, u32>,
+    /// The flow-blind locals' initializer rows: each UNANNOTATED local
+    /// declaration's name-token offset to its initializer expression's row
+    /// offset (`for_in` marks a loop variable whose type is the
+    /// initializer's ELEMENT, not the iterable). The pass-2 pre-pass
+    /// derives the semantic face (`init_derived_types`) for the receiver
+    /// faces the flow lattice cannot spell — member returns, abstract
+    /// getters through the on-face walk, parameterized iterables.
+    pub(crate) local_init_rows: FxHashMap<u32, (u32, bool)>,
+    /// The pass-2 derived initializer faces, keyed by the declaring
+    /// local's name-token offset. `RefCell`: the pre-pass STAGES as it
+    /// walks (source order is the topological order — an initializer
+    /// reading an earlier flow-blind local sees its derived face through
+    /// the same table the receiver faces read), so the immutable
+    /// expression walk and the staging interleave.
+    pub(crate) init_derived_types: std::cell::RefCell<FxHashMap<u32, Ty>>,
     /// The fold's twin of [`Engine::local_decl_at_read`]: each member
     /// row's offset to the receiver read's local declaration offset. The
     /// receiver re-bind fallback keys it (the receiver read's own span is

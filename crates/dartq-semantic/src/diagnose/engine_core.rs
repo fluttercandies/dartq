@@ -233,6 +233,8 @@ impl<'a> Engine<'a> {
             frame_local_marks: Vec::new(),
             local_hits: FxHashMap::default(),
             local_decl_at_read: FxHashMap::default(),
+            local_init_rows: FxHashMap::default(),
+            init_derived_types: std::cell::RefCell::default(),
             local_decl_at_member: FxHashMap::default(),
             deferred_closure_formals: Vec::new(),
             pattern_group_open: None,

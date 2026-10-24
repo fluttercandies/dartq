@@ -1550,6 +1550,21 @@ impl ParserListener for DiagnoseListener<'_> {
                 }
                 _ => {}
             }
+        } else if let (Some(&mark), Some((_, name_tok))) =
+            (self.engine.for_in_marks.last(), loop_var.as_ref())
+            && let Some((row_ty, _, row_range)) = self.engine.single_row_since(mark)
+            // The single-row discipline the parse-time staging holds: a
+            // multi-row iterable window (a map-index expression's rows)
+            // attributes to no one row, so it stays under-reported.
+            && row_ty == Ty::UNKNOWN
+        {
+            // The flow-blind fallback: the iterable's face resolves only
+            // in pass 2 (a member-send return the flow lattice cannot
+            // spell), so the loop variable's ELEMENT derivation defers to
+            // the `resolve_rows` pre-pass over the initializer row.
+            self.engine
+                .local_init_rows
+                .insert(name_tok.offset, (row_range.offset, true));
         }
 
         // The `_checkForEachParts` iterable face: the iterable's operand

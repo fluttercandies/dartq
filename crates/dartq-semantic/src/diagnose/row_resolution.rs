@@ -627,6 +627,61 @@ impl<'a> Engine<'a> {
             .collect();
         let mut deferred = std::mem::take(&mut self.deferred_miss_rows);
         deferred.sort_by_key(|row| row.range.offset);
+        // The flow-blind locals' initializer faces — the pass-2 pre-pass:
+        // the flow lattice cannot spell member returns, so an unannotated
+        // for-in variable over a property-read iterable
+        // (`for (var a in x.annotations)`) latched `Unknown` at parse; its
+        // element derives HERE, once, through the semantic expression
+        // faces, for every receiver face to read. Source order IS the
+        // topological order (a local reads only earlier locals), and the
+        // `RefCell` table stages incrementally so a later initializer's
+        // receiver chain sees an earlier local's derived face.
+        if !self.local_init_rows.is_empty() {
+            let mut entries: Vec<(u32, (u32, bool))> = self.local_init_rows.drain().collect();
+            entries.sort_by_key(|(_, (row_offset, _))| *row_offset);
+            for (decl, (row_offset, for_in)) in entries {
+                let Some(row) = rows.iter().find(|row| row.range.offset == row_offset) else {
+                    continue;
+                };
+                // A member initializer's face is the accessor return — the
+                // parse-time row carries `Unknown` (its receiver resolved
+                // only here), so the member-read record's accessor face
+                // re-derives it through the SAME receiver-expression
+                // chain every pass-2 verdict reads.
+                let record = match &row.shape {
+                    RowShape::Member { .. } => self
+                        .member_reads
+                        .iter()
+                        .find(|read| read.offset == row.range.offset),
+                    _ => None,
+                };
+                let mut ty = match record {
+                    Some(read) => self.chained_read_static_ty(read),
+                    None => Some(self.expression_row_ty(row)),
+                }
+                .filter(|ty| *ty != Ty::UNKNOWN)
+                .unwrap_or(Ty::UNKNOWN);
+                if for_in {
+                    ty = match ty {
+                        Ty::Named { args, .. } => self
+                            .boundary
+                            .pool()
+                            .get(args)
+                            .first()
+                            .copied()
+                            .unwrap_or(Ty::Dynamic),
+                        // A non-named iterable face (a raw `Iterable` or an
+                        // unresolvable return) stays under-reported — no
+                        // invented element.
+                        _ => continue,
+                    };
+                }
+                if ty == Ty::UNKNOWN {
+                    continue;
+                }
+                self.init_derived_types.borrow_mut().insert(decl, ty);
+            }
+        }
         // The fold-deferred rows interleave by offset: their emissions keep
         // the report's source order (later merges assume it).
         let mut index = 0usize;
@@ -1846,7 +1901,24 @@ impl<'a> Engine<'a> {
         if let Some(ty) = self.rebound_read_face(read_span) {
             return Some(ty);
         }
-        if let Some(ty) = self.read_type_at(read_span) {
+        // The flow row is the PROMOTED face when one stands; a flow-blind
+        // local's row carries `Unknown` (the lattice cannot spell the
+        // initializer's member return), and that must not short-circuit
+        // the derived leg below — every caller that pattern-matches a face
+        // treats `Some(Unknown)` exactly as `None`.
+        if let Some(ty) = self
+            .read_type_at(read_span)
+            .filter(|ty| *ty != Ty::UNKNOWN)
+        {
+            return Some(ty);
+        }
+        // The flow-blind local's pass-2 initializer face: the for-in
+        // variable over a property-read iterable (the flow lattice cannot
+        // spell the member return), answered by the `resolve_rows`
+        // pre-pass over the initializer row.
+        if let Some(&decl) = self.local_decl_at_read.get(&read_span.offset)
+            && let Some(ty) = self.init_derived_types.borrow().get(&decl).copied()
+        {
             return Some(ty);
         }
         // The chain leg reads the staged member-read records only: a chain
