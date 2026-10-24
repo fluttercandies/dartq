@@ -1696,6 +1696,10 @@ impl ParserListener for DiagnoseListener<'_> {
             // consumed (a for-element's loop variable) is dropped with the
             // window: it belongs to no initializer.
             engine.var_infer_pending = None;
+            // The declarator's range ahead of the let-chain: the flow-blind
+            // fallback below reads it, and a let-chain's own bindings never
+            // reach an else arm.
+            let init_declarator_range = engine.init_declarators.last().copied().flatten();
             if let Some((name, decl_range)) = engine.init_declarators.pop().flatten()
                 && let Some(mark) = engine.init_mark
                 && let Some((expr, ifnull_ty)) = {
@@ -1857,6 +1861,20 @@ impl ParserListener for DiagnoseListener<'_> {
                     .unwrap_or_default();
                     staged = Some((decl_range.offset, lexeme, nullable, tree));
                 }
+            } else if let Some(mark) = engine.init_mark
+                && engine.rows.len() == mark + 1
+                && engine.rows[mark].ty == Ty::UNKNOWN
+                && let Some((_, decl_range)) = init_declarator_range
+            {
+                // The flow-blind declarator fallback (the plain
+                // `var x = <member read>`): the initializer row's face
+                // resolves only in pass 2 (the accessor return the flow
+                // lattice cannot spell), so the local's type derivation
+                // defers to the `resolve_rows` pre-pass — the same single-
+                // row discipline the bind window holds.
+                engine
+                    .local_init_rows
+                    .insert(decl_range.offset, (engine.rows[mark].range.offset, false));
             }
             staged
         };

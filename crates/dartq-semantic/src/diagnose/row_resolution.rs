@@ -1915,11 +1915,18 @@ impl<'a> Engine<'a> {
         // The flow-blind local's pass-2 initializer face: the for-in
         // variable over a property-read iterable (the flow lattice cannot
         // spell the member return), answered by the `resolve_rows`
-        // pre-pass over the initializer row.
+        // pre-pass over the initializer row. The NON-NULL form: the face
+        // feeds member RESOLUTION (the head), while the nullability
+        // verdicts stay with the flow — the promotion machinery only
+        // knows flow-staged types, so a nullable derived face would
+        // report `unchecked_use_of_nullable_value` rows the oracle's
+        // `!= null`/`is` promotions silence (and a guard-less read the
+        // oracle DOES report was already suppressed as Unknown — the
+        // under-report direction stands either way).
         if let Some(&decl) = self.local_decl_at_read.get(&read_span.offset)
             && let Some(ty) = self.init_derived_types.borrow().get(&decl).copied()
         {
-            return Some(ty);
+            return Some(Self::non_null_form(ty));
         }
         // The chain leg reads the staged member-read records only: a chain
         // node's own record sits at its member token, whose span END equals

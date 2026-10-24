@@ -472,7 +472,12 @@ void keepsAssertFace(Sdk? sourceFactory) {
             **c == "undefined_getter" || **c == "unchecked_use_of_nullable_value" || **c == "dead_code"
         })
         .collect::<Vec<_>>();
-    assert!(family.is_empty(), "faces leaked: {cs:?}");
+    // The pass-2 initializer derivation types `b` as `DNum.marker`'s
+    // declared `Object`, so the `b.value` tail reports the getter miss
+    // the oracle reports (probed: undefined_getter for the type 'Object'
+    // at that access) — the re-bind faces (v/m/a) stay silent, and no
+    // unchecked/dead row leaks.
+    assert_eq!(family, vec![&"undefined_getter"], "faces leaked: {cs:?}");
 }
 
 /// The condition-variable face (language#1274): a bool local bound from a
