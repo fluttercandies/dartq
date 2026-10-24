@@ -371,7 +371,8 @@ impl Interp<'_> {
                 if self.collecting() {
                     return true;
                 }
-                match self.find_continue_target(*label) {
+                let target = self.find_continue_target(*label);
+                match target {
                     Some(index) => self.do_continue(index),
                     None => self.current = self.current.clone().set_unreachable(&mut self.reach),
                 }

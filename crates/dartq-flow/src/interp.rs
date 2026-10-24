@@ -2825,7 +2825,14 @@ impl Interp<'_> {
             return Control::Continue;
         }
         let end = end as usize;
-        let Some(parts) = (i + 1..end).find(|&j| matches!(events[j], Ev::ForParts { .. })) else {
+        // The header's own first marker decides the kind: a search for
+        // `ForParts` alone HIJACKS a for-in's extent when a C-for nests
+        // inside its body (the inner `ForParts` matches, and the replay
+        // slices the inner header over the outer tail — the for-in's post
+        // code runs as loop body and every break/continue folds wrong).
+        let Some(parts) = (i + 1..end).find(|&j| {
+            matches!(events[j], Ev::ForParts { .. } | Ev::ForInParts)
+        }) else {
             return Control::Continue;
         };
         let Ev::ForParts {
@@ -2833,7 +2840,8 @@ impl Interp<'_> {
             right_sep,
         } = events[parts]
         else {
-            return Control::Jump(end + 1);
+            // A for-in: the linear walk delivers its `ForInParts` event.
+            return Control::Continue;
         };
         let bounds = ForBounds::build(
             events,
@@ -3075,7 +3083,12 @@ impl Interp<'_> {
         }
         let end = end as usize;
         let base = self.exprs.len();
-        if let Some(parts) = (i + 1..end).find(|&j| matches!(events[j], Ev::ForParts { .. })) {
+        // The header's own first marker decides the kind (the statement
+        // form's `for_begin` documents the nested-marker hijack).
+        if let Some(parts) = (i + 1..end).find(|&j| {
+            matches!(events[j], Ev::ForParts { .. } | Ev::ForInParts)
+        }) && matches!(events[parts], Ev::ForParts { .. })
+        {
             let Ev::ForParts {
                 left_sep,
                 right_sep,

@@ -2717,10 +2717,19 @@ impl ParserListener for Flow<'_> {
         // `Type<...>(field: Typed x)` head degrades to the bare spelling —
         // under-precision, never a wrong non-empty tree.
         let args = std::mem::take(&mut self.pending_type_args);
-        if dot.is_some() {
-            return;
-        }
-        let name = self.name(first_identifier);
+        // A dotted head is a QUALIFIED type name (`ast.ConstructorInvocation
+        // (...)`) in an object pattern — the grammar's typeName admits the
+        // prefixed spelling — so the type segment still runs the head test;
+        // only a missing segment (recovery) constrains nothing here.
+        let head = if dot.is_some() {
+            match _second_identifier {
+                Some(second) => second,
+                None => return,
+            }
+        } else {
+            first_identifier
+        };
+        let name = self.name(head);
         self.record(Ev::ObjectPattern { name, args });
     }
 

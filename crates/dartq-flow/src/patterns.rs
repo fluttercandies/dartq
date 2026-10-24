@@ -584,6 +584,22 @@ impl Interp<'_> {
         // constrains the SCRUTINEE — its promotion joins the alternation
         // at the close (`or_pattern_end`).
         if self.pattern_depth != 1 && Some(self.pattern_depth) != self.or_operand_depth {
+            // A nested object pattern's head tests its own PROPERTY and may
+            // fail on that value (`Obj(parent2: Cascade())`): under a
+            // vacuous enclosing head this join is the only unmatched path —
+            // the same deferral the nested typed binder carries. The
+            // property's type is beyond the flow lattice, so the head
+            // joins as maybe-failing whenever a pattern context is open.
+            if !self.collecting()
+                && self.pattern.is_some()
+                && let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone())
+            {
+                let cur = self.current.clone();
+                let joined = self.join(Some(chain), Some(cur));
+                if let Some(pattern) = self.pattern.as_mut() {
+                    pattern.unmatched = joined;
+                }
+            }
             return;
         }
         let known = Ty {
