@@ -327,6 +327,44 @@ impl<'a> Engine<'a> {
     /// and an invoked member (`var l = c.fragments.toList()`) answers
     /// the instantiated SEND result, never the raw schema a bare
     /// `return_ty` read would leak.
+    /// The shared re-bind direction gate: only a NARROWING face is a
+    /// promotion (see the member arm's inline twin for the full
+    /// rationale — the `!`/`as` widening binds keep their written face).
+    fn promotion_narrows(&self, corrected: Ty, parse_ty: Ty) -> bool {
+        match (corrected, parse_ty) {
+            (
+                Ty::Named {
+                    name: c_head,
+                    nullable: c_null,
+                    ..
+                },
+                Ty::Named {
+                    name: p_head,
+                    nullable: p_null,
+                    ..
+                },
+            ) => {
+                let nullability_ok = !c_null || p_null;
+                if p_head == self.intern("Object") {
+                    nullability_ok && !c_null
+                } else if c_head == p_head {
+                    nullability_ok
+                } else {
+                    let non_null = |name: StringId| Ty::Named {
+                        name,
+                        nullable: false,
+                        args: ArgListId::EMPTY,
+                    };
+                    !matches!(
+                        self.declared_subtype_negative(&non_null(c_head), &non_null(p_head)),
+                        Some(false)
+                    )
+                }
+            }
+            _ => false,
+        }
+    }
+
     fn apply_deferred_rebinds(&mut self) {
         let deferred = std::mem::take(&mut self.deferred_var_rebinds);
         for (decl_offset, member_offset, parse_ty) in deferred {
@@ -441,6 +479,23 @@ impl<'a> Engine<'a> {
                 }
                 _ => false,
             };
+            if corrected != Ty::UNKNOWN && corrected != parse_ty && narrows {
+                self.rebound_locals.insert(decl_offset, (parse_ty, corrected));
+            }
+        }
+        // The bare-identifier initializer twin (#2567): `var x = p;` where
+        // `p`'s flow state carries a promotion infers the PROMOTED type
+        // (the official inference reads the initializer's static type —
+        // the promoted face). The parse-time bind cannot see the
+        // promotion (the read-type table fills after the parse pass), so
+        // the declaration stages here and the pass-2 read type re-binds
+        // under the same narrowing gate.
+        let deferred_bare = std::mem::take(&mut self.deferred_bare_rebinds);
+        for (decl_offset, span, parse_ty) in deferred_bare {
+            let Some(corrected) = self.read_type_at(span) else {
+                continue;
+            };
+            let narrows = self.promotion_narrows(corrected, parse_ty);
             if corrected != Ty::UNKNOWN && corrected != parse_ty && narrows {
                 self.rebound_locals.insert(decl_offset, (parse_ty, corrected));
             }

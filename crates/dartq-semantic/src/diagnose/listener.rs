@@ -1794,6 +1794,22 @@ impl ParserListener for DiagnoseListener<'_> {
                         .deferred_var_rebinds
                         .push((decl.range.offset, expr_row.range.offset, ty));
                 }
+                // The bare-identifier twin (#2567): `var x = p;` defers the
+                // same re-bind — the initializer read's flow type (a
+                // promotion standing at the read) re-binds the inferred
+                // face in pass 2. A plain bare read only; every other
+                // shape's face decided above.
+                if let Some(expr_row) = engine.rows.get(expr)
+                    && matches!(
+                        expr_row.shape,
+                        RowShape::Bare(BareInfo::Plain { .. })
+                    )
+                    && let Some(decl) = engine.locals.last().filter(|decl| decl.name == name)
+                {
+                    engine
+                        .deferred_bare_rebinds
+                        .push((decl.range.offset, expr_row.range, ty));
+                }
                 // The promotion face rides the flow layer's declared-type
                 // slot (#2140): a name-level type with no written
                 // arguments stages as the flow declared type, keyed on

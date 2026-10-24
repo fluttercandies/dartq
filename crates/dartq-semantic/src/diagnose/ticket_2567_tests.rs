@@ -659,3 +659,25 @@ fn case_binder_scopes_to_its_member() {
     );
     assert_eq!(count_code(&expr, "undefined_getter"), 0, "{:?}", messages(&expr));
 }
+
+/// `var x = p;` where `p`'s flow state carries a promotion infers the
+/// promoted type (official inference reads the initializer's static
+/// type): the parse-time bind saw the declared face, and the pass-2
+/// read type re-binds it under the narrowing gate — the
+/// `evaluation.dart` `var declaration = constant;` family, where the
+/// `constantInitializer2` read false-reported on the declared type.
+#[test]
+fn bare_initializer_infers_the_promoted_type() {
+    let source = [
+        "class Element {} class VarImpl extends Element { int get init2 => 1; }",
+        "void f(Element constant) {",
+        "  if (constant is VarImpl) {",
+        "    var declaration = constant;",
+        "    var x = declaration.init2;",
+        "  }",
+        "}",
+    ]
+    .join("\n");
+    let r = report(&source);
+    assert_eq!(count_code(&r, "undefined_getter"), 0, "{:?}", messages(&r));
+}

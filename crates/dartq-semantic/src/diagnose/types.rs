@@ -2425,6 +2425,10 @@ pub(crate) struct Engine<'a> {
     /// type); pass 2 recomputes the accessor over the re-derived receiver
     /// and re-binds before any row resolves.
     pub(crate) deferred_var_rebinds: Vec<(u32, u32, Ty)>,
+    /// The bare-identifier initializer re-binds (#2567): the declaring
+    /// local's name-token offset, the initializer read's span, and the
+    /// parse-time bound face — the pass-2 flow read type re-binds it.
+    pub(crate) deferred_bare_rebinds: Vec<(u32, SourceRange, Ty)>,
     /// An implicitly typed closure formal whose context schema derived
     /// from a staged receiver row (`rebound.fragments.where((f) => …)`'s
     /// `f`): pass 1 freezes the schema entry over the unre-derived
