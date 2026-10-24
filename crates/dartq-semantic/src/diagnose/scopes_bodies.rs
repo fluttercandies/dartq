@@ -1227,8 +1227,16 @@ impl<'a> Engine<'a> {
                 // binds itself — `(e)` under `void Function(R?)` binds
                 // `R?`, nullable suffix and all — not the `Object?`
                 // recovery that face exists for (an `InvalidType` or
-                // `T <: Null` head).
-                if self.named_type_is_type(head) && self.args_are_types(args) {
+                // `T <: Null` head). An alias spelling resolving is not
+                // enough: a typedef whose right-hand fold terminates in an
+                // unprovable head (a `shared.` import the package config
+                // cannot resolve) is the oracle's InvalidType at the use —
+                // the formal takes the recovery faces below, never this
+                // bind.
+                if self.named_type_is_type(head)
+                    && self.args_are_types(args)
+                    && self.folded_alias_arg_provable(head)
+                {
                     return Some(Ty::Named {
                         name: head,
                         nullable,
@@ -1311,7 +1319,17 @@ impl<'a> Engine<'a> {
                                 // head dot-joined; it resolves through the
                                 // import prefix, not the bare name tables.
                                 || self.prefixed_element_head_resolves(arg_head))
-                                && self.args_are_types(arg_args) =>
+                                && self.args_are_types(arg_args)
+                                // An alias spelling resolves, but what it
+                                // SPELLS decides: a typedef whose right-hand
+                                // fold terminates in an unprovable head
+                                // (`MergedTypeConstraint` — a `shared.`
+                                // import the package config cannot resolve)
+                                // is the oracle's InvalidType at the use,
+                                // and greatestClosure binds the formal
+                                // `Object?` — the nullable verdict — not
+                                // the silent arm.
+                                && self.folded_alias_arg_provable(arg_head) =>
                             {
                                 None
                             }
@@ -2224,6 +2242,26 @@ impl<'a> Engine<'a> {
         self.boundary.pool().get(args).first().copied()
     }
 
+    /// Whether a receiver argument's ALIAS spelling stays provable after
+    /// the right-hand fold: an alias resolving to an unprovable head (a
+    /// typedef of a prefixed import the package config cannot resolve) is
+    /// the oracle's `InvalidType` at the use — the closure formal binds
+    /// greatestClosure's `Object?`, never the silent arm. A non-alias
+    /// spelling folds to itself and keeps whatever the caller's gate
+    /// already decided.
+    fn folded_alias_arg_provable(&self, arg_head: StringId) -> bool {
+        match self.fold_alias_ty(Ty::named(arg_head)) {
+            // `dynamic` never infers — the silent arm.
+            Ty::Dynamic => true,
+            Ty::Named { name, .. } => {
+                self.named_type_is_type(name)
+                    || !self.graph.declaring_libraries(name).is_empty()
+                    || self.prefixed_element_head_resolves(name)
+            }
+            _ => false,
+        }
+    }
+
     /// The static face of a chained producer's result (`m.values.map(…)`,
     /// `holder.items.map(…)`): a member-access row carries no receiver face
     /// of its own ([`Self::argument_receiver`] answers `Unknown`), but the
@@ -2254,7 +2292,27 @@ impl<'a> Engine<'a> {
             let Ty::Named { name, nullable, .. } = ret else {
                 return Receiver::Unknown;
             };
-            let ret = match self.bounds.container_params(*type_name) {
+            let ret = match self
+                .bounds
+                .container_params(*type_name)
+                .filter(|params| !params.is_empty())
+                .or_else(|| {
+                    // An SDK names-only stub's getter rows carry no
+                    // parameter spellings (`Map.values`' raw `Iterable<V>`)
+                    // — the dart:core table supplies the head's own, the
+                    // same fallback `instantiate_accessor_static` applies;
+                    // without it the raw schema leaks and the decidability
+                    // gate below suppresses the whole link.
+                    crate::member_face::CORE_CONTAINER_PARAMS
+                        .iter()
+                        .find(|(head, ..)| *head == self.strings.resolve(*type_name))
+                        .map(|(_, params)| {
+                            params
+                                .iter()
+                                .map(|p| (self.intern(p), None, false))
+                                .collect::<Vec<_>>()
+                        })
+                }) {
                 Some(params) if !params.is_empty() => {
                     let Ty::Named { args: recv_args, .. } = *ty else {
                         return Receiver::Unknown;

@@ -73,6 +73,13 @@ pub(crate) enum CoreRet {
     Fixed(&'static str),
     RecvHead(&'static str),
     BareHead(&'static str),
+    /// The head typed with ONE SELECTED receiver argument —
+    /// `Map<K, V>.values` answers the `Iterable` of the receiver's
+    /// second written argument (map.dart: `Iterable<V> get values`), a
+    /// selection the whole-list re-heading of [`CoreRet::RecvHead`]
+    /// cannot spell. Every entry of this shape is a getter, which the
+    /// accessor-read face relies on.
+    RecvArg(&'static str, u8),
 }
 
 /// The core members whose official signatures are unambiguous at this
@@ -203,8 +210,8 @@ pub(crate) const CORE_MEMBER_RETURNS: &[(&str, &str, CoreRet)] = &[
     ("Map", "isNotEmpty", CoreRet::Fixed("bool")),
     ("Map", "containsKey", CoreRet::Fixed("bool")),
     ("Map", "containsValue", CoreRet::Fixed("bool")),
-    ("Map", "keys", CoreRet::BareHead("Iterable")),
-    ("Map", "values", CoreRet::BareHead("Iterable")),
+    ("Map", "keys", CoreRet::RecvArg("Iterable", 0)),
+    ("Map", "values", CoreRet::RecvArg("Iterable", 1)),
     ("Map", "toString", CoreRet::Fixed("String")),
 ];
 
@@ -219,6 +226,7 @@ fn core_ret_head_ids(strings: &StringTable) -> FxHashMap<&'static str, StringId>
     for head in CORE_MEMBER_RETURNS.iter().flat_map(|(h, _, ret)| {
         let ret_head = match ret {
             CoreRet::Fixed(h) | CoreRet::RecvHead(h) | CoreRet::BareHead(h) => *h,
+            CoreRet::RecvArg(h, _) => *h,
         };
         [*h, ret_head]
     }) {

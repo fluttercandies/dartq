@@ -836,7 +836,9 @@ impl<'a> Engine<'a> {
                             {
                                 self.instantiate_accessor_static(container, recv, answer(&entry))
                             }
-                            _ => self.object_instance_read_ty(row),
+                            _ => self
+                                .core_accessor_read_ty(row, container, recv)
+                                .unwrap_or_else(|| self.object_instance_read_ty(row)),
                         }
                     }
                     None => self.object_instance_read_ty(row),
@@ -844,6 +846,41 @@ impl<'a> Engine<'a> {
             }
             _ => Ty::UNKNOWN,
         }
+    }
+
+    /// A builtin core receiver's accessor READ on the member-walk miss:
+    /// the SDK libraries carry no element model, so the getter-shaped
+    /// static-table entries answer instead — every
+    /// [`crate::member_face::CoreRet::RecvArg`] entry is a getter
+    /// (`Map<K, V>.values` answers the `Iterable` of the receiver's
+    /// second written argument, official map.dart `Iterable<V> get
+    /// values`), so a method tear-off read never lands here by
+    /// construction. A container the graph element-models resolves
+    /// through the walk above and never reaches this face; a receiver
+    /// without written arguments keeps the miss.
+    fn core_accessor_read_ty(&self, row: &Row, container: StringId, recv: &Receiver) -> Option<Ty> {
+        let crate::member_face::CoreRet::RecvArg(head, index) =
+            crate::member_face::core_member_return(
+                self.strings.resolve(container),
+                self.strings.resolve(row.name),
+            )?
+        else {
+            return None;
+        };
+        let name = self.members.core_ret_id(head)?;
+        let Receiver::Typed { ty, .. } = recv else {
+            return None;
+        };
+        let Ty::Named { args, .. } = ty else {
+            return None;
+        };
+        let elem = self.boundary.pool().get(*args).get(index as usize).copied()?;
+        Some(
+            self.boundary
+                .args
+                .borrow_mut()
+                .named(name, false, std::slice::from_ref(&elem)),
+        )
     }
 
     /// Instantiates a resolved accessor's declared type with the
@@ -1078,6 +1115,20 @@ impl<'a> Engine<'a> {
                         name,
                         nullable: false,
                         args,
+                    })
+                }),
+                crate::member_face::CoreRet::RecvArg(h, index) => head(h).and_then(|name| {
+                    // One SELECTED receiver argument types the head —
+                    // a `Map<K, V>.values` send answers the `Iterable`
+                    // of the second written argument alone.
+                    let elem = receiver_args().and_then(|args| {
+                        self.boundary.pool().get(args).get(index as usize).copied()
+                    });
+                    elem.map(|elem| {
+                        self.boundary
+                            .args
+                            .borrow_mut()
+                            .named(name, false, std::slice::from_ref(&elem))
                     })
                 }),
             }
