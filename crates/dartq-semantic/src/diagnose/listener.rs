@@ -3795,6 +3795,21 @@ impl ParserListener for DiagnoseListener<'_> {
             if op == UnOp::Not {
                 engine.classify_negation_operand(&row);
                 let ty = engine.operand_static_ty(&row);
+                // An `await` operand's close-time rewrite read an `Unknown`
+                // row (member rows resolve in the later pass), so the
+                // declared return standing here is the RAW face
+                // (`FutureOr<bool>`) — the extent re-applies the flatten
+                // exactly like the var-inferred bind's deferred face
+                // (#2506): `!await f()` negates the flattened `bool`.
+                let ty = if ty != Ty::UNKNOWN
+                    && engine.await_operand_extents.iter().any(|&(start, end)| {
+                        row.range.offset >= start && row.range.end() <= end
+                    })
+                {
+                    engine.flatten(ty)
+                } else {
+                    ty
+                };
                 let covered = engine.bool_decided_covers(&row);
                 let operand_start = engine.skip_whitespace(operator.range.end());
                 let list_shaped = engine.byte_at(operand_start) == Some(b'[')
@@ -4944,8 +4959,15 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_cast_pattern(&mut self, operator: Token) {
         let engine = &mut self.engine;
-        // `p as X` covers X's values (official `castPatternToSpace`).
+        // `p as X` covers X's values (official `castPatternToSpace`) — the
+        // written arguments ride along, so `x as List<int>`'s space never
+        // covers a later `x as List<num>` case's.
         let leaf = match engine.armed_ty {
+            Some(Ty::Named {
+                name,
+                nullable,
+                args,
+            }) if args != ArgListId::EMPTY => Restriction::NamedArgs(name, nullable, args),
             Some(Ty::Named { name, nullable, .. }) => Restriction::Named(name, nullable),
             _ => Restriction::Unknown,
         };
@@ -5471,7 +5493,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 Some(Ty::Named {
                     name: ty_name,
                     nullable,
-                    ..
+                    args,
                 }) => {
                     engine.bind_var_type(
                         name,
@@ -5481,7 +5503,15 @@ impl ParserListener for DiagnoseListener<'_> {
                             args: ArgListId::EMPTY,
                         },
                     );
-                    engine.pattern_leaf(Restriction::Named(ty_name, nullable));
+                    // The space leaf keeps the WRITTEN arguments: two
+                    // same-head typed-variable cases (`final Map<A, B> m`
+                    // then `final Map<Object, Object?> m`) differ at the
+                    // argument list, and neither covers the other.
+                    engine.pattern_leaf(if args != ArgListId::EMPTY {
+                        Restriction::NamedArgs(ty_name, nullable, args)
+                    } else {
+                        Restriction::Named(ty_name, nullable)
+                    });
                 }
                 ty => {
                     if let Some(ty) = ty {
@@ -5520,10 +5550,19 @@ impl ParserListener for DiagnoseListener<'_> {
         let declared = engine.armed_ty;
         engine.armed_ty_span = None;
         engine.check_wildcard_pattern(wildcard.range, declared);
-        let Some(Ty::Named { name, nullable, .. }) = engine.armed_ty.take() else {
+        let Some(Ty::Named {
+            name,
+            nullable,
+            args,
+        }) = engine.armed_ty.take()
+        else {
             return;
         };
-        engine.pattern_leaf(Restriction::Named(name, nullable));
+        engine.pattern_leaf(if args != ArgListId::EMPTY {
+            Restriction::NamedArgs(name, nullable, args)
+        } else {
+            Restriction::Named(name, nullable)
+        });
     }
 
     // —— switch statements ————————————————————————————————————————————

@@ -1279,8 +1279,26 @@ impl<'a> Engine<'a> {
         } else {
             self.walk_members(container, name)
         };
+        // An explicit instance receiver (`x.m`, `C().m`) that resolves a
+        // STATIC member is the official `instance_access_to_static_member`
+        // world (the access resolves the static with its DEDICATED error,
+        // never the arity/argument checks against its formals) — and where
+        // the flow later narrows the receiver past the static's
+        // declaration (a pattern-narrowed scrutinee:
+        // `switch (type) { CustomSqlType() => type.read(x) }` over
+        // `BaseSqlType<T>`'s static helper), the oracle resolves the
+        // instance member outright. Either way this parse-time close must
+        // not check the send against the static's formals. ONLY value
+        // receivers: an implicit-`this` UNQUALIFIED call (`_helper()` in a
+        // class body) resolves the static through the class scope — a
+        // legal call whose arity checks DO run — and `this`/`super`
+        // receivers keep the static formals for the same reason.
         match walk {
-            Walk::Found(entry) if entry.kind == MemberKind::Method => {
+            Walk::Found(entry)
+                if entry.kind == MemberKind::Method
+                    && !(entry.is_static
+                        && matches!(recv, Receiver::Typed { .. } | Receiver::Created { .. })) =>
+            {
                 // The receiver-instantiation environment (#2433): a
                 // `Receiver::Typed`'s written arguments substitute the
                 // container parameters the member's formals spell. `None`

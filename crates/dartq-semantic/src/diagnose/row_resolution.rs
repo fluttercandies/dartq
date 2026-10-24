@@ -2155,6 +2155,27 @@ impl<'a> Engine<'a> {
                     );
                     return;
                 }
+                // The record-receiver extension face: a receiver whose
+                // static type is a RECORD (a `(BoxedT,)?` sentinel, a
+                // record typedef's instance) names no container — the flow
+                // lattice cannot spell records either, so the parse-time
+                // side table (`record_recv_tys`) is the only holder of the
+                // face. The shape application credits the declaring
+                // extension's member (the resolution itself stays silent,
+                // matching the oracle's resolved access).
+                if !self_named
+                    && matches!(
+                        row.intent,
+                        Intent::Invoke | Intent::Read | Intent::ReadWrite
+                    )
+                    && let Some(&(_, record)) = self
+                        .record_recv_tys
+                        .iter()
+                        .find(|(offset, _)| *offset == row.range.offset)
+                {
+                    self.credit_record_extension_use(record, row.name, row.range.offset);
+                    return;
+                }
             }
             Receiver::Prefix { name: prefix } => {
                 // `lazy.loadLibrary()` is the deferred-load runtime face
@@ -2467,6 +2488,19 @@ impl<'a> Engine<'a> {
                         .insert((self.file, index, row.name));
                 }
             }
+            return;
+        }
+        // A typedef-to-record receiver (`previous._value?.copyWith(..)`
+        // over `_DataRecord<ValueT>`): the alias folds to the record the
+        // shape application resolves through — no container exists to
+        // walk, and the record-extension face owns the access (silent,
+        // the oracle's resolved send).
+        if let Receiver::Typed { ty, .. } = recv
+            && matches!(row.intent, Intent::Invoke | Intent::Read | Intent::ReadWrite)
+            && matches!(self.fold_alias_ty(ty), Ty::Record { .. })
+        {
+            let folded = self.fold_alias_ty(ty);
+            self.credit_record_extension_use(folded, row.name, row.range.offset);
             return;
         }
         // The extension-application faces read the receiver's nullability
@@ -5315,6 +5349,156 @@ impl<'a> Engine<'a> {
                     || self.unique_declared_elsewhere(name, self.lib).is_some()
             }
             _ => true,
+        }
+    }
+
+    /// The record-receiver extension application (`extension<BoxedT> on
+    /// (BoxedT,)?` — riverpod's `unwrapSentinel`): a receiver whose static
+    /// type is a RECORD has no container name, so the named-`on` face loop
+    /// of [`Self::extension_application`] never sees it — this face answers
+    /// the same `applicableTo` question over shapes: both sides fold
+    /// through type aliases to records, the nullability and field
+    /// skeletons must agree (positional arity + named-field names), and an
+    /// `on` field spelling one of the face's own type parameters
+    /// instantiates (the inference always binds, exactly like the named
+    /// arm's parameter arguments); a concrete field pair decides by head
+    /// equality. Returns the single applicable face (the credit's element
+    /// key), `None` when zero or several apply — an ambiguous record
+    /// application resolves no member, the same posture the named loop
+    /// keeps.
+    pub(crate) fn record_extension_face(
+        &mut self,
+        receiver_ty: Ty,
+        member: StringId,
+    ) -> Option<(&'a ExtensionFace, FileId)> {
+        let receiver = self.fold_alias_ty(receiver_ty);
+        let Ty::Record {
+            shape: recv_shape,
+            nullable: recv_nullable,
+        } = receiver
+        else {
+            return None;
+        };
+        let recv_shape = self
+            .boundary
+            .pool()
+            .record_shape(recv_shape)
+            .clone();
+        self.accessible_extension_faces();
+        let faces = self.accessible_extensions.as_deref().unwrap_or(&[]);
+        let mut hits: Vec<(&'a ExtensionFace, FileId)> = Vec::new();
+        for &(face, face_file) in faces {
+            if !face.members.contains_key(&member) {
+                continue;
+            }
+            let on_ty = self.boundary.ty(face_file, face.on_ty);
+            let Ty::Record {
+                shape: on_shape,
+                nullable: on_nullable,
+            } = self.fold_alias_ty(on_ty)
+            else {
+                continue;
+            };
+            if !on_nullable && recv_nullable {
+                // `applicableTo`'s subtype ask: a non-nullable `on` record
+                // never accepts a nullable receiver; the nullable `on`
+                // accepts both (a non-null value fits the nullable type).
+                continue;
+            }
+            let on_shape = self.boundary.pool().record_shape(on_shape).clone();
+            if on_shape.positional.len() != recv_shape.positional.len()
+                || on_shape.named.len() != recv_shape.named.len()
+                || on_shape
+                    .named
+                    .iter()
+                    .zip(recv_shape.named.iter())
+                    .any(|(on, recv)| on.0 != recv.0)
+            {
+                continue;
+            }
+            let fields_agree = on_shape
+                .positional
+                .iter()
+                .chain(on_shape.named.iter().map(|(_, ty)| ty))
+                .zip(
+                    recv_shape
+                        .positional
+                        .iter()
+                        .chain(recv_shape.named.iter().map(|(_, ty)| ty)),
+                )
+                .all(|(on_field, recv_field)| {
+                    let Ty::Named { name, .. } = on_field else {
+                        return false;
+                    };
+                    // An `on` field spelling the extension's own parameter
+                    // instantiates against the receiver (the inference
+                    // binds; the bound — unbounded here — accepts).
+                    face.type_param_names.contains(name)
+                        || matches!(
+                            (on_field, recv_field),
+                            (
+                                Ty::Named {
+                                    name: on_name,
+                                    args: on_args,
+                                    ..
+                                },
+                                Ty::Named {
+                                    name: recv_name,
+                                    ..
+                                },
+                            ) if on_args == &ArgListId::EMPTY && on_name == recv_name
+                        )
+                });
+            if fields_agree {
+                hits.push((face, face_file));
+            }
+        }
+        (hits.len() == 1).then(|| hits[0])
+    }
+
+    /// Credits the record application's member use (the `usedElements`
+    /// face — the same insert [`Self::extension_application`]'s unique-hit
+    /// arm performs) plus the contributing import. A receiver whose alias
+    /// folds to a record reaches the `Unknown` receiver dispatch (no
+    /// container name exists), so this is the only credit path its member
+    /// sends ever see. A `?.` access already unwrapped the receiver — the
+    /// shape comparison reads the non-null record.
+    pub(crate) fn credit_record_extension_use(
+        &mut self,
+        receiver_ty: Ty,
+        member: StringId,
+        member_offset: u32,
+    ) {
+        let receiver_ty = if self.null_aware_members.contains(&member_offset) {
+            match receiver_ty {
+                Ty::Record {
+                    shape,
+                    nullable: true,
+                } => Ty::Record {
+                    shape,
+                    nullable: false,
+                },
+                other => other,
+            }
+        } else {
+            receiver_ty
+        };
+        if let Some((face, face_file)) = self.record_extension_face(receiver_ty, member) {
+            if let Some(face_index) = self
+                .index
+                .get(face_file)
+                .and_then(|elements| {
+                    elements
+                        .extension_faces()
+                        .iter()
+                        .position(|entry| std::ptr::eq(entry, face))
+                })
+                .and_then(|index| u32::try_from(index).ok())
+            {
+                self.extension_member_used
+                    .insert((face_file, face_index, member));
+            }
+            self.credit_extension_import(face, face_file);
         }
     }
 

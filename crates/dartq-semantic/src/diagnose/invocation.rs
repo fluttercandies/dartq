@@ -658,6 +658,14 @@ impl<'a> Engine<'a> {
                                     type_name: *name,
                                     ty: receiver_ty,
                                 },
+                                // The record face has no receiver spelling —
+                                // the parse-time type keys the side table the
+                                // pass-2 record-extension application reads.
+                                (Receiver::Unknown, Ty::Record { .. }) => {
+                                    self.record_recv_tys
+                                        .push((member.range.offset, receiver_ty));
+                                    other
+                                }
                                 _ => other,
                             },
                         }
@@ -671,6 +679,11 @@ impl<'a> Engine<'a> {
                             type_name: name,
                             ty: receiver_ty,
                         },
+                        Ty::Record { .. } => {
+                            self.record_recv_tys
+                                .push((member.range.offset, receiver_ty));
+                            Receiver::Unknown
+                        }
                         _ => Receiver::Unknown,
                     },
                     RowShape::Receiver(recv) => *recv,
@@ -721,6 +734,11 @@ impl<'a> Engine<'a> {
                             type_name: name,
                             ty: receiver_ty,
                         },
+                        Ty::Record { .. } => {
+                            self.record_recv_tys
+                                .push((member.range.offset, receiver_ty));
+                            Receiver::Unknown
+                        }
                         _ => Receiver::Unknown,
                     },
                 };

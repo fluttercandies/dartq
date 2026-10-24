@@ -276,6 +276,11 @@ pub(crate) fn restriction_disjoint_from(
         Restriction::Named(name, nullable) => {
             !world.can_be_subtype_of(&NameTy::Named(*name, *nullable), &matched)
         }
+        Restriction::NamedArgs(name, nullable, args) => !world
+            .can_be_subtype_of(
+                &NameTy::NamedArgs(*name, *nullable, *args),
+                &matched,
+            ),
         Restriction::BoolValue(value) => {
             !world.can_be_subtype_of(&NameTy::BoolValue(*value), &matched)
         }
@@ -463,6 +468,12 @@ pub(crate) enum Restriction {
     /// A type test as written (`X`, `X?`): cast patterns, typed variable
     /// patterns, object patterns.
     Named(StringId, bool),
+    /// A type test with its WRITTEN arguments (`List<int>`, `Map<K, V>`):
+    /// the case space keeps the instantiation, so two same-head cases with
+    /// distinct arguments never cover one another (invariant generics —
+    /// neither instantiation is a subtype of the other; the official
+    /// `convertTypePattern` lowers the resolved type with its arguments).
+    NamedArgs(StringId, bool, ArgListId),
     /// The `null` constant (the only value-precise constant at name level).
     Null,
     /// `true`/`false`.
@@ -529,6 +540,9 @@ fn collect_singles(
         // single (official `convertTypePattern`/`convertConstantPattern`).
         Restriction::Named(name, nullable) => {
             out.push(Single::full(NameTy::Named(*name, *nullable)));
+        }
+        Restriction::NamedArgs(name, nullable, args) => {
+            out.push(Single::full(NameTy::NamedArgs(*name, *nullable, *args)));
         }
         Restriction::BoolValue(value) => out.push(Single::full(NameTy::BoolValue(*value))),
         Restriction::EnumValue(enum_name, constant) => {

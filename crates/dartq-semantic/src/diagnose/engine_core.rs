@@ -312,6 +312,7 @@ impl<'a> Engine<'a> {
             interpolation_child_rows: FxHashSet::default(),
             read_types: Vec::new(),
             cast_rewrites: Vec::new(),
+            record_recv_tys: Vec::new(),
             query_type_rows: Vec::new(),
             unnamed_extension_faces_opened: 0,
             initializer_locals: FxHashSet::default(),

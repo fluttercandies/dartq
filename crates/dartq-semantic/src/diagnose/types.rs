@@ -2938,6 +2938,13 @@ pub(crate) struct Engine<'a> {
     /// reads the rewritten static type (`AsExpression.staticType`), never
     /// the operand's parse-time capture.
     pub(crate) cast_rewrites: Vec<(SourceRange, Ty)>,
+    /// The record-typed receiver reads' member offsets with the parse-time
+    /// static type, in arrival order — the receiver classification has no
+    /// record face (the flow lattice cannot spell records either), so this
+    /// side table is the only holder of the record the pass-2
+    /// record-extension application reads (`source.unwrapSentinel(..)`
+    /// over the `(DataSource?,)?` formal).
+    pub(crate) record_recv_tys: Vec<(u32, Ty)>,
     /// The semantic-side query-type rows (#1869-2): spans whose static
     /// type the walk itself knows but the flow layer cannot answer — the
     /// `this` keyword (the enclosing container's type) and the
