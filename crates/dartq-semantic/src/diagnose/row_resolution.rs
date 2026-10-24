@@ -1279,6 +1279,17 @@ impl<'a> Engine<'a> {
                 // of the user operators (the `A < 1` container face's
                 // decision, one resolution grade down).
                 if matches!(row.intent, Intent::Operator(..)) {
+                    // The promotion-latched initializer's re-bind (#2539): an
+                    // implicitly typed local whose initializer's member row
+                    // re-derived under a promoted receiver (`final v =
+                    // t.value` past `t is Sub` — the base getter's declared
+                    // `Object` at parse time, the override's `BigInt` after
+                    // the re-decision) carries the corrected face only in
+                    // the re-bind map. The operator verdict reads the same
+                    // corrected static type the receiver faces read
+                    // (`rebound_read_face` outranks the parse bind; a live
+                    // promotion at the read still outranks both).
+                    let ty = self.rebound_read_face(row.range).unwrap_or(ty);
                     let ty = match promotions.promoted(row.range) {
                         Some(Ty::Unknown) => Self::non_null_form(ty),
                         Some(promoted) => promoted,

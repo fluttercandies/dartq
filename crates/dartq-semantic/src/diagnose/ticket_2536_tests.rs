@@ -622,3 +622,35 @@ void f(Base b) {
         "override-precision re-bind did not land: {cs:?}"
     );
 }
+
+/// The operator operand's re-bound face (xml's number.dart rig): a `final`
+/// local initialized from a getter read on an `is`-promoted receiver keeps
+/// the parse-time bind (the base getter's `Object`) in the local table, so
+/// a later operator application on the local reported `undefined_operator`
+/// where the oracle resolves the override's `BigInt`. The pass-2 verdict
+/// reads the same re-bound static type the receiver faces read
+/// (`rebound_read_face` outranks the parse bind).
+#[test]
+fn rebound_local_feeds_operator_operand() {
+    let report = unit_report(
+        r#"
+sealed class N {
+  Object get value => this;
+}
+final class I extends N {
+  BigInt get value => BigInt.zero;
+}
+void f(N arg) {
+  if (arg is I) {
+    final v = arg.value;
+    print(v ~/ BigInt.two);
+  }
+}
+"#,
+    );
+    let cs = codes(&report);
+    assert!(
+        !cs.contains(&"undefined_operator"),
+        "operator operand missed the re-bound face: {cs:?}"
+    );
+}
