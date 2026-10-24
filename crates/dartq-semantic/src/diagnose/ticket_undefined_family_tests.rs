@@ -377,18 +377,30 @@ fn extension_on_record_names_unknown() {
 }
 
 /// `on void Function()`: the oracle displays 'Function' — the
-/// function-type `this`. The model's `on`-clause capture does not
-/// intern the function shape, so the miss is currently under-reported;
-/// the pin locks the no-`undefined_function` direction and a silent
-/// report rather than a misnamed one.
+/// function-type `this` (oracle probe: `c()` reports `undefined_method`
+/// "isn't defined for the type 'Function'"). The interned function
+/// `on_ty` reaching `this_static_ty`'s fallback made the miss report
+/// exactly like the named face (the pre-fallback posture was a silent
+/// under-report).
 #[test]
 fn extension_on_function_type_is_silent() {
     let source = "extension G on void Function() {\n\
                         void m() { c(); }\n\
                       }";
-    let names = code_names(&report(source));
+    let report = report(source);
+    let names = code_names(&report);
     assert!(!names.contains(&"undefined_function"), "{names:?}");
-    assert!(!names.contains(&"undefined_method"), "{names:?}");
+    assert_eq!(
+        names.iter().filter(|c| **c == "undefined_method").count(),
+        1,
+        "{names:?}"
+    );
+    let diag = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code.name == "undefined_method")
+        .unwrap();
+    assert!(diag.message.contains("Function"), "{diag:?}");
 }
 
 /// A mixin `on` miss keeps the MIXIN name — `this` inside a mixin is

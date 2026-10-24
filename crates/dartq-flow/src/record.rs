@@ -1508,9 +1508,15 @@ impl ParserListener for Flow<'_> {
         // [`Flow::extension_on_head`]): only depth-0 heads race — the
         // on-type's own type arguments nest inside their group — and only
         // a plain named head feeds the `this` staging (a `dynamic`/`void`/
-        // `Never`/`Null` head answers nothing the verdict reads).
+        // `Never`/`Null` head answers nothing the verdict reads). A
+        // record `on` type's FIELD heads are depth-0 by the group test but
+        // sit inside the record's parentheses (`extension<T> on (T,)?` —
+        // `T` would otherwise latch as the on-head and type `this` as the
+        // unresolved field name, starving the body's record accessors
+        // into the Object recovery).
         if self.in_extension_header
             && self.type_arg_groups.is_empty()
+            && !self.tv_in_record
             && let crate::ty::Base::Name(head) = base
         {
             self.extension_on_head = Some((head, nullable));

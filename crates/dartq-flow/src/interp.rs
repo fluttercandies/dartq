@@ -1926,9 +1926,6 @@ impl<'o> Interp<'o> {
             }
             return;
         }
-        if std::env::var_os("DQ_PROBE_DEAD").is_some() {
-            eprintln!("DQ_PROBE_DEAD window opens at {}", span.range.offset);
-        }
         self.dead = Some(DeadWindow::at(self.stack.len(), span));
     }
 
