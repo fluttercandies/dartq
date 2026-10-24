@@ -974,8 +974,13 @@ impl<'a> Engine<'a> {
     /// write's promotion needs the resolved return; every other send
     /// consumer keeps the unknown-suppress posture over receivers the
     /// graph carries no element model for, where a wrong face would
-    /// fire rows the oracle never reports).
-    pub(crate) fn callee_return_ty_for_write(&self, row: &Row) -> Ty {
+    /// fire rows the oracle never reports). `context` is the write
+    /// target's declared face: a bare-container element constructor
+    /// (`List<E> of(Iterable<E>)`) spells no receiver arguments, and the
+    /// oracle's downward inference reads `E` from the assignment's
+    /// context — `Iterable<String>? x; x = List.of(xs)` writes
+    /// `List<String>`, the context's element.
+    pub(crate) fn callee_return_ty_for_write(&self, row: &Row, context: Ty) -> Ty {
         let resolved = self.callee_return_ty(row);
         if resolved != Ty::UNKNOWN {
             return resolved;
@@ -1016,10 +1021,9 @@ impl<'a> Engine<'a> {
         // spelling, so a container the graph element-models (a user
         // class, however spelled) never hits; constructors stay out of
         // the table and keep their own face below.
-        if let Some(face) = crate::member_face::core_member_return(
-            self.strings.resolve(container),
-            self.strings.resolve(row.name),
-        ) {
+        let member = self.strings.resolve(row.name);
+        if let Some(face) = crate::member_face::core_member_return(self.strings.resolve(container), member)
+        {
             let head = |spelling: &str| self.members.core_ret_id(spelling);
             let receiver_args = || {
                 let index = self
@@ -1034,11 +1038,43 @@ impl<'a> Engine<'a> {
                     }
                 })
             };
+            // A bare container head's element constructors (`List<E>
+            // unmodifiable(Iterable<E> elements)`, `List<E> of(Iterable<E>)`)
+            // spell no receiver arguments — the receiver row's EMPTY list
+            // would instantiate `E` to its bound (`dynamic`), staging a
+            // `List<dynamic>` the promotion gate rightly refuses against
+            // an `Iterable<String>` interest. The oracle's inference reads
+            // `E` from the assignment's downward context: the write
+            // target's declared element args re-head the constructor.
+            let element_from_context = || {
+                if member != "unmodifiable" && member != "of" {
+                    return None;
+                }
+                match context {
+                    Ty::Named {
+                        name: ctx_head,
+                        args,
+                        ..
+                    } if args != crate::model::ArgListId::EMPTY
+                        && matches!(
+                            self.strings.resolve(ctx_head),
+                            "Iterable" | "List" | "Set"
+                        ) =>
+                    {
+                        Some(args)
+                    }
+                    _ => None,
+                }
+            };
             return match face {
                 crate::member_face::CoreRet::Fixed(h) => head(h).map(Ty::named),
                 crate::member_face::CoreRet::BareHead(h) => head(h).map(Ty::named),
                 crate::member_face::CoreRet::RecvHead(h) => head(h).and_then(|name| {
-                    receiver_args().map(|args| Ty::Named {
+                    let args = receiver_args()
+                        .filter(|args| *args != crate::model::ArgListId::EMPTY)
+                        .or_else(element_from_context)
+                        .or_else(receiver_args);
+                    args.map(|args| Ty::Named {
                         name,
                         nullable: false,
                         args,

@@ -1148,3 +1148,37 @@ fn core_member_rhs_stages_the_write_promotion() {
         .collect();
     assert_eq!(miss, Vec::<&str>::new(), "{:?}", messages(&r));
 }
+
+/// A bare-container element constructor on a write's right side
+/// instantiates its parameter from the assignment's context (#2567, the
+/// intl locale shape): `List.unmodifiable` spells no receiver arguments,
+/// so the core member face alone staged an argless `List` whose
+/// `dynamic` element the promotion gate refused against the declared
+/// `Iterable<String>` — the oracle's downward inference writes
+/// `List<String>` (the context's element), which promotes and the later
+/// argument read passes.
+#[test]
+fn element_constructor_rhs_instantiates_from_the_write_context() {
+    let r = super::test_rig::report_ops(concat!(
+        "class L {\n",
+        "  final Iterable<String>? variants;\n",
+        "  L(this.variants);\n",
+        "}\n",
+        "void g(Iterable<String> xs) {}\n",
+        "class W {\n",
+        "  void f(Iterable<String>? variants) {\n",
+        "    variants = (variants != null && variants.isNotEmpty)\n",
+        "        ? List.unmodifiable(variants.toList()..sort())\n",
+        "        : const [];\n",
+        "    g(variants);\n",
+        "  }\n",
+        "}\n",
+    ));
+    let miss: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.code.name == "argument_type_not_assignable")
+        .map(|d| d.message.as_str())
+        .collect();
+    assert_eq!(miss, Vec::<&str>::new(), "{:?}", messages(&r));
+}

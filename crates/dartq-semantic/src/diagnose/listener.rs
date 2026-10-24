@@ -3367,7 +3367,15 @@ impl ParserListener for DiagnoseListener<'_> {
             // reads would strip to `C`.
             let from_ty = match rhs_row.ty {
                 Ty::Named { args, .. } if args != crate::model::ArgListId::EMPTY => rhs_row.ty,
-                _ if rhs_row.intent == Intent::Invoke => engine.callee_return_ty_for_write(&rhs_row),
+                _ if rhs_row.intent == Intent::Invoke => {
+                    // The write's context — the target's declared face —
+                    // rides beside the row: a bare element constructor
+                    // (`List.of(xs)` on `Iterable<String>? x`) instantiates
+                    // its parameter from the assignment's downward
+                    // inference, which the target's element args carry.
+                    let context = engine.receiver_static_ty(&engine.rows[target]);
+                    engine.callee_return_ty_for_write(&rhs_row, context)
+                }
                 _ => {
                     let resolved = engine.initializer_read_ty(&rhs_row);
                     if resolved != Ty::UNKNOWN {
