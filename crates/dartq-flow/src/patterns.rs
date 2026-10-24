@@ -577,6 +577,32 @@ impl Interp<'_> {
                     .is_invalid_typed(ty, frame_args, self.args, self.names)
             {
                 self.defer_vacuous_object_cover(name);
+                return;
+            }
+            // The official `promoteForPattern` runs for a non-reference
+            // matched value too (`switch (this.state)` — a property
+            // scrutinee, flow_analysis.dart:7746-7776):
+            // `tryPromoteForTypeCheck` promotes nothing, so the true and
+            // false arms are both the unpromoted current, and
+            // `matchFailsIfWrongType && !coversMatchedType` still joins
+            // that arm into `_unmatched`. Without the join the chain keeps
+            // its `beginAlternative` unreachable seed and every later
+            // alternative of the switch reads dead (riverpod's
+            // `notifier_provider.dart` `_callEncode` — cases after the
+            // first went DEAD_CODE). The covers gate is the same subtype
+            // verdict the reference path runs below, over the frame's
+            // latched scrutinee type; the raw pattern head already spells
+            // the required type, and no latched type at all may always
+            // fail, so both directions join.
+            let covered = self
+                .frame_scrutinee_ty()
+                .is_some_and(|(ty, frame_args)| {
+                    self.ops
+                        .is_subtype_typed(ty, frame_args, known, args, self.args, self.names)
+                });
+            if !covered {
+                let cur = self.current.clone();
+                self.join_unmatched(cur);
             }
             return;
         };

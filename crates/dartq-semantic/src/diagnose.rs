@@ -3211,6 +3211,20 @@ fn synthesize_invalid_scrutinee_dead_cases(
         }) {
             continue;
         }
+        // A type-parameter spelling is a VALID type to the oracle — a type
+        // variable answers the read (riverpod's `AnyNotifier<AsyncValue<T>,
+        // T>`-shaped inheritance can latch the unsubstituted parameter as
+        // the getter's read type), never the `InvalidType` this synthesis
+        // mirrors, so the whole-check rows stand down for it.
+        if index.get(file).is_some_and(|elements| {
+            elements.container_order.iter().any(|&container| {
+                elements
+                    .container(container)
+                    .is_some_and(|c| c.type_param_names.contains(&name))
+            })
+        }) {
+            continue;
+        }
         // The unresolved-CALL chain face (`var x = nowheresfn();` — the
         // flow's invalid-call typing latches the callee's own head as the
         // row) belongs to the joined synthesizer below, whose
