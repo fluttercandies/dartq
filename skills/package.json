@@ -1,0 +1,8 @@
+{
+  "name": "dartq-skills",
+  "version": "0.1.0",
+  "description": "dartq skills: AI-first Dart/Flutter analysis, test driving, monorepo sessions, debugging, and MCP integration. Conventional package layout: skills/ is discovered natively by pi and oh-my-pi (omp).",
+  "type": "module",
+  "license": "Apache-2.0 OR MIT",
+  "omp": {}
+}

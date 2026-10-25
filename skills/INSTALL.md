@@ -181,41 +181,48 @@ the MCP entry).
 
 ## pi
 
-The pi extension `adapters/pi/extensions/dartq.ts` registers the shared
-skills directory through `resources_discover`. Package it (or point a
-package at this checkout) and install:
+pi natively discovers `skills/` inside an installed package — the
+conventional directory is all this package needs. Install it (local path,
+git URL, or npm spec all work):
 
 ```bash
-pi install <this-package>/adapters/pi
+pi install <this-package>
 ```
 
-For development, load it temporarily:
+For development, load it for one session without installing:
 
 ```bash
-pi -e <this-package>/adapters/pi
+pi -e <this-package>
 ```
 
-The extension is dependency-free, so it runs without installing agent
-types. MCP: register `dartq mcp` per pi's MCP configuration.
+pi lists each skill's name, description, and path in the system prompt;
+invoke one with `/skill:using-dartq` or let the model load the matching
+skill for the task. MCP: register `dartq mcp` per pi's MCP configuration
+(stdio: command `dartq`, args `["mcp"]`).
 
 ## oh-my-pi (omp)
 
-omp package: `adapters/omp/` — `package.json` declares
-`omp.extensions: ["./extensions/dartq.ts"]`, and that extension registers
-the shared skills directory (the skills live outside the adapter, so the
-extension resolves them explicitly). Install:
+omp natively discovers `skills/` inside installed packages; the root
+`package.json` carries the `omp` manifest that marks the package as an
+omp plugin. Install from a checkout:
 
 ```bash
-omp install <this-package>/adapters/omp
+omp install <this-package>
 ```
 
-or for development: `omp --extension <this-package>/adapters/omp`. Start a
-new session after install. MCP: add `dartq mcp` as a stdio server in your
-omp MCP configuration.
+Installs from a local path are linked, so edits flow through — start a
+new session to pick them up. Verify offline (no session needed):
+
+```bash
+omp skill list   # the dartq skills should be listed
+```
+
+MCP: in an omp session run `/mcp add dartq -- dartq mcp`.
 
 ## Kiro
 
-Kiro consumes steering files. Copy the steering document into your
+Kiro consumes steering files from `.kiro/steering/` in the workspace (or
+`~/.kiro/steering/` globally). Copy the steering document into your
 project:
 
 ```bash
@@ -223,13 +230,22 @@ mkdir -p .kiro/steering
 cp <this-package>/adapters/kiro/steering/dartq.md .kiro/steering/dartq.md
 ```
 
-The file
-carries `inclusion: always` frontmatter and summarizes the dartq contract
-with pointers to the skill files. For the skills themselves, Kiro reads
+The file carries `inclusion: always` frontmatter (allowed values:
+`always`, `fileMatch` + `fileMatchPattern`, `manual`, `auto`), so Kiro
+loads it into every interaction; it summarizes the dartq contract with
+pointers to the skill files. For the skills themselves, Kiro reads
 markdown guidance — the steering file links the set; hosts that support
-the skills convention can consume `skills/` directly. MCP: register
-`dartq mcp` in Kiro's MCP settings (stdio: command `dartq`, args
-`["mcp"]`).
+the skills convention can consume `skills/` directly.
+
+MCP: `.kiro/settings/mcp.json` (workspace) or `~/.kiro/settings/mcp.json`
+(user) — open it via the command palette ("Kiro: Open workspace MCP
+config (JSON)") or the Open MCP Config icon in the Kiro panel:
+
+```json
+{ "mcpServers": { "dartq": { "command": "dartq", "args": ["mcp"] } } }
+```
+
+Configs hot-reload on save.
 
 ## Any other harness (AGENTS.md convention)
 
@@ -244,19 +260,27 @@ the skills convention can consume `skills/` directly. MCP: register
 
 - **Verify the binary before anything else:** `dartq version`.
 - **Verify skills landed:** ask the agent "list your dartq skills" — the
-  `using-dartq` index should be named.
+  `using-dartq` index should be named. On omp you can verify offline with
+  `omp skill list`.
 - **Relative skills paths** (`../../skills` in the claude/codex/cursor/
   kimi manifests): the flat-dir assembly steps exist because some host
   versions do not traverse upward from a manifest. If a host rejects the
   path, use the assembly variant shown in that section.
-- **Kiro confidence note:** the steering markdown (with `inclusion`
-  frontmatter) is the documented extension point; no config-file shape for
-  MCP is shipped — register the server through Kiro's settings UI.
-- **omp/pi confidence note:** the extensions follow the documented
-  `resources_discover` → `skillPaths` registration (pi) and
-  `omp.extensions` manifest field (omp); skills are registered explicitly
-  because the package keeps them in a shared directory rather than the
-  conventional root-level `skills/` of the adapter.
+- **Kiro note:** verified against kiro.dev docs — steering frontmatter
+  `inclusion` takes `always` (default), `fileMatch` + `fileMatchPattern`,
+  `manual`, or `auto` (requires `name` + `description`); steering lives in
+  `.kiro/steering/` (workspace) or `~/.kiro/steering/` (global), and MCP
+  servers are configured in `.kiro/settings/mcp.json` /
+  `~/.kiro/settings/mcp.json` (workspace wins on merge). Note: custom
+  Kiro agents do not include steering files automatically — add
+  `"resources": ["file://.kiro/steering/**/*.md"]` to the agent config.
+- **omp/pi note:** verified end to end against a local omp 18.10.4
+  install — both agents discover a conventional `skills/` directory
+  inside an installed package natively (omp reports the skills with
+  source `omp-plugins`); no extension code is needed. The root
+  `package.json`'s `omp` manifest is required for omp (`omp plugin
+  doctor` flags its absence); pi reads the same layout convention and
+  ignores the `omp` field.
 - **Wrong workspace over MCP:** the server binds the worktree it was
   started in — restart `dartq mcp` inside the right tree, and check the
   `dartq://workspace-status` resource.

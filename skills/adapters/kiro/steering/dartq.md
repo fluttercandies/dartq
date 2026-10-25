@@ -27,5 +27,10 @@ Skill files (load the matching one before the task):
 - `dartq-debugging` — launch/attach, breakpoints, hot reload (MCP-native)
 - `dartq-mcp` — wiring `dartq mcp` (stdio MCP server) into agent hosts
 
-To expose dartq as MCP tools, register the stdio server `dartq mcp` in
-Kiro's MCP settings.
+To expose dartq as MCP tools, register the stdio server in
+`.kiro/settings/mcp.json` (workspace) or `~/.kiro/settings/mcp.json`
+(user):
+
+```json
+{ "mcpServers": { "dartq": { "command": "dartq", "args": ["mcp"] } } }
+```
