@@ -1,9 +1,14 @@
-//! dartq CLI — `dartq check` (the M0 differential face), `dartq analyze`
-//! (the M1 engine face), the `dartq query` index faces (`symbol` /
-//! `references` / `callers`, plus the `batch`
-//! multi-symbol/multi-kind face), `dartq explain` (the one-stop AI
-//! report), `dartq index` (the index build), `dartq rename` (the symbol
-//! rename face), and `dartq version`.
+//! dartq CLI — the converged verb surface: `analyze` (the engine face;
+//! `--fast` the parser-only pass), `query`, `explain`, `impact`, `fix`,
+//! `rename`, `test`, `packages` (the universe inventory), and the
+//! position faces `resolve` / `complete`; `check`, `index`, `assists`,
+//! and `daemon` stay reachable as hidden faces (`check` is `analyze
+//! --fast`'s alias; `compatibility`, `resolve-at`, and `completion`
+//! alias `compat`, `resolve`, and `complete`).
+//!
+//! Piped (non-TTY) invocations with no explicit `--format` default to
+//! machine JSON — zero prose for programmatic consumers; a TTY keeps
+//! the human forms. Explicit `--format` always wins.
 //!
 //! The per-command cores live in `dartq-commands` (the one implementation
 //! the daemon RPC faces share); this binary adds only argument
@@ -56,7 +61,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -84,7 +89,8 @@ use dartq_engine::{DeclHit, EngineConfig};
 use dartq_sdk::SdkSnapshot;
 
 /// Process exit codes, pinned to the dartdev oracle (analyze.dart:719–731;
-/// usage exit dartdev.dart:209–210).
+/// usage exit dartdev.dart:209–210) plus the sysexits-style tiers the
+/// session-layer faces (#2578+) reserve.
 mod exit {
     pub const CLEAN: u8 = 0;
     pub const FATAL_INFOS: u8 = 1;
@@ -92,14 +98,37 @@ mod exit {
     pub const ERRORS: u8 = 3;
     pub const INTERNAL_ERROR: u8 = 4;
     pub const USAGE: u8 = 64;
+    /// EX_DATAERR — a request payload the consumer could not parse
+    /// (reserved for the session/events protocol faces).
+    #[expect(dead_code, reason = "reserved contract tier; the first consumer wires it")]
+    pub const DATA_ERROR: u8 = 65;
+    /// EX_SOFTWARE — an internal defect reported through a protocol
+    /// channel (the one-shot faces keep exit 4).
+    pub const SOFTWARE: u8 = 70;
+    /// The resident session is unavailable and could not be started
+    /// (the standalone fallback refused — the session-layer faces).
+    #[expect(dead_code, reason = "reserved contract tier; the first consumer wires it")]
+    pub const SESSION: u8 = 79;
+}
+
+/// Whether stdout is not a terminal: the machine-JSONL default. An
+/// explicit `--format` always wins (the flags are `Option`; `None` means
+/// "resolve by terminal shape") — a piped `--format=machine` stays
+/// machine, so deterministic pipelines never see a flip.
+fn non_tty_stdout() -> bool {
+    !io::stdout().is_terminal()
 }
 
 mod compat;
+mod events;
 mod fix;
+mod mcp;
 mod impact;
 mod index;
+mod packages;
 mod rename;
 mod resolve;
+mod session;
 mod test;
 
 #[global_allocator]
@@ -154,6 +183,18 @@ fn run(args: &[String]) -> u8 {
             command: Some(Command::Index(index_args)),
         }) => index::run_entry(&index_args),
         Ok(Cli {
+            command: Some(Command::Packages(packages_args)),
+        }) => packages::run_entry(&packages_args),
+        Ok(Cli {
+            command: Some(Command::Session(session_args)),
+        }) => session::run_entry(&session_args),
+        Ok(Cli {
+            command: Some(Command::Events(events_args)),
+        }) => events::run_entry(&events_args),
+        Ok(Cli {
+            command: Some(Command::Mcp(mcp_args)),
+        }) => mcp::run_entry(&mcp_args),
+        Ok(Cli {
             command: Some(Command::Rename(rename_args)),
         }) => rename::run_entry(&rename_args),
         Ok(Cli {
@@ -196,16 +237,21 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Analyze a package directory through the full engine: scan, parse,
-    /// resolution, and the semantic/flow/lint diagnostic tiers.
+    /// resolution, and the semantic/flow/lint diagnostic tiers. With
+    /// `--fast`, scan + parse only (the parser-tier pass, no engine).
     Analyze(AnalyzeArgs),
-    /// Scan + parse only (the M0 differential face).
+    /// Scan + parse only (the M0 differential face) — the hidden spelling
+    /// of `analyze --fast`, kept for compat.
+    #[command(hide = true)]
     Check(CheckArgs),
     /// Assess the workspace under several SDK roots — a per-axis ✓/✗
-    /// compatibility matrix. `compat` stays as a hidden alias.
-    #[command(alias = "compat")]
+    /// compatibility matrix. `compatibility` stays as a hidden alias.
+    #[command(name = "compat", alias = "compatibility")]
     Compatibility(compat::CompatArgs),
     /// Serve the RPC daemon over stdin/stdout (one client; overlay edits +
-    /// full diagnostic pushes).
+    /// full diagnostic pushes). Hidden — a protocol face; the resident
+    /// session layer supersedes it for interactive use.
+    #[command(hide = true)]
     Daemon(DaemonArgs),
     /// Assemble the one-stop AI report for one symbol over the
     /// analyzed workspace.
@@ -214,11 +260,32 @@ enum Command {
     /// outputs them.
     Fix(fix::FixArgs),
     /// Query the plugin hosts' assists for one file location;
-    /// report-only.
+    /// report-only. Hidden — the assists ride the `fix` family; the
+    /// one-shot verb stays for scripted callers.
+    #[command(hide = true)]
     Assists(fix::AssistsArgs),
     /// Build the symbol index over the analyzed workspace and report what
-    /// it built.
+    /// it built. Hidden — an internal maintenance face.
+    #[command(hide = true)]
     Index(index::IndexArgs),
+    /// List the work points of the enclosing universe: every package
+    /// root (workspace roots, members, independent packages, crossing
+    /// path dependencies), resolved state, and the boundaries the scan
+    /// pruned — the navigation face for multi-package trees.
+    Packages(packages::PackagesArgs),
+    /// Manage the resident analysis session: `start` elects or attaches
+    /// the worktree's long-lived engine server, `status` lists the
+    /// user's live sessions, `stop` ends one. Output is JSON lines on
+    /// every face — the management channel is a machine channel.
+    Session(session::SessionArgs),
+    /// Read a session's events, cursor-paginated: the event log
+    /// (`session` handle) or the cold-analysis progress snapshot
+    /// (`progress` handle — files scanned, current package).
+    Events(events::EventsArgs),
+    /// Serve the MCP stdio face: every tool mirrors a CLI verb and
+    /// converges on the worktree's resident session — one engine for
+    /// CLI, events, and MCP clients alike.
+    Mcp(mcp::McpArgs),
     /// Assess what a change to one file would affect.
     Impact(impact::ImpactArgs),
     /// Query the analyzed workspace's symbol index.
@@ -234,11 +301,13 @@ enum Command {
     Test(test::TestArgs),
     /// Resolve the symbol under one `PATH:LINE:COL` cursor over the
     /// analyzed workspace — the daemon's `dartq/resolveAt` answer,
-    /// one-shot.
+    /// one-shot. `resolve-at` stays as a hidden alias.
+    #[command(name = "resolve", alias = "resolve-at")]
     ResolveAt(resolve::PositionArgs),
     /// Answer the visible-name candidates at one `PATH:LINE:COL` cursor
     /// over the analyzed workspace — the daemon's `dartq/completion`
-    /// answer, one-shot.
+    /// answer, one-shot. `completion` stays as a hidden alias.
+    #[command(name = "complete", alias = "completion")]
     Completion(resolve::PositionArgs),
     /// Print the version.
     Version,
@@ -312,8 +381,15 @@ struct AnalyzeArgs {
     /// directory (the oracle's `Directory.current` fallback).
     #[arg(default_value = ".")]
     targets: Vec<PathBuf>,
-    #[arg(long, value_enum, default_value_t = AnalyzeFormat::Default)]
-    format: AnalyzeFormat,
+    /// Output format; absent falls to the terminal's shape — human on a
+    /// TTY, the machine JSON envelope piped (the AI-first default: zero
+    /// prose for programmatic consumers).
+    #[arg(long, value_enum)]
+    format: Option<AnalyzeFormat>,
+    /// Scan + parse only (the `check` pipeline): parser-tier diagnostics
+    /// without the engine — the fast pass for pure-syntax sweeps.
+    #[arg(long)]
+    fast: bool,
     /// Machine-row volume (`-v`/`--verbosity concise|default|verbose`; the
     /// token-cost sweep's tier axis): `concise` keeps the identifying
     /// severity/type/code + span prefix but drops the message field,
@@ -470,7 +546,7 @@ enum AnalyzeFormat {
 /// conflict with. The `-v` abbreviation upstream is not taken here — it
 /// stays dartq's `--verbosity` short (the `-v`/`--verbose` collision is a
 /// deferred compat-policy decision).
-#[derive(Args, Default)]
+#[derive(Args, Default, Clone, Copy)]
 #[expect(clippy::struct_excessive_bools)] // the bools are independent clap flags; an enum decomposition would obscure the mapping
 struct DartdevGlobals {
     /// Upstream's global verbose logger (declared with the `-v`
@@ -640,6 +716,38 @@ impl Verbosity {
     }
 }
 
+impl AnalyzeArgs {
+    /// The output format: an explicit `--format` wins; absent falls to
+    /// the terminal's shape — the human default on a TTY, the machine
+    /// JSON envelope piped.
+    fn effective_format(&self) -> AnalyzeFormat {
+        self.format.unwrap_or(if non_tty_stdout() {
+            AnalyzeFormat::Json
+        } else {
+            AnalyzeFormat::Default
+        })
+    }
+}
+
+/// The `analyze --fast` face's [`CheckArgs`]: the check pipeline over the
+/// analyze targets, the JSON envelope where explicitly asked (the check
+/// face has no human renderer — a piped default stays machine rows).
+fn check_from_analyze(args: &AnalyzeArgs) -> CheckArgs {
+    CheckArgs {
+        format: match args.effective_format() {
+            AnalyzeFormat::Json => CheckFormat::Json,
+            _ => CheckFormat::Machine,
+        },
+        verbosity: args.verbosity,
+        metrics_json: args.metrics_json.clone(),
+        fatal_warnings: args.fatal_warnings,
+        no_fatal_warnings: args.no_fatal_warnings,
+        fatal_infos: args.fatal_infos,
+        dartdev_globals: args.dartdev_globals,
+        paths: args.targets.clone(),
+    }
+}
+
 #[derive(Args)]
 struct QueryArgs {
     #[command(subcommand)]
@@ -705,8 +813,10 @@ struct SymbolArgs {
     /// `.dart_tool/package_config.json`; defaults to the current directory.
     #[arg(default_value = ".")]
     dir: PathBuf,
-    #[arg(long, value_enum, default_value_t = QueryFormat::Machine)]
-    format: QueryFormat,
+    /// Output format; absent falls to the terminal's shape — machine rows
+    /// on a TTY, JSON lines piped.
+    #[arg(long, value_enum)]
+    format: Option<QueryFormat>,
     /// Report detail tier (the schema's verbosity table; `compact` by
     /// default). `minimal` keeps the red-line locators: the JSON rows drop
     /// the convenience spellings and the element-face columns, the machine
@@ -727,6 +837,18 @@ enum QueryFormat {
     Machine,
     /// Single-line JSON object.
     Json,
+}
+
+impl SymbolArgs {
+    /// The output format: an explicit `--format` wins; absent falls to
+    /// the terminal's shape — machine rows on a TTY, JSON lines piped.
+    fn effective_format(&self) -> QueryFormat {
+        self.format.unwrap_or(if non_tty_stdout() {
+            QueryFormat::Json
+        } else {
+            QueryFormat::Machine
+        })
+    }
 }
 
 /// Severity arithmetic: the highest fatal tier present.
@@ -862,6 +984,11 @@ impl RunMetrics {
 /// panic anywhere aborts with exit 4 and stdout kept empty, because
 /// [`analyze_run`] writes only after analysis fully succeeded.
 fn analyze(args: &AnalyzeArgs) -> u8 {
+    // `--fast` is the check pipeline under the analyze spelling: the
+    // same scan + parse tiers, the same crash discipline.
+    if args.fast {
+        return check(&check_from_analyze(args));
+    }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         analyze_run(args, &mut BufWriter::new(io::stdout().lock()))
     }));
@@ -1209,7 +1336,7 @@ fn analyze_finish(
         eprintln!("{line}");
     }
 
-    let written = match args.format {
+    let written = match args.effective_format() {
         // The advisories ride stderr on the machine face: the oracle's
         // machine stream carries diagnostics only, so each row prints through
         // the same shared writer onto the human stream while stdout keeps
@@ -1474,7 +1601,7 @@ fn daemon(args: &DaemonArgs) -> u8 {
         // shared-store accessors.
         dartq_daemon::Session::with_runtime(config, extras, None, stale_advisory, runtime)
     };
-    let session = match assembled {
+    let mut session = match assembled {
         Ok(session) => session,
         Err(error) => {
             eprintln!("dartq: internal error: daemon session unusable: {error}");
@@ -1491,7 +1618,7 @@ fn daemon(args: &DaemonArgs) -> u8 {
     let watch = args
         .watch
         .then(|| dartq_daemon::WatchOptions::new(args.dir.clone()));
-    match dartq_daemon::run(stdin, stdout, session, watch) {
+    match dartq_daemon::run(stdin, stdout, &mut session, watch) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("dartq: internal error: daemon transport failed: {error}");
@@ -1744,7 +1871,7 @@ fn query_callers_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
         out,
         &run,
         &args.name,
-        args.format,
+        args.effective_format(),
         args.verbosity.into_commands(),
     );
     if let Err(error) = written.and_then(|()| out.flush()) {
@@ -1790,7 +1917,7 @@ fn query_implementations_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
         out,
         &run,
         &args.name,
-        args.format,
+        args.effective_format(),
         args.verbosity.into_commands(),
     );
     if let Err(error) = written.and_then(|()| out.flush()) {
@@ -1836,7 +1963,7 @@ fn query_dependencies_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
         out,
         &run,
         &args.name,
-        args.format,
+        args.effective_format(),
         args.verbosity.into_commands(),
     );
     if let Err(error) = written.and_then(|()| out.flush()) {
@@ -1964,7 +2091,7 @@ fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
         out,
         &run,
         &args.name,
-        args.format,
+        args.effective_format(),
         args.verbosity.into_commands(),
     );
     if let Err(error) = written.and_then(|()| out.flush()) {
@@ -2328,6 +2455,57 @@ mod tests {
             Ok(Some(Command::Check(check))) => check,
             _ => panic!("expected check command"),
         }
+    }
+
+    /// The converged surface: every hidden alias still parses (compat,
+    /// check, index, assists, daemon, compatibility, resolve-at,
+    /// completion), and the new spellings (`compat`, `resolve`,
+    /// `complete`) parse under their primary names.
+    #[test]
+    fn converged_verbs_and_aliases_all_parse() {
+        for args in [
+            vec!["check"],
+            vec!["index"],
+            vec!["assists", "/tmp/a.dart"],
+            vec!["daemon", "/tmp"],
+            vec!["compat", "/tmp/a.dart"],
+            vec!["compatibility", "/tmp/a.dart"],
+            vec!["resolve", "/tmp/a.dart:1:1"],
+            vec!["resolve-at", "/tmp/a.dart:1:1"],
+            vec!["complete", "/tmp/a.dart:1:1"],
+            vec!["completion", "/tmp/a.dart:1:1"],
+            vec!["packages"],
+            vec!["analyze", "--fast"],
+        ] {
+            assert!(
+                parse_args_of(&args).expect("parse").is_some(),
+                "`{}` stays reachable",
+                args.join(" ")
+            );
+        }
+    }
+
+    /// `analyze --fast` is the check pipeline: the delegation maps the
+    /// analyze flags onto the check face one-to-one (JSON stays JSON, the
+    /// human default lands on the machine face — check has no human
+    /// renderer).
+    #[test]
+    fn analyze_fast_maps_onto_the_check_pipeline() {
+        let analyze_args = |args: &[&str]| match parse_args_of(args) {
+            Ok(Some(Command::Analyze(args))) => args,
+            _ => panic!("expected analyze command"),
+        };
+        let fast = analyze_args(&["analyze", "--fast", "/pkg"]);
+        assert!(fast.fast);
+        let mapped = check_from_analyze(&fast);
+        // Tests run with captured stdout (not a terminal): the absent
+        // --format resolves to the machine JSON envelope.
+        assert!(matches!(mapped.format, CheckFormat::Json));
+        assert_eq!(mapped.paths, vec![PathBuf::from("/pkg")]);
+        assert!(!mapped.no_fatal_warnings, "fatal warnings stay on");
+
+        let json = check_from_analyze(&analyze_args(&["analyze", "--fast", "--format=json"]));
+        assert!(matches!(json.format, CheckFormat::Json));
     }
 
     #[test]
@@ -2927,8 +3105,8 @@ mod tests {
             panic!("expected analyze command")
         };
         assert!(
-            matches!(args.format, AnalyzeFormat::Default),
-            "the oracle default-format default"
+            args.format.is_none(),
+            "absent --format resolves by terminal shape (human on a TTY, JSON piped)"
         );
         assert!(
             matches!(args.verbosity, DiagnosticVerbosity::Default),
@@ -2980,7 +3158,7 @@ mod tests {
         let Command::Analyze(args) = parsed else {
             panic!("expected analyze command")
         };
-        assert!(matches!(args.format, AnalyzeFormat::Default));
+        assert!(matches!(args.format, Some(AnalyzeFormat::Default)));
         assert_eq!(args.metrics_json, Some(PathBuf::from("/tmp/m.json")));
         assert_eq!(args.sdk_path, Some(PathBuf::from("/sdk")));
         assert_eq!(
@@ -3017,7 +3195,7 @@ mod tests {
         let Command::Analyze(args) = parsed else {
             panic!("expected analyze command")
         };
-        assert!(matches!(args.format, AnalyzeFormat::Machine));
+        assert!(matches!(args.format, Some(AnalyzeFormat::Machine)));
         assert_eq!(args.sdk_path, Some(PathBuf::from("/sdk")));
 
         let parsed = parse_args_of(&["analyze", "--format=json", "/pkg"])
@@ -3027,7 +3205,7 @@ mod tests {
             panic!("expected analyze command")
         };
         assert!(
-            matches!(args.format, AnalyzeFormat::Json),
+            matches!(args.format, Some(AnalyzeFormat::Json)),
             "the json spelling parses"
         );
 
@@ -3163,7 +3341,8 @@ mod tests {
     ) -> AnalyzeArgs {
         AnalyzeArgs {
             targets: vec![root.to_path_buf()],
-            format,
+            format: Some(format),
+            fast: false,
             verbosity: DiagnosticVerbosity::Default,
             metrics_json,
             overlays: Vec::new(),
@@ -4043,7 +4222,10 @@ mod tests {
         };
         assert_eq!(symbol.name, "Foo");
         assert_eq!(symbol.dir, PathBuf::from("."), "default target cwd");
-        assert!(matches!(symbol.format, QueryFormat::Machine));
+        assert!(
+            symbol.format.is_none(),
+            "absent --format resolves by terminal shape"
+        );
         assert!(
             matches!(symbol.verbosity, Verbosity::Compact),
             "compact default"
@@ -4067,7 +4249,7 @@ mod tests {
         let QueryFace::Symbol(symbol) = args.face else {
             panic!("expected symbol face")
         };
-        assert!(matches!(symbol.format, QueryFormat::Json));
+        assert!(matches!(symbol.format, Some(QueryFormat::Json)));
         assert_eq!(symbol.sdk, Some(PathBuf::from("/sdk")));
         assert_eq!(symbol.dir, PathBuf::from("/pkg"));
         assert_eq!(symbol.name, "Foo");
@@ -4215,7 +4397,7 @@ mod tests {
         SymbolArgs {
             name: name.to_string(),
             dir: root.to_path_buf(),
-            format,
+            format: Some(format),
             verbosity: Verbosity::Compact,
             sdk: Some(root.join("sdk")),
         }

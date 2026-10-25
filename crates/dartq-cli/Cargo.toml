@@ -22,6 +22,7 @@ clap = { workspace = true }
 mimalloc = { workspace = true }
 dartq-commands = { workspace = true }
 dartq-daemon = { workspace = true }
+dartq-session = { workspace = true }
 dartq-diagnostics = { workspace = true }
 dartq-engine = { workspace = true }
 # Pub-native plugin discovery (the fix/assists launcher) resolves declared

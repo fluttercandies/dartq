@@ -47,8 +47,10 @@ pub(crate) struct FixArgs {
     /// Only output the patches; never write files.
     #[arg(long)]
     pub(crate) dry_run: bool,
-    #[arg(long, value_enum, default_value_t = FixFormat::Default)]
-    pub(crate) format: FixFormat,
+    /// Output format; absent falls to the terminal's shape — the human
+    /// listing on a TTY, machine JSON documents piped.
+    #[arg(long, value_enum)]
+    pub(crate) format: Option<FixFormat>,
     /// Apply only the fixes whose diagnostic code matches one of these
     /// (comma-separated; case-insensitive exact match — the upstream
     /// `dart fix --code` selection).
@@ -69,8 +71,10 @@ pub(crate) struct AssistsArgs {
     /// The UTF-16 length of the target span (default: zero).
     #[arg(long, default_value_t = 0)]
     pub(crate) length: u64,
-    #[arg(long, value_enum, default_value_t = FixFormat::Default)]
-    pub(crate) format: FixFormat,
+    /// Output format; absent falls to the terminal's shape — the human
+    /// listing on a TTY, machine JSON documents piped.
+    #[arg(long, value_enum)]
+    pub(crate) format: Option<FixFormat>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -81,6 +85,17 @@ pub(crate) enum FixFormat {
     /// each row's `outcome` (`applied`/`stale`) and the document `summary`
     /// (a dry run emits bare proposals).
     Machine,
+}
+
+/// The resolved output format: an explicit `--format` wins; absent falls
+/// to the terminal's shape — the human listing on a TTY, machine JSON
+/// piped.
+fn effective_format(format: Option<FixFormat>) -> FixFormat {
+    format.unwrap_or(if crate::non_tty_stdout() {
+        FixFormat::Machine
+    } else {
+        FixFormat::Default
+    })
 }
 
 /// Machine format: one single-line patch document per file with rows —
@@ -334,7 +349,7 @@ fn run(args: &FixArgs, out: &mut impl Write) -> u8 {
     report_errors(&mut hosts);
     hosts.shutdown();
     let per_file = fix::select_by_codes(per_file, &args.code);
-    apply_and_report(&per_file, args.dry_run, args.format, out)
+    apply_and_report(&per_file, args.dry_run, effective_format(args.format), out)
 }
 
 /// One assists run: the plugin hosts' proposals for one file, anchored
@@ -364,7 +379,7 @@ fn run_assists(args: &AssistsArgs, out: &mut impl Write) -> u8 {
     report_errors(&mut hosts);
     hosts.shutdown();
 
-    let written = match args.format {
+    let written = match effective_format(args.format) {
         FixFormat::Machine => {
             writeln!(out, "{}", fix::assists_json(&answer, Verbosity::Compact))
         }
@@ -557,12 +572,12 @@ mod tests {
 
         let args = parse(&["fix"]);
         assert!(!args.dry_run, "apply is the default");
-        assert!(matches!(args.format, FixFormat::Default));
+        assert!(args.format.is_none(), "absent --format resolves by terminal shape");
         assert_eq!(args.paths, vec![PathBuf::from(".")], "default target cwd");
 
         let args = parse(&["fix", "--dry-run", "--format=machine", "/tmp/w"]);
         assert!(args.dry_run);
-        assert!(matches!(args.format, FixFormat::Machine));
+        assert!(matches!(args.format, Some(FixFormat::Machine)));
         assert_eq!(args.paths, vec![PathBuf::from("/tmp/w")]);
 
         for rejected in [
@@ -583,12 +598,12 @@ mod tests {
         let target = root.to_str().expect("utf-8 temp path");
 
         let mut out = Vec::new();
-        let args = parse(&["fix", "--dry-run", target]);
+        let args = parse(&["fix", "--dry-run", "--format=default", target]);
         assert_eq!(run(&args, &mut out), exit::CLEAN);
         assert_eq!(String::from_utf8(out).expect("utf-8"), "No fixes found.\n");
 
         let mut out = Vec::new();
-        let args = parse(&["fix", "--format=machine", target]);
+        let args = parse(&["fix", "--format=machine", "--dry-run", target]);
         assert_eq!(run(&args, &mut out), exit::CLEAN);
         assert!(out.is_empty(), "machine face prints nothing without fixes");
 
@@ -899,7 +914,7 @@ mod tests {
         let args = parse(&["assists", path.to_str().expect("utf-8")]);
         assert_eq!(args.offset, 0, "assists default to the file start");
         assert_eq!(args.length, 0);
-        assert!(matches!(args.format, FixFormat::Default));
+        assert!(args.format.is_none());
 
         let args = parse(&[
             "assists",
@@ -912,7 +927,7 @@ mod tests {
         ]);
         assert_eq!(args.offset, 19);
         assert_eq!(args.length, 4);
-        assert!(matches!(args.format, FixFormat::Machine));
+        assert!(matches!(args.format, Some(FixFormat::Machine)));
 
         let mut out = Vec::new();
         assert_eq!(run_assists(&args, &mut out), exit::CLEAN);
@@ -923,7 +938,7 @@ mod tests {
         );
 
         let mut out = Vec::new();
-        let args = parse(&["assists", path.to_str().expect("utf-8")]);
+        let args = parse(&["assists", "--format=default", path.to_str().expect("utf-8")]);
         assert_eq!(run_assists(&args, &mut out), exit::CLEAN);
         // Offset 0 sits at the body's first token end, so the builtin
         // async-body assist proposes (the official guard declines only

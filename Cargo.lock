@@ -296,6 +296,7 @@ dependencies = [
  "dartq-engine",
  "dartq-pub",
  "dartq-sdk",
+ "dartq-session",
  "dartq-source",
  "dartq-test",
  "filetime",
@@ -515,6 +516,8 @@ dependencies = [
  "dartq-language",
  "dartq-source",
  "filetime",
+ "rayon",
+ "rustc-hash",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -579,6 +582,19 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "dartq-session"
+version = "1.0.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

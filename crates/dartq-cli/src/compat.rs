@@ -1,4 +1,4 @@
-//! `dartq compatibility` — the compatibility face: the same workspace
+//! `dartq compat` (alias `compatibility`) — the compat face: the same workspace
 //! analyzed under several SDK roots, aggregated into a per-axis ✓/✗ matrix.
 //!
 //! The matrix mechanics (one axis = one SDK context, sequential axes over

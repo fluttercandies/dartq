@@ -5,7 +5,10 @@
 //!
 //! - the **toolchain**: the runner identity (dart/flutter binary and its
 //!   SDK `version`/`revision` files), the passthrough arguments, and the
-//!   process environment;
+//!   environment's toolchain half (`DART_*`/`FLUTTER_*`); the variables a
+//!   suite's closure reads by literal key join per-suite below, and an
+//!   unnamable environment read (`Platform.environment` iterated, aliased,
+//!   computed-keyed) refuses caching for that suite;
 //! - the **package resolution**: `pubspec.yaml`, `pubspec.lock`,
 //!   `.dart_tool/package_config.json`, and `dart_test.yaml`;
 //! - the suite's **import closure**: every Dart file transitively reached
@@ -84,7 +87,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Cache layout version: bump on any key or entry format change.
-const FORMAT: &str = "dartq-test-cache-v9";
+const FORMAT: &str = "dartq-test-cache-v10";
 
 /// Stored outcomes kept in the shared store; the least recently used are
 /// pruned past it. Every revision of every suite of every checkout is one
@@ -434,6 +437,24 @@ impl Cache {
                 let SuiteInputs { mut ids, pinned } = inputs?;
                 ids.sort_unstable_by_key(|&id| rank[id as usize]);
                 ids.dedup();
+                // The environment's suite half: the names this suite's
+                // closure reads by literal key, each keyed with its
+                // current value. A closure whose environment access the
+                // extractor cannot name is never cached — any variable
+                // could reach a verdict.
+                let mut env_names: Vec<&str> = Vec::new();
+                let mut env_opaque = false;
+                for &id in &ids {
+                    if let Some(file_facts) = dense.env_facts(id) {
+                        env_opaque |= file_facts.env_opaque;
+                        env_names.extend(file_facts.env_reads.iter().map(String::as_str));
+                    }
+                }
+                if env_opaque {
+                    return None;
+                }
+                env_names.sort_unstable();
+                env_names.dedup();
                 let mut hasher = blake3::Hasher::new();
                 hasher.update(base.as_bytes());
                 hasher.update(&[u8::from(pinned)]);
@@ -444,6 +465,18 @@ impl Cache {
                 for id in ids {
                     if let Some(leaf) = &leaves[id as usize] {
                         hasher.update(leaf);
+                    }
+                }
+                hasher.update(&(env_names.len() as u64).to_le_bytes());
+                for name in env_names {
+                    hasher.update(&(name.len() as u64).to_le_bytes());
+                    hasher.update(name.as_bytes());
+                    let value = std::env::var_os(name);
+                    hasher.update(&[u8::from(value.is_some())]);
+                    if let Some(value) = value {
+                        let bytes = value.as_encoded_bytes();
+                        hasher.update(&(bytes.len() as u64).to_le_bytes());
+                        hasher.update(bytes);
                     }
                 }
                 Some(hasher.finalize().to_hex().to_string())
@@ -550,12 +583,20 @@ impl Cache {
             hasher.update(&(arg.len() as u64).to_le_bytes());
             hasher.update(arg.as_bytes());
         }
+        // The environment's toolchain half: `DART_*`/`FLUTTER_*` variables
+        // change how the runner itself behaves (the VM's and flutter
+        // tool's knobs), so they stay keyed for every suite. Everything
+        // else joins only through the names a suite's closure reads
+        // (per-suite, in [`Self::keys`]) — an IDE terminal's ambient
+        // variables (`TERM_PROGRAM`, `VSCODE_*`, …) no longer invalidate
+        // replay.
         let ignored = std::env::var(IGNORE_ENV_VAR).unwrap_or_default();
         let ignored: Vec<&str> = ignored.split(',').map(str::trim).filter(|name| !name.is_empty()).collect();
         let mut env: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os()
             .filter(|(name, _)| {
                 let name = name.to_string_lossy();
-                !VOLATILE_ENV.contains(&name.as_ref())
+                (name.starts_with("DART_") || name.starts_with("FLUTTER_"))
+                    && !VOLATILE_ENV.contains(&name.as_ref())
                     && !ignored.iter().any(|pattern| match pattern.strip_suffix('*') {
                         Some(prefix) => name.starts_with(prefix),
                         None => name == *pattern,
@@ -885,6 +926,14 @@ impl Dense {
             in_toolchain,
             base_inputs,
         }
+    }
+
+    /// The Dart facts of the interned path `id`, when it is a graph node
+    /// whose facts were read (`None` for package inputs, absent candidates,
+    /// and untrusted headers).
+    fn env_facts(&self, id: u32) -> Option<&FileFacts> {
+        let node = self.node_of.get(id as usize).copied().filter(|&n| n != u32::MAX)?;
+        self.facts[node as usize].as_deref()
     }
 
     /// The inputs of one suite, or `None` when its import closure holds an
@@ -1597,5 +1646,53 @@ mod tests {
         std::fs::create_dir_all(store.join("ab")).expect("dir");
         std::fs::write(store.join("ab/abcd.json"), br#"{"format":"dartq-test-cache-v0","events":[]}"#).expect("write");
         assert!(Cache::with_store(&root, store).lookup("abcd").is_none(), "a foreign format never replays");
+    }
+
+    /// The environment enters a key only through the names the suite's
+    /// closure reads: a read variable's flip re-keys its suite alone, an
+    /// ambient terminal variable's flip re-keys nothing, and an unnamable
+    /// read refuses caching. The probe names deliberately avoid the
+    /// `DART_`/`FLUTTER_` prefixes — a toolchain-half probe would flip
+    /// every parallel test's base key mid-run.
+    #[test]
+    fn environment_joins_keys_through_read_names_only() {
+        let (tmp, root) = fixture();
+        let store = tmp.path().join("store");
+        let bin = root.join("pubspec.yaml");
+        std::fs::write(
+            root.join("test/env_test.dart"),
+            "void main() { print(Platform.environment['dartq_probe_read']); }\n",
+        )
+        .expect("write");
+        std::fs::write(
+            root.join("test/opaque_test.dart"),
+            "void main() { for (final e in Platform.environment.entries) {} }\n",
+        )
+        .expect("write");
+        let suites = ["test/a_test.dart", "test/env_test.dart", "test/opaque_test.dart"]
+            .map(|rel| root.join(rel))
+            .to_vec();
+        let mut cache = Cache::with_store(&root, store);
+        unsafe {
+            std::env::set_var("dartq_probe_read", "one");
+            std::env::set_var("dartq_probe_ambient", "x");
+        }
+        let first = cache.keys(&suites, runner(&bin)).expect("keys");
+        assert!(first[0].is_some() && first[1].is_some());
+        assert!(first[2].is_none(), "an unnamable environment read is never cached");
+
+        // An ambient variable no closure reads changes nothing.
+        unsafe { std::env::set_var("dartq_probe_ambient", "y"); }
+        assert_eq!(cache.rekey(&suites, runner(&bin)).expect("keys"), first);
+
+        // The read variable's flip re-keys only its reader.
+        unsafe { std::env::set_var("dartq_probe_read", "two"); }
+        let second = cache.rekey(&suites, runner(&bin)).expect("keys");
+        assert_eq!(second[0], first[0], "a suite without the read is untouched");
+        assert_ne!(second[1], first[1], "the reader re-keys");
+        unsafe {
+            std::env::remove_var("dartq_probe_read");
+            std::env::remove_var("dartq_probe_ambient");
+        }
     }
 }

@@ -54,6 +54,29 @@ pub struct DartqConfig {
     pub memory: Option<MemoryDefaults>,
     /// The cache defaults.
     pub cache: Option<CacheDefaults>,
+    /// The package-discovery policy (the `packages` face).
+    pub packages: Option<PackagesConfig>,
+}
+
+/// The `packages:` section — how `dartq packages` (and every
+/// multi-package face) sees the tree. Globs are `package:glob` relative
+/// POSIX paths against the config root; `exclude` prunes fixture trees
+/// and vendored noise from the walk (a pruned tree that still contains a
+/// pubspec is registered as a boundary, never silently dropped);
+/// `default` names the package set bare invocations operate on when the
+/// tree holds more than one work point.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PackagesConfig {
+    /// Only matching package directories are listed.
+    #[serde(default)]
+    pub include: Vec<String>,
+    /// Matching trees are pruned from the walk.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// The default package set (relative directories) for bare
+    /// multi-package invocations.
+    #[serde(default)]
+    pub default: Vec<String>,
 }
 
 /// One named SDK context.
@@ -316,6 +339,7 @@ fn parse(text: &str) -> Result<DartqConfig, ConfigError> {
         generated: raw.generated,
         memory: raw.memory,
         cache: raw.cache,
+        packages: raw.packages,
     })
 }
 
@@ -327,6 +351,7 @@ struct RawConfig {
     generated: Option<GeneratedPolicy>,
     memory: Option<MemoryDefaults>,
     cache: Option<CacheDefaults>,
+    packages: Option<PackagesConfig>,
 }
 
 #[derive(Deserialize)]

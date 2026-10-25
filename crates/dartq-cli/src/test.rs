@@ -1289,7 +1289,19 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     if grouped.len() > 1 {
         let out_dir = root.join(".dart_tool").join("dartq").join("group");
         let files: Vec<PathBuf> = grouped.iter().map(|&index| plan.suites[index].abs.clone()).collect();
-        let compiled = dartq_test::group::compile(&plan.dart, root, &files, &out_dir, idle_timeout())?;
+        // The degradation ladder's write leg: a read-only checkout (or
+        // any unwritable `.dart_tool`) fails the staging writes here —
+        // every suite falls back to the stock runner, with the reason
+        // on stderr so the slowdown is never a mystery.
+        let compiled = match dartq_test::group::compile(&plan.dart, root, &files, &out_dir, idle_timeout()) {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                eprintln!(
+                    "warning: grouped compile unavailable ({error}); running every suite with the stock runner — this is slower"
+                );
+                dartq_test::group::Compiled { runner: None, excluded: Vec::new() }
+            }
+        };
         match compiled.runner {
             None => stock.extend(&grouped),
             Some(program) => {

@@ -138,7 +138,7 @@ fn install_panic_hook() {
 pub fn run<R, W>(
     input: R,
     output: W,
-    mut session: Session,
+    mut session: &mut Session,
     watch: Option<WatchOptions>,
 ) -> io::Result<u8>
 where
@@ -1106,7 +1106,7 @@ mod tests {
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
         })
         .expect("store opens on a temp root");
-        let session = Session::with_store(workspace.engine_config(), store, None).expect("session");
+        let mut session = Session::with_store(workspace.engine_config(), store, None).expect("session");
         let (client, receiver) = mpsc::channel::<Vec<u8>>();
         let output = TestOutput::default();
         let server_output = output.clone();
@@ -1118,7 +1118,7 @@ mod tests {
                     pending: Vec::new(),
                 }),
                 server_output,
-                session,
+                &mut { session },
                 Some(WatchOptions {
                     root,
                     poll_interval: Duration::from_millis(10),
@@ -1204,7 +1204,7 @@ mod tests {
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
         })
         .expect("store opens on a temp root");
-        let session = Session::with_store(workspace.engine_config(), store, None).expect("session");
+        let mut session = Session::with_store(workspace.engine_config(), store, None).expect("session");
         let (client, receiver) = mpsc::channel::<Vec<u8>>();
         let output = TestOutput::default();
         let server_output = output.clone();
@@ -1280,7 +1280,7 @@ mod tests {
                 pending: Vec::new(),
             }),
             server_output,
-            session,
+            &mut session,
             None,
         )
         .expect("transport does not fail on memory pipes");

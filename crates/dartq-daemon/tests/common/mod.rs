@@ -278,7 +278,7 @@ fn start(session: Session) -> Harness {
         let output = output.clone();
         thread::Builder::new()
             .name("dartq-daemon-test-server".into())
-            .spawn(move || run(std::io::BufReader::new(reader), output, session, None))
+            .spawn(move || run(std::io::BufReader::new(reader), output, &mut { session }, None))
             .expect("server thread spawns")
     };
     let mut harness = Harness {

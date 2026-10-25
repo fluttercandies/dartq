@@ -1,4 +1,4 @@
-//! `dartq resolve-at` / `dartq completion` — the position faces' one-shot
+//! `dartq resolve` / `dartq complete` — the position faces' one-shot (the
 //! CLI spelling: what the analyzed workspace's maintained index holds under
 //! one cursor, and the visible-name set at it, without a resident session.
 //!

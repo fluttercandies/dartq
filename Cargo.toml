@@ -27,6 +27,7 @@ members = [
     "crates/dartq-cli",
     "crates/dartq-debug",
     "crates/dartq-schema",
+    "crates/dartq-session",
     "crates/dartq-test",
     "tests/harness",
     "tools/bench-corpus-gen",
@@ -95,6 +96,7 @@ dartq-scanner = { path = "crates/dartq-scanner", version = "1.0.0" }
 dartq-schema = { path = "crates/dartq-schema", version = "1.0.0" }
 dartq-sdk = { path = "crates/dartq-sdk", version = "1.0.0" }
 dartq-semantic = { path = "crates/dartq-semantic", version = "1.0.0" }
+dartq-session = { path = "crates/dartq-session", version = "1.0.0" }
 dartq-snapshot = { path = "crates/dartq-snapshot", version = "1.0.0" }
 dartq-source = { path = "crates/dartq-source", version = "1.0.0" }
 dartq-test = { path = "crates/dartq-test", version = "1.0.0" }

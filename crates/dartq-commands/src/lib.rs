@@ -53,6 +53,7 @@ pub mod index;
 pub mod layout;
 mod lint_names;
 pub mod lints;
+pub mod packages;
 mod pkg_label;
 pub mod plugins;
 pub mod query;

@@ -1762,7 +1762,7 @@ fn watch_refreshes_the_context_on_a_non_dart_change() {
         capacity_bytes: dartq_snapshot::DEFAULT_CAPACITY_BYTES,
     })
     .expect("store opens on a temp root");
-    let session =
+    let mut session =
         dartq_daemon::Session::with_store(workspace.engine_config(), store, None).expect("session");
     let (client, receiver) = std::sync::mpsc::channel::<Vec<u8>>();
     let output = WatchOutput::default();
@@ -1775,7 +1775,7 @@ fn watch_refreshes_the_context_on_a_non_dart_change() {
                 pending: Vec::new(),
             }),
             server_output,
-            session,
+            &mut session,
             Some(dartq_daemon::WatchOptions::new(root)),
         )
     });

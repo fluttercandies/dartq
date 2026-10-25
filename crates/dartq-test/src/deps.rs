@@ -101,6 +101,23 @@ pub struct FileFacts {
     /// written before this fact existed fails to load and is rebuilt,
     /// rather than vouching `false` for files it never examined.)
     pub engine_shared: bool,
+    /// Environment variable names this file reads by literal key:
+    /// `Platform.environment['NAME']` and
+    /// `Platform.environment.containsKey('NAME')`, deduplicated in source
+    /// order. Only these variables' values enter a suite's cache key — a
+    /// terminal's ambient variables no longer invalidate replay. (No serde
+    /// default, like `engine_shared`: a pre-existing stamp index fails to
+    /// load and is rebuilt rather than vouching an empty read set.)
+    pub env_reads: Vec<String>,
+    /// Reads the process environment through a shape the extractor cannot
+    /// name — iterating `Platform.environment`, indexing it with a computed
+    /// key, aliasing the map into a variable. A suite whose closure reaches
+    /// one is never cached: any variable could reach a verdict.
+    ///
+    /// Dot-shorthand `.environment['X']` accesses (Dart 3.10's inferred
+    /// static invocation, no `Platform` receiver spelled) are not tracked;
+    /// a suite relying on one opts out with `// dartq: no-cache`.
+    pub env_opaque: bool,
 }
 
 /// Longest literal still considered a candidate path.
@@ -390,6 +407,9 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
                     continue;
                 }
                 let member = tokens.lexeme(source, index + 2);
+                if (lexeme, member) == ("Platform", "environment") {
+                    read_environment_access(source, tokens, index + 3, out);
+                }
                 out.nondeterministic |= matches!(
                     (lexeme, member),
                     ("DateTime", "now" | "timestamp")
@@ -455,6 +475,60 @@ fn read_runtime_inputs(source: &str, tokens: &TokenTable, out: &mut FileFacts) {
     out.path_literals.dedup();
     out.absolute_paths.sort_unstable();
     out.absolute_paths.dedup();
+    out.env_reads.sort_unstable();
+    out.env_reads.dedup();
+}
+
+/// One `Platform.environment` access at `at` (the token index just past the
+/// `environment` identifier): a literal index or `containsKey` names the
+/// variable read; every other shape — iteration, `.length`, an aliased map,
+/// a computed key — leaves the read unnamable and the file
+/// [`FileFacts::env_opaque`].
+fn read_environment_access(source: &str, tokens: &TokenTable, at: usize, out: &mut FileFacts) {
+    let slice = tokens.as_slice();
+    let kind = |index: usize| slice.get(index).map(|token| token.kind);
+    match kind(at) {
+        // `Platform.environment['NAME' …]`: adjacent string literals
+        // concatenate (`'N' 'AME'`); a literal followed by anything but
+        // `]` is a computed key.
+        Some(TokenKind::OpenSquare) => {
+            if let Some(name) = string_literal_run(source, tokens, at + 1) {
+                if kind(at + 1 + name.1) == Some(TokenKind::CloseSquare) {
+                    out.env_reads.push(name.0);
+                    return;
+                }
+            }
+            out.env_opaque = true;
+        }
+        // `Platform.environment.containsKey('NAME')`.
+        Some(TokenKind::Period)
+            if kind(at + 2) == Some(TokenKind::OpenParen)
+                && tokens.lexeme(source, at + 1) == "containsKey" =>
+        {
+            if let Some(name) = string_literal_run(source, tokens, at + 3)
+                && kind(at + 3 + name.1) == Some(TokenKind::CloseParen)
+            {
+                out.env_reads.push(name.0);
+            } else {
+                out.env_opaque = true;
+            }
+        }
+        _ => out.env_opaque = true,
+    }
+}
+
+/// The concatenation of the string-literal token run starting at `index`
+/// (`'a' 'b'` → `ab`), with the run's token count. `None` when the token
+/// there is not a plain literal (an escape or an interpolation makes the
+/// value unnamable).
+fn string_literal_run(source: &str, tokens: &TokenTable, index: usize) -> Option<(String, usize)> {
+    let mut value = String::new();
+    let mut count = 0;
+    while tokens.as_slice().get(index + count).map(|t| t.kind) == Some(TokenKind::String) {
+        value.push_str(unquote(tokens.lexeme(source, index + count))?);
+        count += 1;
+    }
+    (count > 0).then_some((value, count))
 }
 
 /// How the file imports `package:path`: whose `current` getter (and the
@@ -752,5 +826,41 @@ void main() {
         assert!(!of("// dartq:no-cache\nvoid main() {}").no_cache, "no space after the colon");
         assert!(!of("// dartq: no-cacheable\nvoid main() {}").no_cache, "a longer word");
         assert!(of("/// dartq: no-cache why\nvoid main() {}").no_cache, "extra slashes and a reason");
+    }
+
+    /// Environment reads: literal indexes and `containsKey` name the
+    /// variable; every shape the extractor cannot name — iteration,
+    /// `.length`, an alias, a computed key, a spread, an escaped literal —
+    /// is opaque.
+    #[test]
+    fn environment_reads_are_named_or_opaque() {
+        let named = of(
+            "void main() {\n  print(Platform.environment['HOME']);\n  print(Platform.environment['A' 'B']);\n  if (Platform.environment.containsKey(\"CI\")) {}\n}\n",
+        );
+        assert!(!named.env_opaque);
+        assert_eq!(named.env_reads, ["AB", "CI", "HOME"]);
+
+        for source in [
+            // Iteration, map views, size.
+            "void main() { for (final e in Platform.environment.entries) {} }",
+            "void main() { print(Platform.environment.keys.length); }",
+            // Aliased into a variable, then indexed dynamically.
+            "void main() { final env = Platform.environment; print(env[x]); }",
+            // Computed keys.
+            "void main() { print(Platform.environment['HO' + 'ME']); }",
+            "void main() { print(Platform.environment[name]); }",
+            // An escape cannot be unquoted with certainty.
+            "void main() { print(Platform.environment['HO\\ME']); }",
+            // Passed whole.
+            "void main() { print(Platform.environment); }",
+        ] {
+            let facts = of(source);
+            assert!(facts.env_opaque, "opaque: {source}");
+            assert!(facts.env_reads.is_empty(), "no names: {source}");
+        }
+
+        // A read inside a comment or string is not a read.
+        let none = of("// Platform.environment['HOME']\nvoid main() { const s = 'Platform.environment[\"X\"]'; }");
+        assert!(!none.env_opaque && none.env_reads.is_empty());
     }
 }
