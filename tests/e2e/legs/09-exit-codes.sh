@@ -41,9 +41,10 @@ legs_09_run() {
   assert_eq "$DQ_RC" 3 "errors stay fatal regardless of the warning flags"
   # The syntax-error face without any options file is also tier 3.
   # (Recovery shapes with an unbalanced/missing body delimiter —
-  # `void main( {}`, `void main() {` — currently trip a source-range
-  # panic in recovery and exit 4; tracked as its own defect, the fixture
-  # here uses the missing-token shape that reports cleanly.)
+  # `void main( {}`, `void main() {` — used to trip a source-range
+  # panic in recovery and exit 4; the position conversion is total since
+  # #2589, pinned by dartq-commands' recovery-shape writer test. The
+  # fixture here keeps the missing-token shape that reports cleanly.)
   make_pkg "$base/syn" "rc_syn"
   wf "$base/syn/lib/main.dart" 'int main() => 1 oops;
 '

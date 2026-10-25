@@ -1446,7 +1446,9 @@ fn oracle_cmp(a: &Diagnostic, b: &Diagnostic, layout: &EngineLayout<'_>) -> Orde
 
 #[cfg(test)]
 mod tests {
-    use dartq_diagnostics::{CodeInfo, DiagnosticType, FileId, Severity};
+    use dartq_diagnostics::{
+        AnalysisOutput, CodeInfo, DiagnosticType, FileId, Severity, write_json,
+    };
     use dartq_engine::Engine;
     use dartq_pub::PackageConfig;
     use dartq_source::SourceRange;
@@ -1509,6 +1511,55 @@ mod tests {
         assert_eq!(messages, ["alpha", "beta", "gamma", "delta", "omega"]);
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// #2589: recovery-shaped sources must run through the analyze face
+    /// and render through the JSON writer without the position conversion
+    /// panicking. Parser recovery reports the eof-anchored `expected_token`
+    /// row as length-1 at the eof offset (the official `translateErrorToken`
+    /// law), so the writer converts that row's **end** position at eof+1 —
+    /// through this exact production composition the run formerly died as
+    /// "UTF-16 offset 15 out of range" (a 14-unit source) and the CLI
+    /// catch-all surfaced it as an internal error. The bounded behavior is
+    /// the official `getLocation` extrapolation (`line_col_utf16`'s total
+    /// contract in dartq-source): the row renders start (2,1), end (2,2).
+    #[test]
+    fn recovery_shaped_sources_render_through_the_json_writer() {
+        for source in ["void main( {}\n", "void main() {\n"] {
+            let root = workspace("analyze_recovery", &[("lib/main.dart", source)])
+                .canonicalize()
+                .expect("canonical root");
+            let (config, _) = engine_config(&root, Some(&root.join("sdk"))).expect("assembly");
+            let mut engine = Engine::new(config).expect("engine");
+            let analyzed = run(&mut engine, std::slice::from_ref(&root)).expect("run");
+            // The eof-anchored row is present — offset 14 (the 14-unit
+            // source's eof), length 1, so its end converts at 15. Pinning
+            // the trigger keeps this test from passing vacuously if the
+            // parser's recovery shape ever shifts.
+            assert!(
+                analyzed
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.range.offset == 14 && d.range.end() == 15),
+                "the eof-anchored recovery row is present: {:?}",
+                analyzed.diagnostics
+            );
+            let mut json = Vec::new();
+            write_json(
+                &mut json,
+                &AnalysisOutput {
+                    diagnostics: &analyzed.diagnostics,
+                    files: &analyzed.layout,
+                },
+            )
+            .expect("write");
+            let json = String::from_utf8(json).expect("utf-8");
+            assert!(
+                json.contains(r#""end":{"offset":15,"line":2,"column":2}"#),
+                "the eof+1 end position extrapolates onto the final line: {json}"
+            );
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     /// The overlay run's contract: an empty overlay list is the

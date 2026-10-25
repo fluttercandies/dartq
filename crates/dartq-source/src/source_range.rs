@@ -277,25 +277,36 @@ impl LineIndex {
     /// so an offset between the surrogates of an astral character reports
     /// the LOW surrogate's position.
     ///
+    /// The conversion is **total**, mirroring the oracle exactly: the
+    /// official `getLocation` (line_info.dart) is a plain binary search with
+    /// no bounds check, and the analysis server feeds it end positions
+    /// unchanged (`toRange`: `getLocation(offset + length)`, mapping.dart) —
+    /// so an offset past the source's UTF-16 length resolves to the last
+    /// line with the column extrapolated past the text, never clamped and
+    /// never rejected. This is reachable, not hypothetical: parser recovery
+    /// reports eof-anchored `expected_token` rows as length-1 at the eof
+    /// offset, whose **end** position converts at eof+1 (`void main() {` —
+    /// #2589 previously panicked here). The byte-domain converters keep
+    /// their in-range asserts because their results index source bytes.
+    ///
     /// # Panics
     ///
-    /// Panics when `utf16_offset` is greater than the source's UTF-16
-    /// length, or when the resulting line or column overflows [`u32`]
-    /// (same profile-independent contract as [`Self::byte_to_line_col`]).
+    /// Panics only when the resulting line or column overflows [`u32`]
+    /// (unreachable through the engine's byte-bounded intake; same
+    /// profile-independent contract as [`Self::byte_to_line_col`]).
     #[must_use]
     pub fn line_col_utf16(&self, _source: &str, utf16_offset: u32) -> (u32, u32) {
-        let total = self.source_len - self.wide_lines.last().map_or(0, |wl| wl.utf16_deficit);
-        assert!(
-            utf16_offset <= total,
-            "UTF-16 offset {utf16_offset} out of range (source has {total} UTF-16 code units)"
-        );
         // Locate the line in the UTF-16 domain — the same locate as
         // `utf16_to_byte`'s general branch, minus the snap. A line's UTF-16
         // start is its byte start minus the deficit of the preceding lines;
         // pure-ASCII sources have no wide lines, so UTF-16 offsets are byte
-        // offsets and the search is one plain binary search.
+        // offsets and the search is one plain binary search. The ASCII arm
+        // locates at the clamped offset: every past-end offset lies on the
+        // final line, so pinning the locate at the source length yields the
+        // same line the official unbounded search finds, while the column
+        // below still extrapolates from the real offset.
         let (line, line_start_utf16) = if self.wide_lines.is_empty() {
-            let line = self.line_at(utf16_offset);
+            let line = self.line_at(utf16_offset.min(self.source_len));
             (line, self.line_starts[line])
         } else {
             let mut lo = 0usize;
@@ -748,6 +759,37 @@ mod tests {
         assert_eq!(index.line_col_utf16(source, 4), (1, 5)); // high surrogate
         assert_eq!(index.line_col_utf16(source, 5), (1, 6)); // low surrogate
         assert_eq!(index.line_col_utf16(source, 6), (1, 7));
+    }
+
+    /// The conversion must be total for recovery-shaped sources (#2589):
+    /// parser recovery reports eof-anchored `expected_token` rows as
+    /// length-1 at the eof offset, so the writer converts their **end**
+    /// position at eof+1 — `void main( {}\n` / `void main() {\n` (14 UTF-16
+    /// units, line 2 starts at 14) previously panicked on offset 15 and
+    /// surfaced as the CLI's internal error. The bounded behavior is the
+    /// official one: `getLocation` is a bounds-check-free binary search, so
+    /// the row reads start (2,1), end (2,2) — the column extrapolated onto
+    /// the virtual line past the text, never clamped, never a panic.
+    #[test]
+    fn line_col_utf16_total_past_eof_on_recovery_shapes() {
+        for source in ["void main( {}\n", "void main() {\n"] {
+            let index = LineIndex::new(source);
+            let eof = utf16_len_of(source); // 14: 13 chars + newline
+            assert_eq!(index.line_col_utf16(source, eof), (2, 1));
+            assert_eq!(index.line_col_utf16(source, eof + 1), (2, 2));
+        }
+        // The extrapolation is line-start arithmetic, so it holds past any
+        // distance and across the line-break and wide-character classes:
+        // lone `\r`, astral final char, and the empty source.
+        let index = LineIndex::new("a\r");
+        assert_eq!(index.line_col_utf16("a\r", 3), (2, 2)); // line 2 starts at utf16 2
+        let index = LineIndex::new("a\u{1F600}");
+        // eof is utf16 3 (a + surrogate pair); 4 is one past, still line 1.
+        assert_eq!(index.line_col_utf16("a\u{1F600}", 3), (1, 4));
+        assert_eq!(index.line_col_utf16("a\u{1F600}", 4), (1, 5));
+        let empty = LineIndex::new("");
+        assert_eq!(empty.line_col_utf16("", 0), (1, 1));
+        assert_eq!(empty.line_col_utf16("", 7), (1, 8));
     }
 
     /// U+2028/U+2029 (LINE/PARAGRAPH SEPARATOR) are ordinary wide
