@@ -1,0 +1,203 @@
+# Debug-profile multi-SDK smoke matrix.
+#
+# One job per released Dart 3.x minor line — the same live-resolved stable
+# band as sdk-stable-matrix.yml. Where that workflow gates the release
+# differential against each SDK as the oracle, this one builds dartq in
+# the DEBUG profile and runs, per SDK, the faces a debug binary exercises:
+#   - the unit suites behind `dartq test`: the dartq-test crate plus the
+#     test modules of dartq-cli and dartq-daemon (the live-gated M4
+#     integration faces stay opt-in via DARTQ_M4_LIVE, as on ci.yml);
+#   - smoke runs of the binary itself: `--help`, a clean `analyze` (exit
+#     0, zero diagnostics), a broken-file `analyze` (exit 3, the file
+#     named), and one real `dartq test` suite under package:test resolved
+#     and executed by that job's SDK.
+# The debug profile is the point: debug_assert!/overflow checks and the
+# unoptimized paths surface version-sensitive behavior (SDK metadata
+# parsing, vm discovery, runner-protocol drift) that release builds skip.
+# Every row hard-gates — unlike the differential matrices there is no
+# expected-skew concept here, so no continue-on-error rows and no Step
+# Summary table restating boolean verdicts: a red old row is a real
+# version-sensitivity finding to fix (or to narrow the band floor by
+# explicit ledger decision, not silently).
+name: dartq-debug-matrix
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "07 5 * * *" # daily, offset from the stable/dev matrices (3:17 / 3:47) and bench (4:23)
+  pull_request:
+    paths:
+      - "crates/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.versions.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: versions
+        name: Resolve the stable band from the dart-archive listing
+        # pipefail + the empty check: a resolver failure (curl, JSON,
+        # pagination guard) must fail this step loudly — a dead pipe must
+        # never degrade into a silently empty (all-green) matrix.
+        run: |
+          set -euo pipefail
+          versions="$(bash scripts/sdk-matrix-versions.sh --stable \
+            | cut -d'|' -f1 | jq -R '.' | jq -sc '.')"
+          if [ "$versions" = "[]" ]; then
+            echo "::error::stable-band resolver returned an empty matrix"
+            exit 1
+          fi
+          echo "stable band: $versions"
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+
+  debug:
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.resolve.outputs.versions) }}
+    env:
+      VERSION: ${{ matrix.version }}
+      DARTQ: ${{ github.workspace }}/target/debug/dartq
+      SMOKE: ${{ runner.temp }}/debug-smoke
+    steps:
+      - uses: actions/checkout@v4
+      - name: Strip host-discipline cargo config (sccache wrapper + jobs=2)
+        run: |
+          sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+          if grep -qE '^(rustc-wrapper|jobs = 2)' .cargo/config.toml; then
+            echo "::error::cargo config strip left matches behind (layout drift?)"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the matrix SDK
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ matrix.version }}
+      - name: Record the SDK root and lay out the fvm-style oracle home
+        # The banner check guards the whole job's premise: setup-dart
+        # resolving something other than the pinned $VERSION must fail
+        # here, not surface as an unrelated face failure later.
+        run: |
+          set -euo pipefail
+          banner="$(dart --version 2>&1)"
+          case "$banner" in
+            *"$VERSION "*) ;;
+            *) echo "::error::dart on PATH is not $VERSION ($banner)"; exit 1 ;;
+          esac
+          sdk_root="$(dirname "$(dirname "$(command -v dart)")")"
+          mkdir -p "$HOME/fvm/default/bin/cache"
+          ln -s "$sdk_root" "$HOME/fvm/default/bin/cache/dart-sdk"
+          echo "sdk root: $sdk_root"
+          echo "DART_SDK=$sdk_root" >> "$GITHUB_ENV"
+      - name: Build dartq (debug profile)
+        run: cargo build -p dartq-cli
+      - name: Unit suite (dartq-test)
+        run: cargo test -p dartq-test --lib
+      - name: Unit suite (dartq-cli test module)
+        run: cargo test -p dartq-cli --bin dartq -- "test::"
+      - name: Unit suite (dartq-daemon test module)
+        run: cargo test -p dartq-daemon --lib -- "test::"
+      - name: Stage the smoke fixture
+        # A one-suite package resolvable by every stable in the band
+        # (sdk ^3.0.0; pub picks the newest package:test line that SDK
+        # accepts), staged outside the workspace like bench.yml's manifest.
+        run: |
+          set -euo pipefail
+          mkdir -p "$SMOKE/pkg/lib" "$SMOKE/pkg/test"
+          cat > "$SMOKE/pkg/pubspec.yaml" <<'EOF'
+          name: debug_matrix_smoke
+          publish_to: none
+          environment:
+            sdk: ^3.0.0
+          dev_dependencies:
+            test: ^1.24.0
+          EOF
+          cat > "$SMOKE/pkg/lib/main.dart" <<'EOF'
+          int twice(int value) => value * 2;
+
+          void main() {
+            print(twice(21));
+          }
+          EOF
+          cat > "$SMOKE/pkg/test/smoke_test.dart" <<'EOF'
+          import 'package:test/test.dart';
+
+          void main() {
+            test('arithmetic', () {
+              expect(21 * 2, equals(42));
+            });
+          }
+          EOF
+      - name: Pub-get the smoke fixture (matrix SDK)
+        run: (cd "$SMOKE/pkg" && dart pub get)
+      - name: Smoke (dartq --help)
+        run: |
+          set -euo pipefail
+          out="$("$DARTQ" --help)"
+          echo "$out" | grep -q "Usage" || {
+            echo "::error::dartq --help printed no usage"; exit 1
+          }
+      - name: Smoke (analyze a clean package, exit 0 and zero diagnostics)
+        # No --sdk: this face exercises the $DART_SDK default resolution.
+        run: |
+          set -euo pipefail
+          code=0
+          out="$("$DARTQ" analyze --format=machine "$SMOKE/pkg")" || code=$?
+          if [ "$code" -ne 0 ]; then
+            echo "::error::clean analyze exited $code (expected 0)"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+          if [ -n "$out" ]; then
+            echo "::error::clean analyze emitted diagnostics:"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+      - name: Smoke (dartq test, package:test under the matrix SDK)
+        run: |
+          set -euo pipefail
+          code=0
+          out="$(cd "$SMOKE/pkg" && "$DARTQ" test 2>&1)" || code=$?
+          printf '%s\n' "$out"
+          if [ "$code" -ne 0 ]; then
+            echo "::error::dartq test exited $code (expected 0)"
+            exit 1
+          fi
+          grep -q "All tests passed" <<<"$out" || {
+            echo "::error::dartq test reported no passing summary"
+            exit 1
+          }
+      - name: Smoke (analyze a broken file, exit 3 and file named)
+        # Explicit --sdk alongside the parser-level break: both SDK plumbing
+        # paths (flag and env default) get one face each, and a syntax
+        # error is language-version- and SDK-insensitive, so exit 3 plus
+        # the file being named is deterministic on every row of the band.
+        run: |
+          set -euo pipefail
+          cat > "$SMOKE/pkg/lib/broken_syntax.dart" <<'EOF'
+          class {
+          EOF
+          code=0
+          out="$("$DARTQ" analyze --format=machine --sdk "$DART_SDK" "$SMOKE/pkg")" || code=$?
+          printf '%s\n' "$out"
+          if [ "$code" -ne 3 ]; then
+            echo "::error::broken analyze exited $code (expected 3, ERROR severity)"
+            exit 1
+          fi
+          grep -q "broken_syntax.dart" <<<"$out" || {
+            echo "::error::broken analyze did not name the broken file"
+            exit 1
+          }
