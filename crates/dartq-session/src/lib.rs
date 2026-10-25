@@ -134,12 +134,23 @@ fn binary_hash() -> io::Result<String> {
 // Layout and state
 // ---------------------------------------------------------------------------
 
+/// The byte length beyond which a worktree-local unix-domain socket
+/// path relocates to the per-user short directory (#2592): `sun_path`
+/// caps at 104 bytes on the BSDs/macOS and 108 on Linux; 92 leaves
+/// margin for every host while keeping ordinary checkouts worktree-
+/// local. Past it the old behavior was a silent bind failure — the
+/// serve process died with stderr nulled, and `session start` retried
+/// into "never listened" forever.
+const SOCKET_PATH_LIMIT: usize = 92;
+
 /// The session artifacts of one worktree: `.dart_tool/dartq/`.
 #[derive(Clone, Debug)]
 pub struct Layout {
     /// The session directory: `<root>/.dart_tool/dartq/`.
     pub dir: PathBuf,
-    /// The daemon-protocol socket.
+    /// The daemon-protocol socket: worktree-local when its path fits
+    /// the kernel's `sun_path`, else the per-user relocation (see
+    /// [`Layout::new`]).
     pub socket: PathBuf,
     /// The liveness state (pid, heartbeat, triple).
     pub state: PathBuf,
@@ -148,13 +159,15 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// The layout under `root` — computed, not probed: constructing it
-    /// touches nothing.
+    /// The layout under `root`. Computed, not probed — except the
+    /// relocation branch (#2592), which canonicalizes the root once so
+    /// every spelling of one worktree lands on the same relocated
+    /// socket. Ordinary (short-path) checkouts touch nothing.
     #[must_use]
     pub fn new(root: &Path) -> Self {
         let dir = root.join(".dart_tool").join("dartq");
         Self {
-            socket: dir.join("session.sock"),
+            socket: socket_path(&dir, root),
             state: dir.join("state.json"),
             elect: dir.join("elect.lock"),
             dir,
@@ -163,6 +176,10 @@ impl Layout {
 
     /// Creates the session directory; `Err` carries the degradation
     /// reason (a read-only checkout or an unwritable `.dart_tool`).
+    /// A relocated socket also gets its per-user directory and a
+    /// pointer file in the session directory naming the socket's real
+    /// path (discovery stays deterministic; the pointer is for humans
+    /// and tools reading the worktree).
     pub fn create(&self) -> Result<(), String> {
         std::fs::create_dir_all(&self.dir)
             .map_err(|error| format!("cannot create {}: {error}", self.dir.display()))?;
@@ -171,8 +188,92 @@ impl Layout {
             .append(true)
             .open(&self.elect)
             .map_err(|error| format!("cannot write {}: {error}", self.elect.display()))?;
+        let pointer = self.dir.join("session.sock.point");
+        if self.socket.parent() == Some(self.dir.as_path()) {
+            // Worktree-local: no relocation, no pointer.
+            let _ = std::fs::remove_file(&pointer);
+            return Ok(());
+        }
+        let parent = self
+            .socket
+            .parent()
+            .ok_or_else(|| format!("socket path has no directory: {}", self.socket.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+        std::fs::write(&pointer, self.socket.as_os_str().as_encoded_bytes())
+            .map_err(|error| format!("cannot write {}: {error}", pointer.display()))?;
         Ok(())
     }
+}
+
+/// The worktree-local socket path when it fits the kernel's `sun_path`
+/// budget, else `<cache>/dartq/sessions/sockets/<hash>.sock`. The
+/// fit-or-relocate decision is keyed on the *canonical* root's path —
+/// two spellings of one worktree (one through a symlink) must make the
+/// same decision, or they would split into two sockets (and two
+/// engines). The relocation hash is the canonical root too, so every
+/// spelling agrees on the destination as well.
+fn socket_path(dir: &Path, root: &Path) -> PathBuf {
+    let canonical = stable_canonical(root);
+    let canonical_local = canonical
+        .join(".dart_tool")
+        .join("dartq")
+        .join("session.sock");
+    if canonical_local.as_os_str().len() <= SOCKET_PATH_LIMIT {
+        return dir.join("session.sock");
+    }
+    let digest: [u8; 8] = blake3::hash(canonical.as_os_str().as_encoded_bytes()).as_bytes()
+        [..8]
+        .try_into()
+        .expect("8 bytes");
+    cache_root().join("sockets").join(format!("{}.sock", hex::encode(digest)))
+}
+
+/// The canonical form of `root`, stable whether or not the path exists
+/// yet: `fs::canonicalize` answers `None` for a missing tail, and the
+/// naive fallback (the path as given) hashes differently from the
+/// post-creation canonical form — two spellings of one worktree would
+/// then land on two relocated sockets (#2592's split-brain). The
+/// deepest *existing* ancestor is canonicalized and the missing tail
+/// re-attached, so before and after `mkdir` agree.
+fn stable_canonical(root: &Path) -> PathBuf {
+    if let Ok(full) = std::fs::canonicalize(root) {
+        return full;
+    }
+    let mut prefix = root.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(name) = prefix.file_name() {
+        let parent = prefix.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        match std::fs::canonicalize(&parent) {
+            Ok(real) => {
+                let mut path = real;
+                path.push(name);
+                for part in tail.iter().rev() {
+                    path.push(part);
+                }
+                return path;
+            }
+            Err(_) => {
+                tail.push(name.to_owned());
+                prefix = parent;
+            }
+        }
+    }
+    root.to_path_buf()
+}
+
+/// The per-user session cache root, shared by the registry and the
+/// relocated sockets: `$XDG_CACHE_HOME|~/.cache` + `dartq/sessions`.
+fn cache_root() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|home| home.join(".cache")))
+        .unwrap_or_default()
+        .join("dartq")
+        .join("sessions")
 }
 
 /// The on-disk liveness state, written by the serve loop.
@@ -439,11 +540,7 @@ impl Registry {
     /// The per-user registry at `$XDG_CACHE_HOME|~/.cache/dartq/sessions`.
     #[must_use]
     pub fn open() -> Self {
-        let base = std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::home_dir().map(|home| home.join(".cache")))
-            .unwrap_or_default();
-        Self { dir: base.join("dartq").join("sessions") }
+        Self { dir: cache_root() }
     }
 
     /// The registry rooted at `dir` (tests).
@@ -794,6 +891,75 @@ mod tests {
         /// The spawned sleep children, reaped on drop.
         static SESSION_CHILDREN: std::cell::RefCell<Vec<std::process::Child>> =
             const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// #2592: a socket path that fits the kernel's `sun_path` stays
+    /// worktree-local with no pointer; a too-long one relocates to the
+    /// per-user short directory deterministically — both spellings of
+    /// one worktree (through a symlink) land on the same socket, the
+    /// same property the worktree-local path had — and `create` leaves
+    /// the pointer naming the real path.
+    #[test]
+    fn long_socket_paths_relocate_deterministically() {
+        // Short: worktree-local, no pointer.
+        let short = temp("short-sock");
+        let layout = Layout::new(&short);
+        assert_eq!(layout.socket, layout.dir.join("session.sock"));
+        layout.create().expect("create");
+        assert!(!layout.dir.join("session.sock.point").exists());
+
+        // Long: relocates into the per-user sockets directory, fits the
+        // budget, and both spellings agree.
+        let segment = "d".repeat(64);
+        let long = PathBuf::from("/tmp").join(format!("dqs-longsock-{}-{segment}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&long);
+        std::fs::create_dir_all(&long).expect("dir");
+        assert!(
+            long.join(".dart_tool/dartq/session.sock").as_os_str().len() > 104,
+            "the fixture must exceed sun_path"
+        );
+        let layout = Layout::new(&long);
+        assert_ne!(layout.socket, layout.dir.join("session.sock"));
+        assert!(
+            layout.socket.as_os_str().len() <= 104,
+            "the relocated path fits sun_path: {}",
+            layout.socket.display()
+        );
+        assert!(
+            layout.socket.components().any(|part| part.as_os_str() == "sockets"),
+            "the relocation lands under the per-user sockets directory: {}",
+            layout.socket.display()
+        );
+        let through_link = PathBuf::from("/tmp").join(format!("dqs-longsock-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&through_link);
+        std::os::unix::fs::symlink(&long, &through_link).expect("symlink");
+        assert_eq!(
+            Layout::new(&through_link).socket,
+            layout.socket,
+            "both spellings of one worktree share the relocated socket"
+        );
+        // The stability pin: a layout computed over a MISSING tail must
+        // hash the same canonical form as after the tail exists —
+        // `ensure` builds layouts pre-`create`, and a spelling drift
+        // there split one worktree into two sockets (#2592).
+        let deep = long.join("deep");
+        let before = Layout::new(&deep).socket;
+        std::fs::create_dir_all(&deep).expect("deep dir");
+        assert_eq!(
+            before,
+            Layout::new(&deep).socket,
+            "pre-creation and post-creation spellings agree"
+        );
+        let _ = std::fs::remove_dir_all(&deep);
+        layout.create().expect("create");
+        let pointer = std::fs::read_to_string(layout.dir.join("session.sock.point")).expect("pointer");
+        assert_eq!(pointer.as_bytes(), layout.socket.as_os_str().as_encoded_bytes());
+        assert!(layout.socket.exists() || layout.socket.parent().is_some_and(|dir| dir.exists()), "the sockets directory exists");
+
+        let _ = std::fs::remove_file(&through_link);
+        let _ = std::fs::remove_file(&layout.socket);
+        let _ = std::fs::remove_dir_all(&long);
+        let _ = std::fs::remove_dir_all(&short);
     }
 
     #[test]

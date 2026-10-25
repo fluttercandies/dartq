@@ -113,18 +113,19 @@ fn install_panic_hook() {
 /// Runs one RPC session to its end and returns the process exit code.
 ///
 /// Spawns the reader thread and runs the main loop on the current thread.
-/// There is no handshake gate: the session is ready from the start, and the
-/// workspace sweep runs before the first turn, so the resident analysis is
-/// already warm (and its `dartq/diagnostics` pushes already emitted) before
-/// the first client frame lands. With `watch` set it also spawns the one
-/// watch thread, whose debounced batches ride the same channel; dropping
-/// the watcher at session end stops and joins it. Returns when the input
-/// stream ends — a client close is the session's only end signal —
-/// (possibly leaving the reader blocked on the next read — under a real
-/// process the caller exits immediately, which reaps it; the reader is
-/// joined only when it is known to have finished). Input buffering is the
-/// shell's policy: the reader thread wraps the stream so batch boundaries
-/// follow read granularity.
+/// There is no handshake gate: the session is ready from the start, and
+/// the loop answers the first frame immediately — the workspace walk and
+/// first analysis run lazily, on the first drain that stages engine work
+/// (#2591; see `Session::service`), so a cold engine still answers every
+/// face that never touches the analysis engines. With `watch` set it also
+/// spawns the one watch thread, whose debounced batches ride the same
+/// channel; dropping the watcher at session end stops and joins it.
+/// Returns when the input stream ends — a client close is the session's
+/// only end signal — (possibly leaving the reader blocked on the next
+/// read — under a real process the caller exits immediately, which reaps
+/// it; the reader is joined only when it is known to have finished).
+/// Input buffering is the shell's policy: the reader thread wraps the
+/// stream so batch boundaries follow read granularity.
 ///
 /// # Errors
 ///
@@ -159,14 +160,16 @@ where
     // Set only by a framing desync; every other break is `EXIT_CLEAN`.
     let mut exit_code: Option<u8> = None;
 
-    // The resident posture: discover the workspace and run the first
-    // analysis before serving — the sweep's diagnostics pushes (and the
-    // session-start advisory) leave with this drain, ahead of anything the
-    // client sends.
-    if let Err(error) = session.sweep() {
-        failed("sweep", &error);
-    }
-    write_turn(&mut output, session.service())?;
+    // The lazy-boot posture (#2591): the loop serves from the first
+    // frame. A cold full-workspace discovery+analysis runs for minutes on
+    // a monster tree, and running it here — ahead of the first client
+    // frame — held the loop with every RPC timing out and the starter's
+    // socket wait racing it. Instead the session discovers on demand, at
+    // the first drain that stages engine work (see `Session::service`):
+    // faces that never touch the analysis engine (status, debug, test)
+    // answer immediately on a cold engine, and the first analysis-needing
+    // request pays the cold cost in its own drain. The startup advisory
+    // and the first publish diff ride that first drain instead.
 
     // Ends when the reader thread disconnects or a notification breaks out.
     loop {
@@ -1111,6 +1114,113 @@ mod tests {
         }
     }
 
+    /// #2591's lazy-boot pin: a cold engine answers the faces that never
+    /// touch the analysis engines before ANY analysis has run — no
+    /// eager startup sweep holds the loop — and the workspace walk plus
+    /// first publish ride the first analysis-needing request's drain.
+    #[test]
+    fn a_cold_engine_answers_before_any_analysis_and_discovers_on_demand() {
+        let workspace = test_fixtures::Workspace::new(BROKEN_MAIN);
+        let uri = crate::uri::from_path(&workspace.path("lib/main.dart"));
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("lazy-boot")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let session =
+            Session::with_store(workspace.engine_config(), store, None).expect("session");
+        let (client, receiver) = mpsc::channel::<Vec<u8>>();
+        let output = TestOutput::default();
+        let server_output = output.clone();
+        let server = thread::spawn(move || {
+            run(
+                BufReader::new(FeedClient {
+                    receiver,
+                    pending: Vec::new(),
+                }),
+                server_output,
+                &mut { session },
+                None,
+            )
+        });
+
+        // The very first frame on the cold engine: a non-analysis face,
+        // answered immediately — no diagnostics push exists yet because
+        // no analysis has run (the pre-#2591 eager sweep would have held
+        // this answer for the whole workspace walk).
+        client
+            .send(framed(&request(1, "dartq/test/status", json!({}))))
+            .expect("status send");
+        let status = wait_for(
+            || {
+                transcript_of(&output)
+                    .iter()
+                    .find(|frame| frame.get("id") == Some(&json!(1)))
+                    .cloned()
+            },
+            "the cold engine never answered the status probe",
+        );
+        assert!(status["result"]["runs"].is_array(), "answered: {status}");
+        assert!(
+            !transcript_of(&output)
+                .iter()
+                .any(|frame| frame["method"] == "dartq/diagnostics"),
+            "no analysis ran before any analysis-needing request"
+        );
+
+        // The first analysis-needing request pays the workspace walk in
+        // its own drain: the seeded error surfaces through it.
+        client
+            .send(framed(&request(2, "dartq/analyze", json!({}))))
+            .expect("analyze send");
+        let analyze = wait_for(
+            || {
+                transcript_of(&output)
+                    .iter()
+                    .find(|frame| frame.get("id") == Some(&json!(2)))
+                    .cloned()
+            },
+            "the analyze request never answered",
+        );
+        assert!(
+            analyze["result"]["diagnostics"]
+                .as_array()
+                .expect("array")
+                .iter()
+                .any(|d| d["code"] == "uri_does_not_exist"),
+            "the lazily-discovered workspace analyzes: {analyze}"
+        );
+        let push = wait_for(
+            || {
+                transcript_of(&output)
+                    .iter()
+                    .find(|frame| frame["method"] == "dartq/diagnostics"
+                        && frame["params"]["uri"] == uri)
+                    .cloned()
+            },
+            "the first publish diff never rode the analyze drain",
+        );
+        assert!(
+            push["params"]["diagnostics"]
+                .as_array()
+                .expect("array")
+                .iter()
+                .any(|d| d["code"] == "uri_does_not_exist"),
+            "the push carries the seeded error: {push}"
+        );
+
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !server.is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        server
+            .join()
+            .expect("server thread does not panic")
+            .expect("transport does not fail on memory pipes");
+    }
+
+
     /// #2587's core pin: a debug op stuck on its (bounded) attach must
     /// never wedge the serve loop — a request on another face riding
     /// the same connection answers while the attach is still in
@@ -1350,9 +1460,9 @@ mod tests {
         // The loop runs on THIS thread: the probe's read-panic trigger is
         // thread-local (the containment pin arms it on the session-owner
         // thread), so a spawned-thread harness cannot reach it. A feeder
-        // thread plays the client. The startup sweep's read is the first
-        // group — skip it so the sync batch's base group takes the hit.
-        crate::probe::arm_read_panic_on_group(1);
+        // thread plays the client. The lazy boot (#2591) runs no startup
+        // read, so the sync batch's base group IS the first read group.
+        crate::probe::arm_read_panic_on_group(0);
         // The feeder's view of the same buffer (the loop's writer end is the
         // third handle, moved into `run` below).
         let feeder_output = output.clone();

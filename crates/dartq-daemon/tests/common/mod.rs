@@ -287,9 +287,10 @@ fn start(session: Session) -> Harness {
         server,
         probe: 1000,
     };
-    // The server is ready from `run()`'s start — no handshake: the startup
-    // drain writes the sweep's pushes ahead of any client frame. Settle it
-    // through a probe so every test steps on a drained baseline.
+    // The server is ready from `run()`'s start — no handshake and (#2591)
+    // no startup sweep: the probe's analyze is the first engine work, so
+    // the lazy discovery plus first publish ride its drain and every test
+    // steps on a drained baseline.
     harness.probe_step();
     harness
 }

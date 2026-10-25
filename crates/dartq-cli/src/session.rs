@@ -358,8 +358,31 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     let registry = Registry::open();
     heartbeat(&layout, &registry, &triple);
 
+    // #2591: the heartbeat owns its own thread. Beating between accepts
+    // tied liveness to client service — a long client connection (a
+    // minutes-long cold analysis inside one drain) stopped the beat for
+    // its whole duration (a 233 s heartbeat age observed live), leaving
+    // `session status` reporting a stale engine. The beat thread is
+    // independent of the accept loop; it exits when the flag drops at
+    // reap/exit, before cleanup strips the state.
+    let beating = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let beat_layout = layout.clone();
+    let beat_triple = triple.clone();
+    let beat_registry = Registry::open();
+    let beat_flag = std::sync::Arc::clone(&beating);
+    let beater = std::thread::Builder::new()
+        .name("dartq-heartbeat".into())
+        .spawn(move || {
+            while beat_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(HEARTBEAT);
+                if beat_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    heartbeat(&beat_layout, &beat_registry, &beat_triple);
+                }
+            }
+        })
+        .expect("the heartbeat thread spawns");
+
     let mut last_client = Instant::now();
-    let mut next_beat = Instant::now() + HEARTBEAT;
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -369,22 +392,20 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
                 serve_client(stream, &mut session);
                 let _ = events.append("session", "client_detached", serde_json::json!({}));
                 heartbeat(&layout, &registry, &triple);
-                next_beat = Instant::now() + HEARTBEAT;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => {
                 eprintln!("dartq: session serve: accept failed: {error}");
+                beating.store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = beater.join();
                 cleanup(&layout, &root);
                 return exit::SOFTWARE;
             }
         }
-        let now = Instant::now();
-        if now >= next_beat {
-            heartbeat(&layout, &registry, &triple);
-            next_beat = now + HEARTBEAT;
-        }
-        if now.duration_since(last_client) > idle_timeout {
+        if Instant::now().duration_since(last_client) > idle_timeout {
             let _ = events.append("session", "reaped", serde_json::json!({"idle_s": idle_timeout.as_secs()}));
+            beating.store(false, std::sync::atomic::Ordering::Relaxed);
+            let _ = beater.join();
             cleanup(&layout, &root);
             return exit::CLEAN;
         }
@@ -427,6 +448,7 @@ fn heartbeat(layout: &Layout, registry: &Registry, triple: &SessionTriple) {
 fn cleanup(layout: &Layout, root: &Path) {
     let _ = std::fs::remove_file(&layout.socket);
     let _ = std::fs::remove_file(&layout.state);
+    let _ = std::fs::remove_file(layout.dir.join("session.sock.point"));
     Registry::open().remove(root);
 }
 
@@ -594,7 +616,120 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// #2587: the resident engine detaches from its starter's process
+    /// #2591: the heartbeat keeps beating while a client connection is
+    /// being served — a held-open client used to stop the beat for its
+    /// whole duration (a cold analysis inside one drain aged the
+    /// heartbeat by minutes). The beat thread is independent of the
+    /// accept loop, so the state stays fresh under a held client.
+    #[test]
+    fn the_heartbeat_stays_fresh_while_a_client_is_held_open() {
+        let root = test_fixture("beat-held");
+        let serve_dir = root.clone();
+        let serve_sdk = root.join("sdk");
+        let server = std::thread::spawn(move || {
+            serve_loop(&ServeArgs { dir: serve_dir, sdk: serve_sdk }, Duration::from_secs(1))
+        });
+        let layout = Layout::new(&root);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !dartq_session::socket_open(&layout) {
+            assert!(Instant::now() < deadline, "the serve loop never listened");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Hold a client open past one-and-a-half heartbeat windows.
+        let held = UnixStream::connect(&layout.socket).expect("client connects");
+        let held_start = SessionState::now_ms();
+        std::thread::sleep(HEARTBEAT + HEARTBEAT / 2);
+        let state = SessionState::read(&layout).expect("state while held");
+        let age_ms = SessionState::now_ms().saturating_sub(state.heartbeat_ms);
+        assert!(
+            age_ms < held_start.saturating_sub(state.heartbeat_ms) + u128::try_from(HEARTBEAT.as_millis()).expect("ms"),
+            "the beat stayed fresh under a held client: age {age_ms} ms"
+        );
+        drop(held);
+        let _ = server.join();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// #2592: a checkout whose worktree socket path exceeds the kernel's
+    /// `sun_path` budget still gets a listening session — the socket
+    /// relocates to the per-user short directory (pointer file left in
+    /// the session dir), and the protocol round-trips over it.
+    #[test]
+    fn a_long_checkout_path_still_listens_on_the_relocated_socket() {
+        // A root deep enough that `<root>/.dart_tool/dartq/session.sock`
+        // blows the 104-byte sun_path: one long directory name under /tmp.
+        let segment = "w".repeat(72);
+        let root = PathBuf::from("/tmp").join(format!("dqs-long-{}-{segment}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lib")).expect("dir");
+        std::fs::create_dir_all(root.join(".dart_tool")).expect("dot dir");
+        std::fs::write(root.join("pubspec.yaml"), "name: fx\nenvironment:\n  sdk: ^3.5.0\n").expect("pubspec");
+        std::fs::write(
+            root.join(".dart_tool/package_config.json"),
+            r#"{"configVersion":2,"packages":[{"name":"fx","rootUri":"../","packageUri":"lib/","languageVersion":"3.5"}],"generator":"pub"}"#,
+        )
+        .expect("package config");
+        let sdk = root.join("sdk");
+        for (rel, body) in [
+            ("version", "3.13.1\n"),
+            ("lib/libraries.json", r#"{"vm":{"libraries":{"core":{"uri":"core/core.dart"}}}}"#),
+            (
+                "lib/_internal/allowed_experiments.json",
+                r#"{"version":1,"experimentSets":{"sdkExperiments":[]},"sdk":{"default":{"experimentSet":"sdkExperiments"}},"packages":{}}"#,
+            ),
+            ("lib/core/core.dart", "library dart.core;\n"),
+        ] {
+            let path = sdk.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("sdk dir");
+            std::fs::write(path, body).expect("sdk file");
+        }
+        std::fs::write(root.join("lib/a.dart"), "int a() => 1;\n").expect("source");
+
+        let layout = Layout::new(&root);
+        let local = layout.dir.join("session.sock");
+        assert!(
+            local.as_os_str().len() > 104,
+            "the fixture's local socket path must exceed sun_path: {}",
+            local.display()
+        );
+        assert_ne!(layout.socket, local, "the socket relocated");
+        assert!(
+            layout.socket.as_os_str().len() <= 104,
+            "the relocated path fits: {}",
+            layout.socket.display()
+        );
+
+        let serve_dir = root.clone();
+        let serve_sdk = sdk.clone();
+        let server = std::thread::spawn(move || {
+            serve_loop(&ServeArgs { dir: serve_dir, sdk: serve_sdk }, Duration::from_secs(1))
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !dartq_session::socket_open(&layout) {
+            assert!(Instant::now() < deadline, "the long-path session never listened");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // The pointer file names the real socket; the protocol answers
+        // over the relocated path.
+        let pointer = std::fs::read_to_string(layout.dir.join("session.sock.point"))
+            .expect("the pointer file exists");
+        assert_eq!(
+            pointer.as_bytes(),
+            layout.socket.as_os_str().as_encoded_bytes(),
+            "the pointer names the socket"
+        );
+        let answer = roundtrip(
+            &layout.socket,
+            r#"{"jsonrpc":"2.0","id":1,"method":"dartq/test/status","params":{}}"#,
+        );
+        assert!(answer.contains("\"id\":1"), "answered over the relocated socket: {answer}");
+        assert!(!local.exists(), "no socket was attempted at the long path");
+
+        let _ = server.join();
+        assert!(!layout.socket.exists(), "the reap removed the relocated socket");
+        std::fs::remove_dir_all(&root).ok();
+        let _ = std::fs::remove_file(&layout.socket);
+    }
     /// group. A starter task killed by group (the CI/shell shape — the
     /// live incident's second finding) must leave the engine serving:
     /// the socket answers and the state's pid stays alive.

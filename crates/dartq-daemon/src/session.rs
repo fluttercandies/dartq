@@ -906,6 +906,10 @@ pub struct Session {
     /// context-tagged or agent requests ride the read, so the diff still
     /// goes out.
     publishes_due: bool,
+    /// Whether any context has walked its workspace yet (#2591's lazy
+    /// boot): the walk runs on the first drain staging engine work, not
+    /// at startup — see [`Session::discover_all`].
+    discovered: bool,
     /// The session symbol table.
     symbols: commands::SymbolTable,
     /// The per-file lint-row memo (#772): rows keyed by content, features,
@@ -1315,6 +1319,7 @@ impl Session {
             cursor: 0,
             changed: FxHashMap::default(),
             publishes_due: false,
+            discovered: false,
             symbols: commands::SymbolTable::default(),
             lint_memo: dartq_commands::lints::LintMemo::default(),
             gc_watermark: 0,
@@ -1360,6 +1365,7 @@ impl Session {
     ///
     /// Discovery I/O.
     pub fn sweep(&mut self) -> Result<(), SessionError> {
+        self.discovered = true;
         for index in 0..self.context_ids.len() {
             self.engine_mut(self.context_ids[index])
                 .discover_workspace()?;
@@ -1372,6 +1378,23 @@ impl Session {
         self.publishes_due = true;
         self.ensure_read(self.default_context, Tier::Normal);
         Ok(())
+    }
+
+    /// The lazy-boot workspace walk (#2591): every context's discovery,
+    /// run on the first drain that stages engine work. A cold walk of a
+    /// monster workspace takes minutes; doing it at startup held the
+    /// serve loop with every RPC timing out, so the walk lands here
+    /// instead — the faces that never touch the engines answer on a cold
+    /// engine, and the first analysis-needing request pays the walk in
+    /// its own drain. A failed walk is logged and the turn proceeds on
+    /// whatever loaded (the pre-#2591 startup sweep's failure posture).
+    fn discover_all(&mut self) {
+        self.discovered = true;
+        for index in 0..self.context_ids.len() {
+            if let Err(error) = self.engine_mut(self.context_ids[index]).discover_workspace() {
+                eprintln!("dartq-daemon: workspace discovery failed: {error}");
+            }
+        }
     }
 
     /// The config-input watch sweep's advisory heal: re-runs the assembly's
@@ -2107,6 +2130,15 @@ impl Session {
             self.ensure_write();
         }
         let report = self.runtime.drain();
+        // The lazy-boot discovery (#2591): the first drain that actually
+        // stages engine work walks the workspace here — ahead of this
+        // turn's write arm, so staged client overlays apply on top of the
+        // discovered disk state (last-wins), the same order the retired
+        // eager startup sweep produced. Drains without engine work (a
+        // status, debug, or test intake) never pay the walk.
+        if !self.discovered && !report.tasks.is_empty() {
+            self.discover_all();
+        }
         let mut turn = Turn::default();
         // Paths this turn's write removed (empty on every write-free turn):
         // their publish-baseline entries drop once this turn's diff has run.
