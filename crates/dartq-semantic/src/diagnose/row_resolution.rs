@@ -4614,8 +4614,19 @@ impl<'a> Engine<'a> {
                     if arg_args != ArgListId::EMPTY || bound_args != ArgListId::EMPTY {
                         return true;
                     }
+                    // A bare argument head the name level cannot order — a
+                    // scope parameter the torn-down window lost (`List<T>`
+                    // over the class's own `T extends Enum`), or an
+                    // undefined spelling (the oracle's InvalidType
+                    // subtypes every bound, `subtype.dart`'s invalid arm)
+                    // — keeps the face (the under-report posture); only a
+                    // head some container or the known world declares is
+                    // ordered into the subtype test.
                     (!arg_nullable || bound_nullable)
-                        && (arg_head == bound_head || reaches(arg_head, bound_head))
+                        && (arg_head == bound_head
+                            || reaches(arg_head, bound_head)
+                            || (!user_container(arg_head)
+                                && !world.is_known_head(arg_head)))
                 }
                 // A shape the name level cannot order (an unknown
                 // instantiation, a record or function bound) keeps the
@@ -5042,15 +5053,40 @@ impl<'a> Engine<'a> {
                 // projected shape, and the name-level arm reads it
                 // verbatim below.
                 let on_ty = boundary.ty(face_file, face.on_ty);
-                // A structural `true` is a proof the face applies; a
-                // structural `false` (or no fact) hands the question to the
-                // name-level gate chain — the snapshot's hierarchy is only
-                // as complete as the captures that fed it.
+                // An `on` clause spelling the extension's OWN parameter
+                // (`extension<T extends AstNode> on T`): the parameter
+                // instantiates to the receiver's type, so the head gate
+                // becomes the parameter's declared bound — every receiver
+                // the bound admits applies (an absent bound is the top).
+                let own_param_applies = (|| {
+                    let Some(head) = face.on_type else { return false; };
+                    if face.on_type_nullable {
+                        return false;
+                    }
+                    let Ty::Named { args, .. } = on_ty else {
+                        return false;
+                    };
+                    if args != ArgListId::EMPTY {
+                        return false;
+                    }
+                    let Some(index) = face.type_param_names.iter().position(|&n| n == head)
+                    else {
+                        return false;
+                    };
+                    match face.type_param_bounds.get(index).copied() {
+                        None | Some(Ty::Dynamic) | Some(Ty::Unknown) => true,
+                        Some(bound) => match boundary.ty(face_file, bound) {
+                            Ty::Named { name, .. } => name == object || reaches(receiver, name),
+                            _ => false,
+                        },
+                    }
+                })();
                 let applicable_face = matches!(applies_strict(face, face_file, on_ty), Some(true))
                     || (reaches(receiver, on)
                         && provenance_ok(face_file, receiver, on)
-                        && arg_applicable(face, face_file));
-                if !applicable_face {
+                        && arg_applicable(face, face_file))
+                    || own_param_applies;
+                                if !applicable_face {
                     continue;
                 }
                 applicable.push((face, on_ty, face_file));

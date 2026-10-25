@@ -4956,3 +4956,5 @@ mod flow_scope_tests;
 mod scope_inference_tests;
 #[cfg(test)]
 mod closure_invalid_chain_tests;
+#[cfg(test)]
+mod extension_param_on_type_tests;
