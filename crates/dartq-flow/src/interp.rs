@@ -1424,8 +1424,7 @@ impl<'o> Interp<'o> {
         promote_to_interest: bool,
         write_span: Option<SourceRange>,
         literal_rhs: bool,
-    ) {
-        // A stale id (a collect rollback can strand effect-set entries and
+    ) {        // A stale id (a collect rollback can strand effect-set entries and
         // scope bindings past their variable) degrades to the unknown
         // declared type; the state write itself is model-bounds-safe.
         let (declared, declared_args) = match self.vars.get(var as usize) {

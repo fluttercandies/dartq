@@ -3388,6 +3388,25 @@ impl ParserListener for DiagnoseListener<'_> {
                 return None;
             }
             let limit = operator.range.offset;
+            // A switch-expression RHS: the parser fires this event while
+            // the RHS is still parsing, so the row heuristic below reads a
+            // PARTIAL arm's face (a non-null call, say) — the official
+            // static type is the arms' nullability-joined LUB, exactly the
+            // face the flow layer's own value carries. Stand down on the
+            // source spelling (`switch` right after the operator).
+            let after_op = engine.skip_whitespace(operator.range.end());
+            let is_switch_rhs = engine.byte_at(after_op) == Some(b's')
+                && engine.byte_at(after_op + 1) == Some(b'w')
+                && engine.byte_at(after_op + 2) == Some('i' as u8)
+                && engine.byte_at(after_op + 3) == Some(b't')
+                && engine.byte_at(after_op + 4) == Some(b'c')
+                && engine.byte_at(after_op + 5) == Some(b'h')
+                && engine
+                    .byte_at(after_op + 6)
+                    .is_none_or(|b| b == b' ' || b == b'(' || b == b'\n' || b == b'\t' || b == b'\r');
+            if is_switch_rhs {
+                return None;
+            }
             let target = engine
                 .rows
                 .iter()
