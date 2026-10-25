@@ -3985,7 +3985,12 @@ impl ParserListener for DiagnoseListener<'_> {
         // best_practices_verifier.dart:987-1041).
         let engine = &mut self.engine;
         engine.nsm_poison();
-        engine.check_type_check(is_operator.range, not.is_some());
+        // The verdict row anchors the whole `is` expression — the oracle's
+        // `_checkAllTypeChecks` reports on the IsExpression node, whose
+        // offset is the operand's (`returnValue is Future<…>` reports at
+        // the operand, never at the operator token).
+        let verdict_at = engine.operand_row().map_or(is_operator.range, |row| row.range);
+        engine.check_type_check(verdict_at, not.is_some());
         engine.const_capture.not_constant(is_operator.range);
         // An `is` expression is statically `bool` — the enclosing condition
         // checkpoint spares the operand row.

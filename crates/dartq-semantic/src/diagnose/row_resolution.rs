@@ -5058,11 +5058,14 @@ impl<'a> Engine<'a> {
                 // instantiates to the receiver's type, so the head gate
                 // becomes the parameter's declared bound — every receiver
                 // the bound admits applies (an absent bound is the top).
+                // The nullable spelling (`extension<T> on T?`) answers the
+                // same bound question against the receiver's non-null
+                // core — `T?` accepts every receiver whose core satisfies
+                // the bound, nullable or not (the face's whole purpose:
+                // `extension<T> on T? { mapOrNull }` over any `T?`
+                // receiver, a safe application on the nullable side).
                 let own_param_applies = (|| {
                     let Some(head) = face.on_type else { return false; };
-                    if face.on_type_nullable {
-                        return false;
-                    }
                     let Ty::Named { args, .. } = on_ty else {
                         return false;
                     };

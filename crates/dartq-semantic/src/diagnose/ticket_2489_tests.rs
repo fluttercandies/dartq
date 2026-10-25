@@ -131,7 +131,7 @@ fn future_or_undef_operand_is_future_folds_unnecessary() {
         "}\n",
     );
     let report = report_ops(source);
-    let is_token = source.find(" is Future").map(|i| i as u32 + 1).unwrap();
+    let is_token = source.find("rv is").map(|i| i as u32).unwrap();
     let checks = rows(&report, "unnecessary_type_check");
     assert!(
         checks.iter().any(|&(offset, _)| offset == is_token),
@@ -156,7 +156,7 @@ fn future_operand_is_future_or_folds_unnecessary() {
         "}\n",
     );
     let report = report_ops(source);
-    let is_token = source.find(" is FutureOr").map(|i| i as u32 + 1).unwrap();
+    let is_token = source.find("rv is").map(|i| i as u32).unwrap();
     let checks = rows(&report, "unnecessary_type_check");
     assert!(
         checks.iter().any(|&(offset, _)| offset == is_token),
@@ -328,7 +328,7 @@ fn null_operand_is_future_or_null_folds_unnecessary() {
         "}\n",
     );
     let report = report_ops(source);
-    let is_token = source.find(" is FutureOr").map(|i| i as u32 + 1).unwrap();
+    let is_token = source.find("rv is").map(|i| i as u32).unwrap();
     let checks = rows(&report, "unnecessary_type_check");
     assert!(
         checks.iter().any(|&(offset, _)| offset == is_token),
@@ -354,7 +354,7 @@ fn future_or_undef_operand_is_not_future_folds_unnecessary_false() {
         "}\n",
     );
     let report = report_ops(source);
-    let is_token = source.find(" is! Future").map(|i| i as u32 + 1).unwrap();
+    let is_token = source.find("rv is").map(|i| i as u32).unwrap();
     let checks = rows(&report, "unnecessary_type_check");
     assert!(
         checks.iter().any(|&(offset, _)| offset == is_token),
