@@ -4958,3 +4958,5 @@ mod scope_inference_tests;
 mod closure_invalid_chain_tests;
 #[cfg(test)]
 mod extension_param_on_type_tests;
+#[cfg(test)]
+mod foreign_alias_invocation_tests;

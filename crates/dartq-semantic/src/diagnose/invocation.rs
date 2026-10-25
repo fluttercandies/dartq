@@ -4100,6 +4100,90 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Whether `name` spells a visible type alias and whether its
+    /// right-hand side grounds (a constructible class face): the this-file
+    /// TopDecl and clause capture first, then the foreign alias through
+    /// the scoped lookup (its TopDecl's `var_ty` carries the right-hand
+    /// side's head as written). `None` — no visible alias — leaves the
+    /// existing faces untouched.
+    fn alias_head_grounded(&self, name: StringId) -> Option<bool> {
+        if matches!(
+            self.top_level_decl(name).as_deref(),
+            Some(decl) if decl.kind == MicroKind::TypeAlias
+        ) {
+            // The this-file clause capture decides when it has the alias;
+            // a foreign alias (or one whose capture never armed) reads the
+            // declaration's own `var_ty` — the right-hand side's head as
+            // written, projected through the boundary — and the graph-wide
+            // container face answers the groundedness instead.
+            if self.bounds.alias_named_shape(name).is_some()
+                || self.bounds.alias_fn_shape(name).is_some()
+            {
+                return Some(self.alias_creation_grounded(name, 0));
+            }
+            let var_ty = self.top_level_decl(name).map(|decl| decl.var_ty)?;
+            return Some(self.foreign_alias_rhs_grounded(var_ty));
+        }
+        match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::Found(NamespaceEntry::Decl(file)) => {
+                self.index
+                    .get(file)
+                    .and_then(|els| els.decl(name))
+                    .and_then(|decl| {
+                        (decl.kind == MicroKind::TypeAlias)
+                            .then(|| self.foreign_alias_rhs_grounded(decl.var_ty))
+                    })
+            }
+            _ => None,
+        }
+    }
+
+    /// A foreign alias's right-hand side grounds when its written head
+    /// names a constructible type some unit of the graph carries
+    /// (`typedef A = Real;` — `A()` is the `Real` creation): the leaf
+    /// head resolves as a container (the diagnosing scope or any unit's
+    /// declaration face). A head nothing declares — `shared.TCG` behind
+    /// an import no config can resolve, its leaf spelling a class no
+    /// unit carries — never grounds and the invocation reports. An
+    /// uncaptured right-hand side (`Ty::Unknown`, the old-style
+    /// function-typed spelling) stays undecided — the under-report
+    /// direction.
+    fn foreign_alias_rhs_grounded(&self, rhs: Ty) -> bool {
+        match rhs {
+            // An uncaptured right-hand side — the old-style function-typed
+            // spelling, or a modern one whose head sits behind a prefix no
+            // config resolves (the armed annotation never completes) —
+            // names no constructible class: the oracle's element model
+            // holds an unresolvable aliased type and the invocation
+            // reports.
+            Ty::Unknown => false,
+            Ty::Named { name, .. } => {
+                resolve_container(
+                    self.graph,
+                    self.namespaces,
+                    self.index,
+                    self.lib,
+                    self.file,
+                    name,
+                )
+                .is_some()
+                    // The container-level world face, never the alias's
+                    // own top-level declaration (the corpus spellings
+                    // keep the aliased class's leaf identical to the
+                    // alias name).
+                    || self.name_world().is_known_head(name)
+            }
+            _ => false,
+        }
+    }
+
     /// Re-interns a constructor's formal table into the diagnosing pool.
     /// `resolve_container`'s `ctor_formals` hit is owned by `owner`'s unit —
     /// its `formal.ty` slots index that pool, and the member-walk
@@ -4331,14 +4415,13 @@ impl<'a> Engine<'a> {
             return false;
         };
         // The gate asks only about visible type aliases; every other head
-        // shape keeps its existing face.
-        if !matches!(
-            self.top_level_decl(name).as_deref(),
-            Some(decl) if decl.kind == MicroKind::TypeAlias
-        ) {
-            return false;
-        }
-        if self.alias_creation_grounded(name, 0) {
+        // shape keeps its existing face. A foreign alias (the declaring
+        // unit imported — `generic_inferrer.dart` invoking the imported
+        // `TypeConstraintFromArgument`) reaches through the scoped
+        // lookup: its TopDecl's `var_ty` carries the right-hand side's
+        // head as written, and the groundedness question decides over
+        // the graph-wide declaration face.
+        if self.alias_head_grounded(name) != Some(false) {
             return false;
         }
         let name_text = self.strings.resolve(name).to_string();
@@ -4627,18 +4710,10 @@ impl<'a> Engine<'a> {
                         (head.range.end() <= row.range.offset
                             && !head.qualified
                             && matches!(head.shape, RowShape::Bare(BareInfo::Plain { .. }))
-                            && matches!(
-                                self.top_level_decl(head.name).as_deref(),
-                                Some(decl) if decl.kind == MicroKind::TypeAlias
-                            )
-                            && !self.alias_creation_grounded(head.name, 0))
+                            && self.alias_head_grounded(head.name) == Some(false))
                         .then_some((head.name, head.range, false))
                     } else if matches!(row.shape, RowShape::Bare(BareInfo::Plain { .. }))
-                        && matches!(
-                            self.top_level_decl(row.name).as_deref(),
-                            Some(decl) if decl.kind == MicroKind::TypeAlias
-                        )
-                        && !self.alias_creation_grounded(row.name, 0)
+                        && self.alias_head_grounded(row.name) == Some(false)
                     {
                         Some((row.name, row.range, true))
                     } else {
@@ -6037,14 +6112,6 @@ impl<'a> Engine<'a> {
                 if self.fn_var_sigs.contains_key(&row.name) {
                     return;
                 }
-                let Ty::Named { name, .. } = ty else {
-                    return;
-                };
-                // A `Function`-typed value is the function-type supertype —
-                // callable.
-                if self.strings.resolve(*name) == "Function" {
-                    return;
-                }
                 // The callee that SPELLS a type alias (`DioMediaType(...)`)
                 // is a type used as a value: upstream resolves the
                 // identifier to the alias element and reports
@@ -6052,19 +6119,26 @@ impl<'a> Engine<'a> {
                 // (element_resolver.dart's function-invocation face). The
                 // row's own type is already the alias EXPANSION head
                 // (`Named(MediaType)` under `typedef DioMediaType =
-                // MediaType;`), so the question rides the source spelling;
-                // every other callee shape (a variable, a member) keeps its
-                // spelling and the leg below never fires for it.
+                // MediaType;`), so the question rides the source spelling —
+                // and a foreign alias's unresolvable expansion leaves the
+                // row's type `Unknown`, so the check precedes the named
+                // destructure; every other callee shape (a variable, a
+                // member) keeps its spelling and the leg below never fires
+                // for it.
                 if let Some(spelled) = self.bare_creation_head_name(row.range)
-                    && matches!(
-                        self.top_level_decl(spelled).as_deref(),
-                        Some(decl) if decl.kind == MicroKind::TypeAlias
-                    )
-                    && !self.alias_creation_grounded(spelled, 0)
+                    && self.alias_head_grounded(spelled) == Some(false)
                 {
                     let name_text = self.strings.resolve(spelled).to_string();
                     let range = row.range;
                     self.emit(SemanticCode::InvocationOfNonFunction, range, &name_text, "");
+                    return;
+                }
+                let Ty::Named { name, .. } = ty else {
+                    return;
+                };
+                // A `Function`-typed value is the function-type supertype —
+                // callable.
+                if self.strings.resolve(*name) == "Function" {
                     return;
                 }
                 // A parameterized function-type alias is callable the same
