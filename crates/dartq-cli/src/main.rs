@@ -2836,6 +2836,72 @@ mod tests {
         );
     }
 
+    /// The verb table's hidden faces and visible aliases, straight off the
+    /// clap command tree: `check`/`index`/`assists`/`daemon` are hidden
+    /// (protocol and compat faces), the primary names stay visible, and
+    /// `compatibility`/`resolve-at`/`completion` ride as aliases.
+    #[test]
+    fn hidden_verb_table_is_declared() {
+        use clap::CommandFactory as _;
+        let command = Cli::command();
+        let subcommand = |name: &str| {
+            command
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("`{name}` is declared"))
+                .clone()
+        };
+        for hidden in ["check", "index", "assists", "daemon"] {
+            assert!(subcommand(hidden).is_hide_set(), "`{hidden}` stays hidden");
+        }
+        for visible in ["analyze", "packages", "session", "events", "mcp", "query", "compat", "resolve", "complete"] {
+            assert!(!subcommand(visible).is_hide_set(), "`{visible}` stays visible");
+        }
+        assert!(
+            subcommand("compat").get_aliases().any(|alias| alias == "compatibility"),
+            "`compatibility` rides as an alias"
+        );
+        assert!(subcommand("resolve").get_aliases().any(|alias| alias == "resolve-at"));
+        assert!(subcommand("complete").get_aliases().any(|alias| alias == "completion"));
+    }
+
+    /// The output-format resolution: an absent `--format` falls to the
+    /// terminal's shape — the machine/JSON faces piped (the test harness
+    /// captures stdout, the non-TTY posture) — and an explicit `--format`
+    /// always wins on both faces that carry it.
+    #[test]
+    fn explicit_format_wins_over_the_non_tty_default() {
+        assert!(non_tty_stdout(), "the harness captures stdout (the piped posture)");
+        let analyze = |args: &[&str]| match parse_args_of(args) {
+            Ok(Some(Command::Analyze(args))) => args,
+            _ => panic!("expected analyze command"),
+        };
+        assert!(
+            matches!(analyze(&["analyze", "/p"]).effective_format(), AnalyzeFormat::Json),
+            "piped with no flag: the machine JSON envelope"
+        );
+        assert!(matches!(
+            analyze(&["analyze", "--format=machine", "/p"]).effective_format(),
+            AnalyzeFormat::Machine
+        ));
+        assert!(matches!(
+            analyze(&["analyze", "--format=default", "/p"]).effective_format(),
+            AnalyzeFormat::Default
+        ), "the human face stays human even piped");
+
+        let symbol = |args: &[&str]| match parse_args_of(args) {
+            Ok(Some(Command::Query(QueryArgs { face: QueryFace::Symbol(args) }))) => args,
+            _ => panic!("expected query symbol"),
+        };
+        assert!(
+            matches!(symbol(&["query", "symbol", "X"]).effective_format(), QueryFormat::Json),
+            "piped with no flag: JSON lines"
+        );
+        assert!(matches!(
+            symbol(&["query", "symbol", "--format=machine", "X"]).effective_format(),
+            QueryFormat::Machine
+        ));
+    }
+
     fn one_diag(severity: Severity) -> Diagnostic {
         let mut table = FileTable::new();
         let file = table.intern(Path::new("/c/lib/a.dart"));

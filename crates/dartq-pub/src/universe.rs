@@ -1031,4 +1031,221 @@ mod tests {
         );
         assert_eq!(report.packages.len(), 2, "the real dir registers, the alias does not");
     }
+
+    /// The other half of the symlink rule: a symlinked directory carrying
+    /// no pubspec registers nothing — the boundary exists only when a
+    /// package-shaped tree silently disappeared.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_dirs_without_a_pubspec_stay_silent() {
+        let root = temp_dir("symlink-bare");
+        write(&root.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
+        std::fs::create_dir_all(root.join("plain")).expect("mkdir");
+        std::os::unix::fs::symlink(root.join("plain"), root.join("alias")).expect("symlink");
+        let report = scan(&root, &ScanOptions::default());
+        assert!(
+            !report
+                .boundaries
+                .iter()
+                .any(|entry| entry.reason == BoundaryReason::SymlinkDir),
+            "no package hidden, no boundary: {:?}",
+            report.boundaries
+        );
+        assert_eq!(report.packages.len(), 1);
+    }
+
+    /// The probe's depth budget: a pubspec up to three directories inside
+    /// a pruned tree is found and named in the boundary's detail; one
+    /// deeper is beyond the budget and the tree stays silent.
+    #[test]
+    fn probe_depth_bounds_boundary_registration() {
+        let root = temp_dir("probe-depth");
+        write(&root.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
+        // Three levels below the hidden root: inside the budget.
+        write(&root.join(".dot").join("a").join("b").join("c").join("pubspec.yaml"),
+            "name: deep\nenvironment:\n  sdk: ^3.5.0\n");
+        let report = scan(&root, &ScanOptions::default());
+        let boundary = report
+            .boundaries
+            .iter()
+            .find(|entry| entry.dir == normalize(&root.join(".dot")))
+            .expect("the shallow-hidden pubspec is registered");
+        assert_eq!(boundary.reason, BoundaryReason::HiddenTree);
+        assert!(
+            boundary.detail.as_deref().unwrap_or_default().contains("pubspec.yaml"),
+            "the detail names the hidden pubspec: {:?}",
+            boundary.detail
+        );
+
+        // Four levels below: beyond the budget, silently pruned.
+        let deep = temp_dir("probe-deeper");
+        write(&deep.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
+        write(&deep.join(".dot").join("a").join("b").join("c").join("d").join("pubspec.yaml"),
+            "name: deeper\nenvironment:\n  sdk: ^3.5.0\n");
+        let report = scan(&deep, &ScanOptions::default());
+        assert!(
+            !report
+                .boundaries
+                .iter()
+                .any(|entry| entry.dir == normalize(&deep.join(".dot"))),
+            "beyond PROBE_DEPTH the tree is not registered: {:?}",
+            report.boundaries
+        );
+    }
+
+    /// The probe's width budget: a pruned tree with more than
+    /// [`PROBE_DIRS`] directories to visit stops the search (nothing
+    /// package-shaped is reported), while a wide-but-within-budget tree
+    /// still finds a pubspec in its last-sorted corner.
+    #[test]
+    fn probe_width_budget_bounds_the_search() {
+        let root = temp_dir("probe-wide");
+        write(&root.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
+        let hidden = root.join(".dot");
+        for index in 0..70 {
+            std::fs::create_dir_all(hidden.join(format!("d{index:02}"))).expect("mkdir");
+        }
+        let report = scan(&root, &ScanOptions::default());
+        assert!(
+            !report
+                .boundaries
+                .iter()
+                .any(|entry| entry.dir == normalize(&hidden)),
+            "the budget stops the search: {:?}",
+            report.boundaries
+        );
+
+        let wide = temp_dir("probe-wide-ok");
+        write(&wide.join("pubspec.yaml"), "name: outer\nenvironment:\n  sdk: ^3.5.0\n");
+        let hidden = wide.join(".dot");
+        for index in 0..60 {
+            std::fs::create_dir_all(hidden.join(format!("d{index:02}"))).expect("mkdir");
+        }
+        write(&hidden.join("zz").join("pubspec.yaml"), "name: z\nenvironment:\n  sdk: ^3.5.0\n");
+        let report = scan(&wide, &ScanOptions::default());
+        assert!(
+            report
+                .boundaries
+                .iter()
+                .any(|entry| entry.dir == normalize(&hidden) && entry.detail.is_some()),
+            "within the budget the sweep reaches the last corner: {:?}",
+            report.boundaries
+        );
+    }
+
+    /// Include and exclude combine: exclude prunes the walk (a pruned tree
+    /// registers as a boundary and its packages never list, include
+    /// cannot resurrect them), include narrows the report.
+    #[test]
+    fn include_and_exclude_combine() {
+        let root = temp_dir("combine");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - pkgs/a\n",
+        );
+        write(&root.join("pkgs").join("a").join("pubspec.yaml"),
+            "name: a\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n");
+        // One level inside the pruned tree — the boundary probe searches
+        // the pruned dir's children, matching the other prune fixtures.
+        write(&root.join("vendor").join("fixture").join("pkg").join("pubspec.yaml"),
+            "name: fixture\nenvironment:\n  sdk: ^3.5.0\n");
+        let scan_options = ScanOptions {
+            include: vec![Glob::new("pkgs/**").expect("glob"), Glob::new("vendor/fixture").expect("glob")],
+            exclude: vec![Glob::new("vendor/fixture").expect("glob")],
+        };
+        let report = scan(&root, &scan_options);
+        assert_eq!(
+            report
+                .packages
+                .iter()
+                .map(|entry| entry.name.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("a")],
+            "the excluded tree never lists, include cannot resurrect it"
+        );
+        assert!(
+            report
+                .boundaries
+                .iter()
+                .any(|entry| entry.dir == normalize(&root.join("vendor").join("fixture"))
+                    && entry.reason == BoundaryReason::ExcludedTree
+                    && entry.detail.is_some()),
+            "the pruned pubspec is a boundary with its detail: {:?}",
+            report.boundaries
+        );
+    }
+
+    /// An orphan member — `resolution: workspace` no root accepts — is
+    /// the ladder's refusal, from its own directory and from below it:
+    /// the pubspec exists but no universe answers, which is the
+    /// navigation error the caller renders.
+    #[test]
+    fn orphan_member_universe_is_the_refusal() {
+        let root = temp_dir("orphan-ladder");
+        write(&root.join("pkg").join("pubspec.yaml"),
+            "name: pkg\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n");
+        for from in [root.join("pkg"), root.join("pkg").join("lib")] {
+            assert!(
+                matches!(enclosing_universe(&from), Err(PubError::OrphanMember(_))),
+                "the orphan refuses from {}",
+                from.display()
+            );
+        }
+    }
+
+    /// The resolved-state fast path falls through to the declarative walk
+    /// on every unverifiable ref: no `workspaceRoot` key, a root without
+    /// a pubspec — the ladder's answer is byte-identical to running
+    /// without the ref.
+    #[test]
+    fn ref_fast_path_falls_through_on_unverifiable_refs() {
+        let root = temp_dir("ref-fallthrough");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - pkg_a\n",
+        );
+        write(
+            &root.join("pkg_a").join("pubspec.yaml"),
+            "name: pkg_a\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
+        let from = root.join("pkg_a");
+        let expected = enclosing_universe(&from).expect("universe").root;
+        let reference = from.join(".dart_tool").join("pub").join("workspace_ref.json");
+        write(&reference, "{}");
+        assert_eq!(enclosing_universe(&from).expect("universe").root, expected, "no key: ignored");
+        write(&reference, r#"{"workspaceRoot":"../../empty"}"#);
+        assert_eq!(
+            enclosing_universe(&from).expect("universe").root,
+            expected,
+            "a ref naming a pubspec-less dir is ignored"
+        );
+    }
+
+    /// A scan root without a pubspec of its own is a vantage point, not a
+    /// work point: its children's universes list, the hidden trees under
+    /// it register, and the root itself never appears as a package.
+    #[test]
+    fn bare_scan_root_lists_child_packages() {
+        let root = temp_dir("bare-root");
+        write(&root.join("app").join("pubspec.yaml"), "name: app\nenvironment:\n  sdk: ^3.5.0\n");
+        write(&root.join(".dot").join("pkg").join("pubspec.yaml"),
+            "name: dot\nenvironment:\n  sdk: ^3.5.0\n");
+        let report = scan(&root, &ScanOptions::default());
+        assert_eq!(report.root, normalize(&root));
+        assert_eq!(report.packages.len(), 1);
+        assert_eq!(report.packages[0].name.as_deref(), Some("app"));
+        assert!(
+            !report.packages.iter().any(|entry| entry.dir == normalize(&root)),
+            "the bare root is not a package"
+        );
+        assert!(
+            report
+                .boundaries
+                .iter()
+                .any(|entry| entry.dir == normalize(&root.join(".dot"))
+                    && entry.reason == BoundaryReason::HiddenTree),
+            "the hidden tree registers: {:?}",
+            report.boundaries
+        );
+    }
 }

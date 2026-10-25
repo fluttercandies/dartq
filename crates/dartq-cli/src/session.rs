@@ -582,4 +582,128 @@ pub(crate) mod tests {
         assert!(!layout.state.exists(), "the state was removed at reap");
         std::fs::remove_dir_all(&root).ok();
     }
+
+    /// The subverb grammar: `start` defaults to the cwd with no SDK flag,
+    /// `stop` takes `--all`, `serve` requires both `--dir` and `--sdk`
+    /// (it is the machine-facing spawn, not a human verb), and an unknown
+    /// subverb is the clap usage error.
+    #[test]
+    fn session_subverbs_parse() {
+        // `derive(Args)` brings no `try_parse_from`; parse through the
+        // augmented command the parent `Cli` would splice in.
+        let parse = |args: &[&str]| -> Result<SessionArgs, clap::Error> {
+            let command = <SessionArgs as clap::Args>::augment_args(clap::Command::new("session"));
+            let matches = command
+                .try_get_matches_from(std::iter::once("session").chain(args.iter().copied()))?;
+            <SessionArgs as clap::FromArgMatches>::from_arg_matches(&matches)
+        };
+        let start = parse(&["start"]).expect("parse");
+        match &start.command {
+            SessionCommand::Start(args) => {
+                assert_eq!(args.dir, PathBuf::from("."));
+                assert_eq!(args.sdk, None);
+            }
+            _ => panic!("expected start"),
+        }
+        let start = parse(&["start", "/w", "--sdk", "/s"]).expect("parse");
+        match &start.command {
+            SessionCommand::Start(args) => {
+                assert_eq!(args.dir, PathBuf::from("/w"));
+                assert_eq!(args.sdk, Some(PathBuf::from("/s")));
+            }
+            _ => panic!("expected start"),
+        }
+        assert!(matches!(parse(&["status"]).expect("parse").command, SessionCommand::Status));
+        let stop = parse(&["stop"]).expect("parse");
+        match &stop.command {
+            SessionCommand::Stop(args) => {
+                assert_eq!(args.dir, PathBuf::from("."));
+                assert!(!args.all);
+            }
+            _ => panic!("expected stop"),
+        }
+        let stop = parse(&["stop", "--all", "/w"]).expect("parse");
+        match &stop.command {
+            SessionCommand::Stop(args) => {
+                assert!(args.all);
+                assert_eq!(args.dir, PathBuf::from("/w"));
+            }
+            _ => panic!("expected stop"),
+        }
+        let serve = parse(&["serve", "--dir", "/w", "--sdk", "/s"]).expect("parse");
+        assert!(
+            matches!(&serve.command, SessionCommand::Serve(args) if args.dir == PathBuf::from("/w") && args.sdk == PathBuf::from("/s"))
+        );
+        assert!(parse(&["serve"]).is_err(), "serve requires its flags");
+        assert!(parse(&["bogus"]).is_err());
+    }
+
+    /// The SDK root order: the flag wins, `$DART_SDK` answers when the
+    /// flag is absent, and neither is the navigation error.
+    #[test]
+    fn resolved_sdk_root_flag_then_env_then_error() {
+        let flag = resolved_sdk_root(Some(Path::new("/flag")));
+        assert_eq!(flag, Ok(PathBuf::from("/flag")));
+        let saved = std::env::var_os("DART_SDK");
+        unsafe { std::env::set_var("DART_SDK", "/env/sdk"); }
+        assert_eq!(resolved_sdk_root(None), Ok(PathBuf::from("/env/sdk")));
+        assert_eq!(
+            resolved_sdk_root(Some(Path::new("/flag"))),
+            Ok(PathBuf::from("/flag")),
+            "the flag still wins over the environment"
+        );
+        unsafe { std::env::remove_var("DART_SDK"); }
+        let error = resolved_sdk_root(None).expect_err("no sdk source");
+        assert!(error.contains("DART_SDK"), "{error}");
+        if let Some(saved) = saved {
+            unsafe { std::env::set_var("DART_SDK", saved); }
+        }
+    }
+
+    /// One `stop` of a live record: the process dies, the socket, the
+    /// state file, and the registry entry all go, and the caller learns
+    /// it left.
+    #[test]
+    fn stop_one_terminates_and_cleans_every_artifact() {
+        let home = std::env::temp_dir().join(format!("dqs-stop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("dir");
+        let registry = Registry::at(&home.join("sessions"));
+        let root = home.join("w");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let triple = SessionTriple::compute(&root, &root);
+        let listener = UnixListener::bind(&layout.socket).expect("bind");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    break;
+                }
+            }
+        });
+        let child = std::process::Command::new("sleep").arg("30").spawn().expect("sleep child");
+        let state = SessionState { pid: child.id(), heartbeat_ms: SessionState::now_ms(), triple: triple.clone() };
+        state.write(&layout).expect("state");
+        let record = Record { id: triple.identity(), state };
+        registry.upsert(&record).expect("upsert");
+        assert!(layout.socket.exists() && layout.state.exists());
+        // In production the serve process's parent is init (detached), so
+        // termination reaps promptly; in the harness the test process is
+        // the parent, and a zombie still answers kill(pid, 0) — the
+        // boolean is therefore not asserted here, the delivery is.
+        let _ = stop_one(&registry, &record);
+        let mut child = child;
+        let exited = child.try_wait().expect("waitable").expect("the SIGTERM reached the server");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(exited.signal(), Some(libc::SIGTERM), "{exited:?}");
+        }
+        assert!(!layout.socket.exists(), "socket removed");
+        assert!(!layout.state.exists(), "state removed");
+        assert!(registry.list().is_empty(), "the registry entry dropped");
+        // A dead pid answers gone immediately.
+        assert!(wait_gone(u32::MAX - 1));
+        std::fs::remove_dir_all(&home).ok();
+    }
 }

@@ -621,4 +621,200 @@ mod tests {
         let _ = server.join();
         std::fs::remove_dir_all(&root).ok();
     }
+
+    /// The tool table behind `tools/list`: names are unique, every daemon
+    /// tool maps to a `dartq/*` method, and the served shape carries the
+    /// permissive object schema (the daemon owns the parameter contracts).
+    #[test]
+    fn tool_table_is_well_formed() {
+        let mut names: Vec<&str> = TOOLS.iter().map(|tool| tool.name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "tool names are unique");
+        assert!(TOOLS.len() >= 20, "{} tools", TOOLS.len());
+        for tool in TOOLS {
+            if let ToolKind::Daemon(method) = tool.kind {
+                assert!(method.starts_with("dartq/"), "{} maps to a daemon method", tool.name);
+            }
+            let shape = tool_shape(tool);
+            assert_eq!(shape["name"], tool.name);
+            assert_eq!(shape["description"], tool.description);
+            assert_eq!(shape["inputSchema"]["type"], "object");
+            assert_eq!(shape["inputSchema"]["additionalProperties"], true);
+        }
+    }
+
+    /// The wire's noise discipline: a line that is not JSON and a
+    /// notification (no id) answer nothing; the next real request still
+    /// gets its answer, and EOF ends the loop cleanly.
+    #[test]
+    fn malformed_lines_and_notifications_answer_nothing() {
+        let root = std::env::temp_dir().join(format!("dqs-mcp-noise-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("dir");
+        let mcp = Mcp { layout: Layout::new(&root), root: root.clone(), session: Err("standalone".into()) };
+        let input = concat!(
+            "this line is not json\n",
+            "\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}\n",
+        );
+        let mut output = Vec::new();
+        let code = serve(Cursor::new(input.as_bytes().to_vec()), &mut output, &mcp).expect("serve");
+        assert_eq!(code, exit::CLEAN);
+        let lines: Vec<Value> = String::from_utf8(output)
+            .expect("utf-8")
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(lines.len(), 1, "only the ping answered: {lines:?}");
+        assert_eq!(lines[0]["id"], 9);
+        assert!(lines[0]["result"].as_object().is_some());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Unknown methods and unknown resources answer the protocol's usage
+    /// errors (-32601, -32602) with the offending name in the message.
+    #[test]
+    fn unknown_method_and_resource_answer_protocol_errors() {
+        let root = std::env::temp_dir().join(format!("dqs-mcp-unknown-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("dir");
+        let mcp = Mcp { layout: Layout::new(&root), root: root.clone(), session: Err("standalone".into()) };
+        let answers = drive(
+            &mcp,
+            &[
+                json!({"jsonrpc": "2.0", "id": 1, "method": "workspace/symbol", "params": {}}),
+                json!({"jsonrpc": "2.0", "id": 2, "method": "resources/read",
+                       "params": {"uri": "dartq://nope"}}),
+                json!({"jsonrpc": "2.0", "id": 3, "method": "resources/list"}),
+            ],
+        );
+        let answer = |id: u64| {
+            answers
+                .iter()
+                .find(|value| value["id"].as_u64() == Some(id))
+                .unwrap_or_else(|| panic!("answer {id}: {answers:?}"))
+                .clone()
+        };
+        assert_eq!(answer(1)["error"]["code"], -32601);
+        assert!(
+            answer(1)["error"]["message"].as_str().unwrap_or_default().contains("workspace/symbol"),
+            "the message names the method"
+        );
+        assert_eq!(answer(2)["error"]["code"], -32602, "an unknown resource is a usage error");
+        let resources = answer(3)["result"]["resources"].as_array().cloned().expect("resources");
+        assert_eq!(resources[0]["uri"], STATUS_URI);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A tools/call carrying `_meta.progressToken` is bracketed by MCP
+    /// progress notifications (0 before the work, 1 after), in output
+    /// order ahead of the answer; without a token no notification rides
+    /// the stream.
+    #[test]
+    fn progress_token_brackets_a_tool_call() {
+        let root = std::env::temp_dir().join(format!("dqs-mcp-progress-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("dir");
+        let mcp = Mcp { layout: Layout::new(&root), root: root.clone(), session: Err("read-only checkout".into()) };
+        let mut input = String::new();
+        input.push_str(
+            &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "dartq_analyze", "arguments": {},
+                               "_meta": {"progressToken": "tok-7"}}})
+                .to_string(),
+        );
+        input.push('\n');
+        input.push_str(
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "dartq_events", "arguments": {"handle": "progress"}}})
+                .to_string(),
+        );
+        input.push('\n');
+        let mut output = Vec::new();
+        serve(Cursor::new(input.into_bytes()), &mut output, &mcp).expect("serve");
+        let lines: Vec<Value> = String::from_utf8(output)
+            .expect("utf-8")
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let progress: Vec<&Value> = lines
+            .iter()
+            .filter(|value| value["method"].as_str() == Some("notifications/progress"))
+            .collect();
+        assert_eq!(progress.len(), 2, "exactly the token-carrying call brackets: {lines:?}");
+        for (index, value) in progress.iter().enumerate() {
+            assert_eq!(value["params"]["progressToken"], "tok-7");
+            assert_eq!(value["params"]["progress"], index as u64, "0 then 1, in order");
+            assert_eq!(value["params"]["total"], 1);
+        }
+        // The notifications precede their call's answer.
+        let answer_position = lines
+            .iter()
+            .position(|value| value["id"].as_u64() == Some(1))
+            .expect("answer 1");
+        assert!(
+            lines[..answer_position].iter().any(|value| value["method"].as_str() == Some("notifications/progress")),
+            "the bracket opens before the answer rides the stream"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// One daemon frame over a socketpair: headers parse case-insensitively,
+    /// the body must be JSON, and a frame without Content-Length is the
+    /// usage error string.
+    #[test]
+    fn read_frame_parses_headers_and_rejects_missing_length() {
+        let (mut mine, mut theirs) = UnixStream::pair().expect("socketpair");
+        let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+        write!(mine, "Content-Type: application/json\r\ncontent-length: {}\r\n\r\n{}", body.len(), body)
+            .expect("write frame");
+        mine.flush().expect("flush");
+        let answer = read_frame(&mut theirs).expect("frame");
+        assert_eq!(answer["result"]["ok"], true);
+        write!(mine, "X-Other: 1\r\n\r\nno length").expect("write headerless");
+        mine.flush().expect("flush");
+        assert_eq!(read_frame(&mut theirs), Err("missing Content-Length".to_owned()));
+    }
+
+    /// The rename target grammar splits from the right, so a Windows-style
+    /// drive path keeps its colon; every other shape is the usage error.
+    #[test]
+    fn parse_target_splits_from_the_right() {
+        let ok = |spec: &str| parse_target(spec).expect("target");
+        assert_eq!(ok("lib/a.dart:3:7"), (PathBuf::from("lib/a.dart"), 3, 7));
+        assert_eq!(ok("/w/a.dart:1:2"), (PathBuf::from("/w/a.dart"), 1, 2));
+        assert_eq!(ok("C:\\a.dart:1:2"), (PathBuf::from("C:\\a.dart"), 1, 2));
+        for bad in ["a.dart", "a.dart:1", "a.dart:x:2", ":1:2", ""] {
+            assert!(parse_target(bad).is_err(), "`{bad}` must be refused");
+        }
+    }
+
+    /// The events tool is a local face: without a session it still reads
+    /// the event log (handle filtering, since/limit) and the progress
+    /// snapshot, and an unknown handle is the usage error.
+    #[test]
+    fn events_tool_reads_local_faces_without_a_session() {
+        let root = std::env::temp_dir().join(format!("dqs-mcp-events-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("dir");
+        let layout = Layout::new(&root);
+        let log = EventLog::new(&layout);
+        log.append("session", "serving", json!({})).expect("append");
+        log.append("session", "client_attached", json!({})).expect("append");
+        let mcp = Mcp { layout, root: root.clone(), session: Err("read-only checkout".into()) };
+
+        let events = events_call(&json!({}), &mcp).expect("default handle is session");
+        assert_eq!(events["events"].as_array().expect("events").len(), 2);
+        let tail = events_call(&json!({"since": 1, "limit": 10}), &mcp).expect("cursor read");
+        assert_eq!(tail["events"].as_array().expect("events").len(), 1);
+        let limited = events_call(&json!({"limit": 1}), &mcp).expect("limit read");
+        assert_eq!(limited["events"].as_array().expect("events").len(), 1);
+
+        let progress = events_call(&json!({"handle": "progress"}), &mcp).expect("progress");
+        assert_eq!(progress["files_scanned"], 0, "no trace in this tree");
+
+        let error = events_call(&json!({"handle": "bogus"}), &mcp).expect_err("unknown handle");
+        assert!(error.contains("unknown handle"), "{error}");
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

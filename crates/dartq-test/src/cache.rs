@@ -1690,9 +1690,39 @@ mod tests {
         let second = cache.rekey(&suites, runner(&bin)).expect("keys");
         assert_eq!(second[0], first[0], "a suite without the read is untouched");
         assert_ne!(second[1], first[1], "the reader re-keys");
+        // Removing the variable re-keys again: presence is part of the key.
+        unsafe { std::env::remove_var("dartq_probe_read"); }
+        assert_ne!(cache.rekey(&suites, runner(&bin)).expect("keys")[1], second[1]);
+        unsafe { std::env::remove_var("dartq_probe_ambient"); }
+    }
+
+    /// The base key's environment half is the toolchain's alone: IDE and
+    /// terminal noise (`VSCODE_*`, `TERM_PROGRAM`) never enters a key, so
+    /// a terminal switch or an editor restart never invalidates replay —
+    /// a variable joins only through a closure's literal read.
+    #[test]
+    fn base_key_ignores_ide_terminal_noise() {
+        let (tmp, root) = fixture();
+        let bin = root.join("pubspec.yaml");
+        let suites = vec![root.join("test/a_test.dart")];
+        let mut cache = Cache::with_store(&root, tmp.path().join("store"));
         unsafe {
-            std::env::remove_var("dartq_probe_read");
-            std::env::remove_var("dartq_probe_ambient");
+            std::env::set_var("VSCODE_DARTQ_PROBE", "one");
+            std::env::set_var("TERM_PROGRAM_DARTQ", "terminal-a");
+        }
+        let first = cache.keys(&suites, runner(&bin)).expect("keys");
+        unsafe {
+            std::env::set_var("VSCODE_DARTQ_PROBE", "two");
+            std::env::set_var("TERM_PROGRAM_DARTQ", "terminal-b");
+        }
+        assert_eq!(
+            cache.rekey(&suites, runner(&bin)).expect("keys"),
+            first,
+            "terminal and editor noise is not an input"
+        );
+        unsafe {
+            std::env::remove_var("VSCODE_DARTQ_PROBE");
+            std::env::remove_var("TERM_PROGRAM_DARTQ");
         }
     }
 }

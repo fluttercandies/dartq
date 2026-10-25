@@ -811,6 +811,72 @@ mod tests {
         assert_ne!(a.identity(), SessionTriple::compute(&root, &sdk).identity());
     }
 
+    /// Unreadable identity inputs key as facts, not failures: an SDK root
+    /// without a `version` file keys the empty string (stably — the SDK
+    /// identity is "no version file", shared by every such SDK), no
+    /// `.fvmrc` keys `None`, and the running binary always hashes (the
+    /// test binary is readable).
+    #[test]
+    fn unreadable_identity_inputs_key_as_empty_facts() {
+        let root = temp("bare-sdk");
+        let sdk = temp("sdk-noversion");
+        let triple = SessionTriple::compute(&root, &sdk);
+        assert_eq!(triple.sdk_version, "", "a missing version file keys empty");
+        assert_eq!(triple.fvmrc, None, "no .fvmrc keys None");
+        assert!(!triple.binary_hash.is_empty(), "the binary always hashes");
+        assert_eq!(
+            triple.identity(),
+            SessionTriple::compute(&root, &sdk).identity(),
+            "the facts are stable"
+        );
+        // An empty .fvmrc is a present fact — a different identity from
+        // an absent one.
+        write(&root.join(".fvmrc"), "");
+        assert_ne!(triple.identity(), SessionTriple::compute(&root, &sdk).identity());
+    }
+
+    /// The root leg of the triple is the realpath: two spellings of one
+    /// worktree (one through a symlink) are one session, never two.
+    #[test]
+    fn triple_root_resolves_symlinks() {
+        let real = temp("real-root");
+        let link = PathBuf::from("/tmp").join(format!("dqs-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&link);
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let sdk = temp("sdk-link");
+        let through_link = SessionTriple::compute(&link, &sdk);
+        assert_eq!(through_link.root, real.canonicalize().expect("canonical"));
+        assert_eq!(
+            through_link.identity(),
+            SessionTriple::compute(&real, &sdk).identity(),
+            "both spellings are one session"
+        );
+        let _ = std::fs::remove_file(&link);
+    }
+
+    /// The state file round-trips through JSON; a malformed or absent
+    /// state is `None` — stale, the takeover path, never a failure.
+    #[test]
+    fn state_round_trips_and_malformed_state_is_stale() {
+        let root = temp("state");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        assert!(SessionState::read(&layout).is_none(), "absent state");
+        let state = SessionState {
+            pid: std::process::id(),
+            heartbeat_ms: 123_456,
+            triple: SessionTriple::compute(&root, &root),
+        };
+        state.write(&layout).expect("write");
+        assert_eq!(SessionState::read(&layout).as_ref(), Some(&state));
+        // No temp file residue from the atomic write.
+        assert!(!layout.dir.join(".state.json.tmp").exists());
+        write(&layout.state, "{ not json");
+        assert!(SessionState::read(&layout).is_none(), "malformed state is stale");
+        // A heartbeat is a positive millisecond timestamp.
+        assert!(SessionState::now_ms() > 1_000_000_000_000);
+    }
+
     #[test]
     fn ensure_attaches_a_live_session_without_respawning() {
         let root = temp("live");
@@ -857,14 +923,121 @@ mod tests {
 
     #[test]
     fn ensure_degrades_on_an_unwritable_tree() {
-        // A *file* where the session directory must be: `.dart_tool` as
-        // a file (a read-only checkout's reliable, portable stand-in).
+        // A *file* where the session directory must be: `.dart_tool` as a
+        // file (a read-only checkout's reliable, portable stand-in).
         let parent = temp("ro");
         std::fs::create_dir_all(&parent).expect("mkdir");
         write(&parent.join(".dart_tool"), "a file");
         match ensure(&parent, &parent, &|_, _| Ok(())) {
             Ensured::Standalone(reason) => assert!(reason.contains("cannot"), "{reason}"),
             Ensured::Attached(_) => panic!("no session can live in this tree"),
+        }
+    }
+
+    /// The loser of a live election: another starter holds the lock and is
+    /// bringing the server up; the loser waits for the socket and attaches
+    /// to the winner's state — it never spawns a second server.
+    #[test]
+    fn election_loser_waits_for_the_winner_and_attaches() {
+        let root = temp("loser");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let guard = match flock_exclusive(&layout.elect) {
+            Ok(guard) => guard,
+            Err(_) => panic!("the test must hold the election lock"),
+        };
+        let winner_dir = root.clone();
+        let winner = std::thread::spawn(move || {
+            // The winner's bring-up takes a moment; the loser must poll
+            // the socket, not fail fast.
+            std::thread::sleep(Duration::from_millis(300));
+            let triple = SessionTriple::compute(&winner_dir, &winner_dir);
+            let layout = Layout::new(&winner_dir);
+            bring_up(&layout, &triple);
+        });
+        let spawns = std::cell::Cell::new(0);
+        match ensure(&root, &root, &|_, _| {
+            spawns.set(spawns.get() + 1);
+            Ok(())
+        }) {
+            Ensured::Attached(state) => {
+                assert_eq!(state.triple, SessionTriple::compute(&root, &root));
+                assert_eq!(state.pid, std::process::id());
+            }
+            Ensured::Standalone(reason) => panic!("the loser attaches: {reason}"),
+        }
+        assert_eq!(spawns.get(), 0, "the loser never spawns a rival server");
+        winner.join().expect("winner thread");
+        drop(guard);
+    }
+
+    /// A live pid under a *foreign* triple (an upgraded binary, an FVM
+    /// switch) and a live pid over a dead socket are both stale sessions:
+    /// taken over — socket and state replaced, the new server spawned
+    /// exactly once.
+    #[test]
+    fn ensure_takes_over_foreign_triples_and_dead_sockets() {
+        // A live pid, but a triple from another binary generation.
+        let root = temp("foreign");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let current = SessionTriple::compute(&root, &root);
+        let foreign = SessionTriple { binary_hash: "another-binary".to_owned(), ..current.clone() };
+        // A socket answers (a live server), but the state names a foreign
+        // triple: an upgrade left the old server behind.
+        bring_up(&layout, &current);
+        SessionState { pid: std::process::id(), heartbeat_ms: 0, triple: foreign }
+            .write(&layout)
+            .expect("state");
+        let spawns = std::cell::Cell::new(0);
+        match ensure(&root, &root, &|spawn_layout, spawn_triple| {
+            spawns.set(spawns.get() + 1);
+            bring_up(spawn_layout, spawn_triple);
+            Ok(())
+        }) {
+            Ensured::Attached(state) => assert_eq!(state.triple, current),
+            Ensured::Standalone(reason) => panic!("takeover: {reason}"),
+        }
+        assert_eq!(spawns.get(), 1, "the foreign session was replaced once");
+
+        // A live pid with a matching triple but a socket nobody answers.
+        let root = temp("deadsock");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let triple = SessionTriple::compute(&root, &root);
+        SessionState { pid: std::process::id(), heartbeat_ms: 0, triple: triple.clone() }
+            .write(&layout)
+            .expect("state");
+        write(&layout.socket, ""); // a socket file, no listener
+        match ensure(&root, &root, &|spawn_layout, spawn_triple| {
+            bring_up(spawn_layout, spawn_triple);
+            Ok(())
+        }) {
+            Ensured::Attached(state) => assert_eq!(state.triple, triple),
+            Ensured::Standalone(reason) => panic!("takeover: {reason}"),
+        }
+    }
+
+    /// A spawn that never listens degrades to standalone with the reason
+    /// (the caller runs in-process); a spawn error carries the error.
+    #[test]
+    fn ensure_degrades_when_the_spawn_never_listens_or_fails() {
+        let root = temp("nolisten");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        match ensure(&root, &root, &|_, _| Ok(())) {
+            Ensured::Standalone(reason) => {
+                assert!(reason.contains("never listened"), "{reason}")
+            }
+            Ensured::Attached(_) => panic!("nothing listened"),
+        }
+        let root = temp("spawnfail");
+        Layout::new(&root).create().expect("layout");
+        match ensure(&root, &root, &|_, _| Err(io::Error::other("no exec"))) {
+            Ensured::Standalone(reason) => {
+                assert!(reason.contains("spawning") && reason.contains("no exec"), "{reason}")
+            }
+            Ensured::Attached(_) => panic!("the spawn failed"),
         }
     }
 
@@ -890,6 +1063,60 @@ mod tests {
         assert_eq!(log.read(Some("test:1"), 0, 10).len(), 1);
         assert_eq!(log.read(None, 0, 1).len(), 1);
         assert!(log.read(None, second, 10).is_empty(), "nothing past the head");
+    }
+
+    /// The handle namespaces the log: `session`, `test:<id>`, `debug:<id>`
+    /// events coexist; the read filters on the exact handle string.
+    #[test]
+    fn event_log_namespaces_by_handle() {
+        let root = temp("handles");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let log = EventLog::new(&layout);
+        for (handle, event) in [("session", "serving"), ("test:1", "started"), ("test:2", "started"), ("debug:1", "launched"), ("session", "client_attached")] {
+            log.append(handle, event, serde_json::json!({})).expect("append");
+        }
+        let of = |handle: &str| {
+            log.read(Some(handle), 0, 10)
+                .into_iter()
+                .map(|(seq, value)| (seq, value["event"].as_str().unwrap_or_default().to_owned()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            of("session"),
+            [(1, "serving".to_owned()), (5, "client_attached".to_owned())]
+        );
+        assert_eq!(of("test:1"), [(2, "started".to_owned())]);
+        assert_eq!(of("test:2"), [(3, "started".to_owned())]);
+        assert_eq!(of("debug:1"), [(4, "launched".to_owned())]);
+        // An exact-string filter: no prefix or substring accidents.
+        assert!(of("test:").is_empty() && of("debug").is_empty());
+    }
+
+    /// Past [`EVENT_LOG_MAX_BYTES`] the log rewrites keeping the newest
+    /// half: sequences stay monotonic, a cursor inside the kept half
+    /// survives, and the dropped half is gone.
+    #[test]
+    fn event_log_trims_to_the_newest_half() {
+        let root = temp("trim");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let log = EventLog::new(&layout);
+        let blob = "x".repeat(60_000);
+        let mut last = 0;
+        for _ in 0..20 {
+            last = log.append("session", "noise", serde_json::json!({"blob": &blob})).expect("append");
+        }
+        assert_eq!(log.head_seq(), last, "sequence numbers survive the rewrite");
+        let size = std::fs::metadata(&layout.dir.join("events.jsonl")).expect("meta").len();
+        assert!(size <= EVENT_LOG_MAX_BYTES, "the trim brought the log under the cap ({size})");
+        let kept = log.read(None, 0, usize::MAX);
+        let first = kept.first().expect("the newest half survives").0;
+        assert!(first > 1, "the older half was dropped (first kept seq {first})");
+        assert_eq!(kept.last().expect("tail").0, last);
+        assert_eq!(kept.len() as u64, last - first + 1, "a contiguous newest half");
+        // A cursor inside the kept half still paginates from itself.
+        assert_eq!(log.read(None, first, usize::MAX).len(), kept.len() - 1);
     }
 
     #[test]
@@ -924,6 +1151,53 @@ mod tests {
         assert_eq!(progress.current_package.as_deref(), Some("a"), "path-derived, kept");
         // Absent trace: zero progress, not an error.
         assert_eq!(Progress::from_trace(&dir.join("gone.jsonl")), Progress::default());
+    }
+
+    /// The derivation branches of the trace walk: garbage lines and
+    /// non-analysis events never count, `file://` spellings derive the
+    /// package root like plain paths, the toolchain's own `lib/` carries
+    /// no package signal (the last derivable package stays), and a
+    /// URI-less event updates nothing but the scan count.
+    #[test]
+    fn progress_walks_only_analysis_events() {
+        let dir = temp("branches");
+        let trace = dir.join("trace.jsonl");
+        std::fs::write(
+            &trace,
+            "this line is not json
+             {\"event\":\"OverlayApplied\",\"uri\":\"package:nobody/overlay.dart\"}
+             {\"event\":\"LibraryAnalyzed\",\"uri\":\"file:///w/p/lib/a.dart\",\"from_cache\":true}
+             {\"event\":\"LibraryAnalyzed\",\"uri\":\"/sdk/lib/core/core.dart\"}
+             {\"event\":\"LibraryAnalyzed\",\"uri\":\"package:x/y.dart\",\"from_cache\":true}
+             {\"event\":\"LibraryAnalyzed\",\"from_cache\":false}
+            ",
+        )
+        .expect("write");
+        let progress = Progress::from_trace(&trace);
+        assert_eq!(progress.files_scanned, 4, "every LibraryAnalyzed event counts");
+        assert_eq!(progress.from_cache, 2);
+        assert_eq!(
+            progress.current.as_deref(),
+            Some("package:x/y.dart"),
+            "the URI-less event updated neither current nor the package"
+        );
+        assert_eq!(
+            progress.current_package.as_deref(),
+            Some("x"),
+            "the sdk's own lib carried no package signal; the last derivable one stays"
+        );
+
+        // The `sdk` filter is by path segment: a workspace package named
+        // anything else under a lib/ still derives.
+        std::fs::write(
+            &trace,
+            "{\"event\":\"LibraryAnalyzed\",\"uri\":\"/w/sdk/lib/a.dart\"}
+             {\"event\":\"LibraryAnalyzed\",\"uri\":\"/w/my_sdk/lib/b.dart\"}
+            ",
+        )
+        .expect("rewrite");
+        let progress = Progress::from_trace(&trace);
+        assert_eq!(progress.current_package.as_deref(), Some("my_sdk"), "only the exact segment `sdk` is filtered");
     }
 
     #[test]
@@ -986,5 +1260,55 @@ mod tests {
         // remove() drops one root's records.
         registry.remove(&a.state.triple.root);
         assert_eq!(registry.list().len(), 1);
+    }
+
+    /// The session cap: past [`SESSION_CAP`] live sessions the
+    /// least-recently-heartbeat dies first, in heartbeat order, and its
+    /// record leaves the registry; the survivors stay.
+    #[test]
+    fn registry_evicts_least_recently_heartbeat_past_the_cap() {
+        let home = temp("cap");
+        let registry = Registry::at(&home.join("sessions"));
+        let record = |tag: &str, heartbeat: u128| {
+            let root = temp(tag);
+            let layout = Layout::new(&root);
+            layout.create().expect("layout");
+            let triple = SessionTriple { root: root.clone(), sdk_root: root.clone(), sdk_version: String::new(), fvmrc: None, binary_hash: "bin".to_owned() };
+            let pid = bring_up_child(&layout, &triple);
+            Record { id: triple.identity(), state: SessionState { pid, heartbeat_ms: heartbeat, triple } }
+        };
+        // Six live sessions; the oldest heartbeat is the eviction.
+        let records: Vec<_> = (0..SESSION_CAP + 1)
+            .map(|index| record(&format!("cap-{index}"), 1_000 + u128::try_from(index).expect("index") * 100))
+            .collect();
+        for record in &records {
+            registry.upsert(record).expect("upsert");
+        }
+        let evicted = registry.evict_past_cap();
+        assert_eq!(evicted, [records[0].state.triple.root.clone()], "the oldest heartbeat is evicted, in order");
+        assert_eq!(registry.list().len(), SESSION_CAP, "the cap holds");
+        // The evicted child died for real (reaped while polling — a zombie
+        // still answers kill(pid, 0)).
+        let pid = records[0].state.pid;
+        let mut terminated = false;
+        for _ in 0..50 {
+            SESSION_CHILDREN.with(|children| {
+                for child in children.borrow_mut().iter_mut() {
+                    let _ = child.try_wait();
+                }
+            });
+            if !pid_alive(pid) {
+                terminated = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(terminated, "the evicted server was terminated");
+        // Under the cap: nothing to evict.
+        assert!(registry.evict_past_cap().is_empty());
+        // Leave no sleeping children behind the test.
+        for record in &records[1..] {
+            terminate(record.state.pid);
+        }
     }
 }

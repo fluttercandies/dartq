@@ -863,4 +863,18 @@ void main() {
         let none = of("// Platform.environment['HOME']\nvoid main() { const s = 'Platform.environment[\"X\"]'; }");
         assert!(!none.env_opaque && none.env_reads.is_empty());
     }
+
+    /// Dot-shorthand `.environment['X']` (Dart 3.10's inferred static
+    /// invocation — no `Platform` receiver spelled) is not tracked:
+    /// neither a named read nor an opaque one. A suite relying on it opts
+    /// out with `// dartq: no-cache` (the `env_opaque` contract). A
+    /// receiver other than `Platform` is not the environment map either.
+    #[test]
+    fn dot_shorthand_environment_access_is_not_tracked() {
+        let shorthand = of("void main() { print(.environment['HOME']); }");
+        assert!(!shorthand.env_opaque, "documented: dot-shorthand is neither named nor opaque");
+        assert!(shorthand.env_reads.is_empty());
+        let other_receiver = of("void main() { print(other.environment['HOME']); }");
+        assert!(!other_receiver.env_opaque && other_receiver.env_reads.is_empty());
+    }
 }
