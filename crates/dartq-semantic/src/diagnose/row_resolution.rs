@@ -4337,6 +4337,11 @@ impl<'a> Engine<'a> {
                         row.range,
                         name_text,
                     );
+                } else {
+                    // The nullable-`on` extension resolved the access: the
+                    // member's result keeps the extension's own nullability
+                    // (the staged nullable-condition face stands down).
+                    self.extension_nullable_resolved.insert(row.range.offset);
                 }
             }
             return true;
@@ -4355,7 +4360,16 @@ impl<'a> Engine<'a> {
         }
         match self.extension_application(container, receiver_ty, row.name, write, receiver_nullable) {
             ExtensionApp::None => false,
-            ExtensionApp::Single => true,
+            ExtensionApp::Single => {
+                // The nullable-`on` face resolved a nullable receiver: the
+                // access is safe and the member's result keeps the
+                // extension's own nullability — the staged
+                // nullable-condition face stands down.
+                if receiver_nullable {
+                    self.extension_nullable_resolved.insert(row.range.offset);
+                }
+                true
+            }
             // The member resolved through a non-nullable `on` face against a
             // nullable receiver (`x.m` on `C?` where `extension E on C`
             // declares `m`): the access resolves the member but reads a

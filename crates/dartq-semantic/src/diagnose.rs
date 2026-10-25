@@ -4961,4 +4961,6 @@ mod extension_param_on_type_tests;
 #[cfg(test)]
 mod extension_nullable_on_param_tests;
 #[cfg(test)]
+mod nullable_extension_condition_tests;
+#[cfg(test)]
 mod foreign_alias_invocation_tests;

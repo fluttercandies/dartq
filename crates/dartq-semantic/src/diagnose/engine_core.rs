@@ -301,6 +301,7 @@ impl<'a> Engine<'a> {
             promoted_recv_reads: Vec::new(),
             inferred_formal_containers: FxHashSet::default(),
             inferred_recv_used_members: FxHashSet::default(),
+            extension_nullable_resolved: FxHashSet::default(),
             prop_promotion_rows: PropPromotionStaging::default(),
             member_reads: Vec::new(),
             member_recv_tys: FxHashMap::default(),
@@ -643,6 +644,18 @@ impl<'a> Engine<'a> {
                     .member_reads
                     .binary_search_by(|row| row.offset.cmp(&check.range.offset))
                     .is_ok();
+                // A member read that resolved through a nullable-applicable
+                // extension face (`extension on DartType?`'s getter over an
+                // `InterfaceType?` receiver — ffi_verifier.dart:2644's
+                // `element.supertype.isAbiSpecificInteger`) carries the
+                // extension's own non-nullable result: the staged
+                // null-shorting face stands down, exactly like the walk's
+                // safe-`Single` verdict already did for the member row.
+                if member_read
+                    && self.extension_nullable_resolved.contains(&check.range.offset)
+                {
+                    continue;
+                }
                 let from = if member_read {
                     self.promotable_field_substitution(props, check.range, check.from)
                         .filter(|ty| *ty != Ty::Unknown)

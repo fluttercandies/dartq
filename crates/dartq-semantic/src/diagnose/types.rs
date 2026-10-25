@@ -2907,6 +2907,15 @@ pub(crate) struct Engine<'a> {
     /// `unused_element` (manifest_item.dart's extension `write` family,
     /// whose only uses ride inferred formals).
     pub(crate) inferred_recv_used_members: FxHashSet<StringId>,
+    /// Member rows that resolved through a nullable-applicable extension
+    /// face on a nullable receiver ([`Engine::member_defined`]'s safe
+    /// `Single` verdict): the access needs no null check and the member's
+    /// result keeps the extension's own nullability — the staged
+    /// nullable-condition face (a `&&` right operand reading the member)
+    /// consults this and stands down (the census's
+    /// `element.supertype.isAbiSpecificInteger` over `extension on
+    /// DartType?`, ffi_verifier.dart:2644).
+    pub(crate) extension_nullable_resolved: FxHashSet<u32>,
     /// One record per completed send: the callee row's offset through the
     /// closing `)` (offset-keyed, kept sorted — nested calls complete
     /// inner-first, so pushes are not monotonic). The assignability emit
