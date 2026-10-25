@@ -497,6 +497,7 @@ impl State {
         // both the dead-code and null-comparison rows). The name level
         // answers `false` — no `Invalid` lives in that lattice.
         if promote_to_interest
+            && !written.nullable
             && !ops.is_invalid_typed(written, written_args, arena, names)
             && !promoted_is(ops, lists, promoted, written, written_args, arena, names)
         {
@@ -507,6 +508,15 @@ impl State {
             // question compares the instantiated spellings — the written
             // type's `written_args`, the current head's chain rows, each
             // candidate's own rows.
+            //
+            // The nullable gate above: every candidate is a NON-NULL form,
+            // and the official's real-types subtype test rejects a nullable
+            // written type wholesale (`x = e?` never promotes `x`) — the
+            // name-level lattice here cannot see the suffix, so the gate
+            // stands in for it (a nullable switch-expression value wrote
+            // `target` and the name-level match against the declared
+            // non-null form promoted it, folding `target ?? …`'s right
+            // side dead).
             let (current, current_args) = if promoted == NIL {
                 (declared, declared_args)
             } else {
@@ -1071,6 +1081,14 @@ fn covers(
     // demoting what the earlier checks promoted.
     if written.base == Base::Unknown {
         return true;
+    }
+    // The nullability stand-in for the name-level subtype below: a
+    // NULLABLE written value never covers a NON-NULL promotion (official
+    // `_demoteViaAssignment`'s real-types subtype rejects it — `x = e?`
+    // demotes every non-null step standing on `x`), and the name-level
+    // lattice cannot see the suffix on its own.
+    if written.nullable && !entry.nullable {
+        return false;
     }
     ops.is_subtype_typed(written, written_args, entry, entry_args, arena, names)
 }
