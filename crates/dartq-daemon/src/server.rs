@@ -32,7 +32,7 @@ use crate::codec::{self, FrameError};
 use crate::commands;
 use crate::debug;
 use crate::jsonrpc::{self, Message, Notification, Request, Response, codes};
-use crate::session::{FixJob, Publish, Session, SessionError, Turn};
+use crate::session::{FixJob, FixMail, Publish, Session, SessionError, Turn};
 use crate::test;
 use crate::watch::{WatchOptions, Watcher, is_config_input};
 use crate::wire::DiagnosticsParams;
@@ -189,44 +189,93 @@ where
             write_turn(&mut output, turn)?;
         }
 
-        // The wait: a select over intake and the fix workers' mailbox, so
-        // either wakes the loop — a completion must not sit behind a quiet
-        // client. The wait is deadline-bounded while a snapshot save, a fix
-        // budget, or the #1310 publish retry is pending (the loop top fires
-        // them); a clean, idle session blocks freely. Either way the loop
-        // stays timer-free.
+        // The wait: a select over intake, the fix workers' mailbox, and
+        // the debug worker's completions, so any of them wakes the loop
+        // — a completion must not sit behind a quiet client. The wait is
+        // deadline-bounded while a snapshot save, a fix budget, or the
+        // #1310 publish retry is pending (the loop top fires them); a
+        // clean, idle session blocks freely. Either way the loop stays
+        // timer-free. The select and its `Selected` token borrow the
+        // session, so both live in this block and only the outcome
+        // escapes it.
+        enum Wake {
+            Fix(FixMail),
+            Debug(Response),
+            Intake(Vec<Incoming>),
+            Closed,
+        }
         let deadline = session
             .fix_deadline()
             .into_iter()
             .chain(session.flush_deadline())
             .chain(session.publish_retry_deadline())
             .min();
-        let mut select = crossbeam_channel::Select::new();
-        let _intake = select.recv(&receiver);
-        let fix_done = select.recv(session.fix_mailbox());
-        let selected = match deadline {
-            None => select.select(),
-            Some(deadline) => {
-                match select.select_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(selected) => selected,
-                    // The loop top re-checks both deadlines: the save or
-                    // the expiry fires there. (A disconnect surfaces
-                    // through the selected operation's recv below.)
-                    Err(SelectTimeoutError) => continue,
+        let wake = {
+            let mut select = crossbeam_channel::Select::new();
+            let _intake = select.recv(&receiver);
+            let fix_done = select.recv(session.fix_mailbox());
+            let debug_done = session
+                .debug_completions()
+                .map(|completions| select.recv(completions));
+            let selected = match deadline {
+                None => select.select(),
+                Some(deadline) => {
+                    match select
+                        .select_timeout(deadline.saturating_duration_since(Instant::now()))
+                    {
+                        Ok(selected) => selected,
+                        // The loop top re-checks both deadlines: the save or
+                        // the expiry fires there. (A disconnect surfaces
+                        // through the selected operation's recv below.)
+                        Err(SelectTimeoutError) => continue,
+                    }
+                }
+            };
+            if selected.index() == fix_done {
+                // The mailbox never disconnects while the session lives —
+                // it owns the sender end, as does the worker holding the
+                // hosts.
+                Wake::Fix(
+                    selected
+                        .recv(session.fix_mailbox())
+                        .expect("the session owns the fix mailbox sender"),
+                )
+            } else if debug_done.is_some_and(|token| selected.index() == token) {
+                // Complete the fired operation (crossbeam demands it)
+                // and carry its answer — the drain below collects
+                // anything else already completed behind it.
+                let completions = session
+                    .debug_completions()
+                    .expect("debug_done implies the dispatch exists");
+                let response = selected
+                    .recv(completions)
+                    .expect("the fired channel yields its answer");
+                Wake::Debug(response)
+            } else {
+                match selected.recv(&receiver) {
+                    Ok(first) => Wake::Intake(first),
+                    Err(_) => Wake::Closed,
                 }
             }
         };
-        if selected.index() == fix_done {
-            // The mailbox never disconnects while the session lives — it
-            // owns the sender end, as does the worker holding the hosts.
-            let mail = selected
-                .recv(session.fix_mailbox())
-                .expect("the session owns the fix mailbox sender");
-            write_turn(&mut output, session.complete_fix(Some(mail)))?;
-            continue;
-        }
-        let Ok(first) = selected.recv(&receiver) else {
-            break;
+        let first = match wake {
+            Wake::Fix(mail) => {
+                write_turn(&mut output, session.complete_fix(Some(mail)))?;
+                continue;
+            }
+            Wake::Debug(response) => {
+                write_message(&mut output, &Message::Response(response))?;
+                // Everything completed behind the fired answer rides
+                // the same turn. (A disconnected worker retires itself
+                // in `complete_debug`; the next turn then re-selects
+                // without the dead channel.)
+                while let Some(response) = session.complete_debug() {
+                    write_message(&mut output, &Message::Response(response))?;
+                }
+                continue;
+            }
+            Wake::Closed => break,
+            Wake::Intake(first) => first,
         };
 
         // The batch window: the reader forwards each buffered chunk as one
@@ -453,28 +502,21 @@ fn handle_request(session: &mut Session, request: Request) -> Option<Response> {
             let params = request.params.unwrap_or(Value::Null);
             assists_stage(session, &params, id)
         }
-        // The debug faces answer at intake too: they hit the session's
-        // debug registry (their own Dart processes and VM connections),
-        // never the analysis engine — the overlay faces' posture, minus
-        // the scheduler entirely. The underlying calls are synchronous
-        // (child spawn, WebSocket round trips, bounded waits) and run
-        // inline on this loop; every wait is bounded by dartq-debug's
-        // own SessionConfig (30 s banner, 30 s per RPC, 30 s pause
-        // waits), so the loop is never held indefinitely — but a step
-        // or snapshot waiting on a pause does hold it until the pause
-        // lands or times out, and requests queued behind answer after.
+        // The debug faces leave the loop entirely (#2587): they queue
+        // onto the session's debug worker (spawned with the registry at
+        // the first debug request) and the answer arrives on the
+        // completion channel the main loop selects on. The underlying
+        // calls are synchronous child spawns and WebSocket round trips,
+        // every one bounded by dartq-debug's SessionConfig (10 s
+        // connect, 30 s handshake budget, 30 s per RPC, 30 s pause
+        // waits) — and even a stuck op would hold only the debug face:
+        // this loop, and every other face on it, keeps answering.
         // Debug traffic is inherently sequential per session (step,
-        // read, decide), so the inline posture is the honest shape.
+        // read, decide), so the single sequential worker is the honest
+        // shape.
         method if debug::is_request(method) => {
             let params = request.params.unwrap_or(Value::Null);
-            let root = session.workspace_root().to_path_buf();
-            Some(debug_response(
-                session.debug_registry(),
-                id,
-                method,
-                &params,
-                &root,
-            ))
+            session.debug_request(id, method, params)
         }
         method if test::is_request(method) => {
             let params = request.params.unwrap_or(Value::Null);
@@ -581,28 +623,6 @@ fn overlay_response(
             }
             Err(message) => Response::error(Some(id), codes::INVALID_PARAMS, message),
         },
-    }
-}
-
-/// Answers one `dartq/debug/*` request against the session's debug
-/// registry: parameter decoding, the (possibly blocking) session call,
-/// and the DTO shaping all live in the debug module; this layer only maps
-/// the failure set onto the wire — the shared `INVALID_PARAMS` tier for a
-/// structural mismatch, one server-error code carrying a `DARTQ/DEBUG/*`
-/// machine prefix for the session domain.
-fn debug_response(
-    manager: &mut debug::DebugManager,
-    id: jsonrpc::RequestId,
-    method: &str,
-    params: &Value,
-    root: &Path,
-) -> Response {
-    match debug::handle(manager, method, params, root) {
-        Ok(result) => Response::ok(id, result),
-        Err(error) => {
-            let (code, message) = error.wire();
-            Response::error(Some(id), code, message)
-        }
     }
 }
 
@@ -1089,6 +1109,124 @@ mod tests {
             assert!(Instant::now() < deadline, "{message}");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// #2587's core pin: a debug op stuck on its (bounded) attach must
+    /// never wedge the serve loop — a request on another face riding
+    /// the same connection answers while the attach is still in
+    /// flight, and the attach itself answers its structured error
+    /// within its own bound. The stall target is the worst live shape:
+    /// a peer that accepts TCP but never answers the WebSocket
+    /// upgrade (a stalled DDS).
+    #[test]
+    fn a_stuck_debug_attach_does_not_wedge_the_serve_loop() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind stall target");
+        let stall_port = listener.local_addr().expect("addr").port();
+        // The stalled DDS: accept and hold, never answering the upgrade.
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::mem::forget(stream);
+            }
+        });
+
+        let workspace = test_fixtures::Workspace::new(BROKEN_MAIN);
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("stuck-attach")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let session =
+            Session::with_store(workspace.engine_config(), store, None).expect("session");
+        let (client, receiver) = mpsc::channel::<Vec<u8>>();
+        let output = TestOutput::default();
+        let server_output = output.clone();
+        let server = thread::spawn(move || {
+            run(
+                BufReader::new(FeedClient {
+                    receiver,
+                    pending: Vec::new(),
+                }),
+                server_output,
+                &mut { session },
+                None,
+            )
+        });
+
+        // Both requests ride one batch: the attach dispatches to the
+        // debug worker (stuck for its connect bound), and the status
+        // must answer from the main loop without waiting for it.
+        let mut batch = Vec::new();
+        batch.extend_from_slice(&framed(&request(
+            1,
+            "dartq/debug/attach",
+            json!({ "wsUri": format!("ws://127.0.0.1:{stall_port}/auth=/ws") }),
+        )));
+        batch.extend_from_slice(&framed(&request(2, "dartq/test/status", json!({}))));
+        client.send(batch).expect("batch send");
+
+        let status = wait_for(
+            || {
+                transcript_of(&output)
+                    .iter()
+                    .find(|frame| frame.get("id") == Some(&json!(2)))
+                    .cloned()
+            },
+            "the status request never answered while the attach was stuck",
+        );
+        assert!(
+            status["result"]["runs"].is_array(),
+            "the status answered off the wedged face: {status}"
+        );
+        // No attach answer yet: the worker is inside its connect bound.
+        assert!(
+            !transcript_of(&output)
+                .iter()
+                .any(|frame| frame.get("id") == Some(&json!(1))),
+            "the attach is still (bounded-)stuck while other faces answer"
+        );
+
+        // The attach answers within its own connect bound (the default
+        // is 10 s — wider than `wait_for`'s 10 s deadline, so poll with
+        // a comfortable margin).
+        let attach_deadline = Instant::now() + Duration::from_secs(30);
+        let attach = loop {
+            if let Some(frame) = transcript_of(&output)
+                .iter()
+                .find(|frame| frame.get("id") == Some(&json!(1)))
+                .cloned()
+            {
+                break frame;
+            }
+            assert!(
+                Instant::now() < attach_deadline,
+                "the attach never answered its structured error"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(
+            attach["error"]["code"],
+            codes::DEBUG_SESSION,
+            "the structured debug-domain failure: {attach}"
+        );
+        assert!(
+            attach["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("DARTQ/DEBUG/VM:")),
+            "the machine-coded prefix rides the failure: {attach}"
+        );
+
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !server.is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(server.is_finished(), "the server did not end");
+        server
+            .join()
+            .expect("server thread does not panic")
+            .expect("transport does not fail on memory pipes");
     }
 
     /// A watch batch converges the session to the touched disk state: the

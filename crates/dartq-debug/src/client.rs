@@ -9,11 +9,14 @@
 //! (`runtime/vm/service/service.md` in the upstream Dart SDK) — the
 //! request/response/event envelope is JSON-RPC 2.0 with named params.
 
+use std::io;
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use tungstenite::client::IntoClientRequest;
 
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, bounded};
 use parking_lot::Mutex;
@@ -29,6 +32,10 @@ use crate::protocol::Event;
 /// Default timeout for a single RPC round-trip. VM operations that
 /// can take longer (reload of a large app) lift it per call.
 const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default bound on the whole connect phase (TCP connect plus the
+/// WebSocket/TLS handshake) when the caller passes no explicit budget.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the connection thread wakes to drain the write channel
 /// and check for shutdown when no inbound frame arrives.
@@ -140,8 +147,119 @@ impl VmClient {
     /// Fails on TCP connect, TLS, or WebSocket handshake errors, or
     /// when the socket cannot enter the read-tick timeout mode.
     pub fn connect(ws_uri: &str) -> Result<Self> {
-        let (socket, _response) = tungstenite::client::connect_with_config(ws_uri, Some(ws_config()), 3)?;
-        Self::from_socket(socket)
+        Self::connect_bounded(ws_uri, DEFAULT_CONNECT_TIMEOUT)
+    }
+
+    /// [`VmClient::connect`] with an explicit bound on the whole
+    /// connect phase: TCP connect and the WebSocket/TLS handshake each
+    /// get the budget's remainder as their OS timeout (#2587: a peer
+    /// that accepts the socket but never answers the upgrade — a
+    /// stalled DDS — must fail here, not block the caller forever).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Timeout`] when the phase exceeds `timeout`; otherwise
+    /// the transport errors of [`VmClient::connect`].
+    pub fn connect_bounded(ws_uri: &str, timeout: Duration) -> Result<Self> {
+        use std::net::ToSocketAddrs as _;
+
+        let request = ws_uri
+            .into_client_request()
+            .map_err(Error::WebSocket)?;
+        let uri = request.uri().clone();
+        let host = uri.host().ok_or_else(|| {
+            Error::Protocol(format!("ws uri names no host: {ws_uri}"))
+        })?;
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let port = uri
+            .port_u16()
+            .unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
+        let deadline = Instant::now() + timeout;
+
+        // TCP connect, bounded per resolved address by the remainder.
+        let addrs = (host, port)
+            .to_socket_addrs()
+            .map_err(Error::Io)?
+            .collect::<Vec<_>>();
+        let mut stream = None;
+        let mut connect_error = None;
+        for addr in &addrs {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match TcpStream::connect_timeout(addr, remaining) {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    break;
+                }
+                Err(error) => connect_error = Some(error),
+            }
+        }
+        let stream = match stream {
+            Some(stream) => stream,
+            None => {
+                let spent = matches!(connect_error, Some(ref error)
+                    if error.kind() == io::ErrorKind::TimedOut);
+                return Err(if spent || connect_error.is_none() {
+                    Error::Timeout(format!(
+                        "connect to {ws_uri}: no tcp connection within {timeout:?}"
+                    ))
+                } else {
+                    Error::Io(connect_error.expect("checked above"))
+                });
+            }
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Timeout(format!(
+                "connect to {ws_uri}: budget spent before the handshake ({timeout:?})"
+            )));
+        }
+        stream.set_nodelay(true).map_err(Error::Io)?;
+        // The handshake drives under the same budget. tungstenite reports
+        // a read timeout mid-handshake as `Interrupted` (WouldBlock is
+        // its nonblocking signal), so the socket reads tick at a small
+        // quantum and the loop below bounds the *total* by the
+        // deadline: a peer that stalls the upgrade fails as
+        // Error::Timeout, never a hang.
+        const HANDSHAKE_TICK: Duration = Duration::from_millis(250);
+        stream
+            .set_read_timeout(Some(remaining.min(HANDSHAKE_TICK)))
+            .map_err(Error::Io)?;
+        stream.set_write_timeout(Some(remaining)).map_err(Error::Io)?;
+        let map_failure = |error: tungstenite::Error| match error {
+            tungstenite::Error::Io(io)
+                if matches!(io.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+            {
+                Error::Timeout(format!(
+                    "connect to {ws_uri}: no websocket handshake within {timeout:?}"
+                ))
+            }
+            other => Error::WebSocket(other),
+        };
+        let mut handshake = match tungstenite::client_tls_with_config(
+            request,
+            stream,
+            Some(ws_config()),
+            None,
+        ) {
+            Ok((socket, _)) => return Self::from_socket(socket),
+            Err(tungstenite::HandshakeError::Failure(error)) => return Err(map_failure(error)),
+            Err(tungstenite::HandshakeError::Interrupted(mid)) => mid,
+        };
+        loop {
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                return Err(Error::Timeout(format!(
+                    "connect to {ws_uri}: no websocket handshake within {timeout:?}"
+                )));
+            }
+            match handshake.handshake() {
+                Ok((socket, _)) => return Self::from_socket(socket),
+                Err(tungstenite::HandshakeError::Failure(error)) => return Err(map_failure(error)),
+                Err(tungstenite::HandshakeError::Interrupted(mid)) => handshake = mid,
+            }
+        }
     }
 
     /// Builds a client over an already-established socket — the

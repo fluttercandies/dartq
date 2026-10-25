@@ -7,7 +7,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Control, MockVm, Reply, default_reply, err, err_with_details, ok};
-use dartq_debug::{Error, EventKind, VmClient};
+use dartq_debug::{DebugSession, Error, EventKind, SessionConfig, VmClient};
 use serde_json::{Value, json};
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -318,5 +318,72 @@ fn typed_decoding_error_is_protocol_error() {
     assert!(
         matches!(error, Error::Protocol(ref message) if message.contains("getVersion")),
         "got {error:?}"
+    );
+}
+
+/// #2587: a peer that accepts the TCP connection but never answers the
+/// WebSocket upgrade (the stalled-DDS shape) fails within the connect
+/// bound — the client never blocks forever on the handshake.
+#[test]
+fn connect_fails_within_bound_against_a_stalled_handshake() {
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    // Accept and hold the socket open without writing the upgrade
+    // answer — the wedge shape, forever.
+    std::thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            std::mem::forget(stream);
+        }
+    });
+    let started = std::time::Instant::now();
+    let error = VmClient::connect_bounded(
+        &format!("ws://127.0.0.1:{port}/auth=/ws"),
+        Duration::from_secs(2),
+    )
+    .err()
+    .expect("a stalled handshake must fail");
+    assert!(
+        matches!(error, Error::Timeout(ref message) if message.contains("handshake")),
+        "the structured timeout: {error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "the failure is bounded: {:?}",
+        started.elapsed()
+    );
+}
+
+/// #2587: an endpoint that completes the WebSocket handshake but never
+/// answers VM Service requests fails within the handshake budget — not
+/// `rpc_timeout` per round trip. The budget bounds the whole phase
+/// (version, streams, getVM, isolate seeding) however many calls it
+/// has left.
+#[test]
+fn attach_fails_within_the_handshake_budget_when_rpcs_stall() {
+    let vm = MockVm::start(|request| match request.method.as_str() {
+        "getVersion" => Reply::Silent,
+        _ => default_reply(request),
+    });
+    let settings = SessionConfig {
+        connect_timeout: Duration::from_secs(2),
+        handshake_timeout: Duration::from_secs(3),
+        rpc_timeout: Duration::from_secs(30),
+        ..SessionConfig::default()
+    };
+    let started = std::time::Instant::now();
+    let error =
+        DebugSession::attach_with(&vm.ws_uri, settings)
+            .err()
+            .expect("a silent vm must fail");
+    assert!(
+        matches!(error, Error::Timeout(ref message) if message.contains("getVersion")),
+        "the structured timeout names the stalled rpc: {error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the handshake budget (3s), not the rpc timeout (30s), bounds the failure: {:?}",
+        started.elapsed()
     );
 }

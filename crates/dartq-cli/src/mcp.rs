@@ -29,6 +29,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use clap::Args;
 use serde_json::{Value, json};
@@ -394,8 +395,25 @@ fn call_tool(params: &Value, mcp: &Mcp, output: &mut impl Write) -> Result<Value
     })
 }
 
-/// One daemon request over the session socket.
+/// How long one proxied daemon request may run before the tool answers
+/// `isError` (#2587): every daemon face is bounded well inside this
+/// (the slowest legitimate one is a debug hot restart at ~2 min plus
+/// breakpoint re-arms), and a wedged engine surfaces as a bounded
+/// error instead of a hung MCP client.
+const DAEMON_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// One daemon request over the session socket, bounded by
+/// [`DAEMON_CALL_TIMEOUT`].
 fn daemon_call(method: &str, params: &Value, mcp: &Mcp) -> Result<Value, String> {
+    daemon_call_bounded(method, params, mcp, DAEMON_CALL_TIMEOUT)
+}
+
+fn daemon_call_bounded(
+    method: &str,
+    params: &Value,
+    mcp: &Mcp,
+    timeout: Duration,
+) -> Result<Value, String> {
     if let Err(reason) = &mcp.session {
         return Err(format!(
             "no resident session ({reason}) — the engine tools need one; \
@@ -403,25 +421,76 @@ fn daemon_call(method: &str, params: &Value, mcp: &Mcp) -> Result<Value, String>
         ));
     }
     let mut stream = UnixStream::connect(&mcp.layout.socket).map_err(|error| error.to_string())?;
+    // The bound covers the whole round trip: a wedged engine (or a
+    // wedged serve between clients) answers the timeout error, never a
+    // hang.
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| error.to_string())?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|error| error.to_string())?;
     let body = serde_json::to_string(&json!({
         "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
     }))
     .map_err(|error| error.to_string())?;
-    write!(stream, "Content-Length: {}\r\n\r\n{body}", body.len()).map_err(|e| e.to_string())?;
+    write!(stream, "Content-Length: {}\r\n\r\n{body}", body.len())
+        .map_err(|error| error.to_string())?;
     stream.flush().map_err(|error| error.to_string())?;
-    let answer = read_frame(&mut stream)?;
+    let answer = match read_frame(&mut stream) {
+        Ok(answer) => answer,
+        Err(ReadError::Wedged) => {
+            return Err(format!(
+                "the engine did not answer {method} within {timeout:?} — \
+                 the session may be wedged; check `dartq session status`"
+            ));
+        }
+        Err(ReadError::Io(error)) => return Err(error.to_string()),
+        Err(ReadError::Malformed(message)) => return Err(message),
+    };
     if let Some(error) = answer.get("error") {
         return Err(error.to_string());
     }
     Ok(answer.get("result").cloned().unwrap_or_else(|| json!({})))
 }
 
+/// One framed-read failure: the socket timed out (the wedge signal,
+/// #2587), the transport broke, or the frame was not a valid
+/// Content-Length-framed JSON message.
+enum ReadError {
+    Wedged,
+    Io(std::io::Error),
+    Malformed(String),
+}
+
+impl std::fmt::Debug for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wedged => f.write_str("Wedged"),
+            Self::Io(error) => write!(f, "Io({error})"),
+            Self::Malformed(message) => write!(f, "Malformed({message})"),
+        }
+    }
+}
+
 /// Reads one Content-Length framed JSON message.
-fn read_frame(stream: &mut UnixStream) -> Result<Value, String> {
+fn read_frame(stream: &mut UnixStream) -> Result<Value, ReadError> {
+    let mut read = |buf: &mut [u8]| {
+        stream.read_exact(buf).map_err(|error| {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) {
+                ReadError::Wedged
+            } else {
+                ReadError::Io(error)
+            }
+        })
+    };
     let mut header = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        stream.read_exact(&mut byte).map_err(|error| error.to_string())?;
+        read(&mut byte)?;
         header.push(byte[0]);
         if header.ends_with(b"\r\n\r\n") {
             break;
@@ -435,10 +504,11 @@ fn read_frame(stream: &mut UnixStream) -> Result<Value, String> {
                 .then(|| value.trim().parse::<usize>().ok())
                 .flatten()
         }))
-        .ok_or_else(|| "missing Content-Length".to_owned())?;
+        .ok_or_else(|| ReadError::Malformed("missing Content-Length".to_owned()))?;
     let mut body = vec![0u8; length];
-    stream.read_exact(&mut body).map_err(|error| error.to_string())?;
-    serde_json::from_slice(&body).map_err(|error| error.to_string())
+    read(&mut body)?;
+    serde_json::from_slice(&body)
+        .map_err(|error| ReadError::Malformed(error.to_string()))
 }
 
 /// The rename face over a cold in-process engine (the rare tool).
@@ -800,7 +870,8 @@ mod tests {
 
     /// One daemon frame over a socketpair: headers parse case-insensitively,
     /// the body must be JSON, and a frame without Content-Length is the
-    /// usage error string.
+    /// usage error. A peer that accepts but never answers is the wedge
+    /// signal: the bounded read answers `Wedged`, not a hang (#2587).
     #[test]
     fn read_frame_parses_headers_and_rejects_missing_length() {
         let (mut mine, mut theirs) = UnixStream::pair().expect("socketpair");
@@ -812,7 +883,54 @@ mod tests {
         assert_eq!(answer["result"]["ok"], true);
         write!(mine, "X-Other: 1\r\n\r\nno length").expect("write headerless");
         mine.flush().expect("flush");
-        assert_eq!(read_frame(&mut theirs), Err("missing Content-Length".to_owned()));
+        assert!(matches!(
+            read_frame(&mut theirs),
+            Err(ReadError::Malformed(message)) if message == "missing Content-Length"
+        ));
+
+        // The wedge: a peer holding the socket open without writing.
+        // The read deadline turns the would-be hang into `Wedged`.
+        let (silent, mut reader) = UnixStream::pair().expect("socketpair");
+        std::mem::forget(silent); // held open, never written
+        reader
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("timeout");
+        assert!(matches!(read_frame(&mut reader), Err(ReadError::Wedged)));
+    }
+
+    /// A daemon proxy against an engine that never answers fails within
+    /// the caller's bound with the wedge message (#2587): the MCP tool
+    /// answers `isError`, it never hangs.
+    #[test]
+    fn daemon_call_answers_iserror_within_bound_against_a_silent_engine() {
+        let root = std::env::temp_dir().join(format!("dqs-mcp-wedge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("dir");
+        let layout = Layout::new(&root);
+        std::fs::create_dir_all(&layout.dir).expect("session dir");
+        let listener = std::os::unix::net::UnixListener::bind(&layout.socket).expect("bind");
+        // The silent engine: accepts the connection, never answers.
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::mem::forget(stream);
+            }
+        });
+        let mcp = Mcp { layout, root: root.clone(), session: Ok(()) };
+        let started = std::time::Instant::now();
+        let error = daemon_call_bounded(
+            "dartq/test/status",
+            &json!({}),
+            &mcp,
+            Duration::from_millis(300),
+        )
+        .expect_err("the silent engine must answer the bound error");
+        assert!(started.elapsed() < Duration::from_secs(5), "bounded: {error}");
+        assert!(
+            error.contains("did not answer dartq/test/status"),
+            "the error names the method: {error}"
+        );
+        assert!(error.contains("wedged"), "the error says wedge: {error}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The rename target grammar splits from the right, so a Windows-style

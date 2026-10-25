@@ -8,12 +8,12 @@
 //!
 //! The face is a registry problem, not an analysis problem: every request
 //! targets one of the session's live [`DebugManager`] entries and never
-//! touches the analysis engine, so the server answers these methods at
-//! intake (the overlay faces' posture) instead of staging them onto the
-//! read scheduler. The underlying [`dartq_debug::DebugSession`] calls are
-//! synchronous — child-process spawn, WebSocket round trips, and bounded
-//! waits — and run inline on the main loop; see the server's dispatch
-//! notes for the blocking posture.
+//! touches the analysis engine. The registry lives on a dedicated worker
+//! thread ([`DebugDispatch`], #2587): the server hands each debug request
+//! to the worker at intake and the answer arrives on the completion
+//! channel — a slow or stuck debug op never holds the main loop, and
+//! every other face keeps answering. Every underlying wait is bounded by
+//! dartq-debug's `SessionConfig` (connect, handshake, per-RPC, pause).
 //!
 //! dartq-debug's session types carry no serde derives by design (the
 //! crate keeps its wire face at the VM protocol level), so this module
@@ -22,7 +22,9 @@
 //! re-exports (`Event` and friends) are serde-derived and embed directly.
 
 use std::path::{Path, PathBuf};
+use std::thread;
 
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use dartq_debug::{
     BreakpointHandle, BreakpointLocationSpec, BreakpointSpec, DebugSession, EventBatch,
     ExceptionPauseMode, FrameLocation, FrameSummary, LaunchConfig, LaunchKind, OutputBatch,
@@ -32,7 +34,7 @@ use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::jsonrpc::codes;
+use crate::jsonrpc::{RequestId, Response, codes};
 
 /// The `dartq/debug/*` method names — the debug family's closed request
 /// set. `pub` so the drift gate (tests/rpc_schema.rs) can pin the served
@@ -162,6 +164,99 @@ impl DebugManager {
     /// The named session, or the machine-coded miss.
     fn get(&mut self, id: u32) -> Result<&mut ManagedSession, DebugError> {
         self.sessions.get_mut(&id).ok_or(DebugError::NoSuchSession(id))
+    }
+}
+
+/// One queued debug request bound for the worker.
+pub(crate) struct DebugJob {
+    pub(crate) id: RequestId,
+    pub(crate) method: String,
+    pub(crate) params: Value,
+    pub(crate) root: PathBuf,
+}
+
+/// How many debug requests may queue while the worker executes one —
+/// and how many completed answers may wait for the main loop. A full
+/// queue answers the structured busy error at intake instead of
+/// blocking the sender.
+const DEBUG_QUEUE_CAPACITY: usize = 16;
+
+/// The debug faces' executor (#2587): a dedicated thread that owns the
+/// [`DebugManager`], so a slow or stuck debug op — an attach against a
+/// stalled DDS, a step waiting out its pause bound — never holds the
+/// daemon's main loop, and every other face keeps answering. Requests
+/// run sequentially in arrival order (debug traffic is inherently
+/// sequential per session); answers ride the completion channel back
+/// to the main loop, which owns the output. Every underlying wait is
+/// bounded by dartq-debug's `SessionConfig`, so the worker always
+/// returns to the queue; if it ever dies anyway (a bug), the
+/// containment is the debug face alone — the sessions drop with it,
+/// later debug requests answer the structured worker-gone error, and
+/// a fresh request spawns a fresh worker.
+pub(crate) struct DebugDispatch {
+    requests: Sender<DebugJob>,
+    completions: Receiver<Response>,
+}
+
+impl DebugDispatch {
+    /// Spawns the worker over `manager`, taking ownership of it for
+    /// the dispatch's lifetime (the session hands it over at the first
+    /// debug request and never touches it again).
+    pub(crate) fn spawn(manager: DebugManager) -> Self {
+        let (requests, request_rx) = bounded::<DebugJob>(DEBUG_QUEUE_CAPACITY);
+        let (completion_tx, completions) = bounded::<Response>(DEBUG_QUEUE_CAPACITY);
+        thread::Builder::new()
+            .name("dartq-debug-worker".into())
+            .spawn(move || {
+                let mut manager = manager;
+                // The session lives as long as the request sender; when
+                // it drops, the loop ends and the manager tears down
+                // here (children reaped, sockets closed) — off the main
+                // loop, whatever a teardown ladder costs.
+                for job in request_rx {
+                    let response = match handle(&mut manager, &job.method, &job.params, &job.root) {
+                        Ok(result) => Response::ok(job.id, result),
+                        Err(error) => {
+                            let (code, message) = error.wire();
+                            Response::error(Some(job.id), code, message)
+                        }
+                    };
+                    if completion_tx.send(response).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("the debug worker thread spawns");
+        Self { requests, completions }
+    }
+
+    /// Queues one request. `Some` is the intake-time answer for a
+    /// request the worker cannot take: the queue is full (more debug
+    /// traffic than one sequential session can chew) or the worker is
+    /// gone (see [`DebugDispatch`]'s containment note).
+    pub(crate) fn send(&self, job: DebugJob) -> Option<Response> {
+        match self.requests.try_send(job) {
+            Ok(()) => None,
+            Err(TrySendError::Full(DebugJob { id, .. })) => Some(Response::error(
+                Some(id),
+                codes::DEBUG_SESSION,
+                format!(
+                    "DARTQ/DEBUG/BUSY: {} requests already queued",
+                    DEBUG_QUEUE_CAPACITY
+                ),
+            )),
+            Err(TrySendError::Disconnected(DebugJob { id, .. })) => Some(Response::error(
+                Some(id),
+                codes::DEBUG_SESSION,
+                "DARTQ/DEBUG/WORKER_GONE: the debug worker terminated; retry the request".to_owned(),
+            )),
+        }
+    }
+
+    /// The completion channel the main loop selects on. It lives for
+    /// the dispatch's lifetime.
+    pub(crate) fn completions(&self) -> &Receiver<Response> {
+        &self.completions
     }
 }
 
@@ -417,11 +512,12 @@ fn resolve(root: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
-/// Answers one `dartq/debug/*` request against the session's registry.
+/// Answers one `dartq/debug/*` request against the registry — executed
+/// on the debug worker thread ([`DebugDispatch`]), never the main loop.
 /// Every session call is synchronous (a child process, WebSocket round
-/// trips, bounded waits) and runs inline on the caller's thread; the
-/// waits are bounded by dartq-debug's own `SessionConfig` (30 s banner,
-/// 30 s per RPC, 30 s pause waits), so no call blocks forever.
+/// trips, bounded waits) and bounded by dartq-debug's own
+/// `SessionConfig` (10 s connect, 30 s handshake budget, 30 s per RPC,
+/// 30 s pause waits), so the worker always returns to its queue.
 ///
 /// # Errors
 ///

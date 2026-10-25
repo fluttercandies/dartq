@@ -132,6 +132,16 @@ pub struct SessionConfig {
     pub expand_limits: ExpandLimits,
     /// Timeout for ordinary RPCs (slow operations lift it per call).
     pub rpc_timeout: Duration,
+    /// Bound on the connect phase: TCP connect plus the WebSocket/TLS
+    /// handshake (#2587 — a stalled peer must fail, not hang).
+    pub connect_timeout: Duration,
+    /// Bound on the whole VM-Service handshake after connect: version
+    /// negotiation, stream subscriptions, `getVM`, and per-isolate
+    /// pause seeding. Each RPC inside also honors the budget's
+    /// remainder, so an endpoint that accepts connections but never
+    /// answers requests fails within this bound, not after
+    /// `rpc_timeout` per round trip.
+    pub handshake_timeout: Duration,
 }
 
 impl Default for SessionConfig {
@@ -144,6 +154,8 @@ impl Default for SessionConfig {
             pause_timeout: Duration::from_secs(30),
             expand_limits: ExpandLimits::default(),
             rpc_timeout: Duration::from_secs(30),
+            connect_timeout: crate::client::DEFAULT_CONNECT_TIMEOUT,
+            handshake_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -594,7 +606,7 @@ impl DebugSession {
         let connected = await_banner(&mut child, &rx, config.launch_timeout).and_then(
             |(service_uri, early_stdout, early_stderr)| {
                 let ws_uri = service_uri_to_ws(&service_uri)?;
-                let client = VmClient::connect(&ws_uri)?;
+                let client = VmClient::connect_bounded(&ws_uri, settings.connect_timeout)?;
                 Ok((client, ws_uri, early_stdout, early_stderr))
             },
         );
@@ -619,7 +631,7 @@ impl DebugSession {
             session.stderr.push(chunk);
         }
         // On failure `session` drops here, and its Drop reaps the child.
-        session.handshake(false)?;
+        session.handshake(false, Instant::now() + session.config.handshake_timeout)?;
         if config.kind == LaunchKind::Flutter {
             // The engine spawns the root isolate after the service is
             // up; without this wait a launch could hand back a session
@@ -649,16 +661,21 @@ impl DebugSession {
         Self::attach_with(ws_uri, SessionConfig::default())
     }
 
-    /// [`DebugSession::attach`] with explicit session wiring.
+    /// [`DebugSession::attach`] with explicit session wiring. Both the
+    /// connect phase and the whole VM-Service handshake are bounded by
+    /// the config (#2587): a peer that accepts the socket but never
+    /// answers fails within `connect_timeout` + `handshake_timeout`,
+    /// never hangs the caller.
     ///
     /// # Errors
     ///
     /// See [`DebugSession::attach`].
     pub fn attach_with(ws_uri: &str, settings: SessionConfig) -> Result<Self> {
-        let client = VmClient::connect(ws_uri)?;
+        let client = VmClient::connect_bounded(ws_uri, settings.connect_timeout)?;
         let mut session = Self::new(client, None, settings);
         session.ws_uri = ws_uri.to_owned();
-        session.handshake(true)?;
+        let deadline = Instant::now() + session.config.handshake_timeout;
+        session.handshake(true, deadline)?;
         Ok(session)
     }
 
@@ -690,9 +707,14 @@ impl DebugSession {
     /// Negotiates the protocol version, subscribes the session
     /// streams, seeds isolate tracking from `getVM`, and seeds each
     /// isolate's current pause state — an isolate already paused when
-    /// the session attaches never re-sends its pause event.
-    fn handshake(&mut self, output_streams: bool) -> Result<()> {
-        let version = self.client.get_version()?;
+    /// the session attaches never re-sends its pause event. Every RPC
+    /// in the sequence honors the handshake budget's remainder
+    /// (`deadline`, #2587), so the whole phase is bounded however
+    /// many isolates there are to seed.
+    fn handshake(&mut self, output_streams: bool, deadline: Instant) -> Result<()> {
+        let version: crate::protocol::Version = self
+            .client
+            .call_typed("getVersion", json!({}), self.handshake_rpc_timeout(deadline)?)?;
         if version.major != SUPPORTED_MAJOR {
             return Err(Error::VersionIncompatible {
                 expected_major: SUPPORTED_MAJOR,
@@ -705,12 +727,18 @@ impl DebugSession {
         // client already listens on this VM.
         let outputs: &[&str] = if output_streams { &OUTPUT_STREAMS } else { &[] };
         for stream in CONTROL_STREAMS.iter().chain(outputs) {
-            match self.client.stream_listen(stream) {
+            match self.client.call_unit(
+                "streamListen",
+                json!({ "streamId": stream }),
+                self.handshake_rpc_timeout(deadline)?,
+            ) {
                 Ok(()) | Err(Error::Rpc { code: 103, .. }) => {}
                 Err(error) => return Err(error),
             }
         }
-        let vm = self.client.get_vm()?;
+        let vm: crate::protocol::Vm = self
+            .client
+            .call_typed("getVM", json!({}), self.handshake_rpc_timeout(deadline)?)?;
         // System isolates are tracked for completeness but are not
         // debug targets; only user isolates get their pause state.
         for isolate in vm.system_isolates {
@@ -719,9 +747,23 @@ impl DebugSession {
         for isolate in vm.isolates {
             let id = isolate.id.clone();
             self.note_isolate(isolate);
-            self.seed_pause_state(&id)?;
+            self.seed_pause_state(&id, deadline)?;
         }
         Ok(())
+    }
+
+    /// The RPC timeout for one handshake-phase call: the ordinary RPC
+    /// bound tightened to the budget's remainder. A spent budget is
+    /// the structured timeout, not a zero-length wait.
+    fn handshake_rpc_timeout(&self, deadline: Instant) -> Result<Duration> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Timeout(format!(
+                "vm service handshake exceeded {:?}",
+                self.config.handshake_timeout
+            )));
+        }
+        Ok(self.config.rpc_timeout.min(remaining))
     }
 
     /// Re-reads the isolate table from `getVM` (used after a hot
@@ -734,7 +776,7 @@ impl DebugSession {
         for isolate in vm.isolates {
             let id = isolate.id.clone();
             self.note_isolate(isolate);
-            self.seed_pause_state(&id)?;
+            self.seed_pause_state(&id, Instant::now() + self.config.rpc_timeout)?;
         }
         Ok(())
     }
@@ -830,12 +872,18 @@ impl DebugSession {
 
     /// Records the isolate's current pause event (`getIsolate`'s
     /// `pauseEvent`) unless a live event already superseded it. A
-    /// collected isolate is simply forgotten.
-    fn seed_pause_state(&mut self, isolate: &str) -> Result<()> {
+    /// collected isolate is simply forgotten. Under `deadline` when
+    /// called from the attach handshake (the budget-bound form,
+    /// #2587); the post-restart re-seed passes a far-future deadline
+    /// and is bounded by `rpc_timeout` alone.
+    fn seed_pause_state(&mut self, isolate: &str, deadline: Instant) -> Result<()> {
+        let timeout = self.config.rpc_timeout.min(
+            deadline.saturating_duration_since(Instant::now()),
+        );
         let fetched: crate::protocol::Isolate = match self.client.call_typed(
             "getIsolate",
             json!({ "isolateId": isolate }),
-            self.config.rpc_timeout,
+            timeout,
         ) {
             Ok(fetched) => fetched,
             Err(Error::Sentinel { .. }) => {

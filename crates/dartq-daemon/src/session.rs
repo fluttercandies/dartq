@@ -211,7 +211,8 @@ use thiserror::Error;
 use dartq_snapshot::{SnapshotConfig, SnapshotStore};
 
 use crate::commands::{self, Request};
-use crate::jsonrpc::{Notification, RequestId};
+use crate::debug::{DebugDispatch, DebugJob};
+use crate::jsonrpc::{Notification, RequestId, Response};
 use crate::plugins::{self, PluginSet};
 use crate::uri;
 use crate::wire;
@@ -1010,11 +1011,16 @@ pub struct Session {
     /// The dispatch budget (`FIX_TIME_BUDGET`; test seam overrides it).
     fix_budget: Duration,
     /// The `dartq/debug/*` faces' session registry (launch/attach
-    /// debugging lives outside the analysis engine; the server answers
-    /// those methods at intake against this field). Empty until a
-    /// client launches or attaches; dropped sessions tear themselves
-    /// down.
+    /// debugging lives outside the analysis engine). The manager moves
+    /// onto the debug worker ([`Self::debug_request`]'s dispatch) at
+    /// the first debug request and this field stays empty afterwards;
+    /// dropped sessions tear themselves down on the worker.
     debug: crate::debug::DebugManager,
+    /// The debug worker's dispatch handles once the worker exists: the
+    /// request sender (dies with the session, ending the worker) and
+    /// the completion channel the main loop selects on (#2587 — a
+    /// stuck debug op must never hold the loop).
+    debug_dispatch: Option<crate::debug::DebugDispatch>,
     /// The `dartq/test/*` faces' run registry (test orchestration lives
     /// outside the analysis engine; the server answers those methods at
     /// intake against this field). Empty until a client submits a run;
@@ -1334,6 +1340,7 @@ impl Session {
             fix_done: bounded(MAX_QUEUED_FIX_MAILS),
             fix_budget: FIX_TIME_BUDGET,
             debug: crate::debug::DebugManager::default(),
+            debug_dispatch: None,
             test: crate::test::TestManager::default(),
             mapped_pool,
             snapshot: SnapshotSink {
@@ -1863,10 +1870,52 @@ impl Session {
         &self.workspace_root
     }
 
-    /// The `dartq/debug/*` faces' session registry (the server answers
-    /// those requests at intake against it).
-    pub(crate) fn debug_registry(&mut self) -> &mut crate::debug::DebugManager {
-        &mut self.debug
+    /// Queues one `dartq/debug/*` request on the debug worker,
+    /// spawning the worker (with the registry moved onto it) at the
+    /// first debug request. `None` means the request is dispatched and
+    /// its answer arrives on [`Session::complete_debug`]; `Some` is an
+    /// intake-time structured answer for a request the worker cannot
+    /// take (#2587: the queue is bounded, the worker gone is reported).
+    pub(crate) fn debug_request(
+        &mut self,
+        id: RequestId,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Option<Response> {
+        let root = self.workspace_root.to_path_buf();
+        let dispatch = self
+            .debug_dispatch
+            .get_or_insert_with(|| DebugDispatch::spawn(std::mem::take(&mut self.debug)));
+        dispatch.send(DebugJob {
+            id,
+            method: method.to_owned(),
+            params,
+            root,
+        })
+    }
+
+    /// Pops one completed debug answer if any is ready. A worker that
+    /// died (its completion channel disconnected) is retired here: the
+    /// dispatch is dropped so the main loop stops selecting on the dead
+    /// channel, and the next debug request spawns a fresh worker.
+    pub(crate) fn complete_debug(&mut self) -> Option<Response> {
+        let dispatch = self.debug_dispatch.as_ref()?;
+        match dispatch.completions().try_recv() {
+            Ok(response) => Some(response),
+            Err(crossbeam_channel::TryRecvError::Empty) => None,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.debug_dispatch = None;
+                None
+            }
+        }
+    }
+
+    /// The debug completions channel for the main loop's select —
+    /// present once the worker exists.
+    pub(crate) fn debug_completions(&self) -> Option<&crossbeam_channel::Receiver<Response>> {
+        self.debug_dispatch
+            .as_ref()
+            .map(|dispatch| dispatch.completions())
     }
 
     /// The `dartq/test/*` faces' run registry (the server answers those
