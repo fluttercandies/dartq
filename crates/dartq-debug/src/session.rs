@@ -1,7 +1,9 @@
 //! AI-first debug session orchestration over the VM Service client:
-//! launch/attach, breakpoints (line, entry, conditional), step-and-
-//! package stopped snapshots, lazy object-graph expansion, exception
-//! pause mode, hot reload/restart, and bounded stdout/stderr capture.
+//! launch/attach (both `dart` scripts and `flutter run` apps — Flutter
+//! is dartq's primary target platform), breakpoints (line, entry,
+//! conditional), step-and-package stopped snapshots, lazy object-graph
+//! expansion, exception pause mode, hot reload/restart, and bounded
+//! stdout/stderr capture.
 //!
 //! Ordering contract (fixed by the VM service): connect, negotiate
 //! `getVersion`, subscribe streams, then arm breakpoints. Subscriptions
@@ -16,6 +18,7 @@
 //! are capped so a ping-ponging condition surfaces as a stop instead
 //! of hanging the session.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -39,8 +42,10 @@ const SUPPORTED_MAJOR: u64 = 4;
 
 /// Streams every session subscribes to before arming breakpoints:
 /// `Debug` carries pause/breakpoint events, `Isolate` the isolate
-/// lifecycle, `Logging` `dart:developer.log` records.
-const CONTROL_STREAMS: [&str; 3] = ["Debug", "Isolate", "Logging"];
+/// lifecycle, `Logging` `dart:developer.log` records, and `Service`
+/// the registration notices whose `method` field names the
+/// tool-registered services (see [`DebugSession::flutter_tool_attached`]).
+const CONTROL_STREAMS: [&str; 4] = ["Debug", "Isolate", "Logging", "Service"];
 
 /// Output streams an *attached* session subscribes to. A launched
 /// session already owns the child's pipes; subscribing as well would
@@ -143,37 +148,94 @@ impl Default for SessionConfig {
     }
 }
 
+/// Which toolchain a launch drives. Flutter is the primary target
+/// platform, but the two launch paths share every session feature:
+/// breakpoints, stepping, snapshots, reload, and restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LaunchKind {
+    /// `dart <script>` — the Dart CLI (VM service via
+    /// `--enable-vm-service`).
+    #[default]
+    Dart,
+    /// `flutter run` — a Flutter app on a device. The VM service is
+    /// always enabled in debug mode; the tool wraps it in DDS and
+    /// prints its own banner, registers the tool-orchestrated
+    /// `reloadSources`/`hotRestart` services, and owns the app
+    /// process. dartq-debug attaches over the WebSocket like any
+    /// other service-protocol client and never touches the tool's
+    /// stdin.
+    Flutter,
+}
+
 /// How to start a Dart process under debug.
 #[derive(Debug, Clone)]
 pub struct LaunchConfig {
-    /// Script to run (`dart <script> [args]`).
+    /// Toolchain to launch.
+    pub kind: LaunchKind,
+    /// Script to run: `dart <script>` or `flutter run -t <script>`.
     pub script: PathBuf,
-    /// Arguments passed to the script.
+    /// Arguments passed to the script (after `--` for Flutter).
     pub args: Vec<String>,
-    /// Extra VM flags placed before the script path.
+    /// Extra VM flags placed before the script path (Dart launches
+    /// only; Flutter launches reject them — pass tool flags through
+    /// `flutter_args`).
     pub vm_flags: Vec<String>,
-    /// Pause the main isolate at start (`--pause-isolates-on-start`).
-    /// The AI-first default is `true`: breakpoints are armed before the
+    /// Pause the main isolate at start: Dart
+    /// `--pause-isolates-on-start`, Flutter `--start-paused`. The
+    /// AI-first default is `true`: breakpoints are armed before the
     /// program runs.
     pub pause_on_start: bool,
-    /// How long to wait for the service-URI banner.
+    /// How long to wait for the service-URI banner. The Flutter
+    /// default is far larger because the first `flutter run` on a
+    /// project may need a full debug build (and concurrent flutter
+    /// commands serialize on the tool's startup lock).
     pub launch_timeout: Duration,
     /// Working directory for the child.
     pub cwd: Option<PathBuf>,
+    /// Device to run the app on (`flutter run -d`; Dart launches
+    /// ignore this).
+    pub device: Option<String>,
+    /// Build flavor (`flutter run --flavor`; not every device
+    /// supports flavors).
+    pub flavor: Option<String>,
+    /// `--dart-define` key/value pairs.
+    pub dart_defines: Vec<(String, String)>,
+    /// Extra `flutter run` arguments passed through verbatim (before
+    /// `--`), e.g. `--no-devtools`, `--route`.
+    pub flutter_args: Vec<String>,
 }
 
 impl LaunchConfig {
-    /// A launch configuration for `script` with the AI-first defaults
-    /// (paused at start, 30 s banner timeout).
+    /// A Dart launch configuration for `script` with the AI-first
+    /// defaults (paused at start, 30 s banner timeout).
     #[must_use]
     pub fn new(script: impl Into<PathBuf>) -> Self {
         Self {
+            kind: LaunchKind::Dart,
             script: script.into(),
             args: Vec::new(),
             vm_flags: Vec::new(),
             pause_on_start: true,
             launch_timeout: Duration::from_secs(30),
             cwd: None,
+            device: None,
+            flavor: None,
+            dart_defines: Vec::new(),
+            flutter_args: Vec::new(),
+        }
+    }
+
+    /// A Flutter launch configuration for the entrypoint `target`
+    /// (paused at start — the standard agent takeover). The banner
+    /// timeout defaults to 300 s: the first debug build of a Flutter
+    /// app can legitimately take minutes, and the tool's startup lock
+    /// serializes concurrent flutter commands.
+    #[must_use]
+    pub fn flutter(target: impl Into<PathBuf>) -> Self {
+        Self {
+            kind: LaunchKind::Flutter,
+            launch_timeout: Duration::from_secs(300),
+            ..Self::new(target)
         }
     }
 }
@@ -225,6 +287,17 @@ pub struct BreakpointHandle {
     pub condition: Option<String>,
     /// Whether the VM has bound the breakpoint to a concrete location.
     pub resolved: bool,
+}
+
+/// What came back from a hot restart: the breakpoints this session
+/// re-armed against the post-restart isolate, and the ones it could
+/// not (each entry says why).
+#[derive(Debug, Clone)]
+pub struct RestartOutcome {
+    /// Breakpoints re-armed on the new main isolate (fresh ids).
+    pub re_armed: Vec<BreakpointHandle>,
+    /// Re-arm failures, one diagnostic string per dropped breakpoint.
+    pub dropped: Vec<String>,
 }
 
 /// One variable, rendered for an agent: name, short value
@@ -391,6 +464,10 @@ pub struct DebugSession {
     /// are numbered per isolate (`breakpoints/1` exists in every
     /// isolate that has one), so the id alone is ambiguous.
     breakpoints: FxHashMap<(String, String), BreakpointHandle>,
+    /// The spec that produced each breakpoint — what
+    /// [`DebugSession::hot_restart`] re-arms after the tool restarted
+    /// the app under fresh isolate ids.
+    breakpoint_specs: FxHashMap<(String, String), BreakpointSpec>,
     /// Most recent pause event per isolate, with its feed sequence
     /// number (used to ignore pauses that predate a resume).
     pause_events: FxHashMap<String, (u64, Event)>,
@@ -421,19 +498,36 @@ pub struct DebugSession {
     /// Root-library object id per isolate, resolved lazily by
     /// [`DebugSession::evaluate_in_root_lib`].
     root_libs: FxHashMap<String, String>,
+    /// The WebSocket URI this session speaks (re-attach after a
+    /// detach, or the address to hand another client).
+    ws_uri: String,
+    /// Tool-registered services by service name, valued with the
+    /// fully-qualified method DDS routes (`client1.reloadSources`) —
+    /// learned from `ServiceRegistered` events and the discovery
+    /// probe (see [`DebugSession::flutter_tool_attached`]).
+    tool_services: FxHashMap<String, String>,
+    /// Cached answer to "is a flutter_tools behind this service?" —
+    /// its DDS client namespace once discovered.
+    flutter_tool: Option<String>,
+    /// Whether the launched child is `flutter run` (drives the
+    /// teardown ladder in [`DebugSession::terminate`]).
+    flutter_child: bool,
 }
 
 impl DebugSession {
-    /// Launches `dart` with the VM service enabled, parses the service
-    /// URI banner, connects, negotiates the protocol version,
+    /// Launches the configured toolchain (`dart <script>` or
+    /// `flutter run`) with the VM service reachable, parses the
+    /// service-URI banner, connects, negotiates the protocol version,
     /// subscribes the session streams, and returns the live session.
     ///
     /// # Errors
     ///
-    /// [`Error::DartBinaryNotFound`] when neither `DARTQ_DART_BIN` nor
-    /// `PATH` yields a `dart`; [`Error::LaunchTimeout`] when no banner
-    /// arrives in time; [`Error::ProcessExited`] when the child dies
-    /// first; plus the connection errors of [`DebugSession::attach_with`].
+    /// [`Error::DartBinaryNotFound`] / [`Error::FlutterBinaryNotFound`]
+    /// when neither the `DARTQ_DART_BIN` / `DARTQ_FLUTTER_BIN` override
+    /// nor `PATH` yields the tool; [`Error::LaunchTimeout`] when no
+    /// banner (or, for Flutter, no debuggable main isolate) arrives in
+    /// time; [`Error::ProcessExited`] when the child dies first; plus
+    /// the connection errors of [`DebugSession::attach_with`].
     pub fn launch(config: LaunchConfig) -> Result<Self> {
         Self::launch_with(config, SessionConfig::default())
     }
@@ -444,26 +538,43 @@ impl DebugSession {
     ///
     /// See [`DebugSession::launch`].
     pub fn launch_with(config: LaunchConfig, settings: SessionConfig) -> Result<Self> {
-        let dart = find_dart_binary()?;
-        let mut command = Command::new(&dart);
+        let started = Instant::now();
+        let program = match config.kind {
+            LaunchKind::Dart => find_dart_binary()?,
+            LaunchKind::Flutter => find_flutter_binary()?,
+        };
+        let argv = match config.kind {
+            LaunchKind::Dart => dart_argv(&config),
+            LaunchKind::Flutter => flutter_argv(&config)?,
+        };
+        let mut command = Command::new(&program);
         command
-            .arg("--enable-vm-service=0")
-            .args(&config.vm_flags);
-        if config.pause_on_start {
-            command.arg("--pause-isolates-on-start");
-        }
-        command
-            .arg(&config.script)
-            .args(&config.args)
+            .args(&argv)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
         }
+        if config.kind == LaunchKind::Flutter {
+            // `flutter run` spawns the app as its own child; a private
+            // process group lets terminate() signal the whole tree
+            // (the engine's exit extension is not always registered,
+            // and SIGKILL on the tool alone would orphan the app).
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
+        }
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                Error::DartBinaryNotFound(dart.display().to_string())
+                match config.kind {
+                    LaunchKind::Dart => Error::DartBinaryNotFound(program.display().to_string()),
+                    LaunchKind::Flutter => {
+                        Error::FlutterBinaryNotFound(program.display().to_string())
+                    }
+                }
             } else {
                 Error::Io(error)
             }
@@ -482,11 +593,12 @@ impl DebugSession {
         // From here on any failure must not leak the spawned VM.
         let connected = await_banner(&mut child, &rx, config.launch_timeout).and_then(
             |(service_uri, early_stdout, early_stderr)| {
-                let client = VmClient::connect(&service_uri_to_ws(&service_uri)?)?;
-                Ok((client, early_stdout, early_stderr))
+                let ws_uri = service_uri_to_ws(&service_uri)?;
+                let client = VmClient::connect(&ws_uri)?;
+                Ok((client, ws_uri, early_stdout, early_stderr))
             },
         );
-        let (client, early_stdout, early_stderr) = match connected {
+        let (client, ws_uri, early_stdout, early_stderr) = match connected {
             Ok(parts) => parts,
             Err(error) => {
                 reap(&mut child);
@@ -494,8 +606,12 @@ impl DebugSession {
             }
         };
         let mut session = Self::new(client, Some(child), settings);
+        session.ws_uri = ws_uri;
         session.pipe_feed = Some(rx);
         session.pipe_drops = Some(drops);
+        if config.kind == LaunchKind::Flutter {
+            session.flutter_child = true;
+        }
         for chunk in early_stdout {
             session.stdout.push(chunk);
         }
@@ -504,11 +620,25 @@ impl DebugSession {
         }
         // On failure `session` drops here, and its Drop reaps the child.
         session.handshake(false)?;
+        if config.kind == LaunchKind::Flutter {
+            // The engine spawns the root isolate after the service is
+            // up; without this wait a launch could hand back a session
+            // that cannot even name an isolate yet. The wait floors at
+            // 10 s: once the banner arrived the VM is up, and isolate
+            // spawn is quick even on a slow device.
+            let budget =
+                config.launch_timeout.saturating_sub(started.elapsed()).max(Duration::from_secs(10));
+            session.wait_for_main_isolate(budget)?;
+        }
         Ok(session)
     }
 
     /// Attaches to an already-running VM service endpoint (its `ws`
-    /// URI), then performs the handshake.
+    /// URI — for a `flutter run`, the DDS URI from the "A Dart VM
+    /// Service on … is available at:" banner), then performs the
+    /// handshake. Attachment coexists with the tool's own clients:
+    /// dartq-debug speaks only the WebSocket protocol and never the
+    /// tool's stdin.
     ///
     /// # Errors
     ///
@@ -527,6 +657,7 @@ impl DebugSession {
     pub fn attach_with(ws_uri: &str, settings: SessionConfig) -> Result<Self> {
         let client = VmClient::connect(ws_uri)?;
         let mut session = Self::new(client, None, settings);
+        session.ws_uri = ws_uri.to_owned();
         session.handshake(true)?;
         Ok(session)
     }
@@ -542,12 +673,17 @@ impl DebugSession {
             isolates: FxHashMap::default(),
             main_isolate: None,
             breakpoints: FxHashMap::default(),
+            breakpoint_specs: FxHashMap::default(),
             pause_events: FxHashMap::default(),
             pipe_feed: None,
             pipe_drops: None,
             folded_pipe_drops: [0; 2],
             auto_resumes: FxHashMap::default(),
             root_libs: FxHashMap::default(),
+            tool_services: FxHashMap::default(),
+            ws_uri: String::new(),
+            flutter_tool: None,
+            flutter_child: false,
         }
     }
 
@@ -586,6 +722,110 @@ impl DebugSession {
             self.seed_pause_state(&id)?;
         }
         Ok(())
+    }
+
+    /// Re-reads the isolate table from `getVM` (used after a hot
+    /// restart replaced every isolate id).
+    fn seed_from_vm(&mut self) -> Result<()> {
+        let vm = self.client.get_vm()?;
+        for isolate in vm.system_isolates {
+            self.note_isolate(isolate);
+        }
+        for isolate in vm.isolates {
+            let id = isolate.id.clone();
+            self.note_isolate(isolate);
+            self.seed_pause_state(&id)?;
+        }
+        Ok(())
+    }
+
+    /// The WebSocket URI this session speaks — what to re-attach to
+    /// after [`DebugSession::detach`], or to hand to another client.
+    #[must_use]
+    pub fn ws_uri(&self) -> &str {
+        &self.ws_uri
+    }
+
+    /// Whether a `flutter run`-style tool is behind this service
+    /// (flutter_tools wrapping the VM service in DDS and registering
+    /// its orchestration services — the `Service` stream announces
+    /// them, replayed to this session's subscription, so the answer is
+    /// available right after the handshake).
+    pub fn flutter_tool_attached(&mut self) -> bool {
+        self.tool_namespace().is_some()
+    }
+
+    /// The flutter_tools service namespace (`s0` in DDS builds that
+    /// prefix tool services this way), taken from the replayed
+    /// `ServiceRegistered` events. A bare Dart VM service registers no
+    /// client services, so the answer is `None` there.
+    fn tool_namespace(&mut self) -> Option<String> {
+        if let Some(known) = &self.flutter_tool {
+            return Some(known.clone());
+        }
+        // The registrations replayed at subscription are already on
+        // the wire when the handshake's streamListen returned; fold
+        // them in. A closed feed means no tool is announcing anything.
+        let _ = self.poll_events();
+        let namespace = self
+            .tool_services
+            .get("flutterVersion")
+            .and_then(|method| method.split('.').next())
+            .map(str::to_owned)
+            .filter(|namespace| !namespace.is_empty());
+        if namespace.is_some() {
+            self.flutter_tool = namespace.clone();
+        }
+        namespace
+    }
+
+    /// The fully-qualified method name of a tool-registered service
+    /// (`reloadSources`, `hotRestart`), announced by the `Service`
+    /// stream with its routable name.
+    fn tool_service_method(&mut self, service: &str) -> Option<String> {
+        self.tool_namespace()?;
+        self.tool_services.get(service).cloned()
+    }
+
+    /// Waits until a debuggable (non-system) isolate exists — the
+    /// engine spawns the root isolate after the service comes up, and
+    /// every session operation needs an isolate to name.
+    fn wait_for_main_isolate(&mut self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut last_seed = Instant::now();
+        loop {
+            self.poll_events()?;
+            if self.main_isolate.is_some() {
+                return Ok(());
+            }
+            if let Some(child) = self.process.as_mut()
+                && let Some(status) = child.try_wait()?
+            {
+                return Err(Error::ProcessExited(status.code()));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Timeout(format!(
+                    "no debuggable isolate appeared within {timeout:?}"
+                )));
+            }
+            // IsolateStart events usually deliver the isolate; the
+            // periodic re-seed covers an event lost before the
+            // subscriptions went live.
+            if last_seed.elapsed() >= Duration::from_millis(500) {
+                last_seed = Instant::now();
+                self.seed_from_vm()?;
+                continue;
+            }
+            match self.client.next_event(remaining.min(Duration::from_millis(20))) {
+                Ok(Some(event)) => self.absorb_event(event),
+                Ok(None) => {}
+                Err(Error::Closed) if self.process.is_some() => {
+                    std::thread::sleep(remaining.min(Duration::from_millis(20)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Records the isolate's current pause event (`getIsolate`'s
@@ -680,13 +920,12 @@ impl DebugSession {
         let handle = BreakpointHandle {
             id: breakpoint.id,
             isolate,
-            condition: spec.condition,
+            condition: spec.condition.clone(),
             resolved: breakpoint.resolved,
         };
-        self.breakpoints.insert(
-            (handle.isolate.clone(), handle.id.clone()),
-            handle.clone(),
-        );
+        let key = (handle.isolate.clone(), handle.id.clone());
+        self.breakpoint_specs.insert(key.clone(), spec);
+        self.breakpoints.insert(key, handle.clone());
         Ok(handle)
     }
 
@@ -712,6 +951,7 @@ impl DebugSession {
         ) {
             Ok(()) | Err(Error::Sentinel { .. }) => {
                 self.breakpoints.remove(&key);
+                self.breakpoint_specs.remove(&key);
                 Ok(())
             }
             Err(error) => Err(error),
@@ -1322,58 +1562,232 @@ impl DebugSession {
         Ok(out)
     }
 
-    /// Hot reload (`reloadSources`). Returns whether the VM reported
-    /// success.
+    /// Hot reload (`reloadSources`). Returns whether the reload was
+    /// reported successful.
+    ///
+    /// On a Flutter session the RPC is fielded by flutter_tools'
+    /// tool-registered `reloadSources` service (DDS routes the method
+    /// name to the tool), so the reload follows the tool's own
+    /// orchestration — DevFS source push plus reassemble — exactly
+    /// what the tool's `r` key does. On a bare Dart VM the native
+    /// reload runs. Either way a compile error in the edited sources
+    /// comes back as [`Error::Rpc`] carrying the tool's diagnostics
+    /// while the session stays alive and usable.
     ///
     /// # Errors
     ///
-    /// [`Error::Rpc`] codes 108/109/110 for reload-state conflicts.
+    /// [`Error::Rpc`] codes 108/109/110 for reload-state conflicts,
+    /// or the tool's compile diagnostics on a broken edit.
     pub fn reload_sources(&mut self, isolate: Option<&str>, force: bool) -> Result<bool> {
         let isolate = self.resolve_isolate(isolate)?;
         // A reload may replace the root library object.
         self.root_libs.clear();
-        let report: crate::protocol::ReloadReport = self.client.call_typed(
-            "reloadSources",
-            json!({ "isolateId": isolate, "force": force }),
-            // Reloads of large apps legitimately outrun the ordinary
-            // RPC timeout.
-            self.config.rpc_timeout.max(Duration::from_secs(120)),
-        )?;
+        let params = json!({ "isolateId": isolate, "force": force });
+        // Reloads of large apps legitimately outrun the ordinary RPC
+        // timeout.
+        let timeout = self.config.rpc_timeout.max(Duration::from_secs(120));
+        if let Some(method) = self.tool_service_method("reloadSources") {
+            let value = self.client.call(&method, params, timeout)?;
+            return tool_answer_ok(&value)
+                .map(|()| true)
+                .ok_or_else(|| Error::Protocol(format!("tool reload answered {value}")));
+        }
+        let value = self.client.call("reloadSources", params, timeout)?;
+        let report: crate::protocol::ReloadReport = serde_json::from_value(value)
+            .map_err(|error| Error::Protocol(format!("malformed reload report: {error}")))?;
         Ok(report.success)
     }
 
-    /// Hot restart through the DDS-registered `hotRestart` service
-    /// (registered by DDS/DWDS middleware, not by the bare VM service;
-    /// a plain VM answers with an RPC error, surfaced unchanged).
+    /// Hot restart through the tool-registered `hotRestart` service
+    /// (flutter_tools registers it over DDS under its client
+    /// namespace; a bare VM service has no such method and answers
+    /// with an RPC error, surfaced unchanged).
+    ///
+    /// Restart semantics (verified against flutter_tools' own hot
+    /// restart): every isolate is torn down and rebuilt with fresh
+    /// ids, the tool itself removes the old breakpoints, and the app
+    /// state resets as the tool's `R` key resets it — the app runs
+    /// again immediately. Re-arming breakpoints afterwards is the
+    /// *client's* job ("new isolates … will be configured by the
+    /// editor as they are started", flutter_tools source); this
+    /// session does exactly that: every tracked breakpoint spec is
+    /// re-armed against the post-restart main isolate. A breakpoint
+    /// in first-frame code (e.g. a widget `build`) may be armed a
+    /// hair after that first frame — later builds and calls hit it.
     ///
     /// # Errors
     ///
     /// [`Error::Rpc`] when the service is not registered or the
-    /// restart fails.
-    pub fn hot_restart(&mut self) -> Result<()> {
-        self.client.call_unit(
-            "hotRestart",
-            json!({}),
-            self.config.rpc_timeout.max(Duration::from_secs(120)),
-        )
+    /// restart fails; [`Error::Timeout`] when no post-restart isolate
+    /// appears in a bounded window.
+    pub fn hot_restart(&mut self) -> Result<RestartOutcome> {
+        let specs: Vec<BreakpointSpec> = self.breakpoint_specs.values().cloned().collect();
+        let timeout = self.config.rpc_timeout.max(Duration::from_secs(120));
+        if let Some(method) = self.tool_service_method("hotRestart") {
+            let value = self.client.call(&method, json!({}), timeout)?;
+            tool_answer_ok(&value)
+                .ok_or_else(|| Error::Protocol(format!("tool restart answered {value}")))?;
+        } else {
+            let value = self.client.call("hotRestart", json!({}), timeout)?;
+            check_success(&value)?;
+        }
+        // The old isolates, breakpoints, and pause records all died
+        // with the restart; rebuild the tables from VM truth.
+        self.isolates.clear();
+        self.main_isolate = None;
+        self.pause_events.clear();
+        self.auto_resumes.clear();
+        self.root_libs.clear();
+        self.breakpoints.clear();
+        self.breakpoint_specs.clear();
+        self.seed_from_vm()?;
+        self.wait_for_main_isolate(Duration::from_secs(15))?;
+        let main = self
+            .main_isolate
+            .clone()
+            .ok_or_else(|| Error::Protocol("no isolate survived the restart".into()))?;
+        let mut outcome = RestartOutcome {
+            re_armed: Vec::new(),
+            dropped: Vec::new(),
+        };
+        for mut spec in specs {
+            // Old isolate ids are dead; everything re-arms on the new
+            // main isolate.
+            spec.isolate = None;
+            match self.add_breakpoint(spec) {
+                Ok(handle) => outcome.re_armed.push(handle),
+                Err(error) => outcome.dropped.push(error.to_string()),
+            }
+        }
+        // A start-paused launch re-applies the start pause to the
+        // restarted isolate; `R` semantics leave the app running, so
+        // release it — with the re-armed breakpoints already bound.
+        if self
+            .pause_events
+            .get(&main)
+            .is_some_and(|(_, event)| event.kind == EventKind::PauseStart)
+        {
+            self.resume_marked(&main, json!({ "isolateId": main }))?;
+        }
+        Ok(outcome)
     }
 
-    /// Kills the launched process (no-op when attached) and closes the
-    /// connection.
+    /// Closes the debugger connection and releases the launched
+    /// program: the app keeps running under its own steam. The child
+    /// is moved to a reaper thread so it never lingers as a zombie;
+    /// the session is inert afterwards and its [`Drop`] no longer
+    /// kills anything. Re-attach later through [`DebugSession::ws_uri`].
+    pub fn detach(&mut self) {
+        self.client.close();
+        if let Some(child) = self.process.take() {
+            // A detached child must still be waited or it zombies; the
+            // thread lives as long as the app does.
+            let _ = std::thread::Builder::new()
+                .name("dartq-debug-reaper".into())
+                .spawn(move || drop(child));
+        }
+    }
+
+    /// Kills the launched process (no-op when attached) and closes
+    /// the connection. Idempotent.
+    ///
+    /// A launched `flutter run` is torn down in a ladder so no orphan
+    /// app survives: first the engine's `ext.flutter.exit` service
+    /// extension (the app exits itself, the tool follows), then
+    /// `SIGTERM` (the tool's cleanup handler stops the app), and only
+    /// then `SIGKILL`. Every rung is bounded.
     ///
     /// # Errors
     ///
-    /// Propagates an unexpected kill failure from the OS.
+    /// Propagates an unexpected kill/wait failure from the OS.
     pub fn terminate(&mut self) -> Result<()> {
+        if self.child_alive()? && self.flutter_child {
+            self.stop_flutter_child();
+            if self.child_alive()? {
+                self.signal_child_group(libc::SIGTERM)?;
+                self.wait_child_grace(Duration::from_secs(10))?;
+            }
+        }
         self.client.close();
         if let Some(mut child) = self.process.take() {
             // Already exited: the kill is a no-op on every platform
-            // once the child is reaped, and `wait` reaps it.
+            // once the child is reaped, and `wait` reaps it. A Flutter
+            // run is killed as a process group so the app never
+            // survives the tool.
             if child.try_wait()?.is_none() {
+                #[cfg(unix)]
+                if self.flutter_child {
+                    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                }
                 child.kill()?;
             }
             child.wait()?;
         }
+        Ok(())
+    }
+
+    /// Whether a not-yet-reaped child is still running.
+    fn child_alive(&mut self) -> Result<bool> {
+        Ok(match self.process.as_mut() {
+            Some(child) => child.try_wait()?.is_none(),
+            None => false,
+        })
+    }
+
+    /// Asks the running app to exit through the engine's
+    /// `ext.flutter.exit` extension (bounded; not every app registers
+    /// it, and failure falls through to the signal rungs).
+    fn stop_flutter_child(&mut self) {
+        if let Some(isolate) = self.main_isolate.clone() {
+            let _ = self.client.call_unit(
+                "ext.flutter.exit",
+                json!({ "isolateId": isolate }),
+                Duration::from_secs(5),
+            );
+        }
+        // The tool observes the app exit and exits on its own; give it
+        // a moment before the signal rungs.
+        let _ = self.wait_child_grace(Duration::from_secs(10));
+    }
+
+    /// Waits up to `grace` for the child to exit on its own.
+    fn wait_child_grace(&mut self, grace: Duration) -> Result<()> {
+        let deadline = Instant::now() + grace;
+        loop {
+            if !self.child_alive()? {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            // Keep the rings current while the app winds down.
+            let _ = self.poll_events();
+            std::thread::sleep(remaining.min(Duration::from_millis(50)));
+        }
+    }
+
+    /// Signals the launched Flutter tree (the tool and the app share
+    /// the process group set at launch). `Child::kill` is SIGKILL on
+    /// the tool alone and would orphan the app, so the signals go out
+    /// directly.
+    #[cfg(unix)]
+    fn signal_child_group(&mut self, signal: i32) -> Result<()> {
+        if let Some(child) = self.process.as_mut()
+            && unsafe { libc::kill(-(child.id() as i32), signal) } != 0
+        {
+            return Err(Error::Io(std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn signal_child_group(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn signal_child_term(&mut self) -> Result<()> {
         Ok(())
     }
 
@@ -1427,6 +1841,16 @@ impl DebugSession {
                 // root library may have been replaced.
                 self.root_libs.clear();
             }
+            EventKind::ServiceRegistered => {
+                if let (Some(service), Some(method)) = (&event.service, &event.method) {
+                    self.tool_services.insert(service.clone(), method.clone());
+                }
+            }
+            EventKind::ServiceUnregistered => {
+                if let Some(service) = &event.service {
+                    self.tool_services.remove(service);
+                }
+            }
             EventKind::BreakpointAdded
             | EventKind::BreakpointResolved
             | EventKind::BreakpointUpdated => {
@@ -1441,6 +1865,8 @@ impl DebugSession {
             EventKind::BreakpointRemoved => {
                 if let (Some(id), Some(breakpoint)) = (isolate_id, &event.breakpoint) {
                     self.breakpoints
+                        .remove(&(id.to_owned(), breakpoint.id.clone()));
+                    self.breakpoint_specs
                         .remove(&(id.to_owned(), breakpoint.id.clone()));
                 }
             }
@@ -1503,6 +1929,7 @@ impl DebugSession {
         self.auto_resumes.remove(id);
         self.root_libs.remove(id);
         self.breakpoints.retain(|(isolate, _), _| isolate != id);
+        self.breakpoint_specs.retain(|(isolate, _), _| isolate != id);
         if self.main_isolate.as_deref() == Some(id) {
             // Deterministic re-election: the lowest-numbered user
             // isolate (the VM numbers isolates in spawn order).
@@ -1850,14 +2277,40 @@ fn check_success(value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Extracts the service URI from a banner line:
-/// `The Dart VM service is listening on http://127.0.0.1:PORT/AUTH=/`.
+/// Whether a flutter_tools-registered service answered success. The
+/// tool's service callbacks return `{"result": {"type": "Success"}}`,
+/// which the vm_service package nests once under `result` — both
+/// spellings are accepted.
+fn tool_answer_ok(value: &Value) -> Option<()> {
+    let tag = value.get("type").and_then(Value::as_str);
+    let nested = value.pointer("/result/type").and_then(Value::as_str);
+    (tag == Some("Success") || nested == Some("Success")).then_some(())
+}
+
+/// Extracts the service URI from a banner line. Two spellings exist:
+///
+/// * `dart` (the CLI VM):
+///   `The Dart VM service is listening on http://127.0.0.1:PORT/AUTH=/`
+/// * `flutter run` (flutter_tools prints the DDS address):
+///   `A Dart VM Service on macOS is available at: http://127.0.0.1:PORT/AUTH=/`
+///
+/// The device name in the Flutter banner may contain spaces, so the
+/// URI is taken after the ` is available at: ` separator, not as the
+/// first token after a fixed prefix.
 fn banner_in(line: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(line).ok()?;
-    let marker = "The Dart VM service is listening on ";
-    let start = text.find(marker)? + marker.len();
-    let uri = text[start..].split_whitespace().next()?;
-    Some(uri.trim_end_matches('\r').to_owned())
+    let text = std::str::from_utf8(line).ok()?.trim_end_matches('\r');
+    const DART_MARKER: &str = "The Dart VM service is listening on ";
+    const FLUTTER_TAIL: &str = " is available at: ";
+    const FLUTTER_PREFIX: &str = "A Dart VM Service on ";
+    let uri = if let Some(start) = text.find(DART_MARKER) {
+        text[start + DART_MARKER.len()..].split_whitespace().next()?
+    } else if let Some(rest) = text.strip_prefix(FLUTTER_PREFIX) {
+        let separator = rest.rfind(FLUTTER_TAIL)?;
+        rest[separator + FLUTTER_TAIL.len()..].split_whitespace().next()?
+    } else {
+        return None;
+    };
+    Some(uri.to_owned())
 }
 
 /// Converts the announced http(s) service URI to its WebSocket form:
@@ -1915,30 +2368,121 @@ impl ServiceUri {
 
 /// Finds the `dart` executable: `DARTQ_DART_BIN` wins, then `PATH`.
 fn find_dart_binary() -> Result<PathBuf> {
-    if let Some(explicit) = std::env::var_os("DARTQ_DART_BIN") {
+    find_binary("DARTQ_DART_BIN", "dart", Error::DartBinaryNotFound)
+}
+
+/// Finds the `flutter` executable: `DARTQ_FLUTTER_BIN` wins, then
+/// `PATH`.
+fn find_flutter_binary() -> Result<PathBuf> {
+    find_binary("DARTQ_FLUTTER_BIN", "flutter", Error::FlutterBinaryNotFound)
+}
+
+/// One lookup shared by both toolchains: the explicit override, then
+/// every `PATH` entry.
+fn find_binary(
+    override_var: &str,
+    name: &str,
+    missing: fn(String) -> Error,
+) -> Result<PathBuf> {
+    if let Some(explicit) = std::env::var_os(override_var) {
         let path = PathBuf::from(explicit);
         if is_executable(&path) {
             return Ok(path);
         }
-        return Err(Error::DartBinaryNotFound(format!(
-            "DARTQ_DART_BIN={} is not an executable file",
+        return Err(missing(format!(
+            "{override_var}={} is not an executable file",
             path.display()
         )));
     }
     let Some(path_var) = std::env::var_os("PATH") else {
-        return Err(Error::DartBinaryNotFound(
-            "PATH is unset and DARTQ_DART_BIN is not set".into(),
-        ));
+        return Err(missing(format!(
+            "PATH is unset and {override_var} is not set"
+        )));
+    };
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
     };
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(if cfg!(windows) { "dart.exe" } else { "dart" });
+        let candidate = dir.join(&file);
         if is_executable(&candidate) {
             return Ok(candidate);
         }
     }
-    Err(Error::DartBinaryNotFound(
-        "no `dart` executable on PATH (set DARTQ_DART_BIN to override)".into(),
-    ))
+    Err(missing(format!(
+        "no `{name}` executable on PATH (set {override_var} to override)"
+    )))
+}
+
+/// The `dart <script>` argument vector: VM flags, the script, then the
+/// script's own arguments.
+fn dart_argv(config: &LaunchConfig) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec!["--enable-vm-service=0".into()];
+    argv.extend(config.vm_flags.iter().map(Into::into));
+    if config.pause_on_start {
+        argv.push("--pause-isolates-on-start".into());
+    }
+    argv.push(config.script.as_os_str().to_owned());
+    argv.extend(config.args.iter().map(Into::into));
+    argv
+}
+
+/// The `-t` target as `flutter run` should receive it. flutter_tools
+/// registers the entrypoint's kernel script under its package URI
+/// only when the target is the project-relative path; an absolute
+/// target compiles fine but leaves the script unlisted (and therefore
+/// unbreakable), so the cwd-anchored relative form wins whenever it
+/// exists.
+fn flutter_target(config: &LaunchConfig) -> PathBuf {
+    if let Some(cwd) = &config.cwd
+        && let Ok(relative) = config.script.strip_prefix(cwd)
+        && !relative.as_os_str().is_empty()
+    {
+        return relative.to_path_buf();
+    }
+    config.script.clone()
+}
+
+/// The `flutter run` argument vector: device, target, flavor, defines,
+/// start-pause, passthrough flags, then the program arguments after
+/// `--`.
+///
+/// # Errors
+///
+/// [`Error::Protocol`] when Dart-VM flags were configured —
+/// `flutter run` has no channel for them (pass tool flags through
+/// `flutter_args` or build-time defines instead).
+fn flutter_argv(config: &LaunchConfig) -> Result<Vec<OsString>> {
+    if !config.vm_flags.is_empty() {
+        return Err(Error::Protocol(
+            "vm_flags are not supported for flutter launches; pass tool flags through flutter_args"
+                .into(),
+        ));
+    }
+    let mut argv: Vec<OsString> = vec!["run".into()];
+    if let Some(device) = &config.device {
+        argv.push("-d".into());
+        argv.push(device.into());
+    }
+    argv.push("-t".into());
+    argv.push(flutter_target(config).into_os_string());
+    if let Some(flavor) = &config.flavor {
+        argv.push("--flavor".into());
+        argv.push(flavor.into());
+    }
+    for (key, value) in &config.dart_defines {
+        argv.push(format!("--dart-define={key}={value}").into());
+    }
+    if config.pause_on_start {
+        argv.push("--start-paused".into());
+    }
+    argv.extend(config.flutter_args.iter().map(Into::into));
+    if !config.args.is_empty() {
+        argv.push("--".into());
+        argv.extend(config.args.iter().map(Into::into));
+    }
+    Ok(argv)
 }
 
 #[cfg(unix)]
@@ -2146,7 +2690,11 @@ mod tests {
     use std::io::Cursor;
     use std::time::{Duration, Instant};
 
-    use super::{PipeEvent, PipeKind, banner_in, service_uri_to_ws, spawn_pipe_reader};
+    use super::{
+        LaunchConfig, LaunchKind, PipeEvent, PipeKind, banner_in, dart_argv, flutter_argv,
+        flutter_target, service_uri_to_ws, spawn_pipe_reader,
+    };
+    use std::path::PathBuf;
 
     const BANNER: &str = "The Dart VM service is listening on http://127.0.0.1:8181/AbC=/\n";
 
@@ -2156,6 +2704,37 @@ mod tests {
             banner_in(BANNER.trim_end().as_bytes()).as_deref(),
             Some("http://127.0.0.1:8181/AbC=/")
         );
+    }
+
+    #[test]
+    fn flutter_banner_is_parsed_with_and_without_spaces_in_device_name() {
+        assert_eq!(
+            banner_in(b"A Dart VM Service on macOS is available at: http://127.0.0.1:9001/xY=/")
+                .as_deref(),
+            Some("http://127.0.0.1:9001/xY=/")
+        );
+        // Device names may contain spaces (e.g. a phone with a
+        // parenthetical) — the URI still follows the separator.
+        assert_eq!(
+            banner_in(
+                b"A Dart VM Service on Yona\xe7\x9a\x84iPhone (wireless) is available at: \
+http://127.0.0.1:9002/A=/\r"
+            )
+            .as_deref(),
+            Some("http://127.0.0.1:9002/A=/")
+        );
+    }
+
+    #[test]
+    fn flutter_lookalike_lines_are_not_banners() {
+        // The DevTools and DTD announcements share the tail shape but
+        // not the prefix; only the Dart VM Service line is a banner.
+        assert_eq!(
+            banner_in(b"The Dart Tooling Daemon is available at: ws://127.0.0.1:1234/ab=/"),
+            None
+        );
+        assert_eq!(banner_in(b"A DevTools server is available at: http://127.0.0.1:9/"), None);
+        assert_eq!(banner_in(b"A Dart VM Service on macOS never finished"), None);
     }
 
     #[test]
@@ -2170,6 +2749,101 @@ mod tests {
     fn unrelated_lines_are_not_banners() {
         assert_eq!(banner_in(b"hello"), None);
         assert_eq!(banner_in(b""), None);
+    }
+
+    #[test]
+    fn dart_argv_places_flags_script_then_args() {
+        let config = LaunchConfig {
+            vm_flags: vec!["--enable-asserts".into()],
+            args: vec!["--fast".into()],
+            ..LaunchConfig::new("bin/main.dart")
+        };
+        let argv: Vec<String> = dart_argv(&config)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            [
+                "--enable-vm-service=0",
+                "--enable-asserts",
+                "--pause-isolates-on-start",
+                "bin/main.dart",
+                "--fast"
+            ]
+        );
+    }
+
+    #[test]
+    fn flutter_argv_maps_every_option() {
+        let config = LaunchConfig {
+            device: Some("macos".into()),
+            flavor: Some("dev".into()),
+            dart_defines: vec![("PROBE_TAG".into(), "e2e".into())],
+            flutter_args: vec!["--no-devtools".into()],
+            args: vec!["--route=/x".into()],
+            ..LaunchConfig::flutter("lib/main.dart")
+        };
+        let argv: Vec<String> = flutter_argv(&config)
+            .expect("valid flutter argv")
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            argv,
+            [
+                "run",
+                "-d",
+                "macos",
+                "-t",
+                "lib/main.dart",
+                "--flavor",
+                "dev",
+                "--dart-define=PROBE_TAG=e2e",
+                "--start-paused",
+                "--no-devtools",
+                "--",
+                "--route=/x"
+            ]
+        );
+    }
+
+    #[test]
+    fn flutter_target_prefers_the_cwd_relative_form() {
+        let config = LaunchConfig {
+            cwd: Some(PathBuf::from("/tmp/proj")),
+            ..LaunchConfig::flutter("/tmp/proj/lib/main.dart")
+        };
+        assert_eq!(flutter_target(&config), PathBuf::from("lib/main.dart"));
+
+        // Outside the cwd, or with no cwd: the path passes through.
+        let outside = LaunchConfig::flutter("/elsewhere/lib/main.dart");
+        assert_eq!(
+            flutter_target(&outside),
+            PathBuf::from("/elsewhere/lib/main.dart")
+        );
+    }
+
+    #[test]
+    fn flutter_argv_rejects_vm_flags_and_minimal_launch_runs_unpaused() {
+        let rejected = LaunchConfig {
+            vm_flags: vec!["--enable-asserts".into()],
+            ..LaunchConfig::flutter("lib/main.dart")
+        };
+        assert!(flutter_argv(&rejected).is_err());
+
+        let minimal = LaunchConfig {
+            pause_on_start: false,
+            ..LaunchConfig::flutter("lib/main.dart")
+        };
+        let argv: Vec<String> = flutter_argv(&minimal)
+            .expect("minimal argv")
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(argv, ["run", "-t", "lib/main.dart"]);
+        assert_eq!(minimal.kind, LaunchKind::Flutter);
+        assert_eq!(minimal.launch_timeout, Duration::from_secs(300));
     }
 
     #[test]

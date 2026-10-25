@@ -145,7 +145,7 @@ fn attach_pause_step_rewind() {
         "no pause event in ring"
     );
 
-    // hot_restart on a bare VM: DDS-registered service absent -> Rpc
+    // hot_restart on a bare VM: tool-registered service absent -> Rpc
     // error, not a crash.
     match session.hot_restart() {
         Err(e) => {
@@ -155,7 +155,8 @@ fn attach_pause_step_rewind() {
                 "unexpected hot_restart error: {text}"
             );
         }
-        Ok(()) => {} // DDS-connected VM would succeed — acceptable.
+        // A DDS-connected VM would succeed — acceptable.
+        Ok(_) => {}
     }
 
     session.terminate().expect("terminate");

@@ -150,19 +150,34 @@ analysis, and lifecycle reads. Not for: test-run result events \
     },
     Tool {
         name: "dartq_debug_launch",
-        description: "Launch a debug session for a Dart entrypoint. Use for: interactive \
-debugging. Not for: analyzing code or running tests.",
+        description: "Launch a debug session for a Dart script or a Flutter app (Flutter is \
+the primary target; kind: dart|flutter, plus device/flavor/dartDefines for flutter). Use for: \
+interactive debugging — launch pauses at start, so arm breakpoints via \
+dartq_debug_breakpoint_add, then dartq_debug_resume (the standard takeover loop). Not for: \
+analyzing code or running tests.",
         kind: ToolKind::Daemon("dartq/debug/launch"),
     },
     Tool {
         name: "dartq_debug_attach",
-        description: "Attach a debug session to a running VM service URI. Use for: \ndebugging an already-started program. Not for: starting fresh \n(dartq_debug_launch).",
+        description: "Attach a debug session to a running VM service ws URI — including one \
+owned by a live `flutter run` (dartq speaks only the service protocol; the tool's own \
+console keeps working). Use for: debugging an already-started program. Not for: starting \
+fresh (dartq_debug_launch).",
         kind: ToolKind::Daemon("dartq/debug/attach"),
     },
     Tool {
         name: "dartq_debug_detach",
-        description: "Detach one debug session (the program keeps running). Use for: ending \ndebugging without killing the program. Not for: terminating it \n(dartq_debug_launch owns launched programs' lifecycle).",
+        description: "Detach one debug session; the program keeps running and the answer \
+carries the ws URI for re-attaching later. Use for: ending debugging without stopping the \
+app. Not for: terminating it (dartq_debug_stop).",
         kind: ToolKind::Daemon("dartq/debug/detach"),
+    },
+    Tool {
+        name: "dartq_debug_stop",
+        description: "Stop one debug session and its launched program (a Flutter app is shut \
+down through the tool's own cleanup ladder — no orphaned app). Use for: ending a launched \
+session for good. Not for: keeping it running (dartq_debug_detach).",
+        kind: ToolKind::Daemon("dartq/debug/stop"),
     },
     Tool {
         name: "dartq_debug_status",
@@ -203,6 +218,30 @@ debugging. Not for: analyzing code or running tests.",
         name: "dartq_debug_snapshot",
         description: "A stopped frame snapshot: variables, scopes. Use for: inspecting a \npaused program. Not for: its output stream (dartq_debug_output).",
         kind: ToolKind::Daemon("dartq/debug/snapshot"),
+    },
+    Tool {
+        name: "dartq_debug_reload",
+        description: "Hot reload (reloadSources) — on a Flutter session this is the tool's \
+own orchestrated reload (source push + reassemble), so edits on disk take effect. A broken \
+edit answers the compile error as data; the session stays usable. Use for: the edit-reload \
+half of the loop. Not for: state resets (dartq_debug_restart).",
+        kind: ToolKind::Daemon("dartq/debug/reload"),
+    },
+    Tool {
+        name: "dartq_debug_restart",
+        description: "Hot restart (Flutter): state resets like the tool's `R`, isolates are \
+rebuilt, and the session re-arms its breakpoints on the new isolate (the answer lists them). \
+Use for: a clean slate after edits too large for reload. Not for: keeping state \
+(dartq_debug_reload).",
+        kind: ToolKind::Daemon("dartq/debug/restart"),
+    },
+    Tool {
+        name: "dartq_debug_evaluate",
+        description: "Evaluate one Dart expression in a paused frame (frameIndex) or the \
+isolate's root library (no frameIndex). Use for: inspecting state the snapshot only names, \
+verifying a fix from inside the app. Not for: the one-call stopped bundle \
+(dartq_debug_snapshot).",
+        kind: ToolKind::Daemon("dartq/debug/evaluate"),
     },
     Tool {
         name: "dartq_debug_events",

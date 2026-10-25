@@ -826,16 +826,17 @@ fn the_served_set_is_exactly_the_frozen_family() {
 }
 
 /// The frozen `dartq/debug/*` family: the daemon-native debug registry's
-/// 13-method request table, pinned the same way the analysis family is —
+/// 17-method request table, pinned the same way the analysis family is —
 /// an added, renamed, or removed method drifts the table and fails the
 /// gate. The family is deliberately NOT part of `METHODS` (that table is
 /// the CLI-mirror analysis family; the debug faces target the debug
 /// registry, never the analysis engine), so it carries its own frozen
 /// copy and its own disjointness pins.
-const FROZEN_DEBUG_METHODS: [&str; 13] = [
+const FROZEN_DEBUG_METHODS: [&str; 17] = [
     "dartq/debug/launch",
     "dartq/debug/attach",
     "dartq/debug/detach",
+    "dartq/debug/stop",
     "dartq/debug/status",
     "dartq/debug/breakpointAdd",
     "dartq/debug/breakpointRemove",
@@ -844,6 +845,9 @@ const FROZEN_DEBUG_METHODS: [&str; 13] = [
     "dartq/debug/pause",
     "dartq/debug/step",
     "dartq/debug/snapshot",
+    "dartq/debug/reload",
+    "dartq/debug/restart",
+    "dartq/debug/evaluate",
     "dartq/debug/events",
     "dartq/debug/output",
 ];

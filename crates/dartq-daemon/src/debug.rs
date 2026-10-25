@@ -1,6 +1,10 @@
 //! The `dartq/debug/*` face: launch/attach debugging sessions over the
 //! daemon's RPC surface and drive them — breakpoints, stepping, stopped
-//! snapshots with variables, and cursor-paged event/output reads.
+//! snapshots with variables, evaluation, hot reload/restart, and
+//! cursor-paged event/output reads. Launches run `dart` scripts or
+//! `flutter run` apps (Flutter is the primary target platform); attach
+//! takes any live VM service URI, including one owned by a running
+//! `flutter run`.
 //!
 //! The face is a registry problem, not an analysis problem: every request
 //! targets one of the session's live [`DebugManager`] entries and never
@@ -21,8 +25,8 @@ use std::path::{Path, PathBuf};
 
 use dartq_debug::{
     BreakpointHandle, BreakpointLocationSpec, BreakpointSpec, DebugSession, EventBatch,
-    ExceptionPauseMode, FrameLocation, FrameSummary, LaunchConfig, OutputBatch, SessionEvent,
-    StepOption, StoppedReason, StoppedSnapshot, Variable,
+    ExceptionPauseMode, FrameLocation, FrameSummary, LaunchConfig, LaunchKind, OutputBatch,
+    RestartOutcome, SessionEvent, StepOption, StoppedReason, StoppedSnapshot, Variable, VmObject,
 };
 use rustc_hash::FxHashMap;
 use serde::Deserialize;
@@ -36,6 +40,7 @@ use crate::jsonrpc::codes;
 pub const DEBUG_LAUNCH: &str = "dartq/debug/launch";
 pub const DEBUG_ATTACH: &str = "dartq/debug/attach";
 pub const DEBUG_DETACH: &str = "dartq/debug/detach";
+pub const DEBUG_STOP: &str = "dartq/debug/stop";
 pub const DEBUG_STATUS: &str = "dartq/debug/status";
 pub const DEBUG_BREAKPOINT_ADD: &str = "dartq/debug/breakpointAdd";
 pub const DEBUG_BREAKPOINT_REMOVE: &str = "dartq/debug/breakpointRemove";
@@ -44,15 +49,19 @@ pub const DEBUG_RESUME: &str = "dartq/debug/resume";
 pub const DEBUG_PAUSE: &str = "dartq/debug/pause";
 pub const DEBUG_STEP: &str = "dartq/debug/step";
 pub const DEBUG_SNAPSHOT: &str = "dartq/debug/snapshot";
+pub const DEBUG_RELOAD: &str = "dartq/debug/reload";
+pub const DEBUG_RESTART: &str = "dartq/debug/restart";
+pub const DEBUG_EVALUATE: &str = "dartq/debug/evaluate";
 pub const DEBUG_EVENTS: &str = "dartq/debug/events";
 pub const DEBUG_OUTPUT: &str = "dartq/debug/output";
 
 /// Every `dartq/debug/*` request name — the family the server intercepts
 /// at intake ahead of the analysis-command arm.
-pub const DEBUG_REQUESTS: [&str; 13] = [
+pub const DEBUG_REQUESTS: [&str; 17] = [
     DEBUG_LAUNCH,
     DEBUG_ATTACH,
     DEBUG_DETACH,
+    DEBUG_STOP,
     DEBUG_STATUS,
     DEBUG_BREAKPOINT_ADD,
     DEBUG_BREAKPOINT_REMOVE,
@@ -61,6 +70,9 @@ pub const DEBUG_REQUESTS: [&str; 13] = [
     DEBUG_PAUSE,
     DEBUG_STEP,
     DEBUG_SNAPSHOT,
+    DEBUG_RELOAD,
+    DEBUG_RESTART,
+    DEBUG_EVALUATE,
     DEBUG_EVENTS,
     DEBUG_OUTPUT,
 ];
@@ -106,8 +118,14 @@ impl DebugError {
 
 /// How a managed session came to be — the `status` face's origin field.
 enum Origin {
-    /// A launched `dart <script>` (the script path as requested).
-    Launch(PathBuf),
+    /// A launched process (the entrypoint path as requested, plus the
+    /// toolchain that runs it).
+    Launch {
+        /// The entrypoint script or Flutter target.
+        script: PathBuf,
+        /// The toolchain (`dart`/`flutter`).
+        kind: LaunchKind,
+    },
     /// An attached VM service WebSocket URI.
     Attach(String),
 }
@@ -155,6 +173,9 @@ impl DebugManager {
 #[serde(rename_all = "camelCase")]
 struct LaunchParams {
     script: PathBuf,
+    /// `dart` (default) or `flutter`.
+    #[serde(default)]
+    kind: Option<String>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
@@ -162,6 +183,18 @@ struct LaunchParams {
     #[serde(default = "default_pause_on_start")]
     pause_on_start: bool,
     cwd: Option<PathBuf>,
+    /// Flutter: the device id (`flutter run -d`).
+    #[serde(default)]
+    device: Option<String>,
+    /// Flutter: the build flavor.
+    #[serde(default)]
+    flavor: Option<String>,
+    /// Flutter: `--dart-define` entries, `KEY=VALUE` strings.
+    #[serde(default)]
+    dart_defines: Vec<String>,
+    /// Flutter: extra `flutter run` arguments passed through.
+    #[serde(default)]
+    flutter_args: Vec<String>,
 }
 
 /// The AI-first default: pause at start, so breakpoints arm before the
@@ -253,6 +286,37 @@ struct StepParams {
     option: String,
 }
 
+/// The `reload` payload.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReloadParams {
+    session_id: u32,
+    #[serde(default)]
+    isolate: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+/// The `restart` payload.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RestartParams {
+    session_id: u32,
+}
+
+/// The `evaluate` payload: a frame index evaluates in that frame of
+/// the paused isolate; without one the isolate's root library answers.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EvaluateParams {
+    session_id: u32,
+    #[serde(default)]
+    isolate: Option<String>,
+    expression: String,
+    #[serde(default)]
+    frame_index: Option<u32>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotParams {
@@ -312,6 +376,37 @@ fn parse_step_option(option: &str) -> Option<StepOption> {
     }
 }
 
+/// The `launch` kind spellings.
+fn parse_launch_kind(kind: Option<&str>) -> Result<LaunchKind, DebugError> {
+    match kind {
+        None | Some("dart") => Ok(LaunchKind::Dart),
+        Some("flutter") => Ok(LaunchKind::Flutter),
+        Some(other) => Err(DebugError::InvalidParams(format!(
+            "kind must be \"dart\" or \"flutter\", got {other:?}"
+        ))),
+    }
+}
+
+/// Splits one `KEY=VALUE` dart-define entry.
+fn split_define(entry: &str) -> Result<(String, String), DebugError> {
+    entry
+        .split_once('=')
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .ok_or_else(|| {
+            DebugError::InvalidParams(format!(
+                "dartDefines entries must be KEY=VALUE, got {entry:?}"
+            ))
+        })
+}
+
+/// The wire word of a launch kind.
+fn launch_kind_word(kind: LaunchKind) -> &'static str {
+    match kind {
+        LaunchKind::Dart => "dart",
+        LaunchKind::Flutter => "flutter",
+    }
+}
+
 /// Relative request paths resolve against the session workspace root (the
 /// analysis faces' rule).
 fn resolve(root: &Path, path: PathBuf) -> PathBuf {
@@ -348,13 +443,32 @@ pub(crate) fn handle(
                     "script must be a non-empty path".into(),
                 ));
             }
-            let mut config = LaunchConfig::new(resolve(root, decoded.script.clone()));
+            let kind = parse_launch_kind(decoded.kind.as_deref())?;
+            let resolved = resolve(root, decoded.script.clone());
+            let mut config = match kind {
+                LaunchKind::Dart => LaunchConfig::new(resolved),
+                LaunchKind::Flutter => LaunchConfig::flutter(resolved),
+            };
             config.args = decoded.args;
             config.vm_flags = decoded.vm_flags;
             config.pause_on_start = decoded.pause_on_start;
             config.cwd = decoded.cwd.map(|cwd| resolve(root, cwd));
+            config.device = decoded.device;
+            config.flavor = decoded.flavor;
+            config.flutter_args = decoded.flutter_args;
+            config.dart_defines = decoded
+                .dart_defines
+                .iter()
+                .map(|entry| split_define(entry))
+                .collect::<Result<Vec<_>, _>>()?;
             let session = DebugSession::launch(config).map_err(DebugError::Vm)?;
-            let id = manager.register(Origin::Launch(decoded.script), session);
+            let id = manager.register(
+                Origin::Launch {
+                    script: decoded.script,
+                    kind,
+                },
+                session,
+            );
             Ok(session_opened_row(id, &manager.get(id).expect("just registered").session))
         }
         DEBUG_ATTACH => {
@@ -370,12 +484,22 @@ pub(crate) fn handle(
         DEBUG_DETACH => {
             let decoded =
                 serde_json::from_value::<SessionParams>(params.clone()).map_err(invalid)?;
-            // Removing drops the session; its Drop tears the child and
-            // the connection down.
-            manager
-                .sessions
-                .remove(&decoded.session_id)
-                .ok_or(DebugError::NoSuchSession(decoded.session_id))?;
+            let managed = manager.get(decoded.session_id)?;
+            // Detach leaves the program running: an attached program
+            // was never ours, and a launched child is orphaned to a
+            // reaper instead of killed. The ws URI rides the answer so
+            // the caller can re-attach (or stop it with `stop`).
+            managed.session.detach();
+            let ws_uri = managed.session.ws_uri().to_owned();
+            manager.sessions.remove(&decoded.session_id);
+            Ok(json!({ "ok": true, "wsUri": ws_uri }))
+        }
+        DEBUG_STOP => {
+            let decoded =
+                serde_json::from_value::<SessionParams>(params.clone()).map_err(invalid)?;
+            let managed = manager.get(decoded.session_id)?;
+            managed.session.terminate().map_err(DebugError::Vm)?;
+            manager.sessions.remove(&decoded.session_id);
             Ok(json!({ "ok": true }))
         }
         DEBUG_STATUS => {
@@ -497,6 +621,45 @@ pub(crate) fn handle(
                 .map_err(DebugError::Vm)?;
             Ok(snapshot_row(&snapshot))
         }
+        DEBUG_RELOAD => {
+            let decoded =
+                serde_json::from_value::<ReloadParams>(params.clone()).map_err(invalid)?;
+            let managed = manager.get(decoded.session_id)?;
+            let ok = managed
+                .session
+                .reload_sources(decoded.isolate.as_deref(), decoded.force)
+                .map_err(DebugError::Vm)?;
+            Ok(json!({ "ok": ok }))
+        }
+        DEBUG_RESTART => {
+            let decoded =
+                serde_json::from_value::<RestartParams>(params.clone()).map_err(invalid)?;
+            let managed = manager.get(decoded.session_id)?;
+            let outcome = managed.session.hot_restart().map_err(DebugError::Vm)?;
+            Ok(restart_row(&outcome))
+        }
+        DEBUG_EVALUATE => {
+            let decoded =
+                serde_json::from_value::<EvaluateParams>(params.clone()).map_err(invalid)?;
+            if decoded.expression.is_empty() {
+                return Err(DebugError::InvalidParams(
+                    "expression must be a non-empty string".into(),
+                ));
+            }
+            let managed = manager.get(decoded.session_id)?;
+            let value = match decoded.frame_index {
+                Some(frame_index) => managed.session.evaluate_in_frame(
+                    decoded.isolate.as_deref(),
+                    frame_index,
+                    &decoded.expression,
+                ),
+                None => managed
+                    .session
+                    .evaluate_in_root_lib(decoded.isolate.as_deref(), &decoded.expression),
+            }
+            .map_err(DebugError::Vm)?;
+            Ok(vm_object_row(&value))
+        }
         DEBUG_SNAPSHOT => {
             let decoded =
                 serde_json::from_value::<SnapshotParams>(params.clone()).map_err(invalid)?;
@@ -578,10 +741,52 @@ fn status_row(id: u32, managed: &ManagedSession) -> Value {
         "breakpointCount": session.breakpoints().count(),
     });
     match &managed.origin {
-        Origin::Launch(script) => row["script"] = json!(script.display().to_string()),
+        Origin::Launch { script, kind } => {
+            row["script"] = json!(script.display().to_string());
+            row["kind"] = json!(launch_kind_word(*kind));
+        }
         Origin::Attach(uri) => row["wsUri"] = json!(uri),
     }
     row
+}
+
+/// A hot-restart outcome: the re-armed breakpoints and the drops.
+fn restart_row(outcome: &RestartOutcome) -> Value {
+    json!({
+        "reArmed": outcome.re_armed.iter().map(breakpoint_row).collect::<Vec<_>>(),
+        "dropped": outcome.dropped,
+    })
+}
+
+/// One evaluation answer: a short rendering plus the lazy-expansion
+/// handle where one exists.
+fn vm_object_row(object: &VmObject) -> Value {
+    match object {
+        VmObject::Instance(instance) => {
+            let class = instance
+                .class
+                .as_ref()
+                .and_then(|class| class.name.clone())
+                .unwrap_or_else(|| "instance".into());
+            json!({
+                "kind": "instance",
+                "class": class,
+                "value": instance.value_as_string.clone().unwrap_or_default(),
+                "handle": if instance.id.is_empty() { Value::Null } else { json!(instance.id) },
+            })
+        }
+        VmObject::Sentinel(sentinel) => json!({
+            "kind": "sentinel",
+            "value": sentinel
+                .value_as_string
+                .clone()
+                .unwrap_or_else(|| sentinel.kind.as_str().to_owned()),
+        }),
+        VmObject::Error { kind, message } => {
+            json!({ "kind": "error", "errorKind": kind, "message": message })
+        }
+        VmObject::Other(raw) => json!({ "kind": "other", "raw": raw }),
+    }
 }
 
 /// A breakpoint handle as the daemon answers it.
@@ -703,17 +908,23 @@ mod tests {
     use super::*;
     use dartq_debug::Event;
 
-    /// The `launch` payload decodes with its AI-first defaults and
-    /// rejects a missing script (the only required field).
+    /// The `launch` payload decodes with its AI-first defaults (a dart
+    /// launch), carries every Flutter option, and rejects a missing
+    /// script (the only required field).
     #[test]
     fn launch_params_decode_with_defaults_and_reject_missing_script() {
         let decoded: LaunchParams =
             serde_json::from_value(json!({ "script": "bin/main.dart" })).expect("decodes");
         assert_eq!(decoded.script, PathBuf::from("bin/main.dart"));
+        assert_eq!(decoded.kind.as_deref(), None);
         assert!(decoded.args.is_empty());
         assert!(decoded.vm_flags.is_empty());
         assert!(decoded.pause_on_start);
         assert!(decoded.cwd.is_none());
+        assert!(decoded.device.is_none());
+        assert!(decoded.flavor.is_none());
+        assert!(decoded.dart_defines.is_empty());
+        assert!(decoded.flutter_args.is_empty());
 
         let decoded: LaunchParams = serde_json::from_value(json!({
             "script": "bin/main.dart",
@@ -728,8 +939,47 @@ mod tests {
         assert!(!decoded.pause_on_start);
         assert_eq!(decoded.cwd, Some(PathBuf::from("bin")));
 
+        let flutter: LaunchParams = serde_json::from_value(json!({
+            "script": "lib/main.dart",
+            "kind": "flutter",
+            "device": "macos",
+            "flavor": "dev",
+            "dartDefines": ["PROBE=1"],
+            "flutterArgs": ["--no-devtools"]
+        }))
+        .expect("decodes");
+        assert_eq!(flutter.kind.as_deref(), Some("flutter"));
+        assert_eq!(flutter.device.as_deref(), Some("macos"));
+        assert_eq!(flutter.flavor.as_deref(), Some("dev"));
+        assert_eq!(flutter.dart_defines, ["PROBE=1"]);
+        assert_eq!(flutter.flutter_args, ["--no-devtools"]);
+
         assert!(serde_json::from_value::<LaunchParams>(json!({ "args": [] })).is_err());
         assert!(serde_json::from_value::<LaunchParams>(json!({ "script": 7 })).is_err());
+    }
+
+    /// The launch kind maps its wire words or rejects; a dart-define
+    /// splits on the first `=` or answers the shared tier.
+    #[test]
+    fn launch_kind_and_dart_defines_map_or_reject() {
+        assert!(matches!(parse_launch_kind(None), Ok(LaunchKind::Dart)));
+        assert!(matches!(
+            parse_launch_kind(Some("dart")),
+            Ok(LaunchKind::Dart)
+        ));
+        assert!(matches!(
+            parse_launch_kind(Some("flutter")),
+            Ok(LaunchKind::Flutter)
+        ));
+        assert!(parse_launch_kind(Some("Flutter")).is_err());
+
+        assert_eq!(
+            split_define("PROBE=1=x").expect("splits on the first ="),
+            ("PROBE".to_owned(), "1=x".to_owned())
+        );
+        assert!(split_define("PROBE").is_err());
+        assert_eq!(launch_kind_word(LaunchKind::Flutter), "flutter");
+        assert_eq!(launch_kind_word(LaunchKind::Dart), "dart");
     }
 
     /// A breakpoint location decodes in both shapes — the line form and
@@ -926,6 +1176,46 @@ mod tests {
         );
     }
 
+    /// A restart answer carries the re-armed breakpoint rows and the
+    /// drops; an evaluation answer renders each `VmObject` shape with
+    /// its lazy handle.
+    #[test]
+    fn restart_and_evaluate_rows_shape_the_outcomes() {
+        let outcome = RestartOutcome {
+            re_armed: vec![BreakpointHandle {
+                id: "breakpoints/1".into(),
+                isolate: "isolates/9".into(),
+                condition: None,
+                resolved: true,
+            }],
+            dropped: vec!["rpc error 102: script gone".into()],
+        };
+        let row = restart_row(&outcome);
+        assert_eq!(row["reArmed"][0]["id"], "breakpoints/1");
+        assert_eq!(row["dropped"][0], "rpc error 102: script gone");
+
+        let instance = serde_json::from_value::<dartq_debug::Instance>(json!({
+            "type": "@Instance",
+            "id": "objects/7",
+            "kind": "String",
+            "valueAsString": "probe-v1"
+        }))
+        .expect("instance decodes");
+        let row = vm_object_row(&VmObject::Instance(Box::new(instance)));
+        assert_eq!(row["kind"], "instance");
+        assert_eq!(row["value"], "probe-v1");
+        assert_eq!(row["handle"], "objects/7");
+
+        let error = vm_object_row(&VmObject::Error {
+            kind: "EvaluationError".into(),
+            message: "undefined name".into(),
+        });
+        assert_eq!(error["kind"], "error");
+        assert_eq!(error["message"], "undefined name");
+        assert!(vm_object_row(&VmObject::Other(json!({ "type": "Script" })))["raw"]["type"]
+            == "Script");
+    }
+
     /// One recorded event answers its kind tag, cursor, and stream, embeds
     /// the protocol event, and carries the raw JSON only when dartq-debug
     /// retained one.
@@ -982,6 +1272,7 @@ mod tests {
 
         for (method, params) in [
             (DEBUG_DETACH, json!({ "sessionId": 1 })),
+            (DEBUG_STOP, json!({ "sessionId": 1 })),
             (DEBUG_RESUME, json!({ "sessionId": 1 })),
             (DEBUG_PAUSE, json!({ "sessionId": 1, "isolate": "isolates/1" })),
             (DEBUG_SNAPSHOT, json!({ "sessionId": 1, "isolate": "isolates/1" })),
@@ -990,6 +1281,9 @@ mod tests {
             (DEBUG_BREAKPOINT_REMOVE, json!({ "sessionId": 1, "breakpointId": "breakpoints/1" })),
             (DEBUG_EXCEPTION_PAUSE, json!({ "sessionId": 1, "mode": "none" })),
             (DEBUG_STEP, json!({ "sessionId": 1, "option": "into" })),
+            (DEBUG_RELOAD, json!({ "sessionId": 1 })),
+            (DEBUG_RESTART, json!({ "sessionId": 1 })),
+            (DEBUG_EVALUATE, json!({ "sessionId": 1, "expression": "1 + 1" })),
         ] {
             let error = handle(&mut manager, method, &params, root)
                 .err()
@@ -1008,10 +1302,16 @@ mod tests {
         // without a line names no position).
         for (method, params) in [
             (DEBUG_LAUNCH, json!({})),
+            (DEBUG_LAUNCH, json!({ "script": "lib/main.dart", "kind": "swift" })),
+            (
+                DEBUG_LAUNCH,
+                json!({ "script": "lib/main.dart", "kind": "flutter", "dartDefines": ["NOVALUE"] }),
+            ),
             (DEBUG_STEP, json!({ "sessionId": 1, "option": "sideways" })),
             (DEBUG_OUTPUT, json!({ "sessionId": 1, "stream": "stdin" })),
             (DEBUG_ATTACH, json!({ "wsUri": "" })),
             (DEBUG_EXCEPTION_PAUSE, json!({ "sessionId": 1, "mode": "sometimes" })),
+            (DEBUG_EVALUATE, json!({ "sessionId": 1, "expression": "" })),
             (
                 DEBUG_BREAKPOINT_ADD,
                 json!({ "sessionId": 1, "location": { "script": "package:app/main.dart" } }),

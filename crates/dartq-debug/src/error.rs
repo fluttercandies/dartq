@@ -66,6 +66,11 @@ pub enum Error {
     #[error("dart binary not found: {0}")]
     DartBinaryNotFound(String),
 
+    /// The `flutter` executable could not be located (neither
+    /// `DARTQ_FLUTTER_BIN` nor `PATH` produced one).
+    #[error("flutter binary not found: {0}")]
+    FlutterBinaryNotFound(String),
+
     /// The spawned process did not print its service URI banner before
     /// the launch deadline elapsed.
     #[error("timed out waiting for the VM service URI banner")]

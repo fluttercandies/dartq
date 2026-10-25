@@ -53,7 +53,7 @@ fn attach_performs_version_streams_then_vm() {
     let session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
     let mut methods = Vec::new();
     let mut streams = Vec::new();
-    for _ in 0..7 {
+    for _ in 0..8 {
         let request = vm
             .requests
             .recv_timeout(WAIT)
@@ -72,12 +72,18 @@ fn attach_performs_version_streams_then_vm() {
             "streamListen",
             "streamListen",
             "streamListen",
+            "streamListen",
             "getVM",
         ]
     );
     // Attach mode subscribes the output streams too (a launched
-    // session reads the child's pipes instead).
-    assert_eq!(streams, ["Debug", "Isolate", "Logging", "Stdout", "Stderr"]);
+    // session reads the child's pipes instead), and the Service stream
+    // carries tool-service registrations (DDS replays them — how a
+    // Flutter session finds the tool's reload/restart services).
+    assert_eq!(
+        streams,
+        ["Debug", "Isolate", "Logging", "Service", "Stdout", "Stderr"]
+    );
     assert_eq!(session.main_isolate(), Some("isolates/1"));
     assert_eq!(session.isolates().count(), 1);
     assert_eq!(session.config().pause_timeout, Duration::from_secs(5));

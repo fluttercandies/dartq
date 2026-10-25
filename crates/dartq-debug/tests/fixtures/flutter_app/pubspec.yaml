@@ -1,0 +1,12 @@
+name: flutter_debug_fixture
+description: >-
+  A minimal Flutter app for dartq-debug's real-VM e2e tests. The test
+  harness copies these files into a freshly generated project scaffold
+  so the platform runner always matches the installed Flutter. Every
+  dependency is an SDK dependency: no network, no hosted packages.
+publish_to: none
+environment:
+  sdk: ^3.0.0
+dependencies:
+  flutter:
+    sdk: flutter

@@ -10,11 +10,13 @@
 //! same connection.
 //!
 //! [`session::DebugSession`] layers the AI-first surface on top:
-//! launching or attaching to a Dart process, breakpoints (including
-//! conditional breakpoints implemented as frame-scoped evaluation),
-//! step-and-package stopped snapshots, lazy object-graph expansion by
-//! handle, exception pause mode, hot reload, and bounded stdout/stderr
-//! capture — all without any IDE in the loop.
+//! launching or attaching to a Dart process (a `dart` script or a
+//! `flutter run` app — Flutter is dartq's primary target platform),
+//! breakpoints (including conditional breakpoints implemented as
+//! frame-scoped evaluation), step-and-package stopped snapshots, lazy
+//! object-graph expansion by handle, exception pause mode, hot
+//! reload/restart, and bounded stdout/stderr capture — all without
+//! any IDE in the loop.
 
 mod client;
 mod error;
@@ -34,6 +36,6 @@ pub use protocol::{
 pub use ring::Ring;
 pub use session::{
     BreakpointHandle, BreakpointLocationSpec, BreakpointSpec, ConditionalResumeLimit, DebugSession,
-    EventBatch, ExpandLimits, FrameLocation, FrameSummary, LaunchConfig, OutputBatch, SessionConfig,
-    SessionEvent, StoppedReason, StoppedSnapshot, Variable,
+    EventBatch, ExpandLimits, FrameLocation, FrameSummary, LaunchConfig, LaunchKind, OutputBatch,
+    RestartOutcome, SessionConfig, SessionEvent, StoppedReason, StoppedSnapshot, Variable,
 };
