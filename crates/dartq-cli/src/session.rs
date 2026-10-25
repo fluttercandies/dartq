@@ -94,10 +94,15 @@ pub(crate) fn resolved_sdk_root(sdk: Option<&Path>) -> Result<PathBuf, String> {
 }
 
 /// The detached serve spawn: the current binary, `session serve`, quiet
-/// stdio — the child outlives the starter by design.
+/// stdio — the child outlives the starter by design. Its own process
+/// group detaches it from the starter's fate (#2587): a starter — or
+/// the whole shell task it ran in — being killed by group must never
+/// reap the resident engine (the same posture as dartq-debug's flutter
+/// children).
 pub(crate) fn spawn_server(layout: &Layout, triple: &SessionTriple) -> io::Result<()> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("dartq"));
-    Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg("session")
         .arg("serve")
         .arg("--dir")
@@ -106,7 +111,13 @@ pub(crate) fn spawn_server(layout: &Layout, triple: &SessionTriple) -> io::Resul
         .arg(&triple.sdk_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    command
         .spawn()
         .map(|child| {
             // Reaped by init when the serve loop exits; the starter does
@@ -580,6 +591,83 @@ pub(crate) mod tests {
         assert_eq!(code, exit::CLEAN);
         assert!(!layout.socket.exists(), "the socket was removed at reap");
         assert!(!layout.state.exists(), "the state was removed at reap");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// #2587: the resident engine detaches from its starter's process
+    /// group. A starter task killed by group (the CI/shell shape — the
+    /// live incident's second finding) must leave the engine serving:
+    /// the socket answers and the state's pid stays alive.
+    #[test]
+    fn the_engine_survives_its_starters_process_group_death() {
+        use std::os::unix::process::CommandExt as _;
+
+        let root = test_fixture("pg-detach");
+        // The real CLI binary: unit tests execute from
+        // `deps/dartq-<hash>`, the linked binary sits two levels up
+        // (`cargo test` builds the bin target alongside).
+        let dartq = std::env::current_exe()
+            .expect("current exe")
+            .parent()
+            .and_then(Path::parent)
+            .map(|dir| dir.join("dartq"))
+            .filter(|path| path.is_file())
+            .unwrap_or_else(|| panic!("no linked dartq binary next to the test"));
+        // A shell task in its own process group starts the session and
+        // then lingers — the kill below lands on the whole group while
+        // it is alive, exactly like a harness reaping its task.
+        let script = format!(
+            "'{}' session start '{}' --sdk '{}' && sleep 30",
+            dartq.display(),
+            root.display(),
+            root.join("sdk").display()
+        );
+        let mut starter = Command::new("zsh");
+        starter
+            .arg("-c")
+            .arg(&script)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // A private session registry: the real `session start` sweeps
+        // foreign-binary records, and this suite's in-process serve
+        // tests register the test process itself — a shared registry
+        // would have the starter SIGTERM this very test binary.
+        starter.env("XDG_CACHE_HOME", root.join("cache"));
+        let mut starter = starter.spawn().expect("starter task spawns");
+        let layout = Layout::new(&root);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !dartq_session::socket_open(&layout) {
+            assert!(Instant::now() < deadline, "the engine never listened");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let state = SessionState::read(&layout).expect("state after start");
+
+        // The group kill: SIGKILL to the starter's whole process group.
+        // The engine's own group (spawn_server's detach) must survive it.
+        unsafe {
+            libc::kill(-(starter.id() as libc::pid_t), libc::SIGKILL);
+        }
+        let _ = starter.wait();
+
+        assert!(
+            pid_alive(state.pid),
+            "the engine survived its starter's process-group death"
+        );
+        let answer = roundtrip(
+            &layout.socket,
+            r#"{"jsonrpc":"2.0","id":1,"method":"dartq/test/status","params":{}}"#,
+        );
+        assert!(answer.contains("\"id\":1"), "the engine still answers: {answer}");
+        assert!(answer.contains("runs"), "the status envelope: {answer}");
+
+        // Teardown: stop the engine and clear the tree.
+        dartq_session::terminate(state.pid);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pid_alive(state.pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 
