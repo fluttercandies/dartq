@@ -37,6 +37,9 @@ dartq-source = { workspace = true }
 # The `dartq test` face's substrate (result cache, grouped runner, host
 # memory leases, reporters).
 dartq-test = { workspace = true }
+# The `dartq test` face replays cached results in parallel (one entry file
+# per suite).
+rayon = { workspace = true }
 rustc-hash = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

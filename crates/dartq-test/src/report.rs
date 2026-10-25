@@ -129,6 +129,9 @@ pub struct Renderer {
     opts: Options,
     started: Instant,
     tests: rustc_hash::FxHashMap<u64, Test>,
+    /// Tests an `error` event named: every real failure carries one before
+    /// its `testDone`.
+    errored: rustc_hash::FxHashSet<u64>,
     suites: rustc_hash::FxHashMap<u64, String>,
     passed: usize,
     skipped: usize,
@@ -152,6 +155,7 @@ impl Renderer {
             opts,
             started: Instant::now(),
             tests: rustc_hash::FxHashMap::default(),
+            errored: rustc_hash::FxHashSet::default(),
             suites: rustc_hash::FxHashMap::default(),
             passed: 0,
             skipped: 0,
@@ -272,6 +276,11 @@ impl Renderer {
             "print" => self.print(event, out)?,
             "error" => self.error(event, out)?,
             "testDone" => self.test_done(event)?,
+            crate::event::SHELL => {
+                // The tool (or the runner) wrote the line itself, around the
+                // reporter's output; it prints exactly as written.
+                writeln!(out, "{}", event.str_at(&["message"]).unwrap_or(""))?;
+            }
             _ => {}
         }
         Ok(())
@@ -298,7 +307,11 @@ impl Renderer {
             counted: false,
             result: "",
         };
-        if matches!(self.kind, Kind::Expanded) {
+        // The engine announces a starting test only when it is the one
+        // running (`active.first`); a test starting beside another still
+        // running prints nothing until it is that one.
+        let solo = test.load || self.active.is_empty();
+        if matches!(self.kind, Kind::Expanded) && solo {
             let description = self.description(&test);
             self.progress(out, &description, None, None)?;
         }
@@ -334,6 +347,10 @@ impl Renderer {
         let Some(test) = self.tests.get(&id).cloned() else {
             return Ok(());
         };
+        // An error event is what a real failure or error always carries
+        // before its `testDone`; its absence there marks the engine's
+        // synthesized completion of a test whose suite was torn down.
+        self.errored.insert(id);
         let error = event.str_at(&["error"]).unwrap_or("");
         let stack = event.str_at(&["stackTrace"]).unwrap_or("");
         if !test.load && !self.opts.chain_stack_traces {
@@ -405,6 +422,14 @@ impl Renderer {
         let Some(test) = self.tests.get_mut(&id) else {
             return Ok(());
         };
+        // A non-success outcome no error event announced is the engine's
+        // synthesized completion of a test whose suite was torn down (a
+        // suite that called `exit()`): its outcome is unknown, so it counts
+        // nowhere and prints as not having completed.
+        if result != "success" && !skipped && !self.errored.contains(&id) {
+            test.result = "error";
+            return Ok(());
+        }
         test.done = true;
         test.hidden = hidden;
         test.skipped = skipped;
@@ -439,12 +464,29 @@ impl Renderer {
         if matches!(self.kind, Kind::Silent | Kind::Json) {
             return Ok(());
         }
-        if self.live == 0 {
+        // A test the run ended on without completing (`exit()` mid-test): the
+        // runner prints it once more with a marker, and the summary lists it.
+        let unfinished: Vec<String> = self
+            .active
+            .iter()
+            .filter_map(|id| self.tests.get(id).map(|test| self.description(test)))
+            .collect();
+        let incomplete: Vec<(String, String)> = self
+            .active
+            .iter()
+            .filter_map(|id| self.tests.get(id))
+            .map(|test| (self.suites.get(&test.suite).cloned().unwrap_or_default(), test.name.clone()))
+            .collect();
+        if self.live == 0 && unfinished.is_empty() {
             writeln!(out, "No tests ran.")?;
-        } else if self.failed > 0 {
+        } else if self.failed > 0 || !unfinished.is_empty() {
+            let suffix = format!(" - did not complete {}{}[E]{}", self.paint(BOLD), self.paint(RED), self.paint(NO_COLOR));
+            for description in &unfinished {
+                self.progress(out, description, None, Some(&suffix))?;
+            }
             self.progress(out, "Some tests failed.", Some(RED), None)?;
             if self.kind == Kind::Expanded {
-                self.summary(out)?;
+                self.summary(out, incomplete)?;
             }
         } else if self.passed == 0 {
             let message = if self.kind == Kind::Expanded {
@@ -470,20 +512,28 @@ impl Renderer {
     }
 
     /// The expanded reporter's `Failing tests:` list: sorted by path then
-    /// name, at most five entries.
-    fn summary(&mut self, out: &mut dyn Write) -> io::Result<()> {
-        if self.failures.is_empty() {
+    /// name, at most five entries; `incomplete` are the tests the run ended
+    /// on without completing, each annotated.
+    fn summary(&mut self, out: &mut dyn Write, incomplete: Vec<(String, String)>) -> io::Result<()> {
+        let mut entries: Vec<(String, String, bool)> = self
+            .failures
+            .iter()
+            .map(|(path, name)| (path.clone(), name.clone(), false))
+            .chain(incomplete.into_iter().map(|(path, name)| (path, name, true)))
+            .collect();
+        if entries.is_empty() {
             return Ok(());
         }
-        self.failures.sort();
+        entries.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         writeln!(out)?;
         writeln!(out, "{}Failing tests:{}", self.paint(RED), self.paint(NO_COLOR))?;
-        let shown = if self.failures.len() > 5 { 4 } else { self.failures.len() };
-        for (path, name) in &self.failures[..shown] {
-            writeln!(out, "  {path}: {name}")?;
+        let shown = if entries.len() > 5 { 4 } else { entries.len() };
+        for (path, name, incomplete) in &entries[..shown] {
+            let suffix = if *incomplete { " (did not complete)" } else { "" };
+            writeln!(out, "  {path}: {name}{suffix}")?;
         }
-        if self.failures.len() > shown {
-            writeln!(out, "  ... and {} more", self.failures.len() - shown)?;
+        if entries.len() > shown {
+            writeln!(out, "  ... and {} more", entries.len() - shown)?;
         }
         Ok(())
     }
@@ -692,6 +742,11 @@ impl Compact {
                 "print" => self.message(event, out)?,
                 "error" => self.error(event, out)?,
                 "testDone" => self.complete(event, out)?,
+                crate::event::SHELL => {
+                    // The line follows the in-place progress bytes as the
+                    // tool wrote it: no progress of its own, no blank line.
+                    writeln!(out, "{}", event.str_at(&["message"]).unwrap_or(""))?;
+                }
                 _ => {}
             }
         }
@@ -788,9 +843,16 @@ impl Compact {
         let Some(id) = event.u64_at(&["testID"]) else { return Ok(()) };
         let hidden = event.get("hidden").and_then(Json::as_bool).unwrap_or(false);
         let skipped = event.get("skipped").and_then(Json::as_bool).unwrap_or(false);
+        let result = event.str_at(&["result"]).unwrap_or("");
         let Some(test) = self.tests.get_mut(&id) else { return Ok(()) };
         test.hidden = hidden;
         if test.result != "failed" {
+            // A non-success outcome no error event announced is the engine's
+            // synthesized completion of a torn-down suite: the test counts
+            // nowhere and prints as not having completed.
+            if result != "success" && !skipped {
+                return Ok(());
+            }
             // Completed without an error: `_onStateChange` shows the oldest
             // active test, else this one.
             test.done = true;
@@ -831,7 +893,10 @@ impl Compact {
     ///
     /// Write failures on `out`.
     pub fn done(&mut self, out: &mut dyn Write) -> io::Result<()> {
-        if self.live == 0 {
+        // Tests the run ended on without completing: one line each, uncut,
+        // then a blank line, as the runner prints them.
+        let unfinished: Vec<String> = self.active.iter().map(|&id| self.describe(id)).collect();
+        if self.live == 0 && unfinished.is_empty() {
             if !self.printed_newline {
                 write!(out, "\r")?;
             }
@@ -841,7 +906,12 @@ impl Compact {
                 write!(out, "{}", " ".repeat(self.opts.line_length.saturating_sub(message.len())))?;
             }
             writeln!(out)?;
-        } else if self.failed > 0 {
+        } else if self.failed > 0 || !unfinished.is_empty() {
+            let suffix = format!(" - did not complete {}{}[E]{}", self.paint(BOLD), self.paint(RED), self.paint(NO_COLOR));
+            for description in &unfinished {
+                self.progress(out, description, "", false, Some(&suffix))?;
+                writeln!(out)?;
+            }
             let red = self.paint(RED);
             self.progress(out, "Some tests failed.", red, true, None)?;
             writeln!(out)?;
@@ -949,6 +1019,11 @@ impl Github {
                     if let (Some(id), Some(path)) = (event.u64_at(&["suite", "id"]), event.str_at(&["suite", "path"])) {
                         self.suites.insert(id, path.to_owned());
                     }
+                }
+                crate::event::SHELL => {
+                    // The tool writes the line around the reporter's groups;
+                    // it lands inside whichever group is open.
+                    writeln!(out, "{}", event.str_at(&["message"]).unwrap_or(""))?;
                 }
                 "testStart" => {
                     let Some(id) = event.u64_at(&["test", "id"]) else { continue };
@@ -1205,6 +1280,12 @@ impl JsonMerge {
         self.suites += 1;
         let mut load: Option<u64> = None;
         for (index, event) in events.iter().enumerate() {
+            if event.kind() == crate::event::SHELL {
+                // The runner interleaved the raw line with its events; the
+                // merged stream keeps it where it was.
+                writeln!(out, "{}", event.str_at(&["message"]).unwrap_or(""))?;
+                continue;
+            }
             if self.machine && event.kind() == "testDone" && load.is_some() && event.u64_at(&["testID"]) == load {
                 if !self.announced {
                     self.announce(event.u64_at(&["time"]), out)?;
@@ -1331,6 +1412,43 @@ mod tests {
              Consider enabling the flag chain-stack-traces to receive more detailed exceptions.\n\
              For example, 'dart test --chain-stack-traces'.\n"
         );
+    }
+
+    /// A test the run ended on without completing (`exit()` mid-test) is
+    /// printed once more with the runner's marker, and the summary lists it
+    /// as such; a raw output line interleaved with a suite's events prints
+    /// where the runner wrote it.
+    #[test]
+    fn unfinished_tests_and_raw_lines_match_the_runner() {
+        let suite = events(&[
+            r#"{"suite":{"id":0,"platform":"vm","path":"test/exit_test.dart"},"type":"suite","time":0}"#,
+            r#"{"test":{"id":1,"name":"loading test/exit_test.dart","suiteID":0,"groupIDs":[],"metadata":{"skip":false,"skipReason":null}},"type":"testStart","time":0}"#,
+            r#"{"testID":1,"result":"success","skipped":false,"hidden":true,"type":"testDone","time":1}"#,
+            r#"{"test":{"id":2,"name":"exits","suiteID":0,"groupIDs":[],"metadata":{"skip":false,"skipReason":null}},"type":"testStart","time":1}"#,
+            r#"{"type":"dartq.shell","message":"Shell: goodbye raw"}"#,
+        ]);
+        // No error event ever arrived (the run ended on the test), so the
+        // runner prints no chaining notice.
+        assert_eq!(
+            render(Kind::Expanded, &[suite.clone()]),
+            "00:00 +0: loading test/exit_test.dart\n\
+             00:00 +0: test/exit_test.dart: exits\n\
+             Shell: goodbye raw\n\
+             00:00 +0: test/exit_test.dart: exits - did not complete [E]\n\
+             00:00 +0: Some tests failed.\n\
+             \n\
+             Failing tests:\n  \
+             test/exit_test.dart: exits (did not complete)\n"
+        );
+        // The failures-only and compact reporters print the same marker.
+        assert!(render(Kind::FailuresOnly, &[suite.clone()]).contains("test/exit_test.dart: exits - did not complete [E]"));
+        let mut out = Vec::new();
+        let mut compact = Compact::new(Options { color: false, print_path: true, line_length: 200, executable: "dart".into(), chain_stack_traces: false });
+        compact.block(&suite, &mut out).expect("block");
+        compact.done(&mut out).expect("done");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("Shell: goodbye raw"));
+        assert!(text.contains("exits - did not complete [E]"));
     }
 
     #[test]

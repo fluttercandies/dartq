@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use clap::Args;
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use dartq_test::event::Json;
@@ -789,6 +790,9 @@ struct Tally {
     /// No error and no non-success outcome anywhere, the hidden load test
     /// included.
     green: bool,
+    /// A test started and never finished (a suite that called `exit()`
+    /// mid-test): its outcome is unknown, so the run cannot be green.
+    incomplete: bool,
 }
 
 /// Tally a suite's events the way the runner counts its engine: hidden
@@ -803,10 +807,19 @@ fn tally(events: &[Json]) -> Tally {
         .filter(|event| event.kind() == "error")
         .filter_map(|event| event.u64_at(&["testID"]))
         .collect();
+    let mut open: FxHashSet<u64> = FxHashSet::default();
     for event in events {
         match event.kind() {
             "error" => tally.green = false,
+            "testStart" => {
+                if let Some(id) = event.u64_at(&["test", "id"]) {
+                    open.insert(id);
+                }
+            }
             "testDone" => {
+                if let Some(id) = event.u64_at(&["testID"]) {
+                    open.remove(&id);
+                }
                 let hidden = event.get("hidden").and_then(Json::as_bool).unwrap_or(false);
                 let skipped = event.get("skipped").and_then(Json::as_bool).unwrap_or(false);
                 let success = event.str_at(&["result"]) == Some("success");
@@ -829,6 +842,7 @@ fn tally(events: &[Json]) -> Tally {
             _ => {}
         }
     }
+    tally.incomplete = !open.is_empty();
     tally
 }
 
@@ -908,7 +922,7 @@ impl Sink {
             // No reporter listens for test output, so the runner prints
             // every message as it arrives.
             Self::SilentPrints(out) => {
-                for event in events.iter().filter(|event| event.kind() == "print") {
+                for event in events.iter().filter(|event| event.kind() == "print" || event.kind() == dartq_test::event::SHELL) {
                     writeln!(out, "{}", event.str_at(&["message"]).unwrap_or(""))?;
                 }
                 out.flush()
@@ -986,6 +1000,26 @@ impl Outputs {
             f(file)?;
         }
         Ok(())
+    }
+
+    /// One suite's events: the main reporter renders them as-is; a file
+    /// reporter without the runner's own raw lines (the tool wrote those to
+    /// standard output only, no reporter ever saw them).
+    fn block(&mut self, events: &[Json]) -> io::Result<()> {
+        self.main.block(events)?;
+        let Some(file) = self.file.as_mut() else {
+            return Ok(());
+        };
+        if events.iter().any(|event| event.kind() == dartq_test::event::SHELL) {
+            let stripped: Vec<Json> = events
+                .iter()
+                .filter(|event| event.kind() != dartq_test::event::SHELL)
+                .cloned()
+                .collect();
+            file.block(&stripped)
+        } else {
+            file.block(events)
+        }
     }
 }
 
@@ -1184,8 +1218,14 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     let mut stats = Stats::default();
     let mut rerun: Vec<usize> = Vec::new();
     let mut to_run: Vec<usize> = Vec::new();
-    for (index, key) in keys.iter().enumerate() {
-        match key.as_deref().and_then(|key| cache.as_ref().and_then(|cache| cache.lookup(key))) {
+    // A warm run parses every replayed entry's events: thousands of files,
+    // each parsed on its own core.
+    let replayed: Vec<Option<Vec<Json>>> = keys
+        .par_iter()
+        .map(|key| key.as_deref().and_then(|key| cache.as_ref().and_then(|cache| cache.lookup(key))))
+        .collect();
+    for (index, events) in replayed.into_iter().enumerate() {
+        match events {
             Some(events) => {
                 slots[index] = Some(events);
                 stats.replayed += 1;
@@ -1214,7 +1254,8 @@ fn execute(plan: &Plan) -> io::Result<u8> {
             totals.passed += tally.passed;
             totals.skipped += tally.skipped;
             totals.failed += tally.failed;
-            outputs.each(|sink| sink.block(&events))?;
+            totals.incomplete |= tally.incomplete;
+            outputs.block(&events)?;
             emitted += 1;
         }
         Ok(())
@@ -1222,8 +1263,17 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     emit(&mut slots, &mut outputs, &mut totals)?;
 
     // The suites to run, grouped where the shared program can host them.
-    let (grouped, mut stock): (Vec<usize>, Vec<usize>) =
-        to_run.iter().partition(|&&index| groupable(&plan.suites[index].abs));
+    // The facts pass that keyed the run already read every suite: its
+    // verdict decides grouping, and only a run without a cache reads again.
+    let (grouped, mut stock): (Vec<usize>, Vec<usize>) = to_run
+        .iter()
+        .partition(|&&index| {
+            let file = &plan.suites[index].abs;
+            match cache.as_ref().and_then(|cache| cache.facts(file)) {
+                Some(facts) => !facts.launch,
+                None => groupable(file),
+            }
+        });
     let mut staged_keys: FxHashMap<usize, String> = FxHashMap::default();
     let mut settle = |index: usize, block: SuiteBlock, verdict_ok: bool, slots: &mut Vec<Option<Vec<Json>>>, cache: &mut Option<dartq_test::Cache>| -> io::Result<()> {
         if verdict_ok {
@@ -1329,8 +1379,9 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     }
 
     // The engine's verdict: every test it ran passed (vacuously so when
-    // none ran, which the exit code reports separately).
-    let success = totals.failed == 0;
+    // none ran, which the exit code reports separately). A test that never
+    // finished fails the run without joining the count.
+    let success = totals.failed == 0 && !totals.incomplete;
     let stock_spoke = stock_stderr;
     outputs.each(|sink| sink.done(success))?;
     if plan.inv.stats {
@@ -1343,7 +1394,7 @@ fn execute(plan: &Plan) -> io::Result<u8> {
             started.elapsed().as_secs_f64()
         );
     }
-    if totals.passed + totals.skipped + totals.failed == 0 {
+    if totals.passed + totals.skipped + totals.failed == 0 && !totals.incomplete {
         if !stock_spoke {
             eprintln!("{}", no_tests_message(&plan.inv));
         }
@@ -1488,7 +1539,7 @@ fn run_grouped(
         part.iter().map(|abs| PathBuf::from(&plan.suites[index_of[abs.as_path()]].spelling)).collect()
     };
 
-    let (sender, receiver) = std::sync::mpsc::channel::<Settled>();
+    let (sender, receiver) = std::sync::mpsc::channel::<dartq_test::Streamed>();
     let mut settled: FxHashSet<usize> = FxHashSet::default();
     let mut recorded: Vec<(PathBuf, u64)> = Vec::new();
     let mut peak = 0u64;
@@ -1512,7 +1563,15 @@ fn run_grouped(
             })
             .collect();
         drop(sender);
-        for Settled { block, .. } in receiver {
+        for streamed in receiver {
+            // A raw line of no suite in flight prints where the runner
+            // wrote it; every other item is a settled suite's block.
+            let dartq_test::Streamed::Settled(Settled { block, .. }) = streamed else {
+                if let dartq_test::Streamed::Line(line) = streamed {
+                    println!("{line}");
+                }
+                continue;
+            };
             if failure.is_some() {
                 continue;
             }
@@ -1575,7 +1634,7 @@ fn run_stock(
     let deadline = Instant::now() + idle_timeout();
     let (lease, workers) = dartq_test::lease_run(plan.workers.min(indices.len()).max(1), deadline)?
         .ok_or_else(|| io::Error::other("timed out waiting for host memory held by other dartq runs"))?;
-    let (sender, receiver) = std::sync::mpsc::channel::<Settled>();
+    let (sender, receiver) = std::sync::mpsc::channel::<dartq_test::Streamed>();
     let cfg = ExecConfig {
         dart_bin: plan.dart.clone(),
         cwd: root.clone(),
@@ -1593,7 +1652,15 @@ fn run_stock(
         // run, or the receive loop below would wait forever.
         let paths = &paths;
         let handle = scope.spawn(move || dartq_test::execute(paths, &cfg));
-        for Settled { block, .. } in &receiver {
+        for streamed in &receiver {
+            // A raw line of no suite in flight prints where the runner
+            // wrote it; every other item is a settled suite's block.
+            let dartq_test::Streamed::Settled(Settled { block, .. }) = streamed else {
+                if let dartq_test::Streamed::Line(line) = streamed {
+                    println!("{line}");
+                }
+                continue;
+            };
             if failure.is_some() {
                 continue;
             }
@@ -1791,5 +1858,12 @@ mod tests {
         assert!(!t.green && t.failed == 1 && t.passed == 0, "an error after success fails the test");
         let lost = lost_suite("test/a_test.dart");
         assert_eq!(tally(&lost).failed, 1);
+        // A test that started and never finished (a suite that called
+        // `exit()` mid-test) keeps its outcome unknown: not counted, and
+        // the run cannot succeed.
+        let cut = tally(&ok[..4]);
+        assert!(cut.incomplete, "a started test that never finished");
+        assert!(cut.passed == 0 && cut.failed == 0, "it counts nowhere");
+        assert!(!tally(&ok).incomplete, "a finished suite is complete");
     }
 }

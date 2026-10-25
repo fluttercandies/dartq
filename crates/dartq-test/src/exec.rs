@@ -45,8 +45,10 @@ pub struct ExecConfig {
     /// grouped runner's per-suite marker, or the end of the run) instead of
     /// collecting them in [`Execution::blocks`]: a caller can report and
     /// cache a suite while the rest of the run continues, holding no more
-    /// than the suites still in flight.
-    pub sink: Option<std::sync::mpsc::Sender<Settled>>,
+    /// than the suites still in flight. A raw output line that belongs to no
+    /// suite in flight ([`Streamed::Line`]) arrives the moment it was
+    /// written, so a caller prints it in place.
+    pub sink: Option<std::sync::mpsc::Sender<Streamed>>,
     /// Signalled once the runner reports its first suite: everything it
     /// prepares before loading suites (packages, test assets, native
     /// assets) is in place by then.
@@ -60,6 +62,15 @@ pub struct Settled {
     /// When the runner that produced the block was spawned: its events'
     /// `time` fields count from about then.
     pub spawned: Instant,
+}
+
+/// What a run's stream hands to its sink as the run progresses.
+#[derive(Debug)]
+pub enum Streamed {
+    Settled(Settled),
+    /// A raw output line that belongs to no suite in flight: print it now,
+    /// before the suites still running settle.
+    Line(String),
 }
 
 /// Spawn error.
@@ -384,7 +395,7 @@ struct Parsed {
 /// stdout writes interleave with the reporter) are skipped.
 fn parse_stream(
     reader: BufReader<impl std::io::Read>,
-    sink: Option<&std::sync::mpsc::Sender<Settled>>,
+    sink: Option<&std::sync::mpsc::Sender<Streamed>>,
     mut ready: Option<std::sync::mpsc::Sender<()>>,
     spawned: Instant,
 ) -> Result<Parsed, ExecError> {
@@ -397,12 +408,26 @@ fn parse_stream(
     let mut block_of: FxHashMap<u64, usize> = FxHashMap::default();
     let mut suite_of_test: FxHashMap<u64, u64> = FxHashMap::default();
     let mut block_at: FxHashMap<String, usize> = FxHashMap::default();
+    // The block that received the latest suite event and is still held: a
+    // raw line interleaved with it is the suite's own (at the runner's
+    // concurrency of one, exactly), so it joins the block at its position —
+    // a suite's block renders as a unit, and the line prints where the
+    // runner wrote it.
+    let mut streaming: Option<usize> = None;
 
     for line in reader.lines() {
         let line = line?;
         let Some(raw) = crate::event::parse(&line) else {
             if !line.is_empty() {
-                loose.push(Loose::Line(line));
+                match streaming.and_then(|index| blocks[index].as_mut()) {
+                    Some(block) => block.events.push(crate::event::shell(&line)),
+                    None => match sink {
+                        Some(sink) => {
+                            let _ = sink.send(Streamed::Line(line));
+                        }
+                        None => loose.push(Loose::Line(line)),
+                    },
+                }
             }
             continue;
         };
@@ -422,7 +447,7 @@ fn parse_stream(
                     }
                     if let Some(sink) = sink {
                         if let Some(block) = blocks[index].take() {
-                            let _ = sink.send(Settled { block, spawned });
+                            let _ = sink.send(Streamed::Settled(Settled { block, spawned }));
                         }
                     }
                 }
@@ -437,6 +462,7 @@ fn parse_stream(
                 order.push(PathBuf::from(&path));
                 block_of.insert(id, blocks.len());
                 block_at.insert(path.clone(), blocks.len());
+                streaming = Some(blocks.len());
                 blocks.push(Some(SuiteBlock { path, events: vec![raw], closed: false, clean: false }));
             }
             _ => {
@@ -447,9 +473,14 @@ fn parse_stream(
                 }
                 let suite = crate::event::suite_of(&raw)
                     .or_else(|| raw.u64_at(&["testID"]).and_then(|test| suite_of_test.get(&test).copied()));
-                match suite.and_then(|suite| block_of.get(&suite)).and_then(|&index| blocks[index].as_mut()) {
-                    Some(block) => block.events.push(raw),
-                    None => loose.push(Loose::Event(raw)),
+                let placed = suite.and_then(|suite| block_of.get(&suite)).copied();
+                if let Some(index) = placed
+                    && let Some(block) = blocks[index].as_mut()
+                {
+                    block.events.push(raw);
+                    streaming = Some(index);
+                } else {
+                    loose.push(Loose::Event(raw));
                 }
             }
         }
@@ -467,14 +498,14 @@ fn parse_stream(
 /// there is one (the caller then holds none), else returned.
 fn settle(
     blocks: Vec<Option<SuiteBlock>>,
-    sink: Option<&std::sync::mpsc::Sender<Settled>>,
+    sink: Option<&std::sync::mpsc::Sender<Streamed>>,
     spawned: Instant,
 ) -> Vec<SuiteBlock> {
     let held = blocks.into_iter().flatten();
     match sink {
         Some(sink) => {
             for block in held {
-                let _ = sink.send(Settled { block, spawned });
+                let _ = sink.send(Streamed::Settled(Settled { block, spawned }));
             }
             Vec::new()
         }
@@ -495,6 +526,60 @@ mod tests {
             loose: Vec::new(),
             stderr: String::new(),
         }
+    }
+
+    /// A raw line interleaved with a suite's events joins that suite's
+    /// block at the runner's own position (so it renders in place); a line
+    /// of no suite in flight reaches the sink the moment it was written.
+    #[test]
+    fn raw_lines_join_the_streaming_suite() {
+        let stream = "\
+runner banner\n\
+{\"suite\":{\"id\":0,\"path\":\"test/a_test.dart\"},\"type\":\"suite\",\"time\":0}\n\
+raw from a\n\
+{\"test\":{\"id\":1,\"name\":\"a\",\"suiteID\":0},\"type\":\"testStart\",\"time\":1}\n\
+{\"testID\":1,\"result\":\"success\",\"skipped\":false,\"hidden\":false,\"type\":\"testDone\",\"time\":2}\n\
+between suites\n\
+{\"suite\":{\"id\":2,\"path\":\"test/b_test.dart\"},\"type\":\"suite\",\"time\":3}\n\
+{\"test\":{\"id\":3,\"name\":\"b\",\"suiteID\":2},\"type\":\"testStart\",\"time\":3}\n\
+raw from b\n\
+{\"testID\":3,\"result\":\"success\",\"skipped\":false,\"hidden\":false,\"type\":\"testDone\",\"time\":4}\n\
+{\"success\":true,\"type\":\"done\",\"time\":5}\n";
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let parsed = parse_stream(
+            BufReader::new(std::io::Cursor::new(stream.as_bytes().to_vec())),
+            Some(&sender),
+            None,
+            Instant::now(),
+        )
+        .expect("parse");
+        drop(sender);
+        let streamed: Vec<Streamed> = receiver.into_iter().collect();
+        // The runner banner (before any suite event) streams on its own.
+        assert!(matches!(&streamed[0], Streamed::Line(line) if line == "runner banner"));
+        let Streamed::Settled(Settled { block: a, .. }) = &streamed[1] else { panic!("settled") };
+        assert_eq!(a.events.len(), 5);
+        assert_eq!(a.events[1].kind(), crate::event::SHELL);
+        assert_eq!(a.events[1].str_at(&["message"]), Some("raw from a"));
+        // A line between suites still belongs to the suite that streamed
+        // last: it renders with that suite, never after the run.
+        assert_eq!(a.events[4].kind(), crate::event::SHELL);
+        assert_eq!(a.events[4].str_at(&["message"]), Some("between suites"));
+        let Streamed::Settled(Settled { block: b, .. }) = &streamed[2] else { panic!("settled") };
+        // `raw from b` sits between b's testStart and its testDone.
+        assert_eq!(b.events[2].kind(), crate::event::SHELL);
+        assert_eq!(b.events[3].kind(), "testDone");
+
+        // Without a sink the lines keep their order in `loose`.
+        let parsed = parse_stream(
+            BufReader::new(std::io::Cursor::new(stream.as_bytes().to_vec())),
+            None,
+            None,
+            Instant::now(),
+        )
+        .expect("parse");
+        assert!(parsed.blocks[0].events.iter().any(|event| event.kind() == crate::event::SHELL));
+        assert!(matches!(&parsed.loose[0], Loose::Line(line) if line == "runner banner"));
     }
 
     /// A selection past the argument budget splits into consecutive

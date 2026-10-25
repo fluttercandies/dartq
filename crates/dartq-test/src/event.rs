@@ -126,6 +126,22 @@ pub fn parse(line: &str) -> Option<Json> {
     Some(value)
 }
 
+/// The event kind carrying one raw output line (`Shell:` relays of a
+/// tester's writes, a suite's unprefixed stdout) inside the suite block it
+/// interleaved with, at the runner's own position. Renderers print the
+/// message as written; it carries no ids and no `time`, so merging and
+/// replaying leave it in place.
+pub const SHELL: &str = "dartq.shell";
+
+/// One raw output line as an in-band event (see [`SHELL`]).
+#[must_use]
+pub fn shell(line: &str) -> Json {
+    Json::Object(vec![
+        ("type".to_owned(), Json::String(SHELL.to_owned())),
+        ("message".to_owned(), Json::String(line.to_owned())),
+    ])
+}
+
 /// Rewrite every id an event carries through `map` (suite, group and test
 /// ids share one id space, as in the runner).
 pub fn remap(event: &mut Json, map: &mut impl FnMut(u64) -> u64) {

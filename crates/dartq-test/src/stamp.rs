@@ -33,9 +33,9 @@ struct Stamp {
     /// The stamp was taken safely after the last modification.
     trusted: bool,
     digest: String,
-    facts: Option<FileFacts>,
+    facts: Option<Arc<FileFacts>>,
     /// Path-shaped words of a non-Dart text file ([`data_paths`]).
-    refs: Option<Vec<String>>,
+    refs: Option<Arc<Vec<String>>>,
 }
 
 /// One stamped file.
@@ -185,8 +185,8 @@ fn stamp_file(
     {
         let entry = Entry {
             digest,
-            facts: old.facts.clone().map(Arc::new),
-            refs: old.refs.clone().map(Arc::new),
+            facts: old.facts.clone(),
+            refs: old.refs.clone(),
         };
         return Ok(Some((entry, old.clone())));
     }
@@ -197,8 +197,8 @@ fn stamp_file(
     };
     let digest = *blake3::hash(&bytes).as_bytes();
     let dart = path.extension().is_some_and(|ext| ext == "dart");
-    let facts = dart.then(|| facts(&bytes));
-    let refs = (!dart && len <= MAX_DATA_FILE).then(|| data_paths(&bytes));
+    let facts = dart.then(|| Arc::new(facts(&bytes)));
+    let refs = (!dart && len <= MAX_DATA_FILE).then(|| Arc::new(data_paths(&bytes)));
     let trusted = meta
         .modified()
         .ok()
@@ -214,11 +214,7 @@ fn stamp_file(
         facts: facts.clone(),
         refs: refs.clone(),
     };
-    let entry = Entry {
-        digest,
-        facts: facts.map(Arc::new),
-        refs: refs.map(Arc::new),
-    };
+    let entry = Entry { digest, facts, refs };
     Ok(Some((entry, stamp)))
 }
 

@@ -1096,6 +1096,14 @@ impl Cache {
         &self.staged
     }
 
+    /// The facts stamped for `path` (the same pass that keyed this run
+    /// stamped every suite and its closure), so a caller need not read and
+    /// scan the file again.
+    #[must_use]
+    pub fn facts(&self, path: &Path) -> Option<std::sync::Arc<FileFacts>> {
+        self.stamps.get(path).and_then(|entry| entry.facts.clone())
+    }
+
     /// Persist the stamp index, then prune the shared store's least
     /// recently used entries when it outgrew its bound (at most once per
     /// [`PRUNE_EVERY`]).

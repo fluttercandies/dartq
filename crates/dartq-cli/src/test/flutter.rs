@@ -37,6 +37,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use dartq_test::event::Json;
@@ -295,8 +296,14 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     let mut totals = Tally::default();
     let mut stats = Stats::default();
     let mut to_run: Vec<usize> = Vec::new();
-    for (index, key) in keys.iter().enumerate() {
-        match key.as_deref().and_then(|key| cache.as_ref().and_then(|cache| cache.lookup(key))) {
+    // A warm run parses every replayed entry's events: thousands of files,
+    // each parsed on its own core.
+    let replayed: Vec<Option<Vec<Json>>> = keys
+        .par_iter()
+        .map(|key| key.as_deref().and_then(|key| cache.as_ref().and_then(|cache| cache.lookup(key))))
+        .collect();
+    for (index, events) in replayed.into_iter().enumerate() {
+        match events {
             Some(events) => {
                 slots[index] = Some(events);
                 stats.replayed += 1;
@@ -319,7 +326,8 @@ fn execute(plan: &Plan) -> io::Result<u8> {
             totals.passed += tally.passed;
             totals.skipped += tally.skipped;
             totals.failed += tally.failed;
-            outputs.each(|sink| sink.block(&events))?;
+            totals.incomplete |= tally.incomplete;
+            outputs.block(&events)?;
             emitted += 1;
         }
         Ok(())
@@ -392,7 +400,9 @@ fn execute(plan: &Plan) -> io::Result<u8> {
         }
     }
 
-    let success = totals.failed == 0;
+    // A test that never finished (a suite that called `exit()` mid-test)
+    // fails the run without joining the count.
+    let success = totals.failed == 0 && !totals.incomplete;
     outputs.each(|sink| sink.done(success))?;
     eprint!("{tool_stderr}");
     if plan.inv.stats {
@@ -405,7 +415,7 @@ fn execute(plan: &Plan) -> io::Result<u8> {
             started.elapsed().as_secs_f64()
         );
     }
-    if totals.passed + totals.skipped + totals.failed == 0 {
+    if totals.passed + totals.skipped + totals.failed == 0 && !totals.incomplete {
         if tool_stderr.is_empty() {
             eprintln!("{}", super::no_tests_message(&plan.inv));
         }
@@ -516,7 +526,7 @@ fn run_shards(
     let shard_of: FxHashMap<&Path, usize> =
         parts.iter().enumerate().flat_map(|(shard, part)| part.iter().map(move |abs| (abs.as_path(), shard))).collect();
 
-    let (sender, receiver) = std::sync::mpsc::channel::<Settled>();
+    let (sender, receiver) = std::sync::mpsc::channel::<dartq_test::Streamed>();
     let mut settled: FxHashSet<usize> = FxHashSet::default();
     let mut recorded: Vec<(PathBuf, u64)> = Vec::new();
     let mut failure: Option<io::Error> = None;
@@ -552,7 +562,15 @@ fn run_shards(
             })
             .collect();
         drop(sender);
-        for Settled { block, .. } in receiver {
+        for streamed in receiver {
+            // A raw line of no suite in flight prints where the tool wrote
+            // it; every other item is a settled suite's block.
+            let dartq_test::Streamed::Settled(Settled { block, .. }) = streamed else {
+                if let dartq_test::Streamed::Line(line) = streamed {
+                    println!("{line}");
+                }
+                continue;
+            };
             if failure.is_some() {
                 continue;
             }
@@ -738,7 +756,7 @@ fn grouped_pass(
         .ok_or_else(|| io::Error::other("timed out waiting for host memory held by other dartq runs"))?;
     let index_of: FxHashMap<&Path, usize> =
         hosted.iter().zip(&hosted_index).map(|(suite, &index)| (suite.path.as_path(), index)).collect();
-    let (sender, receiver) = std::sync::mpsc::channel::<Settled>();
+    let (sender, receiver) = std::sync::mpsc::channel::<dartq_test::Streamed>();
     let cfg = ExecConfig {
         dart_bin: PathBuf::new(),
         cwd: root.clone(),
@@ -765,7 +783,15 @@ fn grouped_pass(
     std::thread::scope(|scope| {
         let run = &run;
         let handle = scope.spawn(move || dartq_test::flutter::execute(run, &cfg));
-        for Settled { block, .. } in &receiver {
+        for streamed in &receiver {
+            // A raw line of no suite in flight prints where the tool wrote
+            // it; every other item is a settled suite's block.
+            let dartq_test::Streamed::Settled(Settled { block, .. }) = streamed else {
+                if let dartq_test::Streamed::Line(line) = streamed {
+                    println!("{line}");
+                }
+                continue;
+            };
             if failure.is_some() {
                 continue;
             }
