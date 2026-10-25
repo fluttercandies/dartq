@@ -66,7 +66,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "bench-corpus-gen"
-version = "1.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "bitflags"
@@ -211,7 +211,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "corpus-gen"
-version = "1.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "cpufeatures"
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-ai"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "dartq-index",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-ast"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-language",
  "dartq-scanner",
@@ -287,7 +287,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-cli"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "dartq-commands",
@@ -311,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-commands"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-ai",
  "dartq-ast",
@@ -342,7 +342,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-daemon"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "dartq-commands",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-debug"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "base64",
  "crossbeam-channel",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-diagnostics"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "dartq-semantic",
@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-engine"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "dartq-diagnostics",
@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-flow"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-language",
  "dartq-parser",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-index"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-language",
  "dartq-parser",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-language"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "rustc-hash",
  "serde",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-lints"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-ast",
  "dartq-engine",
@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-package"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-pub",
  "dartq-source",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-parser"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-diagnostics",
  "dartq-language",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-plugin"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-diagnostics",
  "dartq-pub",
@@ -511,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-pub"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-language",
  "dartq-source",
@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-resolution"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-diagnostics",
  "dartq-pub",
@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-scanner"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-diagnostics",
  "dartq-language",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-schema"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-ai",
  "serde_json",
@@ -556,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-sdk"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-language",
  "dartq-source",
@@ -567,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-semantic"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "dartq-diagnostics",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-session"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "hex",
@@ -599,7 +599,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-snapshot"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "filetime",
@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-source"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "hex",
@@ -628,7 +628,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-test"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "blake3",
  "dartq-pub",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "dartq-types"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "rustc-hash",
  "thiserror",
@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "1.0.0"
+version = "0.1.0"
 dependencies = [
  "dartq-commands",
  "dartq-diagnostics",
@@ -1180,7 +1180,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "sdk-faces-gen"
-version = "1.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "security-framework"

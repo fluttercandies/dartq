@@ -36,7 +36,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0 OR MIT"
 rust-version = "1.96"
@@ -76,31 +76,31 @@ tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 # Internal crates: path plus version so member manifests consume them via
 # `dartq-xxx = { workspace = true }` (cargo publish requires a version on
 # every path dependency).
-dartq-ai = { path = "crates/dartq-ai", version = "1.0.0" }
-dartq-ast = { path = "crates/dartq-ast", version = "1.0.0" }
-dartq-commands = { path = "crates/dartq-commands", version = "1.0.0" }
-dartq-daemon = { path = "crates/dartq-daemon", version = "1.0.0" }
-dartq-debug = { path = "crates/dartq-debug", version = "1.0.0" }
-dartq-diagnostics = { path = "crates/dartq-diagnostics", version = "1.0.0" }
-dartq-engine = { path = "crates/dartq-engine", version = "1.0.0" }
-dartq-flow = { path = "crates/dartq-flow", version = "1.0.0" }
-dartq-index = { path = "crates/dartq-index", version = "1.0.0" }
-dartq-language = { path = "crates/dartq-language", version = "1.0.0" }
-dartq-lints = { path = "crates/dartq-lints", version = "1.0.0" }
-dartq-package = { path = "crates/dartq-package", version = "1.0.0" }
-dartq-parser = { path = "crates/dartq-parser", version = "1.0.0" }
-dartq-plugin = { path = "crates/dartq-plugin", version = "1.0.0" }
-dartq-pub = { path = "crates/dartq-pub", version = "1.0.0" }
-dartq-resolution = { path = "crates/dartq-resolution", version = "1.0.0" }
-dartq-scanner = { path = "crates/dartq-scanner", version = "1.0.0" }
-dartq-schema = { path = "crates/dartq-schema", version = "1.0.0" }
-dartq-sdk = { path = "crates/dartq-sdk", version = "1.0.0" }
-dartq-semantic = { path = "crates/dartq-semantic", version = "1.0.0" }
-dartq-session = { path = "crates/dartq-session", version = "1.0.0" }
-dartq-snapshot = { path = "crates/dartq-snapshot", version = "1.0.0" }
-dartq-source = { path = "crates/dartq-source", version = "1.0.0" }
-dartq-test = { path = "crates/dartq-test", version = "1.0.0" }
-dartq-types = { path = "crates/dartq-types", version = "1.0.0" }
+dartq-ai = { path = "crates/dartq-ai", version = "0.1.0" }
+dartq-ast = { path = "crates/dartq-ast", version = "0.1.0" }
+dartq-commands = { path = "crates/dartq-commands", version = "0.1.0" }
+dartq-daemon = { path = "crates/dartq-daemon", version = "0.1.0" }
+dartq-debug = { path = "crates/dartq-debug", version = "0.1.0" }
+dartq-diagnostics = { path = "crates/dartq-diagnostics", version = "0.1.0" }
+dartq-engine = { path = "crates/dartq-engine", version = "0.1.0" }
+dartq-flow = { path = "crates/dartq-flow", version = "0.1.0" }
+dartq-index = { path = "crates/dartq-index", version = "0.1.0" }
+dartq-language = { path = "crates/dartq-language", version = "0.1.0" }
+dartq-lints = { path = "crates/dartq-lints", version = "0.1.0" }
+dartq-package = { path = "crates/dartq-package", version = "0.1.0" }
+dartq-parser = { path = "crates/dartq-parser", version = "0.1.0" }
+dartq-plugin = { path = "crates/dartq-plugin", version = "0.1.0" }
+dartq-pub = { path = "crates/dartq-pub", version = "0.1.0" }
+dartq-resolution = { path = "crates/dartq-resolution", version = "0.1.0" }
+dartq-scanner = { path = "crates/dartq-scanner", version = "0.1.0" }
+dartq-schema = { path = "crates/dartq-schema", version = "0.1.0" }
+dartq-sdk = { path = "crates/dartq-sdk", version = "0.1.0" }
+dartq-semantic = { path = "crates/dartq-semantic", version = "0.1.0" }
+dartq-session = { path = "crates/dartq-session", version = "0.1.0" }
+dartq-snapshot = { path = "crates/dartq-snapshot", version = "0.1.0" }
+dartq-source = { path = "crates/dartq-source", version = "0.1.0" }
+dartq-test = { path = "crates/dartq-test", version = "0.1.0" }
+dartq-types = { path = "crates/dartq-types", version = "0.1.0" }
 
 [workspace.lints.rust]
 rust_2018_idioms = "warn"
