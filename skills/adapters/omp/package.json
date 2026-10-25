@@ -1,0 +1,15 @@
+{
+  "name": "dartq-skills",
+  "version": "0.1.0",
+  "description": "dartq skills for the pi coding agent (oh-my-pi): AI-first Dart/Flutter analysis, test driving, monorepo sessions, debugging, and MCP integration",
+  "type": "module",
+  "license": "Apache-2.0 OR MIT",
+  "files": [
+    "extensions"
+  ],
+  "omp": {
+    "extensions": [
+      "./extensions/dartq.ts"
+    ]
+  }
+}

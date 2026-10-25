@@ -1,0 +1,18 @@
+{
+  "name": "dartq",
+  "description": "dartq skills: AI-first Dart/Flutter analysis, test driving, monorepo sessions, debugging, and MCP integration",
+  "owner": {
+    "name": "iota9star"
+  },
+  "plugins": [
+    {
+      "name": "dartq",
+      "description": "dartq skills: AI-first Dart/Flutter analysis, test driving, monorepo sessions, debugging, and MCP integration",
+      "version": "0.1.0",
+      "source": "./",
+      "author": {
+        "name": "iota9star"
+      }
+    }
+  ]
+}

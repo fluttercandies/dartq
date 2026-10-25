@@ -1,0 +1,23 @@
+{
+  "name": "dartq",
+  "displayName": "dartq",
+  "version": "0.1.0",
+  "description": "dartq skills: AI-first Dart/Flutter analysis, test driving, monorepo sessions, debugging, and MCP integration",
+  "suggestedPrompts": [
+    "Analyze this Dart/Flutter workspace and explain the diagnostics",
+    "Run only the tests impacted by my change",
+    "Debug this Flutter app with breakpoints and hot reload"
+  ],
+  "category": "Developer Tools",
+  "keywords": [
+    "dart",
+    "flutter",
+    "analysis",
+    "testing",
+    "debugging"
+  ],
+  "author": {
+    "name": "iota9star"
+  },
+  "license": "Apache-2.0 OR MIT"
+}

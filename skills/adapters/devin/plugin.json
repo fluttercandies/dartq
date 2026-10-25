@@ -1,0 +1,17 @@
+{
+  "name": "dartq",
+  "version": "0.1.0",
+  "description": "dartq skills: AI-first Dart/Flutter analysis, test driving, monorepo sessions, debugging, and MCP integration.",
+  "author": {
+    "name": "iota9star"
+  },
+  "license": "Apache-2.0 OR MIT",
+  "keywords": [
+    "dart",
+    "flutter",
+    "analysis",
+    "testing",
+    "debugging",
+    "skills"
+  ]
+}

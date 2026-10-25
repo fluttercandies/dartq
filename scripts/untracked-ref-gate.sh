@@ -54,7 +54,12 @@ PATTERN='[.]third|(^|[^[:alnum:]_./])[d]ocs/|AGENTS[.]md|[P]RD|GOALS[.]md|REF[.]
 # change the tested behavior, so the tree is excluded like the vendor dir
 # (a literal directory pathspec already covers its whole subtree; the /**
 # caveat above applies only to paths with a wildcarded component).
-excludes=(':(exclude).gitignore' ':(exclude)scripts/untracked-ref-gate.sh' ':(exclude)Cargo.lock' ':(exclude)tests/plugin-validation/vendor' ':(exclude)tests/plugin-validation/corpora' ':(exclude)tests/corpus/real/*/lib/**')
+# The skills/ tree is a shipped user-facing artifact (the agent skill
+# package). It legitimately names the public AGENTS.md convention — the
+# file it ships (skills/adapters/agents-md/AGENTS.md) is tracked, so the
+# reference dangles nowhere. Same class as the vendored-content excludes
+# above: the heuristic would false-positive on the convention's own name.
+excludes=(':(exclude).gitignore' ':(exclude)scripts/untracked-ref-gate.sh' ':(exclude)Cargo.lock' ':(exclude)tests/plugin-validation/vendor' ':(exclude)tests/plugin-validation/corpora' ':(exclude)tests/corpus/real/*/lib/**' ':(exclude)skills')
 
 # Sanctioned standard-tool position (charter exemption face): the fvm SDK
 # default (`~/fvm/...`, or its absolute-user spelling) inside recorded
