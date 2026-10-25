@@ -101,6 +101,8 @@ dartq-snapshot = { path = "crates/dartq-snapshot", version = "0.1.0" }
 dartq-source = { path = "crates/dartq-source", version = "0.1.0" }
 dartq-test = { path = "crates/dartq-test", version = "0.1.0" }
 dartq-types = { path = "crates/dartq-types", version = "0.1.0" }
+notify = "6.1.1"
+tempfile = "3"
 
 [workspace.lints.rust]
 rust_2018_idioms = "warn"

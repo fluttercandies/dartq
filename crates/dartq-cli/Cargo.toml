@@ -49,7 +49,7 @@ serde_yaml = { workspace = true }
 # chain.
 [dev-dependencies]
 filetime = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
 
 # The metrics hook reads peak RSS through getrusage;
 # unix-only until a non-unix story exists.

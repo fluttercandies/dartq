@@ -40,7 +40,7 @@ dartq-test = { workspace = true }
 # fallback. Admitted from the local registry cache: MSRV 1.60; the macOS
 # face is fsevent-sys (no bindgen build, sole dep libc) + bitflags + log +
 # walkdir; crossbeam-channel is a default feature and already a dep here.
-notify = "6.1.1"
+notify = { workspace = true }
 # The test faces' run registry holds each run's progress behind
 # parking_lot mutexes (the workspace's standard lock, per the dep policy).
 parking_lot = { workspace = true }
