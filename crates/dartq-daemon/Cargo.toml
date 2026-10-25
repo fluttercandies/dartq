@@ -33,12 +33,17 @@ dartq-pub = { workspace = true }
 dartq-scanner = { workspace = true }
 dartq-snapshot = { workspace = true }
 dartq-source = { workspace = true }
+# The `dartq/test/probe` face reports the toolchain a run would use.
+dartq-test = { workspace = true }
 # The watch face's OS-event substrate (FSEvents on macOS, inotify on
 # Linux) behind the WatchSource seam — the poll substrate stays as the
 # fallback. Admitted from the local registry cache: MSRV 1.60; the macOS
 # face is fsevent-sys (no bindgen build, sole dep libc) + bitflags + log +
 # walkdir; crossbeam-channel is a default feature and already a dep here.
 notify = "6.1.1"
+# The test faces' run registry holds each run's progress behind
+# parking_lot mutexes (the workspace's standard lock, per the dep policy).
+parking_lot = { workspace = true }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -46,6 +51,10 @@ serde_json = { workspace = true }
 # enablement) parses here, root-file-only.
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
+
+# A cancelled test run's process group is signalled.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 dartq-package = { workspace = true }

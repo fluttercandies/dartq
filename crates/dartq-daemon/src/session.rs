@@ -1015,6 +1015,11 @@ pub struct Session {
     /// client launches or attaches; dropped sessions tear themselves
     /// down.
     debug: crate::debug::DebugManager,
+    /// The `dartq/test/*` faces' run registry (test orchestration lives
+    /// outside the analysis engine; the server answers those methods at
+    /// intake against this field). Empty until a client submits a run;
+    /// completed runs stay queryable until the session drops.
+    test: crate::test::TestManager,
     /// The shared mapped-content pool — `Some` only under
     /// [`SessionRuntime::pooled_mapped_store`]: every context's content
     /// store was rebound to it at assembly. Kept as the session's handle
@@ -1329,6 +1334,7 @@ impl Session {
             fix_done: bounded(MAX_QUEUED_FIX_MAILS),
             fix_budget: FIX_TIME_BUDGET,
             debug: crate::debug::DebugManager::default(),
+            test: crate::test::TestManager::default(),
             mapped_pool,
             snapshot: SnapshotSink {
                 store,
@@ -1861,6 +1867,12 @@ impl Session {
     /// those requests at intake against it).
     pub(crate) fn debug_registry(&mut self) -> &mut crate::debug::DebugManager {
         &mut self.debug
+    }
+
+    /// The `dartq/test/*` faces' run registry (the server answers those
+    /// requests at intake against it).
+    pub(crate) fn test_registry(&mut self) -> &mut crate::test::TestManager {
+        &mut self.test
     }
 
     /// `dartq/cancel`: cancels one queued request by id, precisely

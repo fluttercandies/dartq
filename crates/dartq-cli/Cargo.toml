@@ -34,12 +34,18 @@ dartq-sdk = { workspace = true }
 # The fix apply face's span-capacity gate (#1543 bypass face) speaks the
 # source crate's capacity constant and error text directly.
 dartq-source = { workspace = true }
+# The `dartq test` face's substrate (result cache, grouped runner, host
+# memory leases, reporters).
+dartq-test = { workspace = true }
+rustc-hash = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 
 # Test-only: the stale-config advisory tests pin the pub faces' mtime
 # chain.
 [dev-dependencies]
 filetime = { workspace = true }
+tempfile = "3"
 
 # The metrics hook reads peak RSS through getrusage;
 # unix-only until a non-unix story exists.

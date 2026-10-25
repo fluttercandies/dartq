@@ -33,6 +33,7 @@ use crate::commands;
 use crate::debug;
 use crate::jsonrpc::{self, Message, Notification, Request, Response, codes};
 use crate::session::{FixJob, Publish, Session, SessionError, Turn};
+use crate::test;
 use crate::watch::{WatchOptions, Watcher, is_config_input};
 use crate::wire::DiagnosticsParams;
 
@@ -475,6 +476,17 @@ fn handle_request(session: &mut Session, request: Request) -> Option<Response> {
                 &root,
             ))
         }
+        method if test::is_request(method) => {
+            let params = request.params.unwrap_or(Value::Null);
+            let root = session.workspace_root().to_path_buf();
+            Some(test_response(
+                session.test_registry(),
+                id,
+                method,
+                &params,
+                &root,
+            ))
+        }
         method if commands::is_command(method) => {
             // Every `dartq/*` face queues onto the session's read task (the
             // coalesced analysis runs once; the command answers from the
@@ -586,6 +598,28 @@ fn debug_response(
     root: &Path,
 ) -> Response {
     match debug::handle(manager, method, params, root) {
+        Ok(result) => Response::ok(id, result),
+        Err(error) => {
+            let (code, message) = error.wire();
+            Response::error(Some(id), code, message)
+        }
+    }
+}
+
+/// Answers one `dartq/test/*` request against the session's run registry:
+/// parameter decoding, the (non-blocking) registry/exec call, and the
+/// DTO shaping all live in the test module; this layer only maps the
+/// failure set onto the wire — `INVALID_PARAMS` for a structural mismatch,
+/// `TEST_RUN` (-32002) carrying a `DARTQ/TEST/*` machine prefix for the
+/// orchestration domain.
+fn test_response(
+    manager: &mut test::TestManager,
+    id: jsonrpc::RequestId,
+    method: &str,
+    params: &Value,
+    root: &Path,
+) -> Response {
+    match test::handle(manager, method, params, root) {
         Ok(result) => Response::ok(id, result),
         Err(error) => {
             let (code, message) = error.wire();

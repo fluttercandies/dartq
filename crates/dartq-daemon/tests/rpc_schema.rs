@@ -908,3 +908,73 @@ fn the_debug_family_matches_the_frozen_table() {
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
     fs::remove_dir_all(&workspace.root).ok();
 }
+
+/// The frozen `dartq/test/*` family: the daemon-native test orchestration
+/// registry's 5-method request table, pinned the same way the debug family
+/// is — an added, renamed, or removed method drifts the table and fails the
+/// gate. Like the debug faces it stays out of `METHODS` (that table is the
+/// analysis family; the test faces target the run registry, never the
+/// analysis engine), so it carries its own frozen copy and disjointness
+/// pins.
+const FROZEN_TEST_METHODS: [&str; 5] = [
+    "dartq/test/run",
+    "dartq/test/status",
+    "dartq/test/events",
+    "dartq/test/cancel",
+    "dartq/test/probe",
+];
+
+/// The test-family drift gate: the served table equals the frozen copy
+/// exactly, stays disjoint from the analysis request family and the
+/// notification family, and every name is a live face — an empty-params
+/// request answers the shared `INVALID_PARAMS` intake verdict (or, for the
+/// all-optional `status`/`probe`, a result), never `METHOD_NOT_FOUND`. The
+/// empty-params probe is chosen so no face reaches a live toolchain: `run`
+/// fails parameter decoding (or resolves an empty file set) before any
+/// process spawns.
+#[test]
+fn the_test_family_matches_the_frozen_table() {
+    assert_eq!(
+        dartq_daemon::TEST_REQUESTS.len(),
+        FROZEN_TEST_METHODS.len(),
+        "the test request family grew or shrank"
+    );
+    for method in dartq_daemon::TEST_REQUESTS {
+        assert!(
+            FROZEN_TEST_METHODS.contains(&method),
+            "{method} is a live test face but not in the frozen table"
+        );
+        assert!(
+            !dartq_daemon::METHODS.contains(&method),
+            "{method} must stay out of the analysis request family"
+        );
+        assert!(
+            !dartq_daemon::SERVED_NOTIFICATIONS.contains(&method),
+            "{method} is both a request and a notification"
+        );
+    }
+
+    let workspace = seeded_query_workspace();
+    let mut h = spawn(&workspace, &store_root("schema-test-methods"));
+    for (id, method) in FROZEN_TEST_METHODS.iter().enumerate() {
+        let id = (id + 1) as i64;
+        h.step(&request(id, method, json!({})), 1);
+        let frame = h.wait_answer(id);
+        let code = frame["error"]["code"].as_i64();
+        assert_ne!(
+            code,
+            Some(-32601),
+            "{method} must be a live face, not METHOD_NOT_FOUND: {frame}"
+        );
+    }
+
+    // The family is closed: an unknown test-spelled name answers
+    // METHOD_NOT_FOUND.
+    h.step(&request(99, "dartq/test/nope", json!({})), 1);
+    let frame = h.wait_answer(99);
+    assert_eq!(frame["error"]["code"], -32601, "the test face set is closed");
+
+    let (code, _) = h.join_ended();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+    fs::remove_dir_all(&workspace.root).ok();
+}

@@ -100,6 +100,7 @@ mod impact;
 mod index;
 mod rename;
 mod resolve;
+mod test;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -155,6 +156,9 @@ fn run(args: &[String]) -> u8 {
         Ok(Cli {
             command: Some(Command::Rename(rename_args)),
         }) => rename::run_entry(&rename_args),
+        Ok(Cli {
+            command: Some(Command::Test(test_args)),
+        }) => test::run_entry(&test_args),
         Ok(Cli {
             command: Some(Command::ResolveAt(resolve_args)),
         }) => resolve::resolve_at_entry(&resolve_args),
@@ -223,6 +227,11 @@ enum Command {
     /// prints the machine-readable edit set; `--write` applies it in
     /// place, refusing any file outside the workspace.
     Rename(rename::RenameArgs),
+    /// `dart test` (or, with `--flutter`, `flutter test`) with the same
+    /// arguments and output, plus a result cache shared across worktrees,
+    /// parallel execution under a host-wide memory lease, and
+    /// `--impacted[=REF]` selection.
+    Test(test::TestArgs),
     /// Resolve the symbol under one `PATH:LINE:COL` cursor over the
     /// analyzed workspace — the daemon's `dartq/resolveAt` answer,
     /// one-shot.

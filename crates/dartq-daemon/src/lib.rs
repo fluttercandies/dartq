@@ -96,6 +96,7 @@ mod debug;
 pub mod jsonrpc;
 pub(crate) mod plugins;
 pub mod session;
+mod test;
 mod watch;
 pub mod wire;
 
@@ -116,6 +117,7 @@ mod server;
 
 pub use commands::METHODS;
 pub use debug::DEBUG_REQUESTS;
+pub use test::TEST_REQUESTS;
 pub use server::{EXIT_CLEAN, EXIT_PROTOCOL, INTAKE_REQUESTS, SERVED_NOTIFICATIONS, run};
 pub use session::{Publish, Session, SessionError, SessionRuntime, Turn};
 pub use watch::WatchOptions;

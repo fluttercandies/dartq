@@ -1,0 +1,35 @@
+[package]
+name = "dartq-test"
+description = "dartq test: dart test with a result cache, grouped execution and host-wide memory leases"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+repository.workspace = true
+
+[dependencies]
+blake3.workspace = true
+# The result cache resolves `package:` directive URIs through the parsed
+# package_config.json.
+dartq-pub.workspace = true
+# Directive extraction runs on the official-grammar token table.
+dartq-scanner.workspace = true
+dartq-source.workspace = true
+hex.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+
+# The exec watchdog kills the runner's whole process group.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

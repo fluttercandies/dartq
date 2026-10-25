@@ -21,6 +21,11 @@ pub mod codes {
     /// the cause — the family shares one server-error code, the prefix
     /// discriminates.
     pub const DEBUG_SESSION: i64 = -32001;
+    /// A `dartq/test/*` face failure (the test orchestration domain: no
+    /// such run, scheduler rejection, exec spawn failure). The message
+    /// carries a `DARTQ/TEST/*` machine-code prefix; one server-error
+    /// code keeps the family distinguishable from debug/analysis faces.
+    pub const TEST_RUN: i64 = -32002;
 }
 
 /// A request id: integer or string (JSON-RPC 2.0); fractional numbers are

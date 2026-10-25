@@ -27,6 +27,7 @@ members = [
     "crates/dartq-cli",
     "crates/dartq-debug",
     "crates/dartq-schema",
+    "crates/dartq-test",
     "tests/harness",
     "tools/bench-corpus-gen",
     "tools/corpus-gen",
@@ -96,6 +97,7 @@ dartq-sdk = { path = "crates/dartq-sdk", version = "1.0.0" }
 dartq-semantic = { path = "crates/dartq-semantic", version = "1.0.0" }
 dartq-snapshot = { path = "crates/dartq-snapshot", version = "1.0.0" }
 dartq-source = { path = "crates/dartq-source", version = "1.0.0" }
+dartq-test = { path = "crates/dartq-test", version = "1.0.0" }
 dartq-types = { path = "crates/dartq-types", version = "1.0.0" }
 
 [workspace.lints.rust]
