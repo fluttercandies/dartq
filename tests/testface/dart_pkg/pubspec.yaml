@@ -1,0 +1,7 @@
+name: dartq_testface_dart
+description: Minimal pure-Dart fixture for the test-face parity matrix.
+publish_to: none
+environment:
+  sdk: ^3.0.0
+dev_dependencies:
+  test: ^1.24.0

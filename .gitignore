@@ -32,6 +32,11 @@ tests/corpus/nested-versions/.dart_tool/pub/*
 tests/corpus/mega/
 # generated flutter-app corpus output (app-gate, #2063)
 tests/corpus/app/
+# test-face parity fixtures (test-face-matrix workflow +
+# scripts/test-face-parity.sh): pub-get artifacts, the dartq probe/recipe
+# trees and the tool's build outputs are regenerated per matrix job
+tests/testface/*/.dart_tool/
+tests/testface/*/pubspec.lock
 build/
 *.iml
 

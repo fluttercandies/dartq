@@ -1,0 +1,12 @@
+name: dartq_testface_flutter
+description: Minimal Flutter widget-test fixture for the test-face parity matrix.
+publish_to: none
+environment:
+  sdk: ^3.0.0
+  flutter: ^3.0.0
+dependencies:
+  flutter:
+    sdk: flutter
+dev_dependencies:
+  flutter_test:
+    sdk: flutter

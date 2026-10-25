@@ -1,0 +1,194 @@
+# Multi-version CI coverage for the test face (`dartq test`).
+#
+# The existing matrices (ci, sdk-stable-matrix, sdk-dev-matrix) gate the
+# analyze face against the `dart analyze` oracle; this workflow gates the
+# test face against the stock runners it replaces (`dart test` /
+# `flutter test`) across a band of toolchain versions. The flutter path
+# mirrors flutter_tools internals through the verbose-trace probe
+# (Recipe::probe reads the tool's own compile/tester command lines), which
+# can drift between Flutter versions with nothing in-repo noticing — this
+# matrix is that notice.
+#
+# Axes, both resolved live at run time (the sdk-stable-matrix discipline:
+# a silently stale pin would gate against versions that no longer ship,
+# and an empty resolution fails the resolve job loudly):
+#   - dart: the newest patch of each of the last 4 Dart stable minor lines
+#     (scripts/sdk-matrix-versions.sh --stable, the same dart-archive
+#     authority the stable matrix uses)
+#   - flutter: the newest patch of each of the last 3 stable Flutter minor
+#     lines (the flutter_infra_release releases manifest)
+#
+# Each job: the offline unit suites (dartq-test's lib, the CLI test
+# module), a release dartq build, then scripts/test-face-parity.sh over a
+# small tracked fixture package — oracle vs dartq cold vs dartq warm on a
+# green suite, a red suite, and the whole test/ directory — compared as
+# (outcome, suite, name) row sets from the JSON event stream, plus exit
+# codes on every leg. A version-drift failure surfaces as a red job with
+# the divergent row diff in the log and the per-leg evidence (event
+# streams, row sets, exit codes, toolchain banner) as an artifact.
+name: test-face-matrix
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "7 5 * * *" # daily, offset from the two sdk matrices and bench
+  pull_request:
+    paths:
+      - crates/dartq-test/**
+      - crates/dartq-cli/src/test.rs
+      - crates/dartq-cli/src/test/**
+      - tests/testface/**
+      - scripts/test-face-parity.sh
+      - .github/workflows/test-face-matrix.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resolve-dart:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.versions.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: versions
+        name: Resolve the recent Dart stable band
+        env:
+          DART_MINORS: 4
+        run: |
+          set -euo pipefail
+          versions="$(bash scripts/sdk-matrix-versions.sh --stable \
+            | cut -d'|' -f1 | tail -n "$DART_MINORS" | jq -R '.' | jq -sc '.')"
+          if [ "$versions" = "[]" ]; then
+            echo "::error::stable-band resolver returned no versions for the test-face matrix"
+            exit 1
+          fi
+          echo "dart axis: $versions"
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+
+  resolve-flutter:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.versions.outputs.versions }}
+    steps:
+      - id: versions
+        name: Resolve the recent stable Flutter band
+        env:
+          FLUTTER_MINORS: 3
+        run: |
+          set -euo pipefail
+          versions="$(curl -fsSL --retry 3 --max-time 60 \
+            "https://storage.googleapis.com/flutter_infra_release/releases/releases_linux.json" \
+            | python3 -c '
+          import json, os, sys
+
+          band = int(os.environ["FLUTTER_MINORS"])
+          releases = json.load(sys.stdin)["releases"]
+          # Newest patch per (major, minor) among stable-channel releases,
+          # then the last `band` minor lines, ascending.
+          rows = {}
+          for release in releases:
+              if release.get("channel") != "stable":
+                  continue
+              parts = release.get("version", "").split(".")
+              if len(parts) != 3 or not all(part.isdigit() for part in parts):
+                  continue
+              key = (int(parts[0]), int(parts[1]))
+              if key not in rows or int(parts[2]) > rows[key]:
+                  rows[key] = int(parts[2])
+          picked = ["%d.%d.%d" % (key[0], key[1], rows[key]) for key in sorted(rows)[-band:]]
+          print(json.dumps(picked))
+          ')"
+          if [ "$versions" = "[]" ]; then
+            echo "::error::flutter releases manifest resolved to an empty stable band"
+            exit 1
+          fi
+          echo "flutter axis: $versions"
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+
+  dart-face:
+    needs: resolve-dart
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.resolve-dart.outputs.versions) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Strip host-discipline cargo config (sccache wrapper + jobs=2)
+        run: |
+          sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+          if grep -qE '^(rustc-wrapper|jobs = 2)' .cargo/config.toml; then
+            echo "::error::cargo config strip left matches behind (layout drift?)"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the matrix Dart SDK
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: ${{ matrix.version }}
+      - name: Offline unit suites (dartq-test + the CLI test module)
+        run: |
+          cargo test -p dartq-test --lib
+          cargo test -p dartq-cli --bin dartq test::
+      - name: Build dartq (release)
+        run: cargo build -p dartq-cli --release
+      - name: Pub-get the dart fixture
+        run: (cd tests/testface/dart_pkg && dart pub get)
+      - name: Test-face parity (oracle dart ${{ matrix.version }})
+        run: bash scripts/test-face-parity.sh --dart tests/testface/dart_pkg
+      - name: Upload the parity evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-face-dart-${{ matrix.version }}
+          path: target/evidence/test-face/
+          if-no-files-found: ignore
+
+  flutter-face:
+    needs: resolve-flutter
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.resolve-flutter.outputs.versions) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Strip host-discipline cargo config (sccache wrapper + jobs=2)
+        run: |
+          sed -i '/^rustc-wrapper/d;/^jobs = 2/d' .cargo/config.toml
+          if grep -qE '^(rustc-wrapper|jobs = 2)' .cargo/config.toml; then
+            echo "::error::cargo config strip left matches behind (layout drift?)"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the matrix Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ matrix.version }}
+      - name: Offline unit suites (dartq-test + the CLI test module)
+        run: |
+          cargo test -p dartq-test --lib
+          cargo test -p dartq-cli --bin dartq test::
+      - name: Build dartq (release)
+        run: cargo build -p dartq-cli --release
+      - name: Pub-get the flutter fixture
+        run: (cd tests/testface/flutter_pkg && flutter pub get)
+      - name: Test-face parity (oracle flutter ${{ matrix.version }})
+        run: bash scripts/test-face-parity.sh --flutter tests/testface/flutter_pkg
+      - name: Upload the parity evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-face-flutter-${{ matrix.version }}
+          path: target/evidence/test-face/
+          if-no-files-found: ignore
