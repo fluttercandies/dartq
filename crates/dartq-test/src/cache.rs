@@ -1436,4 +1436,166 @@ mod tests {
             .expect("keys");
         assert_eq!(keys, [None]);
     }
+
+    /// A stored entry spells the package root as a mark: the checkout that
+    /// replays it sees its own root in the events, as a path and as a
+    /// `file:` URI.
+    #[test]
+    fn replayed_entries_spell_the_replaying_root() {
+        let (tmp_a, root_a) = fixture();
+        let (tmp_b, root_b) = fixture();
+        let shared = tempfile::tempdir().expect("tmp");
+        let store = shared.path().join("store");
+        // The runner binary is outside both checkouts, so it keys alike.
+        let bin = shared.path().join("dart");
+        std::fs::write(&bin, "bin").expect("bin");
+        let suites = |root: &Path| vec![root.join("test/a_test.dart")];
+        let mut a = Cache::with_store(&root_a, store.clone());
+        let key_a = a.keys(&suites(&root_a), runner(&bin)).expect("keys");
+        let mut b = Cache::with_store(&root_b, store.clone());
+        let key_b = b.keys(&suites(&root_b), runner(&bin)).expect("keys");
+        assert_eq!(key_a[0], key_b[0], "same content keys alike");
+        let key = key_a[0].clone().expect("key");
+        let events = |root: &Path| {
+            [
+                format!(r#"{{"suite":{{"id":0,"platform":"vm","path":"{}/test/a_test.dart"}},"type":"suite","time":0}}"#, root.display()),
+                format!(r#"{{"type":"print","message":"loaded file://{}/test/a_test.dart"}}"#, root.display()),
+            ]
+            .map(|line| crate::event::parse(&line).expect("event"))
+            .to_vec()
+        };
+        a.stage(&key, &events(&root_a)).expect("stage");
+        let verified: FxHashSet<String> = [key.clone()].into_iter().collect();
+        a.commit(&verified).expect("commit");
+
+        let from_b = Cache::with_store(&root_b, store.clone()).lookup(&key).expect("hit");
+        let text = from_b.iter().map(|event| event.to_line()).collect::<String>();
+        assert!(text.contains(&format!("{}/test/a_test.dart", root_b.display())));
+        assert!(text.contains(&format!("file://{}/test/a_test.dart", root_b.display())));
+        let staged_root = root_a.to_string_lossy();
+        assert!(!text.contains(staged_root.as_ref()), "the staging root never leaks");
+
+        let from_a = Cache::with_store(&root_a, store).lookup(&key).expect("hit");
+        let own = format!("{}/test/a_test.dart", root_a.display());
+        assert!(from_a.iter().any(|event| event.str_at(&["suite", "path"]) == Some(own.as_str())));
+        drop((tmp_a, tmp_b));
+    }
+
+    /// A pub workspace member resolves through the workspace root's
+    /// package configuration; a broken pointer falls back to the member.
+    #[test]
+    fn workspace_members_resolve_through_the_workspace_root() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let write = |rel: &str, body: &str| {
+            let path = tmp.path().join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(&path, body).expect("write");
+        };
+        write("ws/.dart_tool/package_config.json", "{}");
+        // The pointer resolves from its `.dart_tool/pub` directory.
+        write("ws/pkg/a/.dart_tool/pub/workspace_ref.json", r#"{"workspaceRoot": "../../../.."}"#);
+        let member = tmp.path().join("ws/pkg/a");
+        assert_eq!(workspace_root(&member), Some(tmp.path().join("ws")));
+        assert_eq!(package_config_path(&member), tmp.path().join("ws/.dart_tool/package_config.json"));
+        // A package without a pointer is its own workspace.
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).expect("dir");
+        assert_eq!(workspace_root(&plain), Some(plain.clone()));
+        assert_eq!(package_config_path(&plain), plain.join(".dart_tool/package_config.json"));
+        // An unreadable pointer names nothing; the member's own
+        // configuration is the fallback.
+        write("ws/pkg/b/.dart_tool/pub/workspace_ref.json", "not json");
+        let broken = tmp.path().join("ws/pkg/b");
+        assert_eq!(workspace_root(&broken), None);
+        assert_eq!(package_config_path(&broken), broken.join(".dart_tool/package_config.json"));
+    }
+
+    /// `flutter test` wraps the nearest `flutter_test_config.dart` (every
+    /// closer candidate's absence an input too) and bundles the pubspec's
+    /// assets: both reach every suite's inputs.
+    #[test]
+    fn flutter_config_and_asset_inputs() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().canonicalize().expect("canon");
+        let write = |rel: &str, body: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(&path, body).expect("write");
+        };
+        write("pubspec.yaml", "name: fx\n");
+        write("test/flutter_test_config.dart", "void main() {}\n");
+        let suite = root.join("test/sub/a_test.dart");
+        let (configs, absent) = flutter_inputs(&root, &suite);
+        assert_eq!(configs, vec![root.join("test/flutter_test_config.dart")]);
+        assert_eq!(absent, vec![root.join("test/sub/flutter_test_config.dart")]);
+        // Without it the walk reaches the package root, every absent
+        // candidate along the way an input.
+        std::fs::remove_file(root.join("test/flutter_test_config.dart")).expect("rm");
+        let (configs, absent) = flutter_inputs(&root, &suite);
+        assert!(configs.is_empty());
+        assert_eq!(
+            absent,
+            [
+                root.join("test/sub/flutter_test_config.dart"),
+                root.join("test/flutter_test_config.dart"),
+                root.join("flutter_test_config.dart"),
+            ]
+        );
+        // Assets: files, directory subtrees and font files.
+        write(
+            "pubspec.yaml",
+            "name: fx\nflutter:\n  assets:\n    - assets/data.txt\n    - assets/dir/\n  fonts:\n    - family: X\n      fonts:\n        - asset: fonts/X.ttf\n",
+        );
+        write("assets/data.txt", "x");
+        write("assets/dir/a.txt", "a");
+        write("assets/dir/sub/b.txt", "b");
+        write("fonts/X.ttf", "font");
+        assert_eq!(
+            flutter_assets(&root),
+            [
+                root.join("assets/data.txt"),
+                root.join("assets/dir/a.txt"),
+                root.join("assets/dir/sub/b.txt"),
+                root.join("fonts/X.ttf"),
+            ]
+        );
+        // Suite URLs percent-encode everything but the characters Dart's
+        // `Uri` leaves alone.
+        assert_eq!(encode_uri_segment("a b"), "a%20b");
+        assert_eq!(encode_uri_segment("a+b'"), "a+b'");
+        assert_eq!(encode_uri_segment("a/b"), "a%2Fb");
+    }
+
+    /// The key covers the runner invocation: arguments and the tool reach
+    /// it.
+    #[test]
+    fn keys_cover_the_runner_arguments_and_tool() {
+        let (tmp, root) = fixture();
+        let bin = root.join("pubspec.yaml");
+        let suites = vec![root.join("test/a_test.dart")];
+        let mut cache = Cache::with_store(&root, tmp.path().join("store"));
+        let plain = cache.keys(&suites, runner(&bin)).expect("keys");
+        let named = cache
+            .keys(&suites, Runner { bin: &bin, args: &["--name=x".to_owned()], flutter: false })
+            .expect("keys");
+        let flutter = cache.keys(&suites, Runner { bin: &bin, args: &[], flutter: true }).expect("keys");
+        assert_ne!(plain[0], named[0], "arguments are inputs");
+        assert_ne!(plain[0], flutter[0], "the tool is an input");
+    }
+
+    /// A run that ends without committing leaves no staged entry behind,
+    /// and an entry of a foreign format never replays.
+    #[test]
+    fn uncommitted_staging_is_removed_on_drop() {
+        let (tmp, root) = fixture();
+        let store = tmp.path().join("store");
+        let mut cache = Cache::with_store(&root, store.clone());
+        cache.stage("deadbeef", &[]).expect("stage");
+        assert!(cache.staging.is_dir());
+        drop(cache);
+        assert!(!store.join(format!(".staging-{}", std::process::id())).is_dir());
+        std::fs::create_dir_all(store.join("ab")).expect("dir");
+        std::fs::write(store.join("ab/abcd.json"), br#"{"format":"dartq-test-cache-v0","events":[]}"#).expect("write");
+        assert!(Cache::with_store(&root, store).lookup("abcd").is_none(), "a foreign format never replays");
+    }
 }

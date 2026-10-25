@@ -658,4 +658,41 @@ mod tests {
         assert_eq!(shard(&suites, 64, cost).len(), 6);
         assert_eq!(shard(&suites, 0, |_| None).len(), 1);
     }
+
+    /// Recorded durations load back per suite, summed across rows (the
+    /// rows carry package-relative paths, as the runners record them);
+    /// suites outside the package, or a corrupt index, key nothing.
+    #[test]
+    fn durations_round_trip_per_suite() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().canonicalize().expect("canon");
+        let a = root.join("test/a_test.dart");
+        let b = root.join("test/b_test.dart");
+        assert_eq!(Durations::load(&root).get(&root, &a), None);
+        let rel = |suite: &Path| PathBuf::from(suite.strip_prefix(&root).expect("inside"));
+        Durations::load(&root).record(&root, &[(rel(&a), 100), (rel(&a), 50), (rel(&b), 200)]);
+        let durations = Durations::load(&root);
+        assert_eq!(durations.get(&root, &a), Some(150));
+        assert_eq!(durations.get(&root, &b), Some(200));
+        assert_eq!(durations.get(&root, &root.join("test/c_test.dart")), None);
+        assert_eq!(durations.get(Path::new("/elsewhere"), &a), None, "outside the package");
+        // A corrupt index starts empty, and recording no rows writes nothing.
+        std::fs::write(Durations::path(&root), b"{").expect("write");
+        Durations::load(&root).record(&root, &[]);
+        assert_eq!(Durations::load(&root).get(&root, &a), None);
+    }
+
+    /// The command line that starts a compiled runner: asserts on, the
+    /// package configuration it was compiled against, then the kernel.
+    #[test]
+    fn runner_args_start_the_kernel() {
+        let runner = GroupRunner {
+            kernel: PathBuf::from("/k/group.dill"),
+            packages: PathBuf::from("/p/.dart_tool/package_config.json"),
+        };
+        assert_eq!(
+            runner.args(),
+            ["--enable-asserts", "--packages=/p/.dart_tool/package_config.json", "/k/group.dill"]
+        );
+    }
 }

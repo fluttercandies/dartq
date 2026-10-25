@@ -530,4 +530,63 @@ mod tests {
         let prefixed = b"@t.Tags(['slow'])\nlibrary;\nimport 'package:test/test.dart' as t;\nvoid main() {}\n";
         assert_eq!(select(prefixed, &none), Selection::Dropped);
     }
+
+    /// The tag argument forms the runner accepts — `const`, type
+    /// arguments, trailing commas, adjacent literals, empty lists — and the
+    /// ones it does not.
+    #[test]
+    fn tag_arguments_cover_the_runners_literal_forms() {
+        let slow = filter(&[], &["slow"]);
+        let src = |line: &str| format!("{line}\nlibrary;\nvoid main() {{}}\n").into_bytes();
+        for form in [
+            "@Tags(['slow'])",
+            "@Tags(const ['slow'])",
+            "@Tags(<String>['slow'])",
+            "@Tags(const <String>['slow',])",
+            "@Tags(['fast', 'slow'])",
+            "@Tags(['sl' 'ow'])",
+        ] {
+            assert_eq!(select(&src(form), &slow), Selection::Dropped, "{form}");
+        }
+        for form in ["@Tags(['fast'])"] {
+            assert_eq!(select(&src(form), &slow), Selection::Loaded, "{form}");
+        }
+        // An empty list is one `Index` token to the scanner, not a group:
+        // the runner decides, as it does for the truly unreadable forms.
+        for form in ["@Tags([])", "@Tags()", "@Tags('slow')", "@Tags([k])", "@Tags(['a\\tb'])"] {
+            assert_eq!(select(&src(form), &slow), Selection::Unknown, "{form}");
+        }
+        // A byte-order mark precedes the annotations; an `@` inside code is
+        // not an annotation the runner reads.
+        let bom: &[u8] = "\u{feff}@Tags(['slow'])\nlibrary;\n".as_bytes();
+        assert_eq!(select(bom, &slow), Selection::Dropped);
+        assert_eq!(select(b"void main() { @Deprecated('x') f(); }\n", &slow), Selection::Loaded);
+    }
+
+    /// The selector grammar's remaining corners: nested conditionals,
+    /// negated groups, hyphenated names, comments (nestable, and an
+    /// unterminated one never ends), and rejected forms.
+    #[test]
+    fn selectors_cover_conditional_and_comment_forms() {
+        let truth = |set: &'static [&'static str]| move |v: &str| set.contains(&v);
+        let chained = Selector::parse("a ? b : !c ? d : e").expect("parses");
+        assert!(chained.evaluate(&truth(&["a", "b"])));
+        assert!(chained.evaluate(&truth(&["c", "e"])));
+        assert!(!chained.evaluate(&truth(&["a", "c"])));
+        let grouped = Selector::parse("!(tag-one || two_two)").expect("parses");
+        assert!(grouped.evaluate(&truth(&[])));
+        assert!(!grouped.evaluate(&truth(&["tag-one"])));
+        assert!(Selector::parse("a /* c */ ? b : c // tail").is_some());
+        assert!(Selector::parse("a/*x*/&&b").is_some());
+        assert!(Selector::parse("a /* /* nested */ */ && b").is_some());
+        assert!(Selector::parse("a /* /* nested */ && b").is_none(), "the inner comment never closed");
+        for bad in ["a ? b", "(a", "a b", "?a", "a:", "()"] {
+            assert!(Selector::parse(bad).is_none(), "{bad}");
+        }
+        // An unreadable suite file is the runner's to report.
+        assert_eq!(
+            select_all(&[std::path::PathBuf::from("/dartq/missing_test.dart")], &filter(&[], &[])),
+            [Selection::Unknown]
+        );
+    }
 }

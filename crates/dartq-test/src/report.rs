@@ -1546,4 +1546,166 @@ mod tests {
         assert_eq!(second_start.u64_at(&["test", "suiteID"]), Some(7));
         assert!(text.contains(r#"{"count":2,"#));
     }
+
+    /// The compact reporter's lines for the same suite, as `dart test -r
+    /// compact -j 1` prints them: progress rewritten in place with `\r`,
+    /// padded to the terminal width, the failure uncut with its rerun hint.
+    #[test]
+    fn compact_matches_the_runner() {
+        let mut out = Vec::new();
+        let mut compact = Compact::new(Options {
+            color: false,
+            print_path: true,
+            line_length: 200,
+            executable: "dart".into(),
+            chain_stack_traces: false,
+        });
+        compact.block(&suite_a(), &mut out).expect("block");
+        compact.done(&mut out).expect("done");
+        let text = String::from_utf8(out).expect("utf8");
+        // Every in-place progress segment pads to the terminal width (the
+        // `\r` rides in front of it, outside the segment).
+        let first = text.split('\n').next().expect("line");
+        let segments: Vec<&str> = first.split('\r').collect();
+        assert!(segments.first().is_some_and(|piece| piece.is_empty()), "the run opens with \\r");
+        assert!(segments.iter().skip(1).all(|segment| segment.len() + 1 == 200), "{segments:?}");
+        // The reporter rewrites in place: each `\r` segment, and each
+        // newline-terminated line, is one printed piece.
+        let body = text.strip_prefix('\r').expect("opens with \\r");
+        let body = body.strip_suffix('\n').expect("ends with a newline");
+        let pieces: Vec<String> = body.split(['\r', '\n']).map(|piece| piece.trim_end().to_owned()).collect();
+        assert_eq!(
+            pieces,
+            [
+                "00:00 +0: loading test/a_test.dart",
+                "00:00 +0: test/a_test.dart: g passes",
+                "00:00 +0: test/a_test.dart: g passes",
+                "hello from a",
+                "",
+                "00:00 +1: test/a_test.dart: g passes",
+                "00:00 +1: test/a_test.dart: g fails",
+                "00:00 +1 -1: test/a_test.dart: g fails [E]",
+                "  Expected: <2>",
+                "    Actual: <1>",
+                "",
+                "  package:matcher        expect",
+                "  test/a_test.dart 5:24  main.<fn>.<fn>",
+                "",
+                "",
+                "To run this test again: dart test test/a_test.dart -p vm --plain-name 'g fails'",
+                "",
+                "00:00 +1 -1: test/a_test.dart: g skipped",
+                "00:00 +1 ~1 -1: test/a_test.dart: g skipped",
+                "00:00 +1 ~1 -1: Some tests failed.",
+                "",
+                "Consider enabling the flag chain-stack-traces to receive more detailed exceptions.",
+                "For example, 'dart test --chain-stack-traces'.",
+            ]
+        );
+    }
+
+    /// A name longer than the terminal is cut the runner's own `truncate`
+    /// spells it: the trailing characters behind a `...` prefix.
+    #[test]
+    fn compact_truncates_to_the_terminal_width() {
+        let suite = events(&[
+            r#"{"suite":{"id":0,"platform":"vm","path":"test/a_test.dart"},"type":"suite","time":0}"#,
+            r#"{"test":{"id":1,"name":"loading test/a_test.dart","suiteID":0,"groupIDs":[],"metadata":{"skip":false,"skipReason":null}},"type":"testStart","time":0}"#,
+            r#"{"testID":1,"result":"success","skipped":false,"hidden":true,"type":"testDone","time":1}"#,
+            &format!(
+                r#"{{"test":{{"id":2,"name":"{}","suiteID":0,"groupIDs":[3],"metadata":{{"skip":false,"skipReason":null}}}},"type":"testStart","time":1}}"#,
+                "a".repeat(40)
+            ),
+            r#"{"testID":2,"result":"success","skipped":false,"hidden":false,"type":"testDone","time":2}"#,
+        ]);
+        let mut out = Vec::new();
+        let mut compact = Compact::new(Options {
+            color: false,
+            print_path: true,
+            line_length: 40,
+            executable: "dart".into(),
+            chain_stack_traces: true,
+        });
+        compact.block(&suite, &mut out).expect("block");
+        compact.done(&mut out).expect("done");
+        let text = String::from_utf8(out).expect("utf8");
+        let body = text.strip_prefix('\r').expect("opens with \\r");
+        let body = body.strip_suffix('\n').expect("ends with a newline");
+        let pieces: Vec<&str> = body.split(['\r', '\n']).collect();
+        let truncated = format!("00:00 +0: ...{}", "a".repeat(25));
+        assert_eq!(pieces[1].trim_end(), truncated, "the long name is cut");
+        assert!(pieces.iter().all(|piece| piece.trim_end().len() <= 40), "{pieces:?}");
+        assert!(text.contains("All tests passed!"));
+    }
+
+    /// A test that fails after it completed: the passed count gives the
+    /// test back, the failure gets its group, and its late output prints
+    /// outside every group, as the reporter does.
+    #[test]
+    fn github_reports_failures_after_completion() {
+        let suite = events(&[
+            r#"{"suite":{"id":0,"platform":"vm","path":"test/a_test.dart"},"type":"suite","time":0}"#,
+            r#"{"test":{"id":1,"name":"t","suiteID":0,"groupIDs":[],"metadata":{"skip":false,"skipReason":null}},"type":"testStart","time":0}"#,
+            r#"{"testID":1,"result":"success","skipped":false,"hidden":false,"type":"testDone","time":1}"#,
+            r#"{"testID":1,"error":"boom","stackTrace":"frame","isFailure":true,"type":"error","time":2}"#,
+            r#"{"testID":1,"messageType":"print","message":"late","type":"print","time":2}"#,
+        ]);
+        let mut out = Vec::new();
+        let mut github = Github::new(false);
+        github.start(&mut out).expect("start");
+        github.block(&suite, &mut out).expect("block");
+        github.done(&mut out).expect("done");
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "\n::group::✅ Passing tests\n✅ t\n::endgroup::\n::group::❌ t (failed after test completion)\nboom\nframe\n::endgroup::\nlate\n\n::error::0 tests passed, 1 failed.\n"
+        );
+    }
+
+    /// Under `--machine` the tool's `test.startedProcess` event lands after
+    /// the suite's load test finishes, `allSuites` is announced once, and a
+    /// raw shell line prints exactly as written.
+    #[test]
+    fn json_merge_replays_machine_events_and_shell_lines() {
+        let suite = events(&[
+            r#"{"suite":{"id":0,"platform":"vm","path":"test/a_test.dart"},"type":"suite","time":0}"#,
+            r#"{"test":{"id":1,"name":"loading test/a_test.dart","suiteID":0,"groupIDs":[],"metadata":{"skip":false,"skipReason":null}},"type":"testStart","time":0}"#,
+            r#"{"testID":1,"result":"success","skipped":false,"hidden":true,"type":"testDone","time":1}"#,
+        ]);
+        let mut out = Vec::new();
+        let mut merge = JsonMerge::start(&mut out, None, Instant::now(), 1).expect("start");
+        merge.machine = true;
+        merge.block(&suite, &mut out).expect("block");
+        merge.block(&[crate::event::shell("Shell: from the tool")], &mut out).expect("block");
+        merge.done(false, &mut out).expect("done");
+        let text = String::from_utf8(out).expect("utf8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with(r#"{"protocolVersion":"0.1.1","runnerVersion":null,"pid":"#));
+        assert!(lines[0].ends_with(r#","type":"start","time":0}"#));
+        let kinds: Vec<String> = lines.iter().filter_map(|line| parse(line).map(|event| event.kind().to_owned())).collect();
+        assert_eq!(kinds, ["start", "suite", "testStart", "allSuites", "testDone", "done"]);
+        let started = lines.iter().position(|line| line.contains("test.startedProcess")).expect("started");
+        assert_eq!(lines[started], r#"[{"event":"test.startedProcess","params":{"vmServiceUri":null}}]"#);
+        assert_eq!(lines[started - 2], r#"{"count":1,"time":1,"type":"allSuites"}"#);
+        assert!(lines.contains(&"Shell: from the tool"), "the shell line prints raw");
+    }
+
+    /// An error after a test passed takes it back out of the passed count
+    /// (the expanded reporter shows `+0 -1` and lists it), and the silent
+    /// reporter prints nothing at all.
+    #[test]
+    fn late_errors_take_a_passed_test_back() {
+        let suite = events(&[
+            r#"{"suite":{"id":0,"platform":"vm","path":"test/a_test.dart"},"type":"suite","time":0}"#,
+            r#"{"test":{"id":1,"name":"loading test/a_test.dart","suiteID":0,"groupIDs":[],"metadata":{"skip":false,"skipReason":null}},"type":"testStart","time":0}"#,
+            r#"{"testID":1,"result":"success","skipped":false,"hidden":true,"type":"testDone","time":1}"#,
+            r#"{"test":{"id":2,"name":"t","suiteID":0,"groupIDs":[],"metadata":{"skip":false,"skipReason":null}},"type":"testStart","time":1}"#,
+            r#"{"testID":2,"result":"success","skipped":false,"hidden":false,"type":"testDone","time":2}"#,
+            r#"{"testID":2,"error":"late","stackTrace":"frame","isFailure":true,"type":"error","time":3}"#,
+        ]);
+        let text = render(Kind::Expanded, &[suite.clone()]);
+        assert!(text.contains("00:00 +0: test/a_test.dart: t\n"));
+        assert!(text.contains("00:00 +0 -1: test/a_test.dart: t [E]\n"));
+        assert!(text.contains("Failing tests:\n  test/a_test.dart: t\n"));
+        assert_eq!(render(Kind::Silent, &[suite]), "");
+    }
 }

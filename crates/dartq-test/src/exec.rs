@@ -546,7 +546,7 @@ raw from b\n\
 {\"testID\":3,\"result\":\"success\",\"skipped\":false,\"hidden\":false,\"type\":\"testDone\",\"time\":4}\n\
 {\"success\":true,\"type\":\"done\",\"time\":5}\n";
         let (sender, receiver) = std::sync::mpsc::channel();
-        let parsed = parse_stream(
+        parse_stream(
             BufReader::new(std::io::Cursor::new(stream.as_bytes().to_vec())),
             Some(&sender),
             None,
@@ -616,5 +616,52 @@ raw from b\n\
         })
         .expect("runs");
         assert_eq!(empty, 1);
+    }
+
+    /// The grouped runner's per-suite marker settles a block the moment
+    /// its suite closes — carrying its clean flag — while a plain run's
+    /// blocks close at `done`; an event of no suite is loose.
+    #[test]
+    fn suite_done_markers_settle_blocks_early() {
+        let stream = "\
+{\"suite\":{\"id\":0,\"path\":\"test/a_test.dart\"},\"type\":\"suite\",\"time\":0}\n\
+{\"test\":{\"id\":1,\"name\":\"loading test/a_test.dart\",\"suiteID\":0,\"groupIDs\":[]},\"type\":\"testStart\",\"time\":0}\n\
+{\"testID\":1,\"result\":\"success\",\"skipped\":false,\"hidden\":true,\"type\":\"testDone\",\"time\":1}\n\
+{\"type\":\"dartq.suiteDone\",\"path\":\"test/a_test.dart\",\"clean\":true}\n\
+{\"suite\":{\"id\":2,\"path\":\"test/b_test.dart\"},\"type\":\"suite\",\"time\":2}\n\
+{\"test\":{\"id\":3,\"name\":\"b\",\"suiteID\":2,\"groupIDs\":[]},\"type\":\"testStart\",\"time\":2}\n\
+{\"testID\":3,\"result\":\"success\",\"skipped\":false,\"hidden\":false,\"type\":\"testDone\",\"time\":3}\n\
+{\"testID\":9,\"result\":\"success\",\"skipped\":false,\"hidden\":false,\"type\":\"testDone\",\"time\":3}\n\
+{\"success\":true,\"type\":\"done\",\"time\":4}\n";
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let parsed = parse_stream(
+            BufReader::new(std::io::Cursor::new(stream.as_bytes().to_vec())),
+            Some(&sender),
+            None,
+            Instant::now(),
+        )
+        .expect("parse");
+        drop(sender);
+        assert!(parsed.blocks.is_empty(), "every block reached the sink");
+        let streamed: Vec<Streamed> = receiver.into_iter().collect();
+        let Streamed::Settled(Settled { block: a, .. }) = &streamed[0] else { panic!("settled") };
+        assert!(a.closed && a.clean, "the marker closed the suite clean");
+        assert_eq!(a.events.len(), 3, "the marker itself joins no block");
+        let Streamed::Settled(Settled { block: b, .. }) = &streamed[1] else { panic!("settled") };
+        assert!(b.closed, "`done` closes the suites still held");
+        assert!(!b.clean);
+
+        // Without a sink the same stream keeps its blocks; the orphan
+        // event belongs to no suite.
+        let parsed = parse_stream(
+            BufReader::new(std::io::Cursor::new(stream.as_bytes().to_vec())),
+            None,
+            None,
+            Instant::now(),
+        )
+        .expect("parse");
+        assert!(parsed.blocks[0].closed && parsed.blocks[0].clean);
+        assert!(parsed.blocks[1].closed && !parsed.blocks[1].clean);
+        assert!(matches!(&parsed.loose[0], Loose::Event(event) if event.kind() == "testDone"));
     }
 }

@@ -727,4 +727,30 @@ void main() {
         assert_eq!(located("void main() { relative('a'); x.canonicalize; Zone.current; }"), (false, false));
 
     }
+
+    /// `Platform.executableArguments` observes the launch exactly as
+    /// `Platform.script` does.
+    #[test]
+    fn executable_arguments_observe_the_launch_too() {
+        let facts = of("void main() { print(Platform.executableArguments); }");
+        assert!(facts.launch && facts.ambient);
+    }
+
+    /// Path-shaped words of a data file: a separator or a plausible
+    /// extension makes one; absolute paths, versions and prose do not.
+    #[test]
+    fn data_paths_shape_rules() {
+        assert_eq!(
+            data_paths(b"key: value\n- lib/src/a.dart\n- 'q.dart'\n- /abs/x.dart\n- no-ext\n- v1.2\n- word\n- a.b/c\n- x.C++\n"),
+            ["a.b/c", "lib/src/a.dart", "q.dart"]
+        );
+    }
+
+    /// The opt-out markers match one exact spelling each.
+    #[test]
+    fn markers_match_one_spelling() {
+        assert!(!of("// dartq:no-cache\nvoid main() {}").no_cache, "no space after the colon");
+        assert!(!of("// dartq: no-cacheable\nvoid main() {}").no_cache, "a longer word");
+        assert!(of("/// dartq: no-cache why\nvoid main() {}").no_cache, "extra slashes and a reason");
+    }
 }

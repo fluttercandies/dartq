@@ -910,4 +910,95 @@ mod tests {
         fs::write(pkg.join(".dart_tool/package_config.json"), r#"{"configVersion":2,"packages":[],"generator":"bazel"}"#).expect("config");
         assert!(pub_up_to_date(&pkg, &flutter));
     }
+
+    /// The `package:test` arguments the tool hands its runner: no color by
+    /// default, the last `--timeout`/`--tags` value wins, names repeat,
+    /// and the goldens and asset switches opt the grouped pass out.
+    #[test]
+    fn runner_args_match_the_tools_handoff() {
+        let pass = [
+            "--timeout=1x",
+            "--timeout=2x",
+            "--name=a",
+            "--name=b",
+            "--plain-name=p",
+            "--tags=s",
+            "--tags=t",
+            "--exclude-tags=e",
+            "--exclude-tags=f",
+            "--run-skipped",
+            "--ignore-timeouts",
+            "--total-shards=4",
+            "--shard-index=2",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            runner_args(&pass, false).expect("args"),
+            [
+                "--no-color",
+                "--timeout",
+                "2x",
+                "--ignore-timeouts",
+                "--name",
+                "a",
+                "--name",
+                "b",
+                "--plain-name",
+                "p",
+                "--tags",
+                "t",
+                "--exclude-tags",
+                "f",
+                "--run-skipped",
+                "--total-shards=4",
+                "--shard-index=2",
+                "--chain-stack-traces",
+            ]
+        );
+        let colored = runner_args(&pass, true).expect("args");
+        assert_eq!(colored.first().map(String::as_str), Some("--timeout"));
+        assert!(runner_args(&["--update-goldens".to_owned()], false).is_none());
+        assert!(runner_args(&["--no-test-assets".to_owned()], false).is_none());
+    }
+
+    /// Only the arguments that shape the compile or the tester reach the
+    /// recipe probe.
+    #[test]
+    fn build_args_pick_the_shaping_flags() {
+        let pass = [
+            "--dart-define=A=1",
+            "--dart-define-from-file=env.json",
+            "--enable-experiment=x",
+            "--flavor=f",
+            "--track-widget-creation",
+            "--no-enable-impeller",
+            "--enable-hcpp",
+            "--timeout=1x",
+            "--name=a",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            build_args(&pass),
+            [
+                "--dart-define=A=1",
+                "--dart-define-from-file=env.json",
+                "--enable-experiment=x",
+                "--flavor=f",
+                "--track-widget-creation",
+                "--no-enable-impeller",
+                "--enable-hcpp",
+            ]
+            .map(str::to_owned)
+            .to_vec()
+        );
+    }
+
+    /// The compact hint names the Dart SDK inside the Flutter SDK's cache.
+    #[test]
+    fn flutter_hints_name_the_cached_sdk() {
+        assert_eq!(
+            flutter_dart(Path::new("/sdk/bin/flutter")),
+            PathBuf::from("/sdk/bin/cache/dart-sdk/bin/dart")
+        );
+    }
 }

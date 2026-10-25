@@ -332,4 +332,21 @@ mod tests {
         event.remove("a");
         assert_eq!(event.to_line(), r#"{"type":"x","time":9,"extra":null}"#);
     }
+
+    /// Root placeholders rewrite only string values, wherever they sit;
+    /// keys and numbers stay as they were.
+    #[test]
+    fn replace_all_touches_only_strings() {
+        let mut event = parse(r#"{"suite":{"id":1,"path":"/a/test/x.dart"},"nest":["/a/y","keep",5],"type":"suite"}"#)
+            .expect("event");
+        replace_all(&mut event, &[("/a", "/b")]);
+        assert_eq!(event.str_at(&["suite", "path"]), Some("/b/test/x.dart"));
+        assert_eq!(event.get("nest").expect("nest").to_line(), r#"["/b/y","keep",5]"#);
+        assert_eq!(event.u64_at(&["suite", "id"]), Some(1));
+        let mut keyed = parse(r#"{"a/a":"/a","type":"print"}"#).expect("event");
+        replace_all(&mut keyed, &[("/a", "/b")]);
+        assert_eq!(keyed.to_line(), r#"{"a/a":"/b","type":"print"}"#);
+        // A raw output line event round-trips as itself.
+        assert_eq!(shell("Shell: hi").to_line(), r#"{"type":"dartq.shell","message":"Shell: hi"}"#);
+    }
 }

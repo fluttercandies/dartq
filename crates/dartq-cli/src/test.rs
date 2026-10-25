@@ -1789,6 +1789,121 @@ mod tests {
         assert_eq!(spell("a%20b_test.dart"), None);
     }
 
+    /// `flutter test`'s own grammar: the tool's shaping options pass,
+    /// dartq's `--no-pub`/`--machine` are recognized, `-j` follows the
+    /// tool's lenient `int.tryParse`, and only the tester platform runs
+    /// here.
+    #[test]
+    fn flutter_grammar_matches_the_tool() {
+        let inv = parse(&args(&[
+            "--flutter",
+            "--no-pub",
+            "--machine",
+            "-j",
+            "4",
+            "--dart-define=A=1",
+            "--update-goldens",
+            "test/widget_test.dart",
+        ]))
+        .expect("parse");
+        assert!(inv.flutter && inv.no_pub && inv.machine && !inv.delegate);
+        assert_eq!(inv.concurrency, Some(4));
+        assert_eq!(inv.pass, ["--dart-define=A=1", "--update-goldens"]);
+        assert!(inv.no_cache, "a run that writes goldens never caches");
+        assert_eq!(inv.paths, ["test/widget_test.dart"]);
+
+        // The tester platform runs here (the tool's default, so it is not
+        // re-passed); anything else is the tool's.
+        let tester = parse(&args(&["--flutter", "--platform", "tester"])).expect("parse");
+        assert!(!tester.delegate && tester.pass.is_empty());
+        assert!(parse(&args(&["--flutter", "--platform", "chrome"])).expect("parse").delegate);
+
+        // The tool's own lenient parse: junk leaves the default and the
+        // run stays dartq's.
+        let junk = parse(&args(&["--flutter", "-j", "x"])).expect("parse");
+        assert!(!junk.delegate && junk.concurrency.is_none());
+
+        // Tag options accumulate; debugging, verbose logging and coverage
+        // delegate.
+        let tags = parse(&args(&["--flutter", "-t", "slow", "--exclude-tags=flaky"])).expect("parse");
+        assert_eq!(tags.include_tags, ["slow"]);
+        assert_eq!(tags.exclude_tags, ["flaky"]);
+        for line in [
+            &["--flutter", "--verbose"][..],
+            &["--flutter", "-v"],
+            &["--flutter", "--start-paused"],
+            &["--flutter", "--coverage"],
+        ] {
+            assert!(parse(&args(line)).expect("parse").delegate, "{line:?}");
+        }
+        // After `--` the options ended: `--flutter` is a selection.
+        let after = parse(&args(&["--", "--flutter"])).expect("parse");
+        assert!(!after.flutter && after.paths == ["--flutter"]);
+    }
+
+    /// The runner's `NoTestsFoundException` message: name patterns first,
+    /// then the tag selectors, else the plain sentence.
+    #[test]
+    fn no_tests_message_matches_the_runner() {
+        let own = |values: &[&str]| values.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>();
+        let inv = Invocation { names: own(&["a"]), ..Invocation::default() };
+        assert_eq!(no_tests_message(&inv), "No tests match regular expression \"a\".");
+        let inv = Invocation { names: own(&["a", "b"]), ..Invocation::default() };
+        assert_eq!(
+            no_tests_message(&inv),
+            "No tests match regular expression \"a\" and regular expression \"b\"."
+        );
+        let inv = Invocation { names: own(&["a", "b", "c"]), ..Invocation::default() };
+        assert_eq!(
+            no_tests_message(&inv),
+            "No tests match regular expression \"a\", regular expression \"b\", and regular expression \"c\"."
+        );
+        let inv = Invocation { plain_names: own(&["x y"]), ..Invocation::default() };
+        assert_eq!(no_tests_message(&inv), "No tests match \"x y\".");
+        let inv = Invocation {
+            include_tags: own(&["s", "t,u"]),
+            exclude_tags: own(&["v"]),
+            ..Invocation::default()
+        };
+        assert_eq!(
+            no_tests_message(&inv),
+            "No tests match the requested tag selectors:\n  include: \"s && t && u\"\n  exclude: \"v\""
+        );
+        assert_eq!(no_tests_message(&Invocation::default()), "No tests were found.");
+    }
+
+    /// The rerun hint names the VM the `dart` entry point launches: a
+    /// Flutter SDK's shim names the VM in its cache, a Dart SDK's `dart`
+    /// is the VM itself.
+    #[test]
+    fn rerun_hints_name_the_underlying_vm() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let shim = tmp.path().join("sdk/bin/dart");
+        std::fs::create_dir_all(shim.parent().expect("parent")).expect("dir");
+        std::fs::write(&shim, "shim").expect("write");
+        let vm = tmp.path().join("sdk/bin/cache/dart-sdk/bin/dart");
+        std::fs::create_dir_all(vm.parent().expect("parent")).expect("dir");
+        std::fs::write(&vm, "vm").expect("write");
+        assert_eq!(vm_executable(&shim), vm.canonicalize().expect("canon"));
+        let plain = tmp.path().join("dart");
+        std::fs::write(&plain, "vm").expect("write");
+        assert_eq!(vm_executable(&plain), plain.canonicalize().expect("canon"));
+    }
+
+    /// A skipped test that errored counts as failed: errors outrank skips.
+    #[test]
+    fn an_errored_skip_fails() {
+        let event = |line: &str| dartq_test::event::parse(line).expect("event");
+        let rows = vec![
+            event(r#"{"suite":{"id":0,"path":"test/a_test.dart"},"type":"suite","time":0}"#),
+            event(r#"{"test":{"id":1,"name":"t","suiteID":0,"groupIDs":[],"metadata":{"skip":true}},"type":"testStart","time":0}"#),
+            event(r#"{"testID":1,"error":"boom","stackTrace":"","isFailure":false,"type":"error","time":1}"#),
+            event(r#"{"testID":1,"result":"success","skipped":true,"hidden":false,"type":"testDone","time":1}"#),
+        ];
+        let t = tally(&rows);
+        assert!(!t.green && t.failed == 1 && t.skipped == 0 && t.passed == 0);
+    }
+
     /// Discovery walks hidden and `build` directories and links, as the
     /// runner's `listSync(recursive: true)` does; a file reached twice or a
     /// missing selection is the runner's to report.

@@ -907,4 +907,101 @@ mod tests {
             [Placement::Shared, Placement::Fresh, Placement::Stock, Placement::Stock]
         );
     }
+
+    /// A trace dartq cannot split back unambiguously, or one missing a part
+    /// of the recipe, is refused rather than guessed.
+    #[test]
+    fn recipe_parse_refuses_ambiguous_or_incomplete_traces() {
+        let drop_line = |needle: &str| {
+            TRACE.lines().filter(|line| !line.contains(needle)).collect::<Vec<_>>().join("\n")
+        };
+        // The compiler line, the tester line and the environment event are
+        // all required.
+        assert!(Recipe::parse(&drop_line("frontend_server")).is_none());
+        assert!(Recipe::parse(&drop_line("Starting flutter_tester")).is_none());
+        assert!(Recipe::parse(&drop_line("dartq.environment")).is_none());
+        // A double space cannot be split back into arguments.
+        assert!(Recipe::parse(&TRACE.replace("--sdk-root ", "--sdk-root  ")).is_none());
+        // A tester argument that is not a flag means the split guessed.
+        assert!(Recipe::parse(&TRACE.replace("--non-interactive", "positional")).is_none());
+        // An environment that is not a map of strings is refused.
+        let swapped = TRACE
+            .lines()
+            .map(|line| {
+                if line.contains("dartq.environment") {
+                    r#"{"testID":3,"messageType":"print","message":"dartq.environment [1]","type":"print","time":10}"#
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(Recipe::parse(&swapped).is_none());
+        // The fonts configuration is derived from the compiler's SDK cache;
+        // a compiler outside one yields no recipe.
+        assert!(Recipe::parse(&TRACE.replace("/sdk/bin/cache/dart-sdk/bin/dartaotruntime", "/opt/dart/dartaotruntime")).is_none());
+    }
+
+    /// Suites wrapped by the same `flutter_test_config.dart` share its
+    /// import: each config imports once however many suites use it.
+    #[test]
+    fn chunk_entry_imports_each_config_once() {
+        let one = PathBuf::from("/p/test/one/flutter_test_config.dart");
+        let top = PathBuf::from("/p/test/flutter_test_config.dart");
+        let wrapped = |path: &str, config: &Path| Hosted {
+            path: PathBuf::from(path),
+            config: Some(config.to_path_buf()),
+            fresh: false,
+        };
+        let a = wrapped("/p/test/one/a_test.dart", &one);
+        let b = wrapped("/p/test/one/b_test.dart", &one);
+        let c = wrapped("/p/test/c_test.dart", &top);
+        let src = chunk_entry(1, &[(0, &a), (2, &b), (3, &c)]);
+        assert_eq!(src.matches("as c0;").count(), 1);
+        assert_eq!(src.matches("as c1;").count(), 1);
+        assert!(src.contains("const int _chunk = 1;"));
+        for (suite, config) in [("s0", "c0"), ("s2", "c0"), ("s3", "c1")] {
+            assert!(
+                src.contains(&format!("{config}.testExecutable(() async {{ await Future({suite}.main); }})")),
+                "{suite}"
+            );
+        }
+    }
+
+    /// A suite importing a package the resolution does not know runs stock
+    /// (its closure cannot be read); the Flutter SDK's own packages are the
+    /// framework every suite runs on and are never entered.
+    #[test]
+    fn placement_stocks_unresolved_and_skips_the_framework() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().canonicalize().expect("canonical");
+        let write = |base: &Path, rel: &str, text: &str| {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(&path, text).expect("write");
+            path
+        };
+        // Outside the package, spelled as canonically as the resolved
+        // imports will be (the framework prefix check compares paths).
+        let sdk = root.parent().expect("tmp parent").join("sdk");
+        write(&sdk, "packages/fw/lib/launch.dart", "import 'dart:io';\nvar s = Platform.script;\n");
+        let config = format!(
+            concat!(
+                r#"{{"configVersion":2,"packages":["#,
+                r#"{{"name":"p","rootUri":"../","packageUri":"lib/"}},"#,
+                r#"{{"name":"fw","rootUri":"../sdk/packages/fw/","packageUri":"lib/"}}],"#,
+                r#""flutterRoot":"file://{sdk}"}}"#
+            ),
+            sdk = sdk.display()
+        );
+        std::fs::create_dir_all(root.join(".dart_tool")).expect("dir");
+        std::fs::write(root.join(".dart_tool/package_config.json"), config).expect("write");
+        let own = write(&root, "test/own_test.dart", "void main() { FontLoader('x'); }");
+        let unknown = write(&root, "test/unknown_test.dart", "import 'package:nosuch/x.dart';\nvoid main() {}");
+        let framework = write(&root, "test/fw_test.dart", "import 'package:fw/launch.dart';\nvoid main() {}");
+        assert_eq!(
+            place(&root, &[own, unknown, framework]).expect("placed"),
+            [Placement::Fresh, Placement::Stock, Placement::Shared]
+        );
+    }
 }
