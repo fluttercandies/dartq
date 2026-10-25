@@ -4954,3 +4954,5 @@ mod receiver_face_tests;
 mod flow_scope_tests;
 #[cfg(test)]
 mod scope_inference_tests;
+#[cfg(test)]
+mod closure_invalid_chain_tests;

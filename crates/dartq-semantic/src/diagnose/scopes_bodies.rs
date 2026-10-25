@@ -2144,12 +2144,52 @@ impl<'a> Engine<'a> {
     }
 
     /// The `Object?` recovery type (`_typeSystem.objectQuestion`).
-    fn object_question(&mut self) -> Ty {
+    fn object_question(&self) -> Ty {
         Ty::Named {
             name: self.intern("Object"),
             nullable: true,
             args: ArgListId::EMPTY,
         }
+    }
+
+    /// Per-argument invalid recovery for a chain receiver's element face:
+    /// a decidable argument keeps itself; the oracle's `InvalidType`
+    /// stand-ins (the unresolvable-import `Named` head, the `Unknown`
+    /// face) take greatestClosure's `Object?` — the closure formal binds
+    /// the nullable face and its member reads report
+    /// (`_inferFormalParameters`'s recovery). Every other undecidable
+    /// shape drops the whole chain (the pre-existing suppression).
+    fn sanitize_invalid_args(&self, args: ArgListId, leak: &[StringId]) -> Option<ArgListId> {
+        let list: Vec<Ty> = self.boundary.pool().get(args).to_vec();
+        let mut out: Vec<Ty> = Vec::with_capacity(list.len());
+        for arg in list {
+            if self.schema_type_is_decidable(arg) {
+                out.push(arg);
+                continue;
+            }
+            if let Ty::Named { name, .. } = arg
+                && leak.contains(&name)
+            {
+                return None;
+            }
+            match arg {
+                Ty::Unknown => out.push(self.object_question()),
+                // A head any graph unit declares is NOT invalid (the
+                // getter's declared return spelling a foreign class the
+                // diagnosing file never imports — the oracle's element
+                // model holds the resolved class and the stand-in walk
+                // below answers the silent arm).
+                Ty::Named { name, .. }
+                    if !self.named_type_is_type(name)
+                        && !self.prefixed_element_head_resolves(name)
+                        && self.graph.declaring_libraries(name).is_empty() =>
+                {
+                    out.push(self.object_question())
+                }
+                _ => return None,
+            }
+        }
+        Some(self.boundary.intern_list(&out))
     }
 
     /// Every written type argument names a type — the oracle's argument
@@ -2168,14 +2208,52 @@ impl<'a> Engine<'a> {
 
     /// The full formal table of a callee (an unmerged member placeholder's
     /// receiver resolves the member face; a bare callee reads the
-    /// top-level declaration).
+    /// top-level declaration; a constructor selector reads the resolved
+    /// container's `ctor_formals` table).
     fn callee_formals(&self, recv: &Receiver, name: StringId) -> Option<Formals> {
         match recv {
+            // A bare class-name callee's constructor schema stays closed:
+            // the class's own type parameters bind only through the
+            // oracle's downward inference from the assignment context
+            // (`SplayTreeMap((a, b) => …)`'s `K`/`V`), a face the
+            // name-level walk cannot see — the formal keeps `dynamic`.
             Receiver::Unknown | Receiver::Prefix { .. } => self
                 .top_level_decl(name)
                 .and_then(|d| d.formals.as_deref().cloned()),
+            // A constructor invocation (`Eb._(cb: (n) => …)`, the below
+            // row a bare class name): constructors are not
+            // [`MemberEntry`] rows, so the member walk never reaches
+            // them — the container's own table answers as the fallback.
+            Receiver::Container { name: class, .. } => self
+                .member_formals_full(recv, name)
+                .map(|f| f.into_owned())
+                .or_else(|| self.ctor_schema_formals(*class, name)),
             _ => self.member_formals_full(recv, name).map(|f| f.into_owned()),
         }
+    }
+
+    /// A constructor invocation's formal table as a closure-context
+    /// schema source: the literal at an argument slot
+    /// (`Eb._(reportError: (scopeName, node) { … })`) infers its formals
+    /// from the selected constructor's parameters exactly like a function
+    /// call's — an unannotated field formal (`required this.reportError`)
+    /// carries the field's declared type. `check_arguments`'s same faces
+    /// apply: the foreign-pool projection and the field-type patch
+    /// (same-file only; a foreign class's unannotated field formal stays
+    /// `Unknown` and the schema stays silent — the under-report posture).
+    fn ctor_schema_formals(&self, class: StringId, selector: StringId) -> Option<Formals> {
+        let (container, owner) = resolve_container(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            class,
+        )?;
+        let mut formals = (**container.ctor_formals.get(&selector)?).clone();
+        self.project_formals(owner, &mut formals);
+        self.patch_field_formals(class, &mut formals);
+        Some(formals)
     }
 
     /// The written function shape of a type, aliases unfolded — the
@@ -2335,20 +2413,54 @@ impl<'a> Engine<'a> {
             };
             // A nullable result head (`Node? get best`) is no iterable face
             // to chain from; a provable non-null named head is the access
-            // result's own receiver.
+            // result's own receiver. The result's arguments run the same
+            // invalid recovery as the producer table above (`Iterable<
+            // Token>` with an unresolvable `Token` chains on `Object?`
+            // elements); a deeper undecidable shape keeps the drop.
             let Ty::Named { args, .. } = ret else {
                 return Receiver::Unknown;
             };
-            return if nullable
-                || !self.named_type_is_type(name)
-                || !self.args_are_types(args)
+            if nullable || !self.named_type_is_type(name) {
+                return Receiver::Unknown;
+            }
+            // The declaring container's own type-parameter spellings: an
+            // uninstantiated stub getter's declared return leaks them raw
+            // (`Iterable<V>` of `HashMap.values` when the substitution
+            // found no parameter table) — a spelling, not a written type,
+            // and never the invalid-import face this recovery exists for.
+            let mut leak: Vec<StringId> = Vec::new();
+            if let Some(params) = self.bounds.container_params(*type_name) {
+                leak.extend(params.iter().map(|(param, ..)| *param));
+            }
+            let head = self.strings.resolve(*type_name);
+            // The alias roots' parameter spellings stand in for the
+            // collection head the bounds and core tables cannot see
+            // (`HashMap` reaches `Map`'s `K`/`V`).
+            let mut heads = vec![head];
+            if let Some((_, roots)) = crate::member_face::COLLECTION_INTERFACE_ALIASES
+                .iter()
+                .find(|(alias, _)| *alias == head)
             {
-                Receiver::Unknown
-            } else {
-                Receiver::Typed {
-                    type_name: name,
-                    ty: ret,
+                heads.extend(roots.iter().copied());
+            }
+            for head in heads {
+                if let Some((_, params)) = crate::member_face::CORE_CONTAINER_PARAMS
+                    .iter()
+                    .find(|(core, _)| *core == head)
+                {
+                    leak.extend(params.iter().map(|param| self.intern(param)));
                 }
+            }
+            let Some(args) = self.sanitize_invalid_args(args, &leak) else {
+                return Receiver::Unknown;
+            };
+            return Receiver::Typed {
+                type_name: name,
+                ty: Ty::Named {
+                    name,
+                    nullable,
+                    args,
+                },
             };
         }
         // The SDK's unindexed units chain-break, so the frozen producer
@@ -2368,9 +2480,30 @@ impl<'a> Engine<'a> {
         let Some(element) = self.boundary.pool().get(args).get(*index).copied() else {
             return Receiver::Unknown;
         };
-        if !self.schema_type_is_decidable(element) {
-            return Receiver::Unknown;
-        }
+        // greatestClosure(InvalidType) = `Object?`: the unresolvable-import
+        // element (`Map<String, YamlScalar>` with `package:yaml` absent)
+        // still forms the chain — the closure formal binds the nullable
+        // face and its member reads report. A deeper undecidable shape
+        // keeps the drop.
+        let element = if self.schema_type_is_decidable(element) {
+            element
+        } else {
+            match element {
+                Ty::Unknown => self.object_question(),
+                // A head any graph unit declares is not the oracle's
+                // `InvalidType` (a foreign-but-real element class): the
+                // element keeps itself and the schema's stand-in walk
+                // answers the silent arm.
+                Ty::Named { name, .. }
+                    if !self.named_type_is_type(name)
+                        && !self.prefixed_element_head_resolves(name)
+                        && self.graph.declaring_libraries(name).is_empty() =>
+                {
+                    self.object_question()
+                }
+                _ => return Receiver::Unknown,
+            }
+        };
         Receiver::Typed {
             type_name: self.intern(result),
             ty: Ty::Named {

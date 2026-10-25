@@ -4109,7 +4109,7 @@ impl<'a> Engine<'a> {
     /// the `model.rs` `ArgListId`/`FnShapeId` panic — or silently a
     /// different shape), so every `formal.ty` re-interns here before the
     /// argument walk derefs it. A same-file `owner` short-circuits.
-    fn project_formals(&self, owner: FileId, formals: &mut Formals) {
+    pub(crate) fn project_formals(&self, owner: FileId, formals: &mut Formals) {
         for formal in formals
             .positional
             .iter_mut()
@@ -4126,7 +4126,7 @@ impl<'a> Engine<'a> {
     /// answers it (the field may be declared after the constructor). The
     /// enum-constant walk applies the same face to the enum's selected
     /// constructor.
-    fn patch_field_formals(&self, container: StringId, formals: &mut Formals) {
+    pub(crate) fn patch_field_formals(&self, container: StringId, formals: &mut Formals) {
         let Some(entry) = self
             .index
             .get(self.file)
