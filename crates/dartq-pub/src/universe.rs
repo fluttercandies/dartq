@@ -72,6 +72,14 @@ pub struct Universe {
 /// normalization collapses `"."` to `""` and every child walk reads from
 /// nowhere.
 pub fn enclosing_universe(from: &Path) -> Result<Universe, PubError> {
+    // #2593: the ladder walks the absolute spelling. A relative `from`
+    // (the `dartq packages` default `.`) breaks twice — the workspace-ref
+    // fast path normalizes `./.dart_tool/pub/../../..` against nothing
+    // (collapsing to the invocation directory itself), and the
+    // declarative climb dies on `Path::parent(".") == ""` without ever
+    // reaching the covering root.
+    let anchored = crate::workspace::walk_start(from);
+    let from = anchored.as_path();
     // The fast path: `from` is a package root whose resolved state names
     // its workspace. Verified membership: the ref must point at a real
     // root whose layout covers `from`.
@@ -769,6 +777,51 @@ mod tests {
     /// answers in the caller's spelling, and lexical normalization
     /// collapses `"."` to `""` — the scan would then read children from
     /// nowhere and fabricate scan-error boundaries.
+    /// #2593's live repro shape: `dartq packages` from inside a nested
+    /// workspace member (the bare `.` default). The walk must ascend
+    /// through the intermediate `resolution: workspace` member to the
+    /// covering root — a relative `.` previously died on
+    /// `Path::parent(".") == ""` and reported the first-met member as
+    /// orphaned (rc 64 with pub's no-root text), while real pub resolved
+    /// the same directory fine.
+    #[test]
+    fn relative_invocation_inside_a_nested_member_reaches_the_root() {
+        let root = temp_dir("relative-member");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - examples/mid\n  - examples/mid/cockpit\n",
+        );
+        write(
+            &root.join("examples").join("mid").join("pubspec.yaml"),
+            "name: mid\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
+        write(
+            &root.join("examples").join("mid").join("cockpit").join("pubspec.yaml"),
+            "name: nested\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
+        let here = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(root.join("examples").join("mid").join("cockpit"))
+            .expect("chdir");
+        let universe = enclosing_universe(Path::new("."));
+        std::env::set_current_dir(here).expect("chdir back");
+        let universe = universe.expect("the nested member resolves through `.`");
+        assert!(universe.root.is_absolute());
+        assert_eq!(
+            universe.root,
+            std::fs::canonicalize(&root).expect("canonical root"),
+            "the root is the workspace root"
+        );
+        let layout = universe.layout.expect("a pubspec universe carries its layout");
+        assert_eq!(layout.root, universe.root);
+        assert_eq!(
+            layout.members,
+            vec![
+                universe.root.join("examples").join("mid"),
+                universe.root.join("examples").join("mid").join("cockpit"),
+            ]
+        );
+    }
+
     #[test]
     fn relative_invocation_roots_absolutely() {
         let root = temp_dir("relative");

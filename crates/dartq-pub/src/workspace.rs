@@ -68,7 +68,15 @@ pub struct WorkspaceLayout {
 /// succeeded, which is what sets `first_met`); the `expect` pins that
 /// invariant.
 pub fn find_workspace_root(from: &Path) -> Result<WorkspaceLayout, PubError> {
-    let mut dir = from.to_path_buf();
+    // pub's own walk runs from the CLI's absolute working directory; a
+    // relative spelling (#2593: the `dartq packages` default `.`) dies on
+    // `Path::parent`'s empty form without ever ascending — "." has no
+    // parent but "", and "" has none at all, so the ladder never reaches
+    // the covering root and reports the first-met member as orphaned.
+    // Walk the absolute spelling, lexically: symlink spellings of the
+    // caller's path are preserved (the walk reports what it was given),
+    // and a relative input anchors to the process working directory.
+    let mut dir = walk_start(from);
     // The first pubspec met on the walk, for the no-root error.
     let mut first_met: Option<(PathBuf, Resolution)> = None;
     loop {
@@ -134,6 +142,19 @@ pub fn find_workspace_root(from: &Path) -> Result<WorkspaceLayout, PubError> {
                 });
             }
         }
+    }
+}
+
+/// The absolute lexical spelling the ladder walks from: an absolute
+/// input is normalized in place, a relative one anchored to the process
+/// working directory (#2593 — `Path::parent` cannot ascend past `"."`).
+/// Lexical only: the caller's symlink spelling survives, so the walk's
+/// answers keep the spelling they were asked with.
+pub(crate) fn walk_start(from: &Path) -> PathBuf {
+    if from.is_absolute() {
+        normalize(from)
+    } else {
+        normalize(&std::env::current_dir().unwrap_or_default().join(from))
     }
 }
 
@@ -600,6 +621,48 @@ mod tests {
                 root.join("pkg_c").join("nested"),
             ]
         );
+    }
+
+    /// #2593: the cockpit-demo shape — the root lists BOTH an
+    /// intermediate `resolution: workspace` member and a nested member
+    /// directly — resolves from the nested member's directory (and from
+    /// deep inside it) to the root. The intermediate member's pubspec is
+    /// walked through, never rooted at.
+    #[test]
+    fn nested_member_under_an_intermediate_member_resolves_to_the_root() {
+        let root = temp_dir("nested-under-member");
+        write(
+            &root.join("pubspec.yaml"),
+            "name: ws_root\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - examples/mid\n  - examples/mid/cockpit\n",
+        );
+        write(
+            &root.join("examples").join("mid").join("pubspec.yaml"),
+            "name: mid\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
+        write(
+            &root
+                .join("examples")
+                .join("mid")
+                .join("cockpit")
+                .join("pubspec.yaml"),
+            "name: nested\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n",
+        );
+
+        // From the nested member itself…
+        let layout = find_workspace_root(&root.join("examples").join("mid").join("cockpit"))
+            .expect("the nested member resolves");
+        assert_eq!(layout.root, root);
+        assert_eq!(
+            layout.members,
+            vec![root.join("examples").join("mid"), root.join("examples").join("mid").join("cockpit")]
+        );
+
+        // …and from a subdirectory of it (no pubspec met until the member).
+        std::fs::create_dir_all(root.join("examples").join("mid").join("cockpit").join("lib"))
+            .expect("mkdir");
+        let layout = find_workspace_root(&root.join("examples").join("mid").join("cockpit").join("lib"))
+            .expect("the nested member's subdirectory resolves");
+        assert_eq!(layout.root, root);
     }
 
     #[test]
