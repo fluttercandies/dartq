@@ -27,7 +27,7 @@ agents that read the AGENTS.md convention pick it up automatically.
 | Rename | `dartq rename --new-name NAME PATH:LINE:COL` (dry run, then `--write`) |
 | Fix lints | `dartq fix --dry-run`, then `dartq fix` |
 | Unfamiliar monorepo | `dartq packages` first — every package root and pruned boundary |
-| Debugging a running app | the MCP tools (`dartq_debug_*` via `dartq mcp`) — daemon/MCP-native |
+| Debugging a running app | `dartq debug …` — launch/attach, breakpoints, stepping, hot reload (MCP hosts: the `dartq_debug_*` tools) |
 
 ## Skill files
 
@@ -39,8 +39,8 @@ per-face depth, under `skills/dartq/`:
 - `references/test-driving.md` — the result cache, markers, `--impacted`, `--stats`
 - `references/analysis-loop.md` — analyze → query/explain → impact → rename/fix → verify
 - `references/sessions-and-monorepos.md` — session model, multi-worktree, boundaries
-- `references/debugging.md` — launch/attach, paused-on-start takeover, hot reload
-- `references/mcp.md` — the 28-tool stdio MCP server and CLI-vs-MCP guidance
+- `references/debugging.md` — the `dartq debug` verb group: launch/attach, paused-on-start takeover, hot reload
+- `references/mcp.md` — the stdio MCP server wiring and CLI-vs-MCP guidance
 
 ## MCP
 

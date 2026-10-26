@@ -105,6 +105,11 @@ mod exit {
     /// EX_SOFTWARE — an internal defect reported through a protocol
     /// channel (the one-shot faces keep exit 4).
     pub const SOFTWARE: u8 = 70;
+    /// A domain failure the resident engine answered over the protocol —
+    /// the debug face's data tier: one `{"error":{"code","message"}}`
+    /// line rides stdout (the `DARTQ/DEBUG/*` machine code names the
+    /// cause), rc 1.
+    pub const DEBUG_DOMAIN: u8 = 1;
     /// The resident session is unavailable and could not be started
     /// (the standalone fallback refused — the session-layer faces).
     #[expect(dead_code, reason = "reserved contract tier; the first consumer wires it")]
@@ -120,6 +125,7 @@ fn non_tty_stdout() -> bool {
 }
 
 mod compat;
+mod debug;
 mod events;
 mod fix;
 mod mcp;
@@ -188,6 +194,9 @@ fn run(args: &[String]) -> u8 {
         Ok(Cli {
             command: Some(Command::Session(session_args)),
         }) => session::run_entry(&session_args),
+        Ok(Cli {
+            command: Some(Command::Debug(debug_args)),
+        }) => debug::run_entry(&debug_args),
         Ok(Cli {
             command: Some(Command::Events(events_args)),
         }) => events::run_entry(&events_args),
@@ -278,6 +287,14 @@ enum Command {
     /// user's live sessions, `stop` ends one. Output is JSON lines on
     /// every face — the management channel is a machine channel.
     Session(session::SessionArgs),
+    /// Drive debug sessions on the resident engine: `launch` or
+    /// `attach`, breakpoints, stepping, paused-frame snapshots and
+    /// evaluation, hot reload/restart, and cursor-paged event/output
+    /// reads — the same `dartq/debug/*` faces the daemon serves MCP
+    /// clients (one engine, one protocol). Output is one JSON line per
+    /// call; a domain failure answers one `{"error":...}` line and exit
+    /// 1.
+    Debug(debug::DebugArgs),
     /// Read a session's events, cursor-paginated: the event log
     /// (`session` handle) or the cold-analysis progress snapshot
     /// (`progress` handle — files scanned, current package).

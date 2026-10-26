@@ -29,11 +29,11 @@ product means one skill entry, depth lives in references):
 | `references/test-driving.md` | running tests, cache questions, `--impacted` edit-test loops |
 | `references/analysis-loop.md` | diagnose → understand → scope → execute → verify on analyzed code |
 | `references/sessions-and-monorepos.md` | resident sessions, nested worktrees, monster monorepos |
-| `references/debugging.md` | launching/attaching, breakpoints, hot reload — no IDE |
+| `references/debugging.md` | the `dartq debug` verb group: launching/attaching, breakpoints, hot reload — no IDE |
 | `references/mcp.md` | wiring `dartq mcp` into an agent host, CLI vs MCP |
 
-Four deeper references sit beside them: `cache-and-markers.md`,
-`formats-and-tiers.md`, `session-model.md`, and `tool-catalog.md`.
+Three deeper references sit beside them: `cache-and-markers.md`,
+`formats-and-tiers.md`, and `session-model.md`.
 
 ## Install
 

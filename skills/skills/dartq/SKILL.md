@@ -36,6 +36,7 @@ CLI, events, and MCP clients alike.
 | `test` | `dart test` / `flutter test` with a result cache and `--impacted` |
 | `session` | Manage the resident engine: start / status / stop |
 | `events` | Cursor-paginated session log or cold-analysis progress |
+| `debug` | Drive debug sessions: launch/attach, breakpoints, stepping, snapshots, evaluation, hot reload/restart |
 | `resolve` / `complete` | One-shot `PATH:LINE:COL` cursor answers |
 | `compat` | One workspace under several SDK roots: a compatibility matrix |
 | `mcp` | stdio MCP server mirroring the verbs (28 tools) |
@@ -53,8 +54,8 @@ under `references/`. Load the one that matches the task:
 | Running tests, speeding up edit-test loops, cache questions | [references/test-driving.md](references/test-driving.md) — depth: [references/cache-and-markers.md](references/cache-and-markers.md) |
 | Diagnose → understand → scope → edit → verify on analyzed code | [references/analysis-loop.md](references/analysis-loop.md) — depth: [references/formats-and-tiers.md](references/formats-and-tiers.md) |
 | Nested worktrees, monster monorepos, multi-checkout parallel work | [references/sessions-and-monorepos.md](references/sessions-and-monorepos.md) — depth: [references/session-model.md](references/session-model.md) |
-| Launching, pausing, inspecting, hot-reloading a running app | [references/debugging.md](references/debugging.md) |
-| Wiring dartq into an agent host as MCP tools | [references/mcp.md](references/mcp.md) — depth: [references/tool-catalog.md](references/tool-catalog.md) |
+| Launching, pausing, inspecting, hot-reloading a running app | [references/debugging.md](references/debugging.md) — the `dartq debug` verb group |
+| Wiring dartq into an agent host as MCP tools | [references/mcp.md](references/mcp.md) |
 
 ## Defaults That Surprise Newcomers
 
@@ -67,8 +68,10 @@ under `references/`. Load the one that matches the task:
 - Engine faces need a resolved workspace: `pubspec.yaml` plus
   `.dart_tool/package_config.json` (run `dart pub get` first). `--fast` and
   `--sdk-path`/`$DART_SDK` control the rest.
-- Debugging is daemon/MCP-native — there is no `dartq debug` CLI verb; the
-  debug tools are MCP tools (`dartq mcp`), see the debugging reference.
+- `debug` is a machine channel like `session`/`events`: one JSON line per
+  call, daemon parameter spellings (`--sessionId`, `--wsUri`), and a
+  domain failure answers one `{"error":…}` line with a `DARTQ/DEBUG/*`
+  machine code at exit 1.
 
 ## Not Sure dartq Is Installed?
 

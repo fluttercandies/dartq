@@ -55,6 +55,7 @@ source legs/06-fix-rename.sh
 source legs/07-mcp.sh
 source legs/08-cross.sh
 source legs/09-exit-codes.sh
+source legs/10-debug.sh
 
 legs_01_run
 legs_02_run
@@ -65,6 +66,7 @@ legs_06_run
 legs_07_run
 legs_08_run
 legs_09_run
+legs_10_run
 
 # Zero-orphan gate: nothing the suite spawned may outlive it — any live
 # dartq process whose command line OR working directory belongs to this

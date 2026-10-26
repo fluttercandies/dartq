@@ -29,39 +29,23 @@ pass its path as the `DIR` argument) so tools bind the right session.
 ## CLI vs MCP: When to Use Which
 
 - **Use the CLI** for one-shot, scriptable, or CI-shaped work — analysis
-  sweeps, batch queries, renames, test runs whose output you pipe. Cheaper
-  process, exact same engine.
+  sweeps, batch queries, renames, test runs whose output you pipe, and
+  debug loops driven from a shell (`dartq debug …`). Cheaper process,
+  exact same engine.
 - **Use MCP** when the host should own the interaction: long conversations
   where tool calls beat shell round-trips, or clients that cannot run
-  shells (debug orchestration, event polling).
+  shells.
 - Both faces converge on the resident session — mixing them is fine:
-  analyze in the shell, debug over MCP, same engine, same diagnostics.
+  analyze in the shell, debug over MCP (or the reverse), same engine,
+  same answers.
 
-## Tool Catalog (28 tools)
+## Tool Schemas Are Self-Describing
 
-Analysis and navigation: `dartq_analyze`, `dartq_query` (kind:
-symbol/references/callers/implementations/dependencies), `dartq_explain`,
-`dartq_impact`, `dartq_fix`.
-
-Workspace edits: `dartq_rename` — runs a cold in-process analysis pass per
-call (a rare operation), expect it slower than the session-resident tools;
-returns the machine edit set, the caller applies it.
-
-Tests: `dartq_test` (run), `dartq_test_status` (poll in-flight and finished
-runs), `dartq_test_events` (cursor-paged results of one run),
-`dartq_test_cancel`.
-
-Observability: `dartq_events` — the session's unified event stream or its
-cold-analysis progress (`handle`: `session` | `progress`; `since`, `limit`)
-— the "is it still working" tool during a long first analysis.
-
-Debugging (17 tools): `dartq_debug_launch`, `_attach`, `_detach`, `_stop`,
-`_status`, `_breakpoint_add`, `_breakpoint_remove`, `_exception_pause`,
-`_resume`, `_pause`, `_step`, `_snapshot`, `_reload`, `_restart`,
-`_evaluate`, `_events`, `_output`. Semantics: [debugging.md](debugging.md).
-
-The full per-tool descriptions (with use-for / not-for lines):
-[tool-catalog.md](tool-catalog.md).
+The server's `tools/list` carries every tool's parameter schema and a
+when-to-use / not-for description — including the full debug family
+(`dartq_debug_*`, the `dartq debug` verbs' mirror). Ask the host to list
+tools instead of loading a catalog here; the live answer is always
+current, a copied one only drifts.
 
 ## Resource
 

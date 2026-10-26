@@ -25,6 +25,11 @@
 //! Tool calls open one socket connection per call (the resident server
 //! serves one client at a time; short-lived connections keep CLI
 //! one-shots from queueing behind a resident MCP host).
+//!
+//! The daemon-call proxy ([`daemon_call`]) is the binary's shared
+//! session transport: the `debug` verb group proxies its
+//! `dartq/debug/*` requests through the same machinery — one engine,
+//! one protocol, two faces.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -261,10 +266,29 @@ const STATUS_URI: &str = "dartq://workspace-status";
 
 /// One server's bound context: the worktree, its layout, and whether the
 /// resident session is attached (the degradation reason when not).
-struct Mcp {
-    root: PathBuf,
-    layout: Layout,
-    session: Result<(), String>,
+pub(crate) struct Mcp {
+    pub(crate) root: PathBuf,
+    pub(crate) layout: Layout,
+    pub(crate) session: Result<(), String>,
+}
+
+impl Mcp {
+    /// Elects or attaches the worktree's resident session — the one
+    /// binding every session-converging face shares (this server and
+    /// the `debug` verb group's proxy). `session` carries the
+    /// standalone degradation reason when the tree cannot host one.
+    pub(crate) fn attach(root: PathBuf, sdk: Option<&Path>) -> Self {
+        let session = match crate::session::resolved_sdk_root(sdk) {
+            Ok(sdk_root) => {
+                match dartq_session::ensure(&root, &sdk_root, &crate::session::spawn_server) {
+                    dartq_session::Ensured::Attached(_) => Ok(()),
+                    dartq_session::Ensured::Standalone(reason) => Err(reason),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        Self { layout: Layout::new(&root), root, session }
+    }
 }
 
 pub fn run_entry(args: &McpArgs) -> u8 {
@@ -275,15 +299,7 @@ pub fn run_entry(args: &McpArgs) -> u8 {
             return exit::USAGE;
         }
     };
-    let sdk = crate::session::resolved_sdk_root(args.sdk.as_deref());
-    let session = match sdk {
-        Ok(sdk_root) => match dartq_session::ensure(&root, &sdk_root, &crate::session::spawn_server) {
-            dartq_session::Ensured::Attached(_) => Ok(()),
-            dartq_session::Ensured::Standalone(reason) => Err(reason),
-        },
-        Err(error) => Err(error),
-    };
-    let mcp = Mcp { layout: Layout::new(&root), root, session };
+    let mcp = Mcp::attach(root, args.sdk.as_deref());
     let stdin = io::stdin();
     let stdout = io::stdout();
     let code = serve(BufReader::new(stdin.lock()), stdout.lock(), &mcp);
@@ -379,9 +395,14 @@ fn call_tool(params: &Value, mcp: &Mcp, output: &mut impl Write) -> Result<Value
     notify(output, &token, 0);
     let outcome = match tool.kind {
         ToolKind::Daemon(method) => daemon_call(method, &arguments, mcp),
-        ToolKind::Rename => rename_call(&arguments, mcp),
-        ToolKind::Events => events_call(&arguments, mcp),
-    };
+        ToolKind::Rename => rename_call(&arguments, mcp).map_err(ProxyError::Transport),
+        ToolKind::Events => events_call(&arguments, mcp).map_err(ProxyError::Transport),
+    }
+    .map_err(|error| match error {
+        // The wire error object verbatim — the daemon owns the shape.
+        ProxyError::Daemon(code, message) => json!({"code": code, "message": message}).to_string(),
+        ProxyError::Transport(reason) => reason,
+    });
     notify(output, &token, 1);
     Ok(match outcome {
         Ok(value) => json!({
@@ -395,79 +416,94 @@ fn call_tool(params: &Value, mcp: &Mcp, output: &mut impl Write) -> Result<Value
     })
 }
 
-/// How long one proxied daemon request may run before the tool answers
-/// `isError` (#2587): every daemon face is bounded well inside this
-/// (the slowest legitimate one is a debug hot restart at ~2 min plus
-/// breakpoint re-arms), and a wedged engine surfaces as a bounded
-/// error instead of a hung MCP client.
+/// How long one proxied daemon request may run before the caller hears
+/// about it (#2587): every daemon face is bounded well inside this (the
+/// slowest legitimate one is a debug hot restart at ~2 min plus
+/// breakpoint re-arms), and a wedged engine surfaces as a bounded error
+/// instead of a hung client.
 const DAEMON_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// One proxied daemon round trip's failure: the daemon answered a
+/// JSON-RPC error (a domain failure carrying its machine-code prefix,
+/// e.g. the debug family's `DARTQ/DEBUG/*`), or the transport failed
+/// before an answer (connect refused, no resident session, a wedged
+/// engine, a malformed frame). The MCP face flattens both into its
+/// `isError` text; the CLI's debug face maps them to different exit
+/// tiers.
+#[derive(Debug)]
+pub(crate) enum ProxyError {
+    Daemon(i64, String),
+    Transport(String),
+}
 
 /// One daemon request over the session socket, bounded by
 /// [`DAEMON_CALL_TIMEOUT`].
-fn daemon_call(method: &str, params: &Value, mcp: &Mcp) -> Result<Value, String> {
+pub(crate) fn daemon_call(method: &str, params: &Value, mcp: &Mcp) -> Result<Value, ProxyError> {
     daemon_call_bounded(method, params, mcp, DAEMON_CALL_TIMEOUT)
 }
 
-fn daemon_call_bounded(
+pub(crate) fn daemon_call_bounded(
     method: &str,
     params: &Value,
     mcp: &Mcp,
     timeout: Duration,
-) -> Result<Value, String> {
+) -> Result<Value, ProxyError> {
     if let Err(reason) = &mcp.session {
-        return Err(format!(
-            "no resident session ({reason}) — the engine tools need one; \
+        return Err(ProxyError::Transport(format!(
+            "no resident session ({reason}) — the engine faces need one; \
              start it with `dartq session start` in a writable checkout"
-        ));
+        )));
     }
-    let mut stream = UnixStream::connect(&mcp.layout.socket).map_err(|error| error.to_string())?;
+    let mut stream =
+        UnixStream::connect(&mcp.layout.socket).map_err(|error| ProxyError::Transport(error.to_string()))?;
     // The bound covers the whole round trip: a wedged engine (or a
     // wedged serve between clients) answers the timeout error, never a
     // hang.
     stream
         .set_read_timeout(Some(timeout))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ProxyError::Transport(error.to_string()))?;
     stream
         .set_write_timeout(Some(timeout))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ProxyError::Transport(error.to_string()))?;
     let body = serde_json::to_string(&json!({
         "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
     }))
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| ProxyError::Transport(error.to_string()))?;
     write!(stream, "Content-Length: {}\r\n\r\n{body}", body.len())
-        .map_err(|error| error.to_string())?;
-    stream.flush().map_err(|error| error.to_string())?;
+        .map_err(|error| ProxyError::Transport(error.to_string()))?;
+    stream.flush().map_err(|error| ProxyError::Transport(error.to_string()))?;
     // The daemon streams publishes and progress notifications ahead of
     // the answer on the same connection (#2596: a resident that picked up
     // an out-of-band edit emits its diagnostics pushes first) — the proxy
     // reads past every notification frame until the response (the frame
     // carrying our id).
+    let wedged = || {
+        ProxyError::Transport(format!(
+            "the engine did not answer {method} within {timeout:?} — \
+             the session may be wedged; check `dartq session status`"
+        ))
+    };
     let mut answer = match read_frame(&mut stream) {
         Ok(answer) => answer,
-        Err(ReadError::Wedged) => {
-            return Err(format!(
-                "the engine did not answer {method} within {timeout:?} — \
-                 the session may be wedged; check `dartq session status`"
-            ));
-        }
-        Err(ReadError::Io(error)) => return Err(error.to_string()),
-        Err(ReadError::Malformed(message)) => return Err(message),
+        Err(ReadError::Wedged) => return Err(wedged()),
+        Err(ReadError::Io(error)) => return Err(ProxyError::Transport(error.to_string())),
+        Err(ReadError::Malformed(message)) => return Err(ProxyError::Transport(message)),
     };
     while answer.get("id").is_none() {
         answer = match read_frame(&mut stream) {
             Ok(frame) => frame,
-            Err(ReadError::Wedged) => {
-                return Err(format!(
-                    "the engine did not answer {method} within {timeout:?} — \
-                     the session may be wedged; check `dartq session status`"
-                ));
-            }
-            Err(ReadError::Io(error)) => return Err(error.to_string()),
-            Err(ReadError::Malformed(message)) => return Err(message),
+            Err(ReadError::Wedged) => return Err(wedged()),
+            Err(ReadError::Io(error)) => return Err(ProxyError::Transport(error.to_string())),
+            Err(ReadError::Malformed(message)) => return Err(ProxyError::Transport(message)),
         };
     }
     if let Some(error) = answer.get("error") {
-        return Err(error.to_string());
+        return Err(ProxyError::Daemon(
+            // The daemon's error answers always carry both fields
+            // (`Response::error`); -32603 is the JSON-RPC fallback tier.
+            error["code"].as_i64().unwrap_or(-32603),
+            error["message"].as_str().unwrap_or_default().to_owned(),
+        ));
     }
     Ok(answer.get("result").cloned().unwrap_or_else(|| json!({})))
 }
@@ -935,13 +971,17 @@ mod tests {
         });
         let mcp = Mcp { layout, root: root.clone(), session: Ok(()) };
         let started = std::time::Instant::now();
-        let error = daemon_call_bounded(
+        let error = match daemon_call_bounded(
             "dartq/test/status",
             &json!({}),
             &mcp,
             Duration::from_millis(300),
         )
-        .expect_err("the silent engine must answer the bound error");
+        .expect_err("the silent engine must answer the bound error")
+        {
+            ProxyError::Transport(reason) => reason,
+            other => panic!("the wedge is a transport failure: {other:?}"),
+        };
         assert!(started.elapsed() < Duration::from_secs(5), "bounded: {error}");
         assert!(
             error.contains("did not answer dartq/test/status"),
