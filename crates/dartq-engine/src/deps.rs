@@ -1,25 +1,30 @@
 //! Lazy, import-driven indexing of dependency libraries outside the
-//! analyzed workspace (the pub cache): when a live library's `package:`
-//! import resolves to a file no package root's discovery made resident,
-//! its interface facts load on demand so the workspace's own rows resolve
-//! the same faces the oracle sees — `class DelegatingList implements List`
-//! in a dependency becomes a real supertype edge, and the override/
-//! assignability families that consult it fire in the workspace files.
+//! analyzed workspace (the pub cache, SDK-provided packages, path
+//! dependencies pointing outside the workspace tree): when a live
+//! library's `package:` import resolves to a file no package root's
+//! discovery made resident, its interface facts load on demand so the
+//! workspace's own rows resolve the same faces the oracle sees — `class
+//! DelegatingList implements List` in a dependency becomes a real
+//! supertype edge, and the override/assignability families that consult
+//! it fire in the workspace files.
 //!
 //! # Shape
 //!
 //! The graph build ([`crate::pipeline::build_library_graph`]) walks the
 //! live libraries' import/export targets: a resolved target outside
-//! residency whose package is not workspace source seeds a bounded BFS —
+//! residency whose package is outside the workspace bound seeds a BFS —
 //! the target file reads from disk, runs the shared per-file pipeline
 //! ([`crate::l1::compute_unit`]: scan, one parse, element collection),
-//! and its own import/export directives resolve for the next frontier
-//! ([`MAX_DEPTH`] hops from the workspace — deep enough for the re-export
-//! chains pub entry points are, never deeper). Each loaded file registers
-//! as a graph node beside the synthetic `dart:` faces: its containers
-//! declare, its edges point at SDK/dep/workspace nodes, and its element
-//! model joins the analyze's shared element index — but it is never an
-//! engine library, so it yields zero diagnostic rows of its own (the
+//! and its own import/export directives resolve for the next frontier.
+//! The walk is closure-complete like the oracle's (the analyzer resolves
+//! a `package:` import's whole transitive closure, `dart analyze` never
+//! bounds it by hops); termination is structural — the visited set only
+//! grows, each queue entry either loads a unit or finds it loaded, and
+//! the file cap bounds the open set. Each loaded file registers as a
+//! graph node beside the synthetic `dart:` faces: its containers declare,
+//! its edges point at SDK/dep/workspace nodes, and its element model
+//! joins the analyze's shared element index — but it is never an engine
+//! library, so it yields zero diagnostic rows of its own (the
 //! differential counts workspace files only; the dep's job is to make its
 //! class/member/clause faces resolvable).
 //!
@@ -28,42 +33,45 @@
 //! Loaded units cache in engine state keyed by the interned canonical
 //! path (the [`FileId`] is that path's identity — same key, no second
 //! table), capped at [`DEP_FILE_CAP`] files per engine; past the cap the
-//! skip is one stderr note. Imports past the depth bound and unreadable
-//! targets count in the debug counters. Missing configs, missing files,
-//! and unreadable bytes stay silent — no new diagnostics — exactly the
-//! posture a broken or absent dependency had before this layer.
+//! skip is one stderr note. Unreadable targets count in the debug
+//! counters. Missing configs, missing files, and unreadable bytes stay
+//! silent — no new diagnostics — exactly the posture a broken or absent
+//! dependency had before this layer. The retained per-unit payload is the
+//! interface face (element model, directives, resolved targets, line
+//! index) plus the source bytes in the content store; the scan face's
+//! token table is deliberately NOT retained (≈20 B/token — the dominant
+//! per-file cost at closure scale, and a pure function of the bytes): the
+//! one consumer that needs tokens (the clause-tree capture) re-scans the
+//! retained text on demand.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use dartq_package::SourceCategory;
+use dartq_language::LanguageVersion;
 use dartq_resolution::{DirectiveKind as UriDirectiveKind, ResolvedTarget, UriResolver};
 use dartq_source::{FileId, SourceText};
 use rustc_hash::FxHashMap;
 
 use crate::l1;
-use crate::state::{DirectiveKind, EngineState, ScannedFace, UnitFacts};
+use crate::state::{DirectiveKind, EngineState, UnitFacts};
 
-/// The total dependency-file cap per engine. Each cached unit is one
-/// dep file's facts (element model + directives + scan face) — a few KB
-/// for a typical package file — so the cap holds the layer to a bounded
-/// slice of the dependency closure however wide the import graph is.
-pub(crate) const DEP_FILE_CAP: usize = 512;
-
-/// The depth bound from any workspace file: depth 1 is a workspace
-/// import/export target, depth 2 a dep file's own target. Two hops cover
-/// the re-export shape of pub entry points (`package:x/x.dart` exporting
-/// `src/impl.dart`); a third hop's target is skipped with a counted note.
-const MAX_DEPTH: u8 = 2;
+/// The total dependency-file cap per engine. Each cached unit is one dep
+/// file's interface face (element model + directives + resolved targets +
+/// line index) plus its bytes in the content store — the closure of a
+/// real application (a Flutter widget tree's interface closure runs to
+/// a couple of thousand files) fits with headroom while the cap keeps the
+/// layer a bounded slice of memory however wide the import graph is.
+pub(crate) const DEP_FILE_CAP: usize = 4096;
 
 /// One indexed dependency file: the interface facts (its diagnostics are
-/// dead weight — the file is never an engine library and never folds), the
-/// scan face its clause-tree capture parses through, and the resolved
-/// target per directive (index-aligned with [`UnitFacts::directives`]) the
-/// graph build maps onto SDK/dep/workspace nodes.
+/// dead weight — the file is never an engine library and never folds),
+/// the settled language version (the clause-tree capture's re-scan key),
+/// and the resolved target per directive (index-aligned with
+/// [`UnitFacts::directives`]) the graph build maps onto
+/// SDK/dep/workspace nodes.
 pub(crate) struct DepUnit {
     pub facts: Arc<UnitFacts>,
-    pub scanned: Arc<ScannedFace>,
+    pub version: LanguageVersion,
     pub targets: Box<[ResolvedTarget]>,
 }
 
@@ -74,8 +82,6 @@ pub(crate) struct DepUnit {
 pub(crate) struct DepIndex {
     /// The indexed units by interned canonical path.
     pub units: FxHashMap<FileId, DepUnit>,
-    /// Debug counter: targets past the depth bound.
-    pub depth_skips: u64,
     /// Debug counter: unreadable or missing dep files.
     pub load_failures: u64,
     /// The one-shot stderr note's tripwire for cap overflows.
@@ -90,7 +96,10 @@ pub(crate) struct DepIndex {
 
 /// Seeds and drains the dependency closure for the current live libraries.
 /// Called at every graph build; cached units reuse, so a warm graph
-/// rebuild pays only the seed scan (O(live directives)).
+/// rebuild pays only the seed scan (O(live directives)). The frontier is
+/// closure-complete (no depth bound — the oracle's resolution face); the
+/// visited set makes it structurally terminating and the cap bounds the
+/// resident unit count.
 pub(crate) fn load_dep_closure(state: &mut EngineState) {
     if state.residency.is_empty() {
         return;
@@ -103,7 +112,7 @@ pub(crate) fn load_dep_closure(state: &mut EngineState) {
         .units
         .retain(|file, _| !state.residency.contains_key(file));
     crate::sdk_units::load_sdk_units(state);
-    let mut queue: Vec<(FileId, u8)> = Vec::new();
+    let mut queue: Vec<FileId> = Vec::new();
     for library in state.libraries.live() {
         let Some(info) = state.libraries.info(library) else {
             continue;
@@ -120,9 +129,9 @@ pub(crate) fn load_dep_closure(state: &mut EngineState) {
                     continue;
                 };
                 // Workspace-entry shape only: a `package:` URI naming a
-                // non-workspace package whose file discovery never made
-                // resident. Relative targets and workspace-package files
-                // keep the pre-existing postures.
+                // package whose file discovery never made resident. Relative
+                // targets and in-bound package files keep the pre-existing
+                // postures.
                 if !directive
                     .uri
                     .as_deref()
@@ -135,12 +144,12 @@ pub(crate) fn load_dep_closure(state: &mut EngineState) {
                     continue;
                 }
                 if dep_candidate(state, target) {
-                    queue.push((target, 1));
+                    queue.push(target);
                 }
             }
         }
     }
-    while let Some((file, depth)) = queue.pop() {
+    while let Some(file) = queue.pop() {
         if state.deps.units.contains_key(&file) || state.residency.contains_key(&file) {
             continue;
         }
@@ -154,32 +163,33 @@ pub(crate) fn load_dep_closure(state: &mut EngineState) {
             }
             continue;
         }
-        queue.extend(load_dep_unit(state, file, depth));
+        queue.extend(load_dep_unit(state, file));
     }
 }
 
-/// Whether `file` may join the dependency index: anything that is not
-/// workspace source. Path-category packages (the root, members, path
-/// dependencies) are workspace source — their files enter residency
-/// through discovery, and one that did not (an excluded file) keeps that
-/// posture instead of silently re-entering through the dep face. Hosted/
-/// git cache content and SDK-provided packages — and paths under no
-/// package root at all — index.
+/// Whether `file` may join the dependency index: anything outside the
+/// analyzed workspace. The bound is the same one discovery walks — a
+/// package root at or beneath the workspace root is analyzed surface
+/// (its files enter residency through discovery, and one that did not —
+/// an options-excluded file — keeps that posture instead of silently
+/// re-entering through the dep face); a package outside the bound (the
+/// pub cache, a git checkout, an SDK-provided package, a path dependency
+/// pointing elsewhere) and a path under no package root at all index.
 fn dep_candidate(state: &EngineState, file: FileId) -> bool {
     let Some(path) = state.files.path(file) else {
         return false;
     };
     match state.packages.containing(path) {
-        Some(identity) => identity.category != SourceCategory::Path,
+        Some(identity) => !identity.root.starts_with(state.packages.workspace_root()),
         None => true,
     }
 }
 
 /// Loads one dep file: disk read, the shared per-file pipeline, directive
 /// resolution for the graph edges and the next frontier. Returns the
-/// within-bound targets not already resident or indexed. Every failure
-/// mode (no path, unreadable, missing bytes) counts and skips silently.
-fn load_dep_unit(state: &mut EngineState, file: FileId, depth: u8) -> Vec<(FileId, u8)> {
+/// not-already-indexed targets. Every failure mode (no path, unreadable,
+/// missing bytes) counts and skips silently.
+fn load_dep_unit(state: &mut EngineState, file: FileId) -> Vec<FileId> {
     let load_failure = |state: &mut EngineState| {
         state.deps.load_failures += 1;
         Vec::new()
@@ -225,9 +235,9 @@ fn load_dep_unit(state: &mut EngineState, file: FileId, depth: u8) -> Vec<(FileI
         targets.push(resolution.target);
     }
     drop(resolver);
-    // Phase 2 — the depth-bounded frontier over the resolved targets: the
-    // whole-state checks (residency, cache membership, workspace-package
-    // classification) run with the resolver's borrows gone.
+    // Phase 2 — the frontier over the resolved targets: the whole-state
+    // checks (residency, cache membership, workspace-bound classification)
+    // run with the resolver's borrows gone.
     let mut next = Vec::new();
     for dependency in targets.iter().filter_map(|target| match target {
         ResolvedTarget::Resolved(file) => Some(*file),
@@ -240,22 +250,13 @@ fn load_dep_unit(state: &mut EngineState, file: FileId, depth: u8) -> Vec<(FileI
         if !dep_candidate(state, dependency) {
             continue;
         }
-        if depth >= MAX_DEPTH {
-            state.deps.depth_skips += 1;
-        } else {
-            next.push((dependency, depth + 1));
-        }
+        next.push(dependency);
     }
-    let scanned = Arc::new(ScannedFace {
-        tokens: scanned.tokens,
-        features: scanned.features,
-        version: scanned.version,
-    });
     state.deps.units.insert(
         file,
         DepUnit {
             facts,
-            scanned,
+            version: scanned.version,
             targets: targets.into_boxed_slice(),
         },
     );

@@ -29,7 +29,7 @@ use rustc_hash::FxHashSet;
 
 use crate::deps::DepUnit;
 use crate::l1;
-use crate::state::{DirectiveKind, EngineState, ScannedFace, UnitFacts};
+use crate::state::{DirectiveKind, EngineState, UnitFacts};
 
 /// The `dart:` library name a directive URI addresses (`dart:core` →
 /// `core`, `dart:core/bool.dart` → `core`), or `None` for any other URI.
@@ -134,11 +134,7 @@ fn load_sdk_file(state: &mut EngineState, file: FileId) -> Option<Arc<UnitFacts>
         file,
         DepUnit {
             facts: Arc::clone(&facts),
-            scanned: Arc::new(ScannedFace {
-                tokens: scanned.tokens,
-                features: scanned.features,
-                version: scanned.version,
-            }),
+            version: scanned.version,
             targets: targets.into_boxed_slice(),
         },
     );

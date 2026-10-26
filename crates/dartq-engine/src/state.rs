@@ -1700,21 +1700,41 @@ pub(crate) struct EngineState {
     pub(crate) l3: Option<crate::store::ContentStore>,
 }
 
-/// The context roots the analysis surfaces derive from: every package
-/// root — or, when the identity table carries no package at all (the bare
-/// no-pubspec floor, `PackageTable::basic` over `None`), the table's
-/// workspace root, the analyzed directory itself. The oracle's
-/// `BasicWorkspace` over `Packages.empty` roots its context at the
-/// analyzed directory and walks that whole folder (context_locator.dart
-/// :517-522), so the bare floor's discovery and options faces key off the
-/// same directory a package root names in the configured face.
+/// The context roots the analysis surfaces derive from: every package root
+/// **inside the workspace bound** — the directory holding
+/// `package_config.json` and its tree — or, when no package qualifies (the
+/// bare no-pubspec floor, `PackageTable::basic` over `None`), the table's
+/// workspace root, the analyzed directory itself.
+///
+/// The bound is the oracle's context root: `PackageConfigWorkspace` is
+/// "rooted at the innermost package-config file" (pub.dart
+/// `PackageConfigWorkspace.find`), and the context-root folder walk
+/// (context_root.dart `_includedFilesInFolder`) covers that tree only.
+/// Packages the config lists *outside* the bound — the pub cache, git
+/// checkouts, SDK-provided packages, and path dependencies pointing
+/// elsewhere — are resolution targets, never analyzed surface: the oracle
+/// resolves their imports on demand as dependencies and never walks their
+/// trees (a hosted dependency's `test/` is unreachable by construction).
+/// dartq mirrors that split: these roots are what discovery walks and the
+/// options faces key on, and everything else enters through the lazy
+/// dependency index ([`crate::deps`]) — import-driven, interface-only,
+/// never a diagnostic row of its own. The bare floor keeps the oracle's
+/// `BasicWorkspace` over `Packages.empty` rooting its context at the
+/// analyzed directory and walking that whole folder
+/// (context_locator.dart:517-522).
 pub(crate) fn context_roots(packages: &IdentityTable) -> Vec<PathBuf> {
+    let bound = packages.workspace_root();
     let mut roots: Vec<PathBuf> = packages
         .iter()
         .map(|package| package.root.clone())
+        // The inclusive bound: the workspace root itself is a config root in
+        // every pub-written layout, its ancestors are not. Nested package
+        // roots beneath it stay walked by their own pass (each file is
+        // discovered exactly once, attributed to its own package).
+        .filter(|root| root.starts_with(bound))
         .collect();
     if roots.is_empty() {
-        roots.push(packages.workspace_root().to_path_buf());
+        roots.push(bound.to_path_buf());
     }
     roots.sort();
     roots.dedup();

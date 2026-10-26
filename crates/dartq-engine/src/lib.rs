@@ -2562,4 +2562,174 @@ mod tests {
             rows[1].message
         );
     }
+
+    /// A throwaway three-package workspace: the root `t`, an in-tree nested
+    /// package `nested` (a path package beneath the workspace bound), and an
+    /// out-of-tree path package `external` (a sibling directory, the
+    /// fvm/flutter and pub-cache shape) — the fixture the closure-width
+    /// posts pin. Returns `(workspace_root, external_root, engine)`.
+    fn bounded_workspace_engine() -> (PathBuf, PathBuf, Engine) {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let parent = std::env::temp_dir().join(format!(
+            "dartq-engine-bounded-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&parent);
+        let write = |base: &Path, relative: &str, content: &str| {
+            let path = base.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, content).expect("file");
+        };
+        let root = parent.join("ws");
+        let external = parent.join("external");
+        write(
+            &root,
+            "pubspec.yaml",
+            "name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(&root, "pubspec.lock", "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n");
+        write(
+            &root,
+            ".dart_tool/package_config.json",
+            r#"{"configVersion": 2, "packages": [
+                {"name": "t", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"},
+                {"name": "nested", "rootUri": "../pkg/nested", "packageUri": "lib/", "languageVersion": "3.5"},
+                {"name": "external", "rootUri": "../../external", "packageUri": "lib/", "languageVersion": "3.5"}
+            ], "generator": "pub"}"#,
+        );
+        write(
+            &root,
+            "lib/a.dart",
+            "import 'package:external/e.dart';\nimport 'package:nested/n.dart';\n\nclass A extends E {}\n",
+        );
+        write(&root, "pkg/nested/pubspec.yaml", "name: nested\n");
+        write(&root, "pkg/nested/lib/n.dart", "class N {}\n");
+        write(&external, "pubspec.yaml", "name: external\n");
+        write(&external, "lib/e.dart", "class E {\n  void hi() {}\n}\n");
+        // The dependency's own test tree: unreachable by import, and never
+        // part of the oracle's analysis — the 18k-file closure shape.
+        write(&external, "test/never_analyzed.dart", "class InTest {}\n");
+        write(&parent, "sdk/version", "3.13.1\n");
+        write(
+            &parent,
+            "sdk/lib/libraries.json",
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+        );
+        write(
+            &parent,
+            "sdk/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        );
+        // Canonicalize before the pub faces resolve (the spelling universe).
+        let root = root.canonicalize().expect("workspace root resolves");
+        let external = external.canonicalize().expect("external root resolves");
+        let config_dir = root.join(".dart_tool");
+        let config = Arc::new(PackageConfig::parse(
+            &std::fs::read_to_string(config_dir.join("package_config.json")).expect("config"),
+        )
+        .expect("valid config"));
+        let lock = LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
+            .expect("valid lock");
+        let root_pubspec =
+            Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
+                .expect("valid pubspec");
+        let graph = build_graph(
+            &config,
+            &lock,
+            &root_pubspec,
+            &std::collections::BTreeMap::new(),
+            None,
+            &config_dir,
+        )
+        .expect("graph");
+        let engine = Engine::new(EngineConfig {
+            store: memory_store(),
+            sdk: SdkSnapshot::load(&parent.join("sdk"), None).expect("synthetic SDK loads"),
+            packages: PackageTable::build(&config, &graph, &config_dir).expect("table"),
+            pub_config: config,
+            config_dir,
+            semdiag: Some(crate::semdiag::diagnoser()),
+            target: DEFAULT_TARGET.to_owned(),
+            declared_variables: FxHashMap::default(),
+            experiments: Vec::new(),
+        })
+        .expect("engine");
+        (root, external, engine)
+    }
+
+    /// The closure-width post (#2595): discovery walks the workspace bound
+    /// only — the root package and the in-tree nested package — and never
+    /// the out-of-tree dependency package, whatever the config lists. The
+    /// oracle's `PackageConfigWorkspace` roots at the innermost
+    /// package-config file and its folder walk covers that tree; the
+    /// dependency's own files (its `test/` tree included) are resolution
+    /// targets, never analysis surface.
+    #[test]
+    fn discovery_walks_the_workspace_bound_only() {
+        let (root, external, mut engine) = bounded_workspace_engine();
+        let stats = engine.discover_workspace().expect("discover");
+        assert_eq!(
+            stats.file_count, 2,
+            "a.dart and pkg/nested/lib/n.dart — nothing under the external tree"
+        );
+        assert!(
+            engine.file_table().try_file_id(&root.join("lib/a.dart")).is_some()
+                && engine
+                    .file_table()
+                    .try_file_id(&root.join("pkg/nested/lib/n.dart"))
+                    .is_some(),
+            "the root's and the in-tree nested package's files discovered"
+        );
+        for path in ["lib/e.dart", "test/never_analyzed.dart"] {
+            assert!(
+                engine.file_table().try_file_id(&external.join(path)).is_none(),
+                "the out-of-tree dependency's {path} must not be discovered"
+            );
+        }
+    }
+
+    /// The resolution post: the out-of-tree dependency still resolves —
+    /// its interface loads lazily through the dep index (import-driven,
+    /// row-silent), so the workspace file's rows see the dep's declared
+    /// faces with no `uri_does_not_exist` staleness and no dep-tree rows.
+    #[test]
+    fn out_of_bound_dependencies_resolve_through_the_lazy_index() {
+        let (root, external, mut engine) = bounded_workspace_engine();
+        engine.discover_workspace().expect("discover");
+        let diagnostics = engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze completes");
+        let entry = external.join("lib/e.dart");
+        assert!(
+            engine.state.deps.units.contains_key(
+                &engine.state.files.try_file_id(&entry).expect("interned by the dep load")
+            ),
+            "the imported dep file loads through the lazy interface index"
+        );
+        assert!(
+            diagnostics.iter().all(|row| {
+                engine
+                    .state
+                    .files
+                    .path(row.file)
+                    .is_none_or(|path| !path.starts_with(&external))
+            }),
+            "dependency files stay row-silent: {diagnostics:?}"
+        );
+        let importer = diagnostics
+            .iter()
+            .any(|row| {
+                engine
+                    .state
+                    .files
+                    .path(row.file)
+                    .is_some_and(|path| path == root.join("lib/a.dart"))
+                    && row.code.name.contains("uri_")
+            });
+        assert!(
+            !importer,
+            "the workspace importer reports no URI-layer staleness: {diagnostics:?}"
+        );
+    }
 }

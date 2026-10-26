@@ -412,11 +412,18 @@ pub(crate) fn analyze(
             let Ok(text) = std::str::from_utf8(bytes) else {
                 continue;
             };
+            // Dep units retain no token table (the interface face only);
+            // the capture re-scans the retained bytes — a pure function of
+            // (text, settled version), and the scanner is the fastest pass
+            // in the pipeline. The scan's own diagnostics are dropped: a
+            // dependency file never reports rows.
+            let (features, _settled, scanned, _) =
+                l1::scan_unit(text, unit.version, file, &state.grants());
             dartq_semantic::capture_clause_trees(
                 file,
                 text,
-                &unit.scanned.tokens,
-                ParserFeatures::from_feature_set(unit.scanned.features),
+                &scanned.tokens,
+                ParserFeatures::from_feature_set(features),
                 &state.strings,
                 &mut trees,
             );
