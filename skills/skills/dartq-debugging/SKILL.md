@@ -31,6 +31,23 @@ is not the only entry: `dartq_debug_attach` connects to a running VM
 service ws URI — including one owned by a live `flutter run`; the tool's
 own console keeps working.
 
+## Attach to an app another tool manages
+
+An app launcher that surfaces its VM service URI (a device controller, an
+E2E driver, a UI-inspection tool) hands you the attach handle directly —
+read that URI from the tool's session info and feed it to
+`dartq_debug_attach`. You get full VM-level debugging while the other tool
+keeps driving the UI: set breakpoints, tap through the other tool, inspect
+the paused frame, hot-reload your fix, detach without killing the app.
+
+Rules that keep the coexistence clean:
+
+- a paused app freezes the other tool's UI actions — resume before
+  driving the UI, pause when you need the frame
+- both sides may hot-reload; the service multiplexes clients
+- when you are done, `dartq_debug_detach` leaves the app exactly as the
+  other tool expects it
+
 ## Endings: detach vs stop
 
 - `dartq_debug_detach` — end the debug session, **the program keeps
