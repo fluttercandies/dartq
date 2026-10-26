@@ -437,7 +437,12 @@ fn daemon_call_bounded(
     write!(stream, "Content-Length: {}\r\n\r\n{body}", body.len())
         .map_err(|error| error.to_string())?;
     stream.flush().map_err(|error| error.to_string())?;
-    let answer = match read_frame(&mut stream) {
+    // The daemon streams publishes and progress notifications ahead of
+    // the answer on the same connection (#2596: a resident that picked up
+    // an out-of-band edit emits its diagnostics pushes first) — the proxy
+    // reads past every notification frame until the response (the frame
+    // carrying our id).
+    let mut answer = match read_frame(&mut stream) {
         Ok(answer) => answer,
         Err(ReadError::Wedged) => {
             return Err(format!(
@@ -448,6 +453,19 @@ fn daemon_call_bounded(
         Err(ReadError::Io(error)) => return Err(error.to_string()),
         Err(ReadError::Malformed(message)) => return Err(message),
     };
+    while answer.get("id").is_none() {
+        answer = match read_frame(&mut stream) {
+            Ok(frame) => frame,
+            Err(ReadError::Wedged) => {
+                return Err(format!(
+                    "the engine did not answer {method} within {timeout:?} — \
+                     the session may be wedged; check `dartq session status`"
+                ));
+            }
+            Err(ReadError::Io(error)) => return Err(error.to_string()),
+            Err(ReadError::Malformed(message)) => return Err(message),
+        };
+    }
     if let Some(error) = answer.get("error") {
         return Err(error.to_string());
     }

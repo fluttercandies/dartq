@@ -204,6 +204,14 @@ pub struct Engine {
     /// [`Engine::capture_pubspecs`]: a pubspec is re-read only when its
     /// mtime moved since the last capture.
     pubspec_mtimes: FxHashMap<PathBuf, SystemTime>,
+    /// The discovery loads' disk stamps (mtime, size) by normalized path —
+    /// the read guard for [`Engine::refresh_workspace`] (#2596): a source
+    /// is re-read only when its stamp moved since the last load. Seeded by
+    /// [`Engine::discover_workspace`] and kept current by every refresh
+    /// load and removal. A filesystem that reports no mtime records
+    /// `None` and the file re-reads every pass (the pubspec guard's
+    /// posture).
+    source_stamps: FxHashMap<PathBuf, Option<(SystemTime, u64)>>,
     /// The assembly's config directory (normally `.dart_tool/` under the
     /// workspace root) — the context root the snapshot generation salt
     /// folds. A pubspec-less workspace's package table is empty, so this
@@ -258,6 +266,7 @@ impl Engine {
             semdiag,
             context_root: config.config_dir,
             pubspec_mtimes: FxHashMap::default(),
+            source_stamps: FxHashMap::default(),
             pubspec_dirs_scanned: FxHashMap::default(),
             nested_scan_epoch: 0,
             #[cfg(test)]
@@ -1020,7 +1029,11 @@ impl Engine {
                     Ok((text, loc, normalized)) => {
                         stats.loc_total += loc;
                         stats.file_count += 1;
-                        self.set_source_normalized(path, normalized, text);
+                        self.set_source_normalized(path, normalized.clone(), text);
+                        // The refresh guard's stamp (#2596): recorded
+                        // here so the first refresh after discovery is a
+                        // pure stat pass.
+                        self.source_stamps.insert(normalized, stamp(path));
                     }
                     Err(OpenError::TooLarge { .. }) => stats.oversized.push(path.clone()),
                     Err(OpenError::Io(error)) => return Err(error),
@@ -1029,6 +1042,130 @@ impl Engine {
         }
         Ok(stats)
     }
+
+    /// The stat-guarded workspace refresh (#2596): re-walks the discovery
+    /// roots and picks up what moved on disk since the last load — a
+    /// changed file re-reads, a new file loads, a vanished file removes.
+    /// Sources whose (mtime, size) stamp is unchanged are not touched, so
+    /// a quiet tree pays one parallel directory walk plus one stat per
+    /// file and zero reads (the pubspec guard's posture, widened to the
+    /// source set; the lazy-boot resident lost its accidental freshness
+    /// surface when the eager per-connection sweep retired, and this is
+    /// its deliberate replacement — called from the daemon's drain seam
+    /// ahead of every engine-work turn, so an out-of-band edit is visible
+    /// to the next analyze).
+    ///
+    /// The reload stages through the pending overlay exactly like
+    /// discovery, so an overlay change staged by the same turn for the
+    /// same path still wins (last write in the pending map), and an
+    /// unchanged re-read is content-deduped at apply.
+    ///
+    /// The universe roots themselves stay as assembled: a pub get that
+    /// adds a package changes the resolution table, not this walk — the
+    /// daemon refreshes its advisory face on config-input moves, and
+    /// mid-session re-assembly remains out of scope.
+    ///
+    /// New files admit under the session's live-path ceiling
+    /// (`live_path_cap`, the sync-batch gate's governance held over the
+    /// walk): once loading the next unseen path would push the interned
+    /// count past the cap, that path — and every further new one — is
+    /// skipped this pass and counted in [`RefreshStats::skipped`], retried
+    /// by the next pass (removals this pass free room for it). Already
+    /// loaded paths reload freely: a re-read replaces content, it never
+    /// grows residency.
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::Error`] propagated from the root walk's listing (the
+    /// same surface [`Engine::discover_workspace`] fails on); per-file
+    /// read and stat failures skip the file (the next pass retries — a
+    /// transient race is never a failed refresh).
+    pub fn refresh_workspace(&mut self, live_path_cap: usize) -> std::io::Result<RefreshStats> {
+        let roots = state::context_roots(&self.state.packages);
+        let all_roots: FxHashSet<PathBuf> = roots.iter().cloned().collect();
+        let options = &self.state.options;
+        let accepted: Vec<Vec<PathBuf>> = roots
+            .par_iter()
+            .map(|root| discover_root(options, root, &all_roots))
+            .collect();
+        let accepted: Vec<PathBuf> = accepted.into_iter().flatten().collect();
+
+        let mut stats = RefreshStats::default();
+        let mut live = self.file_table().len();
+        let mut walked: FxHashSet<PathBuf> = FxHashSet::default();
+        for chunk in accepted.chunks(DISCOVERY_LOAD_CHUNK) {
+            let refs: Vec<&Path> = chunk.iter().map(PathBuf::as_path).collect();
+            let normalized = dartq_source::normalize_paths(&refs);
+            for (path, normalized) in chunk.iter().zip(normalized) {
+                walked.insert(normalized.clone());
+                let stamp = stamp(path);
+                let known = self.source_stamps.contains_key(&normalized);
+                if known && self.source_stamps.get(&normalized) == Some(&stamp) {
+                    continue; // unchanged on disk since the last load
+                }
+                if !known && live >= live_path_cap {
+                    // A new path past the session's live-path ceiling:
+                    // skipped this pass, retried by the next (the
+                    // sync-batch gate's residency governance).
+                    stats.skipped += 1;
+                    continue;
+                }
+                match dartq_source::open_source(path) {
+                    Ok(text) => {
+                        self.set_source_normalized(path, normalized.clone(), text);
+                        stats.reloaded += 1;
+                        if !known {
+                            live += 1;
+                        }
+                    }
+                    // Too-large or unreadable now: drop the stamp so the
+                    // next pass retries the load.
+                    Err(_) => {
+                        self.source_stamps.remove(&normalized);
+                        continue;
+                    }
+                }
+                self.source_stamps.insert(normalized, stamp);
+            }
+        }
+        // Removals: every previously stamped path the walk no longer
+        // reaches leaves the workspace — stage the removal and forget the
+        // stamp. A path the engine never interned cannot remove; stamped
+        // implies loaded implies interned, so the miss is defensive only.
+        let vanished: Vec<PathBuf> = self
+            .source_stamps
+            .keys()
+            .filter(|path| !walked.contains(*path))
+            .cloned()
+            .collect();
+        for path in vanished {
+            self.source_stamps.remove(&path);
+            if self.remove_file(&path).is_ok() {
+                stats.removed += 1;
+            }
+        }
+        Ok(stats)
+    }
+}
+
+/// One refresh pass's outcome (#2596): how many sources re-read from
+/// disk, how many removed, and how many new paths the live-path ceiling
+/// refused this pass, everything else having matched its stamp.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RefreshStats {
+    /// Sources whose stamp moved (or that were new) and re-read.
+    pub reloaded: usize,
+    /// Previously loaded sources the walk no longer reaches.
+    pub removed: usize,
+    /// New paths skipped past the live-path ceiling (retried next pass).
+    pub skipped: usize,
+}
+
+/// A file's disk stamp: the modification time and size, `None` on a
+/// filesystem that reports no mtime (the caller re-reads every pass).
+fn stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 /// One package root's accepted `.dart` files, sorted: the root's own files
@@ -1856,6 +1993,100 @@ mod tests {
         })
         .expect("engine");
         (root, engine)
+    }
+
+    /// #2596: the stat-guarded refresh picks up out-of-band disk deltas —
+    /// a changed file re-reads, a quiet pass reloads nothing, a new file
+    /// loads, a vanished file removes — against the discovery-seeded
+    /// stamps.
+    #[test]
+    fn refresh_workspace_picks_up_disk_deltas() {
+        let (root, mut engine) = facade_engine();
+        std::fs::create_dir_all(root.join("lib")).expect("lib dir");
+        std::fs::write(root.join("lib/main.dart"), "int main() => 1;\n").expect("seed");
+        engine.discover_workspace().expect("discover");
+        let report = engine.analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        assert!(report.is_empty(), "the seeded tree is clean");
+
+        // A quiet pass: nothing moved, nothing reloads.
+        let quiet = engine.refresh_workspace(usize::MAX).expect("quiet refresh");
+        assert_eq!(quiet, RefreshStats::default(), "stamps match, zero reads");
+
+        // An out-of-band edit: exactly that file reloads and the next
+        // analyze carries the error.
+        std::fs::write(root.join("lib/main.dart"), "int main() => 1 oops;\n").expect("edit");
+        let moved = engine.refresh_workspace(usize::MAX).expect("refresh");
+        assert_eq!(moved.reloaded, 1, "only the edited file re-read");
+        assert_eq!(moved.removed, 0);
+        let report = engine.analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        assert!(
+            report.iter().any(|row| row.code.name == "expected_token"),
+            "the edit surfaces: {report:?}"
+        );
+
+        // A new file loads; removing it reverts (and removing the edited
+        // file's error path — the revert — reloads it too).
+        std::fs::write(root.join("lib/extra.dart"), "int broken(\n").expect("add");
+        let added = engine.refresh_workspace(usize::MAX).expect("refresh");
+        assert_eq!(added.reloaded, 1, "the new file loads");
+        std::fs::remove_file(root.join("lib/extra.dart")).expect("remove");
+        std::fs::write(root.join("lib/main.dart"), "int main() => 1;\n").expect("revert");
+        let reverted = engine.refresh_workspace(usize::MAX).expect("refresh");
+        assert_eq!(reverted.removed, 1, "the vanished file removes");
+        assert_eq!(reverted.reloaded, 1, "the reverted file re-reads");
+        let report = engine.analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        assert!(
+            report.is_empty(),
+            "the reverted tree is clean again: {report:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #2596: the refresh walk admits new paths under the live-path
+    /// ceiling — a new file past the cap skips (counted, no residency),
+    /// and the next pass with room loads it; an already-loaded file
+    /// reloads past the cap regardless (a re-read replaces, never grows).
+    #[test]
+    fn refresh_workspace_admits_new_paths_under_the_cap() {
+        let (root, mut engine) = facade_engine();
+        std::fs::create_dir_all(root.join("lib")).expect("lib dir");
+        std::fs::write(root.join("lib/main.dart"), "int main() => 1;\n").expect("seed");
+        engine.discover_workspace().expect("discover");
+        let live = engine.file_table().len();
+        assert!(live >= 1, "the seeded file is interned");
+
+        // One slot of headroom: a second new file stays skipped while the
+        // cap pins the table at `live`.
+        std::fs::write(root.join("lib/extra.dart"), "int broken(\n").expect("add");
+        let skipped = engine.refresh_workspace(live).expect("refresh");
+        assert_eq!(skipped.skipped, 1, "the new path past the cap skips");
+        assert_eq!(skipped.reloaded, 0);
+        assert_eq!(engine.file_table().len(), live, "residency never grew");
+
+        // Room appears (the cap lifts): the same pass shape loads it.
+        let loaded = engine.refresh_workspace(live + 1).expect("refresh");
+        assert_eq!(loaded.skipped, 0);
+        assert_eq!(loaded.reloaded, 1, "the skipped path loads once admitted");
+        let report = engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        assert!(
+            report.iter().any(|row| row.code.name == "expected_token"),
+            "the admitted file surfaces its error: {report:?}"
+        );
+
+        // A reload of an already-loaded file ignores the cap: content
+        // replacement never grows residency.
+        std::fs::write(root.join("lib/main.dart"), "int main() => 1 oops;\n").expect("edit");
+        let moved = engine.refresh_workspace(live).expect("refresh");
+        assert_eq!(moved.reloaded, 1, "a loaded path reloads past the cap");
+        assert_eq!(moved.skipped, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A throwaway pubspec-less tree + the synthetic SDK — the bare floor

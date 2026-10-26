@@ -189,7 +189,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use dartq_commands::Verbosity;
@@ -767,6 +767,17 @@ fn fix_worker_body(job: FixJob, mut hosts: PluginHosts, done: &Sender<FixMail>, 
     let _ = done.send(FixMail { hosts, outcome });
 }
 
+/// The workspace root's three config-input stamps — pubspec, package
+/// config, analysis options — in that fixed order. A missing file stamps
+/// `None`, so its (re)creation counts as a move.
+fn config_input_stamps(root: &Path) -> [Option<(SystemTime, u64)>; 3] {
+    let stamp = |rel: &str| {
+        let meta = std::fs::metadata(root.join(rel)).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    };
+    [stamp("pubspec.yaml"), stamp(".dart_tool/package_config.json"), stamp("analysis_options.yaml")]
+}
+
 /// The wire form of a request id (the progress notice carries it, so a
 /// client can match the notice to its request).
 fn id_value(id: &RequestId) -> serde_json::Value {
@@ -908,8 +919,15 @@ pub struct Session {
     publishes_due: bool,
     /// Whether any context has walked its workspace yet (#2591's lazy
     /// boot): the walk runs on the first drain staging engine work, not
-    /// at startup — see [`Session::discover_all`].
+    /// at startup — see [`Session::refresh_workspace_state`].
     discovered: bool,
+    /// The config inputs' disk stamps at the last advisory evaluation
+    /// (#2596): a moved stamp on an engine-work drain re-evaluates the
+    /// workspace advisory (a mid-session `pub get` heals its verdict).
+    config_stamps: [Option<(SystemTime, u64)>; 3],
+    /// Whether the refresh walk's live-path skip has been reported (#2596)
+    /// — the once-per-session stderr line for paths the ceiling refused.
+    refresh_skip_reported: bool,
     /// The session symbol table.
     symbols: commands::SymbolTable,
     /// The per-file lint-row memo (#772): rows keyed by content, features,
@@ -1300,6 +1318,10 @@ impl Session {
         // the handshake completes before the first turn. An empty discovery
         // costs one options-file lookup and spawns nothing.
         let plugins = PluginSet::launch(&workspace_root, &pub_config, &config_dir);
+        // The config-input baseline (#2596): stamped at assembly — the
+        // advisory's own evaluation moment — so only a later disk move of
+        // pubspec / package config / analysis options re-evaluates it.
+        let config_stamps = config_input_stamps(&workspace_root);
         Ok(Self {
             runtime,
             contexts,
@@ -1320,6 +1342,8 @@ impl Session {
             changed: FxHashMap::default(),
             publishes_due: false,
             discovered: false,
+            config_stamps,
+            refresh_skip_reported: false,
             symbols: commands::SymbolTable::default(),
             lint_memo: dartq_commands::lints::LintMemo::default(),
             gc_watermark: 0,
@@ -1380,21 +1404,67 @@ impl Session {
         Ok(())
     }
 
-    /// The lazy-boot workspace walk (#2591): every context's discovery,
-    /// run on the first drain that stages engine work. A cold walk of a
-    /// monster workspace takes minutes; doing it at startup held the
-    /// serve loop with every RPC timing out, so the walk lands here
-    /// instead — the faces that never touch the engines answer on a cold
-    /// engine, and the first analysis-needing request pays the walk in
-    /// its own drain. A failed walk is logged and the turn proceeds on
-    /// whatever loaded (the pre-#2591 startup sweep's failure posture).
-    fn discover_all(&mut self) {
-        self.discovered = true;
-        for index in 0..self.context_ids.len() {
-            if let Err(error) = self.engine_mut(self.context_ids[index]).discover_workspace() {
-                eprintln!("dartq-daemon: workspace discovery failed: {error}");
+    /// The drain-seam workspace refresh (#2591's lazy boot, #2596's
+    /// freshness): the first engine-work turn discovers every context;
+    /// every later one re-walks under the engine's (mtime, size) stamp
+    /// guard, so an out-of-band edit lands in the next analyze at
+    /// pure-stat cost on a quiet tree. Config inputs (the root pubspec,
+    /// the package config, the analysis options) re-evaluate the
+    /// workspace advisory when their stamps move — a mid-session
+    /// `dart pub get` heals its verdict instead of the session answering
+    /// with the assembly-time one forever. A failed walk is logged and
+    /// the turn proceeds on whatever loaded (the pre-#2591 startup
+    /// sweep's failure posture).
+    fn refresh_workspace_state(&mut self) {
+        if !self.discovered {
+            self.discovered = true;
+            for index in 0..self.context_ids.len() {
+                if let Err(error) = self.engine_mut(self.context_ids[index]).discover_workspace() {
+                    eprintln!("dartq-daemon: workspace discovery failed: {error}");
+                }
+            }
+        } else {
+            let cap = self.live_path_cap;
+            for index in 0..self.context_ids.len() {
+                match self.engine_mut(self.context_ids[index]).refresh_workspace(cap) {
+                    Ok(stats) if stats.skipped > 0 && !self.refresh_skip_reported => {
+                        self.refresh_skip_reported = true;
+                        eprintln!(
+                            "dartq-daemon: workspace refresh skipped {} new path(s) past the \
+                             {}-path session live-path ceiling; they load when the session \
+                             shrinks or a new session starts",
+                            stats.skipped, cap,
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("dartq-daemon: workspace refresh failed: {error}")
+                    }
+                }
             }
         }
+        // The stamps were noted at assembly (the advisory's evaluation
+        // moment), so a first-turn comparison never misreads the
+        // assembly's own stamps as a move: only a real config-input
+        // change — on the discovery turn or any later one — re-evaluates
+        // the verdict.
+        if self.config_stamps_moved() {
+            self.note_config_stamps();
+            self.refresh_workspace_advisory();
+        }
+    }
+
+    /// Records the config inputs' disk stamps: the workspace root's
+    /// pubspec, package config, and analysis options — the advisory
+    /// face's decisive inputs.
+    fn note_config_stamps(&mut self) {
+        self.config_stamps = config_input_stamps(&self.workspace_root);
+    }
+
+    /// Whether any config input's stamp moved since the last note — the
+    /// cheap per-drain gate for the advisory re-evaluation.
+    fn config_stamps_moved(&self) -> bool {
+        self.config_stamps != config_input_stamps(&self.workspace_root)
     }
 
     /// The config-input watch sweep's advisory heal: re-runs the assembly's
@@ -2136,8 +2206,8 @@ impl Session {
         // discovered disk state (last-wins), the same order the retired
         // eager startup sweep produced. Drains without engine work (a
         // status, debug, or test intake) never pay the walk.
-        if !self.discovered && !report.tasks.is_empty() {
-            self.discover_all();
+        if !report.tasks.is_empty() {
+            self.refresh_workspace_state();
         }
         let mut turn = Turn::default();
         // Paths this turn's write removed (empty on every write-free turn):

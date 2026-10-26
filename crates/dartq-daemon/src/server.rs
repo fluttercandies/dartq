@@ -1114,6 +1114,104 @@ mod tests {
         }
     }
 
+    /// #2596's pin: an out-of-band disk edit lands in the next analyze —
+    /// both directions, plus a new file and a removal. The lazy-boot
+    /// resident lost the eager sweep's accidental per-connection
+    /// re-discovery; the drain seam's stat-guarded refresh is its
+    /// deliberate replacement, and this holds it to the contract.
+    #[test]
+    fn a_disk_edit_between_analyzes_is_visible_to_the_next_one() {
+        let workspace = test_fixtures::Workspace::new(BROKEN_MAIN);
+        let main = workspace.path("lib/main.dart");
+        fs::write(&main, CLEAN_MAIN).expect("seed clean");
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root("disk-delta")),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let session =
+            Session::with_store(workspace.engine_config(), store, None).expect("session");
+        let (client, receiver) = mpsc::channel::<Vec<u8>>();
+        let output = TestOutput::default();
+        let server_output = output.clone();
+        let server = thread::spawn(move || {
+            run(
+                BufReader::new(FeedClient {
+                    receiver,
+                    pending: Vec::new(),
+                }),
+                server_output,
+                &mut { session },
+                None,
+            )
+        });
+
+        // Clean, then an out-of-band edit: the next analyze must carry
+        // the injected error (not a stale clean view).
+        let analyze = |client: &mpsc::Sender<Vec<u8>>, output: &TestOutput, id: i64| {
+            client
+                .send(framed(&request(id, "dartq/analyze", json!({}))))
+                .expect("send");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                if let Some(frame) = transcript_of(output)
+                    .iter()
+                    .find(|frame| frame.get("id") == Some(&json!(id)))
+                    .cloned()
+                {
+                    return frame;
+                }
+                assert!(Instant::now() < deadline, "analyze {id} never answered");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let first = analyze(&client, &output, 1);
+        assert!(
+            first["result"]["diagnostics"] == json!([]),
+            "the clean tree answers clean: {first}"
+        );
+
+        fs::write(&main, BROKEN_MAIN).expect("inject the error");
+        let second = analyze(&client, &output, 2);
+        assert!(
+            second["result"]["diagnostics"]
+                .as_array()
+                .expect("array")
+                .iter()
+                .any(|d| d["code"] == "uri_does_not_exist"),
+            "the edited tree's error surfaces (no stale clean view): {second}"
+        );
+
+        // A brand-new file loads; removing it reverts.
+        fs::write(workspace.path("lib/extra.dart"), "int broken(\n").expect("add file");
+        let third = analyze(&client, &output, 3);
+        assert!(
+            third["result"]["diagnostics"]
+                .as_array()
+                .expect("array")
+                .iter()
+                .any(|d| d["code"] == "expected_token"),
+            "the new file's error surfaces: {third}"
+        );
+        fs::remove_file(workspace.path("lib/extra.dart")).expect("remove file");
+        fs::write(&main, CLEAN_MAIN).expect("revert");
+        let fourth = analyze(&client, &output, 4);
+        assert!(
+            fourth["result"]["diagnostics"] == json!([]),
+            "the reverted tree is clean again (no stale rows): {fourth}"
+        );
+
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !server.is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        server
+            .join()
+            .expect("server thread does not panic")
+            .expect("transport does not fail on memory pipes");
+    }
+
     /// #2591's lazy-boot pin: a cold engine answers the faces that never
     /// touch the analysis engines before ANY analysis has run — no
     /// eager startup sweep holds the loop — and the workspace walk plus
