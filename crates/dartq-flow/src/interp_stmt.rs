@@ -1018,6 +1018,18 @@ impl Interp<'_> {
             }
             Ev::SwitchExprBlockEnd => {
                 if self.collecting() {
+                    // The expression's value leaves the construct at this
+                    // event in every mode: the arrow body's `ExprBody`
+                    // consumer pops it in collect runs too (the same
+                    // contract `ExecEnd`'s is-expr push carries — a
+                    // downstream `ArgumentsEnd` pops the slot the consumer
+                    // means for the expression). Skipping the push in a
+                    // collect walk lets `ExprBody` pop below the walk's
+                    // entry base, and the rollback then restores a short
+                    // stack — every later pop in the enclosing replay
+                    // misreads its slot (an assignment target reads the
+                    // wrong expression and its write never records).
+                    self.exprs.push(Expr::trivial(Ty::UNKNOWN));
                     return true;
                 }
                 let Some(frame_index) = self.switch_frame() else {
