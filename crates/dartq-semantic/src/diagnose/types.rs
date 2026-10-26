@@ -2700,6 +2700,32 @@ pub(crate) struct Engine<'a> {
     /// The open cascades' `(operator offset, target span)` pairs, moved to
     /// [`Self::cascade_last`] at their close.
     pub(crate) cascade_open: Vec<(u32, SourceRange)>,
+    /// The last closed cascade's captured target type (the type twin of
+    /// [`Self::cascade_last`]): a reopened cascade (`a..b = x..c = y` — one
+    /// begin/end per section) sees the PREVIOUS SECTION'S RHS as the stack
+    /// top, never the real target, so its begin reuses this stash for the
+    /// value face instead of reading the leftover row.
+    pub(crate) cascade_last_ty: Option<Ty>,
+    /// The row-stack depth at each open cascade's begin — the target row
+    /// is the entry below it. A cascade expression's static type is its
+    /// TARGET's (`CascadeExpression`'s `staticType`), never the last
+    /// section's value: at close, the section rows truncate back here so
+    /// the target row stands for the whole expression (`(b..f).m` reads
+    /// `.m` on `b`'s type, not the section's result).
+    /// The captured `(static type, operator range)` of each open cascade's
+    /// target row: a section's merge leaves the SECTION's result as the
+    /// stack top, so the close pushes a value row carrying the target's
+    /// type — the cascade expression's value face (`CascadeExpression`'s
+    /// static type is the target's, never the last section's).
+    pub(crate) cascade_target_tys: Vec<(Ty, SourceRange)>,
+    /// The stack offsets of the cascade value rows [`Self::cascade_target_
+    /// tys`] pushed at close: a directly-following `..` reopens the
+    /// cascade (the parser fires one begin/end per section), and the
+    /// reopened cascade's target is the row BELOW the value row — the
+    /// begin pops its own value stand-in so the span latch and the
+    /// section merges read the real target exactly as a fresh cascade
+    /// would.
+    pub(crate) cascade_value_rows: Vec<u32>,
     /// A null-aware RECORD-field read (`result?.read` on
     /// `({M read, …})?`): the record arm bakes the shorted `?` into the
     /// row's stored face (its consumers read the written nullable), so

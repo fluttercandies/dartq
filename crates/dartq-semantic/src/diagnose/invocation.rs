@@ -586,6 +586,40 @@ impl<'a> Engine<'a> {
                             kind: ContainerKind::Class,
                         }
                     }
+                    // A bare head that spells a GROUNDED type alias
+                    // (`Alias.parse(…)` under `typedef Alias =
+                    // MediaType;`) denotes the aliased class itself: the
+                    // dot-send is the class's constructor/static face —
+                    // `Alias.parse` names MediaType's factory constructor,
+                    // a creation, never an instance-member send on the
+                    // expansion type. The receiver classifies as the
+                    // expansion container (alias chains fold first), so
+                    // the send takes the direct-spelling fold: the
+                    // constructor table, static members, and the
+                    // class-named miss faces. An ungrounded alias keeps
+                    // its own faces (`report_alias_selector_face` names
+                    // 'Type'); a local-shadowed spelling stays the value
+                    // receiver (`was_local`).
+                    RowShape::Bare(BareInfo::Plain { ty })
+                        if !was_local
+                            && popped.intent != Intent::Invoke
+                            && self.alias_head_grounded(popped.name) == Some(true)
+                            && let Ty::Named { name: head, .. } = self.fold_alias_ty(*ty)
+                            && resolve_container(
+                                self.graph,
+                                self.namespaces,
+                                self.index,
+                                self.lib,
+                                self.file,
+                                head,
+                            )
+                            .is_some() =>
+                    {
+                        Receiver::Container {
+                            name: head,
+                            kind: self.container_kind_of(head).unwrap_or(ContainerKind::Class),
+                        }
+                    }
                     // A postfix-upgraded receiver carries its static type
                     // on the row (`x!.m`'s `!` rewrite in
                     // [`Self::check_null_assert`]): the `Plain` payload is

@@ -3497,6 +3497,23 @@ impl ParserListener for DiagnoseListener<'_> {
                         .last()
                 })
                 .map(|(index, _)| target + 1 + index)?;
+            // A chained assignment's right side (`m = f.x = v`): the row
+            // the search found is the INNER write's target member row
+            // (`f.x`, its intent upgraded by `mark_assignment`) — its
+            // declared READ type is not the assignment expression's value.
+            // The value is the inner RHS — the region's topmost row
+            // (`v`), which the staging computes from instead.
+            let rhs_index = if engine.rows[rhs_index].intent == Intent::Write
+                && let Some((index, _)) = engine.rows[target + 1..]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| row.range.offset > limit)
+                    .last()
+            {
+                target + 1 + index
+            } else {
+                rhs_index
+            };
             let rhs_row = engine.rows[rhs_index].clone();
             // The send face types on demand
             // ([`Engine::callee_return_ty`]): an invocation row's stored
@@ -4830,6 +4847,43 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().begin_cascade(operator);
 
         let engine = &mut self.engine;
+        // A directly-following `..` reopens the cascade (one begin/end per
+        // section): the previous close's value stand-in must not become
+        // the reopened cascade's target — pop it, so the span latch below
+        // and every section merge read the real target row exactly as a
+        // fresh cascade would. The reopened cascade's stack top is the
+        // PREVIOUS SECTION'S RHS leftover, never the target: its captured
+        // type comes from the last close's stash (the type twin of
+        // `cascade_last`), not the leftover row.
+        let mut reopened = false;
+        if engine.rows.last().is_some_and(|row| {
+            matches!(row.shape, RowShape::Value)
+                && engine.cascade_value_rows.last() == Some(&row.range.offset)
+        }) {
+            engine.rows.pop();
+            engine.cascade_value_rows.pop();
+            reopened = true;
+        }
+        let target_ty = if reopened {
+            engine.cascade_last_ty.unwrap_or(Ty::UNKNOWN)
+        } else {
+            engine.rows.last().map_or(Ty::UNKNOWN, |row| {
+                // An unnamed creation's target row (`B()..m`) carries its
+                // face in the `Created` shape — the row's own ty stays
+                // unset — so the container's instance type answers before
+                // the static fallback.
+                if let RowShape::Receiver(Receiver::Created { name, .. }) = &row.shape {
+                    return Ty::named(*name);
+                }
+                let ty = Engine::receiver_row_ty(row);
+                if ty == Ty::UNKNOWN {
+                    engine.receiver_static_ty(row)
+                } else {
+                    ty
+                }
+            })
+        };
+        engine.cascade_target_tys.push((target_ty, operator.range));
         engine.nsm_poison();
         // The cascade target completed before the `..`: it is a use (the
         // official `CascadeExpression` target arm); the sections' pendings
@@ -4859,6 +4913,28 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.cascade_target_spans.pop();
         engine.cascade_last = engine.cascade_open.pop();
+        // The cascade expression's value is its TARGET's static type
+        // (`CascadeExpression`'s `staticType`), never the last section's
+        // result: the value row pushed here stands for the whole
+        // expression, so the continuation (`(b..f).m`'s `.m`) resolves on
+        // the target's face. The section rows stay untouched — their own
+        // faces (member misses, latch settlements) report through the
+        // pass-2 scans.
+        if let Some((target_ty, op_range)) = engine.cascade_target_tys.pop() {
+            engine.cascade_last_ty = (target_ty != Ty::UNKNOWN).then_some(target_ty);
+            if target_ty != Ty::UNKNOWN {
+                engine.push_row(Row {
+                    name: engine.intern(""),
+                    range: op_range,
+                    qualified: false,
+                    shape: RowShape::Value,
+                    intent: Intent::Read,
+                    write_op: None,
+                    ty: target_ty,
+                });
+                engine.cascade_value_rows.push(op_range.offset);
+            }
+        }
         engine.nsm_poison();
         // The sections are not uses (the official `CascadeExpression` arm
         // spares only the target).
@@ -4963,13 +5039,18 @@ impl ParserListener for DiagnoseListener<'_> {
         // Fold (`a[i]`, `c.j[i] = v`): the index arguments leave the stack —
         // the receiver row carries the `[]` access with the bracket span, and
         // a value row stands for the result so compound-expression detection
-        // (argument types, initializer checks) still sees one opaque row. A
-        // receiver whose own resolution left no name row (call results,
-        // groups) stays unfolded — its operator checks suppress anyway.
+        // (argument types, initializer checks) still sees one opaque row. An
+        // INVOKED receiver row (`getFragments(p)[i]` — a call result indexed
+        // directly) folds the same way: without the fold, the operand row
+        // (the literal index, an `int`) stays topmost and the next member
+        // merge would classify IT as the receiver — the chained send then
+        // reports against `int` instead of the element type. A receiver
+        // whose own resolution left no name row (groups) stays unfolded —
+        // its operator checks suppress anyway.
         if matches!(
             engine.rows[pos].shape,
             RowShape::Bare(_) | RowShape::Member { .. } | RowShape::Receiver(_)
-        ) && engine.rows[pos].intent == Intent::Read
+        ) && matches!(engine.rows[pos].intent, Intent::Read | Intent::Invoke)
         {
             let index_op = engine.intern("[]");
             // The result row's static type (`index_result.rs`): the

@@ -51,6 +51,7 @@ impl<'a> Engine<'a> {
         else {
             return ty;
         };
+
         // A use with written arguments whose head resolves to a
         // parameterized alias substitutes them into the captured RHS
         // (`Predicate<String>` reads `bool Function(String)`); every other
@@ -434,6 +435,24 @@ impl<'a> Engine<'a> {
     /// `name`: this file's declaration table first, then the library
     /// namespace (the same resolution order a container use walks).
     pub(crate) fn alias_rhs(&self, name: StringId) -> Option<Ty> {
+        // A prefixed annotation captured whole (`plural_rules.PluralRule` —
+        // the interned one-head joined form): the tail resolves through the
+        // import prefix's own library, the same face `prefixed_container`
+        // gives containers.
+        if let Some((prefix, tail)) = self.split_prefixed_spelling(name) {
+            return match self.namespaces.lookup_prefixed(
+                self.graph,
+                self.lib,
+                prefix,
+                tail,
+            ) {
+                Lookup::Found(NamespaceEntry::Decl(owner)) => {
+                    let decl = self.index.get(owner)?.decl(tail)?;
+                    self.alias_decl_rhs(owner, decl)
+                }
+                _ => None,
+            };
+        }
         let (owner, decl) = match lookup_scoped(
             self.graph,
             self.namespaces,
@@ -446,16 +465,59 @@ impl<'a> Engine<'a> {
             ScopedHit::Found(NamespaceEntry::Decl(file)) => {
                 (file, self.index.get(file).and_then(|f| f.decl(name))?)
             }
-            _ => return None,
+            // A prefixed import's alias never enters the bare namespace
+            // (`plural_rules.PluralRule`), but a FOREIGN signature's return
+            // rides it: the send's callee declared its return under the
+            // alias, and the chase must resolve the spelling in its OWN
+            // library. The graph-wide unique declaration is that owner —
+            // two same-named aliases in mutually invisible libraries would
+            // answer Ambiguous and stay unchased (the under-report
+            // direction).
+            _ => {
+                let libs = self.graph.declaring_libraries(name);
+                if libs.len() != 1 {
+                    return None;
+                }
+                let file = self.graph.unit_files(libs[0]).iter().copied().find(|&f| {
+                    self.index.get(f).is_some_and(|unit| unit.decl(name).is_some())
+                })?;
+                let decl = self.index.get(file)?.decl(name)?;
+                (file, decl)
+            }
         };
+        self.alias_decl_rhs(owner, decl)
+    }
+
+    /// The non-parameterized alias gate shared by the scoped and prefixed
+    /// resolution paths: a foreign alias's RHS is a slot of its owner's
+    /// pool, projected into the diagnosing universe before anything reads
+    /// it.
+    fn alias_decl_rhs(&self, owner: FileId, decl: &crate::model::TopDecl) -> Option<Ty> {
         match decl.kind {
-            // A foreign alias's RHS is a slot of its owner's pool: project it
-            // into the diagnosing universe before anything reads it.
             MicroKind::TypeAlias if decl.type_params == 0 && decl.var_ty != Ty::UNKNOWN => {
                 Some(self.boundary.ty(owner, decl.var_ty))
             }
             _ => None,
         }
+    }
+
+    /// Splits an interned joined spelling (`prefix.Name`) at its last dot
+    /// when the prefix resolves as an import prefix of the diagnosing
+    /// library; a dotted tail whose head is not an import prefix (a
+    /// library-URI qualified name, recovery residue) stays whole.
+    fn split_prefixed_spelling(&self, name: StringId) -> Option<(StringId, StringId)> {
+        let spelled = self.strings.resolve(name);
+        let dot = spelled.rfind('.')?;
+        let (head, tail) = (&spelled[..dot], &spelled[dot + 1..]);
+        if head.is_empty() || tail.is_empty() || head.contains('.') {
+            return None;
+        }
+        let prefix = self.strings.intern(head);
+        self.graph
+            .import_edges(self.lib)
+            .iter()
+            .any(|edge| edge.prefix == Some(prefix))
+            .then(|| (prefix, self.strings.intern(tail)))
     }
 
     /// The clause-face hop with the alias fold (the name-level twin of
@@ -1602,33 +1664,25 @@ impl<'a> Engine<'a> {
     /// member face (own-file container chain), the extension pool, enum
     /// synthesized members, then the scoped library lookup.
     pub(crate) fn resolve_bare(&self, name: StringId) -> (BareInfo, RefTarget) {
-        
-        if self.frames.iter().rev().any(|f| f.locals.contains(&name)) {
-            return (
-                BareInfo::Plain {
-                    ty: self.typed_local(name).unwrap_or(Ty::UNKNOWN),
-                },
-                RefTarget::Local,
-            );
-        }
-        // A pattern binder's var_types slot (the shorthand `:final x` and
-        // the binder arms bind through `bind_var_type`, never the tracked
-        // locals set — the R53 scoped-locals attempt leaked the flat set
-        // past the clause scope and regressed outer reads): consulting the
-        // frame chain's typed slots answers the binder's reads with its
-        // bound face and leaves the set untouched, so the scope's restore
-        // keeps its exact contract. A slot spelling `Unknown` (the
-        // unresolvable-getter fallback) still resolves — the oracle's
-        // binder is a local however weakly typed (`$Result.error(error,
-        // stackTrace)` reads the bound `stackTrace`, never the implicit
-        // this getter).
-        if let Some(ty) = self
-            .frames
-            .iter()
-            .rev()
-            .find_map(|f| f.var_types.get(&name).copied())
-        {
-            return (BareInfo::Plain { ty }, RefTarget::Local);
+
+        // Innermost frame first: a pattern binder's var_types slot and a
+        // tracked local resolve per-frame, so a binder shadowing an
+        // outer SAME-NAMED local (`if (x case var x?)` rebinds `x` to the
+        // non-null matched type) wins over the outer's declared type —
+        // a graph-wide locals-first scan would read the outer's nullable
+        // face and lose the binder's promotion.
+        for frame in self.frames.iter().rev() {
+            if let Some(ty) = frame.var_types.get(&name) {
+                return (BareInfo::Plain { ty: *ty }, RefTarget::Local);
+            }
+            if frame.locals.contains(&name) {
+                return (
+                    BareInfo::Plain {
+                        ty: self.typed_local(name).unwrap_or(Ty::UNKNOWN),
+                    },
+                    RefTarget::Local,
+                );
+            }
         }
         // The frameless initializer world: a pattern variable of a switch /
         // if-case expression in a top-level variable's initializer binds
