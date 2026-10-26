@@ -6,6 +6,12 @@
 //! takes any live VM service URI, including one owned by a running
 //! `flutter run`.
 //!
+//! Every session-bearing face takes an optional `sessionId`: absent
+//! drives the sole live session (the common shape — one interaction,
+//! one session); zero live sessions and several live sessions are
+//! machine-coded domain misses, the several case listing every
+//! candidate (`#id kind script`) so the caller can pick.
+//!
 //! The face is a registry problem, not an analysis problem: every request
 //! targets one of the session's live [`DebugManager`] entries and never
 //! touches the analysis engine. The registry lives on a dedicated worker
@@ -93,6 +99,12 @@ pub(crate) enum DebugError {
     InvalidParams(String),
     /// The request named a session id that is not live.
     NoSuchSession(u32),
+    /// The request named no session and none are live (the sole-session
+    /// default has nothing to pick).
+    NoSessions,
+    /// The request named no session and several are live (the payload
+    /// lists every candidate: id, kind, script or ws URI).
+    AmbiguousSession(String),
     /// The underlying debug session call failed (transport, VM RPC,
     /// process, or timeout — dartq-debug's typed failure set). Resource
     /// exhaustion (process table, fds, memory) surfaces here as the OS's
@@ -112,6 +124,19 @@ impl DebugError {
             Self::NoSuchSession(id) => (
                 codes::DEBUG_SESSION,
                 format!("DARTQ/DEBUG/NO_SUCH_SESSION: session {id} is not live"),
+            ),
+            Self::NoSessions => (
+                codes::DEBUG_SESSION,
+                "DARTQ/DEBUG/NO_SESSIONS: no debug sessions are live — \
+                 launch or attach one first"
+                    .to_owned(),
+            ),
+            Self::AmbiguousSession(candidates) => (
+                codes::DEBUG_SESSION,
+                format!(
+                    "DARTQ/DEBUG/AMBIGUOUS_SESSION: several debug sessions are live \
+                     ({candidates}) — name one (CLI `-s <ID>`, MCP `sessionId`)"
+                ),
             ),
             Self::Vm(error) => (codes::DEBUG_SESSION, format!("DARTQ/DEBUG/VM: {error}")),
         }
@@ -164,6 +189,45 @@ impl DebugManager {
     /// The named session, or the machine-coded miss.
     fn get(&mut self, id: u32) -> Result<&mut ManagedSession, DebugError> {
         self.sessions.get_mut(&id).ok_or(DebugError::NoSuchSession(id))
+    }
+}
+
+/// One candidate line of the ambiguity listing: `#id kind script` for a
+/// launch, `#id attach <wsUri>` for an attach.
+fn session_line(managed: &ManagedSession, id: u32) -> String {
+    match &managed.origin {
+        Origin::Launch { script, kind } => {
+            format!("#{id} {} {}", launch_kind_word(*kind), script.display())
+        }
+        Origin::Attach(uri) => format!("#{id} attach {uri}"),
+    }
+}
+
+/// Resolves the request's session selector: an explicit id names that
+/// session; absent drives the sole live session — the common shape, and
+/// the reason `sessionId` is optional on every session-bearing face.
+/// Zero live sessions and several live sessions are the machine-coded
+/// domain misses (the several case lists every candidate so the caller
+/// can pick).
+fn select_session(manager: &mut DebugManager, requested: Option<u32>) -> Result<u32, DebugError> {
+    match requested {
+        Some(id) => Ok(id),
+        None => {
+            let mut ids: Vec<u32> = manager.sessions.keys().copied().collect();
+            ids.sort_unstable();
+            match ids[..] {
+                [] => Err(DebugError::NoSessions),
+                [only] => Ok(only),
+                _ => {
+                    let candidates = ids
+                        .iter()
+                        .map(|&id| session_line(&manager.sessions[&id], id))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    Err(DebugError::AmbiguousSession(candidates))
+                }
+            }
+        }
     }
 }
 
@@ -262,7 +326,9 @@ impl DebugDispatch {
 
 // The faces' parameter payloads (`#[serde(default)]` keeps every field
 // optional beyond the contract-critical ones, the analysis faces'
-// convention).
+// convention). `sessionId` itself is optional on every session-bearing
+// face: absent drives the sole live session ([`select_session`]) — the
+// AI-first default, since most interactions hold exactly one session.
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -304,10 +370,12 @@ struct AttachParams {
     ws_uri: String,
 }
 
+/// The `detach`/`stop`/`restart` payload: the selector alone.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionParams {
-    session_id: u32,
+    #[serde(default)]
+    session_id: Option<u32>,
 }
 
 /// The `status` payload: `sessionId` optional — absent lists every
@@ -322,7 +390,8 @@ struct StatusParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IsolateParams {
-    session_id: u32,
+    #[serde(default)]
+    session_id: Option<u32>,
     #[serde(default)]
     isolate: Option<String>,
 }
@@ -330,7 +399,8 @@ struct IsolateParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BreakpointAddParams {
-    session_id: u32,
+    #[serde(default)]
+    session_id: Option<u32>,
     #[serde(default)]
     isolate: Option<String>,
     location: BreakpointLocationParams,
@@ -357,7 +427,8 @@ struct BreakpointLocationParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BreakpointRemoveParams {
-    session_id: u32,
+    #[serde(default)]
+    session_id: Option<u32>,
     breakpoint_id: String,
     #[serde(default)]
     isolate: Option<String>,
@@ -366,7 +437,8 @@ struct BreakpointRemoveParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ExceptionPauseParams {
-    session_id: u32,
+    #[serde(default)]
+    session_id: Option<u32>,
     #[serde(default)]
     isolate: Option<String>,
     mode: String,
@@ -375,7 +447,8 @@ struct ExceptionPauseParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StepParams {
-    session_id: u32,
+    #[serde(default)]
+    session_id: Option<u32>,
     #[serde(default)]
     isolate: Option<String>,
     option: String,
@@ -385,7 +458,8 @@ struct StepParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReloadParams {
-    session_id: u32,
+    #[serde(default)]
+    session_id: Option<u32>,
     #[serde(default)]
     isolate: Option<String>,
     #[serde(default)]
@@ -396,7 +470,8 @@ struct ReloadParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RestartParams {
-    session_id: u32,
+    #[serde(default)]
+    session_id: Option<u32>,
 }
 
 /// The `evaluate` payload: a frame index evaluates in that frame of
@@ -404,7 +479,8 @@ struct RestartParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EvaluateParams {
-    session_id: u32,
+    #[serde(default)]
+    session_id: Option<u32>,
     #[serde(default)]
     isolate: Option<String>,
     expression: String,
@@ -415,14 +491,16 @@ struct EvaluateParams {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnapshotParams {
-    session_id: u32,
+    #[serde(default)]
+    session_id: Option<u32>,
     isolate: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EventsParams {
-    session_id: u32,
+    #[serde(default)]
+    session_id: Option<u32>,
     #[serde(default)]
     cursor: u64,
     #[serde(default = "default_event_limit")]
@@ -437,7 +515,8 @@ fn default_event_limit() -> usize {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OutputParams {
-    session_id: u32,
+    #[serde(default)]
+    session_id: Option<u32>,
     stream: String,
     #[serde(default)]
     cursor: u64,
@@ -580,22 +659,24 @@ pub(crate) fn handle(
         DEBUG_DETACH => {
             let decoded =
                 serde_json::from_value::<SessionParams>(params.clone()).map_err(invalid)?;
-            let managed = manager.get(decoded.session_id)?;
+            let id = select_session(manager, decoded.session_id)?;
+            let managed = manager.get(id)?;
             // Detach leaves the program running: an attached program
             // was never ours, and a launched child is orphaned to a
             // reaper instead of killed. The ws URI rides the answer so
             // the caller can re-attach (or stop it with `stop`).
             managed.session.detach();
             let ws_uri = managed.session.ws_uri().to_owned();
-            manager.sessions.remove(&decoded.session_id);
+            manager.sessions.remove(&id);
             Ok(json!({ "ok": true, "wsUri": ws_uri }))
         }
         DEBUG_STOP => {
             let decoded =
                 serde_json::from_value::<SessionParams>(params.clone()).map_err(invalid)?;
-            let managed = manager.get(decoded.session_id)?;
+            let id = select_session(manager, decoded.session_id)?;
+            let managed = manager.get(id)?;
             managed.session.terminate().map_err(DebugError::Vm)?;
-            manager.sessions.remove(&decoded.session_id);
+            manager.sessions.remove(&id);
             Ok(json!({ "ok": true }))
         }
         DEBUG_STATUS => {
@@ -653,7 +734,8 @@ pub(crate) fn handle(
                     ));
                 }
             };
-            let managed = manager.get(decoded.session_id)?;
+            let id = select_session(manager, decoded.session_id)?;
+            let managed = manager.get(id)?;
             let handle = managed
                 .session
                 .add_breakpoint(BreakpointSpec {
@@ -667,7 +749,8 @@ pub(crate) fn handle(
         DEBUG_BREAKPOINT_REMOVE => {
             let decoded =
                 serde_json::from_value::<BreakpointRemoveParams>(params.clone()).map_err(invalid)?;
-            let managed = manager.get(decoded.session_id)?;
+            let id = select_session(manager, decoded.session_id)?;
+            let managed = manager.get(id)?;
             managed
                 .session
                 .remove_breakpoint(decoded.isolate.as_deref(), &decoded.breakpoint_id)
@@ -683,7 +766,8 @@ pub(crate) fn handle(
                     decoded.mode
                 ))
             })?;
-            let managed = manager.get(decoded.session_id)?;
+            let id = select_session(manager, decoded.session_id)?;
+            let managed = manager.get(id)?;
             managed
                 .session
                 .set_exception_pause_mode(decoded.isolate.as_deref(), mode)
@@ -693,7 +777,8 @@ pub(crate) fn handle(
         DEBUG_RESUME | DEBUG_PAUSE => {
             let decoded =
                 serde_json::from_value::<IsolateParams>(params.clone()).map_err(invalid)?;
-            let managed = manager.get(decoded.session_id)?;
+            let id = select_session(manager, decoded.session_id)?;
+            let managed = manager.get(id)?;
             let result = if method == DEBUG_RESUME {
                 managed.session.resume(decoded.isolate.as_deref())
             } else {
@@ -710,7 +795,8 @@ pub(crate) fn handle(
                     decoded.option
                 ))
             })?;
-            let managed = manager.get(decoded.session_id)?;
+            let id = select_session(manager, decoded.session_id)?;
+            let managed = manager.get(id)?;
             let snapshot = managed
                 .session
                 .step_and_package(decoded.isolate.as_deref(), Some(option))
@@ -720,7 +806,8 @@ pub(crate) fn handle(
         DEBUG_RELOAD => {
             let decoded =
                 serde_json::from_value::<ReloadParams>(params.clone()).map_err(invalid)?;
-            let managed = manager.get(decoded.session_id)?;
+            let id = select_session(manager, decoded.session_id)?;
+            let managed = manager.get(id)?;
             let ok = managed
                 .session
                 .reload_sources(decoded.isolate.as_deref(), decoded.force)
@@ -730,7 +817,8 @@ pub(crate) fn handle(
         DEBUG_RESTART => {
             let decoded =
                 serde_json::from_value::<RestartParams>(params.clone()).map_err(invalid)?;
-            let managed = manager.get(decoded.session_id)?;
+            let id = select_session(manager, decoded.session_id)?;
+            let managed = manager.get(id)?;
             let outcome = managed.session.hot_restart().map_err(DebugError::Vm)?;
             Ok(restart_row(&outcome))
         }
@@ -742,7 +830,8 @@ pub(crate) fn handle(
                     "expression must be a non-empty string".into(),
                 ));
             }
-            let managed = manager.get(decoded.session_id)?;
+            let id = select_session(manager, decoded.session_id)?;
+            let managed = manager.get(id)?;
             let value = match decoded.frame_index {
                 Some(frame_index) => managed.session.evaluate_in_frame(
                     decoded.isolate.as_deref(),
@@ -759,7 +848,8 @@ pub(crate) fn handle(
         DEBUG_SNAPSHOT => {
             let decoded =
                 serde_json::from_value::<SnapshotParams>(params.clone()).map_err(invalid)?;
-            let managed = manager.get(decoded.session_id)?;
+            let id = select_session(manager, decoded.session_id)?;
+            let managed = manager.get(id)?;
             // The event-pump posture: fold what the connection already
             // delivered before reading (`wait_for_pause` polls again in
             // its own loop).
@@ -773,7 +863,8 @@ pub(crate) fn handle(
         DEBUG_EVENTS => {
             let decoded =
                 serde_json::from_value::<EventsParams>(params.clone()).map_err(invalid)?;
-            let managed = manager.get(decoded.session_id)?;
+            let id = select_session(manager, decoded.session_id)?;
+            let managed = manager.get(id)?;
             managed.session.poll_events().map_err(DebugError::Vm)?;
             let batch = managed.session.events_since(decoded.cursor, decoded.limit);
             Ok(events_row(&batch))
@@ -790,7 +881,8 @@ pub(crate) fn handle(
                     )));
                 }
             };
-            let managed = manager.get(decoded.session_id)?;
+            let id = select_session(manager, decoded.session_id)?;
+            let managed = manager.get(id)?;
             managed.session.poll_events().map_err(DebugError::Vm)?;
             let batch = if stderr {
                 managed.session.stderr_since(decoded.cursor, decoded.max_bytes)
@@ -1352,6 +1444,57 @@ mod tests {
         assert_eq!(row["text"], "ok\u{fffd}bad");
         assert_eq!(row["nextCursor"], 9);
         assert_eq!(row["dropped"], 2);
+    }
+
+    /// The sole-session selector: an absent `sessionId` never reaches a
+    /// VM against an empty registry — every session-bearing face answers
+    /// the machine-coded `NO_SESSIONS` miss naming the way out, and an
+    /// explicit id keeps its own `NO_SUCH_SESSION` miss. The several-
+    /// sessions listing needs live sessions and is pinned at the process
+    /// level (the e2e debug leg's ambiguity check).
+    #[test]
+    fn absent_session_id_answers_the_machine_coded_misses() {
+        let mut manager = DebugManager::default();
+        let root = Path::new("/workspace");
+        for (method, params) in [
+            (DEBUG_DETACH, json!({})),
+            (DEBUG_STOP, json!({})),
+            (DEBUG_RESUME, json!({})),
+            (DEBUG_PAUSE, json!({})),
+            (DEBUG_STEP, json!({"option": "into"})),
+            (DEBUG_EVALUATE, json!({"expression": "1"})),
+            (DEBUG_SNAPSHOT, json!({"isolate": "isolates/1"})),
+            (DEBUG_OUTPUT, json!({"stream": "stdout"})),
+            (DEBUG_EVENTS, json!({})),
+            (DEBUG_RELOAD, json!({})),
+            (DEBUG_RESTART, json!({})),
+            (DEBUG_EXCEPTION_PAUSE, json!({"mode": "all"})),
+            (DEBUG_BREAKPOINT_REMOVE, json!({"breakpointId": "breakpoints/1"})),
+            (
+                DEBUG_BREAKPOINT_ADD,
+                json!({"location": {"script": "package:app/main.dart", "line": 1}}),
+            ),
+        ] {
+            let error = handle(&mut manager, method, &params, root)
+                .err()
+                .unwrap_or_else(|| panic!("{method} must not reach a VM with no session"));
+            let (code, message) = error.wire();
+            assert_eq!(code, codes::DEBUG_SESSION, "{method}: {message}");
+            assert!(
+                message.starts_with("DARTQ/DEBUG/NO_SESSIONS: "),
+                "{method}: {message}"
+            );
+            assert!(message.contains("launch or attach"), "{method}: {message}");
+        }
+        // An explicit id keeps its own miss.
+        let (code, message) = handle(&mut manager, DEBUG_RESUME, &json!({"sessionId": 9}), root)
+            .expect_err("miss")
+            .wire();
+        assert_eq!(code, codes::DEBUG_SESSION);
+        assert!(
+            message.starts_with("DARTQ/DEBUG/NO_SUCH_SESSION: "),
+            "{message}"
+        );
     }
 
     /// The dispatch wiring is hermetically exercisable without a live

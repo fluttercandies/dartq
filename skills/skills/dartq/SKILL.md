@@ -69,9 +69,9 @@ under `references/`. Load the one that matches the task:
   `.dart_tool/package_config.json` (run `dart pub get` first). `--fast` and
   `--sdk-path`/`$DART_SDK` control the rest.
 - `debug` is a machine channel like `session`/`events`: one JSON line per
-  call, daemon parameter spellings (`--sessionId`, `--wsUri`), and a
-  domain failure answers one `{"error":…}` line with a `DARTQ/DEBUG/*`
-  machine code at exit 1.
+  call, the sole live session driven by default (`-s <ID>` picks one when
+  several are live), and a domain failure answers one `{"error":…}` line
+  with a `DARTQ/DEBUG/*` machine code at exit 1.
 
 ## Not Sure dartq Is Installed?
 
