@@ -1164,6 +1164,13 @@ impl ParserListener for DiagnoseListener<'_> {
             engine.ctor_new_head_kills.insert(container);
         }
         engine.push_executable_frame(true);
+        // The ctor's own frame depth for the `this`-legality latch: the
+        // body brace is noted against the ctor frame only while no closure
+        // frame sits above it (`ctor_frame_len` equality), so a braceless
+        // closure inside the body cannot fake the initializer window shut
+        // and a braced closure inside an initializer cannot open it.
+        engine.ctor_frame_len = engine.frames.len();
+        engine.ctor_body_open = false;
     }
 
     fn end_constructor(
@@ -1180,6 +1187,8 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let engine = &mut self.engine;
         engine.ctor_pending = None;
+        engine.ctor_body_open = false;
+        engine.ctor_frame_len = 0;
         engine.in_const_ctor = false;
         // A constructor without an initializer list drains its `super.`
         // formals against the unnamed face (`superConstructor` resolves to
@@ -1247,7 +1256,7 @@ impl ParserListener for DiagnoseListener<'_> {
         {
             let text = engine
                 .source
-                .get(head.offset as usize..head.end() as usize)
+                .get(engine.byte_of(head.offset)..engine.byte_of(head.end()))
                 .unwrap_or("");
             let key = if text == "new" || text == engine.strings.resolve(container) {
                 engine.intern("new")
@@ -1829,6 +1838,20 @@ impl ParserListener for DiagnoseListener<'_> {
                         .deferred_bare_rebinds
                         .push((decl.range.offset, expr_row.range, ty));
                 }
+                // The implicit-call twin (`var f = local(args)` over a
+                // promotable bare callee): the send's result is the
+                // promoted callee's `call` member return — a pass-2 face
+                // (the callee's flow read re-decides there), so the rebind
+                // defers like the bare read's.
+                if let Some(expr_row) = engine.rows.get(expr)
+                    && expr_row.intent == Intent::Invoke
+                    && matches!(expr_row.shape, RowShape::Bare(_))
+                    && let Some(decl) = engine.locals.last().filter(|decl| decl.name == name)
+                {
+                    engine
+                        .deferred_call_rebinds
+                        .push((decl.range.offset, expr_row.range, ty));
+                }
                 // The promotion face rides the flow layer's declared-type
                 // slot (#2140): a name-level type with no written
                 // arguments stages as the flow declared type, keyed on
@@ -2198,6 +2221,7 @@ impl ParserListener for DiagnoseListener<'_> {
                         // `Named` (rule 0c), so the written signature is
                         // the only callable record.
                         engine.fn_var_sigs.insert(name, sig.clone());
+                        engine.fn_param_sigs.insert(name, sig.clone());
                         if let Some(exec) = engine.frames.last().and_then(|f| match &f.kind {
                             FrameKind::Executable { ret: Some(ret), .. } => Some(ret.name),
                             _ => None,
@@ -3092,7 +3116,7 @@ impl ParserListener for DiagnoseListener<'_> {
                 engine.check_super_constructor(candidate.container, candidate.name, candidate.span);
             } else if engine
                 .source
-                .get(candidate.span.end() as usize..)
+                .get(engine.byte_of(candidate.span.end())..)
                 .is_some_and(|after| after.trim_start().starts_with('='))
             {
                 let reports = match engine.walk_super(candidate.container, candidate.name) {
@@ -4976,7 +5000,43 @@ impl ParserListener for DiagnoseListener<'_> {
             return;
         };
         let merged = SwitchTracker::collapse(frame.leaves, frame.or_ops);
+        // The whole-pattern null-check binder stagings (bound inside the
+        // engine borrow below, staged into the flow's inferred-local seam
+        // after it ends).
+        let mut staged_null_check: Vec<(String, SourceRange)> = Vec::new();
         if engine.switch.pattern_stack.is_empty() {
+            // The whole-pattern null-check binders take their face here:
+            // the matched type's non-null projection — the open switch
+            // context's scrutinee face, read before an if-case window
+            // closes with it (`if (expr?.f case final x?)` binds `x` to
+            // the chain's non-null element face).
+            let candidates = std::mem::take(&mut engine.null_check_binder_candidates);
+            // A record-slot binder (`case (final x?, _)` — the destructure
+            // path owns its face) never takes the scrutinee's: drop the
+            // names queued for the record bind.
+            let is_record_slot = |name: StringId| {
+                engine
+                    .pattern_bind_vars
+                    .iter()
+                    .any(|(queued, _)| *queued == name)
+            };
+            let candidates: Vec<(StringId, SourceRange)> = candidates
+                .into_iter()
+                .filter(|(name, _)| !is_record_slot(*name))
+                .collect();
+            if let (false, Some(mut scrutinee)) =
+                (candidates.is_empty(), engine.switch.switches.last().map(|c| c.scrutinee))
+                && let Ty::Named { nullable, .. } = &mut scrutinee
+            {
+                *nullable = false;
+                if let Ty::Named { name, .. } = scrutinee {
+                    let lexeme = engine.strings.resolve(name).to_string();
+                    for (name, span) in candidates {
+                        engine.bind_var_type(name, scrutinee);
+                        staged_null_check.push((lexeme.clone(), span));
+                    }
+                }
+            }
             // A root pattern: only an open case header's coverage feeds the
             // exhaustiveness walk. An if-case root closes its own window
             // uncaptured (an if-case is no coverage question — the
@@ -4990,6 +5050,17 @@ impl ParserListener for DiagnoseListener<'_> {
             }
         } else if let Some(parent) = engine.switch.pattern_stack.last_mut() {
             parent.leaves.push(merged);
+        }
+        for (lexeme, span) in staged_null_check {
+            let base = self.flow().intern_name(&lexeme);
+            self.flow().stage_inferred_local(
+                span.offset,
+                FlowTy {
+                    base: FlowBase::Name(base),
+                    nullable: false,
+                },
+                Vec::new(),
+            );
         }
     }
 
@@ -5073,12 +5144,17 @@ impl ParserListener for DiagnoseListener<'_> {
         // matched arm non-null and joins the null arm into the unmatched
         // chain (official `_handleNullCheckPattern`).
         self.flow().handle_null_check_pattern(question);
-        // Only a null-check directly wrapping a latched variable (the
-        // shorthand `:final x?`) carries the non-null projection to the
-        // field boundary; a wrapper on a completed field leaves no live
-        // latch, and a stale bit must not leak into the next field.
         self.engine.pending_pattern_null_check =
             self.engine.last_pattern_variable.map(|(name, _)| name);
+        // A type-free binder the null-check wrapped is a WHOLE-pattern
+        // binder candidate (`case final transformer?` over a member-chain
+        // scrutinee): its face is the matched type's non-null projection,
+        // applied at the root pattern's close — the object-pattern
+        // shorthand path (`:final x?`) claims its binder at the field
+        // boundary first and the claim retracts the candidate.
+        if let Some(pair) = self.engine.last_pattern_variable {
+            self.engine.null_check_binder_candidates.push(pair);
+        }
         // `p?` = the subpattern space ∩ nonNull (official
         // `createNullCheckSpace`, upstream Dart SDK source,
         // pkg/_fe_analyzer_shared/lib/src/exhaustiveness/shared.dart:780-786;
@@ -5385,6 +5461,15 @@ impl ParserListener for DiagnoseListener<'_> {
             let required = Ty::named(head);
             engine.check_pattern_never_matches(first_identifier.range, required);
         }
+        // A case/if-case window's object head latches for the logical-and
+        // binder face (`AsyncData() && final transformer` — the binder
+        // takes the head's type, the matched-type binding for the
+        // and-pattern's right operand).
+        if head.is_some()
+            && (engine.switch.case_sink_open || !engine.switch.switches.is_empty())
+        {
+            engine.last_case_object_head = head;
+        }
         let mut staged_binders: Vec<(Ty, SourceRange)> = Vec::new();
         let fields = engine
             .switch
@@ -5415,13 +5500,29 @@ impl ParserListener for DiagnoseListener<'_> {
                     && engine
                         .local_declared_ty(binder)
                         .map_or(true, |slot| slot == Ty::UNKNOWN)
-                    && let Some(mut ty) = engine.object_pattern_binder_ty(head, getter)
                 {
-                    if field.binder_non_null && let Ty::Named { nullable, .. } = &mut ty {
-                        *nullable = false;
+                    // The field path owns this binder: any whole-pattern
+                    // null-check candidate the `?` latched for it retracts
+                    // (the property face binds, never the scrutinee).
+                    engine
+                        .null_check_binder_candidates
+                        .retain(|(name, _)| *name != binder);
+                    if let Some(mut ty) = engine.object_pattern_binder_ty(head, getter) {
+                        if field.binder_non_null && let Ty::Named { nullable, .. } = &mut ty {
+                            *nullable = false;
+                        }
+                        engine.bind_var_type(binder, ty.clone());
+                        staged_binders.push((ty, binder_span));
+                    } else {
+                        // The shorthand's variable is a LOCAL even when its
+                        // getter face stays unresolvable (parametric return,
+                        // unindexed head): the name shadows any implicit-this
+                        // getter for the rest of the body — the R53
+                        // `$ResultError(:final stackTrace)` face — while the
+                        // unknown slot keeps member reads on the binder
+                        // under-reported.
+                        engine.bind_var_type(binder, Ty::UNKNOWN);
                     }
-                    engine.bind_var_type(binder, ty.clone());
-                    staged_binders.push((ty, binder_span));
                 }
             }
         }
@@ -5571,17 +5672,53 @@ impl ParserListener for DiagnoseListener<'_> {
                     });
                 }
                 ty => {
+                    // The logical-and binder's staging pair (bound inside
+                    // the engine borrow below, staged into the flow's
+                    // inferred-local seam after it ends).
+                    let mut staged_and: Option<(StringId, SourceRange)> = None;
                     if let Some(ty) = ty {
                         engine.bind_var_type(name, ty);
                     } else if !in_assignment_pattern {
+                        // A type-free binder on the RIGHT operand of a
+                        // logical-and inside a case window (`AsyncData() &&
+                        // final transformer`): the matched type is the left
+                        // object pattern's head — the oracle binds the
+                        // variable to it (the and-pattern's variable keeps
+                        // the narrowed face for the arm's member reads).
+                        let and_operand = engine
+                            .switch
+                            .pattern_stack
+                            .last()
+                            .is_some_and(|frame| frame.binary == Some(false));
+                        if and_operand
+                            && let Some(head) = engine.last_case_object_head.take()
+                            && engine
+                                .local_declared_ty(name)
+                                .map_or(true, |slot| slot == Ty::UNKNOWN)
+                        {
+                            engine.bind_var_type(name, Ty::named(head));
+                            staged_and = Some((head, variable.range));
+                        }
                         // A bare pattern variable (`(a, b)`'s `a`): its type
                         // is the scrutinee record's slot — recorded for the
                         // declaration-statement bind ([`Self::
                         // destructure_record`]). Assignment patterns rebind
                         // existing locals and never enter the list.
-                        engine.pattern_bind_vars.push(name);
+                        engine.pattern_bind_vars.push((name, variable.range));
                     }
                     // A type-free variable covers its context: no leaf.
+                    if let Some((head, span)) = staged_and {
+                        let lexeme = self.engine.strings.resolve(head).to_string();
+                        let base = self.flow().intern_name(&lexeme);
+                        self.flow().stage_inferred_local(
+                            span.offset,
+                            FlowTy {
+                                base: FlowBase::Name(base),
+                                nullable: false,
+                            },
+                            Vec::new(),
+                        );
+                    }
                 }
             }
         } else {
@@ -5687,6 +5824,10 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().end_case_expression(case_kw, when, colon);
 
         let engine = &mut self.engine;
+        // The clause's pattern window closed: its object head and any
+        // unapplied null-check candidates never cross into the next clause.
+        engine.last_case_object_head = None;
+        engine.null_check_binder_candidates.clear();
         if engine.const_capture.top_is_constant_pattern()
             && let Some(node) = engine.const_capture.close_constant_pattern()
         {
@@ -6076,7 +6217,9 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().handle_literal_bool(token);
 
         let engine = &mut self.engine;
-        if engine.const_capture.top_is_constant_pattern() && engine.ur_arg_base.is_empty() {
+        if engine.const_capture.top_is_constant_pattern()
+            && (engine.ur_arg_base.is_empty() || engine.switch.case_sink_open)
+        {
             let is_true = engine.text_of(token) == Some("true");
             engine.switch.pending_const = Some(Restriction::BoolValue(is_true));
             let ty = Ty::named(engine.members.primitive_ids[3]);
@@ -6090,7 +6233,17 @@ impl ParserListener for DiagnoseListener<'_> {
         self.flow().handle_literal_null(token);
 
         let engine = &mut self.engine;
-        if engine.const_capture.top_is_constant_pattern() && engine.ur_arg_base.is_empty() {
+        // The `ur_arg_base` gate rejects literals that are plain ARGUMENTS
+        // (a constant-pattern window never opens for those) — but a
+        // switch-expression case head parsing inside an open argument list
+        // (`enclosingPrefix: switch (name) { var n? => .., null => .. }`)
+        // is a genuine pattern head: the open case-header sink proves it
+        // (library_analyzer.dart:937's `null` arm, whose Null space the
+        // plain gate starved to Unknown and false-positived the switch
+        // non-exhaustive).
+        if engine.const_capture.top_is_constant_pattern()
+            && (engine.ur_arg_base.is_empty() || engine.switch.case_sink_open)
+        {
             engine.switch.pending_const = Some(Restriction::Null);
             engine.const_fold.arm(Ty::Null, token.range);
         }
@@ -7373,6 +7526,9 @@ impl ParserListener for DiagnoseListener<'_> {
         kind: FormalParameterKind,
         member_kind: dartq_parser::MemberKind,
     ) {
+        // An unnamed GFT formal's pending type claims at its own close (a
+        // named formal's identifier event already claimed it — no-op).
+        self.engine.fn_capture_formal_unnamed();
         // The inferred-formal face (`_inferFormalParameters`'s flow half):
         // an implicitly typed formal of an open function literal binds its
         // context schema entry in `var_types` at the name event, but the
@@ -8218,8 +8374,38 @@ impl ParserListener for DiagnoseListener<'_> {
         // The flat record destructure bind: `final (a, b) = pair()` — the
         // pattern bound no types of its own, but the scrutinee's record
         // carries them; the name-level locals take the positional slots.
-        self.engine
-            .destructure_record(equals.range.end(), semicolon.range.offset);
+        // The flow-side staging rides the same bind (the destructured
+        // local's VarMeta declared raw-unknown; the element face reaches
+        // it through `inferred_locals`, the #2567 seam).
+        for (name, span, ty) in
+            self.engine
+                .destructure_record(equals.range.end(), semicolon.range.offset)
+        {
+            if let Ty::Named {
+                name: head,
+                nullable,
+                ..
+            } = ty
+            {
+                let lexeme = self.engine.strings.resolve(head).to_string();
+                let base = self.flow().intern_name(&lexeme);
+                self.flow().stage_inferred_local(
+                    span.offset,
+                    FlowTy {
+                        base: FlowBase::Name(base),
+                        nullable,
+                    },
+                    Vec::new(),
+                );
+                dq_probe!(
+                    "[destructure-stage] name={} off={} ty={}?{}",
+                    self.engine.strings.resolve(name),
+                    span.offset,
+                    lexeme,
+                    nullable
+                );
+            }
+        }
     }
 
     fn handle_recoverable_error(&mut self, p0: Message, p1: Token, p2: Token) {

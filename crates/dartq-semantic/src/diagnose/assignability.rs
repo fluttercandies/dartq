@@ -4,7 +4,9 @@ use super::*;
 impl<'a> Engine<'a> {
     pub(crate) fn typed_list_literal_ty(&mut self, left: Token) -> Option<Ty> {
         let bytes = self.source.as_bytes();
-        let mut cursor = left.range.offset as usize;
+        // `left.range.offset` is a UTF-16 offset: convert before walking
+        // source bytes so a wide char upstream cannot desync the group probe.
+        let mut cursor = self.byte_of(left.range.offset);
         while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
             cursor -= 1;
         }
@@ -48,7 +50,9 @@ impl<'a> Engine<'a> {
     /// keeps the literal's opaque row.
     pub(crate) fn typed_set_or_map_literal_ty(&mut self, left: Token) -> Option<(u32, Ty)> {
         let bytes = self.source.as_bytes();
-        let mut cursor = left.range.offset as usize;
+        // `left.range.offset` is a UTF-16 offset: convert before walking
+        // source bytes (the same conversion the list face applies).
+        let mut cursor = self.byte_of(left.range.offset);
         while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
             cursor -= 1;
         }
@@ -84,7 +88,7 @@ impl<'a> Engine<'a> {
         let mut seg_start = head as usize + 1;
         let mut i = seg_start;
         let mut bracket = 0usize;
-        let group_end = left.range.offset as usize;
+        let group_end = self.byte_of(left.range.offset);
         while i < group_end {
             match bytes[i] {
                 b'(' | b'[' | b'{' => bracket += 1,
@@ -118,12 +122,12 @@ impl<'a> Engine<'a> {
         let args: Vec<Ty> = segments
             .iter()
             .map(|(start, end)| {
+                // Segment bounds are bytes; `type_uses` ranges are UTF-16.
+                let (start16, end16) = (self.utf16_of(*start), self.utf16_of(*end));
                 self.type_uses
                     .iter()
                     .rev()
-                    .find(|(range, _)| {
-                        range.offset as usize >= *start && range.end() as usize <= *end
-                    })
+                    .find(|(range, _)| range.offset >= start16 && range.end() <= end16)
                     .copied()
             })
             .collect::<Option<Vec<_>>>()?
@@ -155,10 +159,70 @@ impl<'a> Engine<'a> {
     /// literals infer, an unresolvable element type leaves the row to its
     /// own face, and untypeable elements stay silent (the under-report
     /// posture every assignability face shares).
+    /// The element face a `...spread` operand's receiver carries: an
+    /// `Iterable`-family head answers its first written argument, and a
+    /// head whose superchain (extends/`with`/implements, name-level)
+    /// REACHES one of the iterable heads answers the receiver's first
+    /// argument the same way — `NodeListImpl<AnnotationImpl> implements
+    /// List<AnnotationImpl>` (ast.dart's `..._metadata` into
+    /// `<AstNode>[]`) keeps `AnnotationImpl`, the element the clause's
+    /// own parameter spells. The clause's written arguments live only in
+    /// the source bytes; the first-position substitution is exact for
+    /// every single-parameter wrapper chain and under-reports the rest.
+    fn spread_element_face(&mut self, head: StringId, args: ArgListId) -> Option<Ty> {
+        let iterable_heads = [
+            self.intern("Iterable"),
+            self.intern("List"),
+            self.intern("Set"),
+        ];
+        let first = || {
+            self.boundary
+                .pool()
+                .get(args)
+                .first()
+                .copied()
+                .filter(|ty| *ty != Ty::UNKNOWN)
+        };
+        if iterable_heads.contains(&head) {
+            return first();
+        }
+        let mut queue: Vec<StringId> = vec![head];
+        let mut seen: FxHashSet<StringId> = FxHashSet::from_iter([head]);
+        while let Some(current) = queue.pop() {
+            let Some((decl, _)) = crate::library::resolve_container(
+                self.graph,
+                self.namespaces,
+                self.index,
+                self.lib,
+                self.file,
+                current,
+            ) else {
+                continue;
+            };
+            let supers = decl
+                .superclass
+                .into_iter()
+                .chain(decl.with_clause.iter().copied())
+                .chain(decl.implements_clause.iter().copied());
+            for next in supers {
+                if iterable_heads.contains(&next) {
+                    return first();
+                }
+                if seen.insert(next) {
+                    queue.push(next);
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn check_list_literal_elements(&mut self, left: Token, right: Token) {
         let bytes = self.source.as_bytes();
         // A typed literal's `<` group sits immediately before the `[`.
-        let mut cursor = left.range.offset as usize;
+        // `left`/`right` ranges are UTF-16: convert before walking bytes so a
+        // wide char anywhere upstream cannot desync the walk (or slice
+        // mid-character at the element segmentation — #2594).
+        let mut cursor = self.byte_of(left.range.offset);
         while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
             cursor -= 1;
         }
@@ -194,12 +258,12 @@ impl<'a> Engine<'a> {
             return;
         }
         let head_start = group_open;
+        // The walked group bounds are bytes; `type_uses` ranges are UTF-16.
+        let (head_start16, group_close16) = (self.utf16_of(head_start), self.utf16_of(cursor - 1));
         let Some((name_range, name)) = self
             .type_uses
             .iter()
-            .filter(|(range, _)| {
-                range.offset as usize >= head_start && range.end() as usize <= cursor - 1
-            })
+            .filter(|(range, _)| range.offset >= head_start16 && range.end() <= group_close16)
             .min_by_key(|(range, _)| range.offset)
             .copied()
         else {
@@ -219,8 +283,8 @@ impl<'a> Engine<'a> {
         // Top-level element segments: comma splits at bracket depth 0,
         // string-literal contents skipped.
         let mut segments: Vec<(usize, usize)> = Vec::new();
-        let mut seg_start = left.range.end() as usize;
-        let end = right.range.offset as usize;
+        let mut seg_start = self.byte_of(left.range.end());
+        let end = self.byte_of(right.range.offset);
         let mut i = seg_start;
         let mut depth = 0usize;
         while i < end {
@@ -293,26 +357,31 @@ impl<'a> Engine<'a> {
                     window_start = start as u32 + j as u32 + 1;
                 }
             }
-            let Some(row) = self.rows.iter().rev().find(|row| {
-                row.ty != Ty::UNKNOWN
-                    && row.range.offset >= window_start
-                    && row.range.end() <= stop as u32
-            }) else {
+            // Row ranges are UTF-16; the window/segment bounds are bytes.
+            let (window16, stop16) = (self.utf16_of(window_start as usize), self.utf16_of(stop));
+            let Some((row_ty, row_range)) = self
+                .rows
+                .iter()
+                .rev()
+                .find(|row| {
+                    row.ty != Ty::UNKNOWN
+                        && row.range.offset >= window16
+                        && row.range.end() <= stop16
+                })
+                .map(|row| (row.ty, row.range))
+            else {
                 continue;
             };
-            let mut element_ty = row.ty;
+            let mut element_ty = row_ty;
             if spread
-                && let Ty::Named { name, args, .. } = row.ty
-                && (name == self.intern("List") || name == self.intern("Iterable"))
-                && let Some(first) = self.boundary.pool().get(args).first().copied()
-                && first != Ty::UNKNOWN
+                && let Ty::Named { name, args, .. } = row_ty
+                && let Some(first) = self.spread_element_face(name, args)
             {
                 element_ty = first;
             }
             if self.assignable(element_ty, declared, false) == Some(false) {
                 let (a0, a1) = (self.ty_display(element_ty), self.ty_display(declared));
-                let range = row.range;
-                self.emit(SemanticCode::ListElementTypeNotAssignable, range, &a0, &a1);
+                self.emit(SemanticCode::ListElementTypeNotAssignable, row_range, &a0, &a1);
             }
         }
     }
@@ -825,19 +894,36 @@ impl<'a> Engine<'a> {
                         // super property lookup starts past the enclosing
                         // class's own member map, the same face
                         // `walk_from(skip_own)` owns for `super.m` formals).
+                        //
+                        // Otherwise the receiver re-derives against the
+                        // flow's promoted read first (#1465 — the same
+                        // re-decision `resolve_member_row` makes for the
+                        // member verdict): a read whose receiver promoted
+                        // (`type is TypeParameterType` arm) answers the
+                        // member's face on the PROMOTED spelling
+                        // (`TypeParameterElement`, never the declared
+                        // face's wider `Element?`). The promoted walk wins
+                        // only when it finds an accessor — every other
+                        // outcome (no promotion, an unresolvable promoted
+                        // head, a method-only hit) keeps the declared
+                        // container's own walk, so the re-derivation can
+                        // never widen or lose a face the declared walk
+                        // answered.
                         let found = if matches!(recv, Receiver::Super { .. }) {
                             self.walk_from(container, row.name, true)
                         } else {
                             self.walk_members(container, row.name)
                         };
+                        let recv = recv.clone();
                         match found {
                             Walk::Found(entry)
                                 if matches!(entry.kind, MemberKind::Getter | MemberKind::Field) =>
                             {
-                                self.instantiate_accessor_static(container, recv, answer(&entry))
+                                self.instantiate_accessor_static(container, &recv, answer(&entry))
                             }
                             _ => self
-                                .core_accessor_read_ty(row, container, recv)
+                                .core_accessor_read_ty(row, container, &recv)
+                                .or_else(|| self.core_element_read_ty(row, container, &recv))
                                 .unwrap_or_else(|| self.object_instance_read_ty(row)),
                         }
                     }
@@ -881,6 +967,30 @@ impl<'a> Engine<'a> {
                 .borrow_mut()
                 .named(name, false, std::slice::from_ref(&elem)),
         )
+    }
+
+    /// The element-getter twin of [`Self::core_accessor_read_ty`]:
+    /// `Iterable<E>.first` answers `E` verbatim (iterable.dart), so a
+    /// `??=` right side over a `List<Node>.last` read types `Node` and
+    /// the write promotes the target non-null (treebuilder.dart's
+    /// `parent ??= openElements.last` — the oracle's silent `.nodes`
+    /// read after it).
+    fn core_element_read_ty(&self, row: &Row, container: StringId, recv: &Receiver) -> Option<Ty> {
+        let crate::member_face::CoreRet::ElemArg(index) =
+            crate::member_face::core_member_return(
+                self.strings.resolve(container),
+                self.strings.resolve(row.name),
+            )?
+        else {
+            return None;
+        };
+        let Receiver::Typed { ty, .. } = recv else {
+            return None;
+        };
+        let Ty::Named { args, .. } = ty else {
+            return None;
+        };
+        self.boundary.pool().get(*args).get(index as usize).copied()
     }
 
     /// Instantiates a resolved accessor's declared type with the
@@ -1131,6 +1241,11 @@ impl<'a> Engine<'a> {
                             .named(name, false, std::slice::from_ref(&elem))
                     })
                 }),
+                crate::member_face::CoreRet::ElemArg(index) => receiver_args().and_then(|args| {
+                    // The receiver's argument VERBATIM — `Iterable<E>.first`
+                    // answers `E` (iterable.dart's `E get first`).
+                    self.boundary.pool().get(args).get(index as usize).copied()
+                }),
             }
             .unwrap_or(Ty::UNKNOWN);
         }
@@ -1190,6 +1305,19 @@ impl<'a> Engine<'a> {
                     if let Some(sig) = self.alias_fn_sig(*name) {
                         return sig.return_ty;
                     }
+                }
+                // An implicit-call local (`spec(context)` over a local
+                // promoted to a class carrying `call`): the invocation's
+                // result is the `call` member's return on the callee's
+                // FLOW read type — the promoted spelling at the callee's
+                // own span (a `switch (x) case XPathExpression():` arm's
+                // `x(context)` answers `XPathSequence`, not the declared
+                // `Object`); no flow row or no `call` member keeps the
+                // unknown under-report posture.
+                if let Some(read) = self.read_type_at(row.range)
+                    && let Some((_, call_ret, _)) = self.implicit_call_face(read)
+                {
+                    return call_ret;
                 }
                 return Ty::UNKNOWN;
             }
@@ -2883,6 +3011,23 @@ impl<'a> Engine<'a> {
         }
         let world = self.name_world();
         let value = NameTy::from_semantic(ctx.scrutinee);
+        dq_probe!(
+            "[switch] scrutinee={} value={:?} cases={} expr={} switch_kw={}",
+            self.ty_display(ctx.scrutinee),
+            value,
+            ctx.cases.len(),
+            ctx.is_expression,
+            ctx.switch_kw.offset
+        );
+        for (i, c) in ctx.cases.iter().enumerate() {
+            dq_probe!(
+                "[switch]   case[{}] space={:?} guarded={} anchor={}",
+                i,
+                c.space,
+                c.guarded,
+                c.anchor.offset
+            );
+        }
         let cases: Vec<Case<NameTy>> = ctx
             .cases
             .iter()
@@ -3434,8 +3579,18 @@ impl<'a> Engine<'a> {
             if from_nullable && !to_nullable {
                 return Some(false);
             }
-            let pool = self.boundary.pool();
-            let (from, to) = (pool.record_shape(from_shape), pool.record_shape(to_shape));
+            // Own the shapes before recursing: the pool guard borrows the
+            // args RefCell, and the field checks below recurse into
+            // `assignable`, whose alias chase re-enters the pool through
+            // `intern_list`'s `borrow_mut` — a guard held across the
+            // recursion panics the cell (#2594's live-repro follow-on).
+            let (from, to) = {
+                let pool = self.boundary.pool();
+                (
+                    pool.record_shape(from_shape).clone(),
+                    pool.record_shape(to_shape).clone(),
+                )
+            };
             if from.positional.len() != to.positional.len() || from.named.len() != to.named.len() {
                 return Some(false);
             }

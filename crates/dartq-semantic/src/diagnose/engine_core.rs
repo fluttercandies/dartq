@@ -154,12 +154,14 @@ impl<'a> Engine<'a> {
             method_exec_bounds: FxHashMap::default(),
             pending_exec_is_method: false,
             fn_var_sigs: FxHashMap::default(),
+            fn_param_sigs: FxHashMap::default(),
             fn_formal_sigs: FxHashMap::default(),
             arg_sigs: FxHashMap::default(),
             closure_caps: Vec::new(),
             capture_formal_required: false,
             fn_formal_named_section: false,
             fn_type_capture: Vec::new(),
+            fn_nested_unclaimed: false,
             fn_type_stash: None,
             call_type_args: Vec::new(),
             call_args_capture: None,
@@ -209,6 +211,7 @@ impl<'a> Engine<'a> {
             pending_matched: Vec::new(),
             pending_switch_coverings: Vec::new(),
             deferred_var_rebinds: Vec::new(),
+            deferred_call_rebinds: Vec::new(),
             deferred_bare_rebinds: Vec::new(),
             deferred_invocation_faces: Vec::new(),
             rebound_locals: FxHashMap::default(),
@@ -244,6 +247,8 @@ impl<'a> Engine<'a> {
             pattern_bind_dirty: false,
             last_pattern_variable: None,
             pending_pattern_null_check: None,
+            last_case_object_head: None,
+            null_check_binder_candidates: Vec::new(),
             pending_pattern_getters: Vec::new(),
             open_exec_site: None,
             decl_sites: Vec::new(),
@@ -301,6 +306,8 @@ impl<'a> Engine<'a> {
             promoted_recv_reads: Vec::new(),
             inferred_formal_containers: FxHashSet::default(),
             inferred_recv_used_members: FxHashSet::default(),
+            closure_formal_names: FxHashSet::default(),
+            unresolved_member_rows: Vec::new(),
             extension_nullable_resolved: FxHashSet::default(),
             prop_promotion_rows: PropPromotionStaging::default(),
             member_reads: Vec::new(),
@@ -327,6 +334,8 @@ impl<'a> Engine<'a> {
             field_read_rows: FxHashMap::default(),
             statement_discarded_rows: FxHashSet::default(),
             ctor_pending: None,
+            ctor_body_open: false,
+            ctor_frame_len: 0,
             open_toplevel_site: None,
             open_member_setter: false,
             open_member_static: false,
@@ -379,8 +388,13 @@ impl<'a> Engine<'a> {
     /// comments ride along — a documented divergence.
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     pub(crate) fn trimmed_span(&self, start: u32, end_excl: u32) -> Option<SourceRange> {
-        let start = start as usize;
-        let end = (end_excl as usize).min(self.source.len());
+        // Both bounds arrive as UTF-16 offsets (row/token spans) while the
+        // trim walk reads source bytes: convert at the boundary — a wide
+        // char anywhere before the span would otherwise desync the slice (or
+        // cut mid-character, #2594) — and convert the trimmed bounds back so
+        // the returned span keeps the external UTF-16 convention.
+        let start = self.byte_of(start);
+        let end = self.byte_of(end_excl).min(self.source.len());
         if start >= end {
             return None;
         }
@@ -392,9 +406,11 @@ impl<'a> Engine<'a> {
         }
         // `trimmed` keeps the leading run `offset` already skipped, so the
         // length drops it too — the span is both-ends trimmed.
+        let offset = self.utf16_of(start + lead);
+        let end16 = self.utf16_of(start + trimmed.len());
         Some(SourceRange {
-            offset: (start + lead) as u32,
-            length: (trimmed.len() - lead) as u32,
+            offset,
+            length: end16.saturating_sub(offset),
         })
     }
 
@@ -458,6 +474,14 @@ impl<'a> Engine<'a> {
     /// template with the row's name (the FAM13 context faces and the catch
     /// `on`-type face — `error_converter.dart`'s correction attachments).
     pub(crate) fn emit_corrected(&mut self, code: SemanticCode, range: SourceRange, a0: &str) {
+        dq_probe!(
+            "[emit-corrected] {} file={:?} at {}:{} a0={}",
+            code.code_info().name,
+            self.file,
+            range.offset,
+            range.length,
+            a0
+        );
         let correction = code.correction_message(a0);
         self.report.diagnostics.push(Diagnostic::new(
             code.severity(),
@@ -745,19 +769,36 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let staged_promotion = promotions.promoted(check.range);
+            // The invalid-type vacuous arm (subtype.dart's 0c case): either
+            // side's head resolving nowhere makes every assignability ask
+            // vacuous — the flow's unresolved-tested is-test promotes the
+            // operand TO the tested spelling (`uriSource is
+            // InSummarySource` over the failed package:front_end import
+            // promotes to `InSummarySource`, and the oracle's argument row
+            // stays silent), and a check against an unresolved formal head
+            // is the same non-question.
+            let invalid_face = matches!(staged_promotion, Some(ty) if self.is_invalid_ty(ty));
+            if invalid_face {
+                dq_probe!(
+                    "[invalid-skip] offset={} from={}",
+                    check.range.offset,
+                    self.ty_display(check.from)
+                );
+                continue;
+            }
             // An `as` expression's static type is its resolved target — a
             // staged check anchored inside a cast's whole span reads the
             // rewritten face outright (`g(v?.element as El)` offers `El`,
             // never the operand's nullable parse-time capture); the cast
             // outranks every promotion the operand might carry.
-            let from = if let Some(ty) = self
+            let cast_ty = self
                 .cast_rewrites
                 .iter()
                 .find(|(span, _)| {
                     span.offset <= check.range.offset && check.range.end() <= span.end()
                 })
-                .map(|(_, ty)| *ty)
-            {
+                .map(|(_, ty)| *ty);
+            let mut from = if let Some(ty) = cast_ty {
                 ty
             } else {
                 match staged_promotion {
@@ -775,6 +816,85 @@ impl<'a> Engine<'a> {
                         .unwrap_or(check.from),
                 }
             };
+            // A record-literal operand keeps its per-ELEMENT promotions: the
+            // whole-record span stages no promotion of its own (the record is
+            // not a variable read), but each element's read inside the span
+            // does (`featureSet != null && languageVersion != null` then
+            // `return (featureSet, languageVersion)` — file_state.dart's two
+            // return rows). Rebuild the shape by substituting, in source
+            // order, each element whose read inside the range carries a
+            // promotion that is exactly the element's non-null form — the
+            // null-guard/bang face, never a shape change.
+            if cast_ty.is_none()
+                && staged_promotion.is_none()
+                && let Ty::Record { shape, nullable } = from
+            {
+                let (positional, named) = {
+                    let pool = self.boundary.pool();
+                    let data = pool.record_shape(shape);
+                    (
+                        data.positional.to_vec(),
+                        data.named.iter().map(|&(n, t)| (n, t)).collect::<Vec<_>>(),
+                    )
+                };
+                let element_count = positional.len() + named.len();
+                let mut inside: Vec<Ty> = Vec::with_capacity(element_count);
+                // The window opens 64 bytes before the staged span: a
+                // `return (a, b);` stages the RECORD's own span, and the
+                // first element's read sits a `return (` ahead of it — the
+                // exact-non-null-form guard below rejects any stray
+                // promotion the wider window lets in.
+                let window_start = check.range.offset.saturating_sub(64);
+                for (range, ty) in &promotions.rows {
+                    if range.offset >= window_start
+                        && range.end() <= check.range.end()
+                        && *ty != Ty::Unknown
+                    {
+                        inside.push(*ty);
+                    }
+                }
+                // Pair by exact non-null form, not by position: a literal
+                // element (`(cachedStmt, true)`'s `true`) emits no
+                // promotion row, so a strict count match would refuse the
+                // rebuild; each nullable element whose non-null form the
+                // window saw takes it (distinct-element records — the
+                // oracle's own per-element reads).
+                if !inside.is_empty() {
+                    let mut positional = positional;
+                    let mut named = named;
+                    let mut changed = false;
+                    for element in positional.iter_mut() {
+                        if let Ty::Named { nullable: true, .. } = element {
+                            let promoted = Self::non_null_form(*element);
+                            if &promoted != element && inside.contains(&promoted) {
+                                *element = promoted;
+                                changed = true;
+                            }
+                        }
+                    }
+                    for (_, element) in named.iter_mut() {
+                        if let Ty::Named { nullable: true, .. } = element {
+                            let promoted = Self::non_null_form(*element);
+                            if &promoted != element && inside.contains(&promoted) {
+                                *element = promoted;
+                                changed = true;
+                            }
+                        }
+                    }
+                    if changed {
+                        from =
+                            self.boundary
+                                .args
+                                .borrow_mut()
+                                .record(&positional, &named, nullable);
+                        dq_probe!(
+                            "[record-rebuild] offset={} from={} element_promotions_applied",
+                            check.range.offset,
+                            self.ty_display(from)
+                        );
+                    }
+                }
+            }
             if matches!(check.kind, StagedKind::NeverReceiver) {
                 // One row at the receiver span per `Never` receiver
                 // (`receiverOfTypeNever`). The join above replaced the type
@@ -836,6 +956,17 @@ impl<'a> Engine<'a> {
                 // question undecidable — suppress (under-report).
                 continue;
             }
+            dq_probe!(
+                "[staged-reject] file={:?} offset={} from={} to={} staged_promotion={:?} subst_hit={}",
+                self.file,
+                check.range.offset,
+                self.ty_display(from),
+                self.ty_display(check.to),
+                staged_promotion.map(|t| self.ty_display(t)),
+                self.promotable_field_substitution(props, check.range, check.from)
+                    .map(|t| self.ty_display(t))
+                    .is_some()
+            );
             let (code, a2) = match check.kind {
                 // Routed by the early blocks above; the arms only keep the
                 // match total.
@@ -1403,6 +1534,12 @@ impl<'a> Engine<'a> {
         if operand != cast {
             return;
         }
+        dq_probe!(
+            "[unnecessary-cast] offset={} operand={} cast={}",
+            at.offset,
+            self.ty_display(operand),
+            self.ty_display(cast)
+        );
         if let Ty::Named { name, .. } = cast {
             // The bare `Function` target keeps its cast (the port's
             // `is_bare_function_id` arm).
@@ -2097,21 +2234,163 @@ impl<'a> Engine<'a> {
     /// initializer keeps (binding a nullable inference fires the
     /// return/unchecked verdicts before the write-side re-decides run, the
     /// `[]`-fold arm's rule below the declaration bind).
-    pub(crate) fn ifnull_initializer_ty(&mut self, mark: usize) -> Option<Ty> {
-        if self.rows.len() != mark + 2 {
-                return None;
+    /// The byte position of the `??` operator that directly follows a
+    /// row's effective expression end — `None` when no `??` does. An
+    /// invoked callee's expression extends through its argument list's
+    /// closing `)` (string and character literals inside the scan are
+    /// skipped whole so a quoted paren cannot break the balance); a
+    /// generic callee's `<...>` group rides the same extension when a
+    /// `(` follows its matching `>`. The operand ends at the closer;
+    /// whitespace then `??` decides.
+    fn row_ifnull_operator_at(&self, row: &Row) -> Option<u32> {
+        let mut at = row.range.end();
+        if matches!(row.intent, Intent::Invoke) {
+            if self.byte_at(at) == Some(b'<')
+                && let Some(close) = self.matching_angle(at)
+                && self.byte_at(close + 1) == Some(b'(')
+            {
+                at = close + 1;
+            }
+            if self.byte_at(at) == Some(b'(') {
+                at = self.matching_paren(at)?;
+                at += 1;
+            }
         }
-        let lhs = self.rows[mark].clone();
-        let rhs = self.rows[mark + 1].clone();
-        // The pair is one `??` initializer only when the operator's first
-        // non-whitespace bytes follow the left row's end.
-        let mut at = lhs.range.end();
         while matches!(self.byte_at(at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
             at += 1;
         }
-        if self.byte_at(at) != Some(b'?') || self.byte_at(at + 1) != Some(b'?') {
-                return None;
+        (self.byte_at(at) == Some(b'?') && self.byte_at(at + 1) == Some(b'?')).then_some(at)
+    }
+
+    /// The byte offset of the `)` matching the `(` at `at` — literals
+    /// skipped whole, escapes honored; `None` when unbalanced.
+    fn matching_paren(&self, at: u32) -> Option<u32> {
+        let mut depth = 0u32;
+        let mut i = at;
+        while let Some(b) = self.byte_at(i) {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                b'\'' | b'"' => {
+                    let quote = b;
+                    i += 1;
+                    while let Some(c) = self.byte_at(i) {
+                        if c == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if c == quote {
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
         }
+        None
+    }
+
+    /// The byte offset of the `>` matching the `<` at `at` (no literal
+    /// skipping — a type-argument group holds no strings).
+    fn matching_angle(&self, at: u32) -> Option<u32> {
+        let mut depth = 0u32;
+        let mut i = at;
+        while let Some(b) = self.byte_at(i) {
+            match b {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Whether the bytes in `[start, end)` spell nothing but a receiver
+    /// chain — identifier characters, `.`, `?.`, whitespace. A cascade
+    /// (`)..m = v..n = `), a parenthesized operand (`(a ?? `), or any
+    /// other operator between the window's first row and the left
+    /// operand marks a NESTED `??`, never the declaration's own.
+    fn is_plain_receiver_prefix(&self, start: u32, end: u32) -> bool {
+        let mut at = start;
+        while at < end {
+            match self.byte_at(at) {
+                Some(b) if b.is_ascii_alphanumeric() || b == b'_' || b == b'$' => at += 1,
+                Some(b'.') => at += 1,
+                Some(b'?') if self.byte_at(at + 1) == Some(b'.') => at += 2,
+                Some(b' ' | b'\t' | b'\n' | b'\r') => at += 1,
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    pub(crate) fn ifnull_initializer_ty(&mut self, mark: usize) -> Option<Ty> {
+        // The right operand is the window's LAST row; the left operand is
+        // the last row whose end the `??` operator directly follows — a
+        // call left side leaves its argument rows on the stack (the exact
+        // `mark + 2` gate rejected those), and the operator's own bytes
+        // identify the boundary whatever the row count.
+        let rhs = self.rows.last().cloned()?;
+        let upper = self.rows.len().saturating_sub(1);
+        if mark >= upper {
+            return None;
+        }
+        let lhs = {
+            // The `??`'s left operand: the row whose effective end the
+            // operator directly follows. An invoked callee row's
+            // expression extends through its argument list's closing
+            // paren — no result row exists for a send, the callee row IS
+            // the operand (`int.tryParse(match.group(2) ?? '0') ?? 0`
+            // pairs the OUTER `??` with the tryParse callee). Candidates
+            // compare by the `??`'s own byte position, not row order: a
+            // `??` nested inside the argument list follows an EARLIER
+            // byte, so the maximum picks the outermost operator.
+            let mut best: Option<(u32, usize)> = None;
+            for (index, row) in self.rows[mark..upper].iter().enumerate() {
+                let Some(question_at) = self.row_ifnull_operator_at(row) else {
+                    continue;
+                };
+                if best.is_none_or(|(at, _)| question_at > at) {
+                    best = Some((question_at, index));
+                }
+            }
+            best.map(|(_, index)| self.rows[mark + index].clone())?
+        };
+        // The fold answers only a TOP-LEVEL `??`: the bytes from the
+        // window's first row to the left operand may spell nothing but
+        // the operand's own receiver chain (identifiers, `.`, `?.`). A
+        // `??` nested inside the window — a cascade write
+        // (`C.c(this)..a = x..b = y ?? false`) parks its operand rows
+        // beside the receiver's, and a member suffix
+        // (`(a ?? b ?? c).offset`) parks the chain's — pairing those
+        // with `rows.last()` types the declaration from a nested operand
+        // pair (`context` becomes `bool`, `enterOffset` becomes the
+        // never-null left head).
+        if !self.is_plain_receiver_prefix(self.rows[mark].range.offset, lhs.range.offset) {
+            return None;
+        }
+        dq_probe!(
+            "[ifnull-init] mark={} upper={} lhs@{}:{} rhs@{}:{}",
+            mark,
+            upper,
+            lhs.range.offset,
+            lhs.range.end(),
+            rhs.range.offset,
+            rhs.range.end()
+        );
         let lhs_face = self
             .initializer_static_ty(&lhs)
             .filter(|ty| *ty != Ty::UNKNOWN)
@@ -2128,10 +2407,22 @@ impl<'a> Engine<'a> {
                 (derived != Ty::UNKNOWN).then_some(derived)
             })
             .unwrap_or(Ty::UNKNOWN);
+        dq_probe!("[ifnull-init] lhs_face={:?} rhs_face={:?}", lhs_face, rhs_face);
         let face = match (lhs_face, rhs_face) {
             (a, b) if a == b => a,
             (Ty::UNKNOWN, b) => b,
-            (a, Ty::UNKNOWN) => Engine::non_null_form(a),
+            // An unresolved right operand poisons the join rather than
+            // non-nullifying the left: upstream's `resolveIfNull` computes
+            // `LUB(NonNull(T1), T2)` against the right operand's own type,
+            // and an unresolved `T2` is `InvalidType` — the variable
+            // inherits the invalid face and every downstream check stays
+            // silent (probed 3.47.1: `_dartToDrift[Dart] ??
+            // values.whereType<X>().singleOrNull` keeps the `== null`
+            // comparison alive). Non-nullifying here wrote the left head
+            // into the declaration (`type == null` over-reported
+            // `unnecessary_null_comparison`; `offset:` arguments reported
+            // `argument_type_not_assignable`).
+            (_, Ty::UNKNOWN) => return None,
             (
                 Ty::Named {
                     name: l,
@@ -4169,6 +4460,157 @@ pub(crate) fn flatten_ty(strings: &StringTable, args: &crate::model::ArgPool, ty
         return ty;
     }
     flat[0]
+}
+
+impl<'a> Engine<'a> {
+    /// The `<…>` group of the nearest enclosing generalized function type
+    /// whose formal list covers `offset` — the raw byte window of the
+    /// declared parameter names. `None` when no `Function<…>(…)` encloses
+    /// the offset inside its parameter list. The names inside bind
+    /// throughout the signature (a formal's type `T` and a nested
+    /// `void Function(T)` both reference the declaration), so the type-use
+    /// miss path checks membership before reporting.
+    pub(crate) fn gft_param_group_covering(&self, offset: u32) -> Option<(u32, u32)> {
+        let fn_word_before = |from: u32| -> bool {
+            if from < 8 {
+                return false;
+            }
+            let start = from - 8;
+            (0..8).all(|i| self.byte_at(start + i as u32) == Some(b"Function"[i]))
+        };
+        // Walk back over closers: each `>` is a candidate param-group
+        // closer (its opener found by balanced scan), each `)` skips a
+        // whole formals list. The FIRST `Function<…>(…)` whose formals
+        // span covers the offset is the enclosing declaration.
+        let mut back = offset;
+        while back > 0 {
+            back -= 1;
+            match self.byte_at(back) {
+                // `=>`/`>=`-style `>` is no group closer.
+                Some(b'>') if self.byte_at(back.wrapping_sub(1)) != Some(b'=') => {
+                    // The matching `<`: scanning back from just left of
+                    // this `>`, `<` opens (+1) and `>` closes (−1); the
+                    // opener is where the running sum first reaches +1.
+                    let mut sum = 0i32;
+                    let mut probe = back;
+                    let mut lt = None;
+                    while probe > 0 {
+                        probe -= 1;
+                        match self.byte_at(probe) {
+                            Some(b'<') => {
+                                sum += 1;
+                                if sum == 1 {
+                                    lt = Some(probe);
+                                    break;
+                                }
+                            }
+                            Some(b'>') => sum -= 1,
+                            _ => {}
+                        }
+                    }
+                    let Some(lt) = lt else {
+                        continue;
+                    };
+                    if fn_word_before(lt) {
+                        let mut after = back + 1;
+                        if self.byte_at(after) == Some(b'?') {
+                            after += 1;
+                        }
+                        if self.byte_at(after) == Some(b'(') {
+                            // The formal list's closing `)` (depth-aware
+                            // over nested lists): the offset sits inside
+                            // the signature when it lands within.
+                            let mut depth = 0i32;
+                            let mut close = after;
+                            loop {
+                                let Some(b) = self.byte_at(close) else {
+                                    break;
+                                };
+                                match b {
+                                    b'(' => depth += 1,
+                                    b')' => {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                close += 1;
+                            }
+                            if back < offset && offset < close {
+                                return Some((lt + 1, back));
+                            }
+                        }
+                    }
+                    // Not the enclosing GFT: jump over the whole `<…>`
+                    // group and keep walking.
+                    back = lt;
+                }
+                Some(b'<') => {
+                    // An opener to the LEFT: the offset can only be inside
+                    // its span when the balanced closer sits past it.
+                    // Forward-match the `>`; a GFT-shaped group containing
+                    // the offset answers, anything else just continues.
+                    let mut sum = 0i32;
+                    let mut probe = back;
+                    let mut gt = None;
+                    loop {
+                        let Some(b) = self.byte_at(probe) else {
+                            break;
+                        };
+                        match b {
+                            b'<' => sum += 1,
+                            b'>' => {
+                                sum -= 1;
+                                if sum == 0 {
+                                    gt = Some(probe);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        probe += 1;
+                    }
+                    if let (Some(gt), true) = (gt, fn_word_before(back)) {
+                        let mut after = gt + 1;
+                        if self.byte_at(after) == Some(b'?') {
+                            after += 1;
+                        }
+                        if self.byte_at(after) == Some(b'(') && back < offset && offset < gt {
+                            return Some((back + 1, gt));
+                        }
+                    }
+                }
+                Some(b')') => {
+                    // A closer of an inner formals list: skip its whole
+                    // span so nothing inside it reads as enclosing.
+                    let mut inner = 0i32;
+                    let mut probe = back;
+                    loop {
+                        match self.byte_at(probe) {
+                            Some(b')') => inner += 1,
+                            Some(b'(') => {
+                                inner -= 1;
+                                if inner == 0 {
+                                    break;
+                                }
+                            }
+                            None => break,
+                            _ => {}
+                        }
+                        if probe == 0 {
+                            break;
+                        }
+                        probe -= 1;
+                    }
+                    back = probe;
+                }
+                _ => {}
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]

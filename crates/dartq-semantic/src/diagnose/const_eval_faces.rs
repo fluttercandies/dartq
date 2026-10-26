@@ -585,7 +585,7 @@ impl<'a> Engine<'a> {
             // the container the verifier answers.
             let text = self
                 .source
-                .get(span.offset as usize..span.end() as usize)
+                .get(self.byte_of(span.offset)..self.byte_of(span.end()))
                 .unwrap_or("");
             let head = text.split('(').next().unwrap_or("");
             let Some((head_text, selector)) = head.split_once('.') else {
@@ -606,7 +606,7 @@ impl<'a> Engine<'a> {
         };
         let text = self
             .source
-            .get(span.offset as usize..span.end() as usize)
+            .get(self.byte_of(span.offset)..self.byte_of(span.end()))
             .unwrap_or("");
         let head = self.strings.resolve(container);
         let selector = text
@@ -640,7 +640,7 @@ impl<'a> Engine<'a> {
         // written head at the span like `const_creation_valid` does.
         let text = self
             .source
-            .get(span.offset as usize..span.end() as usize)
+            .get(self.byte_of(span.offset)..self.byte_of(span.end()))
             .unwrap_or("");
         let (head, selector) = if resolve_container(
             self.graph,

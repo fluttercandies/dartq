@@ -1391,8 +1391,7 @@ impl<'a> Engine<'a> {
                     .ctor_decl_site(edge.target_container, edge.target)
                     .is_some_and(|site| site.is_factory)
             {
-                let length = if self.source.as_bytes().get(edge.span.end() as usize) == Some(&b'(')
-                {
+                let length = if self.byte_at(edge.span.end()) == Some(b'(') {
                     self.argument_group_end(edge.span.end()) - edge.span.offset
                 } else {
                     edge.span.length
@@ -3622,14 +3621,26 @@ impl<'a> Engine<'a> {
             // InSummarySource)` reads `InSummarySource`, never the declared
             // `Source?`); a divergent or absent read keeps the captured
             // face.
-            let flow_ty = self
-                .rebound_read_face(*range)
-                .or_else(|| self.read_type_at(*range))
-                .unwrap_or(*ty);
+            let rebound = self.rebound_read_face(*range);
+            let read_at = if rebound.is_none() {
+                self.read_type_at(*range)
+            } else {
+                None
+            };
+            let flow_ty = rebound.or(read_at).unwrap_or(*ty);
             let rejects = self.argument_verdict(flow_ty, formal.ty, *literal) == Some(false);
             if rejects {
                 let from_text = self.ty_display(flow_ty);
                 let to_text = self.ty_display(formal.ty);
+                dq_probe!(
+                    "[arg-type] offset={} from={} to={} (rebound={} read_at={} captured={})",
+                    range.offset,
+                    from_text,
+                    to_text,
+                    rebound.is_some(),
+                    self.ty_display(*ty) != from_text,
+                    self.ty_display(*ty)
+                );
                 // The const-constructor face precedes the assignability row —
                 // the oracle's constant evaluator runs the invocation's
                 // argument check before the general assignability verifier
@@ -5039,15 +5050,32 @@ impl<'a> Engine<'a> {
                 // A function-typed variable's written signature (the
                 // captured `T Function<T>(T)` face) precedes the element
                 // model's — the model poisons such annotations and carries
-                // no formals for a variable.
+                // no formals for a variable. The shadow gate blocks only
+                // the namespace fallbacks below (a same-named top-level
+                // function must not lend its formals to a local's call):
+                // the shadowing local's OWN captured signature is exactly
+                // what `resolveArgumentsToParameters` counts against (a
+                // function-typed parameter called inside the body,
+                // `Future<I> Function(void Function(Object), Object) spawn`
+                // → `spawn(f, m)`).
                 let sig_formals = member.is_none().then(|| {
-                    (!shadowed)
-                        .then(|| {
-                            self.fn_var_sigs
-                                .get(&row.name)
-                                .map(|sig| (sig.formals(self.intern("")), sig.clone()))
-                        })
-                        .flatten()
+                    // A shadowed local still counts against its OWN written
+                    // signature when the name is a parameter whose
+                    // annotation the formal claim captured (`Future<I>
+                    // Function(void Function(Object), Object) isolateSpawn`
+                    // → `isolateSpawn(f, m)`); every other shadowing local
+                    // (a local function, a plain variable) keeps the
+                    // suppress — the general table carries stale-stash
+                    // attributions the parameter-claim table never does.
+                    if shadowed {
+                        self.fn_param_sigs
+                            .get(&row.name)
+                            .map(|sig| (sig.formals(self.intern("")), sig.clone()))
+                    } else {
+                        self.fn_var_sigs
+                            .get(&row.name)
+                            .map(|sig| (sig.formals(self.intern("")), sig.clone()))
+                    }
                 });
                 // A local callee typed by a function-type alias (`Predicate<T>
                 // test` / a folded `FailureJoiner joiner` invoked as
@@ -6030,7 +6058,21 @@ impl<'a> Engine<'a> {
                     body_brace,
                     ..
                 } => {
-                    let in_ctor_initializers = self.ctor_pending.is_some() && body_brace.is_none();
+                    // The initializer window closes at the ctor's OWN body
+                    // brace — a braceless closure (`() => f(this)`) opened
+                    // in the body has no `body_brace` of its own, so the
+                    // ctor-level `ctor_body_open` latch answers for it.
+                    let in_ctor_initializers = self.ctor_pending.is_some()
+                        && body_brace.is_none()
+                        && !self.ctor_body_open;
+                    dq_probe!(
+                        "[kw-recv] is_super={} instance={} body_brace={:?} ctor_body_open={} -> in_init={}",
+                        is_super,
+                        instance,
+                        body_brace.is_some(),
+                        self.ctor_body_open,
+                        in_ctor_initializers
+                    );
                     if !*instance || in_ctor_initializers {
                         return ReceiverState::Invalid;
                     }
@@ -6354,6 +6396,22 @@ impl<'a> Engine<'a> {
             && row.qualified
             && !self.is_never_ty(row.ty)
             && let Some((_, call_ret, _)) = self.implicit_call_face(row.ty)
+        {
+            self.rows[callee].ty = call_ret;
+        }
+        // The same implicit-call retyping for a BARE local callee: the
+        // row's own face is the local's declared type (`Object`), but the
+        // flow read at the callee's span carries the promoted spelling
+        // (`switch (x) case XPathExpression():` arm) — its `call` member's
+        // return types the invocation node exactly as the dot-spelled arm
+        // above (and keeps the invocation-face check's callable exception
+        // honest).
+        if let Some(row) = self.rows.get(callee)
+            && !row.qualified
+            && !self.is_never_ty(row.ty)
+            && let Some(read) = self.read_type_at(row.range)
+            && read != row.ty
+            && let Some((_, call_ret, _)) = self.implicit_call_face(read)
         {
             self.rows[callee].ty = call_ret;
         }

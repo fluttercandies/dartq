@@ -375,6 +375,22 @@ use dartq_types::{
     Case, Exhaustiveness, ExhaustivenessWorld, Variance, Witness as EngineWitness, compute,
 };
 
+// TEMPORARY R53 differential probes — `DQ_PROBE` env-gated eprintln, zero
+// output and one atomic read when unset. Every call site is stripped before
+// commit (the R52+ probe discipline).
+pub(crate) fn dq_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DQ_PROBE").is_some())
+}
+
+macro_rules! dq_probe {
+    ($($arg:tt)*) => {
+        if crate::diagnose::dq_probe_enabled() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 mod assignability;
 mod const_eval_faces;
 mod call_result;
@@ -461,6 +477,13 @@ mod ticket_2316_tests;
 /// `unused_element` member credits.
 #[cfg(test)]
 mod ticket_dead_family_tests;
+
+/// The #2594 char-boundary pins: diagnose passes that walk source bytes
+/// from UTF-16 range anchors (typed-literal element walks, span trims,
+/// flow-fact name slices) over non-ASCII fixtures — Persian/Arabic and
+/// emoji text upstream must never panic or desync the byte domain.
+#[cfg(test)]
+mod ticket_2594_tests;
 
 /// The assignability-family differential pins (W3 real-corpus burn): the
 /// `FutureOr<T>` union rule, the async matrix's Right Bottom leg, the
@@ -1204,6 +1227,11 @@ pub fn fold_unit_with_ops<'t>(
     for fact in &facts {
         match *fact {
             FlowFact::DeadCode { span } => {
+                dq_probe!(
+                    "[dead-fact] offset={} len={} token_kind_probe",
+                    span.range.offset,
+                    span.range.length
+                );
                 // The `??` right operand's dedicated row
                 // (`_checkForDeadNullCoalesce`'s
                 // `dead_null_aware_expression`) coexists with the generic
@@ -1285,7 +1313,11 @@ pub fn fold_unit_with_ops<'t>(
             } => {
                 if is_late && definitely_unassigned {
                     let range = span.range;
-                    let name = &source[range.offset as usize..range.end() as usize];
+                    // The span is UTF-16; the slice reads source bytes —
+                    // convert so a wide char upstream cannot cut a character
+                    // in half (#2594).
+                    let name = &source[engine.byte_of(range.offset)
+                        ..engine.byte_of(range.end()).min(source.len())];
                     let code = SemanticCode::DefinitelyUnassignedLateLocalVariable;
                     flow_diagnostics.push(Diagnostic::new(
                         code.severity(),
