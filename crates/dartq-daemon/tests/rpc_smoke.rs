@@ -60,7 +60,7 @@ fn full_session_sync_and_diagnostics() {
         .into_iter()
         .find(|frame| frame["id"] == 2)
         .expect("analyze answer");
-    assert_eq!(analyze["result"]["diagnostics"], json!([]));
+    assert_eq!(analyze["result"]["diags"], json!([]));
 }
 
 /// A `dartq/sync` report reflects in the subsequent diagnostics while the
@@ -90,7 +90,7 @@ fn sync_change_reflects_in_diagnostics_and_updates_the_snapshot() {
         .into_iter()
         .find(|frame| frame["id"] == 2)
         .expect("analyze answer");
-    assert_eq!(analyze["result"]["diagnostics"], json!([]));
+    assert_eq!(analyze["result"]["diags"], json!([]));
 
     // The workspace file holds exactly what the test wrote — the sync
     // read it, never rewrote it.
@@ -152,7 +152,7 @@ fn unparsable_body_answers_and_session_continues() {
     let answered_frames = answered(&transcript);
     assert_eq!(answered_frames.len(), 1, "the analyze answer");
     assert!(
-        answered_frames[0]["result"]["diagnostics"].is_array(),
+        answered_frames[0]["result"]["diags"].is_array(),
         "the session continued past the bad frame: {:?}",
         answered_frames[0]
     );
@@ -289,7 +289,7 @@ fn burst_two_requests_one_cancel_partitions() {
         .find(|frame| frame["id"] == 3)
         .expect("survivor answer");
     assert!(
-        survivor["result"]["diagnostics"]
+        survivor["result"]["diags"]
             .as_array()
             .expect("array")
             .iter()
@@ -325,7 +325,7 @@ fn burst_unknown_id_cancel_is_ignored() {
         "the cancel never landed: {analyze}"
     );
     assert!(
-        analyze["result"]["diagnostics"]
+        analyze["result"]["diags"]
             .as_array()
             .expect("array")
             .iter()

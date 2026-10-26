@@ -19,7 +19,7 @@
 #      configs are kept only when they carry `packageUri`; stale ones
 #      (pre-packageUri fallback configs) are re-materialized.
 #   2. diff — `harness run` per package: oracle `dart analyze` vs
-#      `dartq analyze --format=machine`, all severities judged, divergences
+#      `dartq analyze --format=json`, all severities judged, divergences
 #      persisted in the standard regression-case-v1 format under
 #      $OUT/cases/<pkg>/. No bespoke diff logic — the harness owns the
 #      (code, file) caliber.
@@ -77,7 +77,7 @@ OUT="target/evidence/real-sweep/$LABEL"
 DARTQ_BIN="./target/release/dartq"
 HARNESS_BIN="./target/release/harness"
 SDK_DESC="${DARTQ_DART_SDK:-<DARTQ_DART_SDK unset>}"
-DARTQ_CMD="$DARTQ_BIN analyze --format=machine --sdk $SDK_DESC"
+DARTQ_CMD="$DARTQ_BIN analyze --format=json --sdk $SDK_DESC"
 
 # --- package discovery --------------------------------------------------------
 # One package per directory carrying a PROVENANCE.md (the vendored-copy mark).

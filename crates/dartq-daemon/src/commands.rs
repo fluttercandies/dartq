@@ -4,7 +4,7 @@
 //! Every face mirrors one CLI command and shares its implementation
 //! through [`dartq_commands`] — this layer adds only the wire contract:
 //!
-//! * every response carries `schema_version` (the frozen v1 contract;
+//! * every response carries `v` (the frozen v1 contract version;
 //!   dartq-schema's per-domain constants are authoritative);
 //! * every request accepts an optional `verbosity` (default compact) whose
 //!   tier semantics are the canonical tables in dartq-schema's crate docs —
@@ -19,12 +19,12 @@
 //! The engine-view faces accept an optional `context` tag naming a declared
 //! context (a `dartq.yaml` row assembled at the shell edge); the request
 //! analyzes that context's engine. Without one they analyze the default
-//! context. The disk-view faces take neither `context` nor `agentId` —
+//! context. The disk-view faces take neither `context` nor `agent_id` —
 //! they never touch a session engine view.
 //!
 //! # Analyzed view per face
 //!
-//! A request with `agentId` analyzes the agent's overlay view (its staged
+//! A request with `agent_id` analyzes the agent's overlay view (its staged
 //! `path → content` deltas over the base view); a request without one
 //! analyzes the base view (on-disk content as `dartq/sync` and the watch
 //! syncs staged it). The per-face visibility is contract:
@@ -38,7 +38,7 @@
 //! |                 | no parse, no second capture                      |
 //! | `dartq/analyze` | requested view (base, or the agent's overlay)    |
 //! | `dartq/check`   | base: the M0 disk pipeline (scan+parse over the  |
-//! |                 | discovered file set). `agentId`: the requested   |
+//! |                 | discovered file set). `agent_id`: the requested   |
 //! |                 | view's engine diagnostics (scan+parse+semantic)  |
 //! |                 | restricted to the discovered paths plus the      |
 //! |                 | agent's own overlay paths — the two check modes  |
@@ -56,9 +56,9 @@
 //! |                 | prefixes; no rows for a delta cursor to      |
 //! |                 | filter)                                   |
 //! | `dartq/impact`  | requested view                                   |
-//! | `dartq/fix`     | disk, always (`agentId`/`since` rejected)        |
+//! | `dartq/fix`     | disk, always (`agent_id`/`since` rejected)        |
 //! | `dartq/compat`  | disk, always — it rebuilds one engine per axis   |
-//! |                 | over the on-disk base (`agentId`/`since`         |
+//! |                 | over the on-disk base (`agent_id`/`since`         |
 //! |                 | rejected)                                        |
 //! | `dartq/explain` | disk, always — it rebuilds one engine over the   |
 //! |                 | on-disk base per query (the `dartq/compat`       |
@@ -66,7 +66,7 @@
 //! |                 | fan-out, which the session engine runs over the  |
 //! |                 | recomputed libraries only, so a warm session     |
 //! |                 | answer would silently miss declarations).        |
-//! |                 | `agentId` is rejected; `since` applies as delta  |
+//! |                 | `agent_id` is rejected; `since` applies as delta  |
 //! |                 | economics — it filters the report's              |
 //! |                 | use/import/test rows by the session's            |
 //! |                 | written-file cursors, it does not select a view  |
@@ -85,10 +85,11 @@
 //!   kinds in one round trip over the session's already-built graph: one
 //!   frozen v1 query envelope per `(item, kind)` pair, request order, no
 //!   aggregate envelope (the schema crate's frozen batch convention). The
-//!   session selectors (`agentId`/`context`) and `since` apply to the whole
+//!   session selectors (`agent_id`/`context`) and `since` apply to the whole
 //!   batch, exactly as they do to the single face.
 //! * **Short-id symbol table** — full-tier `dartq/check` and `dartq/analyze`
-//!   answers substitute path-valued row fields (`file`/`uri`) with
+//!   answers substitute path-valued row fields (`file`, the analyze rows'
+//!   document URIs included) with
 //!   session-stable short ids (`s1`, `s2`, …) and carry a `symbols` preamble
 //!   (id → path) for ids the client has not seen yet, only when the
 //!   substitution saves bytes. Compact answers stay byte-identical to the
@@ -181,7 +182,7 @@ pub const METHODS: [&str; 15] = [
 pub(crate) enum Request {
     /// The analyzed view's resident index tallied (the `index`
     /// face). An engine-view face (the tally reads the view's engine), so
-    /// `agentId`/`context` select the view; `since` is rejected — the
+    /// `agent_id`/`context` select the view; `since` is rejected — the
     /// aggregate has no rows for a delta cursor to filter.
     Index {
         verbosity: Verbosity,
@@ -224,7 +225,7 @@ pub(crate) enum Request {
     },
     /// The position-resolution face: what the analyzed view's maintained
     /// index rows hold under one file offset. An engine-view face
-    /// (`agentId`/`context` select the view); a point answer, so `since`
+    /// (`agent_id`/`context` select the view); a point answer, so `since`
     /// is rejected — it has no rows for a cursor to filter (the
     /// `dartq/index` rule).
     ResolveAt {
@@ -275,7 +276,7 @@ pub(crate) enum Request {
 }
 
 impl Request {
-    /// The request's `agentId`, if it named one. The server validates the
+    /// The request's `agent_id`, if it named one. The server validates the
     /// agent exists before the request queues (fail loud on a typo instead
     /// of silently answering the base view).
     pub(crate) fn agent(&self) -> Option<&str> {
@@ -293,7 +294,7 @@ impl Request {
     }
 
     /// The request's `context` tag, if it named one (the multi-root routing
-    /// selector; validated at intake like `agentId`).
+    /// selector; validated at intake like `agent_id`).
     pub(crate) fn context(&self) -> Option<&str> {
         match self {
             Self::Index { context, .. }
@@ -636,14 +637,14 @@ fn parse_query_batch(params: &Value) -> Result<Request, String> {
 fn parse_explain(params: &Value) -> Result<Request, String> {
     let invalid = |error: serde_json::Error| error.to_string();
     // Delta economics without a view selector: `since` filters the
-    // report's rows (see `explain_answer`), but an `agentId` or `context`
+    // report's rows (see `explain_answer`), but an `agent_id` or `context`
     // would silently answer a different view than the face's disk contract
     // — the fix/compat rule, minus `since`.
     let (agent, since) = session_fields(params)?;
     let context = context_field(params)?;
     if agent.is_some() || context.is_some() {
         return Err(
-            "dartq/explain answers the disk view; agentId/context apply to the \
+            "dartq/explain answers the disk view; agent_id/context apply to the \
              engine-view faces (analyze/check/query/impact)"
                 .into(),
         );
@@ -666,14 +667,14 @@ fn default_query_kinds() -> Vec<QueryKind> {
     vec![QueryKind::Symbol]
 }
 
-/// The params' session-economics fields: the optional `agentId` view selector
+/// The params' session-economics fields: the optional `agent_id` view selector
 /// and the optional `since` delta cursor. Absent and `null` are
 /// equivalent.
 fn session_fields(params: &Value) -> Result<(Option<String>, Option<u64>), String> {
-    let agent = match params.get("agentId") {
+    let agent = match params.get("agent_id") {
         None | Some(Value::Null) => None,
         Some(Value::String(agent)) => Some(agent.clone()),
-        Some(_) => return Err("agentId must be a string".into()),
+        Some(_) => return Err("agent_id must be a string".into()),
     };
     let since = match params.get("since") {
         None | Some(Value::Null) => None,
@@ -699,7 +700,7 @@ fn context_field(params: &Value) -> Result<Option<String>, String> {
     }
 }
 
-/// The disk-view faces take neither session field: an `agentId`, `context`,
+/// The disk-view faces take neither session field: an `agent_id`, `context`,
 /// or `since` there would silently answer a different view than the face's
 /// contract.
 pub(crate) fn reject_disk_view_only(params: &Value, method: &str) -> Result<(), String> {
@@ -707,14 +708,14 @@ pub(crate) fn reject_disk_view_only(params: &Value, method: &str) -> Result<(), 
     let context = context_field(params)?;
     if agent.is_some() || since.is_some() || context.is_some() {
         return Err(format!(
-            "{method} answers the disk view; agentId/context/since apply to the engine-view \
+            "{method} answers the disk view; agent_id/context/since apply to the engine-view \
              faces (analyze/check/query/impact)"
         ));
     }
     Ok(())
 }
 
-/// Decodes `dartq/overlay.set` params: `{agentId, files: {path → content}}`.
+/// Decodes `dartq/overlay.set` params: `{agent_id, files: {path → content}}`.
 /// A content value is whole-file replacement text; `null` is a tombstone —
 /// the agent's view excludes the path (a base-resident file leaves the
 /// view at wear time; a committed tombstone deletes the worktree file).
@@ -722,7 +723,7 @@ pub(crate) fn reject_disk_view_only(params: &Value, method: &str) -> Result<(), 
 ///
 /// # Errors
 ///
-/// A missing or non-string `agentId`, a missing or non-object `files`, or
+/// A missing or non-string `agent_id`, a missing or non-object `files`, or
 /// a non-string-non-null path content.
 pub(crate) fn parse_overlay_set(params: &Value, root: &Path) -> Result<StagedOverlay, String> {
     let agent = overlay_agent(params, "set")?;
@@ -748,28 +749,28 @@ pub(crate) fn parse_overlay_set(params: &Value, root: &Path) -> Result<StagedOve
     Ok((agent, staged))
 }
 
-/// The `{agentId}`-shaped overlay faces' agent field: `overlay.clear`
+/// The `{agent_id}`-shaped overlay faces' agent field: `overlay.clear`
 /// (idempotent teardown) and `overlay.commit` take
 /// exactly that.
 ///
 /// # Errors
 ///
-/// A missing or non-string `agentId`.
+/// A missing or non-string `agent_id`.
 fn overlay_agent(params: &Value, method: &str) -> Result<String, String> {
-    match params.get("agentId") {
+    match params.get("agent_id") {
         Some(Value::String(agent)) if !agent.is_empty() => Ok(agent.clone()),
-        Some(_) => Err("agentId must be a non-empty string".into()),
-        None => Err(format!("overlay.{method} requires an agentId")),
+        Some(_) => Err("agent_id must be a non-empty string".into()),
+        None => Err(format!("overlay.{method} requires an agent_id")),
     }
 }
 
-/// Decodes `dartq/overlay.clear` params: `{agentId}`. Clearing an unknown
+/// Decodes `dartq/overlay.clear` params: `{agent_id}`. Clearing an unknown
 /// agent is answered ok by the caller (idempotent teardown).
 pub(crate) fn parse_overlay_clear(params: &Value) -> Result<String, String> {
     overlay_agent(params, "clear")
 }
 
-/// Decodes `dartq/overlay.commit` params: `{agentId}` — the merge writes
+/// Decodes `dartq/overlay.commit` params: `{agent_id}` — the merge writes
 /// the agent's staged whole-file buffers back to the worktree;
 /// there is no path subset (the overlay declares the end state, the merge
 /// commits it whole).
@@ -1174,46 +1175,50 @@ fn index_answer(drain: &Drain<'_>, _verbosity: Verbosity) -> Value {
 // dartq/analyze — the diagnostics pull face
 // ---------------------------------------------------------------------------
 
-/// The merged diagnostic set of the analyzed view. Compact keeps the
-/// entry shape (uri + wire diagnostic); minimal keeps the red line (code +
-/// location, here `uri` + `range`); full equals compact plus the short-id
-/// economics over entry URIs. The compact/full rows and the envelope come
-/// from the wire-shape module (`crate::wire`) — the frozen pull-face
-/// shapes — plus the session economics here.
+/// The merged diagnostic set of the analyzed view. Compact/full keep the
+/// flattened row (`code`/`sev`/`file`/`line`/`col`/`len`/`msg` — the wire
+/// module's row builder, `file` carrying the document URI); minimal keeps
+/// the red line (code + locator, the same shape minus `sev`/`msg`); full
+/// equals compact plus the short-id economics over row `file` values. The
+/// envelope comes from the wire-shape module (`crate::wire`) — the frozen
+/// pull-face shape — plus the session economics here.
 /// Rows keep the CLI analyze face's severity-first printed order (the
 /// entries are sorted where the read task builds them); the other faces
 /// mirror the engine's canonical (file, offset) order.
 pub(crate) fn analyze_answer(drain: &Drain<'_>, verbosity: Verbosity) -> Value {
-    let diagnostics: Vec<Value> = drain
+    let rows: Vec<Value> = drain
         .entries
         .iter()
         .map(|entry| match verbosity {
             Verbosity::Minimal => json!({
-                "uri": entry.uri,
                 "code": entry.diagnostic.code,
-                "range": entry.diagnostic.range,
+                "file": entry.uri,
+                "line": entry.diagnostic.range.start.line + 1,
+                "col": entry.diagnostic.range.start.character + 1,
+                "len": entry.len,
             }),
             Verbosity::Compact | Verbosity::Full => crate::wire::row(entry),
         })
         .collect();
     session_answer(
-        crate::wire::envelope(&diagnostics),
+        crate::wire::envelope(&rows),
         verbosity,
         None,
         drain,
-        &[("diagnostics", "uri")],
+        &[("diags", "file")],
     )
 }
 
 // ---------------------------------------------------------------------------
-// dartq/check — base: the M0 disk pipeline; agentId: the overlay view's
+// dartq/check — base: the M0 disk pipeline; agent_id: the overlay view's
 // engine diagnostics (the module doc's visibility table is the contract)
 // ---------------------------------------------------------------------------
 
-/// One check row. Compact mirrors the machine face's field set (severity /
-/// type / code / file / position / length / message, code in dartq's
-/// stable `snake_case` name spelling); minimal keeps the red line (`code` +
-/// location); full equals compact today.
+/// One check row, the analyze vocabulary over a disk/engine diagnostic:
+/// `{code, sev, file, line, col, len, msg}` (compact/full; `sev` the
+/// lowercase word, `line`/`col` 1-based, code in dartq's stable
+/// `snake_case` name spelling); minimal keeps the red line (code +
+/// locator); full equals compact today.
 fn check_row(
     diagnostic: &Diagnostic,
     files: &dyn FileLayoutProvider,
@@ -1223,21 +1228,24 @@ fn check_row(
     let file = files.file_path(diagnostic.file).display().to_string();
     match verbosity {
         Verbosity::Minimal => json!({
-            "file": file,
             "code": diagnostic.code.name,
+            "file": file,
             "line": line,
-            "column": column,
-            "length": diagnostic.range.length,
+            "col": column,
+            "len": diagnostic.range.length,
         }),
         Verbosity::Compact | Verbosity::Full => json!({
-            "file": file,
-            "severity": diagnostic.severity.as_machine_str(),
-            "type": diagnostic.code.dtype.as_str(),
             "code": diagnostic.code.name,
+            "sev": wire::severity_word(match diagnostic.severity {
+                dartq_diagnostics::Severity::Error => 1,
+                dartq_diagnostics::Severity::Warning => 2,
+                dartq_diagnostics::Severity::Info => 3,
+            }),
+            "file": file,
             "line": line,
-            "column": column,
-            "length": diagnostic.range.length,
-            "message": diagnostic.message.as_str(),
+            "col": column,
+            "len": diagnostic.range.length,
+            "msg": diagnostic.message.as_str(),
         }),
     }
 }
@@ -1258,18 +1266,18 @@ fn check_disk_view(
     })?;
     let run = check::analyze_files(&files).map_err(SessionError::Io)?;
     let output = run.output();
-    let diagnostics: Vec<Value> = output
+    let diags: Vec<Value> = output
         .diagnostics
         .iter()
         .filter(|diagnostic| delta_row(output.files, diagnostic.file, drain.changes, since))
         .map(|diagnostic| check_row(diagnostic, output.files, verbosity))
         .collect();
     Ok(session_answer(
-        json!({ "schema_version": SCHEMA_VERSION, "diagnostics": diagnostics }),
+        json!({ "v": SCHEMA_VERSION, "diags": diags }),
         verbosity,
         since,
         drain,
-        &[("diagnostics", "file")],
+        &[("diags", "file")],
     ))
 }
 
@@ -1292,7 +1300,7 @@ fn check_engine_view(
     })?;
     allow.extend(drain.overlay_paths.iter().cloned());
     let layout = EngineLayout::over(drain.engine, drain.diagnostics.iter().map(|d| d.file));
-    let diagnostics: Vec<Value> = drain
+    let diags: Vec<Value> = drain
         .diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -1302,11 +1310,11 @@ fn check_engine_view(
         .map(|diagnostic| check_row(diagnostic, &layout, verbosity))
         .collect();
     Ok(session_answer(
-        json!({ "schema_version": SCHEMA_VERSION, "diagnostics": diagnostics }),
+        json!({ "v": SCHEMA_VERSION, "diags": diags }),
         verbosity,
         since,
         drain,
-        &[("diagnostics", "file")],
+        &[("diags", "file")],
     ))
 }
 
@@ -1474,12 +1482,12 @@ fn impact_answer(
         });
     }
     // Tier-invariant: every report field is a locator or a verdict — the
-    // canonical table trims nothing (the report carries its own
-    // `schema_version`). The serialization rides the shared producer
-    // shaper (`impact_core::to_json`, #1605): one implementation for the
-    // CLI and the daemon, schema-validated at birth. Its library labels
-    // stay unsubstituted: each row names a distinct library, so short ids
-    // save nothing.
+    // canonical table trims nothing (the report carries its own version
+    // stamp, `v` under the compact vocabulary). The serialization rides
+    // the shared producer shaper (`impact_core::to_json`, #1605): one
+    // implementation for the CLI and the daemon, schema-validated at
+    // birth. Its library labels stay unsubstituted: each row names a
+    // distinct library, so short ids save nothing.
     let mut value = impact_core::to_json(&report);
     if since.is_some() {
         value["since"] = json!(drain.cursor);
@@ -1492,14 +1500,17 @@ fn impact_answer(
 // ---------------------------------------------------------------------------
 
 /// The explain report's path-valued array fields (the short-id economics'
-/// substitution spots; full tier only). `declaration.file` names one file —
-/// a single occurrence never pays its preamble, so it stays spelled out.
+/// substitution spots; full tier only), under the section keys the shared
+/// producer (`dartq_commands::explain`) emits today — they flip with the
+/// producer's own vocabulary pass, which owns the wire spellings.
+/// `declaration.file` names one file — a single occurrence never pays its
+/// preamble, so it stays spelled out.
 const EXPLAIN_SPOTS: &[(&str, &str)] = &[
-    ("inheritance", "file"),
-    ("interfaces", "file"),
-    ("references", "file"),
-    ("dependencies", "path"),
-    ("affected_tests", "path"),
+    ("bases", "file"),
+    ("ifaces", "file"),
+    ("refs", "file"),
+    ("deps", "path"),
+    ("tests", "path"),
 ];
 
 /// The report for `symbol` over a per-query engine rebuilt on the on-disk
@@ -1536,13 +1547,13 @@ fn explain_answer(
         })?;
     if let Some(since) = since {
         // Delta mode (the impact face's mapping over the report's own
-        // sections): a use/import/test row stays when its file changed in
-        // this session after the cursor. The declaration-site sections
-        // (`declaration`, `inheritance`, `interfaces`, `constructors`,
-        // `methods`) describe the symbol itself and stay — the red line
-        // never drops.
+        // sections, under the producer's current section keys): a
+        // use/import/test row stays when its file changed in this session
+        // after the cursor. The declaration-site sections (`declaration`,
+        // `inheritance`, `interfaces`, `constructors`, `methods`) describe
+        // the symbol itself and stay — the red line never drops.
         let changed = |path: &str| drain.changes.changed_since(Path::new(path), since);
-        for section in ["references", "dependencies", "affected_tests"] {
+        for section in ["refs", "deps", "tests"] {
             if let Some(rows) = report.get_mut(section).and_then(Value::as_array_mut) {
                 rows.retain(|row| {
                     row["file"]
@@ -1595,7 +1606,7 @@ pub(crate) fn fix_answer(
         .map(|fixes| fix::patch_json(fixes, verbosity))
         .collect();
     // The daemon face is dry by contract: it reports patches, never writes.
-    let mut answer = json!({ "schema_version": SCHEMA_VERSION, "files": files });
+    let mut answer = json!({ "v": SCHEMA_VERSION, "files": files });
     let errors = hosts.take_errors();
     if !errors.is_empty() {
         answer["errors"] = json!(
@@ -1652,8 +1663,8 @@ impl From<AnalyzeError> for SessionError {
 mod tests {
     use super::*;
 
-    /// The `diagnostics`-shaped spot list the tests shorten against.
-    const ROWS: &[(&str, &str)] = &[("diagnostics", "uri")];
+    /// The `diags`-shaped spot list the tests shorten against.
+    const ROWS: &[(&str, &str)] = &[("diags", "file")];
 
     /// Ids assign in first-seen row order (#947 F6): the first distinct
     /// path of the answer takes `s1`, the second `s2`, regardless of how
@@ -1663,20 +1674,20 @@ mod tests {
     fn shortening_assigns_ids_in_first_seen_order() {
         let table = SymbolTable::default();
         let mut answer = json!({
-            "diagnostics": [
-                {"uri": "/workspace/lib/first.dart"},
-                {"uri": "/workspace/lib/second_longer_name.dart"},
-                {"uri": "/workspace/lib/first.dart"},
-                {"uri": "/workspace/lib/second_longer_name.dart"},
-                {"uri": "/workspace/lib/first.dart"},
+            "diags": [
+                {"file": "/workspace/lib/first.dart"},
+                {"file": "/workspace/lib/second_longer_name.dart"},
+                {"file": "/workspace/lib/first.dart"},
+                {"file": "/workspace/lib/second_longer_name.dart"},
+                {"file": "/workspace/lib/first.dart"},
             ]
         });
         assert!(table.shorten(&mut answer, ROWS));
-        assert_eq!(answer["diagnostics"][0]["uri"], "s1");
-        assert_eq!(answer["diagnostics"][1]["uri"], "s2");
-        assert_eq!(answer["diagnostics"][2]["uri"], "s1");
-        assert_eq!(answer["diagnostics"][3]["uri"], "s2");
-        assert_eq!(answer["diagnostics"][4]["uri"], "s1");
+        assert_eq!(answer["diags"][0]["file"], "s1");
+        assert_eq!(answer["diags"][1]["file"], "s2");
+        assert_eq!(answer["diags"][2]["file"], "s1");
+        assert_eq!(answer["diags"][3]["file"], "s2");
+        assert_eq!(answer["diags"][4]["file"], "s1");
         assert_eq!(answer["symbols"]["s1"], "/workspace/lib/first.dart");
         assert_eq!(
             answer["symbols"]["s2"],
@@ -1708,14 +1719,14 @@ mod tests {
         // already, so the substitution pays without a fresh id — and the
         // cleared announced set forces the preamble back out.
         let mut answer = json!({
-            "diagnostics": [
-                {"uri": "/workspace/open/a.dart"},
-                {"uri": "/workspace/open/a.dart"},
-                {"uri": "/workspace/open/a.dart"},
+            "diags": [
+                {"file": "/workspace/open/a.dart"},
+                {"file": "/workspace/open/a.dart"},
+                {"file": "/workspace/open/a.dart"},
             ]
         });
         assert!(table.shorten(&mut answer, ROWS));
-        assert_eq!(answer["diagnostics"][0]["uri"], "s1");
+        assert_eq!(answer["diags"][0]["file"], "s1");
         assert_eq!(
             answer["symbols"]["s1"], "/workspace/open/a.dart",
             "the lost preamble is re-announced after recovery"
@@ -1725,14 +1736,14 @@ mod tests {
         // recovery: numbering derives from the recovered map, not from a
         // counter a panic could have desynchronized.
         let mut answer = json!({
-            "diagnostics": [
-                {"uri": "/workspace/open/b_other.dart"},
-                {"uri": "/workspace/open/b_other.dart"},
-                {"uri": "/workspace/open/b_other.dart"},
+            "diags": [
+                {"file": "/workspace/open/b_other.dart"},
+                {"file": "/workspace/open/b_other.dart"},
+                {"file": "/workspace/open/b_other.dart"},
             ]
         });
         assert!(table.shorten(&mut answer, ROWS));
-        assert_eq!(answer["diagnostics"][0]["uri"], "s2");
+        assert_eq!(answer["diags"][0]["file"], "s2");
         assert_eq!(answer["symbols"]["s2"], "/workspace/open/b_other.dart");
     }
 }

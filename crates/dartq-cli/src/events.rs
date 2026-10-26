@@ -9,10 +9,13 @@
 use std::path::PathBuf;
 
 use clap::Args;
+use serde_json::json;
 
 use dartq_session::{EventLog, Layout, Progress};
 
+use crate::OutputFormat;
 use crate::exit;
+use crate::output::lon_line;
 
 /// `dartq events` — read a session's events.
 #[derive(Args)]
@@ -32,6 +35,10 @@ pub struct EventsArgs {
     /// At most this many events per read (session handle).
     #[arg(long, default_value_t = 100)]
     pub limit: usize,
+    /// Output format: `lon` (the default, one canonical line per row),
+    /// `json` (one JSON line per row), or `text` (the indented rows).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Lon)]
+    pub format: OutputFormat,
 }
 
 pub fn run_entry(args: &EventsArgs) -> u8 {
@@ -47,7 +54,17 @@ pub fn run_entry(args: &EventsArgs) -> u8 {
         "session" => {
             let log = EventLog::new(&layout);
             for (_, event) in log.read(None, args.since.unwrap_or_default(), args.limit) {
-                println!("{event}");
+                match args.format {
+                    OutputFormat::Lon => println!("{}", lon_line(&event)),
+                    OutputFormat::Json => println!("{event}"),
+                    // One indented block per row: the read stays
+                    // cursor-paginated line-wise on the data faces, and
+                    // the text face stays humanly scannable per record.
+                    OutputFormat::Text => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&event).expect("the value pretty-prints")
+                    ),
+                }
             }
             exit::CLEAN
         }
@@ -56,14 +73,23 @@ pub fn run_entry(args: &EventsArgs) -> u8 {
             if progress.files_scanned <= args.since.unwrap_or_default() {
                 return exit::CLEAN;
             }
-            println!(
-                "{{\"type\":\"progress\",\"files_scanned\":{},\"from_cache\":{},\"current\":{},\"current_package\":{},\"cursor\":{}}}",
-                progress.files_scanned,
-                progress.from_cache,
-                json_opt(&progress.current),
-                json_opt(&progress.current_package),
-                progress.files_scanned,
-            );
+            let row = json!({
+                "type": "progress",
+                "files_scanned": progress.files_scanned,
+                "from_cache": progress.from_cache,
+                "current": progress.current,
+                "current_package": progress.current_package,
+                "cursor": progress.files_scanned,
+            });
+            match args.format {
+                OutputFormat::Lon => println!("{}", lon_line(&row)),
+                OutputFormat::Json => println!("{row}"),
+                OutputFormat::Text => println!(
+                    "progress: {} files scanned ({})",
+                    progress.files_scanned,
+                    progress.current.as_deref().or(progress.current_package.as_deref()).unwrap_or("analyzing"),
+                ),
+            }
             exit::CLEAN
         }
         other => {
@@ -74,10 +100,6 @@ pub fn run_entry(args: &EventsArgs) -> u8 {
             exit::USAGE
         }
     }
-}
-
-fn json_opt(value: &Option<String>) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "null".into())
 }
 
 #[cfg(all(test, unix))]
@@ -101,7 +123,8 @@ mod tests {
     }
 
     /// The grammar: the handle defaults to `session`, the dir to the cwd,
-    /// `--since` is optional, and `--limit` defaults to 100.
+    /// `--since` is optional, `--limit` defaults to 100, and `lon` is the
+    /// constant format default.
     #[test]
     fn events_args_parse() {
         let args = parse(&[]).expect("parse");
@@ -109,12 +132,14 @@ mod tests {
         assert_eq!(args.dir, PathBuf::from("."));
         assert_eq!(args.since, None);
         assert_eq!(args.limit, 100);
+        assert!(matches!(args.format, OutputFormat::Lon), "lon default");
         let args = parse(&["progress", "/w", "--since", "5", "--limit", "3"]).expect("parse");
         assert_eq!(args.handle, "progress");
         assert_eq!(args.dir, PathBuf::from("/w"));
         assert_eq!(args.since, Some(5));
         assert_eq!(args.limit, 3);
         assert!(parse(&["--limit", "x"]).is_err());
+        assert!(parse(&["--format", "machine"]).is_err(), "machine retired");
     }
 
     /// Every face answers clean while the log drains; an unknown handle
@@ -134,6 +159,7 @@ mod tests {
                 dir: root.clone(),
                 since,
                 limit,
+                format: OutputFormat::Json,
             })
         };
         assert_eq!(read("session", None, 100), exit::CLEAN);
@@ -151,7 +177,13 @@ mod tests {
         assert_eq!(read("progress", Some(0), 100), exit::CLEAN);
         assert_eq!(read("bogus", None, 100), exit::USAGE, "unknown handle");
         assert_eq!(
-            run_entry(&EventsArgs { handle: "session".into(), dir: root.join("gone"), since: None, limit: 100 }),
+            run_entry(&EventsArgs {
+                handle: "session".into(),
+                dir: root.join("gone"),
+                since: None,
+                limit: 100,
+                format: OutputFormat::Json,
+            }),
             exit::USAGE,
             "an unresolvable dir is the usage tier"
         );

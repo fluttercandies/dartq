@@ -1,54 +1,17 @@
 //! `dartq resolve` / `dartq complete` — the position faces' one-shot (the
 //! CLI spelling: what the analyzed workspace's maintained index holds under
-//! one cursor, and the visible-name set at it, without a resident session.
+//! one cursor, and the visible-name set at it, without a resident session).
 //!
 //! The substrate and the answers live in [`dartq_commands::resolve`] — the
 //! one implementation the daemon's `dartq/resolveAt` / `dartq/completion`
 //! RPC answers share, so the faces cannot drift. This binary adds argument
-//! parsing, the crash tier, the usage-tier mapping, and the two output
-//! spellings:
+//! parsing, the crash tier, the usage-tier mapping, and the format axis:
+//! `lon` (the default), `json`, and `text` all encode the daemon answer
+//! envelope (`v`, `off`, `decl_kind`, the hit's locator fields) verbatim —
+//! the same value on every face.
 //!
-//! * `--format json` — the daemon answer envelope verbatim, one line.
-//! * `--format machine` (the default) — one row per line with a stable
-//!   field order, the query face's own row grammar posture (a locator
-//!   listing, deliberately not the diagnostics 8-field face):
-//!
-//! ```text
-//! resolve-at:
-//!   DECL|file|container|decl-kind|name|offset|length
-//!                                                   (the cursor sits on a
-//!                                                   declaration's name
-//!                                                   token; container `-`
-//!                                                   when top-level)
-//!   REF|file|container|decl-kind|name|offset|length|target-file|target-offset|target-length|ref-kind|qualified|prefix
-//!                                                   (the cursor sits on a
-//!                                                   resolved use; `file` is
-//!                                                   the queried file, the
-//!                                                   target columns locate
-//!                                                   the declaration the use
-//!                                                   resolves to; prefix `-`
-//!                                                   when bare)
-//!   MISS                                           (an uncovered position)
-//!
-//! completion:
-//!   PREFIX|<prefix>                                (the fragment the cursor
-//!                                                   completes; empty when
-//!                                                   the cursor does not
-//!                                                   follow identifier
-//!                                                   characters)
-//!   CAND|name|origin|decl-kind|container|file|offset|length
-//!                                                   (one row per candidate,
-//!                                                   ascending by name; `-`
-//!                                                   when a column is absent
-//!                                                   — a `prefix` item is a
-//!                                                   wire word and carries
-//!                                                   only name + origin)
-//! ```
-//!
-//! The file columns are the canonical paths (the machine grammar's
-//! identity spelling); fields are not `|`-escaped, the same posture as the
-//! query rows. The answers are tier-invariant (every field a locator or a
-//! verdict), so there is no `--verbosity` axis.
+//! The answers are tier-invariant (every field a locator or a verdict),
+//! so there is no `--verbosity` axis.
 
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -60,8 +23,9 @@ use dartq_commands::resolve::resolve_at as resolve_at_core;
 use dartq_commands::resolve::{ResolveError, completion as completion_core};
 use dartq_commands::workspace::open_engine;
 
-use crate::QueryFormat;
+use crate::OutputFormat;
 use crate::exit;
+use crate::output::{write_json_value, write_lon, write_text_value};
 
 /// The two position faces' shared flags — one shape, two subcommands
 /// (`resolve-at` and `completion` differ only in the answer they ask for).
@@ -70,18 +34,17 @@ pub(crate) struct PositionArgs {
     /// The `PATH:LINE:COL` cursor (1-based; the column counts UTF-16 code
     /// units). PATH resolves against DIR and must be an analyzed `.dart`
     /// file of the workspace; an uncovered position — a non-identifier, an
-    /// unresolved use, a past-end offset — answers `MISS` / the empty
-    /// candidate set, never an error.
+    /// unresolved use, a past-end offset — answers the miss verdict / the
+    /// empty candidate set, never an error.
     pub(crate) selector: String,
     /// Package directory holding pubspec.yaml and
     /// `.dart_tool/package_config.json`; defaults to the current directory.
     #[arg(default_value = ".")]
     pub(crate) dir: PathBuf,
-    /// Output spelling: `machine` rows (the default) or the single-line
-    /// JSON envelope — the same answer the daemon's `dartq/resolveAt` /
-    /// `dartq/completion` serves.
-    #[arg(long, value_enum, default_value_t = QueryFormat::Machine)]
-    pub(crate) format: QueryFormat,
+    /// Output format: `lon` (the default), `json` (the daemon answer
+    /// envelope verbatim, one line), or `text` (the indented envelope).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Lon)]
+    pub(crate) format: OutputFormat,
     /// Dart SDK root; defaults to `$DART_SDK`.
     #[arg(long)]
     pub(crate) sdk: Option<PathBuf>,
@@ -171,16 +134,13 @@ fn completion_run(args: &PositionArgs, out: &mut impl Write) -> u8 {
     write_answer(out, &answer, args.format, "completion")
 }
 
-fn write_answer(out: &mut impl Write, answer: &Value, format: QueryFormat, face: &str) -> u8 {
+fn write_answer(out: &mut impl Write, answer: &Value, format: OutputFormat, face: &str) -> u8 {
     let written = match format {
-        QueryFormat::Machine => out
-            .write_all(machine_rows(answer).as_bytes())
-            .and_then(|()| out.flush()),
-        QueryFormat::Json => out
-            .write_all(answer.to_string().as_bytes())
-            .and_then(|()| out.write_all(b"\n"))
-            .and_then(|()| out.flush()),
-    };
+        OutputFormat::Lon => write_lon(out, answer),
+        OutputFormat::Json => write_json_value(out, answer),
+        OutputFormat::Text => write_text_value(out, answer),
+    }
+    .and_then(|()| out.flush());
     if let Err(error) = written {
         eprintln!("dartq: internal error: writing the {face} answer failed: {error}");
         return exit::INTERNAL_ERROR;
@@ -209,87 +169,6 @@ fn selector_position(selector: &str, dir: &Path) -> Result<(PathBuf, u32, u32), 
         .canonicalize()
         .map_err(|error| format!("{}: {error}", parsed.path.display()))?;
     Ok((file, line, column))
-}
-
-/// One machine column: the JSON field's verbatim spelling, `-` when the
-/// key drops (the omit-on-absent columns — container, prefix, and the
-/// prefix items' identity columns).
-fn column(row: &Value, key: &str) -> String {
-    match row.get(key) {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Number(number)) => number.to_string(),
-        Some(Value::Bool(flag)) => flag.to_string(),
-        _ => "-".to_owned(),
-    }
-}
-
-/// A span's `(offset, length)` machine columns, `-` `-` when the span is
-/// absent.
-fn span_columns(row: &Value, key: &str) -> (String, String) {
-    match row.get(key) {
-        Some(span @ Value::Object(_)) => (column(span, "offset"), column(span, "length")),
-        _ => ("-".to_owned(), "-".to_owned()),
-    }
-}
-
-/// The machine grammar's rows over the answer envelope (the field names
-/// are the same frozen wire contract the JSON face prints). The reference
-/// hit's `file` field is the target declaration's file — the queried file
-/// (the use site's own) is the envelope's top-level `file`.
-fn machine_rows(answer: &Value) -> String {
-    if answer.get("hit").is_some() {
-        resolve_at_rows(answer)
-    } else {
-        completion_rows(answer)
-    }
-}
-
-fn resolve_at_rows(answer: &Value) -> String {
-    let hit = &answer["hit"];
-    if hit.is_null() {
-        return "MISS\n".to_owned();
-    }
-    let (offset, length) = span_columns(hit, "range");
-    match hit["kind"].as_str() {
-        Some("declaration") => format!(
-            "DECL|{}|{}|{}|{}|{offset}|{length}\n",
-            column(hit, "file"),
-            column(hit, "container"),
-            column(hit, "decl_kind"),
-            column(hit, "name"),
-        ),
-        Some(_) => {
-            let (target_offset, target_length) = span_columns(hit, "target_range");
-            format!(
-                "REF|{}|{}|{}|{}|{offset}|{length}|{}|{target_offset}|{target_length}|{}|{}|{}\n",
-                column(answer, "file"),
-                column(hit, "container"),
-                column(hit, "decl_kind"),
-                column(hit, "name"),
-                column(hit, "file"),
-                column(hit, "ref_kind"),
-                column(hit, "qualified"),
-                column(hit, "prefix"),
-            )
-        }
-        None => "MISS\n".to_owned(),
-    }
-}
-
-fn completion_rows(answer: &Value) -> String {
-    let mut rows = format!("PREFIX|{}\n", column(answer, "prefix"));
-    for item in answer["items"].as_array().into_iter().flatten() {
-        let (offset, length) = span_columns(item, "range");
-        rows.push_str(&format!(
-            "CAND|{}|{}|{}|{}|{}|{offset}|{length}\n",
-            column(item, "name"),
-            column(item, "origin"),
-            column(item, "decl_kind"),
-            column(item, "container"),
-            column(item, "file"),
-        ));
-    }
-    rows
 }
 
 #[cfg(test)]
@@ -347,7 +226,7 @@ mod tests {
 
     /// The CLI face's grammar, mirroring the sibling faces' parse tests:
     /// the selector is the one positional, `dir` the optional second
-    /// spelling, `--format`/`--sdk` options.
+    /// spelling, `--format`/`--sdk` options, `lon` the constant default.
     #[test]
     fn position_args_parse() {
         let parse_resolve = |args: &[&str]| match Cli::try_parse_from(
@@ -376,8 +255,8 @@ mod tests {
         assert_eq!(args.dir, PathBuf::from("."), "default target cwd");
         assert!(args.sdk.is_none(), "no sdk by default");
         assert!(
-            matches!(args.format, QueryFormat::Machine),
-            "machine is the default"
+            matches!(args.format, OutputFormat::Lon),
+            "lon is the constant default"
         );
 
         let args = parse_resolve(&[
@@ -392,7 +271,7 @@ mod tests {
         assert_eq!(args.dir, PathBuf::from("/pkg"));
         assert_eq!(args.sdk, Some(PathBuf::from("/sdk")));
         assert!(
-            matches!(args.format, QueryFormat::Json),
+            matches!(args.format, OutputFormat::Json),
             "--format json parses"
         );
 
@@ -403,6 +282,7 @@ mod tests {
         for rejected in [
             &["resolve-at"][..],
             &["resolve-at", "--bogus"][..],
+            &["resolve-at", "--format", "machine", "a.dart:1:1"][..],
             &["completion"][..],
         ] {
             assert!(
@@ -413,9 +293,17 @@ mod tests {
         }
     }
 
-    /// End to end over the fixture: a declaration cursor answers the DECL
-    /// row, a resolved-use cursor the REF row with the target's identity
-    /// and name span, and the JSON spelling is the daemon envelope shape.
+    /// Decodes one lon line back into a value (the tests' reader — the
+    /// same crate that encodes).
+    fn read_lon(out: &[u8]) -> serde_json::Value {
+        let text = std::str::from_utf8(out).expect("UTF-8");
+        lon::from_str(text.trim_end()).expect("the lon line decodes")
+    }
+
+    /// End to end over the fixture: a declaration cursor answers the hit's
+    /// locator, a resolved-use cursor the reference hit with the target's
+    /// identity, and the json spelling is the daemon envelope shape (the
+    /// same keys as the lon face).
     #[test]
     fn resolve_at_end_to_end() {
         let root = fixture("resolve");
@@ -423,76 +311,70 @@ mod tests {
             selector: "lib/b.dart:3:3".to_owned(),
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
-            format: QueryFormat::Machine,
+            format: OutputFormat::Lon,
         };
         let mut out: Vec<u8> = Vec::new();
         let code = resolve_at_run(&args, &mut out);
         assert_eq!(code, exit::CLEAN);
-        let rows = String::from_utf8(out).expect("UTF-8");
+        let answer = read_lon(&out);
+        let b = root.canonicalize().expect("root").join("lib/b.dart");
+        let a = root.canonicalize().expect("root").join("lib/a.dart");
         // Line 3 is `  foo();` — the use of `foo` (offset 32, the use
         // site's span; the declaration's name token sits at offset 18 in
         // a.dart).
+        assert_eq!(answer["v"], 1, "the envelope's vocabulary version key");
+        assert_eq!(answer["file"], b.display().to_string());
+        assert_eq!(answer["off"], 32, "offset → off");
+        assert_eq!(answer["hit"]["kind"], "reference");
+        assert_eq!(answer["hit"]["name"], "foo");
+        assert_eq!(answer["hit"]["decl_kind"], "function");
+        assert_eq!(answer["hit"]["range"]["off"], 32);
+        assert_eq!(answer["hit"]["range"]["len"], 3);
         assert_eq!(
-            rows,
-            format!(
-                "REF|{}|-|function|foo|32|3|{}|18|3|invoked|false|-\n",
-                root.canonicalize()
-                    .expect("root")
-                    .join("lib/b.dart")
-                    .display(),
-                root.canonicalize()
-                    .expect("root")
-                    .join("lib/a.dart")
-                    .display(),
-            ),
-            "the REF row carries the use site, the target identity, and the relation"
+            answer["hit"]["file"], a.display().to_string(),
+            "the hit's target columns point at the declaration file"
         );
 
-        // The declaration cursor answers the DECL row.
+        // The declaration cursor answers the declaration hit.
         let args = PositionArgs {
             selector: "lib/a.dart:1:7".to_owned(),
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
-            format: QueryFormat::Machine,
+            format: OutputFormat::Lon,
         };
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(resolve_at_run(&args, &mut out), exit::CLEAN);
-        assert_eq!(
-            String::from_utf8(out).expect("UTF-8"),
-            format!(
-                "DECL|{}|-|class|Foo|6|3\n",
-                root.canonicalize()
-                    .expect("root")
-                    .join("lib/a.dart")
-                    .display(),
-            ),
-        );
+        let answer = read_lon(&out);
+        assert_eq!(answer["hit"]["kind"], "declaration");
+        assert_eq!(answer["hit"]["name"], "Foo");
+        assert_eq!(answer["hit"]["decl_kind"], "class");
+        assert_eq!(answer["hit"]["range"]["off"], 6);
+        assert_eq!(answer["hit"]["range"]["len"], 3);
 
-        // The JSON spelling is the daemon envelope (schema_version, file,
-        // offset, hit).
+        // The json spelling is the daemon envelope verbatim (`v`, `off`,
+        // the hit's locator fields — the same keys the lon face prints).
         let args = PositionArgs {
             selector: "lib/a.dart:1:7".to_owned(),
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
-            format: QueryFormat::Json,
+            format: OutputFormat::Json,
         };
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(resolve_at_run(&args, &mut out), exit::CLEAN);
         let json: serde_json::Value =
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["v"], 1);
         assert_eq!(json["hit"]["kind"], "declaration");
         assert_eq!(json["hit"]["name"], "Foo");
-        assert_eq!(json["hit"]["range"]["offset"], 6);
-        assert!(json["offset"].is_number());
+        assert_eq!(json["hit"]["range"]["off"], 6);
+        assert!(json["off"].is_number());
 
         fs::remove_dir_all(&root).ok();
     }
 
     /// End to end: the completion face answers the visible names at the
-    /// cursor — the PREFIX row plus the candidate rows, ascending by name.
-    /// The cursor `3:5` is UTF-16 offset 34 in the fixture — right after
-    /// the `fo` fragment of `  foo();`.
+    /// cursor, ascending by name. The cursor `3:5` is UTF-16 offset 34 in
+    /// the fixture — right after the `fo` fragment of `  foo();`.
     #[test]
     fn completion_end_to_end() {
         let root = fixture("complete");
@@ -500,57 +382,34 @@ mod tests {
             selector: "lib/b.dart:3:5".to_owned(),
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
-            format: QueryFormat::Machine,
+            format: OutputFormat::Lon,
         };
         let mut out: Vec<u8> = Vec::new();
         let code = completion_run(&args, &mut out);
         assert_eq!(code, exit::CLEAN);
-        let rows = String::from_utf8(out).expect("UTF-8");
-        let mut lines = rows.lines();
-        assert_eq!(
-            lines.next(),
-            Some("PREFIX|fo"),
-            "the fragment filters the set"
-        );
-        let candidates: Vec<&str> = lines
-            .map(|row| row.split('|').nth(1).expect("name column"))
+        let answer = read_lon(&out);
+        assert_eq!(answer["prefix"], "fo", "the fragment filters the set");
+        let candidates: Vec<&str> = answer["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|row| row["name"].as_str().expect("name"))
             .collect();
-        assert_eq!(
-            candidates.first(),
-            Some(&"foo"),
-            "the import-proven name answers"
+        assert!(
+            candidates.first() == Some(&"foo"),
+            "the import-proven name answers: {candidates:?}"
         );
         assert!(
             candidates.windows(2).all(|pair| pair[0] <= pair[1]),
             "candidates ascend by name: {candidates:?}"
         );
 
-        // The JSON spelling is the daemon envelope (schema_version, file,
-        // offset, prefix, items).
-        let args = PositionArgs {
-            selector: "lib/b.dart:3:5".to_owned(),
-            dir: root.clone(),
-            sdk: Some(root.join("sdk")),
-            format: QueryFormat::Json,
-        };
-        let mut out: Vec<u8> = Vec::new();
-        assert_eq!(completion_run(&args, &mut out), exit::CLEAN);
-        let json: serde_json::Value =
-            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
-        assert_eq!(json["prefix"], "fo");
-        assert!(
-            json["items"]
-                .as_array()
-                .expect("items")
-                .iter()
-                .any(|row| row["name"] == "foo")
-        );
-
         fs::remove_dir_all(&root).ok();
     }
 
     /// The usage tier: a selector without the cursor position, a path
-    /// outside the workspace, and an uncovered position's MISS verdict.
+    /// outside the workspace, and an uncovered position's miss verdict
+    /// (`hit` null in the lon document, exit 0).
     #[test]
     fn resolve_at_usage_tier_and_miss() {
         let root = fixture("usage");
@@ -559,7 +418,7 @@ mod tests {
                 selector: selector.to_owned(),
                 dir: root.clone(),
                 sdk: Some(root.join("sdk")),
-                format: QueryFormat::Machine,
+                format: OutputFormat::Lon,
             };
             let mut out: Vec<u8> = Vec::new();
             (resolve_at_run(&args, &mut out), out)
@@ -571,16 +430,15 @@ mod tests {
 
         let (code, out) = run_with("lib/missing.dart:1:1");
         assert_eq!(
-            code,
-            exit::USAGE,
+            code, exit::USAGE,
             "a file outside the analyzed view is usage"
         );
         assert!(out.is_empty());
 
-        // A comment position is uncovered: exit 0 with the MISS verdict.
+        // A comment position is uncovered: exit 0, the null hit verdict.
         let (code, out) = run_with("lib/b.dart:1:1");
         assert_eq!(code, exit::CLEAN);
-        assert_eq!(String::from_utf8(out).expect("UTF-8"), "MISS\n");
+        assert_eq!(read_lon(&out)["hit"], serde_json::Value::Null);
 
         fs::remove_dir_all(&root).ok();
     }

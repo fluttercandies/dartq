@@ -88,8 +88,8 @@ pub struct IndexRun {
 }
 
 impl IndexRun {
-    /// The JSON face: one object — `schema_version` plus the row totals
-    /// (`snake_case`, the metrics-JSON convention). The shape is
+    /// The JSON face: one object — `v` plus the row totals (the
+    /// short-vocabulary convention). The shape is
     /// dartq-schema's index-run document (v1); the writer stamps the shared
     /// [`crate::SCHEMA_VERSION`] because the document landed after this
     /// writer — the values are equal at v1, so the payloads conform (the
@@ -109,11 +109,11 @@ impl IndexRun {
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         let value = json!({
-            "schema_version": crate::SCHEMA_VERSION,
+            "v": crate::SCHEMA_VERSION,
             "files": self.files,
             "libraries": self.libraries,
             "symbols": self.symbols,
-            "references": self.references,
+            "refs": self.references,
         });
         let text = value.to_string();
         dartq_schema::validate(&text, dartq_schema::Domain::Index)
@@ -289,7 +289,7 @@ pub fn run_export(
     }
 
     let mut header = json!({
-        "schema_version": crate::SCHEMA_VERSION,
+        "v": crate::SCHEMA_VERSION,
         "documents": totals.documents,
         "declarations": totals.declarations,
     });
@@ -307,7 +307,7 @@ pub fn run_export(
         let capture = engine.file_capture(file).expect("analyzed member");
         let decls = capture.index.decls();
         let mut document = json!({
-            "schema_version": crate::SCHEMA_VERSION,
+            "v": crate::SCHEMA_VERSION,
             "path": label,
             "symbol_count": decls.len(),
         });
@@ -531,11 +531,11 @@ mod tests {
         assert_eq!(run.references, 3, "2 resolved uses in b.dart, 1 in c.dart");
 
         let json = run.to_json();
-        assert_eq!(json["schema_version"], crate::SCHEMA_VERSION);
+        assert_eq!(json["v"], crate::SCHEMA_VERSION);
         assert_eq!(json["files"], 3);
         assert_eq!(json["libraries"], 3);
         assert_eq!(json["symbols"], 5);
-        assert_eq!(json["references"], 3);
+        assert_eq!(json["refs"], 3);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -762,7 +762,7 @@ mod tests {
             compact.iter().all(|k| full.contains(k)),
             "compact ⊆ full: {compact:?} vs {full:?}"
         );
-        assert_eq!(minimal, ["path", "schema_version", "symbol_count"]);
+        assert_eq!(minimal, ["path", "symbol_count", "v"]);
         assert!(
             compact.contains(&"declarations".to_owned())
                 && compact.contains(&"symbols".to_owned()),

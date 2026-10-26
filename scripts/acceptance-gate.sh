@@ -7,9 +7,10 @@
 # every file modeled on the official language tests, provenance in each
 # header) must yield ZERO diagnostics from the release `dartq check` face.
 #
-# The rule is: fail on ANY machine row of ANY tier —
-#   SEVERITY|TYPE|CODE|FILE|LINE|COL|LENGTH|MESSAGE  (SEVERITY in
-#   ERROR|WARNING|INFO)
+# The rule is: fail on ANY diagnostic of ANY tier — the json envelope
+#   {"version":1,"diagnostics":[...]} with SEVERITY in
+#   ERROR|WARNING|INFO (the machine face retired with #2606; the oracle
+#   envelope is the check face's machine-shaped successor)
 # Rationale: the check face is the syntax tier only (scan → parse, no
 # semantic engine), and the corpus is valid by
 # construction over shipped, version-enabled syntax, so a clean run produces
@@ -118,8 +119,8 @@ fi
 # --- plan --------------------------------------------------------------------
 echo "== acceptance-gate plan"
 printf '  %-16s %s (%s files)\n' "corpus" "$CORPUS" "$corpus_count"
-printf '  %-16s fail on ANY machine row of any tier (valid corpus, zero rows expected)\n' "rule"
-printf '  %-16s %s check --format=machine %s\n' "command" "$DARTQ_BIN" "$CORPUS"
+printf '  %-16s fail on ANY diagnostic of any tier (valid corpus, zero rows expected)\n' "rule"
+printf '  %-16s %s check --format=json %s\n' "command" "$DARTQ_BIN" "$CORPUS"
 printf '  %-16s %s\n' "evidence" "$outdir"
 if [ "$dry_run" = 1 ]; then
   echo "== dry run: paths resolved, nothing written or executed"
@@ -142,38 +143,67 @@ mkdir -p "$outdir" || {
   echo "acceptance-gate: cannot create evidence directory $outdir" >&2
   exit 2
 }
-machine_file="$outdir/machine-output.txt"
+json_file="$outdir/check-output.json"
 
 rc=0
-"$DARTQ_BIN" check --format=machine "$CORPUS" >"$machine_file" || rc=$?
+"$DARTQ_BIN" check --format=json "$CORPUS" >"$json_file" || rc=$?
 if [ "$rc" -ge 4 ]; then
   echo "acceptance-gate: dartq check failed with tool exit $rc (internal/usage tier — never a verdict); raw output:" >&2
-  sed 's/^/  | /' "$machine_file" >&2
+  sed 's/^/  | /' "$json_file" >&2
   exit 2
 fi
-# The counters below are integer-scored; a vanished machine file would turn
-# every comparison into a non-integer test (a silent false PASS). Refuse
-# instead — an unreadable artifact is an environment error, not a verdict.
-[ -f "$machine_file" ] || {
-  echo "acceptance-gate: $machine_file missing after the dartq check run" >&2
+# The counters below are integer-scored; a malformed or vanished capture
+# would turn every comparison into a non-integer test (a silent false
+# PASS). Refuse instead — an unparsable artifact is an environment error,
+# not a verdict.
+[ -s "$json_file" ] || {
+  echo "acceptance-gate: $json_file missing or empty after the dartq check run" >&2
   exit 2
 }
+# One pass over the json envelope: per-tier counts on the first line, then
+# one machine-shaped evidence row per diagnostic (severity|type|code|file|
+# line|col|len|message — the json fields re-spelled; legibility only, the
+# verdict reads the counts).
+rows_out="$(python3 - "$json_file" <<'PYEOF'
+import json
+import sys
 
-# grep -c prints 0 (exit 1) on no match; the `|| true` keeps that exit from
-# tripping pipefail, and the defaults keep an empty substitution (a grep
-# that errored outright) from feeding a non-integer into the verdict test.
-rows="$(grep -Ec '^(ERROR|WARNING|INFO)\|' "$machine_file" || true)"
-error_rows="$(grep -Ec '^ERROR\|' "$machine_file" || true)"
-warning_rows="$(grep -Ec '^WARNING\|' "$machine_file" || true)"
-info_rows="$(grep -Ec '^INFO\|' "$machine_file" || true)"
-rows=${rows:-0}
-error_rows=${error_rows:-0}
-warning_rows=${warning_rows:-0}
-info_rows=${info_rows:-0}
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        doc = json.load(handle)
+except (OSError, ValueError) as error:
+    sys.exit("acceptance-gate: json output did not parse (%s)" % error)
+if doc.get("version") != 1:
+    sys.exit("acceptance-gate: unexpected envelope version %r" % doc.get("version"))
+by_sev = {"ERROR": 0, "WARNING": 0, "INFO": 0}
+rows = []
+for diag in doc.get("diagnostics", []):
+    sev = diag.get("severity")
+    if sev in by_sev:
+        by_sev[sev] += 1
+    location = diag.get("location", {})
+    rng = location.get("range", {})
+    start = rng.get("start", {})
+    rows.append("%s|%s|%s|%s|%s|%s|%s|%s" % (
+        sev, diag.get("type", "?"), diag.get("code", "?"),
+        location.get("file", "?"), start.get("line", "?"),
+        start.get("column", "?"),
+        rng.get("end", {}).get("offset", 0) - start.get("offset", 0),
+        diag.get("problemMessage", "?"),
+    ))
+print("%(ERROR)s %(WARNING)s %(INFO)s" % by_sev)
+for row in rows:
+    print(row)
+PYEOF
+)" || exit 2
+error_rows="$(printf '%s\n' "$rows_out" | sed -n 1p | cut -d' ' -f1)"
+warning_rows="$(printf '%s\n' "$rows_out" | sed -n 1p | cut -d' ' -f2)"
+info_rows="$(printf '%s\n' "$rows_out" | sed -n 1p | cut -d' ' -f3)"
+rows=$((error_rows + warning_rows + info_rows))
 
 if [ "$rows" -gt 0 ]; then
   echo "-- [$label] diagnostics over the valid corpus ($rows rows: $error_rows error, $warning_rows warning, $info_rows info):"
-  grep -E '^(ERROR|WARNING|INFO)\|' "$machine_file" | sed 's/^/  | /'
+  printf '%s\n' "$rows_out" | sed '1d' | sed 's/^/  | /'
   verdict=FAIL
 else
   echo "-- [$label] corpus clean: zero rows of every tier"
@@ -184,15 +214,15 @@ fi
 {
   echo "gate: scripts/acceptance-gate.sh"
   echo "corpus: $CORPUS ($corpus_count .dart files)"
-  echo "rule: fail on ANY machine row of any tier (valid corpus, zero rows expected)"
-  echo "command: $DARTQ_BIN check --format=machine $CORPUS"
+  echo "rule: fail on ANY diagnostic of any tier (valid corpus, zero rows expected)"
+  echo "command: $DARTQ_BIN check --format=json $CORPUS"
   echo "dartq check exit: $rc"
   echo "rows: $rows (error=$error_rows warning=$warning_rows info=$info_rows)"
   echo "verdict: $verdict"
 } >"$outdir/verdict.txt"
 
 printf '  %-16s %s (error=%s warning=%s info=%s)\n' "rows" "$rows" "$error_rows" "$warning_rows" "$info_rows"
-printf '  %-16s %s\n' "evidence" "$outdir/machine-output.txt , $outdir/verdict.txt"
+printf '  %-16s %s\n' "evidence" "$outdir/check-output.json , $outdir/verdict.txt"
 
 if [ "$verdict" = "PASS" ]; then
   echo "acceptance-gate: VERDICT PASS (valid-syntax corpus yields zero diagnostics of every tier)"

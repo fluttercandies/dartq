@@ -3,8 +3,9 @@
 **Where debugging lives:** the `dartq debug` verb group — the primary
 face for CLI and scripted integrations. Every subcommand is a thin proxy
 to the worktree's resident session (the same engine, the same semantics
-the MCP tools serve), output is one JSON line per call, and the argument
-spellings follow the daemon's own (`--wsUri`, `--dartDefines`, …), so a
+the MCP tools serve), output rides the shared `--format` axis (one lon
+line per call by default), the flags are kebab-case (`--ws-uri`,
+`--dart-defines`, …), and the wire/answer fields are snake_case — so the
 loop learned in the shell works unchanged in an MCP host.
 
 dartq speaks the Dart VM Service Protocol directly and layers an AI-first
@@ -30,11 +31,11 @@ debug session, and every verb drives it by default — `dartq debug resume`,
 zero live sessions the answer is a `DARTQ/DEBUG/NO_SESSIONS` error naming
 the way out (launch or attach); with several, a
 `DARTQ/DEBUG/AMBIGUOUS_SESSION` error listing every candidate
-(`#id kind script`, or `#id attach <wsUri>`) — then pick one with
+(`#id kind script`, or `#id attach <ws_uri>`) — then pick one with
 `-s <ID>` (long form `--session <ID>`).
 
 Skipping the breakpoint step just means the program runs free after
-resume. Launching is not the only entry: `dartq debug attach --wsUri
+resume. Launching is not the only entry: `dartq debug attach --ws-uri
 ws://…` connects to a running VM service — including one owned by a live
 `flutter run`; the tool's own console keeps working.
 

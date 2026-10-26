@@ -9,7 +9,7 @@
 //! — all declared ones by default, the `--context` labels' subset when
 //! given — through [`dartq_commands::config::compat_axis_roots`], falling
 //! back to `$DART_SDK` when nothing declared any axis), the tier mapping,
-//! and the JSON output.
+//! and the format axis.
 //!
 //! Output is the frozen JSON contract (`schema_version: 1`): the queried
 //! file plus the matrix in axis order (CLI flags first, then contexts in
@@ -59,6 +59,10 @@ pub(crate) struct CompatArgs {
     /// `compact`: the default run's bytes are unchanged.
     #[arg(short = 'v', long, value_enum, default_value_t = Verbosity::Compact)]
     pub(crate) verbosity: Verbosity,
+    /// Output format: `lon` (the default) or `json` (the frozen report,
+    /// both the same value), or `text` (the indented report).
+    #[arg(long, value_enum, default_value_t = crate::OutputFormat::Lon)]
+    pub(crate) format: crate::OutputFormat,
 }
 
 /// Crash tier like the other query faces: a panic aborts with exit 4 and
@@ -117,14 +121,18 @@ fn run(args: &CompatArgs, out: &mut impl Write) -> u8 {
         eprintln!("{line}");
     }
 
-    let written = out
-        .write_all(
-            serde_json::to_string(&report)
-                .expect("the validated report serializes")
-                .as_bytes(),
-        )
-        .and_then(|()| out.write_all(b"\n"))
-        .and_then(|()| out.flush());
+    let written = match args.format {
+        crate::OutputFormat::Json => out
+            .write_all(
+                serde_json::to_string(&report)
+                    .expect("the validated report serializes")
+                    .as_bytes(),
+            )
+            .and_then(|()| out.write_all(b"\n")),
+        crate::OutputFormat::Lon => crate::output::write_lon(out, &report),
+        crate::OutputFormat::Text => crate::output::write_text_value(out, &report),
+    }
+    .and_then(|()| out.flush());
     if let Err(error) = written {
         eprintln!("dartq: internal error: writing the compat report failed: {error}");
         return exit::INTERNAL_ERROR;
@@ -232,6 +240,7 @@ mod tests {
                 root.join("sdks/broken"),
             ],
             verbosity: Verbosity::Compact,
+            format: crate::OutputFormat::Json,
         };
         let mut out: Vec<u8> = Vec::new();
         let code = run(&args, &mut out);
@@ -308,6 +317,7 @@ mod tests {
                 root.join("sdks/broken"),
             ],
             verbosity: Verbosity::Minimal,
+            format: crate::OutputFormat::Json,
         };
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(run(&args, &mut out), exit::CLEAN);
@@ -349,6 +359,7 @@ mod tests {
             contexts: vec![],
             sdk_roots: vec![root.join("sdks/new")],
             verbosity: Verbosity::Compact,
+            format: crate::OutputFormat::Json,
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
         fs::remove_dir_all(&root).ok();
@@ -366,6 +377,7 @@ mod tests {
             contexts: vec![],
             sdk_roots: vec![root.join("sdks/new"), root.join("sdks/old")],
             verbosity: Verbosity::Compact,
+            format: crate::OutputFormat::Json,
         };
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(run(&args, &mut out), exit::CLEAN);
@@ -400,6 +412,7 @@ mod tests {
             contexts: vec![],
             sdk_roots: vec![],
             verbosity: Verbosity::Compact,
+            format: crate::OutputFormat::Json,
         };
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(run(&args, &mut out), exit::CLEAN);
@@ -435,6 +448,7 @@ mod tests {
             contexts: vec!["old".to_owned()],
             sdk_roots: vec![root.join("sdks/new")],
             verbosity: Verbosity::Compact,
+            format: crate::OutputFormat::Json,
         };
         assert_eq!(run(&args, &mut out), exit::CLEAN);
         let json: serde_json::Value =
@@ -471,6 +485,7 @@ mod tests {
             contexts: vec!["nope".to_owned()],
             sdk_roots: vec![],
             verbosity: Verbosity::Compact,
+            format: crate::OutputFormat::Json,
         };
         assert_eq!(run(&unknown, &mut Vec::new()), exit::USAGE);
 

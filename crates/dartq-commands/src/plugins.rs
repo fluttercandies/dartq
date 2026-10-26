@@ -895,9 +895,9 @@ fn element_at(
         }
     }
     let answer = json!({
-        "schema_version": crate::SCHEMA_VERSION,
+        "v": crate::SCHEMA_VERSION,
         "file": file,
-        "offset": offset,
+        "off": offset,
         "elements": elements,
     });
     let Some(map) = answer.as_object() else {
@@ -924,8 +924,8 @@ fn declaration_row(engine: &Engine, capture: &FileCapture, row: &DeclRow) -> Val
         "kind": commands_query::decl_kind_name(row.kind),
         "name": strings.resolve(row.name),
         "line": line,
-        "column": column,
-        "length": row.range.length,
+        "col": column,
+        "len": row.range.length,
     })
 }
 

@@ -44,6 +44,9 @@ rayon = { workspace = true }
 rustc-hash = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+# The default output encoding (`--format lon` everywhere; the MCP tool
+# content payload).
+lon = { workspace = true }
 
 # Test-only: the stale-config advisory tests pin the pub faces' mtime
 # chain.

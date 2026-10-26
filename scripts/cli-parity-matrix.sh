@@ -7,17 +7,20 @@
 # elsewhere; this lane measures the PARAMETER surface around it:
 #   (a) parity flags — must match: exit-code severity ladder
 #       (--fatal-infos / --[no-]fatal-warnings combinations over error-,
-#       warning- and info-only probes), --format machine/default/json
-#       faces, positional file/dir/multi targets, missing-target and
+#       warning- and info-only probes), the --format json byte face (the
+#       shared parity surface since the machine face retired on dartq,
+#       #2606), positional file/dir/multi targets, missing-target and
 #       bogus-value usage errors, --sdk-path / --packages /
 #       --enable-experiment acceptance and rejection, -h/--help,
 #       unknown-flag and --no-fatal-infos rejection.
-#   (b) dartq extensions — must not alter the parity face: -v/--verbosity
-#       tiers, --metrics-json, --overlay, --memory-limit, --trace-events,
-#       --cache-size-limit, --plugins/--no-plugins, the hidden --sdk alias.
-#   (c) cross surface — flags one side lacks: dartq extensions on the
-#       oracle (the oracle's unknown-flag usage error) and the bare `-v`
-#       collision (oracle: silent dartdev global; dartq: verbosity tier).
+#   (b) dartq extensions — must not alter the parity face: --metrics-json,
+#       --overlay, --memory-limit, --trace-events, --cache-size-limit,
+#       --plugins/--no-plugins, the hidden --sdk alias.
+#   (c) cross surface — flags one side lacks: the retired machine face and
+#       --format=default on dartq (usage error 64 there, valid on the
+#       oracle), the dartq-only lon/text faces, dartq extensions on the
+#       oracle (the oracle's unknown-flag usage error), and the bare `-v`
+#       collision (oracle: silent dartdev global; dartq: unknown flag).
 #
 # Verdicts: PASS (contract holds), FAIL (parity leg diverges), CRASH
 # (dartq internal-error path), EXTENSION (documented one-sided surface,
@@ -189,18 +192,20 @@ if side == "dart":
                 cur[3] = tail_code
     if cur: flush()
 else:
-    # dartq default face: one absolute path header line per file, then
-    # `  l:c • Severity • code • message` rows under it.
-    fpath = ""
+    # dartq default face: the canonical LON document `{v:1 diags:[…]}` —
+    # uniform rows collapse to the record table (`[code sev file …;v v v …]`,
+    # positional after the header), non-uniform rows stay object-form
+    # (`{code:X sev:error file:F …}`). File paths carry no spaces in the
+    # corpus, so each row's first three whitespace tokens are safe.
     for line in open(path_file):
-        line = line.rstrip("\n")
-        if "\u2022" in line:
-            m = re.match(r"\s*\d+:\d+\s*\u2022\s*(Error|Warning|Info)\s*\u2022\s*(\S+)", line)
-            if m and fpath:
-                rows.add(f"{m.group(1).lower()}|{m.group(2)}|{norm(fpath)}")
-        elif "/" in line.strip() and not re.match(r"^\d+ issues? found\.$", line.strip()) \
-                and line.strip() != "No issues found!":
-            fpath = line.strip()
+        m = re.search(r"diags:\[([a-z_ ]+);", line)
+        if m and m.group(1).split()[:3] == ["code", "sev", "file"]:
+            for row in line[m.end():].rstrip("]}").split(";"):
+                toks = row.split()
+                if len(toks) >= 3:
+                    rows.add(f"{toks[1]}|{toks[0]}|{norm(toks[2])}")
+        for m in re.finditer(r"(?:^|[{;\s])code:([^ ;]+)\s+sev:(error|warning|info)\s+file:([^ ;]+)", line):
+            rows.add(f"{m.group(2)}|{m.group(1)}|{norm(m.group(3))}")
 for r in sorted(rows):
     print(r)
 PYEOF
@@ -220,31 +225,13 @@ chk_triple() { # (severity, code, file) set equality + rc equality
 }
 
 # Extension neutrality: dartq-only flags leave the dartq baseline face
-# unchanged (machine-row tiers transform per the documented contract).
+# unchanged (the retired -v tiers are gone with the machine face; the
+# remaining extensions must be byte-neutral on the default face).
 chk_ext() {
   local id="$1" strip="$2"
   if panicked "$id"; then echo "CRASH	dartq panicked"; return; fi
   local qrc brc; qrc=$(cat "$PROBES/$id.dartq.rc"); brc=$(cat "$PROBES/ext-baseline.dartq.rc")
   case "$id" in
-    ext-verbosity-concise|ext-verbosity-verbose|ext-verbosity-default)
-      # Tier contract: identifying columns (1-7) unchanged; concise drops the
-      # message field, verbose appends the correctionMessage field, default is
-      # the baseline row verbatim.
-      local base="$PROBES/ext-baseline-machine.dartq.out" out="$PROBES/$id.dartq.out" ok=1
-      case "$id" in
-        ext-verbosity-concise)
-          diff <(awk -F'|' -v OFS='|' '{NF=7; print}' "$base") "$out" >/dev/null 2>&1 || ok=0 ;;
-        ext-verbosity-verbose)
-          diff <(awk -F'|' -v OFS='|' '{NF=7; print}' "$base") <(awk -F'|' -v OFS='|' '{NF=7; print}' "$out") >/dev/null 2>&1 || ok=0
-          awk -F'|' 'NF!=9{bad=1} END{exit bad?1:0}' "$out" || ok=0 ;;
-        *) cmp -s "$out" "$base" || ok=0 ;;
-      esac
-      if [ "$ok" = 1 ]; then
-        echo "PASS	tier face matches documented contract rc=$qrc"
-      else
-        echo "FAIL	tier face differs from documented contract"
-      fi
-      return ;;
     ext-overlay)
       triple_of dartq "$PROBES/$id.dartq.out" "" > "$PROBES/$id.dartq.triple"
       if [ "$qrc" = 0 ] && [ ! -s "$PROBES/$id.dartq.triple" ]; then
@@ -269,7 +256,13 @@ chk_cross() {
   case "$id" in
     cross-dq-flags-on-oracle) exp_d=64; exp_q=3 ;;  # extension accepted only on dartq
     ext-sdk-alias)            exp_d=64; exp_q=3 ;;  # hidden compat alias only on dartq
-    cross-bare-v)             exp_d=3;  exp_q=64 ;; # -v repurposed as tier value on dartq
+    cross-bare-v)             exp_d=3;  exp_q=64 ;; # bare -v: dartdev global vs unknown on dartq
+    fmt-machine-efile)        exp_d=3;  exp_q=64 ;; # machine retired on dartq (errors -> 3)
+    fmt-machine-ifile)        exp_d=0;  exp_q=64 ;; # machine retired on dartq (infos -> 0)
+    fmt-machine-full)         exp_d=3;  exp_q=64 ;; # machine retired on dartq (full corpus)
+    fmt-default-explicit)     exp_d=3;  exp_q=64 ;; # --format=default: oracle human face, retired on dartq
+    fmt-lon-dartq-only)       exp_d=64; exp_q=3 ;;  # the dartq default face is dartq-only
+    fmt-text-dartq-only)      exp_d=64; exp_q=3 ;;  # the dartq human face is dartq-only
   esac
   if [ "$drc" = "$exp_d" ] && [ "$qrc" = "$exp_q" ]; then
     echo "EXTENSION	documented asymmetry holds (dart=$drc dartq=$qrc)"
@@ -283,8 +276,6 @@ emit "id	class	leg	dart_rc	dartq_rc	verdict	detail"
 # ---- dartq baselines for extension neutrality ----
 rc=0; ( cd "$REPO_ROOT" && "$DARTQ" analyze "$E_TARGET" >"$PROBES/ext-baseline.dartq.out" 2>"$PROBES/ext-baseline.dartq.err" ) || rc=$?
 echo "$rc" >"$PROBES/ext-baseline.dartq.rc"
-rc=0; ( cd "$REPO_ROOT" && "$DARTQ" analyze --format=machine "$E_TARGET" >"$PROBES/ext-baseline-machine.dartq.out" 2>"$PROBES/ext-baseline-machine.dartq.err" ) || rc=$?
-echo "$rc" >"$PROBES/ext-baseline-machine.dartq.rc"
 
 # ============ (a) parity legs — must match ============
 
@@ -301,12 +292,10 @@ run_leg exit-e-fatalinfos      parity rc     ""            "E-file --fatal-infos
 run_leg exit-dir               parity triple "tests/corpus/sem2/lib/targeted/" "dir target triple face + rc"                  -- "$DIR_TARGET" -- "$DIR_TARGET"
 run_leg file-multi             parity triple ""            "multi file targets"                                  -- "$DIR_TARGET/const_with_non_const.dart" "$DIR_TARGET/non_bool_condition.dart" -- "$DIR_TARGET/const_with_non_const.dart" "$DIR_TARGET/non_bool_condition.dart"
 run_leg target-missing         parity rc     ""            "missing target -> usage error"                       -- tests/corpus/sem2/lib/nope.dart -- tests/corpus/sem2/lib/nope.dart
-run_leg fmt-machine-efile      parity byte   ""            "--format=machine byte face, E-file"                  -- --format=machine "$E_TARGET" -- --format=machine "$E_TARGET"
-run_leg fmt-machine-ifile      parity byte   ""            "--format=machine byte face, I-file"                  -- --format=machine "$I_TARGET" -- --format=machine "$I_TARGET"
 run_leg fmt-json-efile         parity byte   ""            "--format=json byte face, E-file"                     -- --format=json "$E_TARGET" -- --format=json "$E_TARGET"
-run_leg fmt-default-explicit   parity triple "$E_DIRNAME/"  "--format=default explicit"                           -- --format=default "$E_TARGET" -- --format=default "$E_TARGET"
-run_leg fmt-space-spelling     parity byte   ""            "--format machine (space spelling)"                   -- --format machine "$E_TARGET" -- --format machine "$E_TARGET"
-run_leg fmt-bogus              parity rc     ""            "--format bogus -> usage error"                       -- --format=bogus "$E_TARGET" -- --format=bogus "$E_TARGET"
+run_leg fmt-json-ifile         parity byte   ""            "--format=json byte face, I-file"                     -- --format=json "$I_TARGET" -- --format=json "$I_TARGET"
+run_leg fmt-space-spelling     parity byte   ""            "--format json (space spelling)"                      -- --format json "$E_TARGET" -- --format json "$E_TARGET"
+run_leg fmt-bogus              parity rc     ""            "--format bogus -> usage error on both"               -- --format=bogus "$E_TARGET" -- --format=bogus "$E_TARGET"
 run_leg sdk-valid              parity rc     ""            "--sdk-path valid"                                    -- --sdk-path="$SDK_ROOT" "$E_TARGET" -- --sdk-path="$SDK_ROOT" "$E_TARGET"
 run_leg sdk-bogus              parity rc     ""            "--sdk-path bogus -> usage error"                     -- --sdk-path=/nonexistent/sdk "$E_TARGET" -- --sdk-path=/nonexistent/sdk "$E_TARGET"
 run_leg packages-valid         parity rc     ""            "--packages valid config"                             -- --packages="$CORPUS/.dart_tool/package_config.json" "$E_TARGET" -- --packages="$CORPUS/.dart_tool/package_config.json" "$E_TARGET"
@@ -320,14 +309,10 @@ run_leg no-fatal-infos         parity rc     ""            "--no-fatal-infos rej
 run_leg unknown-flag           parity rc     ""            "unknown flag rejected on both"                       -- --bogus-flag "$E_TARGET" -- --bogus-flag "$E_TARGET"
 
 # Corpus-scale format faces (the convergence quantifiers).
-run_leg fmt-machine-full       parity byte   ""            "--format=machine byte face, full corpus"             -- --format=machine "$CORPUS" -- --format=machine "$CORPUS"
 run_leg fmt-json-full          parity byte   ""            "--format=json byte face, full corpus"                -- --format=json "$CORPUS" -- --format=json "$CORPUS"
 
 # ============ (b) dartq extensions — parity face neutral ============
 
-run_leg ext-verbosity-concise  ext chk_ext "" "-v concise tier face"                 -- ignored -- --format=machine -v concise "$E_TARGET"
-run_leg ext-verbosity-verbose  ext chk_ext "" "-v verbose tier face"                 -- ignored -- --format=machine -v verbose "$E_TARGET"
-run_leg ext-verbosity-default  ext chk_ext "" "-v default tier == baseline face"     -- ignored -- --format=machine -v default "$E_TARGET"
 run_leg ext-metrics-json       ext chk_ext "" "--metrics-json side channel neutral"  -- ignored -- --metrics-json "$PROBES/metrics.json" "$E_TARGET"
 run_leg ext-overlay            ext chk_ext "" "--overlay clean-over-error neutralizes row" -- ignored -- --overlay "$OVERLAY_KEY=$OVERLAY_CLEAN" "$E_TARGET"
 run_leg ext-memory-limit       ext chk_ext "" "--memory-limit neutral"               -- ignored -- --memory-limit 4096 "$E_TARGET"
@@ -353,7 +338,19 @@ rc=0; ( cd "$REPO_ROOT" && "$DART" analyze --memory-limit=2048 "$E_TARGET" >"$PR
 echo "$rc" >"$PROBES/cross-dq-flags-on-oracle.dart.rc"
 emit "cross-dq-flags-on-oracle	cross	--memory-limit on both CLIs	dart=$(cat "$PROBES/cross-dq-flags-on-oracle.dart.rc")	dartq=$(cat "$PROBES/cross-dq-flags-on-oracle.dartq.rc")	EXTENSION	dartq-only extension: oracle says '$(head -1 "$PROBES/cross-dq-flags-on-oracle.dart.err")'"
 
-run_leg cross-bare-v           cross chk_cross "" "bare -v: oracle swallows, dartq demands tier value" -- -v "$E_TARGET" -- -v "$E_TARGET"
+run_leg cross-bare-v           cross chk_cross "" "bare -v: oracle swallows, dartq rejects" -- -v "$E_TARGET" -- -v "$E_TARGET"
+
+# The retired machine face and --format=default: valid on the oracle, usage
+# error (64) on dartq since the #2606 re-cast (lon/json/text is the axis).
+run_leg fmt-machine-efile      cross chk_cross "" "machine retired: oracle 3 (E-file), dartq 64"  -- --format=machine "$E_TARGET" -- --format=machine "$E_TARGET"
+run_leg fmt-machine-ifile      cross chk_cross "" "machine retired: oracle 0 (I-file), dartq 64"  -- --format=machine "$I_TARGET" -- --format=machine "$I_TARGET"
+run_leg fmt-machine-full       cross chk_cross "" "machine retired: oracle 3 (full corpus), dartq 64" -- --format=machine "$CORPUS" -- --format=machine "$CORPUS"
+run_leg fmt-default-explicit   cross chk_cross "" "--format=default: oracle human face, dartq 64" -- --format=default "$E_TARGET" -- --format=default "$E_TARGET"
+
+# The dartq-only format values: lon (the constant default face) and text
+# (the human face) are usage errors on the oracle.
+run_leg fmt-lon-dartq-only     cross chk_cross "" "--format=lon: dartq default face, oracle 64"  -- --format=lon "$E_TARGET" -- --format=lon "$E_TARGET"
+run_leg fmt-text-dartq-only    cross chk_cross "" "--format=text: dartq human face, oracle 64"   -- --format=text "$E_TARGET" -- --format=text "$E_TARGET"
 
 echo "cli-parity-matrix: matrix complete -> $MATRIX"
 if [ "${#FAILS[@]}" -gt 0 ]; then

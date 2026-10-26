@@ -153,37 +153,46 @@ impl LibraryChange {
     }
 }
 
-/// The impact report, JSON contract `schema_version: 2`.
+/// The impact report, JSON contract `v: 2` (the short-vocabulary envelope).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactReport {
     /// The output contract version ([`IMPACT_SCHEMA_VERSION`]).
+    #[serde(rename = "v")]
     pub schema_version: u32,
-    /// The changed symbols of the target libraries.
+    /// The changed symbols of the target libraries (wire: `sym`).
+    #[serde(rename = "sym")]
     pub changed: Vec<ChangedSymbol>,
-    /// The dependency closure, each entry content-only or semantic.
+    /// The dependency closure, each entry content-only or semantic (wire:
+    /// `files`).
+    #[serde(rename = "files")]
     pub affected: Vec<AffectedTarget>,
-    /// The test files exercising the changed or affected libraries.
+    /// The test files exercising the changed or affected libraries (wire:
+    /// `tests`).
+    #[serde(rename = "tests")]
     pub affected_tests: Vec<AffectedTest>,
     /// The environment matrix, answered by the caller — an environment
     /// verdict needs engines this pure query never sees, so the query
     /// ships the section empty and the caller that ran the analysis fills
     /// it: one honest `default` row (the compat verdict rule over the
     /// analysis' diagnostics) when the workspace declares no contexts, one
-    /// row per declared context otherwise, in file order.
+    /// row per declared context otherwise, in file order. Wire: `envs`.
+    #[serde(rename = "envs")]
     pub affected_environments: Vec<EnvironmentImpact>,
 }
 
 /// One changed symbol with its signature verdict.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangedSymbol {
-    /// The stable path reference.
+    /// The stable path reference (wire: `sym`).
+    #[serde(rename = "sym")]
     pub symbol: String,
     /// Whether the symbol's signature changed (v2 digest semantics — see
     /// [`symbol_signature_changed`]): an added or removed declaration, or a
     /// stable name whose member-level digest moved (a parameter type, a
     /// default value, a modifier — anything the canonical face folds). The
     /// v1 name-presence proxy under-reported exactly the stable-name case;
-    /// the member digests retire it.
+    /// the member digests retire it. Wire: `sig_changed`.
+    #[serde(rename = "sig_changed")]
     pub signature_changed: bool,
 }
 
@@ -200,7 +209,8 @@ pub struct AffectedTarget {
     /// posture, the resolved `--symbol` hits under the narrowed one).
     /// Sorted, deduplicated; the empty list marks the transitive case —
     /// the change reaches the row through the import graph alone, none
-    /// of its own uses name a seed symbol.
+    /// of its own uses name a seed symbol. Wire: `lines`.
+    #[serde(rename = "lines")]
     pub reference_lines: Vec<u32>,
 }
 
@@ -935,11 +945,11 @@ mod tests {
         assert_eq!(report.affected[0].impact, ImpactLevel::Semantic);
     }
 
-    /// The JSON contract: `schema_version: 2` round-trips, section keys are
-    /// the names, and the impact tag spells `content-only` /
-    /// `semantic`.
+    /// The JSON contract: `v: 2` round-trips, the section keys are the
+    /// short-vocabulary spellings (`sym`/`files`/`tests`/`envs`), and the
+    /// impact tag spells `content-only` / `semantic`.
     #[test]
-    fn json_round_trip_with_schema_version() {
+    fn json_round_trip_with_the_version_stamp() {
         let fx = fixture();
         let imports: [&[u32]; 2] = [&[], &[0]];
         let tests = TestGraph::default();
@@ -960,13 +970,13 @@ mod tests {
         let back: ImpactReport = serde_json::from_str(&text).expect("deserialize");
         assert_eq!(back, report, "byte-stable round trip");
         let value: serde_json::Value = serde_json::from_str(&text).expect("json");
-        assert_eq!(value["schema_version"], IMPACT_SCHEMA_VERSION);
-        assert!(value["changed"].is_array());
-        assert!(value["affected"].is_array());
-        assert!(value["affected_tests"].is_array());
-        assert!(value["affected_environments"].is_array());
+        assert_eq!(value["v"], IMPACT_SCHEMA_VERSION);
+        assert!(value["sym"].is_array());
+        assert!(value["files"].is_array());
+        assert!(value["tests"].is_array());
+        assert!(value["envs"].is_array());
         assert_eq!(
-            value["affected"][0]["impact"].as_str(),
+            value["files"][0]["impact"].as_str(),
             Some("semantic"),
             "kebab-case tag spelling"
         );

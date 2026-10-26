@@ -117,25 +117,25 @@ fn impact_symbol_table_value_without_path_form_is_named() {
 }
 
 #[test]
-fn dropped_schema_version_is_named() {
+fn dropped_version_stamp_is_named() {
     let mut value = serde_json::to_value(fixture_report()).expect("value");
     value
         .as_object_mut()
         .expect("object")
-        .remove("schema_version");
+        .remove("v");
     let violation = violation_of(&value.to_string(), Domain::Impact);
-    assert_eq!(violation.path, "schema_version");
+    assert_eq!(violation.path, "v");
     assert_eq!(violation.found, "missing");
 }
 
 /// v2: `signature_changed` consults member-level signature digests instead
 /// of the v1 name-presence proxy (#1561) — the former pin 1 is now stale.
 #[test]
-fn wrong_schema_version_is_named() {
+fn wrong_version_stamp_is_named() {
     let mut value = serde_json::to_value(fixture_report()).expect("value");
-    value["schema_version"] = 1.into();
+    value["v"] = 1.into();
     let violation = violation_of(&value.to_string(), Domain::Impact);
-    assert_eq!(violation.path, "schema_version");
+    assert_eq!(violation.path, "v");
     assert_eq!(
         violation.expected,
         format!("the integer {SCHEMA_VERSION_IMPACT}")
@@ -146,9 +146,9 @@ fn wrong_schema_version_is_named() {
 #[test]
 fn misspelled_impact_level_is_named() {
     let mut value = serde_json::to_value(fixture_report()).expect("value");
-    value["affected"][0]["impact"] = "semanticx".into();
+    value["files"][0]["impact"] = "semanticx".into();
     let violation = violation_of(&value.to_string(), Domain::Impact);
-    assert_eq!(violation.path, "affected[0].impact");
+    assert_eq!(violation.path, "files[0].impact");
     assert_eq!(violation.expected, "\"content-only\" or \"semantic\"");
     assert_eq!(violation.found, "\"semanticx\"");
 }
@@ -156,18 +156,18 @@ fn misspelled_impact_level_is_named() {
 #[test]
 fn bare_label_symbol_ref_is_rejected() {
     let mut value = serde_json::to_value(fixture_report()).expect("value");
-    value["changed"][0]["symbol"] = "fb".into();
+    value["sym"][0]["sym"] = "fb".into();
     let violation = violation_of(&value.to_string(), Domain::Impact);
-    assert_eq!(violation.path, "changed[0].symbol");
+    assert_eq!(violation.path, "sym[0].sym");
     assert_eq!(violation.expected, "a `label|name` path reference");
 }
 
 #[test]
 fn undeclared_impact_field_is_named() {
     let mut value = serde_json::to_value(fixture_report()).expect("value");
-    value["changed"][0]["severity"] = 1.into();
+    value["sym"][0]["severity"] = 1.into();
     let violation = violation_of(&value.to_string(), Domain::Impact);
-    assert_eq!(violation.path, "changed[0].severity");
+    assert_eq!(violation.path, "sym[0].severity");
     assert_eq!(violation.found, "an undeclared field");
 }
 
@@ -330,7 +330,7 @@ fn schema_documents_carry_the_version_constants() {
     let impact = dartq_schema::impact_schema();
     assert_eq!(impact["$schema"], "http://json-schema.org/draft-07/schema#");
     assert_eq!(
-        impact["properties"]["schema_version"]["const"],
+        impact["properties"]["v"]["const"],
         SCHEMA_VERSION_IMPACT
     );
     let diagnostics = dartq_schema::diagnostics_schema();
@@ -361,7 +361,8 @@ fn compact_explain_report() -> ExplainReport {
             name: "Foo".to_owned(),
             kind: "class".to_owned(),
             container: None,
-            range: [40, 43],
+            off: 40,
+            len: 3,
         }),
         inheritance: Some(vec![SuperTypeRow {
             name: "Bar".to_owned(),
@@ -377,12 +378,14 @@ fn compact_explain_report() -> ExplainReport {
         methods: Some(vec![MemberRow {
             name: "area".to_owned(),
             kind: "method".to_owned(),
-            range: [90, 93],
+            off: 90,
+            len: 3,
         }]),
         references: Some(vec![ReferenceRow {
             file: "b.dart".to_owned(),
             kind: "invoked".to_owned(),
-            range: [10, 13],
+            off: 10,
+            len: 3,
             qualified: false,
         }]),
         dependencies: Some(vec![DependencyRow {
@@ -415,7 +418,8 @@ fn minimal_explain_report_passes_validation() {
             name: "Foo".to_owned(),
             kind: "class".to_owned(),
             container: None,
-            range: [40, 43],
+            off: 40,
+            len: 3,
         }),
         inheritance: None,
         interfaces: None,
@@ -455,7 +459,8 @@ fn explain_reports_are_exact_at_their_tier() {
             name: "Foo".to_owned(),
             kind: "class".to_owned(),
             container: None,
-            range: [40, 43],
+            off: 40,
+            len: 3,
         }),
         inheritance: None,
         interfaces: None,
@@ -494,7 +499,8 @@ fn misspelled_explain_member_kind_is_named() {
         methods: Some(vec![MemberRow {
             name: "area".to_owned(),
             kind: "constructor".to_owned(),
-            range: [90, 93],
+            off: 90,
+            len: 3,
         }]),
         references: Some(Vec::new()),
         dependencies: Some(Vec::new()),

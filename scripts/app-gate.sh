@@ -69,7 +69,7 @@ FVM_HOME="${FVM_HOME:-$HOME/fvm}"
 sdk_root="$FVM_HOME/default/bin/cache/dart-sdk"
 dart_bin="$sdk_root/bin/dart"
 [ -x "$dart_bin" ] || { echo "app-gate: fvm default dart not found at $dart_bin (set FVM_HOME)" >&2; exit 2; }
-dartq_cmd="${DARTQ_CMD:-./target/release/dartq analyze --format=machine --sdk $sdk_root}"
+dartq_cmd="${DARTQ_CMD:-./target/release/dartq analyze --format=json --sdk $sdk_root}"
 export DART_SDK="$sdk_root"
 # The 10k-file oracle batch exceeds the harness 120 s default (mega-run raises the same way).
 export DARTQ_HARNESS_ORACLE_TIMEOUT_MS="${DARTQ_HARNESS_ORACLE_TIMEOUT_MS:-600000}"

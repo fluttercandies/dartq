@@ -73,7 +73,7 @@ fn seeded_query_workspace() -> Workspace {
 /// `qualified` spelling omitted — the contract types it as the qualified
 /// name string while the row model carries only the bit.
 fn assert_reference_row_shape(row: &Value) {
-    for field in ["target_file", "kind", "offset", "length"] {
+    for field in ["target", "kind", "off", "len"] {
         assert!(
             row.get(field).is_some(),
             "reference row carries {field}: {row}"
@@ -111,27 +111,27 @@ fn default_missing_kind_is_the_symbol_answer() {
 
     // The symbol face's compact shape (the CLI JSON face verbatim, the
     // shared shaper's stable package-form labels included).
-    assert_eq!(absent["schema_version"], 1);
-    assert_eq!(absent["name"], "Foo");
-    let declarations = absent["declarations"].as_array().expect("declarations");
-    assert_eq!(declarations.len(), 1);
-    assert_eq!(declarations[0]["file"], "package:fixture/a.dart");
-    assert_eq!(declarations[0]["kind"], "class");
-    assert_eq!(declarations[0]["name"], "Foo");
-    assert_eq!(declarations[0]["line"], 1);
-    assert_eq!(declarations[0]["column"], 7);
-    assert_eq!(declarations[0]["length"], 3);
-    let references = absent["references"].as_array().expect("references");
+    assert_eq!(absent["v"], 1);
+    assert_eq!(absent["sym"], "Foo");
+    let decls = absent["decls"].as_array().expect("decls");
+    assert_eq!(decls.len(), 1);
+    assert_eq!(decls[0]["file"], "package:fixture/a.dart");
+    assert_eq!(decls[0]["kind"], "class");
+    assert_eq!(decls[0]["name"], "Foo");
+    assert_eq!(decls[0]["line"], 1);
+    assert_eq!(decls[0]["col"], 7);
+    assert_eq!(decls[0]["len"], 3);
+    let refs = absent["refs"].as_array().expect("refs");
     assert_eq!(
-        references.len(),
+        refs.len(),
         2,
         "the annotation use plus the invocation"
     );
-    assert_eq!(references[0]["kind"], "reference");
-    assert_eq!(references[0]["offset"], 33);
-    assert_eq!(references[1]["kind"], "invoked");
-    assert_eq!(references[1]["offset"], 42);
-    references.iter().for_each(assert_reference_row_shape);
+    assert_eq!(refs[0]["kind"], "reference");
+    assert_eq!(refs[0]["off"], 33);
+    assert_eq!(refs[1]["kind"], "invoked");
+    assert_eq!(refs[1]["off"], 42);
+    refs.iter().for_each(assert_reference_row_shape);
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
@@ -156,16 +156,16 @@ fn minimal_tier_keeps_the_package_form_labels() {
         1,
     );
     let result = answer_result(&h, 2);
-    let declarations = result["declarations"].as_array().expect("declarations");
-    assert_eq!(declarations.len(), 1);
-    assert_eq!(declarations[0]["file"], "package:fixture/a.dart");
-    let references = result["references"].as_array().expect("references");
-    assert_eq!(references.len(), 2);
-    assert_eq!(references[0]["target_file"], "package:fixture/a.dart");
+    let decls = result["decls"].as_array().expect("decls");
+    assert_eq!(decls.len(), 1);
+    assert_eq!(decls[0]["file"], "package:fixture/a.dart");
+    let refs = result["refs"].as_array().expect("refs");
+    assert_eq!(refs.len(), 2);
+    assert_eq!(refs[0]["target"], "package:fixture/a.dart");
     assert!(
-        references[0].get("file").is_none(),
+        refs[0].get("file").is_none(),
         "the minimal red line keeps the target locator only: {row}",
-        row = &references[0]
+        row = &refs[0]
     );
 
     let (code, _) = h.join_ended();
@@ -196,22 +196,22 @@ fn references_kind_serves_the_symbol_rows() {
         references, symbol,
         "references serves the symbol rows verbatim"
     );
-    assert_eq!(references["schema_version"], 1);
+    assert_eq!(references["v"], 1);
 
     // The declaration rows' schema-domain shape (compact carries the
     // convenience `container` when a row has one — the omission rule drops
     // it on top-level rows rather than spelling a null).
-    let declarations = references["declarations"].as_array().expect("declarations");
-    assert_eq!(declarations.len(), 1);
-    for field in ["file", "kind", "name", "line", "column", "length"] {
+    let decls = references["decls"].as_array().expect("decls");
+    assert_eq!(decls.len(), 1);
+    for field in ["file", "kind", "name", "line", "col", "len"] {
         assert!(
-            declarations[0].get(field).is_some(),
+            decls[0].get(field).is_some(),
             "declaration row carries {field}"
         );
     }
     // `Foo` is a top-level class, so `container` is omitted per the
     // null/empty omission — not spelled as a null.
-    assert!(declarations[0].get("container").is_none());
+    assert!(decls[0].get("container").is_none());
 
     let text = serde_json::to_string(&references).expect("serialize");
     dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
@@ -239,18 +239,18 @@ fn callers_kind_keeps_the_invocation_rows() {
         1,
     );
     let result = answer_result(&h, 2);
-    assert_eq!(result["schema_version"], 1);
-    let declarations = result["declarations"].as_array().expect("declarations");
-    assert_eq!(declarations.len(), 1, "the declaration rows stay");
-    let references = result["references"].as_array().expect("references");
+    assert_eq!(result["v"], 1);
+    let decls = result["decls"].as_array().expect("decls");
+    assert_eq!(decls.len(), 1, "the declaration rows stay");
+    let refs = result["refs"].as_array().expect("refs");
     assert_eq!(
-        references.len(),
+        refs.len(),
         1,
-        "only the invocation survives: {references:?}"
+        "only the invocation survives: {refs:?}"
     );
-    assert_eq!(references[0]["kind"], "invoked");
-    assert_eq!(references[0]["offset"], 42);
-    references.iter().for_each(assert_reference_row_shape);
+    assert_eq!(refs[0]["kind"], "invoked");
+    assert_eq!(refs[0]["off"], 42);
+    refs.iter().for_each(assert_reference_row_shape);
 
     // `foo`: the call site is the one row, already invocation-shaped.
     h.step(
@@ -262,13 +262,13 @@ fn callers_kind_keeps_the_invocation_rows() {
         1,
     );
     let result = answer_result(&h, 3);
-    let references = result["references"].as_array().expect("references");
-    assert_eq!(references.len(), 1);
-    assert_eq!(references[0]["kind"], "invoked");
-    assert_eq!(references[0]["offset"], 51);
-    let declarations = result["declarations"].as_array().expect("declarations");
-    assert_eq!(declarations.len(), 1);
-    assert_eq!(declarations[0]["kind"], "function");
+    let refs = result["refs"].as_array().expect("refs");
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0]["kind"], "invoked");
+    assert_eq!(refs[0]["off"], 51);
+    let decls = result["decls"].as_array().expect("decls");
+    assert_eq!(decls.len(), 1);
+    assert_eq!(decls[0]["kind"], "function");
 
     let text = serde_json::to_string(&result).expect("serialize");
     dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
@@ -321,7 +321,7 @@ fn unknown_kind_answers_invalid_params() {
         1,
     );
     let result = answer_result(&h, 3);
-    assert_eq!(result["name"], "Foo");
+    assert_eq!(result["sym"], "Foo");
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
@@ -368,7 +368,7 @@ fn implementation_and_dependency_kinds_end_to_end() {
         1,
     );
     let result = answer_result(&h, 2);
-    assert_eq!(result["name"], "Animal");
+    assert_eq!(result["sym"], "Animal");
     let implementations = result["implementations"].as_array().expect("array");
     assert_eq!(
         implementations.len(),
@@ -378,9 +378,9 @@ fn implementation_and_dependency_kinds_end_to_end() {
     assert_eq!(implementations[0]["name"], "Dog");
     assert_eq!(implementations[0]["kind"], "class");
     assert_eq!(implementations[1]["name"], "Cat");
-    let declarations = result["declarations"].as_array().expect("declarations");
-    assert_eq!(declarations.len(), 1);
-    assert!(result["references"].as_array().expect("array").is_empty());
+    let decls = result["decls"].as_array().expect("decls");
+    assert_eq!(decls.len(), 1);
+    assert!(result["refs"].as_array().expect("array").is_empty());
     let text = serde_json::to_string(&result).expect("serialize");
     dartq_schema::validate(&text, dartq_schema::Domain::Query).expect("schema-valid");
 
@@ -418,7 +418,7 @@ fn implementation_and_dependency_kinds_end_to_end() {
     );
     let result = answer_result(&h, 4);
     assert!(
-        result.get("dependencies").is_none(),
+        result.get("deps").is_none(),
         "a.dart imports nothing — the additive array is omitted: {result:?}"
     );
     let text = serde_json::to_string(&result).expect("serialize");
@@ -449,7 +449,7 @@ fn implementation_and_dependency_kinds_end_to_end() {
     // The forward `dependencies` answer for `Animal` (a.dart imports
     // nothing) is empty, so the additive array is omitted here too.
     assert!(
-        answers[1].get("dependencies").is_none(),
+        answers[1].get("deps").is_none(),
         "a.dart imports nothing — the additive array is omitted: {answers:?}"
     );
 
@@ -488,8 +488,8 @@ fn kinded_queries_share_one_turn_of_the_request_lifecycle() {
     let references = answer_result(&h, 3);
     let callers = answer_result(&h, 4);
     assert_eq!(references, symbol, "references == symbol rows");
-    let caller_rows = callers["references"].as_array().expect("references");
-    let symbol_rows = symbol["references"].as_array().expect("references");
+    let caller_rows = callers["refs"].as_array().expect("refs");
+    let symbol_rows = symbol["refs"].as_array().expect("refs");
     assert_eq!(
         caller_rows.len() + 1,
         symbol_rows.len(),

@@ -41,7 +41,7 @@ use crate::Verbosity;
 use crate::query::{DECL_KINDS, REF_KINDS};
 use crate::support::{
     absent, array, boolean, enum_spelling, exact_fields, field, join, non_negative, object,
-    path_session_fields, pinned_version, range_pair, string,
+    path_session_fields, pinned_version, string,
 };
 
 /// The explain report's output contract version. Mirrors the
@@ -62,13 +62,13 @@ static EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "title": "dartq explain report (schema_version 1)",
         "type": "object",
         "additionalProperties": false,
-        "required": ["schema_version", "symbol"],
+        "required": ["v", "sym"],
         "properties": {
-            "schema_version": { "const": SCHEMA_VERSION_EXPLAIN },
-            "symbol": { "type": "string" },
+            "v": { "const": SCHEMA_VERSION_EXPLAIN },
+            "sym": { "type": "string" },
             "declaration": { "type": "object",
                 "additionalProperties": false,
-                "required": ["file", "name", "kind", "range"],
+                "required": ["file", "name", "kind", "off", "len"],
                 "properties": {
                     "file": { "type": "string" },
                     "name": { "type": "string" },
@@ -76,43 +76,45 @@ static EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                     // Compact/full only (minimal trims the convenience
                     // field); absent for a top-level declaration.
                     "container": { "type": "string" },
-                    "range": range_pair_schema(),
+                    "off": { "type": "integer", "minimum": 0 },
+                    "len": { "type": "integer", "minimum": 0 },
                 },
             },
-            "inheritance": supertype_rows(),
+            "bases": supertype_rows(),
             // The `with`/`on`/`implements` supertype edges, each row
             // naming its clause (dartq-ai `explain.rs`, the clause split).
-            "interfaces": supertype_rows(),
+            "ifaces": supertype_rows(),
             // The element face's constructor rows: the spanless shape (the
             // element model carries no constructor ranges).
-            "constructors": constructor_rows(),
+            "ctors": constructor_rows(),
             "methods": member_rows(),
-            "references": { "type": "array", "items": {
+            "refs": { "type": "array", "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["file", "kind", "range"],
+                "required": ["file", "kind", "off", "len"],
                 "properties": {
                     "file": { "type": "string" },
                     "kind": { "enum": REF_KINDS },
-                    "range": range_pair_schema(),
+                    "off": { "type": "integer", "minimum": 0 },
+                    "len": { "type": "integer", "minimum": 0 },
                     "qualified": { "type": "boolean" },
                 },
             }},
-            "dependencies": path_rows(),
-            "affected_tests": path_rows(),
+            "deps": path_rows(),
+            "tests": path_rows(),
             // The `minimal`-tier replacement for the arrays: one entry per
             // section, all seven always present.
             "counts": { "type": "object",
                 "additionalProperties": false,
                 "required": EXPLAIN_SECTIONS,
                 "properties": {
-                    "inheritance": { "type": "integer", "minimum": 0 },
-                    "interfaces": { "type": "integer", "minimum": 0 },
-                    "constructors": { "type": "integer", "minimum": 0 },
+                    "bases": { "type": "integer", "minimum": 0 },
+                    "ifaces": { "type": "integer", "minimum": 0 },
+                    "ctors": { "type": "integer", "minimum": 0 },
                     "methods": { "type": "integer", "minimum": 0 },
-                    "references": { "type": "integer", "minimum": 0 },
-                    "dependencies": { "type": "integer", "minimum": 0 },
-                    "affected_tests": { "type": "integer", "minimum": 0 },
+                    "refs": { "type": "integer", "minimum": 0 },
+                    "deps": { "type": "integer", "minimum": 0 },
+                    "tests": { "type": "integer", "minimum": 0 },
                 },
             },
             // Session token economics (crate docs, "Token economics").
@@ -122,16 +124,6 @@ static EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         },
     })
 });
-
-/// The shared range-pair schema fragment.
-fn range_pair_schema() -> Value {
-    json!({
-        "type": "array",
-        "items": { "type": "integer", "minimum": 0 },
-        "minItems": 2,
-        "maxItems": 2,
-    })
-}
 
 fn supertype_rows() -> Value {
     json!({
@@ -158,11 +150,12 @@ fn member_rows() -> Value {
         "items": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["name", "kind", "range"],
+            "required": ["name", "kind", "off", "len"],
             "properties": {
                 "name": { "type": "string" },
                 "kind": { "enum": MEMBER_KINDS },
-                "range": range_pair_schema(),
+                "off": { "type": "integer", "minimum": 0 },
+                    "len": { "type": "integer", "minimum": 0 },
             },
         },
     })
@@ -180,7 +173,7 @@ fn constructor_rows() -> Value {
                 "kind": { "enum": CONSTRUCTOR_KINDS },
                 // The rendered parameter face; absent only for producers
                 // that cannot render it (the explain producer always does).
-                "signature": { "type": "string" },
+                "sig": { "type": "string" },
             },
         },
     })
@@ -213,48 +206,55 @@ pub const CLAUSE_KINDS: &[&str] = &["extends", "with", "on", "implements"];
 
 /// The explain report's array sections, in `counts` order.
 pub const EXPLAIN_SECTIONS: &[&str] = &[
-    "inheritance",
-    "interfaces",
-    "constructors",
+    "bases",
+    "ifaces",
+    "ctors",
     "methods",
-    "references",
-    "dependencies",
-    "affected_tests",
+    "refs",
+    "deps",
+    "tests",
 ];
 
-const EXPLAIN_TOP: &[&str] = &["schema_version", "symbol"];
+const EXPLAIN_TOP: &[&str] = &["v", "sym"];
 /// Everything beyond the red line is optional: the section arrays drop at
 /// `minimal`, `counts` exists only there, and the session fields
 /// (`symbols`/`since`) ride absent-tolerant.
 const EXPLAIN_OPTIONAL: &[&str] = &[
     "declaration",
-    "inheritance",
-    "interfaces",
-    "constructors",
+    "bases",
+    "ifaces",
+    "ctors",
     "methods",
-    "references",
-    "dependencies",
-    "affected_tests",
+    "refs",
+    "deps",
+    "tests",
     "counts",
     "symbols",
     "since",
 ];
-const DECLARATION_ROW: &[&str] = &["file", "name", "kind", "range"];
+const DECLARATION_ROW: &[&str] = &["file", "name", "kind", "off", "len"];
 const DECLARATION_ROW_OPTIONAL: &[&str] = &["container"];
 const SUPERTYPE_ROW: &[&str] = &["name"];
 const SUPERTYPE_ROW_OPTIONAL: &[&str] = &["file", "clause"];
-const MEMBER_ROW: &[&str] = &["name", "kind", "range"];
+const MEMBER_ROW: &[&str] = &["name", "kind", "off", "len"];
 const CONSTRUCTOR_ROW: &[&str] = &["name", "kind"];
-const CONSTRUCTOR_ROW_OPTIONAL: &[&str] = &["signature"];
-const REFERENCE_ROW: &[&str] = &["file", "kind", "range"];
+const CONSTRUCTOR_ROW_OPTIONAL: &[&str] = &["sig"];
+const REFERENCE_ROW: &[&str] = &["file", "kind", "off", "len"];
 const REFERENCE_ROW_OPTIONAL: &[&str] = &["qualified"];
 const PATH_ROW: &[&str] = &["path"];
+
+/// The off+len locator pair every ranged explain row carries.
+fn span_fields(obj: &serde_json::Map<String, Value>, p: &str) -> Result<(), SchemaViolation> {
+    non_negative(field(obj, "off", p)?, &join(p, "off"))?;
+    non_negative(field(obj, "len", p)?, &join(p, "len"))?;
+    Ok(())
+}
 
 pub(crate) fn validate_explain(value: &Value) -> Result<(), SchemaViolation> {
     let root = object(value, "")?;
     exact_fields(root, EXPLAIN_TOP, EXPLAIN_OPTIONAL, "")?;
-    pinned_version(root, "schema_version", SCHEMA_VERSION_EXPLAIN)?;
-    string(field(root, "symbol", "")?, "symbol")?;
+    pinned_version(root, "v", SCHEMA_VERSION_EXPLAIN)?;
+    string(field(root, "sym", "")?, "sym")?;
     path_session_fields(root)?;
     if let Some(declaration) = root.get("declaration") {
         let p = "declaration";
@@ -263,14 +263,14 @@ pub(crate) fn validate_explain(value: &Value) -> Result<(), SchemaViolation> {
         string(field(obj, "file", p)?, &join(p, "file"))?;
         string(field(obj, "name", p)?, &join(p, "name"))?;
         enum_spelling(field(obj, "kind", p)?, &join(p, "kind"), DECL_KINDS)?;
-        range_pair(field(obj, "range", p)?, &join(p, "range"))?;
+        span_fields(obj, p)?;
         if let Some(container) = obj.get("container") {
             string(container, &join(p, "container"))?;
         }
     }
     // Section arrays are optional (the `minimal` tier drops them); a
     // present section's rows validate whole.
-    for section in ["inheritance", "interfaces"] {
+    for section in ["bases", "ifaces"] {
         let Some(list) = root.get(section) else {
             continue;
         };
@@ -287,7 +287,7 @@ pub(crate) fn validate_explain(value: &Value) -> Result<(), SchemaViolation> {
             }
         }
     }
-    for section in ["constructors", "methods"] {
+    for section in ["ctors", "methods"] {
         let Some(list) = root.get(section) else {
             continue;
         };
@@ -298,33 +298,33 @@ pub(crate) fn validate_explain(value: &Value) -> Result<(), SchemaViolation> {
             // model carries no constructor ranges); methods keep the
             // captured declaration rows' locator.
             let (required, optional, kinds): (&[&str], &[&str], &[&str]) = match section {
-                "constructors" => (CONSTRUCTOR_ROW, CONSTRUCTOR_ROW_OPTIONAL, CONSTRUCTOR_KINDS),
+                "ctors" => (CONSTRUCTOR_ROW, CONSTRUCTOR_ROW_OPTIONAL, CONSTRUCTOR_KINDS),
                 _ => (MEMBER_ROW, &[], MEMBER_KINDS),
             };
             exact_fields(obj, required, optional, &p)?;
             string(field(obj, "name", &p)?, &join(&p, "name"))?;
             enum_spelling(field(obj, "kind", &p)?, &join(&p, "kind"), kinds)?;
             if section == "methods" {
-                range_pair(field(obj, "range", &p)?, &join(&p, "range"))?;
-            } else if let Some(signature) = obj.get("signature") {
-                string(signature, &join(&p, "signature"))?;
+                span_fields(obj, &p)?;
+            } else if let Some(signature) = obj.get("sig") {
+                string(signature, &join(&p, "sig"))?;
             }
         }
     }
-    if let Some(list) = root.get("references") {
-        for (i, row) in array(list, "references")?.iter().enumerate() {
-            let p = format!("references[{i}]");
+    if let Some(list) = root.get("refs") {
+        for (i, row) in array(list, "refs")?.iter().enumerate() {
+            let p = format!("refs[{i}]");
             let obj = object(row, &p)?;
             exact_fields(obj, REFERENCE_ROW, REFERENCE_ROW_OPTIONAL, &p)?;
             string(field(obj, "file", &p)?, &join(&p, "file"))?;
             enum_spelling(field(obj, "kind", &p)?, &join(&p, "kind"), REF_KINDS)?;
-            range_pair(field(obj, "range", &p)?, &join(&p, "range"))?;
+            span_fields(obj, &p)?;
             if let Some(qualified) = obj.get("qualified") {
                 boolean(qualified, &join(&p, "qualified"))?;
             }
         }
     }
-    for section in ["dependencies", "affected_tests"] {
+    for section in ["deps", "tests"] {
         let Some(list) = root.get(section) else {
             continue;
         };
@@ -386,50 +386,52 @@ mod tests {
     /// dartq-ai tests assemble).
     fn full_report() -> Value {
         json!({
-            "schema_version": SCHEMA_VERSION_EXPLAIN,
-            "symbol": "Foo",
+            "v": SCHEMA_VERSION_EXPLAIN,
+            "sym": "Foo",
             "declaration": {
                 "file": "a.dart",
                 "name": "Foo",
                 "kind": "class",
-                "range": [40, 43],
+                "off": 40,
+                "len": 3,
             },
-            "inheritance": [{"name": "Bar", "file": "a.dart", "clause": "extends"}],
-            "interfaces": [{"name": "Mix", "file": "b.dart", "clause": "with"}],
-            "constructors": [
-                {"name": "Foo", "kind": "constructor", "signature": "Foo()"},
+            "bases": [{"name": "Bar", "file": "a.dart", "clause": "extends"}],
+            "ifaces": [{"name": "Mix", "file": "b.dart", "clause": "with"}],
+            "ctors": [
+                {"name": "Foo", "kind": "constructor", "sig": "Foo()"},
             ],
             "methods": [
-                {"name": "area", "kind": "method", "range": [90, 93]},
-                {"name": "label", "kind": "field", "range": [70, 73]},
+                {"name": "area", "kind": "method", "off": 90, "len": 3},
+                {"name": "label", "kind": "field", "off": 70, "len": 3},
             ],
-            "references": [
-                {"file": "b.dart", "kind": "reference", "range": [10, 13], "qualified": false},
+            "refs": [
+                {"file": "b.dart", "kind": "reference", "off": 10, "len": 3, "qualified": false},
             ],
-            "dependencies": [{"path": "package:t/b.dart"}],
-            "affected_tests": [{"path": "package:t/a_test.dart"}],
+            "deps": [{"path": "package:t/b.dart"}],
+            "tests": [{"path": "package:t/a_test.dart"}],
         })
     }
 
     /// A minimal-tier report: declaration + counts, no arrays.
     fn minimal_report() -> Value {
         json!({
-            "schema_version": SCHEMA_VERSION_EXPLAIN,
-            "symbol": "Foo",
+            "v": SCHEMA_VERSION_EXPLAIN,
+            "sym": "Foo",
             "declaration": {
                 "file": "a.dart",
                 "name": "Foo",
                 "kind": "class",
-                "range": [40, 43],
+                "off": 40,
+                "len": 3,
             },
             "counts": {
-                "inheritance": 1,
-                "interfaces": 0,
-                "constructors": 0,
+                "bases": 1,
+                "ifaces": 0,
+                "ctors": 0,
                 "methods": 2,
-                "references": 1,
-                "dependencies": 1,
-                "affected_tests": 1,
+                "refs": 1,
+                "deps": 1,
+                "tests": 1,
             },
         })
     }
@@ -454,7 +456,7 @@ mod tests {
             .collect();
         decl_fields.sort_unstable();
         assert_eq!(schema_keys(declaration), decl_fields);
-        let supertype = &explain["properties"]["inheritance"]["items"];
+        let supertype = &explain["properties"]["bases"]["items"];
         let mut super_fields: Vec<String> = SUPERTYPE_ROW
             .iter()
             .chain(SUPERTYPE_ROW_OPTIONAL.iter())
@@ -462,7 +464,7 @@ mod tests {
             .collect();
         super_fields.sort_unstable();
         assert_eq!(schema_keys(supertype), super_fields);
-        let constructor = &explain["properties"]["constructors"]["items"];
+        let constructor = &explain["properties"]["ctors"]["items"];
         let mut ctor_fields: Vec<String> = CONSTRUCTOR_ROW
             .iter()
             .chain(CONSTRUCTOR_ROW_OPTIONAL.iter())
@@ -472,7 +474,7 @@ mod tests {
         assert_eq!(schema_keys(constructor), ctor_fields);
         let member = &explain["properties"]["methods"]["items"];
         assert_eq!(schema_keys(member), const_names(MEMBER_ROW));
-        let reference = &explain["properties"]["references"]["items"];
+        let reference = &explain["properties"]["refs"]["items"];
         let mut ref_fields: Vec<String> = REFERENCE_ROW
             .iter()
             .chain(REFERENCE_ROW_OPTIONAL.iter())
@@ -480,7 +482,7 @@ mod tests {
             .collect();
         ref_fields.sort_unstable();
         assert_eq!(schema_keys(reference), ref_fields);
-        let path_row = &explain["properties"]["dependencies"]["items"];
+        let path_row = &explain["properties"]["deps"]["items"];
         assert_eq!(schema_keys(path_row), const_names(PATH_ROW));
         let counts = &explain["properties"]["counts"];
         assert_eq!(schema_keys(counts), const_names(EXPLAIN_SECTIONS));
@@ -511,15 +513,15 @@ mod tests {
             MEMBER_KINDS
         );
         assert_eq!(
-            spelling(&explain["properties"]["constructors"]["items"]["properties"]["kind"]),
+            spelling(&explain["properties"]["ctors"]["items"]["properties"]["kind"]),
             CONSTRUCTOR_KINDS
         );
         assert_eq!(
-            spelling(&explain["properties"]["interfaces"]["items"]["properties"]["clause"]),
+            spelling(&explain["properties"]["ifaces"]["items"]["properties"]["clause"]),
             CLAUSE_KINDS
         );
         assert_eq!(
-            spelling(&explain["properties"]["references"]["items"]["properties"]["kind"]),
+            spelling(&explain["properties"]["refs"]["items"]["properties"]["kind"]),
             REF_KINDS
         );
     }
@@ -532,11 +534,11 @@ mod tests {
     #[test]
     fn supertype_and_constructor_columns_are_contract_bound() {
         let mut payload = full_report();
-        payload["interfaces"][0]["clause"] = json!("implements");
+        payload["ifaces"][0]["clause"] = json!("implements");
         assert!(validate_explain(&payload).is_ok(), "clause swap is legal");
 
         let mut payload = full_report();
-        payload["inheritance"][0]
+        payload["bases"][0]
             .as_object_mut()
             .expect("object")
             .remove("clause");
@@ -546,44 +548,44 @@ mod tests {
         );
 
         let mut payload = full_report();
-        payload["interfaces"][0]["clause"] = json!("banana");
+        payload["ifaces"][0]["clause"] = json!("banana");
         let violation = validate_explain(&payload).expect_err("unknown clause");
-        assert_eq!(violation.path, "interfaces[0].clause");
+        assert_eq!(violation.path, "ifaces[0].clause");
 
         let mut payload = full_report();
-        payload["constructors"][0]
+        payload["ctors"][0]
             .as_object_mut()
             .expect("object")
-            .remove("signature");
+            .remove("sig");
         assert!(
             validate_explain(&payload).is_ok(),
             "the signature column is optional (absent-tolerant)"
         );
 
         let mut payload = full_report();
-        payload["constructors"][0]["signature"] = json!(42);
+        payload["ctors"][0]["sig"] = json!(42);
         let violation = validate_explain(&payload).expect_err("non-string signature");
-        assert_eq!(violation.path, "constructors[0].signature");
+        assert_eq!(violation.path, "ctors[0].sig");
 
         let mut payload = full_report();
-        payload["constructors"][0]["range"] = json!([1, 2]);
+        payload["ctors"][0]["off"] = json!(1);
         let violation = validate_explain(&payload).expect_err("constructor rows are spanless");
-        assert_eq!(violation.path, "constructors[0].range");
+        assert_eq!(violation.path, "ctors[0].off");
     }
 
     #[test]
     fn compact_report_validates() {
         assert!(validate_explain(&full_report()).is_ok());
         let empty = json!({
-            "schema_version": SCHEMA_VERSION_EXPLAIN,
-            "symbol": "Nope",
-            "inheritance": [],
-            "interfaces": [],
-            "constructors": [],
+            "v": SCHEMA_VERSION_EXPLAIN,
+            "sym": "Nope",
+            "bases": [],
+            "ifaces": [],
+            "ctors": [],
             "methods": [],
-            "references": [],
-            "dependencies": [],
-            "affected_tests": [],
+            "refs": [],
+            "deps": [],
+            "tests": [],
         });
         assert!(validate_explain(&empty).is_ok());
     }
@@ -593,8 +595,8 @@ mod tests {
         assert!(validate_explain(&minimal_report()).is_ok());
         // The unknown-symbol floor: symbol and version only.
         let floor = json!({
-            "schema_version": SCHEMA_VERSION_EXPLAIN,
-            "symbol": "Nope",
+            "v": SCHEMA_VERSION_EXPLAIN,
+            "sym": "Nope",
         });
         assert!(validate_explain(&floor).is_ok());
     }
@@ -602,18 +604,18 @@ mod tests {
     #[test]
     fn version_constant_is_pinned() {
         let mut bumped = full_report();
-        bumped["schema_version"] = json!(SCHEMA_VERSION_EXPLAIN + 1);
+        bumped["v"] = json!(SCHEMA_VERSION_EXPLAIN + 1);
         let violation = validate_explain(&bumped).expect_err("bumped version must violate");
-        assert_eq!(violation.path, "schema_version");
+        assert_eq!(violation.path, "v");
         assert_eq!(violation.expected, "the integer 1");
     }
 
     #[test]
     fn missing_symbol_is_named() {
         let mut payload = full_report();
-        payload.as_object_mut().expect("object").remove("symbol");
+        payload.as_object_mut().expect("object").remove("sym");
         let violation = validate_explain(&payload).expect_err("missing symbol must violate");
-        assert_eq!(violation.path, "symbol");
+        assert_eq!(violation.path, "sym");
         assert_eq!(violation.found, "missing");
     }
 
@@ -624,14 +626,14 @@ mod tests {
     #[test]
     fn type_errors_are_named() {
         let mut payload = full_report();
-        payload["declaration"]["range"] = json!([40]);
-        let violation = validate_explain(&payload).expect_err("one-element range");
-        assert_eq!(violation.path, "declaration.range");
+        payload["declaration"]["off"] = json!(-1);
+        let violation = validate_explain(&payload).expect_err("negative offset");
+        assert_eq!(violation.path, "declaration.off");
 
         let mut payload = full_report();
-        payload["declaration"]["range"] = json!("40-43");
-        let violation = validate_explain(&payload).expect_err("string range");
-        assert_eq!(violation.path, "declaration.range");
+        payload["declaration"]["len"] = json!("3");
+        let violation = validate_explain(&payload).expect_err("string length");
+        assert_eq!(violation.path, "declaration.len");
 
         let mut payload = full_report();
         payload["declaration"]["kind"] = json!("banana");
@@ -645,9 +647,9 @@ mod tests {
         assert_eq!(violation.path, "methods[0].kind");
 
         let mut payload = full_report();
-        payload["references"][0]["qualified"] = json!("true");
+        payload["refs"][0]["qualified"] = json!("true");
         let violation = validate_explain(&payload).expect_err("string qualified");
-        assert_eq!(violation.path, "references[0].qualified");
+        assert_eq!(violation.path, "refs[0].qualified");
 
         let mut payload = minimal_report();
         payload["counts"]["methods"] = json!("two");
@@ -655,9 +657,9 @@ mod tests {
         assert_eq!(violation.path, "counts.methods");
 
         let mut payload = full_report();
-        payload["dependencies"][0]["file"] = json!("b.dart");
+        payload["deps"][0]["file"] = json!("b.dart");
         let violation = validate_explain(&payload).expect_err("undeclared row field");
-        assert_eq!(violation.path, "dependencies[0].file");
+        assert_eq!(violation.path, "deps[0].file");
     }
 
     /// A counts object missing one section is a violation: the minimal
@@ -668,9 +670,9 @@ mod tests {
         payload["counts"]
             .as_object_mut()
             .expect("object")
-            .remove("references");
+            .remove("refs");
         let violation = validate_explain(&payload).expect_err("missing count entry");
-        assert_eq!(violation.path, "counts.references");
+        assert_eq!(violation.path, "counts.refs");
         assert_eq!(violation.found, "missing");
     }
 
@@ -685,7 +687,7 @@ mod tests {
 
         let violation = validate_explain_at_tier(&full_report(), Verbosity::Minimal)
             .expect_err("minimal must not carry the section arrays");
-        assert_eq!(violation.path, "inheritance");
+        assert_eq!(violation.path, "bases");
         assert_eq!(violation.expected, "omitted at the minimal tier");
 
         assert!(validate_explain_at_tier(&full_report(), Verbosity::Compact).is_ok());

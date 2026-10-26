@@ -5,7 +5,7 @@
 //! `resolve-at` / `completion` subcommands — so the two faces cannot
 //! drift.
 //!
-//! The JSON answer is the wire contract, tier-invariant (every field a
+//! The JSON answer is the wire contract (`v`/`off`/`{off, len}` ranges), tier-invariant (every field a
 //! locator or a verdict — the impact posture; the canonical tables trim
 //! nothing here), so there is no verbosity axis and no frozen schema
 //! Domain: the shape is the locator set the daemon already serves, kept
@@ -205,7 +205,7 @@ pub fn resolve_at_after_analysis(
                 "name": decl.name,
                 "decl_kind": decl_kind_name(decl.kind),
                 "file": path_of(decl.file),
-                "range": { "offset": decl.range.offset, "length": decl.range.length },
+                "range": { "off": decl.range.offset, "len": decl.range.length },
             });
             // The convenience column is omit-on-absent: a top-level
             // declaration has no container, so the key drops rather than
@@ -221,10 +221,10 @@ pub fn resolve_at_after_analysis(
                 "name": use_hit.name,
                 "decl_kind": decl_kind_name(use_hit.decl_kind),
                 "file": path_of(use_hit.target_file),
-                "range": { "offset": use_hit.range.offset, "length": use_hit.range.length },
+                "range": { "off": use_hit.range.offset, "len": use_hit.range.length },
                 "target_range": {
-                    "offset": use_hit.target_range.offset,
-                    "length": use_hit.target_range.length,
+                    "off": use_hit.target_range.offset,
+                    "len": use_hit.target_range.length,
                 },
                 "ref_kind": ref_kind_name(use_hit.kind.into()),
                 "qualified": use_hit.qualified,
@@ -239,9 +239,9 @@ pub fn resolve_at_after_analysis(
         }
     };
     Ok(json!({
-        "schema_version": SCHEMA_VERSION,
+        "v": SCHEMA_VERSION,
         "file": file.display().to_string(),
-        "offset": offset,
+        "off": offset,
         "hit": hit,
     }))
 }
@@ -320,7 +320,7 @@ pub fn completion_after_analysis(
                         row["file"] = json!(path_of(file));
                     }
                     if let Some(range) = item.range {
-                        row["range"] = json!({ "offset": range.offset, "length": range.length });
+                        row["range"] = json!({ "off": range.offset, "len": range.length });
                     }
                     row
                 })
@@ -331,9 +331,9 @@ pub fn completion_after_analysis(
         None => ("", Vec::new()),
     };
     Ok(json!({
-        "schema_version": SCHEMA_VERSION,
+        "v": SCHEMA_VERSION,
         "file": file.display().to_string(),
-        "offset": offset,
+        "off": offset,
         "prefix": prefix,
         "items": items,
     }))
@@ -414,12 +414,12 @@ mod tests {
         // Line 1, column 7: the `Foo` declaration's name token (UTF-16
         // offset 6).
         let answer = resolve_at(&mut engine, &file, 1, 7).expect("answer");
-        assert_eq!(answer["schema_version"], serde_json::json!(SCHEMA_VERSION));
+        assert_eq!(answer["v"], serde_json::json!(SCHEMA_VERSION));
         assert_eq!(answer["hit"]["kind"], "declaration");
         assert_eq!(answer["hit"]["name"], "Foo");
         assert_eq!(answer["hit"]["decl_kind"], "class");
-        assert_eq!(answer["hit"]["range"]["offset"], 6);
-        assert_eq!(answer["hit"]["range"]["length"], 3);
+        assert_eq!(answer["hit"]["range"]["off"], 6);
+        assert_eq!(answer["hit"]["range"]["len"], 3);
         assert_eq!(answer["file"], json!(file.display().to_string()));
 
         // Line 4, column 3: the resolved use of `foo` (offset 43), whose
@@ -428,9 +428,9 @@ mod tests {
         assert_eq!(answer["hit"]["kind"], "reference");
         assert_eq!(answer["hit"]["name"], "foo");
         assert_eq!(answer["hit"]["ref_kind"], "invoked");
-        assert_eq!(answer["hit"]["range"]["offset"], 43);
-        assert_eq!(answer["hit"]["target_range"]["offset"], 18);
-        assert_eq!(answer["hit"]["target_range"]["length"], 3);
+        assert_eq!(answer["hit"]["range"]["off"], 43);
+        assert_eq!(answer["hit"]["target_range"]["off"], 18);
+        assert_eq!(answer["hit"]["target_range"]["len"], 3);
 
         // A non-identifier position answers the explicit null.
         let answer = resolve_at(&mut engine, &file, 1, 1).expect("answer");

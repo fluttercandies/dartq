@@ -23,10 +23,19 @@
 //! pre-session behavior.
 //!
 //! Two simultaneous cold starters elect through an exclusive `flock` on
-//! `.dart_tool/dartq/elect.lock`: the winner takes over (a stale socket
-//! whose pid is gone is unlinked and re-spawned) and brings the server
-//! up; the loser waits for the socket and attaches. A live server with
-//! a matching triple is attached, never duplicated.
+//! `.dart_tool/dartq/elect.lock`. The winner attaches a live server
+//! with a matching triple — never duplicates it — and holds the
+//! one-daemon-per-root invariant by reaping every other daemon recorded
+//! on the root: a stale generation (dead pid, foreign triple, wedged
+//! heartbeat, or dead socket) is terminated, waited for with a SIGKILL
+//! escalation, and only then reclaimed (socket, state, registry entry)
+//! and re-spawned. An un-reaped old daemon heartbeats its state back
+//! over the replacement's forever — the stale-daemon pile-up (#2601).
+//! Between the winner's spawn and the server's first heartbeat a
+//! bring-up placeholder (pid 0) holds the layout: a later election
+//! gives that spawn its start window before re-spawning, so concurrent
+//! starters converge on one server. The loser waits for the winner's
+//! live state and attaches.
 //!
 //! # Registry and lifecycle
 //!
@@ -65,6 +74,20 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 pub const START_TIMEOUT: Duration = Duration::from_secs(30);
 /// Live sessions per user; the least-recently-heartbeat is evicted past it.
 pub const SESSION_CAP: usize = 5;
+/// A heartbeat older than this means the server is wedged (the beat
+/// thread is independent of client service, #2591): the next election
+/// reaps the server rather than attaching it.
+pub const STALE_HEARTBEAT: Duration = Duration::from_secs(3 * HEARTBEAT.as_secs());
+/// The SIGTERM grace before the SIGKILL escalation in a reap. The serve
+/// loop installs no SIGTERM handler, so an ordinary death lands in
+/// milliseconds; the grace only covers a loaded host.
+const REAP_GRACE: Duration = Duration::from_secs(2);
+/// The post-SIGKILL confirmation wait: after the escalation the process
+/// is dead by kernel decree (an unreaped zombie still answers
+/// `kill(pid, 0)` — waiting longer would be waiting for its parent).
+const REAP_CONFIRM: Duration = Duration::from_secs(1);
+/// The reap and attach poll cadence.
+const POLL: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // The triple
@@ -109,7 +132,9 @@ impl SessionTriple {
     #[must_use]
     pub fn identity(&self) -> String {
         let json = serde_json::to_string(self).unwrap_or_default();
-        let digest: [u8; 8] = blake3::hash(json.as_bytes()).as_bytes()[..8].try_into().expect("8 bytes");
+        let digest: [u8; 8] = blake3::hash(json.as_bytes()).as_bytes()[..8]
+            .try_into()
+            .expect("8 bytes");
         hex::encode(digest)
     }
 }
@@ -126,7 +151,9 @@ fn read_or_empty(path: &Path) -> String {
 /// The current executable's content hash — one read of the binary.
 fn binary_hash() -> io::Result<String> {
     let bytes = std::fs::read(std::env::current_exe()?)?;
-    let digest: [u8; 8] = blake3::hash(&bytes).as_bytes()[..8].try_into().expect("8 bytes");
+    let digest: [u8; 8] = blake3::hash(&bytes).as_bytes()[..8]
+        .try_into()
+        .expect("8 bytes");
     Ok(hex::encode(digest))
 }
 
@@ -222,11 +249,12 @@ fn socket_path(dir: &Path, root: &Path) -> PathBuf {
     if canonical_local.as_os_str().len() <= SOCKET_PATH_LIMIT {
         return dir.join("session.sock");
     }
-    let digest: [u8; 8] = blake3::hash(canonical.as_os_str().as_encoded_bytes()).as_bytes()
-        [..8]
+    let digest: [u8; 8] = blake3::hash(canonical.as_os_str().as_encoded_bytes()).as_bytes()[..8]
         .try_into()
         .expect("8 bytes");
-    cache_root().join("sockets").join(format!("{}.sock", hex::encode(digest)))
+    cache_root()
+        .join("sockets")
+        .join(format!("{}.sock", hex::encode(digest)))
 }
 
 /// The canonical form of `root`, stable whether or not the path exists
@@ -243,7 +271,10 @@ fn stable_canonical(root: &Path) -> PathBuf {
     let mut prefix = root.to_path_buf();
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     while let Some(name) = prefix.file_name() {
-        let parent = prefix.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        let parent = prefix
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf();
         if parent.as_os_str().is_empty() {
             break;
         }
@@ -314,11 +345,16 @@ impl SessionState {
     }
 }
 
-/// Whether `pid` is alive (`kill(pid, 0)`); a gone pid is `false`. On
-/// non-unix hosts every pid reports alive (no signal substrate — the
-/// socket connect is the liveness truth there).
+/// Whether `pid` is alive (`kill(pid, 0)`); a gone pid is `false`. Pid
+/// 0 is never a process — it is the bring-up placeholder's sentinel
+/// (`kill(0, 0)` would probe the caller's own process group and answer
+/// alive). On non-unix hosts every pid reports alive (no signal
+/// substrate — the socket connect is the liveness truth there).
 #[must_use]
 pub fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
     #[cfg(unix)]
     {
         // SAFETY: `kill` with signal 0 performs the permission and
@@ -331,19 +367,33 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Whether a process should be terminated (the `stop` verb and the
-/// eviction/sweep paths): SIGTERM, unix only — the Windows bring-up maps
-/// it to `TerminateProcess`.
+/// Whether a process may be terminated (the `stop` verb and the
+/// eviction/sweep/reap paths): SIGTERM, unix only — the Windows bring-up
+/// maps it to `TerminateProcess`. Sentinel and structural pids are
+/// refused: pid 0 addresses the caller's own process group in `kill(2)`,
+/// ids past `pid_t`'s range degrade to group (`-pgid`) or broadcast
+/// (`-1`) kills, and init is never ours to signal.
 pub fn terminate(pid: u32) {
+    if !reapable_pid(pid) {
+        return;
+    }
     #[cfg(unix)]
     {
-        // SAFETY: signal delivery to a pid we own by registry contract.
+        // SAFETY: signal delivery to a pid we own by ledger contract.
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     }
     #[cfg(not(unix))]
     {
         let _ = pid;
     }
+}
+
+/// Who may be reaped: a real pid (> init, inside `pid_t`) that is not
+/// this process. The pids come from our own ledger (the layout's state
+/// file, the registry's records); the self-guard is what keeps fixture
+/// states that stamp the harness pid from reaping the caller itself.
+fn reapable_pid(pid: u32) -> bool {
+    pid >= 2 && pid <= i32::MAX as u32 && pid != std::process::id()
 }
 
 // ---------------------------------------------------------------------------
@@ -364,11 +414,15 @@ pub enum Ensured {
 /// Brings up (or finds) the session for `root`/`sdk_root`.
 ///
 /// The election: under an exclusive `flock` on the layout's lock file, a
-/// live server with a matching triple is attached; a stale one (dead
-/// pid, dead socket, foreign triple) is taken over (socket unlinked,
-/// registry entry dropped) and `spawn` — the caller's bring-up action,
-/// typically `dartq session serve` detached — runs; without the lock the
-/// loser waits for the socket within [`START_TIMEOUT`].
+/// live server with a matching triple is attached (every other daemon
+/// recorded on the root is reaped — one daemon per root, ever); a stale
+/// one (dead pid, foreign triple, wedged heartbeat, dead socket) is
+/// *reaped* — terminated and waited for with a SIGKILL escalation — then
+/// reclaimed (socket unlinked, registry entry dropped) and `spawn` — the
+/// caller's bring-up action, typically `dartq session serve` detached —
+/// runs under a bring-up placeholder until the server's first
+/// heartbeat; without the lock the loser waits for the winner's live
+/// state and attaches.
 ///
 /// `spawn` runs while the lock is held and returns once the serve
 /// process has been *launched* (not necessarily listening).
@@ -396,58 +450,195 @@ pub fn ensure(
     #[cfg(unix)]
     {
         match flock_exclusive(&layout.elect) {
-            // The winner: attach what is live, take over what is stale.
+            // The winner: attach what is live, reap what is stale.
             Ok(guard) => {
                 let outcome = under_election(&layout, &triple, spawn);
                 drop(guard);
                 outcome
             }
             // The loser: the winner is bringing the server up; wait for
-            // the socket, then attach.
-            Err(ElectError::Contended) => {
-                if wait_for_socket(&layout, START_TIMEOUT) && let Some(state) = SessionState::read(&layout) {
-                    return Ensured::Attached(Box::new(state));
-                }
-                Ensured::Standalone(
+            // the live state, then attach.
+            Err(ElectError::Contended) => match wait_attached(&layout, &triple, START_TIMEOUT) {
+                Some(state) => Ensured::Attached(Box::new(state)),
+                None => Ensured::Standalone(
                     "another starter held the election but no session appeared in time — \
                      running standalone"
                         .into(),
-                )
-            }
+                ),
+            },
             Err(ElectError::Io(error)) => Ensured::Standalone(format!("election failed: {error}")),
         }
     }
 }
 
-/// The winner's path, lock held: a live matching server is attached; a
-/// stale or foreign one is taken over and `spawn` brings up the new one.
+/// The winner's path, lock held: a live matching server is attached
+/// (after reaping any other daemon recorded on the root); a stale or
+/// foreign one is reaped, reclaimed, and `spawn` brings up the new one
+/// under a bring-up placeholder.
 fn under_election(
     layout: &Layout,
     triple: &SessionTriple,
     spawn: &dyn Fn(&Layout, &SessionTriple) -> io::Result<()>,
 ) -> Ensured {
+    let registry = Registry::open();
     if let Some(state) = SessionState::read(layout) {
-        let live = state.triple == *triple
-            && pid_alive(state.pid)
-            && socket_open(layout);
-        if live {
+        if state_is_live(&state, triple, layout) {
+            // One daemon per root: any *other* recorded daemon — an
+            // older binary generation, a duplicate spawn — dies here.
+            reap_rivals(&registry, &triple.root, state.pid);
             return Ensured::Attached(Box::new(state));
         }
-        // Take over: the socket file, the state, the registry entry.
-        let _ = std::fs::remove_file(&layout.socket);
-        let _ = std::fs::remove_file(&layout.state);
-        Registry::open().remove(&state.triple.root);
-    }
-    match spawn(layout, triple) {
-        Ok(()) => {
-            if wait_for_socket(layout, START_TIMEOUT)
-                && let Some(state) = SessionState::read(layout)
-            {
-                return Ensured::Attached(Box::new(state));
+        if state.pid == 0 {
+            // A previous election's bring-up placeholder: its serve may
+            // be mid-bring-up (the engine builds before the socket
+            // binds). Give it the remainder of its start window before
+            // re-spawning — two spawns in one window is the duplicate
+            // that steals the socket path back and forth. A *foreign*
+            // generation's placeholder gets no window: its serve will
+            // never match our triple (a different protocol generation),
+            // and the takeover below is the next election's reap of it.
+            let age = placeholder_age(&state);
+            if state.triple == *triple && age < START_TIMEOUT {
+                if let Some(state) = wait_attached(layout, triple, START_TIMEOUT - age) {
+                    return Ensured::Attached(Box::new(state));
+                }
             }
-            Ensured::Standalone("the serve process never listened — running standalone".into())
+            // Window spent, no server: fall through to a fresh takeover.
+        } else {
+            // The stale generation may still be RUNNING (a foreign
+            // binary, a wedged heartbeat, a dead socket under a live
+            // pid): reap it first — an un-reaped daemon heartbeats its
+            // state back over the replacement's forever (#2601).
+            if pid_alive(state.pid) {
+                reap(state.pid);
+            }
         }
-        Err(error) => Ensured::Standalone(format!("spawning the serve process failed: {error}")),
+    }
+    // Reclaim: every recorded daemon on the root is dead by now; the
+    // socket, the state, and the root's registry entries go too.
+    reap_rivals(&registry, &triple.root, 0);
+    let _ = std::fs::remove_file(&layout.socket);
+    let _ = std::fs::remove_file(&layout.state);
+    registry.remove(&triple.root);
+    // The bring-up placeholder: names our triple with the pid sentinel
+    // so a later election waits out this spawn's window instead of
+    // racing a second one.
+    let _ = SessionState {
+        pid: 0,
+        heartbeat_ms: SessionState::now_ms(),
+        triple: triple.clone(),
+    }
+    .write(layout);
+    match spawn(layout, triple) {
+        Ok(()) => match wait_attached(layout, triple, START_TIMEOUT) {
+            Some(state) => Ensured::Attached(Box::new(state)),
+            None => {
+                Ensured::Standalone("the serve process never listened — running standalone".into())
+            }
+        },
+        Err(error) => {
+            // Nothing is in flight: drop the placeholder with it.
+            let _ = std::fs::remove_file(&layout.state);
+            Ensured::Standalone(format!("spawning the serve process failed: {error}"))
+        }
+    }
+}
+
+/// Whether the state names the live session for `triple`: the triple
+/// matches, the pid is a real live process, the socket answers, and the
+/// heartbeat is fresh. The placeholder's pid 0 is never live, so a
+/// bring-up in progress is never "attached" before its first beat.
+fn state_is_live(state: &SessionState, triple: &SessionTriple, layout: &Layout) -> bool {
+    state.triple == *triple
+        && pid_alive(state.pid)
+        && socket_open(layout)
+        && SessionState::now_ms().saturating_sub(state.heartbeat_ms) <= STALE_HEARTBEAT.as_millis()
+}
+
+/// How long ago the placeholder was written.
+fn placeholder_age(state: &SessionState) -> Duration {
+    Duration::from_millis(
+        u64::try_from(SessionState::now_ms().saturating_sub(state.heartbeat_ms))
+            .unwrap_or(u64::MAX),
+    )
+}
+
+/// Terminates a stale daemon and waits for the death: SIGTERM, a
+/// bounded grace, a SIGKILL escalation, a short confirmation. Returns
+/// once the pid is gone or the budget is spent — a straggler past
+/// SIGKILL (an unreaped zombie, an uninterruptible sleep) is treated as
+/// dead and the takeover proceeds: its socket inode is unreachable
+/// through the path, so it cannot steal the bind back.
+fn reap(pid: u32) {
+    if !reapable_pid(pid) {
+        return;
+    }
+    terminate(pid);
+    if gone(pid, REAP_GRACE) {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: the escalation to a pid we own by ledger contract.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+    let _ = gone(pid, REAP_CONFIRM);
+}
+
+/// Waits up to `within` for the pid to leave; `true` when it did.
+fn gone(pid: u32, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        if !pid_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(POLL);
+    }
+    !pid_alive(pid)
+}
+
+/// Kills every daemon the registry records on `root` except `keep` —
+/// the one-daemon-per-root invariant's repair pass (stale generations
+/// and duplicates; a different root's sessions never share this root's
+/// socket and are left to their own elections). Unreapable pids
+/// (sentinels, the caller itself) are skipped; dead ones are not
+/// signaled at all.
+fn reap_rivals(registry: &Registry, root: &Path, keep: u32) {
+    for record in registry.list() {
+        let pid = record.state.pid;
+        if record.state.triple.root == root && pid != keep && reapable_pid(pid) && pid_alive(pid) {
+            reap(pid);
+            registry.remove_id(&record.id);
+        }
+    }
+}
+
+/// Polls until the layout holds the live session for `triple` (socket
+/// answering, state agreeing on triple and pid, fresh heartbeat) or
+/// `timeout` elapses. Strictly stronger than watching the socket: a
+/// dying daemon's socket answers until the reap finishes, and a
+/// placeholder's pid 0 never passes — the serve's first heartbeat is
+/// the attach signal.
+fn wait_attached(
+    layout: &Layout,
+    triple: &SessionTriple,
+    timeout: Duration,
+) -> Option<SessionState> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(state) = SessionState::read(layout)
+            && state_is_live(&state, triple, layout)
+        {
+            return Some(state);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(POLL);
     }
 }
 
@@ -462,18 +653,6 @@ pub fn socket_open(layout: &Layout) -> bool {
     {
         false
     }
-}
-
-/// Polls the socket until it accepts or `timeout` elapses.
-fn wait_for_socket(layout: &Layout, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if socket_open(layout) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
 }
 
 /// The election error: `Contended` is the loser's signal.
@@ -492,9 +671,7 @@ fn flock_exclusive(path: &Path) -> Result<FlockGuard, ElectError> {
         .open(path)
         .map_err(ElectError::Io)?;
     // SAFETY: `flock` on an owned fd; LOCK_EX | LOCK_NB never blocks.
-    let locked = unsafe {
-        libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0
-    };
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 };
     if locked {
         Ok(FlockGuard { file: Some(file) })
     } else {
@@ -546,7 +723,9 @@ impl Registry {
     /// The registry rooted at `dir` (tests).
     #[must_use]
     pub fn at(dir: &Path) -> Self {
-        Self { dir: dir.to_path_buf() }
+        Self {
+            dir: dir.to_path_buf(),
+        }
     }
 
     /// Upserts one session's record.
@@ -570,6 +749,12 @@ impl Registry {
                 let _ = std::fs::remove_file(self.dir.join(format!("{}.json", record.id)));
             }
         }
+    }
+
+    /// Removes one record by identity — the rival reap's targeted drop
+    /// (it must not touch the live record the reap is keeping).
+    pub fn remove_id(&self, id: &str) {
+        let _ = std::fs::remove_file(self.dir.join(format!("{id}.json")));
     }
 
     /// Every readable record, dead ones swept (their files removed): a
@@ -655,7 +840,9 @@ impl EventLog {
     /// The log at `layout.dir/events.jsonl`.
     #[must_use]
     pub fn new(layout: &Layout) -> Self {
-        Self { path: layout.dir.join("events.jsonl") }
+        Self {
+            path: layout.dir.join("events.jsonl"),
+        }
     }
 
     /// Appends one event; `data` carries the event's own fields. Returns
@@ -666,23 +853,21 @@ impl EventLog {
     ///
     /// I/O failure writing the log (an unwritable log drops the event:
     /// callers treat logging as advisory).
-    pub fn append(
-        &self,
-        handle: &str,
-        event: &str,
-        data: serde_json::Value,
-    ) -> io::Result<u64> {
+    pub fn append(&self, handle: &str, event: &str, data: serde_json::Value) -> io::Result<u64> {
         std::fs::create_dir_all(self.path.parent().unwrap_or(Path::new(".")))?;
         let seq = self.head_seq() + 1;
         let line = serde_json::json!({
             "seq": seq,
-            "ts_ms": SessionState::now_ms(),
+            "ts": SessionState::now_ms(),
             "handle": handle,
             "event": event,
             "data": data,
         });
         use std::io::Write as _;
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         writeln!(file, "{line}")?;
         drop(file);
         self.trim();
@@ -705,9 +890,7 @@ impl EventLog {
         text.lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|value| value["seq"].as_u64().is_some_and(|seq| seq > since))
-            .filter(|value| {
-                handle.is_none_or(|wanted| value["handle"].as_str() == Some(wanted))
-            })
+            .filter(|value| handle.is_none_or(|wanted| value["handle"].as_str() == Some(wanted)))
             .take(limit)
             .map(|value| (value["seq"].as_u64().unwrap_or_default(), value))
             .collect()
@@ -881,9 +1064,13 @@ mod tests {
             .expect("sleep child");
         let pid = child.id();
         SESSION_CHILDREN.with(|children| children.borrow_mut().push(child));
-        SessionState { pid, heartbeat_ms: SessionState::now_ms(), triple: triple.clone() }
-            .write(layout)
-            .expect("state");
+        SessionState {
+            pid,
+            heartbeat_ms: SessionState::now_ms(),
+            triple: triple.clone(),
+        }
+        .write(layout)
+        .expect("state");
         pid
     }
 
@@ -891,6 +1078,42 @@ mod tests {
         /// The spawned sleep children, reaped on drop.
         static SESSION_CHILDREN: std::cell::RefCell<Vec<std::process::Child>> =
             const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A terminable child plus the helper that clears its zombie slot
+    /// while a reap's bounded waits poll — a zombie answers
+    /// `kill(pid, 0)`, and in the harness the test process is the
+    /// parent, so `try_wait` is what turns "terminated" into "gone"
+    /// (production serves are parented to init and clear themselves).
+    fn reapable_sleep_child() -> (
+        std::sync::Arc<std::sync::Mutex<std::process::Child>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let child = std::sync::Arc::new(std::sync::Mutex::new(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("sleep child"),
+        ));
+        let clearing = std::sync::Arc::clone(&child);
+        let clearer = std::thread::spawn(move || {
+            for _ in 0..500 {
+                if let Ok(mut guard) = clearing.try_lock()
+                    && guard.try_wait().expect("waitable").is_some()
+                {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        (child, clearer)
+    }
+
+    /// How a reaped child exited: by the reap's SIGTERM/SIGKILL, not
+    /// naturally.
+    fn died_by_reap(exited: &std::process::ExitStatus) -> bool {
+        use std::os::unix::process::ExitStatusExt as _;
+        exited.signal() == Some(libc::SIGTERM) || exited.signal() == Some(libc::SIGKILL)
     }
 
     /// #2592: a socket path that fits the kernel's `sun_path` stays
@@ -911,7 +1134,8 @@ mod tests {
         // Long: relocates into the per-user sockets directory, fits the
         // budget, and both spellings agree.
         let segment = "d".repeat(64);
-        let long = PathBuf::from("/tmp").join(format!("dqs-longsock-{}-{segment}", std::process::id()));
+        let long =
+            PathBuf::from("/tmp").join(format!("dqs-longsock-{}-{segment}", std::process::id()));
         let _ = std::fs::remove_dir_all(&long);
         std::fs::create_dir_all(&long).expect("dir");
         assert!(
@@ -926,11 +1150,15 @@ mod tests {
             layout.socket.display()
         );
         assert!(
-            layout.socket.components().any(|part| part.as_os_str() == "sockets"),
+            layout
+                .socket
+                .components()
+                .any(|part| part.as_os_str() == "sockets"),
             "the relocation lands under the per-user sockets directory: {}",
             layout.socket.display()
         );
-        let through_link = PathBuf::from("/tmp").join(format!("dqs-longsock-link-{}", std::process::id()));
+        let through_link =
+            PathBuf::from("/tmp").join(format!("dqs-longsock-link-{}", std::process::id()));
         let _ = std::fs::remove_file(&through_link);
         std::os::unix::fs::symlink(&long, &through_link).expect("symlink");
         assert_eq!(
@@ -952,9 +1180,16 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&deep);
         layout.create().expect("create");
-        let pointer = std::fs::read_to_string(layout.dir.join("session.sock.point")).expect("pointer");
-        assert_eq!(pointer.as_bytes(), layout.socket.as_os_str().as_encoded_bytes());
-        assert!(layout.socket.exists() || layout.socket.parent().is_some_and(|dir| dir.exists()), "the sockets directory exists");
+        let pointer =
+            std::fs::read_to_string(layout.dir.join("session.sock.point")).expect("pointer");
+        assert_eq!(
+            pointer.as_bytes(),
+            layout.socket.as_os_str().as_encoded_bytes()
+        );
+        assert!(
+            layout.socket.exists() || layout.socket.parent().is_some_and(|dir| dir.exists()),
+            "the sockets directory exists"
+        );
 
         let _ = std::fs::remove_file(&through_link);
         let _ = std::fs::remove_file(&layout.socket);
@@ -971,7 +1206,10 @@ mod tests {
         assert_eq!(a.identity(), SessionTriple::compute(&root, &sdk).identity());
         let other_sdk = temp("sdk2");
         write(&other_sdk.join("version"), "3.6.0\n");
-        assert_ne!(a.identity(), SessionTriple::compute(&root, &other_sdk).identity());
+        assert_ne!(
+            a.identity(),
+            SessionTriple::compute(&root, &other_sdk).identity()
+        );
         // An .fvmrc lands in the identity (an FVM switch is a new session).
         write(&root.join(".fvmrc"), "3.9.0\n");
         assert_ne!(a.identity(), SessionTriple::compute(&root, &sdk).identity());
@@ -998,7 +1236,10 @@ mod tests {
         // An empty .fvmrc is a present fact — a different identity from
         // an absent one.
         write(&root.join(".fvmrc"), "");
-        assert_ne!(triple.identity(), SessionTriple::compute(&root, &sdk).identity());
+        assert_ne!(
+            triple.identity(),
+            SessionTriple::compute(&root, &sdk).identity()
+        );
     }
 
     /// The root leg of the triple is the realpath: two spellings of one
@@ -1038,7 +1279,10 @@ mod tests {
         // No temp file residue from the atomic write.
         assert!(!layout.dir.join(".state.json.tmp").exists());
         write(&layout.state, "{ not json");
-        assert!(SessionState::read(&layout).is_none(), "malformed state is stale");
+        assert!(
+            SessionState::read(&layout).is_none(),
+            "malformed state is stale"
+        );
         // A heartbeat is a positive millisecond timestamp.
         assert!(SessionState::now_ms() > 1_000_000_000_000);
     }
@@ -1061,7 +1305,11 @@ mod tests {
             }
             Ensured::Standalone(reason) => panic!("attached, not standalone: {reason}"),
         }
-        assert_eq!(spawns.get(), 0, "a live session is attached, never duplicated");
+        assert_eq!(
+            spawns.get(),
+            0,
+            "a live session is attached, never duplicated"
+        );
     }
 
     #[test]
@@ -1071,9 +1319,13 @@ mod tests {
         layout.create().expect("layout");
         let triple = SessionTriple::compute(&root, &root);
         // A stale state: a dead pid plus a socket file nobody answers.
-        SessionState { pid: u32::MAX - 1, heartbeat_ms: 0, triple: triple.clone() }
-            .write(&layout)
-            .expect("state");
+        SessionState {
+            pid: u32::MAX - 1,
+            heartbeat_ms: 0,
+            triple: triple.clone(),
+        }
+        .write(&layout)
+        .expect("state");
         std::fs::write(&layout.socket, b"").expect("socket file");
         let spawns = std::cell::Cell::new(0);
         match ensure(&root, &root, &|spawn_layout, spawn_triple| {
@@ -1084,7 +1336,11 @@ mod tests {
             Ensured::Attached(state) => assert_eq!(state.pid, std::process::id()),
             Ensured::Standalone(reason) => panic!("takeover: {reason}"),
         }
-        assert_eq!(spawns.get(), 1, "the stale session was replaced exactly once");
+        assert_eq!(
+            spawns.get(),
+            1,
+            "the stale session was replaced exactly once"
+        );
     }
 
     #[test]
@@ -1148,13 +1404,20 @@ mod tests {
         let layout = Layout::new(&root);
         layout.create().expect("layout");
         let current = SessionTriple::compute(&root, &root);
-        let foreign = SessionTriple { binary_hash: "another-binary".to_owned(), ..current.clone() };
+        let foreign = SessionTriple {
+            binary_hash: "another-binary".to_owned(),
+            ..current.clone()
+        };
         // A socket answers (a live server), but the state names a foreign
         // triple: an upgrade left the old server behind.
         bring_up(&layout, &current);
-        SessionState { pid: std::process::id(), heartbeat_ms: 0, triple: foreign }
-            .write(&layout)
-            .expect("state");
+        SessionState {
+            pid: std::process::id(),
+            heartbeat_ms: 0,
+            triple: foreign,
+        }
+        .write(&layout)
+        .expect("state");
         let spawns = std::cell::Cell::new(0);
         match ensure(&root, &root, &|spawn_layout, spawn_triple| {
             spawns.set(spawns.get() + 1);
@@ -1171,9 +1434,13 @@ mod tests {
         let layout = Layout::new(&root);
         layout.create().expect("layout");
         let triple = SessionTriple::compute(&root, &root);
-        SessionState { pid: std::process::id(), heartbeat_ms: 0, triple: triple.clone() }
-            .write(&layout)
-            .expect("state");
+        SessionState {
+            pid: std::process::id(),
+            heartbeat_ms: 0,
+            triple: triple.clone(),
+        }
+        .write(&layout)
+        .expect("state");
         write(&layout.socket, ""); // a socket file, no listener
         match ensure(&root, &root, &|spawn_layout, spawn_triple| {
             bring_up(spawn_layout, spawn_triple);
@@ -1182,6 +1449,313 @@ mod tests {
             Ensured::Attached(state) => assert_eq!(state.triple, triple),
             Ensured::Standalone(reason) => panic!("takeover: {reason}"),
         }
+    }
+
+    /// #2601: a stale generation that is still RUNNING — a foreign
+    /// binary under a live pid, socket answering — is reaped before the
+    /// replacement spawns. The old takeover only unlinked the socket and
+    /// spawned: the un-reaped daemon kept heartbeating its state over
+    /// the replacement's, and every later call spawned yet another
+    /// daemon (five were observed live on one worktree).
+    #[test]
+    fn takeover_reaps_the_running_stale_generation() {
+        let root = temp("reap");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let current = SessionTriple::compute(&root, &root);
+        let stale = SessionTriple {
+            binary_hash: "old-binary".to_owned(),
+            ..current.clone()
+        };
+        let listener = UnixListener::bind(&layout.socket).expect("bind");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    break;
+                }
+            }
+        });
+        let (child, clearer) = reapable_sleep_child();
+        SessionState {
+            pid: child.lock().expect("child").id(),
+            heartbeat_ms: SessionState::now_ms(),
+            triple: stale,
+        }
+        .write(&layout)
+        .expect("state");
+        let spawns = std::cell::Cell::new(0);
+        match ensure(&root, &root, &|spawn_layout, spawn_triple| {
+            spawns.set(spawns.get() + 1);
+            bring_up(spawn_layout, spawn_triple);
+            Ok(())
+        }) {
+            Ensured::Attached(state) => assert_eq!(state.triple, current),
+            Ensured::Standalone(reason) => panic!("takeover: {reason}"),
+        }
+        assert_eq!(
+            spawns.get(),
+            1,
+            "the stale generation was replaced exactly once"
+        );
+        clearer.join().expect("clearer");
+        let exited = child
+            .lock()
+            .expect("child")
+            .try_wait()
+            .expect("waitable")
+            .expect("the stale daemon exited under the reap");
+        assert!(
+            died_by_reap(&exited),
+            "the reap's signal, not a natural exit: {exited:?}"
+        );
+    }
+
+    /// The rival reap: a daemon recorded on our root dies while a
+    /// daemon of ANOTHER root survives (its own election owns it), and
+    /// a record naming this very process is never signaled.
+    #[test]
+    fn reap_rivals_kill_only_this_roots_daemons() {
+        let home = temp("rivals");
+        let registry = Registry::at(&home.join("sessions"));
+        let root = temp("rivals-root");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        // The root's socket must answer for `list` to keep the records.
+        let listener = UnixListener::bind(&layout.socket).expect("bind");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    break;
+                }
+            }
+        });
+        let record_of = |registry: &Registry, root: &Path, binary: &str, pid: u32| {
+            let triple = SessionTriple {
+                root: root.to_path_buf(),
+                sdk_root: root.to_path_buf(),
+                sdk_version: String::new(),
+                fvmrc: None,
+                binary_hash: binary.to_owned(),
+            };
+            registry
+                .upsert(&Record {
+                    id: triple.identity(),
+                    state: SessionState {
+                        pid,
+                        heartbeat_ms: SessionState::now_ms(),
+                        triple,
+                    },
+                })
+                .expect("upsert");
+        };
+        let (rival, clearer) = reapable_sleep_child();
+        record_of(
+            &registry,
+            &root,
+            "bin-old",
+            rival.lock().expect("child").id(),
+        );
+        record_of(&registry, &root, "bin-new", std::process::id());
+        let other_root = temp("rivals-other");
+        let other_layout = Layout::new(&other_root);
+        other_layout.create().expect("layout");
+        let other_pid = bring_up_child(
+            &other_layout,
+            &SessionTriple {
+                root: other_root.clone(),
+                sdk_root: other_root.clone(),
+                sdk_version: String::new(),
+                fvmrc: None,
+                binary_hash: "bin-new".to_owned(),
+            },
+        );
+        record_of(&registry, &other_root, "bin-new", other_pid);
+        assert_eq!(registry.list().len(), 3, "all three records live");
+
+        reap_rivals(&registry, &root, 0);
+        clearer.join().expect("clearer");
+        let exited = rival
+            .lock()
+            .expect("rival")
+            .try_wait()
+            .expect("waitable")
+            .expect("the rival exited under the reap");
+        assert!(
+            died_by_reap(&exited),
+            "the reap's signal, not a natural exit: {exited:?}"
+        );
+        assert!(
+            pid_alive(other_pid),
+            "another root's daemon is not ours to kill"
+        );
+        assert_eq!(
+            registry.list().len(),
+            2,
+            "the rival's record dropped; the self-named and other-root records survive"
+        );
+        // Teardown: the surviving fixture child.
+        terminate(other_pid);
+        for _ in 0..50 {
+            SESSION_CHILDREN.with(|children| {
+                for child in children.borrow_mut().iter_mut() {
+                    let _ = child.try_wait();
+                }
+            });
+            if !pid_alive(other_pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The bring-up placeholder: an election that lands while a serve of
+    /// the same generation is mid-bring-up (spawned, engine building,
+    /// nothing bound yet) does NOT spawn a rival — it waits out the
+    /// spawn's start window and attaches the server when it lands.
+    #[test]
+    fn a_bring_up_placeholder_gets_its_start_window() {
+        let root = temp("ph-window");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let triple = SessionTriple::compute(&root, &root);
+        SessionState {
+            pid: 0,
+            heartbeat_ms: SessionState::now_ms(),
+            triple: triple.clone(),
+        }
+        .write(&layout)
+        .expect("placeholder");
+        let dir = root.clone();
+        let in_flight = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            bring_up(&Layout::new(&dir), &SessionTriple::compute(&dir, &dir));
+        });
+        let spawns = std::cell::Cell::new(0);
+        match ensure(&root, &root, &|_, _| {
+            spawns.set(spawns.get() + 1);
+            Ok(())
+        }) {
+            Ensured::Attached(state) => assert_eq!(state.triple, triple),
+            Ensured::Standalone(reason) => {
+                panic!("the in-flight serve lands inside the window: {reason}")
+            }
+        }
+        assert_eq!(spawns.get(), 0, "no second serve while one is in flight");
+        in_flight.join().expect("in-flight");
+    }
+
+    /// A placeholder whose start window is spent (the spawn never
+    /// listened) is taken over at once: one fresh spawn, no window wait.
+    /// A FOREIGN placeholder — another binary generation's in-flight
+    /// spawn — never gets our window either: its serve can never match
+    /// this binary's triple, so waiting is dead time.
+    #[test]
+    fn a_spent_or_foreign_placeholder_is_taken_over_at_once() {
+        let root = temp("ph-spent");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let current = SessionTriple::compute(&root, &root);
+        let spent_heartbeat = SessionState::now_ms()
+            .saturating_sub(u128::try_from(START_TIMEOUT.as_millis()).expect("ms") + 5_000);
+        SessionState {
+            pid: 0,
+            heartbeat_ms: spent_heartbeat,
+            triple: current.clone(),
+        }
+        .write(&layout)
+        .expect("placeholder");
+        let started = std::time::Instant::now();
+        let spawns = std::cell::Cell::new(0);
+        match ensure(&root, &root, &|spawn_layout, spawn_triple| {
+            spawns.set(spawns.get() + 1);
+            bring_up(spawn_layout, spawn_triple);
+            Ok(())
+        }) {
+            Ensured::Attached(state) => assert_eq!(state.triple, current),
+            Ensured::Standalone(reason) => panic!("takeover: {reason}"),
+        }
+        assert_eq!(spawns.get(), 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no window wait for a spent placeholder: {:?}",
+            started.elapsed()
+        );
+
+        let root = temp("ph-foreign");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let foreign = SessionTriple {
+            binary_hash: "old-binary".to_owned(),
+            ..SessionTriple::compute(&root, &root)
+        };
+        SessionState {
+            pid: 0,
+            heartbeat_ms: SessionState::now_ms(),
+            triple: foreign,
+        }
+        .write(&layout)
+        .expect("placeholder");
+        let started = std::time::Instant::now();
+        match ensure(&root, &root, &|spawn_layout, spawn_triple| {
+            bring_up(spawn_layout, spawn_triple);
+            Ok(())
+        }) {
+            Ensured::Attached(state) => {
+                assert_eq!(state.triple, SessionTriple::compute(&root, &root));
+            }
+            Ensured::Standalone(reason) => panic!("takeover: {reason}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a foreign placeholder gets no window: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A wedged heartbeat — pid alive, socket answering, no beat for far
+    /// past [`STALE_HEARTBEAT`] — is a stale session: taken over, not
+    /// attached (the beat thread is independent of client service, so a
+    /// silent beat means a silent server).
+    #[test]
+    fn a_wedged_heartbeat_is_a_stale_session() {
+        let root = temp("wedged");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let triple = SessionTriple::compute(&root, &root);
+        bring_up(&layout, &triple);
+        SessionState {
+            pid: std::process::id(),
+            heartbeat_ms: SessionState::now_ms().saturating_sub(10 * STALE_HEARTBEAT.as_millis()),
+            triple: triple.clone(),
+        }
+        .write(&layout)
+        .expect("state");
+        let spawns = std::cell::Cell::new(0);
+        match ensure(&root, &root, &|spawn_layout, spawn_triple| {
+            spawns.set(spawns.get() + 1);
+            bring_up(spawn_layout, spawn_triple);
+            Ok(())
+        }) {
+            Ensured::Attached(state) => assert_eq!(state.triple, triple),
+            Ensured::Standalone(reason) => panic!("takeover: {reason}"),
+        }
+        assert_eq!(
+            spawns.get(),
+            1,
+            "the wedged session was replaced, not attached"
+        );
+    }
+
+    /// Pid 0 (the bring-up sentinel) and out-of-`pid_t` ids are never
+    /// signaled: `kill(0, …)` addresses the caller's own process group
+    /// and a negative cast degrades to a group or broadcast kill. The
+    /// test surviving the two `terminate` calls is the assertion.
+    #[test]
+    fn sentinel_pids_are_never_signaled() {
+        assert!(!pid_alive(0), "the bring-up sentinel is no process");
+        terminate(0);
+        terminate(u32::MAX);
+        assert!(pid_alive(std::process::id()), "the caller lived");
     }
 
     /// A spawn that never listens degrades to standalone with the reason
@@ -1201,7 +1775,10 @@ mod tests {
         Layout::new(&root).create().expect("layout");
         match ensure(&root, &root, &|_, _| Err(io::Error::other("no exec"))) {
             Ensured::Standalone(reason) => {
-                assert!(reason.contains("spawning") && reason.contains("no exec"), "{reason}")
+                assert!(
+                    reason.contains("spawning") && reason.contains("no exec"),
+                    "{reason}"
+                )
             }
             Ensured::Attached(_) => panic!("the spawn failed"),
         }
@@ -1214,8 +1791,12 @@ mod tests {
         layout.create().expect("layout");
         let log = EventLog::new(&layout);
         assert_eq!(log.head_seq(), 0, "absent log");
-        let first = log.append("session", "serving", serde_json::json!({"pid": 1})).expect("append");
-        let second = log.append("test:1", "started", serde_json::json!({})).expect("append");
+        let first = log
+            .append("session", "serving", serde_json::json!({"pid": 1}))
+            .expect("append");
+        let second = log
+            .append("test:1", "started", serde_json::json!({}))
+            .expect("append");
         assert_eq!((first, second), (1, 2), "monotonic sequences");
 
         // Cursor pagination: everything, then past a cursor, then a
@@ -1228,7 +1809,10 @@ mod tests {
         assert_eq!(tail[0].0, second);
         assert_eq!(log.read(Some("test:1"), 0, 10).len(), 1);
         assert_eq!(log.read(None, 0, 1).len(), 1);
-        assert!(log.read(None, second, 10).is_empty(), "nothing past the head");
+        assert!(
+            log.read(None, second, 10).is_empty(),
+            "nothing past the head"
+        );
     }
 
     /// The handle namespaces the log: `session`, `test:<id>`, `debug:<id>`
@@ -1239,8 +1823,15 @@ mod tests {
         let layout = Layout::new(&root);
         layout.create().expect("layout");
         let log = EventLog::new(&layout);
-        for (handle, event) in [("session", "serving"), ("test:1", "started"), ("test:2", "started"), ("debug:1", "launched"), ("session", "client_attached")] {
-            log.append(handle, event, serde_json::json!({})).expect("append");
+        for (handle, event) in [
+            ("session", "serving"),
+            ("test:1", "started"),
+            ("test:2", "started"),
+            ("debug:1", "launched"),
+            ("session", "client_attached"),
+        ] {
+            log.append(handle, event, serde_json::json!({}))
+                .expect("append");
         }
         let of = |handle: &str| {
             log.read(Some(handle), 0, 10)
@@ -1271,16 +1862,30 @@ mod tests {
         let blob = "x".repeat(60_000);
         let mut last = 0;
         for _ in 0..20 {
-            last = log.append("session", "noise", serde_json::json!({"blob": &blob})).expect("append");
+            last = log
+                .append("session", "noise", serde_json::json!({"blob": &blob}))
+                .expect("append");
         }
         assert_eq!(log.head_seq(), last, "sequence numbers survive the rewrite");
-        let size = std::fs::metadata(&layout.dir.join("events.jsonl")).expect("meta").len();
-        assert!(size <= EVENT_LOG_MAX_BYTES, "the trim brought the log under the cap ({size})");
+        let size = std::fs::metadata(&layout.dir.join("events.jsonl"))
+            .expect("meta")
+            .len();
+        assert!(
+            size <= EVENT_LOG_MAX_BYTES,
+            "the trim brought the log under the cap ({size})"
+        );
         let kept = log.read(None, 0, usize::MAX);
         let first = kept.first().expect("the newest half survives").0;
-        assert!(first > 1, "the older half was dropped (first kept seq {first})");
+        assert!(
+            first > 1,
+            "the older half was dropped (first kept seq {first})"
+        );
         assert_eq!(kept.last().expect("tail").0, last);
-        assert_eq!(kept.len() as u64, last - first + 1, "a contiguous newest half");
+        assert_eq!(
+            kept.len() as u64,
+            last - first + 1,
+            "a contiguous newest half"
+        );
         // A cursor inside the kept half still paginates from itself.
         assert_eq!(log.read(None, first, usize::MAX).len(), kept.len() - 1);
     }
@@ -1314,9 +1919,16 @@ mod tests {
         )
         .expect("rewrite");
         let progress = Progress::from_trace(&trace);
-        assert_eq!(progress.current_package.as_deref(), Some("a"), "path-derived, kept");
+        assert_eq!(
+            progress.current_package.as_deref(),
+            Some("a"),
+            "path-derived, kept"
+        );
         // Absent trace: zero progress, not an error.
-        assert_eq!(Progress::from_trace(&dir.join("gone.jsonl")), Progress::default());
+        assert_eq!(
+            Progress::from_trace(&dir.join("gone.jsonl")),
+            Progress::default()
+        );
     }
 
     /// The derivation branches of the trace walk: garbage lines and
@@ -1340,7 +1952,10 @@ mod tests {
         )
         .expect("write");
         let progress = Progress::from_trace(&trace);
-        assert_eq!(progress.files_scanned, 4, "every LibraryAnalyzed event counts");
+        assert_eq!(
+            progress.files_scanned, 4,
+            "every LibraryAnalyzed event counts"
+        );
         assert_eq!(progress.from_cache, 2);
         assert_eq!(
             progress.current.as_deref(),
@@ -1363,7 +1978,11 @@ mod tests {
         )
         .expect("rewrite");
         let progress = Progress::from_trace(&trace);
-        assert_eq!(progress.current_package.as_deref(), Some("my_sdk"), "only the exact segment `sdk` is filtered");
+        assert_eq!(
+            progress.current_package.as_deref(),
+            Some("my_sdk"),
+            "only the exact segment `sdk` is filtered"
+        );
     }
 
     #[test]
@@ -1374,11 +1993,21 @@ mod tests {
             let root = temp(tag);
             let layout = Layout::new(&root);
             layout.create().expect("layout");
-            let triple = SessionTriple { root: root.clone(), sdk_root: root.clone(), sdk_version: String::new(), fvmrc: None, binary_hash: binary.to_owned() };
+            let triple = SessionTriple {
+                root: root.clone(),
+                sdk_root: root.clone(),
+                sdk_version: String::new(),
+                fvmrc: None,
+                binary_hash: binary.to_owned(),
+            };
             let pid = bring_up_child(&layout, &triple);
             Record {
                 id: triple.identity(),
-                state: SessionState { pid, heartbeat_ms: heartbeat, triple },
+                state: SessionState {
+                    pid,
+                    heartbeat_ms: heartbeat,
+                    triple,
+                },
             }
         };
         // Two live sessions; the older heartbeat is the LRU.
@@ -1388,13 +2017,26 @@ mod tests {
         registry.upsert(&b).expect("upsert");
         let live = registry.list();
         assert_eq!(live.len(), 2, "both live");
-        assert_eq!(live[0].state.heartbeat_ms, 2_000, "sorted recent-heartbeat first");
+        assert_eq!(
+            live[0].state.heartbeat_ms, 2_000,
+            "sorted recent-heartbeat first"
+        );
 
         // A dead-pid record sweeps on read (no live socket to answer).
         let dead_root = temp("reg-dead");
         let dead = Record {
             id: "dead".to_owned(),
-            state: SessionState { pid: u32::MAX - 1, heartbeat_ms: 3_000, triple: SessionTriple { root: dead_root, sdk_root: PathBuf::new(), sdk_version: String::new(), fvmrc: None, binary_hash: "bin1".to_owned() } },
+            state: SessionState {
+                pid: u32::MAX - 1,
+                heartbeat_ms: 3_000,
+                triple: SessionTriple {
+                    root: dead_root,
+                    sdk_root: PathBuf::new(),
+                    sdk_version: String::new(),
+                    fvmrc: None,
+                    binary_hash: "bin1".to_owned(),
+                },
+            },
         };
         registry.upsert(&dead).expect("upsert");
         assert_eq!(registry.list().len(), 2, "the dead record swept");
@@ -1439,19 +2081,41 @@ mod tests {
             let root = temp(tag);
             let layout = Layout::new(&root);
             layout.create().expect("layout");
-            let triple = SessionTriple { root: root.clone(), sdk_root: root.clone(), sdk_version: String::new(), fvmrc: None, binary_hash: "bin".to_owned() };
+            let triple = SessionTriple {
+                root: root.clone(),
+                sdk_root: root.clone(),
+                sdk_version: String::new(),
+                fvmrc: None,
+                binary_hash: "bin".to_owned(),
+            };
             let pid = bring_up_child(&layout, &triple);
-            Record { id: triple.identity(), state: SessionState { pid, heartbeat_ms: heartbeat, triple } }
+            Record {
+                id: triple.identity(),
+                state: SessionState {
+                    pid,
+                    heartbeat_ms: heartbeat,
+                    triple,
+                },
+            }
         };
         // Six live sessions; the oldest heartbeat is the eviction.
         let records: Vec<_> = (0..SESSION_CAP + 1)
-            .map(|index| record(&format!("cap-{index}"), 1_000 + u128::try_from(index).expect("index") * 100))
+            .map(|index| {
+                record(
+                    &format!("cap-{index}"),
+                    1_000 + u128::try_from(index).expect("index") * 100,
+                )
+            })
             .collect();
         for record in &records {
             registry.upsert(record).expect("upsert");
         }
         let evicted = registry.evict_past_cap();
-        assert_eq!(evicted, [records[0].state.triple.root.clone()], "the oldest heartbeat is evicted, in order");
+        assert_eq!(
+            evicted,
+            [records[0].state.triple.root.clone()],
+            "the oldest heartbeat is evicted, in order"
+        );
         assert_eq!(registry.list().len(), SESSION_CAP, "the cap holds");
         // The evicted child died for real (reaped while polling — a zombie
         // still answers kill(pid, 0)).

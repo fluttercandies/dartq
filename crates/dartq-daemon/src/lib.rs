@@ -41,10 +41,12 @@
 //!   labels), plus the per-agent overlay faces `dartq/overlay.set`,
 //!   `dartq/overlay.commit` (the merge: the agent's staged
 //!   buffers write back to the worktree and merge into the base view), and
-//!   `dartq/overlay.clear`. All answers carry `schema_version` and
-//!   honor an optional `verbosity` (the canonical tiers in dartq-schema's
-//!   crate docs); the engine-view faces additionally accept `context` (the
-//!   multi-root routing tag), `agentId` (the analyzed overlay
+//!   `dartq/overlay.clear`. All answers carry a version stamp — the
+//!   compact vocabulary's `v`, except the compat face's frozen
+//!   `schema_version` — and honor an optional `verbosity` (the canonical
+//!   tiers in dartq-schema's crate docs); the engine-view faces
+//!   additionally accept `context` (the
+//!   multi-root routing tag), `agent_id` (the analyzed overlay
 //!   view), and `since` (delta mode), with the per-face visibility contract
 //!   documented in the `commands` module.
 //! * The `dartq/debug/*` family (daemon-native, no CLI mirror): launch and

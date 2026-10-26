@@ -29,7 +29,12 @@
 //! interval) or the max-hold deadline, then one batch of touched paths goes
 //! to the main loop over the reader channel — which enqueues the
 //! `dartq/sync`-equivalent overlay syncs at `Tier::Normal` (see
-//! `Session::queue_disk_changes`). Per drain with changes, the release
+//! `Session::queue_disk_changes`). The thread's first hand-off is the boot
+//! tick: one empty batch sent as soon as the substrate arms, staging the
+//! base-view analysis so a `--watch` session publishes its initial
+//! diagnostics with no client frame (the lazy-boot posture stages engine
+//! work only at intake, and a quiet workspace produces no other). Per drain
+//! with changes, the release
 //! watch-latency probe ([`WatchMetrics`]) records the stalest event's wait
 //! — change time to the drain that observed it (the poll source stamps the
 //! file's mtime; the OS substrate stamps delivery, the best known time it
@@ -627,6 +632,24 @@ fn watch_loop(
     let Some(mut source) = init_source(&options.root, substrate) else {
         return;
     };
+    // The boot tick: the substrate is armed, so the face's guarantee of a
+    // published base view starts now — an empty `Watch` batch (a shape the
+    // debouncer never produces) that stages the lazy base analysis at the
+    // main loop's next drain (#2591's lazy boot left no client frame to
+    // stage it on a quiet workspace). The queue is empty at boot — the
+    // main loop is fresh — but a full one is the same backpressure a
+    // change batch meets; a dropped tick costs first-publish latency, and
+    // the next change or client request still boots the view, so it never
+    // requeues.
+    match sender.try_send(vec![Incoming::Watch {
+        touched: Vec::new(),
+    }]) {
+        Ok(()) => {}
+        Err(TrySendError::Disconnected(_)) => return,
+        Err(TrySendError::Full(_)) => {
+            eprintln!("dartq-daemon: watch: boot tick deferred; intake queue full");
+        }
+    }
     let mut debounce = Debounce::default();
     while !stop.load(Ordering::Relaxed) {
         thread::sleep(options.poll_interval);

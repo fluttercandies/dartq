@@ -30,8 +30,9 @@ session identity, so `.fvmrc` switches are respected per worktree.
 ```bash
 cd /path/to/repo
 dart pub get                       # engine faces need .dart_tool/package_config.json
-dartq analyze | head -5            # piped: single-line JSON envelope
-dartq analyze --format default     # the human grouping dart analyze prints
+dartq analyze | head -5            # the default: one canonical LON document
+dartq analyze --format json        # the frozen oracle envelope (jq consumers)
+dartq analyze --format text        # the human grouping (sev code line:col msg rows)
 dartq analyze --fast               # parser-only sweep: no engine, pure syntax
 ```
 
@@ -41,13 +42,12 @@ daemon to babysit.
 
 ## Orientation Pass (unfamiliar repo)
 
-One command per question, all machine-readable when piped:
+One command per question, all machine-readable by default:
 
 ```bash
-dartq packages                      # every package root, kind, resolved state,
-                                    #   and every boundary the scan pruned
+dartq packages                      # {v root pkgs bounds}: every package root,
+                                    #   kind, resolved state, pruned boundary
 dartq packages --format json        # same facts, one JSON object per line
-dartq analyze -v concise            # diagnostics without message bodies (cheap scan)
 dartq query symbol main             # where is main declared, who references it
 dartq explain MyAppService          # one-stop report: shape, refs, related diagnostics
 ```
@@ -55,21 +55,22 @@ dartq explain MyAppService          # one-stop report: shape, refs, related diag
 `packages` is the navigation face for multi-package trees: run it before
 touching a monorepo you do not know.
 
-## The Piped Contract
+## The Output Contract
 
-Every output-bearing verb picks its face from the terminal shape:
+Every output-bearing verb carries one `--format <lon|json|text>` axis whose
+default is the constant `lon` — piped or on a TTY, the same bytes:
 
-| Verb | TTY | Piped (the agent default) |
-| --- | --- | --- |
-| `analyze` | human groups | single-line JSON envelope |
-| `query` / `resolve` / `complete` | machine rows | JSON lines |
-| `packages` | aligned table | `PKG\|...` / `BOUNDARY\|...` machine rows |
-| `fix` | human listing | one JSON document per patched file |
-| `session` / `events` | JSON lines — the management channel is a machine channel | same |
+| Verb | `lon` (default) | `json` | `text` |
+| --- | --- | --- | --- |
+| `analyze` | `{v diags:[…]}` document | oracle envelope | human groups |
+| `query` / `resolve` / `complete` | vocabulary answers | frozen envelopes | indented |
+| `packages` | `{v root pkgs bounds}` | one JSON object per line | aligned table |
+| `fix` | vocabulary patch documents | frozen documents | human listing |
+| `session` / `events` | vocabulary rows | JSON rows | identity lines |
 
-Pin the face explicitly in scripts: `--format machine|default|json` (spelling
-per verb — check `--help`). A piped `--format machine` stays machine;
-pipelines never see a flip.
+Pin the face explicitly in scripts; the short field vocabulary (`v`, `diags`,
+`sev`, `msg`, `decls`, `refs`, `off`, `len`, `sym`, …) is the lon face's
+spelling — the json face keeps the long frozen names for jq.
 
 ## Verb Families at a Glance
 

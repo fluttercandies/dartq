@@ -89,13 +89,18 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
     }
     let mut suites = suites;
     if let Some(base) = &inv.impacted {
-        if let Some(reached) = super::impacted(&root, base) {
-            let reached: FxHashSet<PathBuf> = reached.iter().map(|rel| root.join(rel)).collect();
-            suites.retain(|suite| reached.contains(&suite.abs));
-            if suites.is_empty() {
-                eprintln!("dartq test: no suite is reachable from the changes since {base}");
-                return exit::CLEAN;
+        match dartq_commands::impact::impacted_tests(&root, None, base) {
+            Ok(reached) => {
+                let reached: FxHashSet<PathBuf> = reached.iter().map(|rel| root.join(rel)).collect();
+                suites.retain(|suite| reached.contains(&suite.abs));
+                if suites.is_empty() {
+                    eprintln!("dartq test: no suite is reachable from the changes since {base}");
+                    return exit::CLEAN;
+                }
             }
+            // The conservative fallback — the shared selection cannot bound
+            // the change, so everything runs.
+            Err(reason) => eprintln!("dartq test: {reason} — running everything"),
         }
     }
     // Suites the tool never loads (an excluded `@Tags`, a `@TestOn` the

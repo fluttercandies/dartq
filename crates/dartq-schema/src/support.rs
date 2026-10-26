@@ -295,32 +295,32 @@ pub(crate) fn path_session_fields(obj: &Map<String, Value>) -> Result<(), Schema
 /// `exact_fields` first: the fix patch rows carry more optional columns
 /// (`rule`/`message`/`priority`/`stale`) than the assists rows.
 pub(crate) fn edit_floor(obj: &Map<String, Value>, p: &str) -> Result<(), SchemaViolation> {
-    let offset = join(p, "offset");
-    non_negative(field(obj, "offset", p)?, &offset)?;
-    let length = join(p, "length");
-    non_negative(field(obj, "length", p)?, &length)?;
-    string(field(obj, "replacement", p)?, &join(p, "replacement"))?;
-    string(field(obj, "source", p)?, &join(p, "source"))?;
+    let offset = join(p, "off");
+    non_negative(field(obj, "off", p)?, &offset)?;
+    let length = join(p, "len");
+    non_negative(field(obj, "len", p)?, &length)?;
+    string(field(obj, "text", p)?, &join(p, "text"))?;
+    string(field(obj, "src", p)?, &join(p, "src"))?;
     if let Some(anchor) = obj.get("anchor") {
         let ap = join(p, "anchor");
         let anchor = object(anchor, &ap)?;
         exact_fields(anchor, ANCHOR, ANCHOR_OPTIONAL, &ap)?;
         let line = join(&ap, "line");
         one_based(field(anchor, "line", &ap)?, &line)?;
-        let column = join(&ap, "column");
-        one_based(field(anchor, "column", &ap)?, &column)?;
-        if let Some(before) = anchor.get("context_before") {
-            string(before, &join(&ap, "context_before"))?;
+        let column = join(&ap, "col");
+        one_based(field(anchor, "col", &ap)?, &column)?;
+        if let Some(before) = anchor.get("before") {
+            string(before, &join(&ap, "before"))?;
         }
-        if let Some(after) = anchor.get("context_after") {
-            string(after, &join(&ap, "context_after"))?;
+        if let Some(after) = anchor.get("after") {
+            string(after, &join(&ap, "after"))?;
         }
     }
     Ok(())
 }
 
-pub(crate) const ANCHOR: &[&str] = &["line", "column"];
-pub(crate) const ANCHOR_OPTIONAL: &[&str] = &["context_before", "context_after"];
+pub(crate) const ANCHOR: &[&str] = &["line", "col"];
+pub(crate) const ANCHOR_OPTIONAL: &[&str] = &["before", "after"];
 
 #[cfg(test)]
 pub(crate) fn schema_keys(value: &Value) -> Vec<String> {

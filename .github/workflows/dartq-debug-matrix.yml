@@ -155,14 +155,15 @@ jobs:
         run: |
           set -euo pipefail
           code=0
-          out="$("$DARTQ" analyze --format=machine "$SMOKE/pkg")" || code=$?
+          out="$("$DARTQ" analyze --format=json "$SMOKE/pkg")" || code=$?
           if [ "$code" -ne 0 ]; then
             echo "::error::clean analyze exited $code (expected 0)"
             printf '%s\n' "$out"
             exit 1
           fi
-          if [ -n "$out" ]; then
-            echo "::error::clean analyze emitted diagnostics:"
+          # The json envelope is always emitted; clean means zero diagnostics.
+          if ! printf '%s' "$out" | jq -e '.version == 1 and (.diagnostics | length == 0)' >/dev/null; then
+            echo "::error::clean analyze emitted diagnostics (or a malformed envelope):"
             printf '%s\n' "$out"
             exit 1
           fi
@@ -191,7 +192,7 @@ jobs:
           class {
           EOF
           code=0
-          out="$("$DARTQ" analyze --format=machine --sdk "$DART_SDK" "$SMOKE/pkg")" || code=$?
+          out="$("$DARTQ" analyze --format=json --sdk "$DART_SDK" "$SMOKE/pkg")" || code=$?
           printf '%s\n' "$out"
           if [ "$code" -ne 3 ]; then
             echo "::error::broken analyze exited $code (expected 3, ERROR severity)"
@@ -199,5 +200,9 @@ jobs:
           fi
           grep -q "broken_syntax.dart" <<<"$out" || {
             echo "::error::broken analyze did not name the broken file"
+            exit 1
+          }
+          printf '%s' "$out" | jq -e '.diagnostics | length >= 1 and any(.severity == "ERROR")' >/dev/null || {
+            echo "::error::broken analyze did not answer ERROR-severity diagnostics"
             exit 1
           }

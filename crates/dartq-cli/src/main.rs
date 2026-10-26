@@ -6,9 +6,14 @@
 //! --fast`'s alias; `compatibility`, `resolve-at`, and `completion`
 //! alias `compat`, `resolve`, and `complete`).
 //!
-//! Piped (non-TTY) invocations with no explicit `--format` default to
-//! machine JSON — zero prose for programmatic consumers; a TTY keeps
-//! the human forms. Explicit `--format` always wins.
+//! Output is the one `--format <lon|json|text>` axis on every verb with
+//! output, `lon` the constant default (never the terminal's shape — the
+//! same invocation prints the same bytes piped or on a TTY); `json` keeps
+//! the frozen single-line shapes for jq consumers, `text` is the explicit
+//! human face, and write operations fall back to `lon` on `text` (their
+//! output is a record, not prose). Every face encodes the same value —
+//! the producers' short snake_case word list, the one the daemon's
+//! `dartq/*` answers carry natively (see [`output`]).
 //!
 //! The per-command cores live in `dartq-commands` (the one implementation
 //! the daemon RPC faces share); this binary adds only argument
@@ -47,8 +52,8 @@
 //! | Dialect | Emitted by | Envelope / version contract | The same concept elsewhere |
 //! | --- | --- | --- | --- |
 //! | CLI oracle JSON | the `--format=json` faces (one line on stdout) | the oracle envelope (`version` key), byte parity with `dart analyze --format=json` on both faces; advisory notes ride stderr | the daemon serves its own rows under `dartq/*` — the RPC dialect below, not this one |
-//! | Daemon RPC answers | `dartq/*` method results (dartq-daemon) | JSON-RPC 2.0 result carrying `schema_version`, an optional `verbosity` tier, and a `since` delta cursor; compact rows plus session economics (`symbols` table) | the CLI machine JSON's rows; validated against the schema crate's frozen documents |
-//! | Schema-frozen shapes | never emitted — the contract itself (dartq-schema's per-domain validators, the CI gate) | one frozen v1 document per domain (Query, Explain, …) plus the Verbosity tier table | what both emitters above must keep passing |
+//! | Daemon RPC answers | `dartq/*` method results (dartq-daemon) | JSON-RPC 2.0 result carrying the short-vocabulary fields (`v` and friends); compact rows plus session economics (`symbols` table) | the CLI lon face's rows; validated against the schema crate's frozen documents |
+//! | Schema-frozen shapes | never emitted — the contract itself (dartq-schema's per-domain validators, the CI gate) | one frozen v1 document per domain (Query, Explain, …) plus the Verbosity tier table | what the json-face emitters above must keep passing |
 //!
 //! The daemon face is the one deviation from the crash tier: it installs no
 //! catch-unwind, so a panic on the main thread unwinds out of `main` and
@@ -61,7 +66,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, BufWriter, IsTerminal, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -69,24 +74,38 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser as _, Subcommand, ValueEnum};
 
 use dartq_commands::analyze::Target;
-use dartq_commands::check::{FileSet, write_machine_verbosity};
 use dartq_commands::config::{
     ConfigError, ContextConfig, ContextTarget, load as load_dartq_config, resolve_locator,
 };
 use dartq_commands::discover::{DiscoverError, discover};
 use dartq_commands::explain::ExplainError;
-use dartq_commands::query::{
-    BatchQuery, QueryKind, decl_kind_name, declaration_extras, ref_kind_name,
-};
+use dartq_commands::query::{BatchQuery, QueryKind, to_json_at_tier};
 use dartq_commands::workspace::{
     AnalyzeOverrides, WorkspaceAdvisory, engine_config_with_advisory, engine_config_with_overrides,
     open_engine,
 };
 use dartq_diagnostics::{
-    AnalysisOutput, Diagnostic, FileLayoutProvider, Severity, SourceRange, write_json,
+    AnalysisOutput, Diagnostic, FileLayoutProvider, Severity, write_json,
 };
-use dartq_engine::{DeclHit, EngineConfig};
+use dartq_engine::EngineConfig;
 use dartq_sdk::SdkSnapshot;
+
+mod compat;
+mod debug;
+mod events;
+mod fix;
+mod mcp;
+mod impact;
+mod index;
+mod output;
+mod packages;
+mod rename;
+mod resolve;
+mod session;
+mod test;
+
+pub(crate) use output::OutputFormat;
+use output::{diags_document, text_diag_row, write_json_value, write_lon, write_text_value};
 
 /// Process exit codes, pinned to the dartdev oracle (analyze.dart:719–731;
 /// usage exit dartdev.dart:209–210) plus the sysexits-style tiers the
@@ -115,27 +134,6 @@ mod exit {
     #[expect(dead_code, reason = "reserved contract tier; the first consumer wires it")]
     pub const SESSION: u8 = 79;
 }
-
-/// Whether stdout is not a terminal: the machine-JSONL default. An
-/// explicit `--format` always wins (the flags are `Option`; `None` means
-/// "resolve by terminal shape") — a piped `--format=machine` stays
-/// machine, so deterministic pipelines never see a flip.
-fn non_tty_stdout() -> bool {
-    !io::stdout().is_terminal()
-}
-
-mod compat;
-mod debug;
-mod events;
-mod fix;
-mod mcp;
-mod impact;
-mod index;
-mod packages;
-mod rename;
-mod resolve;
-mod session;
-mod test;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -340,22 +338,8 @@ enum Command {
 /// options-free.
 #[derive(Args)]
 struct CheckArgs {
-    #[arg(long, value_enum, default_value_t = CheckFormat::Machine)]
+    #[arg(long, value_enum, default_value_t = CheckFormat::Lon)]
     format: CheckFormat,
-    /// Machine-row volume (`-v`/`--verbosity concise|default|verbose`; the
-    /// token-cost sweep's tier axis): `concise` keeps the identifying
-    /// severity/type/code + span prefix but drops the message field,
-    /// `default` is the byte-parity oracle row, `verbose` appends the
-    /// correctionMessage as a ninth field (`-` when absent). The diagnostic
-    /// set is complete at every tier; the JSON face is unaffected.
-    #[arg(
-        short = 'v',
-        long,
-        value_enum,
-        value_name = "TIER",
-        default_value_t = DiagnosticVerbosity::Default
-    )]
-    verbosity: DiagnosticVerbosity,
     /// Write one metrics JSON object to PATH at exit.
     #[arg(long)]
     metrics_json: Option<PathBuf>,
@@ -384,10 +368,12 @@ struct CheckArgs {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum CheckFormat {
-    /// SEVERITY|TYPE|CODE|FILE|LINE|COL|LENGTH|MESSAGE per diagnostic.
-    Machine,
+    /// Canonical LON over the short vocabulary: `{v diags:[…]}`.
+    Lon,
     /// Single-line JSON envelope.
     Json,
+    /// Grouped human rendering (the analyze text face's shape).
+    Text,
 }
 
 #[derive(Args)]
@@ -398,30 +384,16 @@ struct AnalyzeArgs {
     /// directory (the oracle's `Directory.current` fallback).
     #[arg(default_value = ".")]
     targets: Vec<PathBuf>,
-    /// Output format; absent falls to the terminal's shape — human on a
-    /// TTY, the machine JSON envelope piped (the AI-first default: zero
-    /// prose for programmatic consumers).
-    #[arg(long, value_enum)]
-    format: Option<AnalyzeFormat>,
+    /// Output format: the constant default is `lon` (canonical LON over
+    /// the short vocabulary — never the terminal's shape, so a piped run
+    /// and a TTY run print the same bytes); `json` is the frozen
+    /// single-line oracle envelope, `text` the grouped human face.
+    #[arg(long, value_enum, default_value_t = AnalyzeFormat::Lon)]
+    format: AnalyzeFormat,
     /// Scan + parse only (the `check` pipeline): parser-tier diagnostics
     /// without the engine — the fast pass for pure-syntax sweeps.
     #[arg(long)]
     fast: bool,
-    /// Machine-row volume (`-v`/`--verbosity concise|default|verbose`; the
-    /// token-cost sweep's tier axis): `concise` keeps the identifying
-    /// severity/type/code + span prefix but drops the message field,
-    /// `default` is the byte-parity oracle row, `verbose` appends the
-    /// correctionMessage as a ninth field (`-` when absent). The diagnostic
-    /// set is complete at every tier; the default-format and JSON faces are
-    /// unaffected.
-    #[arg(
-        short = 'v',
-        long,
-        value_enum,
-        value_name = "TIER",
-        default_value_t = DiagnosticVerbosity::Default
-    )]
-    verbosity: DiagnosticVerbosity,
     /// Write one metrics JSON object to PATH at exit.
     #[arg(long)]
     metrics_json: Option<PathBuf>,
@@ -535,17 +507,18 @@ struct AnalyzeArgs {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum AnalyzeFormat {
-    /// SEVERITY|TYPE|CODE|FILE|LINE|COL|LENGTH|MESSAGE per diagnostic
-    /// (byte-parity differential face).
-    Machine,
-    /// The oracle's default format: human-readable, grouped by file,
-    /// severity-sorted (the unset `--format` face).
-    Default,
+    /// Canonical LON over the short vocabulary: one `{v diags:[…]}`
+    /// document, one flat `{code sev file line col len msg doc?}` row
+    /// per diagnostic (the default).
+    Lon,
     /// Single-line JSON envelope, byte parity with
     /// `dart analyze --format=json` (the shared oracle-exact writer).
     /// Diagnostics only: workspace advisories print as one line on stderr
     /// ahead of it.
     Json,
+    /// The human face: diagnostics grouped by file, `sev code line:col
+    /// msg` rows, the count tail.
+    Text,
 }
 
 /// The dartdev global flags, accepted and ignored on the diagnostic faces
@@ -602,29 +575,6 @@ struct DartdevGlobals {
     /// The `--[no-]analytics` negative spelling — see `analytics`.
     #[arg(long, hide = true, overrides_with = "analytics")]
     no_analytics: bool,
-}
-
-/// The machine rows' output volume (the token-cost sweep's tier axis); the
-/// canonical semantics live in dartq-commands' `check` module, the one
-/// renderer both diagnostic faces share.
-#[derive(Clone, Copy, ValueEnum)]
-enum DiagnosticVerbosity {
-    /// Code + span rows: the message field drops.
-    Concise,
-    /// The oracle machine row verbatim (the default).
-    Default,
-    /// The machine row plus the correctionMessage field (`-` when absent).
-    Verbose,
-}
-
-impl DiagnosticVerbosity {
-    fn into_commands(self) -> dartq_commands::check::DiagnosticVerbosity {
-        match self {
-            Self::Concise => dartq_commands::check::DiagnosticVerbosity::Concise,
-            Self::Default => dartq_commands::check::DiagnosticVerbosity::Default,
-            Self::Verbose => dartq_commands::check::DiagnosticVerbosity::Verbose,
-        }
-    }
 }
 
 #[derive(Args)]
@@ -692,8 +642,10 @@ struct ExplainArgs {
     /// `.dart_tool/package_config.json`; defaults to the current directory.
     #[arg(default_value = ".")]
     dir: PathBuf,
-    #[arg(long, value_enum, default_value_t = ExplainFormat::Json)]
-    format: ExplainFormat,
+    /// Output format; `lon` the default, `json` the report verbatim,
+    /// `text` the indented report.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Lon)]
+    format: OutputFormat,
     /// Dart SDK root; defaults to `$DART_SDK`.
     #[arg(long)]
     sdk: Option<PathBuf>,
@@ -701,13 +653,6 @@ struct ExplainArgs {
     /// default, `minimal` swaps the section arrays for `counts`).
     #[arg(short = 'v', long, value_enum, default_value_t = Verbosity::Compact)]
     verbosity: Verbosity,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum ExplainFormat {
-    /// Single-line JSON report — the report's only format (the
-    /// report is schema-valid at birth; this flag spells it).
-    Json,
 }
 
 /// The output detail tier (dartq-commands [`Verbosity`]'s spelling for the
@@ -733,29 +678,16 @@ impl Verbosity {
     }
 }
 
-impl AnalyzeArgs {
-    /// The output format: an explicit `--format` wins; absent falls to
-    /// the terminal's shape — the human default on a TTY, the machine
-    /// JSON envelope piped.
-    fn effective_format(&self) -> AnalyzeFormat {
-        self.format.unwrap_or(if non_tty_stdout() {
-            AnalyzeFormat::Json
-        } else {
-            AnalyzeFormat::Default
-        })
-    }
-}
-
 /// The `analyze --fast` face's [`CheckArgs`]: the check pipeline over the
-/// analyze targets, the JSON envelope where explicitly asked (the check
-/// face has no human renderer — a piped default stays machine rows).
+/// analyze targets — the format maps one-to-one (the faces share the
+/// same tri-axis).
 fn check_from_analyze(args: &AnalyzeArgs) -> CheckArgs {
     CheckArgs {
-        format: match args.effective_format() {
+        format: match args.format {
+            AnalyzeFormat::Lon => CheckFormat::Lon,
             AnalyzeFormat::Json => CheckFormat::Json,
-            _ => CheckFormat::Machine,
+            AnalyzeFormat::Text => CheckFormat::Text,
         },
-        verbosity: args.verbosity,
         metrics_json: args.metrics_json.clone(),
         fatal_warnings: args.fatal_warnings,
         no_fatal_warnings: args.no_fatal_warnings,
@@ -810,9 +742,14 @@ struct BatchArgs {
     kinds: Vec<QueryKind>,
     /// Report detail tier (the schema's verbosity table; `compact` by
     /// default) — the same tier axis the single faces carry, applied to
-    /// every JSONL answer.
+    /// every answer.
     #[arg(short = 'v', long, value_enum, default_value_t = Verbosity::Compact)]
     verbosity: Verbosity,
+    /// Output format per answer: `lon` the default (one canonical line
+    /// per answer), `json` the v1 envelope per line, `text` the
+    /// indented envelope per answer.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Lon)]
+    format: OutputFormat,
     /// Package directory holding pubspec.yaml and
     /// `.dart_tool/package_config.json`; defaults to the current directory.
     #[arg(default_value = ".")]
@@ -830,42 +767,19 @@ struct SymbolArgs {
     /// `.dart_tool/package_config.json`; defaults to the current directory.
     #[arg(default_value = ".")]
     dir: PathBuf,
-    /// Output format; absent falls to the terminal's shape — machine rows
-    /// on a TTY, JSON lines piped.
-    #[arg(long, value_enum)]
-    format: Option<QueryFormat>,
+    /// Output format; `lon` the default (the short-vocabulary answer,
+    /// canonical LON), `json` the v1 envelope, `text` the indented answer.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Lon)]
+    format: OutputFormat,
     /// Report detail tier (the schema's verbosity table; `compact` by
     /// default). `minimal` keeps the red-line locators: the JSON rows drop
-    /// the convenience spellings and the element-face columns, the machine
-    /// rows drop the container/`explicit` columns, and the reserved kind
-    /// arrays (IMPL/DEP) never print.
+    /// the convenience spellings and the element-face columns, and the
+    /// reserved kind arrays (IMPL/DEP) never print.
     #[arg(short = 'v', long, value_enum, default_value_t = Verbosity::Compact)]
     verbosity: Verbosity,
     /// Dart SDK root; defaults to `$DART_SDK`.
     #[arg(long)]
     sdk: Option<PathBuf>,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum QueryFormat {
-    /// One row per line with a stable field order — `DECL` declaration rows
-    /// and `REF` reference rows (a symbol listing, not the diagnostics
-    /// machine face).
-    Machine,
-    /// Single-line JSON object.
-    Json,
-}
-
-impl SymbolArgs {
-    /// The output format: an explicit `--format` wins; absent falls to
-    /// the terminal's shape — machine rows on a TTY, JSON lines piped.
-    fn effective_format(&self) -> QueryFormat {
-        self.format.unwrap_or(if non_tty_stdout() {
-            QueryFormat::Json
-        } else {
-            QueryFormat::Machine
-        })
-    }
 }
 
 /// Severity arithmetic: the highest fatal tier present.
@@ -926,11 +840,11 @@ fn check(args: &CheckArgs) -> u8 {
     // per line, and an unbuffered lock would flush per diagnostic line.
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
+    let output = run.output();
     let written = match args.format {
-        CheckFormat::Machine => {
-            write_machine_verbosity(&mut out, &run.output(), args.verbosity.into_commands())
-        }
-        CheckFormat::Json => write_json(&mut out, &run.output()),
+        CheckFormat::Lon => write_lon(&mut out, &diags_document(&output)),
+        CheckFormat::Json => write_json(&mut out, &output),
+        CheckFormat::Text => write_human(&mut out, output.diagnostics, output.files),
     };
     if let Err(error) = written.and_then(|()| out.flush()) {
         eprintln!("dartq: internal error: writing diagnostics failed: {error}");
@@ -982,6 +896,9 @@ struct RunMetrics {
 
 impl RunMetrics {
     fn json(&self) -> serde_json::Value {
+        // The one CLI-local face under a published long-stamp contract
+        // (dartq-schema's `Domain::RunMetrics` freezes `schema_version`;
+        // the compact `v` table is the stdout faces' own).
         serde_json::json!({
             "schema_version": dartq_commands::SCHEMA_VERSION,
             "files": self.files,
@@ -1347,37 +1264,28 @@ fn analyze_finish(
 ) -> u8 {
     let discovery_ms = elapsed_ms(run.discovery);
     let analyze_ms = elapsed_ms(run.analysis);
-    let verbosity = args.verbosity.into_commands();
 
     for line in &run.degrade_notices {
         eprintln!("{line}");
     }
 
-    let written = match args.effective_format() {
-        // The advisories ride stderr on the machine face: the oracle's
-        // machine stream carries diagnostics only, so each row prints through
-        // the same shared writer onto the human stream while stdout keeps
-        // the oracle rows alone.
-        AnalyzeFormat::Machine => {
-            let mut stderr = io::stderr().lock();
-            let mut written = Ok(());
+    // The data faces (lon, json) keep the advisory off stdout — one
+    // `Info • code • message` line on stderr per advisory; the text face
+    // leads stdout with the same human line, ahead of the groups.
+    let written = match args.format {
+        AnalyzeFormat::Lon => {
             for advisory in advisories {
-                written = written.and_then(|()| {
-                    write_stale_advisory_machine(&mut stderr, Some(advisory), verbosity)
-                });
+                eprintln!("Info • {} • {}", advisory.code().name, advisory.message());
             }
-            written.and_then(|()| {
-                write_machine_verbosity(
-                    out,
-                    &AnalysisOutput {
-                        diagnostics: &run.diagnostics,
-                        files: run,
-                    },
-                    verbosity,
-                )
-            })
+            write_lon(
+                out,
+                &diags_document(&AnalysisOutput {
+                    diagnostics: &run.diagnostics,
+                    files: run,
+                }),
+            )
         }
-        AnalyzeFormat::Default => {
+        AnalyzeFormat::Text => {
             let mut written = Ok(());
             for advisory in advisories {
                 written = written.and_then(|()| write_stale_advisory_human(out, Some(advisory)));
@@ -1385,9 +1293,9 @@ fn analyze_finish(
             written.and_then(|()| write_human(out, &run.diagnostics, run))
         }
         // The envelope is the JSON face's whole stdout contract (the oracle
-        // envelope carries diagnostics only), so the workspace advisories have
-        // no row in it; each one-line note rides stderr instead — the same
-        // stream the degrade notices print on — keeping the
+        // envelope carries diagnostics only), so the workspace advisories
+        // have no row in it; each one-line note rides stderr instead — the
+        // same stream the degrade notices print on — keeping the
         // degraded-resolution signal on every face. The oracle's `--memory`
         // gate (analyze.dart:200 `printMemory = memory && jsonFormat`)
         // appends the envelope's `memory` key: the process's peak RSS in KiB
@@ -1453,44 +1361,6 @@ fn write_json_memory(out: &mut impl Write, output: &AnalysisOutput<'_>) -> io::R
     }
     line.extend_from_slice(b"}\n");
     out.write_all(&line)
-}
-
-/// The machine-format advisory row, ahead of the diagnostics: the exact
-/// 8-field shape every other `dartq/*` row uses (severity INFO — the
-/// `dartq/memory_degraded` posture for a note that must never fail the run
-/// through the exit tiers; type TOOL per the registry row), anchored at the
-/// config the advisory names, rendered through the one oracle-exact writer.
-fn write_stale_advisory_machine(
-    out: &mut impl Write,
-    advisory: Option<&WorkspaceAdvisory>,
-    verbosity: dartq_commands::check::DiagnosticVerbosity,
-) -> io::Result<()> {
-    let Some(advisory) = advisory else {
-        return Ok(());
-    };
-    // An empty source positions the row at 1:1 — the assembly has no
-    // source span, the memory-budget row's own posture.
-    let mut files = FileSet::default();
-    let file = files.push("", advisory.config_path());
-    let diagnostic = Diagnostic::new(
-        Severity::Info,
-        advisory.code(),
-        advisory.message(),
-        file,
-        SourceRange {
-            offset: 0,
-            length: 0,
-        },
-        None,
-    );
-    write_machine_verbosity(
-        out,
-        &AnalysisOutput {
-            diagnostics: &[diagnostic],
-            files: &files,
-        },
-        verbosity,
-    )
 }
 
 /// The human-format advisory line, ahead of the diagnostics groups: the
@@ -1775,8 +1645,9 @@ fn target_panel(target: ContextTarget) -> &'static str {
     }
 }
 
-/// Human format: diagnostics grouped by file (paths ascending), severity-
-/// sorted within each group. Not a differential face — layout may change
+/// Human format: diagnostics grouped by file (paths ascending), the row
+/// grammar `sev code line:col msg` within each group, the count tail
+/// (the oracle's spelling). Not a differential face — layout may change
 /// freely.
 fn write_human(
     out: &mut impl Write,
@@ -1793,12 +1664,7 @@ fn write_human(
     for (path, group) in &groups {
         writeln!(out, "{}", path.display())?;
         for diag in group {
-            let (line, column) = layout.line_col(diag.file, diag.range.offset);
-            writeln!(
-                out,
-                "  {line}:{column} • {} • {} • {}",
-                diag.severity, diag.code.name, diag.message
-            )?;
+            writeln!(out, "  {}", text_diag_row(diag, layout))?;
         }
     }
     match diags.len() {
@@ -1888,7 +1754,7 @@ fn query_callers_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
         out,
         &run,
         &args.name,
-        args.effective_format(),
+        args.format,
         args.verbosity.into_commands(),
     );
     if let Err(error) = written.and_then(|()| out.flush()) {
@@ -1934,7 +1800,7 @@ fn query_implementations_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
         out,
         &run,
         &args.name,
-        args.effective_format(),
+        args.format,
         args.verbosity.into_commands(),
     );
     if let Err(error) = written.and_then(|()| out.flush()) {
@@ -1980,7 +1846,7 @@ fn query_dependencies_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
         out,
         &run,
         &args.name,
-        args.effective_format(),
+        args.format,
         args.verbosity.into_commands(),
     );
     if let Err(error) = written.and_then(|()| out.flush()) {
@@ -2044,15 +1910,13 @@ fn query_batch_run(args: &BatchArgs, out: &mut impl Write) -> u8 {
     let written = answers
         .iter()
         .try_for_each(|answer| {
-            writeln!(
-                out,
-                "{}",
-                dartq_commands::query::to_json_at_tier(
-                    &answer.run,
-                    answer.name,
-                    args.verbosity.into_commands()
-                )
-            )
+            let value =
+                to_json_at_tier(&answer.run, answer.name, args.verbosity.into_commands());
+            match args.format {
+                OutputFormat::Json => write_json_value(out, &value),
+                OutputFormat::Lon => write_lon(out, &value),
+                OutputFormat::Text => write_text_value(out, &value),
+            }
         })
         .and_then(|()| out.flush());
     if let Err(error) = written {
@@ -2062,25 +1926,23 @@ fn query_batch_run(args: &BatchArgs, out: &mut impl Write) -> u8 {
     exit::CLEAN
 }
 
-/// The query faces' shared output: machine rows or the tier-shaped
-/// one-line JSON envelope (`dartq_commands::query::to_json_at_tier`, the
-/// frozen v1 contract at compact/full, the red line at minimal).
+/// The query faces' shared output: the tier-shaped envelope
+/// (`dartq_commands::query::to_json_at_tier`, the frozen v1 contract at
+/// compact/full, the red line at minimal) through the format axis — the
+/// same value on every face (the envelope's `sym` and the rows'
+/// short-vocabulary fields are the producer's own spelling).
 fn write_query_out(
     out: &mut impl Write,
     run: &dartq_commands::query::SymbolRun<'_>,
     name: &str,
-    format: QueryFormat,
+    format: OutputFormat,
     verbosity: dartq_commands::Verbosity,
 ) -> io::Result<()> {
+    let answer = to_json_at_tier(run, name, verbosity);
     match format {
-        QueryFormat::Machine => write_query_machine(out, run, verbosity),
-        QueryFormat::Json => {
-            writeln!(
-                out,
-                "{}",
-                dartq_commands::query::to_json_at_tier(run, name, verbosity)
-            )
-        }
+        OutputFormat::Json => write_json_value(out, &answer),
+        OutputFormat::Lon => write_lon(out, &answer),
+        OutputFormat::Text => write_text_value(out, &answer),
     }
 }
 
@@ -2108,7 +1970,7 @@ fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
         out,
         &run,
         &args.name,
-        args.effective_format(),
+        args.format,
         args.verbosity.into_commands(),
     );
     if let Err(error) = written.and_then(|()| out.flush()) {
@@ -2116,147 +1978,6 @@ fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
         return exit::INTERNAL_ERROR;
     }
     exit::CLEAN
-}
-
-/// Machine format: one row per line with a stable field order — the query
-/// face's own grammar (a symbol listing, deliberately not the diagnostics
-/// 8-field face):
-///
-/// ```text
-/// DECL|file|container|kind|name|line|column|length|signature|annotations
-///                                                     (container `-` when
-///                                                     top-level; 1-based;
-///                                                     the trailing columns
-///                                                     spell the JSON
-///                                                     face's element-face
-///                                                     extras — `signature`
-///                                                     `-` when the shape
-///                                                     has none,
-///                                                     `annotations` `-`
-///                                                     when none, else the
-///                                                     verbatim texts
-///                                                     joined `,`)
-/// REF|target-file|kind|explicit|offset|length|use-file
-///                                                 (offset is the use
-///                                                 site's UTF-16 offset;
-///                                                 `explicit` is
-///                                                 `true`/`false` — the use
-///                                                 is spelled `p.x` with an
-///                                                 import prefix; the JSON
-///                                                 face's `qualified`
-///                                                 column is the
-///                                                 `<prefix>.<name>` string,
-///                                                 not this field)
-/// IMPL|file|container|kind|name|line|column|length|signature|annotations
-///                                                     (the implementations
-///                                                     face's rows, the
-///                                                     DECL grammar)
-/// DEP|path|name                                     (the dependencies
-///                                                     face's forward rows:
-///                                                     the joined library's
-///                                                     label plus the consumed
-///                                                     symbol's name — `-` on
-///                                                     a bare import edge)
-/// ```
-///
-/// The file columns are the canonical paths (the machine grammar's
-/// identity spelling; the JSON face projects the package-form labels).
-///
-/// At the `minimal` tier the grammar carries the red line only: the
-/// container, `signature`, and `annotations` columns drop from DECL/IMPL
-/// rows, the `explicit` column drops from REF rows (the machine spelling
-/// of the JSON face's `qualified`), and the reserved kind arrays never
-/// print (no IMPL/DEP rows):
-///
-/// ```text
-/// DECL|file|kind|name|line|column|length
-/// REF|target-file|kind|offset|length|use-file
-/// ```
-fn write_query_machine(
-    out: &mut impl Write,
-    run: &dartq_commands::query::SymbolRun<'_>,
-    verbosity: dartq_commands::Verbosity,
-) -> io::Result<()> {
-    let minimal = verbosity == dartq_commands::Verbosity::Minimal;
-    let layout = &run.layout;
-    let engine = layout.engine();
-    // The shared declaration-row grammar: DECL for the queried symbol's
-    // own rows, IMPL for the implementations face's — same columns, the
-    // prefix the harness parser dispatches on. The row renders to a String
-    // so the emit loops over `out` never overlap the builder's borrows.
-    let declaration_row = |prefix: &str, decl: &DeclHit<'_>| {
-        let (line, column) = layout.line_col(decl.file, decl.range.offset);
-        let file = layout.file_path(decl.file).display();
-        let kind = decl_kind_name(decl.kind);
-        if minimal {
-            format!(
-                "{prefix}|{file}|{kind}|{}|{line}|{column}|{}",
-                decl.name, decl.range.length
-            )
-        } else {
-            let (signature, annotations) = declaration_extras(engine, decl);
-            format!(
-                "{prefix}|{file}|{}|{kind}|{}|{line}|{column}|{}|{}|{}",
-                decl.container.unwrap_or("-"),
-                decl.name,
-                decl.range.length,
-                signature.as_deref().unwrap_or("-"),
-                machine_annotations(&annotations),
-            )
-        }
-    };
-    for decl in &run.decls {
-        writeln!(out, "{}", declaration_row("DECL", decl))?;
-    }
-    for reference in &run.refs {
-        if minimal {
-            writeln!(
-                out,
-                "REF|{}|{}|{}|{}|{}",
-                layout.file_path(reference.target_file).display(),
-                ref_kind_name(reference.kind),
-                reference.range.offset,
-                reference.range.length,
-                layout.file_path(reference.file).display(),
-            )?;
-        } else {
-            writeln!(
-                out,
-                "REF|{}|{}|{}|{}|{}|{}",
-                layout.file_path(reference.target_file).display(),
-                ref_kind_name(reference.kind),
-                reference.explicit,
-                reference.range.offset,
-                reference.range.length,
-                layout.file_path(reference.file).display(),
-            )?;
-        }
-    }
-    if !minimal {
-        for decl in &run.implementations {
-            writeln!(out, "{}", declaration_row("IMPL", decl))?;
-        }
-        for row in &run.dependencies {
-            writeln!(
-                out,
-                "DEP|{}|{}",
-                row.path,
-                row.name.as_deref().unwrap_or("-")
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// The machine spelling of the annotations column: `-` when none, else the
-/// verbatim texts joined with `,` — the column closes the row, so a
-/// consumer splitting on `|` takes the tail verbatim.
-fn machine_annotations(annotations: &[String]) -> String {
-    if annotations.is_empty() {
-        "-".to_owned()
-    } else {
-        annotations.join(",")
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2281,7 +2002,7 @@ fn explain_entry(args: &ExplainArgs) -> u8 {
 /// One explain run: the workspace assembly, the collector-installed engine,
 /// and the report assembly all live in `dartq_commands::explain` (the one
 /// implementation the daemon's `dartq/explain` shares); this shell adds the
-/// crash tier, the tier mapping, and the JSON output. The report is
+/// crash tier, the tier mapping, and the format axis. The report is
 /// schema-valid at birth (validated against `Domain::Explain` where it is
 /// built); an unknown symbol is the report's own empty seam report, not an
 /// error — printed as-is, exit 0. Exit tiers: workspace/engine assembly is
@@ -2355,14 +2076,14 @@ fn explain_run(args: &ExplainArgs, out: &mut impl Write) -> u8 {
         }
     };
 
-    let written = out
-        .write_all(
-            serde_json::to_string(&report)
-                .expect("the validated report serializes")
-                .as_bytes(),
-        )
-        .and_then(|()| out.write_all(b"\n"))
-        .and_then(|()| out.flush());
+    let written = match args.format {
+        OutputFormat::Json => out
+            .write_all(report.to_string().as_bytes())
+            .and_then(|()| out.write_all(b"\n")),
+        OutputFormat::Lon => write_lon(out, &report),
+        OutputFormat::Text => write_text_value(out, &report),
+    }
+    .and_then(|()| out.flush());
     if let Err(error) = written {
         eprintln!("dartq: internal error: writing the explain report failed: {error}");
         return exit::INTERNAL_ERROR;
@@ -2503,9 +2224,7 @@ mod tests {
     }
 
     /// `analyze --fast` is the check pipeline: the delegation maps the
-    /// analyze flags onto the check face one-to-one (JSON stays JSON, the
-    /// human default lands on the machine face — check has no human
-    /// renderer).
+    /// analyze flags onto the check face one-to-one (the shared tri-axis).
     #[test]
     fn analyze_fast_maps_onto_the_check_pipeline() {
         let analyze_args = |args: &[&str]| match parse_args_of(args) {
@@ -2515,24 +2234,20 @@ mod tests {
         let fast = analyze_args(&["analyze", "--fast", "/pkg"]);
         assert!(fast.fast);
         let mapped = check_from_analyze(&fast);
-        // Tests run with captured stdout (not a terminal): the absent
-        // --format resolves to the machine JSON envelope.
-        assert!(matches!(mapped.format, CheckFormat::Json));
+        assert!(matches!(mapped.format, CheckFormat::Lon), "lon default");
         assert_eq!(mapped.paths, vec![PathBuf::from("/pkg")]);
         assert!(!mapped.no_fatal_warnings, "fatal warnings stay on");
 
         let json = check_from_analyze(&analyze_args(&["analyze", "--fast", "--format=json"]));
         assert!(matches!(json.format, CheckFormat::Json));
+        let text = check_from_analyze(&analyze_args(&["analyze", "--fast", "--format=text"]));
+        assert!(matches!(text.format, CheckFormat::Text));
     }
 
     #[test]
     fn check_defaults() {
         let check = check_args(&["check"]);
-        assert!(matches!(check.format, CheckFormat::Machine));
-        assert!(
-            matches!(check.verbosity, DiagnosticVerbosity::Default),
-            "default verbosity tier"
-        );
+        assert!(matches!(check.format, CheckFormat::Lon), "lon default");
         assert!(!check.no_fatal_warnings, "fatal-warnings default on");
         assert!(
             !check.fatal_warnings,
@@ -2563,8 +2278,8 @@ mod tests {
             vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
         );
 
-        let check = check_args(&["check", "--format", "machine", "dir/"]);
-        assert!(matches!(check.format, CheckFormat::Machine));
+        let check = check_args(&["check", "--format", "text", "dir/"]);
+        assert!(matches!(check.format, CheckFormat::Text));
         assert_eq!(check.paths, vec![PathBuf::from("dir/")]);
     }
 
@@ -2608,43 +2323,6 @@ mod tests {
         );
     }
 
-    /// The `-v`/`--verbosity` tier flag on both diagnostic faces: the three
-    /// tiers parse through long, `=` and short spellings (the analyze face
-    /// pinned with the flag alongside the positional), the unset default is
-    /// `default`; the invalid spellings are covered by `usage_errors`.
-    #[test]
-    fn verbosity_tier_parse() {
-        assert!(
-            matches!(
-                check_args(&["check"]).verbosity,
-                DiagnosticVerbosity::Default
-            ),
-            "unset default"
-        );
-        assert!(
-            matches!(
-                check_args(&["check", "-v", "concise"]).verbosity,
-                DiagnosticVerbosity::Concise
-            ),
-            "short spelling"
-        );
-        assert!(
-            matches!(
-                check_args(&["check", "--verbosity=verbose"]).verbosity,
-                DiagnosticVerbosity::Verbose
-            ),
-            "= spelling"
-        );
-
-        let parsed = parse_args_of(&["analyze", "--verbosity", "concise", "/pkg"])
-            .expect("parse")
-            .expect("subcommand");
-        let Command::Analyze(args) = parsed else {
-            panic!("expected analyze command")
-        };
-        assert!(matches!(args.verbosity, DiagnosticVerbosity::Concise));
-    }
-
     #[test]
     fn usage_errors() {
         for args in [
@@ -2653,15 +2331,14 @@ mod tests {
             &["check", "--format=yaml"][..],
             &["check", "--bogus"][..],
             &["check", "-x"][..],
-            &["check", "-v"][..],
-            &["check", "--verbosity", "chatty"][..],
-            &["analyze", "-v", "chatty", "/pkg"][..],
+            &["check", "--format", "machine"][..],
+            &["analyze", "--format", "machine", "/p"][..],
+            &["analyze", "--format", "default", "/p"][..],
             &["frobnicate"][..],
             &["--bogus"][..],
-            // `json` is a legal analyze format (the dartdev oracle's allowed
-            // set is exactly default|json|machine, commands/analyze.dart) —
-            // the invalid-value role these lines pin is `yaml`'s and the
-            // retired `human` spelling's, in both spellings.
+            // The tri-axis is the whole set: lon|json|text. `yaml` is the
+            // invalid-value role; `machine` and `default` are retired
+            // spellings, both rejected.
             &["analyze", "--format", "yaml", "/p"][..],
             &["analyze", "--format=yaml", "/p"][..],
             &["analyze", "--format", "human", "/p"][..],
@@ -2675,10 +2352,9 @@ mod tests {
             &["query", "bogus"][..],
             // `explain` parses bare since the face landed (74e3258a): the
             // symbol slot is optional and the run tier rejects the
-            // no-selector form — the invalid-value role these lines pin is
-            // the report format's (`--format=machine`; json is the only
-            // spelling) and the required changed-file positional of
-            // `impact` (483a6642).
+            // no-selector form — the invalid-value role this line pins is
+            // the retired `machine` spelling of the format axis, and the
+            // required changed-file positional of `impact` (483a6642).
             &["explain", "--format=machine", "Dog"][..],
             &["impact"][..],
         ] {
@@ -2881,42 +2557,46 @@ mod tests {
         assert!(subcommand("complete").get_aliases().any(|alias| alias == "completion"));
     }
 
-    /// The output-format resolution: an absent `--format` falls to the
-    /// terminal's shape — the machine/JSON faces piped (the test harness
-    /// captures stdout, the non-TTY posture) — and an explicit `--format`
-    /// always wins on both faces that carry it.
+    /// The format axis: the default is the constant `lon` on every
+    /// face that carries the flag — no terminal sniffing, no piped flip.
     #[test]
-    fn explicit_format_wins_over_the_non_tty_default() {
-        assert!(non_tty_stdout(), "the harness captures stdout (the piped posture)");
+    fn format_defaults_are_constant_lon() {
         let analyze = |args: &[&str]| match parse_args_of(args) {
             Ok(Some(Command::Analyze(args))) => args,
             _ => panic!("expected analyze command"),
         };
         assert!(
-            matches!(analyze(&["analyze", "/p"]).effective_format(), AnalyzeFormat::Json),
-            "piped with no flag: the machine JSON envelope"
+            matches!(analyze(&["analyze", "/p"]).format, AnalyzeFormat::Lon),
+            "analyze defaults to lon"
         );
-        assert!(matches!(
-            analyze(&["analyze", "--format=machine", "/p"]).effective_format(),
-            AnalyzeFormat::Machine
-        ));
-        assert!(matches!(
-            analyze(&["analyze", "--format=default", "/p"]).effective_format(),
-            AnalyzeFormat::Default
-        ), "the human face stays human even piped");
-
         let symbol = |args: &[&str]| match parse_args_of(args) {
             Ok(Some(Command::Query(QueryArgs { face: QueryFace::Symbol(args) }))) => args,
             _ => panic!("expected query symbol"),
         };
         assert!(
-            matches!(symbol(&["query", "symbol", "X"]).effective_format(), QueryFormat::Json),
-            "piped with no flag: JSON lines"
+            matches!(symbol(&["query", "symbol", "X"]).format, OutputFormat::Lon),
+            "query defaults to lon"
         );
-        assert!(matches!(
-            symbol(&["query", "symbol", "--format=machine", "X"]).effective_format(),
-            QueryFormat::Machine
-        ));
+        let explain = match parse_args_of(&["explain", "Dog"]).expect("parse").expect("subcommand")
+        {
+            Command::Explain(args) => args,
+            _ => panic!("expected explain"),
+        };
+        assert!(matches!(explain.format, OutputFormat::Lon));
+    }
+
+    /// The lon document's diags rows' `file` column, in order (the tests'
+    /// reader for the analyze faces).
+    fn diag_files(out: &[u8]) -> Vec<String> {
+        let text = std::str::from_utf8(out).expect("UTF-8");
+        let document: serde_json::Value =
+            lon::from_str(text.trim_end()).expect("one lon document");
+        document["diags"]
+            .as_array()
+            .expect("diags")
+            .iter()
+            .map(|row| row["file"].as_str().expect("file column").to_owned())
+            .collect()
     }
 
     fn one_diag(severity: Severity) -> Diagnostic {
@@ -2984,8 +2664,7 @@ mod tests {
         fs::write(root.join("override.dart"), "// @dart = 99.9\nvar ok = 1;\n").expect("write");
 
         let args = CheckArgs {
-            format: CheckFormat::Machine,
-            verbosity: DiagnosticVerbosity::Default,
+            format: CheckFormat::Lon,
             metrics_json: None,
             fatal_warnings: false,
             no_fatal_warnings: false,
@@ -3017,8 +2696,7 @@ mod tests {
         fs::write(root.join(".dart_tool/skipme.dart"), "var no = 0;\n").expect("write");
 
         let args = CheckArgs {
-            format: CheckFormat::Machine,
-            verbosity: DiagnosticVerbosity::Default,
+            format: CheckFormat::Lon,
             metrics_json: None,
             fatal_warnings: false,
             no_fatal_warnings: false,
@@ -3031,7 +2709,7 @@ mod tests {
 
         let clean_args = CheckArgs {
             paths: vec![root.join("lib/clean.dart")],
-            format: CheckFormat::Machine,
+            format: CheckFormat::Lon,
             ..args
         };
         assert_eq!(check(&clean_args), exit::CLEAN);
@@ -3057,8 +2735,7 @@ mod tests {
 
         let metrics_path = root.join("metrics.json");
         let args = CheckArgs {
-            format: CheckFormat::Machine,
-            verbosity: DiagnosticVerbosity::Default,
+            format: CheckFormat::Lon,
             metrics_json: Some(metrics_path.clone()),
             fatal_warnings: false,
             no_fatal_warnings: false,
@@ -3157,8 +2834,7 @@ mod tests {
 
         // End to end: the ignored arg parses nothing → empty set, exit 0.
         let args = CheckArgs {
-            format: CheckFormat::Machine,
-            verbosity: DiagnosticVerbosity::Default,
+            format: CheckFormat::Lon,
             metrics_json: None,
             fatal_warnings: false,
             no_fatal_warnings: false,
@@ -3175,10 +2851,10 @@ mod tests {
     // dartq analyze
     // -----------------------------------------------------------------------
 
-    /// The analyze command face: the oracle default-format default over the
-    /// cwd positional, flag spellings (`--format=default|machine|json`,
-    /// `--sdk-path` with the hidden `--sdk` alias, both fatal-warnings
-    /// spellings). Malformed spellings are covered by `usage_errors`.
+    /// The analyze command face: the constant `lon` default over the cwd
+    /// positional, flag spellings (`--format=lon|json|text`, `--sdk-path`
+    /// with the hidden `--sdk` alias, both fatal-warnings spellings).
+    /// Malformed spellings are covered by `usage_errors`.
     #[test]
     fn analyze_args_parse() {
         let parsed = parse_args_of(&["analyze", "/pkg"])
@@ -3188,12 +2864,8 @@ mod tests {
             panic!("expected analyze command")
         };
         assert!(
-            args.format.is_none(),
-            "absent --format resolves by terminal shape (human on a TTY, JSON piped)"
-        );
-        assert!(
-            matches!(args.verbosity, DiagnosticVerbosity::Default),
-            "default verbosity tier"
+            matches!(args.format, AnalyzeFormat::Lon),
+            "lon is the constant default"
         );
         assert!(args.metrics_json.is_none() && args.sdk_path.is_none());
         assert!(args.overlays.is_empty(), "no overlay by default");
@@ -3219,7 +2891,7 @@ mod tests {
 
         let parsed = parse_args_of(&[
             "analyze",
-            "--format=default",
+            "--format=text",
             "--metrics-json",
             "/tmp/m.json",
             "--overlay",
@@ -3241,7 +2913,7 @@ mod tests {
         let Command::Analyze(args) = parsed else {
             panic!("expected analyze command")
         };
-        assert!(matches!(args.format, Some(AnalyzeFormat::Default)));
+        assert!(matches!(args.format, AnalyzeFormat::Text));
         assert_eq!(args.metrics_json, Some(PathBuf::from("/tmp/m.json")));
         assert_eq!(args.sdk_path, Some(PathBuf::from("/sdk")));
         assert_eq!(
@@ -3271,14 +2943,13 @@ mod tests {
             "--trace-events parses and plumbs"
         );
 
-        // The hidden compat aliases: `--sdk` and the machine spelling.
-        let parsed = parse_args_of(&["analyze", "--format=machine", "--sdk", "/sdk", "/pkg"])
+        // The hidden compat alias: `--sdk`.
+        let parsed = parse_args_of(&["analyze", "--sdk", "/sdk", "/pkg"])
             .expect("parse")
             .expect("subcommand");
         let Command::Analyze(args) = parsed else {
             panic!("expected analyze command")
         };
-        assert!(matches!(args.format, Some(AnalyzeFormat::Machine)));
         assert_eq!(args.sdk_path, Some(PathBuf::from("/sdk")));
 
         let parsed = parse_args_of(&["analyze", "--format=json", "/pkg"])
@@ -3288,7 +2959,7 @@ mod tests {
             panic!("expected analyze command")
         };
         assert!(
-            matches!(args.format, Some(AnalyzeFormat::Json)),
+            matches!(args.format, AnalyzeFormat::Json),
             "the json spelling parses"
         );
 
@@ -3424,9 +3095,8 @@ mod tests {
     ) -> AnalyzeArgs {
         AnalyzeArgs {
             targets: vec![root.to_path_buf()],
-            format: Some(format),
+            format,
             fast: false,
-            verbosity: DiagnosticVerbosity::Default,
             metrics_json,
             overlays: Vec::new(),
             sdk_path: Some(root.join("sdk")),
@@ -3449,15 +3119,14 @@ mod tests {
     }
 
     /// End to end over a real temp workspace: engine discovery + analysis,
-    /// oracle machine bytes on stdout, error-tier exit code, metrics JSON at
+    /// the lon document on stdout, error-tier exit code, metrics JSON at
     /// exit.
     ///
-    /// Hand trace against the serial oracle probe (dart 3.13.1, machine) and
-    /// `tests/harness/src/machine.rs` (`parse_machine`): 8 `|`-separated
-    /// fields; `void f() { x }` puts `x` at UTF-16 offset 11 → line 1,
-    /// column 12, length 1 on BOTH rows — the syntax row ("Expected to find
-    /// ';'.") and the semantic row ("Undefined name 'x'.") share the token's
-    /// span and order by the message tie-break.
+    /// Hand trace against the serial oracle probe (dart 3.13.1): `void f()
+    /// { x }` puts `x` at UTF-16 offset 11 → line 1, column 12, length 1 on
+    /// BOTH rows — the syntax row ("Expected to find ';'.") and the semantic
+    /// row ("Undefined name 'x'.") share the token's span and order by the
+    /// message tie-break.
     #[test]
     fn analyze_runs_engine_over_temp_workspace() {
         let root = analyze_fixture(
@@ -3470,20 +3139,32 @@ mod tests {
         let metrics_path = root.join("metrics.json");
         let mut out: Vec<u8> = Vec::new();
         let code = analyze_run(
-            &analyze_args(&root, AnalyzeFormat::Machine, Some(metrics_path.clone())),
+            &analyze_args(&root, AnalyzeFormat::Lon, Some(metrics_path.clone())),
             &mut out,
         );
 
         let broken = root.canonicalize().expect("root").join("lib/broken.dart");
+        let text = String::from_utf8(out).expect("stdout is UTF-8");
+        let document: serde_json::Value =
+            lon::from_str(text.trim_end()).expect("one lon document");
+        assert_eq!(document["v"], 1, "the vocabulary envelope key");
+        let diags = document["diags"].as_array().expect("diags rows");
+        assert_eq!(diags.len(), 2, "the fixture's two oracle rows: {text}");
         assert_eq!(
-            String::from_utf8(out).expect("stdout is UTF-8"),
-            format!(
-                "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{}|1|12|1|Expected to find ';'.\n\
-                 ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{}|1|12|1|Undefined name 'x'.\n",
-                broken.display(),
-                broken.display()
-            ),
-            "oracle machine bytes (emitMachineFormat field order; serial oracle probe)"
+            diags[0],
+            serde_json::json!({
+                "code": "expected_token", "sev": "error",
+                "file": broken.display().to_string(),
+                "line": 1, "col": 12, "len": 1,
+                "msg": "Expected to find ';'.",
+            }),
+            "the flat vocabulary row, message tie-break first"
+        );
+        assert_eq!(diags[1]["code"], "undefined_identifier");
+        assert_eq!(diags[1]["msg"], "Undefined name 'x'.");
+        assert!(
+            diags[1].get("doc").is_some(),
+            "the published code carries the docs URL"
         );
         assert_eq!(code, exit::ERRORS, "any ERROR → 3 (analyze.dart:398)");
 
@@ -3496,58 +3177,6 @@ mod tests {
         assert_eq!(metrics["libraries_from_cache"], 0);
         assert!(metrics["max_rss_bytes"].is_u64(), "getrusage hook wired");
         assert!(metrics["total_ms"].is_u64());
-
-        fs::remove_dir_all(&root).ok();
-    }
-
-    /// The verbosity tiers ride the analyze face end to end: `concise`
-    /// strips each oracle row to its identifying prefix (the message field
-    /// gone), `verbose` extends every default row by exactly one field, and
-    /// the exit tier is untouched by the output volume. (The exact verbose
-    /// ninth-field bytes — correctionMessage vs `-`, escaping included —
-    /// are pinned at the shared renderer's tests in dartq-commands' check
-    /// module.)
-    #[test]
-    fn analyze_verbosity_tiers_thread_the_row_faces() {
-        let root = analyze_fixture("verbosity", &[("lib/broken.dart", "void f() { x }\n")]);
-
-        let mut out: Vec<u8> = Vec::new();
-        let concise = AnalyzeArgs {
-            verbosity: DiagnosticVerbosity::Concise,
-            ..analyze_args(&root, AnalyzeFormat::Machine, None)
-        };
-        assert_eq!(analyze_run(&concise, &mut out), exit::ERRORS);
-        let concise_text = String::from_utf8(out).expect("UTF-8");
-        assert_eq!(
-            concise_text,
-            format!(
-                "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{}|1|12|1\n\
-                 ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{}|1|12|1\n",
-                root.canonicalize()
-                    .expect("root")
-                    .join("lib/broken.dart")
-                    .display(),
-                root.canonicalize()
-                    .expect("root")
-                    .join("lib/broken.dart")
-                    .display()
-            ),
-            "concise rows keep the code + span prefix and drop the message"
-        );
-
-        let mut out: Vec<u8> = Vec::new();
-        let verbose = AnalyzeArgs {
-            verbosity: DiagnosticVerbosity::Verbose,
-            ..analyze_args(&root, AnalyzeFormat::Machine, None)
-        };
-        assert_eq!(analyze_run(&verbose, &mut out), exit::ERRORS);
-        let verbose_text = String::from_utf8(out).expect("UTF-8");
-        for (concise_row, verbose_row) in concise_text.lines().zip(verbose_text.lines()) {
-            assert!(
-                verbose_row.starts_with(&format!("{concise_row}|")),
-                "verbose extends the default row by one field: {verbose_row}"
-            );
-        }
 
         fs::remove_dir_all(&root).ok();
     }
@@ -3673,14 +3302,14 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// The degrade notice's machine-format invariant (#1311): a skewed SDK
-    /// whitelist surfaces the notice on stderr only — the machine rows and
-    /// the JSON envelope (the parity-caliber stdout faces) carry no trace of
-    /// it, and the exit tier ignores the telemetry. The once-per-skew /
+    /// The degrade notice's stdout invariant (#1311): a skewed SDK
+    /// whitelist surfaces the notice on stderr only — the lon document and
+    /// the JSON envelope (the data faces on stdout) carry no trace of it,
+    /// and the exit tier ignores the telemetry. The once-per-skew /
     /// zero-when-clean notice contract itself is pinned at the shared core
     /// (`AnalyzeRun.degrade_notices`, dartq-commands' analyze tests).
     #[test]
-    fn analyze_degrade_notice_stays_off_the_machine_and_json_faces() {
+    fn analyze_degrade_notice_stays_off_the_data_faces() {
         let root = analyze_fixture("degrade", &[("lib/ok.dart", "var ok = 1;\n")]);
         fs::write(
             root.join("sdk/lib/_internal/allowed_experiments.json"),
@@ -3690,14 +3319,14 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(
-            analyze_run(&analyze_args(&root, AnalyzeFormat::Machine, None), &mut out),
+            analyze_run(&analyze_args(&root, AnalyzeFormat::Lon, None), &mut out),
             exit::CLEAN,
             "the telemetry never joins the exit tier"
         );
-        let machine = String::from_utf8(out).expect("UTF-8");
+        let lon = String::from_utf8(out).expect("UTF-8");
         assert!(
-            !machine.contains("note: SDK") && !machine.contains("ExperimentDegrade"),
-            "the machine face stays notice-free: {machine}"
+            !lon.contains("note: SDK") && !lon.contains("ExperimentDegrade"),
+            "the lon face stays notice-free: {lon}"
         );
 
         let mut out: Vec<u8> = Vec::new();
@@ -3717,26 +3346,26 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// Clean set → exit 0 with empty machine output (the oracle empty edge);
-    /// the human clean edge carries no per-file heading (nothing to group)
-    /// and ends in the oracle tail — over the broken fixture both oracle
-    /// rows appear under the one file heading (oracle display order,
-    /// message tie-break within the shared token span) and the tail counts
-    /// both.
+    /// Clean set → exit 0 with the empty lon document; the text clean edge
+    /// carries no per-file heading (nothing to group) and ends in the oracle
+    /// tail — over the broken fixture both oracle rows appear under the one
+    /// file heading (oracle display order, message tie-break within the
+    /// shared token span) and the tail counts both.
     #[test]
-    fn analyze_clean_and_human_faces() {
+    fn analyze_clean_and_text_faces() {
         let root = analyze_fixture("faces", &[("lib/clean.dart", "var ok = 1;\n")]);
 
         let mut out: Vec<u8> = Vec::new();
-        let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Machine, None), &mut out);
+        let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Lon, None), &mut out);
         assert_eq!(code, exit::CLEAN);
-        assert!(
-            out.is_empty(),
-            "machine mode emits nothing for an empty set"
+        assert_eq!(
+            String::from_utf8(out).expect("UTF-8"),
+            "{v:1 diags:[]}\n",
+            "the empty set is the empty document"
         );
 
         let mut out: Vec<u8> = Vec::new();
-        let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Default, None), &mut out);
+        let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Text, None), &mut out);
         assert_eq!(code, exit::CLEAN);
         // The whole oracle clean shape in one pin: no `lib/clean.dart`
         // heading (the oracle prints none on a clean set), no
@@ -3752,7 +3381,7 @@ mod tests {
             analyze_fixture("faces-broken", &[("lib/broken.dart", "void f() { x }\n")]);
         let mut out: Vec<u8> = Vec::new();
         let code = analyze_run(
-            &analyze_args(&broken_root, AnalyzeFormat::Default, None),
+            &analyze_args(&broken_root, AnalyzeFormat::Text, None),
             &mut out,
         );
         assert_eq!(code, exit::ERRORS);
@@ -3766,9 +3395,9 @@ mod tests {
             "file heading: {text}"
         );
         assert!(
-            text.contains("• expected_token • Expected to find ';'.")
-                && text.contains("• undefined_identifier • Undefined name 'x'."),
-            "both oracle rows under the heading, in display order: {text}"
+            text.contains("error expected_token 1:12 Expected to find ';'.")
+                && text.contains("error undefined_identifier 1:12 Undefined name 'x'."),
+            "both rows under the heading in `sev code line:col msg` grammar: {text}"
         );
         assert!(
             text.contains("2 issues found."),
@@ -3779,13 +3408,12 @@ mod tests {
     }
 
     /// The stale-config advisory face (#732): a stale fixture surfaces
-    /// exactly ONE advisory ahead of the diagnostics — on the machine face
-    /// the row rides stderr in the exact 8-field `dartq/*` shape (INFO|TOOL,
-    /// anchored at the config the reasons name), on the default-format face
-    /// the line leads stdout in the face's own grammar — and the advisory
-    /// never joins the per-file set, the metrics count, or the exit tier.
-    /// The fresh side of the contract is pinned by the byte-exact
-    /// faces above (`analyze_clean_and_human_faces` — no advisory row, no
+    /// exactly ONE advisory — the data faces keep it off stdout (the lon
+    /// document is diagnostics only, the `Info • code • message` line rides
+    /// stderr), the text face leads stdout with the same human line — and
+    /// the advisory never joins the per-file set, the metrics count, or the
+    /// exit tier. The fresh side of the contract is pinned by the byte-exact
+    /// faces above (`analyze_clean_and_text_faces` — no advisory row, no
     /// extra human line).
     #[test]
     fn analyze_surfaces_stale_config_advisory_once() {
@@ -3802,60 +3430,45 @@ mod tests {
             .expect("stale config");
         };
 
-        // Machine: the advisory row rides stderr (the oracle machine stream
-        // carries diagnostics only), so stdout carries the oracle rows
-        // alone; the row's own bytes pin through the shared writer against
-        // the assembly's advisory.
+        // The assembly surfaces the advisory at all (the fixture's own
+        // pin — the run below only proves the faces' purity).
         let root = analyze_fixture("stale-machine", &[("lib/broken.dart", "void f() { x }\n")]);
         stale_config(&root);
-        let canonical = root.canonicalize().expect("root");
-        let config = canonical.join(".dart_tool/package_config.json");
-        let broken = canonical.join("lib/broken.dart");
-        let mut out: Vec<u8> = Vec::new();
-        let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Machine, None), &mut out);
-        assert_eq!(
-            String::from_utf8(out).expect("stdout is UTF-8"),
-            format!(
-                "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{}|1|12|1|Expected to find ';'.\n\
-                 ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{}|1|12|1|Undefined name 'x'.\n",
-                broken.display(),
-                broken.display()
-            ),
-            "the oracle bytes only: the advisory never joins the machine stream"
-        );
-        assert_eq!(code, exit::ERRORS, "the advisory never moves the exit tier");
-
         let (_engine, _dir, advisory) = open_engine_with_overrides(
             &root,
             Some(root.join("sdk")).as_deref(),
             &AnalyzeOverrides::default(),
         )
         .expect("assembly surfaces the advisory");
-        let Some(advisory) = advisory else {
-            panic!("the stale fixture assembles an advisory")
-        };
-        let mut err: Vec<u8> = Vec::new();
-        write_stale_advisory_machine(
-            &mut err,
-            Some(&advisory),
-            DiagnosticVerbosity::Default.into_commands(),
-        )
-        .expect("the stderr row writes");
-        assert_eq!(
-            String::from_utf8(err).expect("stderr row is UTF-8"),
-            format!(
-                "INFO|TOOL|DARTQ/PACKAGE_CONFIG_OUT_OF_DATE|{}|1|1|0|{message}\n",
-                config.display()
-            ),
-            "one advisory row in the exact 8-field shape, on the stderr stream"
+        assert!(
+            advisory.is_some(),
+            "the stale fixture assembles an advisory"
         );
 
-        // Default format: the advisory line leads, the issues tail counts
+        // The lon face: stdout is the diags document alone — the advisory
+        // has no row in it (it rides stderr as the Info line).
+        let mut out: Vec<u8> = Vec::new();
+        let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Lon, None), &mut out);
+        let text = String::from_utf8(out).expect("stdout is UTF-8");
+        let document: serde_json::Value =
+            lon::from_str(text.trim_end()).expect("one lon document");
+        assert_eq!(
+            document["diags"].as_array().expect("diags").len(),
+            2,
+            "the oracle rows only: {text}"
+        );
+        assert!(
+            !text.contains("package_config_out_of_date"),
+            "the advisory never joins the lon document: {text}"
+        );
+        assert_eq!(code, exit::ERRORS, "the advisory never moves the exit tier");
+
+        // Text format: the advisory line leads, the issues tail counts
         // rows only.
         let root = analyze_fixture("stale-human", &[("lib/broken.dart", "void f() { x }\n")]);
         stale_config(&root);
         let mut out: Vec<u8> = Vec::new();
-        let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Default, None), &mut out);
+        let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Text, None), &mut out);
         assert_eq!(code, exit::ERRORS);
         let text = String::from_utf8(out).expect("UTF-8");
         let mut lines = text.lines();
@@ -3882,12 +3495,12 @@ mod tests {
     fn analyze_usage_tiers() {
         let root = analyze_fixture("usage", &[("lib/clean.dart", "var ok = 1;\n")]);
 
-        let missing_dir = analyze_args(&root.join("nope"), AnalyzeFormat::Machine, None);
+        let missing_dir = analyze_args(&root.join("nope"), AnalyzeFormat::Lon, None);
         assert_eq!(analyze_run(&missing_dir, &mut Vec::new()), exit::USAGE);
 
         let no_sdk = AnalyzeArgs {
             sdk_path: Some(root.join("no-such-sdk")),
-            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+            ..analyze_args(&root, AnalyzeFormat::Lon, None)
         };
         assert_eq!(analyze_run(&no_sdk, &mut Vec::new()), exit::USAGE);
 
@@ -3934,16 +3547,16 @@ mod tests {
         // three files' rows emit, oracle-ordered, one exit tier.
         let args = AnalyzeArgs {
             targets: vec![lib.clone(), test_file.clone()],
-            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+            ..analyze_args(&root, AnalyzeFormat::Lon, None)
         };
         let mut out: Vec<u8> = Vec::new();
         let code = analyze_run(&args, &mut out);
         assert_eq!(code, exit::ERRORS, "any ERROR → 3");
-        let text = String::from_utf8(out).expect("UTF-8");
+        let files = diag_files(&out);
         for name in ["broken_a.dart", "broken_b.dart", "broken_t.dart"] {
             assert!(
-                text.lines().any(|row| row.contains(name)),
-                "the union covers {name}: {text}"
+                files.iter().any(|file| file.contains(name)),
+                "the union covers {name}: {files:?}"
             );
         }
 
@@ -3952,15 +3565,15 @@ mod tests {
         // file context root).
         let args = AnalyzeArgs {
             targets: vec![test_file.clone()],
-            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+            ..analyze_args(&root, AnalyzeFormat::Lon, None)
         };
         let mut out: Vec<u8> = Vec::new();
         let code = analyze_run(&args, &mut out);
         assert_eq!(code, exit::ERRORS);
-        let text = String::from_utf8(out).expect("UTF-8");
+        let files = diag_files(&out);
         assert!(
-            text.lines().all(|row| row.contains("broken_t.dart")) && !text.is_empty(),
-            "the file target emits its rows alone: {text}"
+            !files.is_empty() && files.iter().all(|file| file.contains("broken_t.dart")),
+            "the file target emits its rows alone: {files:?}"
         );
 
         fs::remove_dir_all(&root).ok();
@@ -3995,17 +3608,17 @@ mod tests {
         );
 
         // The flag is inert off the JSON face (the oracle's printMemory
-        // gate): the machine stream stays byte-identical rows.
+        // gate): the lon document never carries the memory key.
         let args = AnalyzeArgs {
             memory: true,
-            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+            ..analyze_args(&root, AnalyzeFormat::Lon, None)
         };
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(analyze_run(&args, &mut out), exit::ERRORS);
-        let machine = String::from_utf8(out).expect("UTF-8");
+        let lon = String::from_utf8(out).expect("UTF-8");
         assert!(
-            !machine.contains("\"memory\":"),
-            "the machine face never carries the memory key: {machine}"
+            !lon.contains("memory:"),
+            "the lon face never carries the memory key: {lon}"
         );
 
         fs::remove_dir_all(&root).ok();
@@ -4023,7 +3636,7 @@ mod tests {
         let args = AnalyzeArgs {
             targets: vec![root_a.clone(), root_b.clone()],
             overlays: vec!["lib/a.dart=/tmp/x.dart".to_owned()],
-            ..analyze_args(&root_a, AnalyzeFormat::Machine, None)
+            ..analyze_args(&root_a, AnalyzeFormat::Lon, None)
         };
         assert_eq!(
             analyze_run(&args, &mut Vec::new()),
@@ -4037,7 +3650,7 @@ mod tests {
 
     /// No `package_config.json` no longer refuses (#759): the run degrades
     /// to the oracle's `BasicWorkspace` floor — the missing-config advisory
-    /// rides stderr (the machine stream keeps the oracle rows alone), and
+    /// rides stderr (the lon document keeps the oracle rows alone), and
     /// the `package:` import resolves to nothing, producing the same
     /// `uri_does_not_exist` ERROR row the oracle's degraded mode
     /// emits for unknown packages (its no-config runs measure exactly that
@@ -4054,49 +3667,33 @@ mod tests {
         );
         fs::remove_file(root.join(".dart_tool/package_config.json")).ok();
         let canonical = root.canonicalize().expect("root");
-        let config = canonical.join(".dart_tool/package_config.json");
         let main = canonical.join("lib/main.dart");
 
         let mut out: Vec<u8> = Vec::new();
-        let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Machine, None), &mut out);
-        let text = String::from_utf8(out).expect("stdout is UTF-8");
+        let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Lon, None), &mut out);
+        let text = std::str::from_utf8(&out).expect("stdout is UTF-8").to_owned();
         assert!(
-            !text.contains("INFO|TOOL|DARTQ/"),
-            "the advisory never joins the machine stdout: {text}"
+            !text.contains("DARTQ/"),
+            "the advisory never joins the lon stdout: {text}"
         );
+        let files = diag_files(&out);
         assert!(
-            text.lines().any(|line| line.contains("URI_DOES_NOT_EXIST")
-                && line.contains(&main.display().to_string())),
-            "the package: import is unresolved, the oracle's degraded face: {text}"
+            files.iter().any(|file| file == &main.display().to_string()),
+            "the package: import is unresolved, the oracle's degraded face: {files:?}"
         );
         assert_eq!(code, exit::ERRORS);
 
-        // The stderr row's own bytes, pinned through the shared writer
-        // against the assembly's advisory.
+        // The assembly surfaces the advisory (the fixture's own pin — the
+        // run above only proves the document's purity).
         let (_engine, _dir, advisory) = open_engine_with_overrides(
             &root,
             Some(root.join("sdk")).as_deref(),
             &AnalyzeOverrides::default(),
         )
         .expect("assembly surfaces the advisory");
-        let Some(advisory) = advisory else {
-            panic!("the missing-config fixture assembles an advisory")
-        };
-        let mut err: Vec<u8> = Vec::new();
-        write_stale_advisory_machine(
-            &mut err,
-            Some(&advisory),
-            DiagnosticVerbosity::Default.into_commands(),
-        )
-        .expect("the stderr row writes");
-        assert_eq!(
-            String::from_utf8(err).expect("stderr row is UTF-8"),
-            format!(
-                "INFO|TOOL|DARTQ/PACKAGE_CONFIG_MISSING|{}|1|1|0|package_config.json not \
-                 found; run `dart pub get` (analyzing with `package:` imports unresolved)\n",
-                config.display()
-            ),
-            "the missing-config advisory row, on the stderr stream"
+        assert!(
+            advisory.is_some(),
+            "the missing-config fixture assembles an advisory"
         );
 
         fs::remove_dir_all(&root).ok();
@@ -4107,8 +3704,8 @@ mod tests {
     /// file's own directory — still analyzes in the no-package context: the
     /// oracle's `dart analyze <file>` face emits the file's own semantic
     /// rows (SDK types resolve, `package:` URIs would degrade to
-    /// `URI_DOES_NOT_EXIST`) rather than an empty stream. Pin the machine
-    /// stdout's non-empty row set against regression to a zero-row run.
+    /// `URI_DOES_NOT_EXIST`) rather than an empty stream. Pin the lon
+    /// document's non-empty row set against regression to a zero-row run.
     #[test]
     fn analyze_bare_file_target_emits_its_own_rows() {
         let root = analyze_fixture("bare-file", &[("bad.dart", "int x = \"s\";\n")]);
@@ -4121,19 +3718,26 @@ mod tests {
 
         let args = AnalyzeArgs {
             targets: vec![file.clone()],
-            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+            ..analyze_args(&root, AnalyzeFormat::Lon, None)
         };
         let mut out: Vec<u8> = Vec::new();
         let code = analyze_run(&args, &mut out);
         assert_eq!(code, exit::ERRORS, "the file's own ERROR rows → 3");
         let text = String::from_utf8(out).expect("UTF-8");
+        let document: serde_json::Value =
+            lon::from_str(text.trim_end()).expect("one lon document");
+        let rows = document["diags"].as_array().expect("diags");
         assert!(
-            text.lines().any(|row| row.contains("INVALID_ASSIGNMENT")
-                && row.contains(&file.display().to_string())),
+            !rows.is_empty()
+                && rows
+                    .iter()
+                    .any(|row| row["code"] == "invalid_assignment"
+                        && row["file"] == file.display().to_string()),
             "the bare file's own diagnostic emits, never a zero-row run: {text}"
         );
         assert!(
-            text.lines().all(|row| row.contains("bad.dart")),
+            rows.iter()
+                .all(|row| row["file"].as_str().is_some_and(|f| f.contains("bad.dart"))),
             "no sibling or workspace noise joins the file target's set: {text}"
         );
 
@@ -4168,8 +3772,8 @@ mod tests {
 
     /// The `--overlay` face: the analyzed file's content is
     /// replaced by the local file's bytes — a clean overlay fixes the
-    /// broken fixture (exit 0, empty machine output), an overlay carrying
-    /// an error reports it against the analyzed path in exact oracle bytes
+    /// broken fixture (exit 0, the empty lon document), an overlay carrying
+    /// an error reports it against the analyzed path in the lon row shape
     /// (the mirrored postlude's pin), and a missing local file is the usage
     /// tier. The overlay path never rewrites the workspace on disk.
     #[test]
@@ -4190,7 +3794,7 @@ mod tests {
         // Clean overlay: the error is gone.
         let fixed = AnalyzeArgs {
             overlays: vec![format!("{}={}", target.display(), clean.display())],
-            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+            ..analyze_args(&root, AnalyzeFormat::Lon, None)
         };
         assert_eq!(analyze_run(&fixed, &mut Vec::new()), exit::CLEAN);
 
@@ -4201,33 +3805,32 @@ mod tests {
         );
 
         // Broken overlay: the errors surface against the analyzed path in
-        // the oracle machine geometry (engine-canonical → oracle display
-        // order; serial oracle probe on `void g() { y }`: `y` at UTF-16
-        // offset 11 → line 1, column 12, length 1 on BOTH rows — the syntax
-        // row ("Expected to find ';'.") and the semantic row ("Undefined
+        // the lon row shape (engine-canonical → oracle display order;
+        // serial oracle probe on `void g() { y }`: `y` at UTF-16 offset 11
+        // → line 1, column 12, length 1 on BOTH rows — the syntax row
+        // ("Expected to find ';'.") and the semantic row ("Undefined
         // name 'y'.") share the token's span and order by the message
         // tie-break).
         let mut out: Vec<u8> = Vec::new();
         let broken_overlay = AnalyzeArgs {
             overlays: vec![format!("{}={}", target.display(), broken.display())],
-            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+            ..analyze_args(&root, AnalyzeFormat::Lon, None)
         };
         assert_eq!(analyze_run(&broken_overlay, &mut out), exit::ERRORS);
+        let overlay_target = target.canonicalize().expect("root");
         assert_eq!(
-            String::from_utf8(out).expect("stdout is UTF-8"),
-            format!(
-                "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{}|1|12|1|Expected to find ';'.\n\
-                 ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{}|1|12|1|Undefined name 'y'.\n",
-                target.canonicalize().expect("root").display(),
-                target.canonicalize().expect("root").display()
-            ),
-            "the overlay path pins the mirrored oracle sort + writer bytes"
+            diag_files(&out),
+            vec![
+                overlay_target.display().to_string(),
+                overlay_target.display().to_string(),
+            ],
+            "the overlay path pins the mirrored oracle sort (both rows on the              analyzed path, message tie-break order)"
         );
 
         // Relative overlay spec resolves against the package dir.
         let relative = AnalyzeArgs {
             overlays: vec![format!("lib/broken.dart={}", clean.display())],
-            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+            ..analyze_args(&root, AnalyzeFormat::Lon, None)
         };
         assert_eq!(analyze_run(&relative, &mut Vec::new()), exit::CLEAN);
 
@@ -4243,24 +3846,20 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let introduced = AnalyzeArgs {
             overlays: vec![format!("lib/new.dart={}", broken.display())],
-            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+            ..analyze_args(&root, AnalyzeFormat::Lon, None)
         };
         assert_eq!(analyze_run(&introduced, &mut out), exit::ERRORS);
         let canonical = root.canonicalize().expect("root");
         let new_file = canonical.join("lib/new.dart");
         let base_file = canonical.join("lib/broken.dart");
         assert_eq!(
-            String::from_utf8(out).expect("stdout is UTF-8"),
-            format!(
-                "ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{}|1|12|1|Expected to find ';'.\n\
-                 ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{}|1|12|1|Undefined name 'x'.\n\
-                 ERROR|SYNTACTIC_ERROR|EXPECTED_TOKEN|{}|1|12|1|Expected to find ';'.\n\
-                 ERROR|COMPILE_TIME_ERROR|UNDEFINED_IDENTIFIER|{}|1|12|1|Undefined name 'y'.\n",
-                base_file.display(),
-                base_file.display(),
-                new_file.display(),
-                new_file.display()
-            ),
+            diag_files(&out),
+            vec![
+                base_file.display().to_string(),
+                base_file.display().to_string(),
+                new_file.display().to_string(),
+                new_file.display().to_string(),
+            ],
             "the introduced file's rows anchor at the canonical dir-joined path"
         );
 
@@ -4271,14 +3870,14 @@ mod tests {
                 target.display(),
                 root.join("nope").display()
             )],
-            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+            ..analyze_args(&root, AnalyzeFormat::Lon, None)
         };
         assert_eq!(analyze_run(&missing, &mut Vec::new()), exit::USAGE);
 
         // Malformed spec → usage tier.
         let malformed = AnalyzeArgs {
             overlays: vec!["no-equals-sign".to_owned()],
-            ..analyze_args(&root, AnalyzeFormat::Machine, None)
+            ..analyze_args(&root, AnalyzeFormat::Lon, None)
         };
         assert_eq!(analyze_run(&malformed, &mut Vec::new()), exit::USAGE);
 
@@ -4306,8 +3905,8 @@ mod tests {
         assert_eq!(symbol.name, "Foo");
         assert_eq!(symbol.dir, PathBuf::from("."), "default target cwd");
         assert!(
-            symbol.format.is_none(),
-            "absent --format resolves by terminal shape"
+            matches!(symbol.format, OutputFormat::Lon),
+            "lon is the constant default"
         );
         assert!(
             matches!(symbol.verbosity, Verbosity::Compact),
@@ -4332,7 +3931,7 @@ mod tests {
         let QueryFace::Symbol(symbol) = args.face else {
             panic!("expected symbol face")
         };
-        assert!(matches!(symbol.format, Some(QueryFormat::Json)));
+        assert!(matches!(symbol.format, OutputFormat::Json));
         assert_eq!(symbol.sdk, Some(PathBuf::from("/sdk")));
         assert_eq!(symbol.dir, PathBuf::from("/pkg"));
         assert_eq!(symbol.name, "Foo");
@@ -4476,22 +4075,28 @@ mod tests {
         );
     }
 
-    fn symbol_args(root: &Path, format: QueryFormat, name: &str) -> SymbolArgs {
+    fn symbol_args(root: &Path, format: OutputFormat, name: &str) -> SymbolArgs {
         SymbolArgs {
             name: name.to_string(),
             dir: root.to_path_buf(),
-            format: Some(format),
+            format,
             verbosity: Verbosity::Compact,
             sdk: Some(root.join("sdk")),
         }
     }
 
+    /// Decodes one lon line (the tests' reader).
+    fn read_lon(out: &[u8]) -> serde_json::Value {
+        lon::from_str(std::str::from_utf8(out).expect("UTF-8").trim_end())
+            .expect("the lon line decodes")
+    }
+
     /// End to end over a real temp workspace: the class plus its cross-file
-    /// uses (two bare, one import-prefixed) in machine bytes (target file,
-    /// then offset order), a member hit with its container name, the JSON
-    /// face (the `qualified` column: omitted on bare rows, `p.Foo` on the
-    /// prefixed row), the empty-result edge (exit 0, no rows), and the
-    /// usage tier.
+    /// uses (two bare, one import-prefixed) in the lon vocabulary answer
+    /// (`sym`/`decls`/`refs`, the rows' `col`/`len`/`off`/`target`), a
+    /// member hit with its container name, the json face (the `qualified`
+    /// column: omitted on bare rows, `p.Foo` on the prefixed row), the
+    /// empty-result edge (exit 0, the empty arrays), and the usage tier.
     #[test]
     fn query_symbol_end_to_end() {
         let root = analyze_fixture(
@@ -4511,147 +4116,128 @@ mod tests {
                 ),
             ],
         );
-        let a = root.canonicalize().expect("root").join("lib/a.dart");
-        let b = root.canonicalize().expect("root").join("lib/b.dart");
-        let c = root.canonicalize().expect("root").join("lib/c.dart");
-
         // `Foo? f` types a reference; `Foo()` is an implicit-creation
         // invocation; both target a.dart unqualified, use sites in b.dart;
-        // c.dart's `p.Foo()` arrives through the armed `p` prefix. The DECL
-        // rows spell the machine grammar's trailing extras (`-` — the plain
-        // fixture carries no signature face and no annotations).
+        // c.dart's `p.Foo()` arrives through the armed `p` prefix.
         let mut out: Vec<u8> = Vec::new();
-        let code = query_symbol_run(&symbol_args(&root, QueryFormat::Machine, "Foo"), &mut out);
+        let code = query_symbol_run(&symbol_args(&root, OutputFormat::Lon, "Foo"), &mut out);
         assert_eq!(code, exit::CLEAN);
+        let answer = read_lon(&out);
+        assert_eq!(answer["v"], 1);
+        assert_eq!(answer["sym"], "Foo", "the queried name rides sym");
+        assert!(
+            answer.get("name").is_none(),
+            "the long spelling drops at the envelope"
+        );
+        let decls = answer["decls"].as_array().expect("decls");
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0]["kind"], "class");
+        assert_eq!(decls[0]["name"], "Foo");
         assert_eq!(
-            String::from_utf8(out).expect("UTF-8"),
-            format!(
-                "DECL|{}|-|class|Foo|1|7|3|-|-\n\
-                 REF|{}|reference|false|33|3|{}\n\
-                 REF|{}|invoked|false|42|3|{}\n\
-                 REF|{}|invoked|true|43|3|{}\n",
-                a.display(),
-                a.display(),
-                b.display(),
-                a.display(),
-                b.display(),
-                a.display(),
-                c.display()
-            )
+            decls[0]["file"], "package:fixture/a.dart",
+            "the row labels are the package-form references"
+        );
+        assert_eq!(decls[0]["line"], 1);
+        assert_eq!(decls[0]["col"], 7, "column → col");
+        assert_eq!(decls[0]["len"], 3, "length → len");
+        let refs = answer["refs"].as_array().expect("refs");
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0]["kind"], "reference");
+        assert_eq!(
+            refs[0]["target"], "package:fixture/a.dart",
+            "target_file → target"
+        );
+        assert_eq!(refs[0]["file"], "package:fixture/b.dart");
+        assert_eq!(refs[0]["off"], 33, "offset → off");
+        assert_eq!(refs[1]["kind"], "invoked");
+        assert_eq!(refs[1]["off"], 42);
+        assert_eq!(refs[2]["kind"], "invoked");
+        assert_eq!(refs[2]["off"], 43);
+        assert_eq!(refs[2]["qualified"], "p.Foo");
+
+        // A member hit: the container name surfaces, and the `sig` column
+        // spells the element face (the rendered member signature); no uses
+        // → no refs rows, still exit 0.
+        let mut out: Vec<u8> = Vec::new();
+        let code = query_symbol_run(&symbol_args(&root, OutputFormat::Lon, "meth"), &mut out);
+        assert_eq!(code, exit::CLEAN);
+        let answer = read_lon(&out);
+        let decls = answer["decls"].as_array().expect("decls");
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0]["container"], "Foo");
+        assert_eq!(decls[0]["sig"], "void meth()", "signature → sig");
+        assert_eq!(
+            answer["refs"].as_array().expect("refs").len(),
+            0,
+            "no uses → no rows"
         );
 
-        // A member hit: the container name surfaces, and the signature
-        // column spells the element face (the rendered member signature);
-        // no uses → no REF rows, still exit 0.
+        // JSON face: one object, the same short-vocabulary fields the lon
+        // face prints (the file labels are the stable package-form
+        // references, #1556's grammar).
         let mut out: Vec<u8> = Vec::new();
-        let code = query_symbol_run(&symbol_args(&root, QueryFormat::Machine, "meth"), &mut out);
-        assert_eq!(code, exit::CLEAN);
-        assert_eq!(
-            String::from_utf8(out).expect("UTF-8"),
-            format!("DECL|{}|Foo|method|meth|2|8|4|void meth()|-\n", a.display())
-        );
-
-        // JSON face: one object, snake_case fields mirroring the rows. The
-        // file labels are the stable package-form references (#1556's
-        // grammar: lib files project, the machine face keeps canonical).
-        let mut out: Vec<u8> = Vec::new();
-        let code = query_symbol_run(&symbol_args(&root, QueryFormat::Json, "Foo"), &mut out);
+        let code = query_symbol_run(&symbol_args(&root, OutputFormat::Json, "Foo"), &mut out);
         assert_eq!(code, exit::CLEAN);
         let json: serde_json::Value =
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
-        assert_eq!(json["name"], "Foo");
-        assert_eq!(json["declarations"][0]["kind"], "class");
-        assert_eq!(json["declarations"][0]["name"], "Foo");
-        assert!(json["declarations"][0]["container"].is_null());
-        assert_eq!(json["declarations"][0]["file"], "package:fixture/a.dart");
-        assert_eq!(json["declarations"][0]["line"], 1);
-        assert_eq!(json["declarations"][0]["column"], 7);
-        assert_eq!(json["references"].as_array().expect("array").len(), 3);
-        assert_eq!(json["references"][0]["kind"], "reference");
-        assert_eq!(
-            json["references"][0]["target_file"],
-            "package:fixture/a.dart"
-        );
-        assert_eq!(json["references"][0]["file"], "package:fixture/b.dart");
-        // The qualified-name column rides armed-prefix rows only: bare rows
-        // keep the key omitted (the schema's optional string), the prefixed
-        // `p.Foo()` row carries the exact spelling.
-        assert!(json["references"][0].get("qualified").is_none());
-        assert_eq!(json["references"][0]["offset"], 33);
-        assert_eq!(json["references"][1]["kind"], "invoked");
-        assert_eq!(json["references"][1]["offset"], 42);
-        assert!(json["references"][1].get("qualified").is_none());
-        assert_eq!(json["references"][2]["kind"], "invoked");
-        assert_eq!(json["references"][2]["offset"], 43);
-        assert_eq!(json["references"][2]["qualified"], "p.Foo");
+        assert_eq!(json["sym"], "Foo");
+        assert_eq!(json["v"], 1);
+        assert_eq!(json["decls"][0]["kind"], "class");
+        assert_eq!(json["decls"][0]["file"], "package:fixture/a.dart");
+        assert_eq!(json["decls"][0]["col"], 7);
+        assert_eq!(json["refs"].as_array().expect("array").len(), 3);
+        assert_eq!(json["refs"][0]["kind"], "reference");
+        assert_eq!(json["refs"][0]["target"], "package:fixture/a.dart");
+        assert_eq!(json["refs"][0]["file"], "package:fixture/b.dart");
+        assert!(json["refs"][0].get("qualified").is_none());
+        assert_eq!(json["refs"][0]["off"], 33);
+        assert_eq!(json["refs"][2]["qualified"], "p.Foo");
 
-        // The minimal tier: the machine rows keep the red line only — the
-        // container and extras columns drop from DECL, `explicit` drops
-        // from REF (the qualified spelling's machine twin) — and the JSON
-        // envelope trims to the locators (the canonical tables' query
-        // rows).
+        // The minimal tier on the lon face: the locators stay, the
+        // convenience fields drop (container/sig on decls; the json face
+        // trims its own way, pinned by the frozen contract).
         let mut out: Vec<u8> = Vec::new();
         let args = SymbolArgs {
             verbosity: Verbosity::Minimal,
-            ..symbol_args(&root, QueryFormat::Machine, "Foo")
+            ..symbol_args(&root, OutputFormat::Lon, "Foo")
         };
         assert_eq!(query_symbol_run(&args, &mut out), exit::CLEAN);
-        assert_eq!(
-            String::from_utf8(out).expect("UTF-8"),
-            format!(
-                "DECL|{}|class|Foo|1|7|3\n\
-                 REF|{}|reference|33|3|{}\n\
-                 REF|{}|invoked|42|3|{}\n\
-                 REF|{}|invoked|43|3|{}\n",
-                a.display(),
-                a.display(),
-                b.display(),
-                a.display(),
-                b.display(),
-                a.display(),
-                c.display()
-            )
-        );
-        let mut out: Vec<u8> = Vec::new();
-        let args = SymbolArgs {
-            verbosity: Verbosity::Minimal,
-            ..symbol_args(&root, QueryFormat::Json, "Foo")
-        };
-        assert_eq!(query_symbol_run(&args, &mut out), exit::CLEAN);
-        let json: serde_json::Value =
-            serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
-        let decl = &json["declarations"][0];
+        let answer = read_lon(&out);
+        let decl = &answer["decls"][0];
         assert_eq!(decl["file"], "package:fixture/a.dart", "the locator stays");
         assert!(decl.get("container").is_none(), "the convenience drops");
+        assert!(decl.get("sig").is_none());
         assert!(
-            json["references"]
+            answer["refs"]
                 .as_array()
                 .expect("array")
                 .iter()
                 .all(|row| row.get("qualified").is_none() && row.get("file").is_none()),
-            "minimal reference rows keep target/kind/offset/length only"
+            "minimal reference rows keep target/kind/off/len only"
         );
 
-        // Zero results: exit 0, machine prints the empty set.
+        // Zero results: exit 0, the empty arrays print.
         let mut out: Vec<u8> = Vec::new();
-        let code = query_symbol_run(&symbol_args(&root, QueryFormat::Machine, "Nope"), &mut out);
+        let code = query_symbol_run(&symbol_args(&root, OutputFormat::Lon, "Nope"), &mut out);
         assert_eq!(code, exit::CLEAN);
-        assert!(out.is_empty(), "no rows for a miss");
+        let answer = read_lon(&out);
+        assert_eq!(answer["sym"], "Nope");
+        assert_eq!(answer["decls"], serde_json::json!([]));
 
         // Usage tier: missing directory.
-        let missing = symbol_args(&root.join("nope"), QueryFormat::Machine, "Foo");
+        let missing = symbol_args(&root.join("nope"), OutputFormat::Lon, "Foo");
         assert_eq!(query_symbol_run(&missing, &mut Vec::new()), exit::USAGE);
 
         fs::remove_dir_all(&root).ok();
     }
 
     /// The references/callers faces end to end over the symbol test's
-    /// fixture: `references` serves the symbol answer's rows byte-for-byte;
-    /// `callers` keeps only the `invoked` rows (the `Foo()` constructor
-    /// site at UTF-16 offset 41, the `foo()` call at 50) while the
-    /// declaration rows stay for target identity; a declaration with no
-    /// invocations prints its DECL row and no REF rows; the JSON envelope is
-    /// the frozen v1 shape.
+    /// fixture: `references` serves the symbol answer's rows
+    /// value-for-value; `callers` keeps only the `invoked` rows (the
+    /// `Foo()` constructor site at UTF-16 offset 41, the `foo()` call at
+    /// 50) while the declaration rows stay for target identity; a
+    /// declaration with no invocations prints its decls row and no refs
+    /// rows; the json envelope is the frozen v1 shape.
     #[test]
     fn query_references_and_callers_end_to_end() {
         let root = analyze_fixture(
@@ -4667,30 +4253,25 @@ mod tests {
                 ),
             ],
         );
-        let a = root.canonicalize().expect("root").join("lib/a.dart");
-        let b = root.canonicalize().expect("root").join("lib/b.dart");
 
         // references == symbol rows (the index's reference surface is
         // name-keyed and already kinded).
         let mut symbol_out: Vec<u8> = Vec::new();
         assert_eq!(
-            query_symbol_run(
-                &symbol_args(&root, QueryFormat::Machine, "Foo"),
-                &mut symbol_out
-            ),
+            query_symbol_run(&symbol_args(&root, OutputFormat::Lon, "Foo"), &mut symbol_out),
             exit::CLEAN
         );
         let mut references_out: Vec<u8> = Vec::new();
         assert_eq!(
             query_references_run(
-                &symbol_args(&root, QueryFormat::Machine, "Foo"),
+                &symbol_args(&root, OutputFormat::Lon, "Foo"),
                 &mut references_out
             ),
             exit::CLEAN
         );
         assert_eq!(
-            String::from_utf8(symbol_out).expect("UTF-8"),
-            String::from_utf8(references_out).expect("UTF-8"),
+            read_lon(&symbol_out),
+            read_lon(&references_out),
             "the references spelling serves the symbol rows"
         );
 
@@ -4698,69 +4279,66 @@ mod tests {
         // reference site).
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(
-            query_callers_run(&symbol_args(&root, QueryFormat::Machine, "Foo"), &mut out),
+            query_callers_run(&symbol_args(&root, OutputFormat::Lon, "Foo"), &mut out),
             exit::CLEAN
         );
+        let answer = read_lon(&out);
         assert_eq!(
-            String::from_utf8(out).expect("UTF-8"),
-            format!(
-                "DECL|{}|-|class|Foo|1|7|3|-|-\nREF|{}|invoked|false|41|3|{}\n",
-                a.display(),
-                a.display(),
-                b.display()
-            )
+            answer["decls"].as_array().expect("decls").len(),
+            1,
+            "the declaration rows stay for target identity"
         );
+        let refs = answer["refs"].as_array().expect("refs");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0]["kind"], "invoked");
+        assert_eq!(refs[0]["off"], 41);
+        assert_eq!(refs[0]["target"], "package:fixture/a.dart");
 
         // callers foo: the one call site. The top-level function carries
-        // its own signature face in the trailing column.
+        // its own signature face.
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(
-            query_callers_run(&symbol_args(&root, QueryFormat::Machine, "foo"), &mut out),
+            query_callers_run(&symbol_args(&root, OutputFormat::Lon, "foo"), &mut out),
             exit::CLEAN
         );
-        assert_eq!(
-            String::from_utf8(out).expect("UTF-8"),
-            // The DECL grammar closes at the annotations column — 10 fields,
-            // 9 separators, no trailing one; the one shared machine writer
-            // serves every query face alike.
-            format!(
-                "DECL|{}|-|function|foo|4|6|3|void foo()|-\nREF|{}|invoked|false|50|3|{}\n",
-                a.display(),
-                a.display(),
-                b.display()
-            )
-        );
+        let answer = read_lon(&out);
+        let decls = answer["decls"].as_array().expect("decls");
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0]["kind"], "function");
+        assert_eq!(decls[0]["sig"], "void foo()", "the element-face signature");
+        let refs = answer["refs"].as_array().expect("refs");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0]["off"], 50);
 
-        // callers meth: declared, never invoked — DECL row, no REF rows.
+        // callers meth: declared, never invoked — decls row, no refs rows.
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(
-            query_callers_run(&symbol_args(&root, QueryFormat::Machine, "meth"), &mut out),
+            query_callers_run(&symbol_args(&root, OutputFormat::Lon, "meth"), &mut out),
             exit::CLEAN
         );
-        assert_eq!(
-            String::from_utf8(out).expect("UTF-8"),
-            format!("DECL|{}|Foo|method|meth|2|8|4|void meth()|-\n", a.display())
-        );
+        let answer = read_lon(&out);
+        assert_eq!(answer["decls"].as_array().expect("decls").len(), 1);
+        assert_eq!(answer["refs"].as_array().expect("refs").len(), 0);
 
-        // callers JSON: the frozen v1 envelope with the filtered references.
+        // Callers json: the same envelope with the filtered references.
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(
-            query_callers_run(&symbol_args(&root, QueryFormat::Json, "Foo"), &mut out),
+            query_callers_run(&symbol_args(&root, OutputFormat::Json, "Foo"), &mut out),
             exit::CLEAN
         );
         let json: serde_json::Value =
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
-        assert_eq!(json["schema_version"], 1);
-        assert_eq!(json["name"], "Foo");
-        assert_eq!(json["declarations"].as_array().expect("array").len(), 1);
-        let refs = json["references"].as_array().expect("array");
+        assert_eq!(json["v"], 1);
+        assert_eq!(json["sym"], "Foo");
+        assert_eq!(json["decls"].as_array().expect("array").len(), 1);
+        let refs = json["refs"].as_array().expect("array");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0]["kind"], "invoked");
-        assert_eq!(refs[0]["offset"], 41);
-        assert_eq!(refs[0]["target_file"], "package:fixture/a.dart");
+        assert_eq!(refs[0]["off"], 41);
+        assert_eq!(refs[0]["target"], "package:fixture/a.dart");
 
         // Usage tier: missing directory.
-        let missing = symbol_args(&root.join("nope"), QueryFormat::Machine, "Foo");
+        let missing = symbol_args(&root.join("nope"), OutputFormat::Lon, "Foo");
         assert_eq!(query_callers_run(&missing, &mut Vec::new()), exit::USAGE);
 
         fs::remove_dir_all(&root).ok();
@@ -4786,7 +4364,7 @@ mod tests {
         assert!(args.file.is_none());
         assert_eq!(args.dir, PathBuf::from("."), "default target cwd");
         assert!(args.sdk.is_none());
-        assert!(matches!(args.format, ExplainFormat::Json), "json default");
+        assert!(matches!(args.format, OutputFormat::Lon), "lon default");
         assert!(
             matches!(args.verbosity, Verbosity::Compact),
             "compact default"
@@ -4811,7 +4389,7 @@ mod tests {
         assert_eq!(args.dir, PathBuf::from("/pkg"));
         assert_eq!(args.sdk, Some(PathBuf::from("/sdk")));
         assert!(matches!(args.verbosity, Verbosity::Full), "-v full parses");
-        assert!(matches!(args.format, ExplainFormat::Json));
+        assert!(matches!(args.format, OutputFormat::Json));
 
         let parsed = parse_args_of(&["explain", "--verbosity", "minimal", "Dog"])
             .expect("parse")
@@ -4927,7 +4505,7 @@ mod tests {
             diagnostic: None,
             file: None,
             dir: root.to_path_buf(),
-            format: ExplainFormat::Json,
+            format: OutputFormat::Json,
             sdk: Some(root.join("sdk")),
             verbosity,
         }
@@ -4971,22 +4549,20 @@ mod tests {
         );
         let json: serde_json::Value =
             serde_json::from_str(line.trim_end()).expect("the report parses");
-        assert_eq!(json["schema_version"], 1);
-        assert_eq!(json["symbol"], "Dog");
+        assert_eq!(json["v"], 1);
+        assert_eq!(json["sym"], "Dog");
         assert_eq!(
             json["declaration"],
             serde_json::json!({
                 "file": dog,
                 "name": "Dog",
                 "kind": "class",
-                "range": [
-                    explain_offset(EXPLAIN_DOG, "Dog"),
-                    explain_offset(EXPLAIN_DOG, "Dog") + 3,
-                ],
+                "off": explain_offset(EXPLAIN_DOG, "Dog"),
+                "len": 3,
             })
         );
         assert_eq!(
-            json["inheritance"],
+            json["bases"],
             serde_json::json!([{ "name": "Animal", "file": animal, "clause": "extends" }])
         );
         assert_eq!(
@@ -4994,28 +4570,23 @@ mod tests {
             serde_json::json!([{
                 "name": "bark",
                 "kind": "method",
-                "range": [
-                    explain_offset(EXPLAIN_DOG, "bark"),
-                    explain_offset(EXPLAIN_DOG, "bark") + 4,
-                ],
+                "off": explain_offset(EXPLAIN_DOG, "bark"),
+                "len": 4,
             }])
         );
-        let references = json["references"].as_array().expect("references");
-        assert_eq!(references.len(), 2, "the main use plus the test use");
+        let refs = json["refs"].as_array().expect("refs");
+        assert_eq!(refs.len(), 2, "the main use plus the test use");
         // Row order keys on the projected label (`package:fixture/main.dart`
         // vs the test tree's canonical path): `/` sorts before `p`, the same
         // posture the impact face pins over this fixture shape.
-        assert_eq!(references[0]["file"], dog_test);
-        assert_eq!(references[0]["kind"], "invoked");
-        assert_eq!(references[1]["file"], main);
+        assert_eq!(refs[0]["file"], dog_test);
+        assert_eq!(refs[0]["kind"], "invoked");
+        assert_eq!(refs[1]["file"], main);
         assert_eq!(
-            json["dependencies"],
+            json["deps"],
             serde_json::json!([{ "path": dog_test }, { "path": main }])
         );
-        assert_eq!(
-            json["affected_tests"],
-            serde_json::json!([{ "path": dog_test }])
-        );
+        assert_eq!(json["tests"], serde_json::json!([{ "path": dog_test }]));
 
         // Minimal: the declaration locators stay, the arrays swap for counts.
         let mut out: Vec<u8> = Vec::new();
@@ -5026,9 +4597,9 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
         assert_eq!(json["declaration"]["name"], "Dog", "the red line stays");
-        assert!(json.get("references").is_none(), "arrays drop");
-        assert_eq!(json["counts"]["references"], 2);
-        assert_eq!(json["counts"]["affected_tests"], 1);
+        assert!(json.get("refs").is_none(), "arrays drop");
+        assert_eq!(json["counts"]["refs"], 2);
+        assert_eq!(json["counts"]["tests"], 1);
 
         // Unknown symbol: the empty seam report, printed as-is at exit 0.
         let mut out: Vec<u8> = Vec::new();
@@ -5038,9 +4609,9 @@ mod tests {
         );
         let json: serde_json::Value =
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
-        assert_eq!(json["symbol"], "Nope");
+        assert_eq!(json["sym"], "Nope");
         assert!(json.get("declaration").is_none());
-        assert_eq!(json["references"], serde_json::json!([]));
+        assert_eq!(json["refs"], serde_json::json!([]));
 
         // Usage tier: a missing directory.
         let missing = explain_args(&root.join("nope"), Verbosity::Compact, "Dog");
@@ -5067,7 +4638,7 @@ mod tests {
             diagnostic: Some("unused_import".to_owned()),
             file: None,
             dir: root.to_path_buf(),
-            format: ExplainFormat::Json,
+            format: OutputFormat::Json,
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
         };
@@ -5078,7 +4649,7 @@ mod tests {
         // The report is born schema-valid inside `explain_diagnostic`
         // (the producing tier rides the gate); the assertions pin the
         // sections the tier promises.
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["v"], 1);
         assert_eq!(json["diagnostic"]["code"], "unused_import");
         assert_eq!(json["diagnostic"]["file"], file);
         assert_eq!(json["why"]["trigger_kind"], "unused-family");

@@ -47,6 +47,11 @@ pub(crate) struct RenameArgs {
     /// writing.
     #[arg(long)]
     pub(crate) write: bool,
+    /// Output format: `lon` (the default) or `json` (both the same
+    /// document — `new_name`, the edit rows' `off`/`len`), or `text`
+    /// (the indented document; a write operation has no prose face).
+    #[arg(long, value_enum, default_value_t = crate::OutputFormat::Lon)]
+    pub(crate) format: crate::OutputFormat,
     /// Package directory holding pubspec.yaml and
     /// `.dart_tool/package_config.json`; defaults to the current directory.
     #[arg(default_value = ".")]
@@ -146,7 +151,12 @@ fn run(args: &RenameArgs, out: &mut impl Write) -> u8 {
     }
 
     let document = rename::to_json(&plan, &args.new_name);
-    let written = writeln!(out, "{document}").and_then(|()| out.flush());
+    let written = match args.format {
+        crate::OutputFormat::Json => writeln!(out, "{document}"),
+        crate::OutputFormat::Lon => crate::output::write_lon(out, &document),
+        crate::OutputFormat::Text => crate::output::write_text_value(out, &document),
+    }
+    .and_then(|()| out.flush());
     if let Err(error) = written {
         eprintln!("dartq: internal error: writing the rename document failed: {error}");
         return exit::INTERNAL_ERROR;
@@ -327,9 +337,9 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(run(&args, &mut out), exit::CLEAN);
         let document = String::from_utf8(out).expect("utf-8");
-        assert!(document.contains("\"new_name\":\"gb\""), "{document}");
-        assert!(document.contains("\"name\":\"fa\""), "{document}");
-        assert!(document.contains("\"edits\":[{"), "{document}");
+        assert!(document.contains("new_name:gb"), "{document}");
+        assert!(document.contains("name:fa"), "{document}");
+        assert!(document.contains("edits:["), "{document}");
         assert!(
             document.contains(target.display().to_string().as_str())
                 && document.contains("lib/b.dart"),
@@ -360,7 +370,7 @@ mod tests {
         assert!(
             String::from_utf8(out)
                 .expect("utf-8")
-                .contains("\"new_name\":\"gb\""),
+                .contains("new_name:gb"),
             "the document prints as the record of the write"
         );
 

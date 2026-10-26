@@ -416,10 +416,10 @@ pub fn to_json(run: &RenameRun<'_>, new_name: &str) -> Value {
             "kind": crate::query::decl_kind_name(target.kind),
             "name": target.name,
             "container": target.container,
-            "offset": target.range.offset,
-            "length": target.range.length,
+            "off": target.range.offset,
+            "len": target.range.length,
             "line": line,
-            "column": column,
+            "col": column,
         })
     });
     let edits = run
@@ -429,15 +429,15 @@ pub fn to_json(run: &RenameRun<'_>, new_name: &str) -> Value {
             let (line, column) = run.layout.line_col(edit.file, edit.range.offset);
             json!({
                 "file": run.layout.file_path(edit.file).to_string_lossy(),
-                "offset": edit.range.offset,
-                "length": edit.range.length,
+                "off": edit.range.offset,
+                "len": edit.range.length,
                 "line": line,
-                "column": column,
+                "col": column,
             })
         })
         .collect::<Vec<_>>();
     json!({
-        "schema_version": crate::SCHEMA_VERSION,
+        "v": crate::SCHEMA_VERSION,
         "new_name": new_name,
         "target": target,
         "edits": edits,
@@ -523,7 +523,7 @@ mod tests {
         }
 
         let json = to_json(&run, "gb");
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["v"], 1);
         assert_eq!(json["new_name"], "gb");
         assert_eq!(json["target"]["name"], "fa");
         assert_eq!(json["target"]["line"], 1);

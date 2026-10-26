@@ -505,11 +505,11 @@ release: [bench] five-axis evidence plan (the bench-readiness ledger) — serial
       --corpus-dir tests/corpus/m0 \\
       --manifest target/evidence/bench/incremental-manifest.json \\
       --metric rss-100k --metric incremental-p95 --metric token-cost --metric cold \\
-      --dartq-cmd "./target/release/dartq check --format=machine" \\
+      --dartq-cmd "./target/release/dartq check --format=json" \\
       --oracle-dart "\$HOME/fvm/default/bin/dart" \\
       --with-oracle --out target/evidence/bench-<fresh-label>
   axis 4 cold (milestone provenance, mega-r1 oracle leg incl. the A7 cold pair; release face + --strict, the serial-gates #1145 shape):
-    rss_cmd.sh mega1 12582912 env DARTQ_CMD="./target/release/dartq analyze --format=machine --sdk $SDK_ROOT" \\
+    rss_cmd.sh mega1 12582912 env DARTQ_CMD="./target/release/dartq analyze --format=json --sdk $SDK_ROOT" \\
       scripts/mega-run.sh --scale 1k --oracle-leg --strict --label $mega_label
   axis 2 resident arm:
     rss_cmd.sh cargobench 4294967296 cargo bench -p dartq-engine --bench incremental_p95
@@ -530,7 +530,7 @@ EOF
     # (debug) face stays untouched for any other invocation.
     [ -x ./target/release/dartq ] || die "./target/release/dartq not found — the A7 cold leg drives the release face; run --phase build first."
     run_guarded bench-mega 12582912 3600 \
-        env DARTQ_CMD="./target/release/dartq analyze --format=machine --sdk $SDK_ROOT" \
+        env DARTQ_CMD="./target/release/dartq analyze --format=json --sdk $SDK_ROOT" \
         scripts/mega-run.sh --scale 1k --oracle-leg --strict --label "$mega_label" || {
         echo "release: FAIL bench (mega-run $mega_label) — see target/evidence/mega/$mega_label and /tmp/serial_bench-mega.log" >&2
         return 1

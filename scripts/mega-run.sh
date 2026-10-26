@@ -108,7 +108,7 @@
 #                   edit-manifest.json.
 #
 # Environment overrides: DARTQ_CMD (the dartq side; default
-# `./target/debug/dartq analyze --format=machine --sdk <fvm default
+# `./target/debug/dartq analyze --format=json --sdk <fvm default
 # dart-sdk>`, the m1-gate shape), FVM_HOME (default ~/fvm; the leg needs
 # its dart binary as the oracle), DARTQ_HARNESS_ORACLE_TIMEOUT_MS
 # (forwarded to the harness drivers; default raised to 600000 here — a
@@ -316,7 +316,7 @@ dart_bin="$sdk_root/bin/dart"
 if dart_dir="$(cd "$(dirname "$dart_bin")" 2>/dev/null && pwd -P)"; then
   dart_bin="$dart_dir/dart"
 fi
-DEFAULT_DARTQ_CMD="./target/debug/dartq analyze --format=machine --sdk $sdk_root"
+DEFAULT_DARTQ_CMD="./target/debug/dartq analyze --format=json --sdk $sdk_root"
 DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
 if [ "$DARTQ_CMD" = "$DEFAULT_DARTQ_CMD" ] && [ ! -x "./target/debug/dartq" ]; then
   die "./target/debug/dartq not found — build it first: cargo build -p dartq-cli (or set DARTQ_CMD=<cmd>)"

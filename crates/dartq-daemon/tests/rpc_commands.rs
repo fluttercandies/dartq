@@ -4,7 +4,7 @@
 //! implementation in `dartq-commands`, so the comparison runs the command
 //! core directly and renders it through the CLI's oracle-exact writers).
 //! Also covers cancellation through the epoch machinery, the verbosity red
-//! line, and the `schema_version` stamp. No network, no dart SDK.
+//! line, and the version stamp. No network, no dart SDK.
 
 mod common;
 
@@ -16,6 +16,7 @@ use common::{
     store_root,
 };
 use dartq_commands::discover::discover;
+use dartq_schema::SCHEMA_VERSION_IMPACT;
 use serde_json::{Value, json};
 
 /// `Workspace::new` pins one pid-derived temp root; the tests in this
@@ -66,14 +67,13 @@ fn machine_face_rows(
             let fields: Vec<&str> = line.splitn(8, '|').collect();
             assert_eq!(fields.len(), 8, "machine line: {line}");
             json!({
-                "severity": fields[0],
-                "type": fields[1],
                 "code": fields[2].to_lowercase(),
+                "sev": fields[0].to_lowercase(),
                 "file": fields[3],
                 "line": fields[4].parse::<u32>().expect("line"),
-                "column": fields[5].parse::<u32>().expect("column"),
-                "length": fields[6].parse::<u32>().expect("length"),
-                "message": fields[7],
+                "col": fields[5].parse::<u32>().expect("column"),
+                "len": fields[6].parse::<u32>().expect("length"),
+                "msg": fields[7],
             })
         })
         .collect()
@@ -99,7 +99,7 @@ fn seeded_query_workspace() -> Workspace {
 
 /// dartq/check vs the CLI machine face: the RPC rows equal the core
 /// diagnostics rendered through the oracle-exact writer, field for field,
-/// under the frozen `schema_version` stamp.
+/// under the `v` stamp.
 #[test]
 fn dartq_check_matches_the_cli_machine_face() {
     let _guard = workspace_lock();
@@ -115,7 +115,7 @@ fn dartq_check_matches_the_cli_machine_face() {
         1,
     );
     let result = answer_result(&h, 2);
-    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["v"], 1);
 
     // The CLI face: the same core through the machine writer.
     let files = discover(&[workspace.path("lib")]).expect("discover");
@@ -127,7 +127,7 @@ fn dartq_check_matches_the_cli_machine_face() {
         "the broken fixture carries diagnostics"
     );
     assert_eq!(
-        result["diagnostics"],
+        result["diags"],
         json!(expected),
         "the RPC rows equal the CLI machine rows"
     );
@@ -146,8 +146,8 @@ fn dartq_analyze_matches_the_cli_machine_face() {
 
     h.step(&request(2, "dartq/analyze", json!({})), 1);
     let result = answer_result(&h, 2);
-    assert_eq!(result["schema_version"], 1);
-    let entries = result["diagnostics"].as_array().expect("entries");
+    assert_eq!(result["v"], 1);
+    let entries = result["diags"].as_array().expect("entries");
     assert!(!entries.is_empty(), "the broken fixture has diagnostics");
 
     // The CLI face: a fresh engine over the same workspace.
@@ -160,19 +160,12 @@ fn dartq_analyze_matches_the_cli_machine_face() {
     assert_eq!(entries.len(), expected.len(), "one entry per machine row");
     for (entry, row) in entries.iter().zip(&expected) {
         let path = std::path::Path::new(row["file"].as_str().expect("file"));
-        assert_eq!(entry["uri"], dartq_daemon::uri::from_path(path));
+        assert_eq!(entry["file"], dartq_daemon::uri::from_path(path));
         assert_eq!(entry["code"], row["code"]);
-        assert_eq!(entry["message"], row["message"]);
-        assert_eq!(
-            entry["range"]["start"]["line"],
-            row["line"].as_u64().expect("line") - 1,
-            "wire positions are zero-based"
-        );
-        assert_eq!(
-            entry["range"]["start"]["character"],
-            row["column"].as_u64().expect("column") - 1
-        );
-        assert_eq!(entry["severity"], 1, "the fixture row is an error");
+        assert_eq!(entry["msg"], row["msg"]);
+        assert_eq!(entry["line"], row["line"], "rows are 1-based");
+        assert_eq!(entry["col"], row["col"], "rows are 1-based");
+        assert_eq!(entry["sev"], "error", "the fixture row is an error");
     }
 
     let (code, _) = h.join_ended();
@@ -190,41 +183,41 @@ fn dartq_query_equals_the_cli_json_face() {
 
     h.step(&request(2, "dartq/query", json!({ "name": "Foo" })), 1);
     let result = answer_result(&h, 2);
-    assert_eq!(result["schema_version"], 1);
-    assert_eq!(result["name"], "Foo");
+    assert_eq!(result["v"], 1);
+    assert_eq!(result["sym"], "Foo");
 
-    let declarations = result["declarations"].as_array().expect("declarations");
-    assert_eq!(declarations.len(), 1);
+    let decls = result["decls"].as_array().expect("decls");
+    assert_eq!(decls.len(), 1);
     assert_eq!(
-        declarations[0]["file"], "package:fixture/a.dart",
+        decls[0]["file"], "package:fixture/a.dart",
         "the stable package-form label (the shared shaper's projection)"
     );
-    assert_eq!(declarations[0]["kind"], "class");
-    assert_eq!(declarations[0]["name"], "Foo");
+    assert_eq!(decls[0]["kind"], "class");
+    assert_eq!(decls[0]["name"], "Foo");
     assert!(
-        declarations[0].get("container").is_none(),
+        decls[0].get("container").is_none(),
         "a top-level row omits the container key (the omission rule): {row}",
-        row = &declarations[0]
+        row = &decls[0]
     );
-    assert_eq!(declarations[0]["line"], 1);
-    assert_eq!(declarations[0]["column"], 7);
-    assert_eq!(declarations[0]["length"], 3);
+    assert_eq!(decls[0]["line"], 1);
+    assert_eq!(decls[0]["col"], 7);
+    assert_eq!(decls[0]["len"], 3);
 
-    let references = result["references"].as_array().expect("references");
-    assert_eq!(references.len(), 2, "the type use plus the invocation");
-    assert_eq!(references[0]["target_file"], "package:fixture/a.dart");
-    assert_eq!(references[0]["kind"], "reference");
+    let refs = result["refs"].as_array().expect("refs");
+    assert_eq!(refs.len(), 2, "the type use plus the invocation");
+    assert_eq!(refs[0]["target"], "package:fixture/a.dart");
+    assert_eq!(refs[0]["kind"], "reference");
     // The frozen contract types `qualified` as the qualified-name string and
     // the row model carries only the bit, so the shared writer omits the
     // column (contract-legal, #627) and the daemon adds nothing back.
     assert!(
-        references[0].get("qualified").is_none(),
+        refs[0].get("qualified").is_none(),
         "the unproducible qualified column stays omitted: {row}",
-        row = &references[0]
+        row = &refs[0]
     );
-    assert_eq!(references[0]["offset"], 33);
-    assert_eq!(references[1]["kind"], "invoked");
-    assert_eq!(references[1]["offset"], 42);
+    assert_eq!(refs[0]["off"], 33);
+    assert_eq!(refs[1]["kind"], "invoked");
+    assert_eq!(refs[1]["off"], 42);
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
@@ -236,7 +229,7 @@ fn dartq_query_equals_the_cli_json_face() {
 /// answer has no rows for a cursor), and the fail-loud unknown file — the
 /// wire contract over the engine substrate (`Engine::resolve_at` carries
 /// the semantics; offsets are the engine's UTF-16 convention, the same
-/// units the query rows' `offset` fields pin: 6 = `Foo`'s declaration, 33
+/// units the query rows' `off` fields pin: 6 = `Foo`'s declaration, 33
 /// its type use in b.dart).
 #[test]
 fn dartq_resolve_at_answers_the_position_shapes() {
@@ -252,9 +245,9 @@ fn dartq_resolve_at_answers_the_position_shapes() {
         1,
     );
     let result = answer_result(&h, 2);
-    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["v"], 1);
     assert_eq!(result["file"], a.display().to_string());
-    assert_eq!(result["offset"], 6);
+    assert_eq!(result["off"], 6);
     let hit = &result["hit"];
     assert_eq!(hit["kind"], "declaration");
     assert_eq!(hit["name"], "Foo");
@@ -265,8 +258,8 @@ fn dartq_resolve_at_answers_the_position_shapes() {
         hit = hit,
     );
     assert_eq!(hit["file"], a.display().to_string());
-    assert_eq!(hit["range"]["offset"], 6);
-    assert_eq!(hit["range"]["length"], 3);
+    assert_eq!(hit["range"]["off"], 6);
+    assert_eq!(hit["range"]["len"], 3);
 
     // A resolved use: the target identity plus its name span.
     h.step(
@@ -278,9 +271,9 @@ fn dartq_resolve_at_answers_the_position_shapes() {
     assert_eq!(hit["name"], "Foo");
     assert_eq!(hit["decl_kind"], "class");
     assert_eq!(hit["file"], a.display().to_string(), "the target's file");
-    assert_eq!(hit["range"]["offset"], 33);
-    assert_eq!(hit["target_range"]["offset"], 6);
-    assert_eq!(hit["target_range"]["length"], 3);
+    assert_eq!(hit["range"]["off"], 33);
+    assert_eq!(hit["target_range"]["off"], 6);
+    assert_eq!(hit["target_range"]["len"], 3);
     assert_eq!(hit["ref_kind"], "reference");
     assert_eq!(hit["qualified"], false);
     assert!(
@@ -334,7 +327,7 @@ fn dartq_resolve_at_answers_the_position_shapes() {
     let error = answer_error(&h, 6);
     assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
     h.step(&request(7, "dartq/analyze", json!({})), 1);
-    assert_eq!(answer_result(&h, 7)["schema_version"], 1);
+    assert_eq!(answer_result(&h, 7)["v"], 1);
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
@@ -376,9 +369,9 @@ fn dartq_completion_answers_the_visible_names() {
         1,
     );
     let result = answer_result(&h, 2);
-    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["v"], 1);
     assert_eq!(result["file"], b.display().to_string());
-    assert_eq!(result["offset"], 53);
+    assert_eq!(result["off"], 53);
     assert_eq!(result["prefix"], "fo");
     let items = result["items"].as_array().expect("items");
     assert_eq!(items.len(), 1, "only `foo` extends `fo`: {items:?}");
@@ -395,8 +388,8 @@ fn dartq_completion_answers_the_visible_names() {
         a.display().to_string(),
         "the target's file"
     );
-    assert_eq!(items[0]["range"]["offset"], 36);
-    assert_eq!(items[0]["range"]["length"], 3);
+    assert_eq!(items[0]["range"]["off"], 36);
+    assert_eq!(items[0]["range"]["len"], 3);
 
     // A fresh-name cursor (no fragment): the whole visible set — the
     // import-proven `Foo` and `foo`, the file-local `main` — ascending by
@@ -419,9 +412,9 @@ fn dartq_completion_answers_the_visible_names() {
     assert_eq!(origins, vec!["reference", "reference", "declaration"]);
     assert_eq!(items[0]["decl_kind"], "class");
     assert_eq!(items[0]["file"], a.display().to_string());
-    assert_eq!(items[0]["range"]["offset"], 6, "Foo's own name span");
+    assert_eq!(items[0]["range"]["off"], 6, "Foo's own name span");
     assert_eq!(items[2]["file"], b.display().to_string());
-    assert_eq!(items[2]["range"]["offset"], 22, "main's own name span");
+    assert_eq!(items[2]["range"]["off"], 22, "main's own name span");
 
     // The armed qualifier in p.dart: `a` answers as a Prefix-origin item —
     // a wire word, not a declaration — beside the import-proven names.
@@ -509,7 +502,7 @@ fn dartq_completion_answers_the_visible_names() {
     let error = answer_error(&h, 8);
     assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
     h.step(&request(9, "dartq/analyze", json!({})), 1);
-    assert_eq!(answer_result(&h, 9)["schema_version"], 1);
+    assert_eq!(answer_result(&h, 9)["v"], 1);
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
@@ -541,13 +534,13 @@ fn dartq_impact_matches_the_cli_report() {
         1,
     );
     let result = answer_result(&h, 2);
-    assert_eq!(result["schema_version"], 2);
+    assert_eq!(result["v"], SCHEMA_VERSION_IMPACT);
 
-    let symbols: Vec<String> = result["changed"]
+    let symbols: Vec<String> = result["sym"]
         .as_array()
-        .expect("changed")
+        .expect("sym")
         .iter()
-        .map(|row| row["symbol"].as_str().expect("symbol").to_string())
+        .map(|row| row["sym"].as_str().expect("sym").to_string())
         .collect();
     assert_eq!(
         symbols,
@@ -562,9 +555,9 @@ fn dartq_impact_matches_the_cli_report() {
         .path("test/a_test.dart")
         .canonicalize()
         .expect("canonical test path");
-    let affected: Vec<(String, String)> = result["affected"]
+    let affected: Vec<(String, String)> = result["files"]
         .as_array()
-        .expect("affected")
+        .expect("files")
         .iter()
         .map(|row| {
             (
@@ -581,7 +574,7 @@ fn dartq_impact_matches_the_cli_report() {
         ],
         "the test tree keeps its canonical path and sorts first: `/` before `p`"
     );
-    let tests: Vec<String> = result["affected_tests"]
+    let tests: Vec<String> = result["tests"]
         .as_array()
         .expect("tests")
         .iter()
@@ -589,7 +582,7 @@ fn dartq_impact_matches_the_cli_report() {
         .collect();
     assert_eq!(tests, vec![test_path.display().to_string()]);
     assert_eq!(
-        result["affected_environments"],
+        result["envs"],
         json!([{ "label": "default", "compatible": true }]),
     );
 
@@ -629,7 +622,7 @@ fn seeded_explain_workspace() -> Workspace {
 /// section (the same content the CLI's report pins — the faces share one
 /// implementation), the `since` delta filtering the use/import/test rows
 /// while the declaration-site sections stay, and the minimal tier's
-/// `counts` swap. An `agentId` is rejected: the face answers the disk view
+/// `counts` swap. An `agent_id` is rejected: the face answers the disk view
 /// (the `dartq/compat` posture — the report's harvest rides the semantic
 /// fan-out, which the session engine runs over recomputed libraries only).
 #[test]
@@ -655,19 +648,20 @@ fn dartq_explain_answers_the_report() {
         0,
     );
     let result = answer_result(&h, 2);
-    assert_eq!(result["schema_version"], 1);
-    assert_eq!(result["symbol"], "Dog");
+    assert_eq!(result["v"], 1);
+    assert_eq!(result["sym"], "Dog");
     assert_eq!(
         result["declaration"],
         json!({
             "file": "package:fixture/dog.dart",
             "name": "Dog",
             "kind": "class",
-            "range": [dog_at, dog_at + 3],
+            "off": dog_at,
+            "len": 3,
         })
     );
     assert_eq!(
-        result["inheritance"],
+        result["bases"],
         json!([{
             "name": "Animal",
             "file": "package:fixture/animal.dart",
@@ -676,24 +670,24 @@ fn dartq_explain_answers_the_report() {
     );
     assert_eq!(
         result["methods"],
-        json!([{ "name": "bark", "kind": "method", "range": [bark_at, bark_at + 4] }])
+        json!([{ "name": "bark", "kind": "method", "off": bark_at, "len": 4 }])
     );
-    let references = result["references"].as_array().expect("references");
-    assert_eq!(references.len(), 2, "the main use plus the test use");
+    let refs = result["refs"].as_array().expect("refs");
+    assert_eq!(refs.len(), 2, "the main use plus the test use");
     // Row order keys on the projected label (`package:fixture/main.dart`
     // vs the test tree's canonical path): `/` sorts before `p`.
-    assert_eq!(references[0]["file"], dog_test.display().to_string());
-    assert_eq!(references[0]["kind"], "invoked");
-    assert_eq!(references[1]["file"], "package:fixture/main.dart");
+    assert_eq!(refs[0]["file"], dog_test.display().to_string());
+    assert_eq!(refs[0]["kind"], "invoked");
+    assert_eq!(refs[1]["file"], "package:fixture/main.dart");
     assert_eq!(
-        result["dependencies"],
+        result["deps"],
         json!([
             { "path": dog_test.display().to_string() },
             { "path": "package:fixture/main.dart" },
         ])
     );
     assert_eq!(
-        result["affected_tests"],
+        result["tests"],
         json!([{ "path": dog_test.display().to_string() }])
     );
 
@@ -714,14 +708,11 @@ fn dartq_explain_answers_the_report() {
         result["declaration"]["name"], "Dog",
         "the red line stays in delta answers"
     );
-    assert_eq!(result["inheritance"].as_array().expect("array").len(), 1);
+    assert_eq!(result["bases"].as_array().expect("array").len(), 1);
     assert!(
-        result["references"].as_array().expect("array").is_empty()
-            && result["dependencies"].as_array().expect("array").is_empty()
-            && result["affected_tests"]
-                .as_array()
-                .expect("array")
-                .is_empty(),
+        result["refs"].as_array().expect("array").is_empty()
+            && result["deps"].as_array().expect("array").is_empty()
+            && result["tests"].as_array().expect("array").is_empty(),
         "no file changed since the cursor: {result}"
     );
 
@@ -740,16 +731,16 @@ fn dartq_explain_answers_the_report() {
     );
     let result = answer_result(&h, 4);
     assert_eq!(result["declaration"]["name"], "Dog", "the red line stays");
-    assert!(result.get("references").is_none(), "arrays drop");
-    assert_eq!(result["counts"]["references"], 2);
-    assert_eq!(result["counts"]["affected_tests"], 1);
+    assert!(result.get("refs").is_none(), "arrays drop");
+    assert_eq!(result["counts"]["refs"], 2);
+    assert_eq!(result["counts"]["tests"], 1);
 
     // The view selector is rejected loudly, never answered as the disk view.
     h.step(
         &request(
             5,
             "dartq/explain",
-            json!({ "symbol": "Dog", "agentId": "A" }),
+            json!({ "symbol": "Dog", "agent_id": "A" }),
         ),
         0,
     );
@@ -759,7 +750,7 @@ fn dartq_explain_answers_the_report() {
         error["message"]
             .as_str()
             .expect("message")
-            .contains("agentId"),
+            .contains("agent_id"),
         "the rejection names the field: {error}"
     );
 
@@ -794,7 +785,7 @@ fn dartq_explain_rejects_a_bad_symbol() {
         ),
         0,
     );
-    assert_eq!(answer_result(&h, 5)["symbol"], "Dog");
+    assert_eq!(answer_result(&h, 5)["sym"], "Dog");
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
@@ -915,7 +906,7 @@ fn dartq_fix_reports_the_schema_shaped_empty_document() {
     let result = answer_result(&h, 2);
     assert_eq!(
         result,
-        json!({ "schema_version": 1, "files": [] }),
+        json!({ "v": 1, "files": [] }),
         "zero patches, schema-stamped"
     );
 
@@ -986,16 +977,17 @@ fn dartq_verbosity_minimal_keeps_the_red_line_fields() {
         1,
     );
     let result = answer_result(&h, 2);
-    assert_eq!(result["schema_version"], 1);
-    let entries = result["diagnostics"].as_array().expect("entries");
+    assert_eq!(result["v"], 1);
+    let entries = result["diags"].as_array().expect("entries");
     assert!(!entries.is_empty());
     let entry = &entries[0];
-    assert!(entry.get("uri").is_some(), "location stays");
+    assert!(entry.get("file").is_some(), "location stays");
     assert!(entry.get("code").is_some(), "code stays");
-    assert!(entry.get("range").is_some(), "range stays");
-    assert!(entry.get("severity").is_none(), "prose drops");
-    assert!(entry.get("message").is_none(), "prose drops");
-    assert!(entry.get("source").is_none(), "prose drops");
+    assert!(entry.get("line").is_some(), "location stays");
+    assert!(entry.get("col").is_some(), "location stays");
+    assert!(entry.get("len").is_some(), "location stays");
+    assert!(entry.get("sev").is_none(), "prose drops");
+    assert!(entry.get("msg").is_none(), "prose drops");
     assert_eq!(entry["code"], "uri_does_not_exist");
 
     h.step(
@@ -1007,22 +999,22 @@ fn dartq_verbosity_minimal_keeps_the_red_line_fields() {
         1,
     );
     let result = answer_result(&h, 3);
-    let rows = result["diagnostics"].as_array().expect("rows");
+    let rows = result["diags"].as_array().expect("rows");
     assert!(!rows.is_empty());
     let row = &rows[0];
     assert!(row.get("file").is_some(), "location stays");
     assert!(row.get("code").is_some(), "code stays");
     assert!(row.get("line").is_some(), "location stays");
-    assert!(row.get("column").is_some(), "location stays");
-    assert!(row.get("length").is_some(), "location stays");
-    assert!(row.get("message").is_none(), "prose drops");
-    assert!(row.get("severity").is_none(), "prose drops");
+    assert!(row.get("col").is_some(), "location stays");
+    assert!(row.get("len").is_some(), "location stays");
+    assert!(row.get("msg").is_none(), "prose drops");
+    assert!(row.get("sev").is_none(), "prose drops");
 
     h.step(&request(4, "dartq/analyze", json!({})), 1);
     let result = answer_result(&h, 4);
-    let entry = &result["diagnostics"].as_array().expect("entries")[0];
-    assert!(entry.get("severity").is_some(), "compact keeps severity");
-    assert!(entry.get("message").is_some(), "compact keeps the message");
+    let entry = &result["diags"].as_array().expect("entries")[0];
+    assert!(entry.get("sev").is_some(), "compact keeps severity");
+    assert!(entry.get("msg").is_some(), "compact keeps the message");
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
@@ -1050,7 +1042,7 @@ fn dartq_invalid_verbosity_answers_invalid_params() {
     // The session is unharmed: the next request answers normally.
     h.step(&request(3, "dartq/analyze", json!({})), 1);
     let answer = answer_result(&h, 3);
-    assert_eq!(answer["schema_version"], 1);
+    assert_eq!(answer["v"], 1);
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
@@ -1084,11 +1076,11 @@ fn dartq_context_routes_and_unknown_tag_fails_loud() {
         2,
     );
     let rows = |id: i64| -> Vec<String> {
-        answer_result(&h, id)["diagnostics"]
+        answer_result(&h, id)["diags"]
             .as_array()
             .expect("diagnostics array")
             .iter()
-            .map(|row| row["uri"].as_str().expect("uri").to_owned())
+            .map(|row| row["file"].as_str().expect("file").to_owned())
             .collect()
     };
     let default_rows = rows(2);
@@ -1117,7 +1109,7 @@ fn dartq_context_routes_and_unknown_tag_fails_loud() {
         "the error names the tag: {error}"
     );
 
-    // The disk-view faces reject the selector (the agentId rule).
+    // The disk-view faces reject the selector (the agent_id rule).
     h.step(
         &request(
             5,
@@ -1132,7 +1124,7 @@ fn dartq_context_routes_and_unknown_tag_fails_loud() {
         error["message"]
             .as_str()
             .unwrap_or("")
-            .contains("agentId/context/since"),
+            .contains("agent_id/context/since"),
         "the rejection names the selector set: {error}"
     );
 
@@ -1145,7 +1137,7 @@ fn dartq_context_routes_and_unknown_tag_fails_loud() {
 /// dartq/fix emits real patch rows through the staged dispatch (progress
 /// notice at the drain, answer one worker hop later): a file carrying an
 /// `unnecessary_new` hit materializes an anchored edit through the #355
-/// bridge, provenance-tagged `builtin-lint`, and an `agentId` selector is
+/// bridge, provenance-tagged `builtin-lint`, and an `agent_id` selector is
 /// rejected (the disk-view rule). The #2070/#2120-window fix face widens
 /// the answer legitimately: the unused local rides its `builtin-semantic`
 /// rename producer, every diagnostic rides the line/file ignore offers,
@@ -1175,7 +1167,7 @@ fn dartq_fix_emits_real_builtin_rows_with_provenance() {
         1,
     );
     let result = answer_result(&h, 2);
-    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["v"], 1);
     let files = result["files"].as_array().expect("files array");
     assert_eq!(
         files.len(),
@@ -1189,67 +1181,67 @@ fn dartq_fix_emits_real_builtin_rows_with_provenance() {
         6,
         "the rewrite, the unused-local rename, and the two codes' ignore offers"
     );
-    assert_eq!(edits[0]["source"], "builtin-lint");
-    assert_eq!(edits[0]["offset"], 19);
-    assert_eq!(edits[0]["length"], 4, "keyword plus trailing space");
+    assert_eq!(edits[0]["src"], "builtin-lint");
+    assert_eq!(edits[0]["off"], 19);
+    assert_eq!(edits[0]["len"], 4, "keyword plus trailing space");
     assert_eq!(edits[0]["anchor"]["line"], 1);
     // The `unused_local_variable` semantic row rides its rename producer
     // (the #2070 producer wave): `a` never reads, so it becomes `_a`.
-    assert_eq!(edits[1]["source"], "builtin-semantic");
-    assert_eq!(edits[1]["offset"], 15);
-    assert_eq!(edits[1]["length"], 1);
-    assert_eq!(edits[1]["replacement"], "_a");
+    assert_eq!(edits[1]["src"], "builtin-semantic");
+    assert_eq!(edits[1]["off"], 15);
+    assert_eq!(edits[1]["len"], 1);
+    assert_eq!(edits[1]["text"], "_a");
     assert_eq!(edits[1]["anchor"]["line"], 1);
     // Every diagnostic also rides the line and file ignore offers (the
     // builtin-ignore provenance), both anchored at the file head — the
     // lint code first, then the semantic one.
-    assert_eq!(edits[2]["source"], "builtin-ignore");
-    assert_eq!(edits[2]["offset"], 0);
-    assert_eq!(edits[2]["length"], 0);
-    assert_eq!(edits[2]["replacement"], "// ignore: unnecessary_new\n");
+    assert_eq!(edits[2]["src"], "builtin-ignore");
+    assert_eq!(edits[2]["off"], 0);
+    assert_eq!(edits[2]["len"], 0);
+    assert_eq!(edits[2]["text"], "// ignore: unnecessary_new\n");
     assert_eq!(edits[2]["anchor"]["line"], 1);
-    assert_eq!(edits[3]["source"], "builtin-ignore");
-    assert_eq!(edits[3]["offset"], 0);
-    assert_eq!(edits[3]["length"], 0);
+    assert_eq!(edits[3]["src"], "builtin-ignore");
+    assert_eq!(edits[3]["off"], 0);
+    assert_eq!(edits[3]["len"], 0);
     assert_eq!(
-        edits[3]["replacement"],
+        edits[3]["text"],
         "// ignore_for_file: unnecessary_new\n\n"
     );
     assert_eq!(edits[3]["anchor"]["line"], 1);
-    assert_eq!(edits[4]["source"], "builtin-ignore");
-    assert_eq!(edits[4]["offset"], 0);
-    assert_eq!(edits[4]["length"], 0);
-    assert_eq!(edits[4]["replacement"], "// ignore: unused_local_variable\n");
+    assert_eq!(edits[4]["src"], "builtin-ignore");
+    assert_eq!(edits[4]["off"], 0);
+    assert_eq!(edits[4]["len"], 0);
+    assert_eq!(edits[4]["text"], "// ignore: unused_local_variable\n");
     assert_eq!(edits[4]["anchor"]["line"], 1);
-    assert_eq!(edits[5]["source"], "builtin-ignore");
-    assert_eq!(edits[5]["offset"], 0);
-    assert_eq!(edits[5]["length"], 0);
+    assert_eq!(edits[5]["src"], "builtin-ignore");
+    assert_eq!(edits[5]["off"], 0);
+    assert_eq!(edits[5]["len"], 0);
     assert_eq!(
-        edits[5]["replacement"],
+        edits[5]["text"],
         "// ignore_for_file: unused_local_variable\n\n"
     );
     assert_eq!(edits[5]["anchor"]["line"], 1);
     // The options-file set: one row per code in sorted order, each
     // appending the `analyzer: errors:` ignore at the options file's end
-    // (offset = its UTF-16 length), anchored against the options text.
+    // (off = its UTF-16 length), anchored against the options text.
     assert_eq!(
         files[1]["file"],
         workspace.path("analysis_options.yaml").display().to_string()
     );
     let options = files[1]["edits"].as_array().expect("options edits array");
     assert_eq!(options.len(), 2, "one ignore row per code");
-    assert_eq!(options[0]["source"], "builtin-ignore");
-    assert_eq!(options[0]["offset"], 39);
-    assert_eq!(options[0]["length"], 0);
+    assert_eq!(options[0]["src"], "builtin-ignore");
+    assert_eq!(options[0]["off"], 39);
+    assert_eq!(options[0]["len"], 0);
     assert_eq!(
-        options[0]["replacement"],
+        options[0]["text"],
         "analyzer:\n  errors:\n    unnecessary_new: ignore\n"
     );
     assert_eq!(options[0]["anchor"]["line"], 4);
-    assert_eq!(options[1]["source"], "builtin-ignore");
-    assert_eq!(options[1]["offset"], 39);
+    assert_eq!(options[1]["src"], "builtin-ignore");
+    assert_eq!(options[1]["off"], 39);
     assert_eq!(
-        options[1]["replacement"],
+        options[1]["text"],
         "analyzer:\n  errors:\n    unused_local_variable: ignore\n"
     );
 
@@ -1257,14 +1249,14 @@ fn dartq_fix_emits_real_builtin_rows_with_provenance() {
         &request(
             3,
             "dartq/fix",
-            json!({ "paths": [fixable.display().to_string()], "agentId": "a" }),
+            json!({ "paths": [fixable.display().to_string()], "agent_id": "a" }),
         ),
         1,
     );
     let error = answer_error(&h, 3);
     assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
     assert!(
-        error["message"].as_str().unwrap_or("").contains("agentId"),
+        error["message"].as_str().unwrap_or("").contains("agent_id"),
         "the disk-view rejection names the selector: {error}"
     );
 
@@ -1277,7 +1269,7 @@ fn dartq_fix_emits_real_builtin_rows_with_provenance() {
 /// dartq/assists answers through the staged dispatch (progress notice at
 /// the drain, answer one worker hop later): with no plugins discovered the
 /// answer carries the built-in rows alone, schema-stamped; a missing target
-/// is the usage tier; an `agentId` selector is rejected.
+/// is the usage tier; an `agent_id` selector is rejected.
 #[test]
 fn dartq_assists_answers_schema_stamped_without_plugins() {
     let _guard = workspace_lock();
@@ -1303,30 +1295,30 @@ fn dartq_assists_answers_schema_stamped_without_plugins() {
         result,
         json!({
             "file": workspace.path("lib/main.dart"),
-            "schema_version": 1,
+            "v": 1,
             "assists": [{
-                "message": "Convert to async function body",
-                "source": "builtin-assist",
+                "msg": "Convert to async function body",
+                "src": "builtin-assist",
                 "priority": 31,
                 "edits": [
                     {
-                        "offset": 12,
-                        "length": 0,
-                        "replacement": "async ",
-                        "source": "builtin-assist",
+                        "off": 12,
+                        "len": 0,
+                        "text": "async ",
+                        "src": "builtin-assist",
                         "anchor": {
                             "line": 1,
-                            "column": 13,
-                            "context_before": " main() ",
-                            "context_after": "{}",
+                            "col": 13,
+                            "before": " main() ",
+                            "after": "{}",
                         },
                     },
                     {
-                        "offset": 0,
-                        "length": 4,
-                        "replacement": "Future<void>",
-                        "source": "builtin-assist",
-                        "anchor": { "line": 1, "column": 1, "context_after": " main() " },
+                        "off": 0,
+                        "len": 4,
+                        "text": "Future<void>",
+                        "src": "builtin-assist",
+                        "anchor": { "line": 1, "col": 1, "after": " main() " },
                     },
                 ],
             }],
@@ -1356,7 +1348,7 @@ fn dartq_assists_answers_schema_stamped_without_plugins() {
         &request(
             4,
             "dartq/assists",
-            json!({ "path": workspace.path("lib/main.dart"), "agentId": "a" }),
+            json!({ "path": workspace.path("lib/main.dart"), "agent_id": "a" }),
         ),
         1,
     );
@@ -1393,14 +1385,14 @@ fn dartq_assists_mounts_the_session_sdk_for_resolved_rows() {
     let assists = result["assists"].as_array().expect("assists array");
     let row = assists
         .iter()
-        .find(|row| row["message"] == "Add return type")
+        .find(|row| row["msg"] == "Add return type")
         .expect("the resolved-only row mounts through the session SDK");
-    assert_eq!(row["source"], "builtin-assist");
+    assert_eq!(row["src"], "builtin-assist");
     assert_eq!(row["priority"], 30);
     // The inferred return type inserts before the name (the resolved mount's
     // type, not the engine-free silence).
-    assert_eq!(row["edits"][0]["offset"], 0);
-    assert_eq!(row["edits"][0]["replacement"], "int ");
+    assert_eq!(row["edits"][0]["off"], 0);
+    assert_eq!(row["edits"][0]["text"], "int ");
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
@@ -1461,16 +1453,16 @@ fn live_plugin_fixes_and_assists_dispatch_end_to_end() {
     let assists = result["assists"].as_array().expect("assists array");
     assert_eq!(assists.len(), 1, "the fixer's reply: {result}");
     assert_eq!(
-        assists[0]["source"], "fixer",
+        assists[0]["src"], "fixer",
         "the manifest name is the provenance"
     );
-    assert_eq!(assists[0]["message"], "insert const");
+    assert_eq!(assists[0]["msg"], "insert const");
     assert_eq!(assists[0]["priority"], 1);
     assert_eq!(
-        assists[0]["edits"][0]["offset"], 19,
+        assists[0]["edits"][0]["off"], 19,
         "the requested range echoes back"
     );
-    assert_eq!(assists[0]["edits"][0]["replacement"], "const ");
+    assert_eq!(assists[0]["edits"][0]["text"], "const ");
     assert_eq!(assists[0]["edits"][0]["anchor"]["line"], 1);
 
     h.step(
@@ -1491,7 +1483,7 @@ fn live_plugin_fixes_and_assists_dispatch_end_to_end() {
     let edits = files[0]["edits"].as_array().expect("edits array");
     let sources: Vec<&str> = edits
         .iter()
-        .map(|edit| edit["source"].as_str().expect("source"))
+        .map(|edit| edit["src"].as_str().expect("src"))
         .collect();
     assert_eq!(
         sources.first(),
@@ -1516,8 +1508,8 @@ fn live_plugin_fixes_and_assists_dispatch_end_to_end() {
     // echoed it back — the discovery -> spawn -> push -> fixes path over a
     // real child process.
     let fixer = edits.last().expect("the plugin row").clone();
-    assert_eq!(fixer["offset"], 19);
-    assert_eq!(fixer["replacement"], "const ");
+    assert_eq!(fixer["off"], 19);
+    assert_eq!(fixer["text"], "const ");
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
@@ -1536,7 +1528,7 @@ fn live_plugin_fixes_and_assists_dispatch_end_to_end() {
 /// and the resident index equals a rebuild once the read task's analysis
 /// pass has run. Also pins the tier invariance (every field is a verdict
 /// count), the `since` rejection (the aggregate has no rows to filter), and
-/// the engine-view intake rule (an unknown `agentId` fails loud).
+/// the engine-view intake rule (an unknown `agent_id` fails loud).
 #[test]
 fn dartq_index_matches_the_cli_totals() {
     let _guard = workspace_lock();
@@ -1545,7 +1537,7 @@ fn dartq_index_matches_the_cli_totals() {
 
     h.step(&request(2, "dartq/index", json!({})), 1);
     let result = answer_result(&h, 2);
-    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["v"], 1);
     let run = dartq_commands::index::run(&workspace.root, Some(&workspace.path("sdk")), false)
         .expect("index core");
     assert!(run.files >= 3, "the fixture's file set: {result}");
@@ -1553,7 +1545,7 @@ fn dartq_index_matches_the_cli_totals() {
     assert_eq!(result["files"], run.files, "{result} vs {run:?}");
     assert_eq!(result["libraries"], run.libraries);
     assert_eq!(result["symbols"], run.symbols);
-    assert_eq!(result["references"], run.references);
+    assert_eq!(result["refs"], run.references);
 
     // Tier-invariant: the minimal tier answers the identical four counts.
     h.step(
@@ -1574,15 +1566,15 @@ fn dartq_index_matches_the_cli_totals() {
         "the rejection names the field: {error}"
     );
 
-    // An unknown agentId fails loud at intake (the engine-view rule).
-    h.step(&request(5, "dartq/index", json!({ "agentId": "a" })), 1);
+    // An unknown agent_id fails loud at intake (the engine-view rule).
+    h.step(&request(5, "dartq/index", json!({ "agent_id": "a" })), 1);
     let error = answer_error(&h, 5);
     assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
     assert!(
         error["message"]
             .as_str()
             .expect("message")
-            .contains("unknown agentId"),
+            .contains("unknown agent_id"),
         "{error}"
     );
 
@@ -1616,7 +1608,7 @@ fn dartq_family_answers_one_to_one_over_the_fixture() {
             6,
             "dartq/impact",
             json!({ "path": a.display().to_string() }),
-            2, // the impact report stamps its own schema generation
+            i64::from(SCHEMA_VERSION_IMPACT), // the report's own generation
         ),
         (
             7,
@@ -1643,23 +1635,26 @@ fn dartq_family_answers_one_to_one_over_the_fixture() {
     for (id, method, params, schema) in cases {
         h.step(&request(id, method, params), 1);
         let result = answer_result(&h, id);
+        // Every face stamps the compact vocabulary's `v`, except the
+        // compat face's frozen `schema_version`.
+        let stamp = if result.get("v").is_some() { &result["v"] } else { &result["schema_version"] };
         assert_eq!(
-            result["schema_version"], schema,
+            stamp, schema,
             "{method} is schema-stamped: {result}"
         );
     }
     // Each face answers its own shape, not a shared envelope.
     assert!(answer_result(&h, 2).get("files").is_some(), "index tallies");
     assert!(
-        answer_result(&h, 3).get("diagnostics").is_some(),
+        answer_result(&h, 3).get("diags").is_some(),
         "check rows"
     );
     assert!(
-        answer_result(&h, 5).get("declarations").is_some(),
+        answer_result(&h, 5).get("decls").is_some(),
         "query rows"
     );
     assert!(
-        answer_result(&h, 6).get("changed").is_some(),
+        answer_result(&h, 6).get("sym").is_some(),
         "impact report"
     );
     assert!(
@@ -1826,14 +1821,14 @@ fn watch_refreshes_the_context_on_a_non_dart_change() {
             .iter()
             .find(|frame| frame.get("id") == Some(&json!(2)))
             .map(|frame| {
-                frame["result"]["diagnostics"]
+                frame["result"]["diags"]
                     .as_array()
                     .expect("entries")
                     .clone()
             })
     });
     for entry in &entries {
-        let uri = entry["uri"].as_str().expect("uri");
+        let uri = entry["file"].as_str().expect("file");
         assert!(
             !uri.ends_with("pubspec.yaml")
                 && !uri.ends_with("package_config.json")

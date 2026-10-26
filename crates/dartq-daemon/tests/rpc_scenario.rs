@@ -118,9 +118,9 @@ fn publishes(h: &Harness) -> Vec<Value> {
 
 /// A query answer's declaration files in canonical (path) order.
 fn declaration_files(query: &Value) -> Vec<String> {
-    query["declarations"]
+    query["decls"]
         .as_array()
-        .expect("declarations")
+        .expect("decls")
         .iter()
         .map(|row| row["file"].as_str().expect("file").to_owned())
         .collect()
@@ -165,30 +165,30 @@ fn agent_script_over_the_daemon_rpc_surface() {
             1,
             |h| {
                 let result = answer_result(h, 2);
-                assert_eq!(result["schema_version"], 1);
-                let declarations = result["declarations"].as_array().expect("declarations");
-                assert_eq!(declarations.len(), 1);
-                assert_eq!(declarations[0]["file"], a_label);
-                assert_eq!(declarations[0]["kind"], "class");
-                assert_eq!(declarations[0]["name"], "Foo");
-                assert_eq!(declarations[0]["line"], 1);
-                assert_eq!(declarations[0]["column"], 7);
-                let references = result["references"].as_array().expect("references");
-                // Row contract (crates/dartq-schema/src/query.rs:76-92, frozen
-                // v1 #361): `target_file` is the referenced declaration's file;
+                assert_eq!(result["v"], 1);
+                let decls = result["decls"].as_array().expect("decls");
+                assert_eq!(decls.len(), 1);
+                assert_eq!(decls[0]["file"], a_label);
+                assert_eq!(decls[0]["kind"], "class");
+                assert_eq!(decls[0]["name"], "Foo");
+                assert_eq!(decls[0]["line"], 1);
+                assert_eq!(decls[0]["col"], 7);
+                let refs = result["refs"].as_array().expect("refs");
+                // Row contract (crates/dartq-schema/src/query.rs, frozen
+                // v1 #361): `target` is the referenced declaration's file;
                 // the additive `file` is the row's use-site file, emitted by
                 // the query producers since the freeze.
-                let mut uses: Vec<(String, &str, i64)> = references
+                let mut uses: Vec<(String, &str, i64)> = refs
                     .iter()
                     .map(|row| {
                         assert_eq!(
-                            row["target_file"], a_label,
-                            "target_file names the declaring file: {row}"
+                            row["target"], a_label,
+                            "target names the declaring file: {row}"
                         );
                         (
                             row["file"].as_str().expect("use-site file").to_owned(),
                             row["kind"].as_str().expect("kind"),
-                            row["offset"].as_i64().expect("offset"),
+                            row["off"].as_i64().expect("off"),
                         )
                     })
                     .collect();
@@ -212,26 +212,26 @@ fn agent_script_over_the_daemon_rpc_surface() {
             request(
                 3,
                 "dartq/overlay.set",
-                json!({"agentId": "A", "files": {"lib/b.dart": AGENT_B_SOURCE}}),
+                json!({"agent_id": "A", "files": {"lib/b.dart": AGENT_B_SOURCE}}),
             ),
             1,
             |h| {
                 assert_eq!(
                     answer_result(h, 3),
-                    json!({"schema_version": 1}),
+                    json!({"v": 1}),
                     "the staging ack carries the contract version"
                 );
             },
         ),
         // -- the agent view analyzes its own overlay, not the base --
         step(
-            request(4, "dartq/analyze", json!({"agentId": "A"})),
+            request(4, "dartq/analyze", json!({"agent_id": "A"})),
             1,
             |h| {
                 let result = answer_result(h, 4);
-                assert_eq!(result["schema_version"], 1);
+                assert_eq!(result["v"], 1);
                 assert!(
-                    result["diagnostics"]
+                    result["diags"]
                         .as_array()
                         .expect("diagnostics")
                         .is_empty(),
@@ -244,28 +244,28 @@ fn agent_script_over_the_daemon_rpc_surface() {
             request(
                 5,
                 "dartq/query",
-                json!({"name": "Foo", "kind": "references", "agentId": "A"}),
+                json!({"name": "Foo", "kind": "references", "agent_id": "A"}),
             ),
             1,
             |h| {
                 let result = answer_result(h, 5);
-                let references = result["references"].as_array().expect("references");
+                let refs = result["refs"].as_array().expect("refs");
                 assert_eq!(
-                    references.len(),
+                    refs.len(),
                     6,
-                    "the overlay's extra use pair shows: {references:?}"
+                    "the overlay's extra use pair shows: {refs:?}"
                 );
-                let mut uses: Vec<(String, &str, i64)> = references
+                let mut uses: Vec<(String, &str, i64)> = refs
                     .iter()
                     .map(|row| {
                         assert_eq!(
-                            row["target_file"], a_label,
-                            "target_file names the declaring file: {row}"
+                            row["target"], a_label,
+                            "target names the declaring file: {row}"
                         );
                         (
                             row["file"].as_str().expect("use-site file").to_owned(),
                             row["kind"].as_str().expect("kind"),
-                            row["offset"].as_i64().expect("offset"),
+                            row["off"].as_i64().expect("off"),
                         )
                     })
                     .collect();
@@ -288,11 +288,11 @@ fn agent_script_over_the_daemon_rpc_surface() {
         // the committed path still owes the client one publish of its fresh
         // state — the merge's push carries its (empty) set --
         step(
-            request(6, "dartq/overlay.commit", json!({"agentId": "A"})),
+            request(6, "dartq/overlay.commit", json!({"agent_id": "A"})),
             1,
             |h| {
                 let result = answer_result(h, 6);
-                assert_eq!(result["schema_version"], 1);
+                assert_eq!(result["v"], 1);
                 assert_eq!(result["committed"], 1, "one file merged");
                 assert_eq!(
                     fs::read(&b).expect("read back"),
@@ -397,10 +397,7 @@ fn agent_script_over_the_daemon_rpc_surface() {
                     "only the delta rows survive"
                 );
                 assert!(
-                    result["references"]
-                        .as_array()
-                        .expect("references")
-                        .is_empty(),
+                    result["refs"].as_array().expect("refs").is_empty(),
                     "no references to main anywhere"
                 );
                 assert_eq!(result["since"], 3, "the cursor echoes (the sync's drain)");
@@ -413,17 +410,14 @@ fn agent_script_over_the_daemon_rpc_surface() {
             1,
             |h| {
                 let result = answer_result(h, 10);
-                // The impact domain's frozen version is 2 — per-domain
+                // The impact domain's frozen version is its own — per-domain
                 // constants are authoritative, not the shared v1.
-                assert_eq!(
-                    result["schema_version"],
-                    dartq_schema::SCHEMA_VERSION_IMPACT
-                );
-                let changed: Vec<String> = result["changed"]
+                assert_eq!(result["v"], dartq_schema::SCHEMA_VERSION_IMPACT);
+                let changed: Vec<String> = result["sym"]
                     .as_array()
-                    .expect("changed")
+                    .expect("sym")
                     .iter()
-                    .map(|row| row["symbol"].as_str().expect("symbol").to_owned())
+                    .map(|row| row["sym"].as_str().expect("sym").to_owned())
                     .collect();
                 assert_eq!(
                     changed,
@@ -431,17 +425,14 @@ fn agent_script_over_the_daemon_rpc_surface() {
                     "the target library's face names"
                 );
                 assert!(
-                    result["affected"].as_array().expect("affected").is_empty(),
+                    result["files"].as_array().expect("files").is_empty(),
                     "nothing imports b.dart"
                 );
                 assert!(
-                    result["affected_tests"]
-                        .as_array()
-                        .expect("affected_tests")
-                        .is_empty()
+                    result["tests"].as_array().expect("tests").is_empty()
                 );
                 assert_eq!(
-                    result["affected_environments"],
+                    result["envs"],
                     json!([{ "label": "default", "compatible": true }]),
                 );
             },
@@ -461,8 +452,8 @@ fn agent_script_over_the_daemon_rpc_surface() {
             1,
             |h| {
                 let result = answer_result(h, 11);
-                assert_eq!(result["schema_version"], 1);
-                assert_eq!(result["symbol"], "Foo");
+                assert_eq!(result["v"], 1);
+                assert_eq!(result["sym"], "Foo");
                 assert_eq!(
                     result["declaration"]["file"], a_label,
                     "the single-occurrence declaration stays spelled out"
@@ -475,23 +466,22 @@ fn agent_script_over_the_daemon_rpc_surface() {
                     "first-seen path (the label-sorted test file) maps to s1"
                 );
                 assert_eq!(symbols["s2"], b_label);
-                let references = result["references"].as_array().expect("references");
+                let refs = result["refs"].as_array().expect("refs");
                 assert_eq!(
-                    references.len(),
+                    refs.len(),
                     6,
                     "the merged library's two pairs plus the test file's pair"
                 );
-                for row in references {
+                for row in refs {
                     let file = row["file"].as_str().expect("file");
                     assert!(
                         file == "s1" || file == "s2",
                         "rows back-reference the ids: {row}"
                     );
                 }
-                let dependencies = result["dependencies"].as_array().expect("dependencies");
+                let deps = result["deps"].as_array().expect("deps");
                 assert_eq!(
-                    dependencies
-                        .iter()
+                    deps.iter()
                         .map(|row| row["path"].as_str().expect("path"))
                         .collect::<Vec<_>>(),
                     ["s1", "s2"],
@@ -515,14 +505,14 @@ fn agent_script_over_the_daemon_rpc_surface() {
                     result.get("symbols").is_none(),
                     "an announced id is never re-announced: {result}"
                 );
-                let references = result["references"].as_array().expect("references");
-                assert_eq!(references.len(), 6);
+                let refs = result["refs"].as_array().expect("refs");
+                assert_eq!(refs.len(), 6);
                 assert!(
-                    references.iter().any(|row| row["file"] == "s1"),
-                    "the repeat path arrives as the s1 back-reference: {references:?}"
+                    refs.iter().any(|row| row["file"] == "s1"),
+                    "the repeat path arrives as the s1 back-reference: {refs:?}"
                 );
                 assert_eq!(
-                    result["dependencies"][0]["path"], "s1",
+                    result["deps"][0]["path"], "s1",
                     "the id mapping is session-stable"
                 );
                 assert_eq!(

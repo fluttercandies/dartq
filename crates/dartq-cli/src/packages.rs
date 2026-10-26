@@ -10,6 +10,7 @@ use clap::Args;
 
 use dartq_commands::packages::{PackagesError, inventory};
 
+use crate::OutputFormat;
 use crate::exit;
 
 /// `dartq packages` — the work-point inventory of the enclosing tree.
@@ -20,31 +21,11 @@ pub struct PackagesArgs {
     /// checkout the ladder finds).
     #[arg(default_value = ".")]
     pub dir: std::path::PathBuf,
-    /// Output format; absent falls to the terminal's shape — the human
-    /// table on a TTY, machine rows piped.
-    #[arg(long, value_enum)]
-    pub format: Option<PackagesFormat>,
-}
-
-impl PackagesArgs {
-    fn effective_format(&self) -> PackagesFormat {
-        self.format.unwrap_or(if crate::non_tty_stdout() {
-            PackagesFormat::Machine
-        } else {
-            PackagesFormat::Human
-        })
-    }
-}
-
-#[derive(Clone, Copy, clap::ValueEnum)]
-pub enum PackagesFormat {
-    /// Aligned table with a navigation summary (the terminal face).
-    Human,
-    /// `PKG|path|name|kind|sdk|resolved` and
-    /// `BOUNDARY|path|reason[|detail]` rows.
-    Machine,
-    /// One JSON object per line.
-    Json,
+    /// Output format: `lon` (the default, one `{v root cfg? pkgs bounds}`
+    /// document), `json` (one JSON object per line), or `text` (the
+    /// aligned table with the navigation summary).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Lon)]
+    pub format: OutputFormat,
 }
 
 /// The entry: assemble, render, and tier. A completed listing exits 0 —
@@ -70,10 +51,10 @@ pub fn run_entry(args: &PackagesArgs) -> u8 {
     };
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
-    let written = match args.effective_format() {
-        PackagesFormat::Human => write_human(&mut out, &listing),
-        PackagesFormat::Machine => write_machine(&mut out, &listing),
-        PackagesFormat::Json => write_json(&mut out, &listing),
+    let written = match args.format {
+        OutputFormat::Lon => crate::output::write_lon(&mut out, &lon_document(&listing)),
+        OutputFormat::Json => write_json(&mut out, &listing),
+        OutputFormat::Text => write_human(&mut out, &listing),
     };
     match written.and_then(|()| out.flush()) {
         Ok(()) => exit::CLEAN,
@@ -145,63 +126,76 @@ fn write_human(out: &mut impl Write, listing: &dartq_commands::packages::Package
     Ok(())
 }
 
-fn write_machine(out: &mut impl Write, listing: &dartq_commands::packages::PackageInventory) -> io::Result<()> {
-    for entry in &listing.report.packages {
-        writeln!(
-            out,
-            "PKG|{}|{}|{}|{}|{}",
-            entry.dir.display(),
-            entry.name.as_deref().unwrap_or("-"),
-            entry.kind.as_str(),
-            entry.sdk.as_deref().unwrap_or("-"),
-            if entry.resolved { "yes" } else { "no" }
-        )?;
-        if let Some(note) = &entry.note {
-            writeln!(out, "NOTE|{}|{}", entry.dir.display(), note.replace('\n', " "))?;
-        }
+/// The `lon` document: `{v root cfg? pkgs bounds}` — one object over the
+/// whole inventory (`pkgs` the work points, `bounds` the pruned trees,
+/// `cfg` the dartq.yaml context labels that shaped the scan, present
+/// only when a config sat on the ladder).
+fn lon_document(listing: &dartq_commands::packages::PackageInventory) -> serde_json::Value {
+    let pkgs = listing
+        .report
+        .packages
+        .iter()
+        .map(|entry| pkg_row(entry))
+        .collect::<Vec<_>>();
+    let bounds = listing
+        .report
+        .boundaries
+        .iter()
+        .map(|boundary| boundary_row(boundary))
+        .collect::<Vec<_>>();
+    let mut document = serde_json::json!({
+        "v": dartq_commands::SCHEMA_VERSION,
+        "root": listing.universe.root.display().to_string(),
+        "has_pubspec": listing.universe.layout.is_some(),
+        "pkgs": pkgs,
+        "bounds": bounds,
+    });
+    if let Some(config) = &listing.config {
+        document["cfg"] = serde_json::json!({
+            "contexts": config.contexts.iter().map(|context| &context.label).collect::<Vec<_>>(),
+        });
     }
-    for boundary in &listing.report.boundaries {
-        match &boundary.detail {
-            Some(detail) => writeln!(
-                out,
-                "BOUNDARY|{}|{}|{}",
-                boundary.dir.display(),
-                boundary.reason.as_str(),
-                detail.replace('\n', " ")
-            )?,
-            None => writeln!(out, "BOUNDARY|{}|{}", boundary.dir.display(), boundary.reason.as_str())?,
-        }
-    }
-    Ok(())
+    document
+}
+
+/// One `pkgs` row (the json face's per-line object, shared spelling).
+fn pkg_row(entry: &dartq_pub::universe::PackageEntry) -> serde_json::Value {
+    serde_json::json!({
+        "dir": entry.dir.display().to_string(),
+        "name": entry.name,
+        "kind": entry.kind.as_str(),
+        "sdk": entry.sdk,
+        "resolved": entry.resolved,
+        "note": entry.note,
+    })
+}
+
+/// One `bounds` row.
+fn boundary_row(boundary: &dartq_pub::universe::BoundaryEntry) -> serde_json::Value {
+    serde_json::json!({
+        "dir": boundary.dir.display().to_string(),
+        "reason": boundary.reason.as_str(),
+        "detail": boundary.detail,
+    })
 }
 
 fn write_json(out: &mut impl Write, listing: &dartq_commands::packages::PackageInventory) -> io::Result<()> {
     let line = serde_json::json!({
-        "schema_version": dartq_commands::SCHEMA_VERSION,
+        "v": dartq_commands::SCHEMA_VERSION,
         "type": "universe",
         "root": listing.universe.root.display().to_string(),
         "has_pubspec": listing.universe.layout.is_some(),
     });
     writeln!(out, "{line}")?;
     for entry in &listing.report.packages {
-        let line = serde_json::json!({
-            "type": "pkg",
-            "dir": entry.dir.display().to_string(),
-            "name": entry.name,
-            "kind": entry.kind.as_str(),
-            "sdk": entry.sdk,
-            "resolved": entry.resolved,
-            "note": entry.note,
-        });
+        let mut line = pkg_row(entry);
+        // The json face keeps its per-line typing.
+        line["type"] = serde_json::json!("pkg");
         writeln!(out, "{line}")?;
     }
     for boundary in &listing.report.boundaries {
-        let line = serde_json::json!({
-            "type": "boundary",
-            "dir": boundary.dir.display().to_string(),
-            "reason": boundary.reason.as_str(),
-            "detail": boundary.detail,
-        });
+        let mut line = boundary_row(boundary);
+        line["type"] = serde_json::json!("boundary");
         writeln!(out, "{line}")?;
     }
     Ok(())
@@ -224,38 +218,29 @@ mod tests {
         <PackagesArgs as clap::FromArgMatches>::from_arg_matches(&matches)
     }
 
-    /// The grammar and the format resolution: absent `--format` falls to
-    /// the terminal's shape (machine piped — the test harness captures
-    /// stdout), and an explicit `--format` always wins.
+    /// The grammar: the dir defaults to the cwd, `lon` is the constant
+    /// default, and the explicit spellings all win.
     #[test]
-    fn packages_args_parse_and_resolve_the_format() {
+    fn packages_args_parse() {
         let args = parse(&[]).expect("parse");
         assert_eq!(args.dir, std::path::PathBuf::from("."));
-        assert!(args.format.is_none());
-        assert!(
-            matches!(args.effective_format(), PackagesFormat::Machine),
-            "a captured (non-TTY) stdout defaults to machine rows"
-        );
-        for (spelling, expected) in [
-            ("human", PackagesFormat::Human),
-            ("machine", PackagesFormat::Machine),
-            ("json", PackagesFormat::Json),
-        ] {
+        assert!(matches!(args.format, OutputFormat::Lon), "lon default");
+        for spelling in ["json", "text"] {
             let args = parse(&["--format", spelling, "/w"]).expect("parse");
             assert_eq!(args.dir, std::path::PathBuf::from("/w"));
-            assert_eq!(
-                std::mem::discriminant(&args.effective_format()),
-                std::mem::discriminant(&expected),
-                "{spelling} wins over the terminal shape"
+            assert!(
+                !matches!(args.format, OutputFormat::Lon),
+                "{spelling} parses"
             );
         }
+        assert!(parse(&["--format", "machine"]).is_err(), "machine retired");
         assert!(parse(&["--format", "yaml"]).is_err());
     }
 
-    /// One inventory rendered through all three faces: the human table
+    /// One inventory rendered through all three faces: the text table
     /// spells directories relative to the universe root (absolute
-    /// outside it), the machine rows stay absolute with `NOTE`/`BOUNDARY`
-    /// companions (multi-line notes flattened), and the JSON lines parse.
+    /// outside it), the lon document carries the `pkgs`/`bounds` rows
+    /// over one object, and the json lines parse.
     #[test]
     fn renderers_shape_every_face() {
         let root = Path::new("/w/uni");
@@ -328,14 +313,23 @@ mod tests {
             "the unresolved hint: {human}"
         );
 
-        let mut machine = Vec::new();
-        write_machine(&mut machine, &listing).expect("machine");
-        let machine = String::from_utf8(machine).expect("utf-8");
-        assert!(machine.contains("PKG|/w/uni/pkgs/a|a|workspace-member|^3.5.0|yes"), "{machine}");
-        assert!(machine.contains("PKG|/w/uni/vendor/x|-|independent|-|no"), "{machine}");
-        assert!(machine.contains("NOTE|/w/uni/vendor/x|pubspec.yaml: line 1 bad"), "one flattened line: {machine}");
-        assert!(machine.contains("BOUNDARY|/w/uni/.stash|hidden-tree"), "{machine}");
-        assert!(machine.contains("BOUNDARY|/w/uni/build|build-tree|contains build/pkg/pubspec.yaml"), "{machine}");
+        let mut lon = Vec::new();
+        crate::output::write_lon(&mut lon, &lon_document(&listing)).expect("lon");
+        let document: serde_json::Value =
+            lon::from_str(String::from_utf8(lon).expect("utf-8").trim_end()).expect("decodes");
+        assert_eq!(document["v"], 1);
+        assert_eq!(document["root"], "/w/uni");
+        assert!(document.get("cfg").is_none(), "no config on the ladder");
+        let pkgs = document["pkgs"].as_array().expect("pkgs");
+        assert_eq!(pkgs.len(), 3);
+        assert_eq!(pkgs[0]["dir"], "/w/uni/pkgs/a");
+        assert_eq!(pkgs[0]["resolved"], true);
+        assert_eq!(pkgs[1]["name"], serde_json::Value::Null);
+        assert_eq!(pkgs[2]["resolved"], false);
+        let bounds = document["bounds"].as_array().expect("bounds");
+        assert_eq!(bounds.len(), 2);
+        assert_eq!(bounds[0]["reason"], "hidden-tree");
+        assert_eq!(bounds[1]["detail"], "contains build/pkg/pubspec.yaml");
 
         let mut json = Vec::new();
         write_json(&mut json, &listing).expect("json");
@@ -359,8 +353,8 @@ mod tests {
     }
 
     /// End to end: a bare tree with one package inventories clean (the
-    /// captured stdout picks the machine face); a tree with no universe
-    /// above it is the usage tier with navigation text.
+    /// constant lon default); a tree with no universe above it is the
+    /// usage tier with navigation text.
     #[test]
     fn run_entry_tiers_over_real_trees() {
         let root = std::env::temp_dir().join(format!("dqs-pkgs-ok-{}", std::process::id()));

@@ -693,14 +693,14 @@ mod tests {
         );
 
         let json = explain_answer(&engine, "Animal", Verbosity::Compact).expect("explain answer");
-        assert_eq!(json["symbol"], "Animal");
+        assert_eq!(json["sym"], "Animal");
         // The dependency rows enumerate the live importers only: dog's
         // library retired, the test library's row survives — the dead
         // slot's name (and its row) are gone, never a mislabel.
         let root = root.canonicalize().expect("canonical root");
         let animal_test = root.join("test/animal_test.dart").display().to_string();
         assert_eq!(
-            json["dependencies"],
+            json["deps"],
             json!([{ "path": animal_test }]),
             "the retired importer's row is gone, the live one intact"
         );
@@ -746,23 +746,24 @@ mod tests {
         )
         .expect("schema-valid at the producing tier");
 
-        assert_eq!(json["schema_version"], 1);
-        assert_eq!(json["symbol"], "Dog");
+        assert_eq!(json["v"], 1);
+        assert_eq!(json["sym"], "Dog");
         assert_eq!(
             json["declaration"],
             json!({
                 "file": dog,
                 "name": "Dog",
                 "kind": "class",
-                "range": [offset(DOG, "Dog"), offset(DOG, "Dog") + 3],
+                "off": offset(DOG, "Dog"),
+                "len": 3,
             })
         );
         assert_eq!(
-            json["inheritance"],
+            json["bases"],
             json!([{"name": "Animal", "file": animal, "clause": "extends"}])
         );
         assert_eq!(
-            json["interfaces"],
+            json["ifaces"],
             json!([
                 {"name": "Loyal", "file": animal, "clause": "with"},
                 {"name": "Pet", "file": animal, "clause": "implements"},
@@ -770,31 +771,31 @@ mod tests {
             "the with/implements edges, each naming its clause"
         );
         assert_eq!(
-            json["constructors"],
+            json["ctors"],
             json!([
-                {"name": "Dog", "kind": "constructor", "signature": "Dog()"},
-                {"name": "Dog.named", "kind": "constructor", "signature": "Dog.named()"},
+                {"name": "Dog", "kind": "constructor", "sig": "Dog()"},
+                {"name": "Dog.named", "kind": "constructor", "sig": "Dog.named()"},
             ]),
             "the unnamed face under the container's own name, the selector under A.named"
         );
         assert_eq!(
             json["methods"],
-            json!([{"name": "bark", "kind": "method", "range": [offset(DOG, "bark"), offset(DOG, "bark") + 4]}])
+            json!([{"name": "bark", "kind": "method", "off": offset(DOG, "bark"), "len": 4}])
         );
         assert_eq!(
-            json["references"],
+            json["refs"],
             json!([
-                {"file": dog_test, "kind": "invoked", "range": [offset(TEST, "Dog"), offset(TEST, "Dog") + 3], "qualified": false},
-                {"file": main, "kind": "invoked", "range": [offset(MAIN, "Dog"), offset(MAIN, "Dog") + 3], "qualified": false},
+                {"file": dog_test, "kind": "invoked", "off": offset(TEST, "Dog"), "len": 3, "qualified": false},
+                {"file": main, "kind": "invoked", "off": offset(MAIN, "Dog"), "len": 3, "qualified": false},
             ]),
             "each row names its use site's file, label-projection order (`/` sorts before `p` in `package:` labels)"
         );
         assert_eq!(
-            json["dependencies"],
+            json["deps"],
             json!([{"path": dog_test}, {"path": main}]),
             "the libraries that import dog.dart, label-projection order"
         );
-        assert_eq!(json["affected_tests"], json!([{"path": dog_test}]));
+        assert_eq!(json["tests"], json!([{"path": dog_test}]));
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -808,30 +809,24 @@ mod tests {
             .expect("explain run");
         let root = root.canonicalize().expect("root");
 
-        assert_eq!(json["symbol"], "Dog");
+        assert_eq!(json["sym"], "Dog");
         assert_eq!(json["declaration"]["name"], "Dog", "the red line stays");
         assert!(json["declaration"].get("container").is_none());
         for section in [
-            "inheritance",
-            "interfaces",
-            "constructors",
-            "methods",
-            "references",
-            "dependencies",
-            "affected_tests",
+            "bases", "ifaces", "ctors", "methods", "refs", "deps", "tests",
         ] {
             assert!(json.get(section).is_none(), "{section} is dropped");
         }
         assert_eq!(
             json["counts"],
             json!({
-                "inheritance": 1,
-                "interfaces": 2,
-                "constructors": 2,
+                "bases": 1,
+                "ifaces": 2,
+                "ctors": 2,
                 "methods": 1,
-                "references": 2,
-                "dependencies": 2,
-                "affected_tests": 1,
+                "refs": 2,
+                "deps": 2,
+                "tests": 1,
             })
         );
 
@@ -854,13 +849,13 @@ mod tests {
             "compact carries no counts section"
         );
         mutated["counts"] = json!({
-            "inheritance": 1,
-            "interfaces": 2,
-            "constructors": 2,
+            "bases": 1,
+            "ifaces": 2,
+            "ctors": 2,
             "methods": 1,
-            "references": 2,
-            "dependencies": 2,
-            "affected_tests": 1,
+            "refs": 2,
+            "deps": 2,
+            "tests": 1,
         });
         let text = serde_json::to_string(&mutated).expect("serialize");
         let violation = dartq_schema::validate_at_tier(
@@ -886,16 +881,16 @@ mod tests {
             .expect("explain run");
         let root = root.canonicalize().expect("root");
 
-        assert_eq!(json["schema_version"], 1);
-        assert_eq!(json["symbol"], "Nope");
+        assert_eq!(json["v"], 1);
+        assert_eq!(json["sym"], "Nope");
         assert!(json.get("declaration").is_none());
-        assert_eq!(json["inheritance"], json!([]));
-        assert_eq!(json["interfaces"], json!([]));
-        assert_eq!(json["constructors"], json!([]));
+        assert_eq!(json["bases"], json!([]));
+        assert_eq!(json["ifaces"], json!([]));
+        assert_eq!(json["ctors"], json!([]));
         assert_eq!(json["methods"], json!([]));
-        assert_eq!(json["references"], json!([]));
-        assert_eq!(json["dependencies"], json!([]));
-        assert_eq!(json["affected_tests"], json!([]));
+        assert_eq!(json["refs"], json!([]));
+        assert_eq!(json["deps"], json!([]));
+        assert_eq!(json["tests"], json!([]));
         assert!(
             json.get("counts").is_none(),
             "counts are a minimal-tier field"
@@ -915,10 +910,10 @@ mod tests {
         let json = explain(&root, Some(&root.join("sdk")), "Cat", Verbosity::Compact)
             .expect("explain run");
         assert_eq!(
-            json["constructors"],
+            json["ctors"],
             json!([
-                {"name": "Cat", "kind": "constructor", "signature": "Cat(String name, {int? lives})"},
-                {"name": "Cat.kitten", "kind": "constructor", "signature": "Cat.kitten()"},
+                {"name": "Cat", "kind": "constructor", "sig": "Cat(String name, {int? lives})"},
+                {"name": "Cat.kitten", "kind": "constructor", "sig": "Cat.kitten()"},
             ]),
             "the unnamed face's captured formals, the redirect's empty list"
         );
@@ -952,17 +947,18 @@ mod tests {
         )
         .expect("explain_diagnostic run");
         assert_eq!(json["diagnostic"]["code"], "unused_import");
-        assert_eq!(json["diagnostic"]["severity"], "WARNING");
+        assert_eq!(json["diagnostic"]["sev"], "WARNING");
         assert_eq!(json["diagnostic"]["file"], file);
+        assert_eq!(json["diagnostic"]["off"], 7);
         assert_eq!(
-            json["diagnostic"]["range"],
-            json!([7, 19]),
+            json["diagnostic"]["len"],
+            12,
             "the unused import's URI-string span (`'dart:async'`)"
         );
         assert_eq!(json["why"]["code_family"], "STATIC_WARNING");
         assert_eq!(json["why"]["trigger_kind"], "unused-family");
         assert_eq!(
-            json["documentation"],
+            json["doc"],
             "https://dart.dev/diagnostics/unused_import"
         );
         assert_eq!(json["related"]["total"], 2, "two unused imports in the run");
@@ -1028,7 +1024,8 @@ mod tests {
             Verbosity::Compact,
         )
         .expect("file selector run");
-        assert_eq!(json["diagnostic"]["range"], json!([7, 19]));
+        assert_eq!(json["diagnostic"]["off"], 7);
+        assert_eq!(json["diagnostic"]["len"], 12);
 
         // The line suffix picks the covering row (line 2 = the
         // `'dart:io'` URI literal).
@@ -1045,7 +1042,8 @@ mod tests {
             Verbosity::Compact,
         )
         .expect("line selector run");
-        assert_eq!(json["diagnostic"]["range"], json!([28, 37]));
+        assert_eq!(json["diagnostic"]["off"], 28);
+        assert_eq!(json["diagnostic"]["len"], 9);
 
         // A code with no row in the run → NoSuchDiagnostic.
         let error = explain_diagnostic(

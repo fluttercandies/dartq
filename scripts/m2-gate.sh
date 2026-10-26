@@ -49,7 +49,7 @@
 # is FATAL; DARTQ_ORACLE_VERSION re-pins the expectation,
 # DARTQ_ORACLE_VERSION_CHECK=off accepts a deliberate off-caliber oracle as
 # a warning), DARTQ_CMD (the dartq side of the harness; default
-# `./target/debug/dartq analyze --format=machine --sdk <fvm default
+# `./target/debug/dartq analyze --format=json --sdk <fvm default
 # dart-sdk>`), DARTQ_HARNESS_ORACLE_TIMEOUT_MS (forwarded to the harness
 # drivers).
 #
@@ -146,7 +146,7 @@ if [ ! -x "$dart_bin" ]; then
   exit 2
 fi
 
-DEFAULT_DARTQ_CMD="./target/debug/dartq analyze --format=machine --sdk $sdk_root"
+DEFAULT_DARTQ_CMD="./target/debug/dartq analyze --format=json --sdk $sdk_root"
 DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
 if [ "$DARTQ_CMD" = "$DEFAULT_DARTQ_CMD" ] && [ ! -x "./target/debug/dartq" ]; then
   echo "m2-gate: ./target/debug/dartq not found — build it first: cargo build -p dartq-cli (or set DARTQ_CMD=<cmd>)" >&2

@@ -34,7 +34,6 @@
 //! `--impacted[=REF]` (run only the suites the changes since REF can reach;
 //! default `HEAD`), `--stats` (one line on stderr saying where suites ran).
 
-use std::collections::BTreeSet;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -694,89 +693,6 @@ fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>, seen: &mut FxHashSet<Pa
     Ok(())
 }
 
-/// Files that differ from `base` in the working tree — committed since,
-/// staged, unstaged, and untracked (not ignored) — relative to `root`.
-/// `None` when there is no repository or `base` does not resolve.
-fn changed_since(root: &Path, base: &str) -> Option<Vec<PathBuf>> {
-    let git = |args: &[&str]| -> Option<Vec<PathBuf>> {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        out.status.success().then(|| {
-            out.stdout.split(|&b| b == 0).filter(|path| !path.is_empty()).map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned())).collect()
-        })
-    };
-    let mut changed = git(&["diff", "--name-only", "-z", "--relative", base, "--"])?;
-    changed.extend(git(&["ls-files", "-z", "--others", "--exclude-standard"])?);
-    Some(changed)
-}
-
-/// The impacted selection: changed `_test.dart` files plus every suite the
-/// semantic impact substrate reports for the changed libraries, as
-/// root-relative spellings. `None` = run the full selection (a change the
-/// graph cannot bound, or no repository to diff).
-fn impacted(root: &Path, base: &str) -> Option<Vec<String>> {
-    let Some(changed) = changed_since(root, base) else {
-        eprintln!("dartq test: cannot diff against {base} (no git repository?) — running everything");
-        return None;
-    };
-    let mut selected: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut sources = Vec::new();
-    for relative in &changed {
-        let path = if relative.is_absolute() { relative.clone() } else { root.join(relative) };
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
-        if matches!(name, "pubspec.yaml" | "pubspec.lock" | "analysis_options.yaml" | "build.yaml" | "dartq.yaml" | "dart_test.yaml")
-            || name.ends_with(".g.dart")
-            || name.ends_with(".freezed.dart")
-            || name.ends_with(".mocks.dart")
-        {
-            eprintln!("dartq test: {} changed — running everything", path.display());
-            return None;
-        }
-        if name.ends_with(".dart") {
-            if name.ends_with("_test.dart") && path.is_file() {
-                selected.insert(path.clone());
-            }
-            sources.push(path);
-        }
-    }
-    if !sources.is_empty() {
-        let tests = (|| -> Result<Vec<PathBuf>, String> {
-            let (mut engine, _dir) = dartq_commands::workspace::open_engine(root, None)
-                .map_err(|error| format!("cannot assemble the workspace: {error}"))?;
-            dartq_commands::analyze::run_overlaid(&mut engine, &[], &[])
-                .map_err(|error| format!("the analysis pass failed: {error}"))?;
-            let mut tests = Vec::new();
-            for seed in &sources {
-                let report = dartq_commands::impact::impact_after_analysis(&engine, seed)
-                    .map_err(|error| format!("{} is outside the analyzed workspace: {error}", seed.display()))?;
-                tests.extend(
-                    report.affected_tests.into_iter().map(|test| PathBuf::from(test.path)).filter(|path| path.is_absolute()),
-                );
-            }
-            Ok(tests)
-        })();
-        match tests {
-            Ok(tests) => selected.extend(tests),
-            Err(reason) => {
-                eprintln!("dartq test: {reason} — running everything");
-                return None;
-            }
-        }
-    }
-    Some(
-        selected
-            .into_iter()
-            .filter_map(|path| path.strip_prefix(root).ok().map(|rel| rel.to_string_lossy().replace('\\', "/")))
-            .filter(|rel| rel.ends_with("_test.dart"))
-            .collect(),
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Verdicts
 // ---------------------------------------------------------------------------
@@ -1096,18 +1012,23 @@ fn run(args: &[String]) -> u8 {
     };
     let print_path = selections.len() > 1 || root.join(spell(&selections[0]).unwrap_or_default()).is_dir();
     if let Some(base) = &inv.impacted {
-        if let Some(reached) = impacted(&root, base) {
-            let reached: FxHashSet<&str> = reached.iter().map(String::as_str).collect();
-            suites.retain(|suite| {
-                suite
-                    .abs
-                    .strip_prefix(&root)
-                    .is_ok_and(|rel| reached.contains(rel.to_string_lossy().replace('\\', "/").as_str()))
-            });
-            if suites.is_empty() {
-                eprintln!("dartq test: no suite is reachable from the changes since {base}");
-                return exit::CLEAN;
+        match dartq_commands::impact::impacted_tests(&root, None, base) {
+            Ok(reached) => {
+                let reached: FxHashSet<&str> = reached.iter().map(String::as_str).collect();
+                suites.retain(|suite| {
+                    suite
+                        .abs
+                        .strip_prefix(&root)
+                        .is_ok_and(|rel| reached.contains(rel.to_string_lossy().replace('\\', "/").as_str()))
+                });
+                if suites.is_empty() {
+                    eprintln!("dartq test: no suite is reachable from the changes since {base}");
+                    return exit::CLEAN;
+                }
             }
+            // The conservative fallback — the shared selection cannot bound
+            // the change, so everything runs.
+            Err(reason) => eprintln!("dartq test: {reason} — running everything"),
         }
     }
     // Suite-level selection: drop what the runner would never load, so

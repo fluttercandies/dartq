@@ -92,7 +92,7 @@ m3_count="$(grep -cv -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$CODES_FILE")"
 command -v jq >/dev/null 2>&1 || { echo "m3-gate: jq is required for the scoring (brew install jq)" >&2; exit 2; }
 sdk_root="${FVM_HOME:-$HOME/fvm}/default/bin/cache/dart-sdk"
 [ -x "$sdk_root/bin/dart" ] || { echo "m3-gate: fvm default dart not found at $sdk_root/bin/dart (install the fvm default pin or set FVM_HOME)" >&2; exit 2; }
-DEFAULT_DARTQ_CMD="./target/debug/dartq analyze --format=machine --sdk $sdk_root"
+DEFAULT_DARTQ_CMD="./target/debug/dartq analyze --format=json --sdk $sdk_root"
 DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
 if [ "$DARTQ_CMD" = "$DEFAULT_DARTQ_CMD" ] && [ ! -x "./target/debug/dartq" ]; then
   echo "m3-gate: ./target/debug/dartq not found — build it first: cargo build -p dartq-cli (or set DARTQ_CMD=<cmd>)" >&2

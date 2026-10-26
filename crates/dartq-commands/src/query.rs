@@ -22,8 +22,8 @@
 //!
 //! The JSON shaper [`to_json`] is the single implementation of the JSON
 //! output face: the CLI's `--format=json` writes it verbatim and the
-//! daemon's `dartq/query` compact verbosity returns it (plus
-//! `schema_version`), so the two faces cannot drift. [`to_json_at_tier`]
+//! daemon's `dartq/query` compact verbosity returns it (plus the `v`
+//! envelope stamp), so the two faces cannot drift. [`to_json_at_tier`]
 //! is the tier-aware spelling of the same envelope — `minimal` keeps the
 //! red-line locators and drops the convenience spellings and the reserved
 //! kind arrays, exactly the canonical tables' query rows; compact and full
@@ -516,7 +516,7 @@ pub struct BatchQuery {
 /// `(item, kind)` pair — [`SymbolRun`] itself, not a new per-item shape,
 /// so a batch answer and the single faces' answer cannot drift.
 pub struct BatchAnswer<'run, 'name> {
-    /// The queried name (the answer envelope's `name`); borrows the request
+    /// The queried name (the answer envelope's `sym`); borrows the request
     /// items, zero-copy past the wire boundary.
     pub name: &'name str,
     /// The kind's own single-query rows over the shared graph.
@@ -560,14 +560,14 @@ pub fn batch_after_analysis<'run, 'name>(
     answers
 }
 
-/// The JSON face: one object — `schema_version`, `name`, and the
-/// `declarations`/`references` arrays carrying the machine rows' fields
-/// (`snake_case`, the metrics-JSON convention). Zero results produce empty
-/// arrays. The `implementations`/`dependencies` arrays ride the answer
-/// only when their kind's rows exist (the frozen v1 reserved slots —
-/// additive, optional, dropped by the daemon's minimal tier). The envelope
-/// is the frozen v1 query contract (dartq-schema's `Domain::Query`), which
-/// requires the `schema_version` key.
+/// The JSON face: one object — `v`, `sym`, and the `decls`/`refs`
+/// arrays carrying the machine rows' short-vocabulary fields. Zero
+/// results produce empty arrays. The `implementations`/`deps` arrays ride
+/// the answer only when their kind's rows exist (the frozen reserved
+/// slots — additive, optional, dropped by the daemon's minimal tier). The
+/// envelope is the query contract (dartq-schema's `Domain::Query`), which
+/// requires the `v` stamp; the queried name rides `sym` (the decl rows'
+/// own `name` field is a row locator and stays).
 ///
 /// # Panics
 ///
@@ -581,11 +581,11 @@ pub fn to_json(run: &SymbolRun<'_>, name: &str) -> serde_json::Value {
 /// The tier-aware spelling of [`to_json`] — the one implementation of the
 /// query JSON face's verbosity axis. `minimal` is the canonical tables'
 /// red line: the declaration rows keep `file` (the stable package-form
-/// label)/`kind`/`name`/`line`/`column`/`length`, the reference rows keep
-/// `target_file`/`kind`/`offset`/`length`; the convenience spellings
+/// label)/`kind`/`name`/`line`/`col`/`len`, the reference rows keep
+/// `target`/`kind`/`off`/`len`; the convenience spellings
 /// (`container`, `qualified`, the use-file column, the element-face
-/// `signature`/`annotations` columns) and the reserved kind arrays
-/// (`implementations`, `dependencies`) drop. `compact` and `full` answer
+/// `sig`/`annotations` columns) and the reserved kind arrays
+/// (`implementations`, `deps`) drop. `compact` and `full` answer
 /// [`to_json`] verbatim (the canonical tables list no full-only extras for
 /// query today).
 #[must_use]
@@ -596,31 +596,31 @@ pub fn to_json_at_tier(
 ) -> serde_json::Value {
     if verbosity == crate::Verbosity::Minimal {
         return json!({
-            "schema_version": crate::SCHEMA_VERSION,
-            "name": name,
-            "declarations": minimal_declaration_rows(run, &run.decls),
-            "references": minimal_reference_rows(run, &run.refs),
+            "v": crate::SCHEMA_VERSION,
+            "sym": name,
+            "decls": minimal_declaration_rows(run, &run.decls),
+            "refs": minimal_reference_rows(run, &run.refs),
         });
     }
     let mut json = json!({
-        "schema_version": crate::SCHEMA_VERSION,
-        "name": name,
-        "declarations": declaration_rows(run, &run.decls),
-        "references": reference_rows(run, &run.refs, name),
+        "v": crate::SCHEMA_VERSION,
+        "sym": name,
+        "decls": declaration_rows(run, &run.decls),
+        "refs": reference_rows(run, &run.refs, name),
     });
     if !run.implementations.is_empty() {
         json["implementations"] = serde_json::to_value(declaration_rows(run, &run.implementations))
             .expect("declaration rows serialize");
     }
     if !run.dependencies.is_empty() {
-        json["dependencies"] =
+        json["deps"] =
             serde_json::to_value(&run.dependencies).expect("dependency rows serialize");
     }
     json
 }
 
-/// The declaration-row shape, shared verbatim by the `declarations` and
-/// `implementations` arrays (the frozen schema's one `DECLARATION_ITEM`),
+/// The declaration-row shape, shared verbatim by the `decls` and
+/// `implementations` arrays (the schema's one declaration-row contract),
 /// plus the additive signature/annotation columns joined from the file's
 /// resident element facts: a member row carries its rendered signature, a
 /// container row its annotations — shapes the facts do not model (a
@@ -639,8 +639,8 @@ fn declaration_rows(run: &SymbolRun<'_>, decls: &[DeclHit<'_>]) -> Vec<serde_jso
                 "kind": decl_kind_name(decl.kind),
                 "name": decl.name,
                 "line": line,
-                "column": column,
-                "length": decl.range.length,
+                "col": column,
+                "len": decl.range.length,
             });
             // The convenience column is omit-on-absent: a top-level row has
             // no container, so the key drops rather than spelling a null.
@@ -649,7 +649,7 @@ fn declaration_rows(run: &SymbolRun<'_>, decls: &[DeclHit<'_>]) -> Vec<serde_jso
             }
             let (signature, annotations) = declaration_extras(engine, decl);
             if let Some(signature) = signature {
-                row["signature"] = json!(signature);
+                row["sig"] = json!(signature);
             }
             if !annotations.is_empty() {
                 row["annotations"] = json!(annotations);
@@ -931,8 +931,8 @@ pub(crate) fn render_formals(
     format!("({})", groups.join(", "))
 }
 
-/// The reference-row shape: the frozen v1 contract plus the optional
-/// use-file and qualified-name columns. The `target_file`/`file` labels
+/// The reference-row shape: the wire contract plus the optional
+/// use-file and qualified-name columns. The `target`/`file` labels
 /// are the stable package-form references (the shared
 /// [`crate::pkg_label::pkg_label`] projection), the sort order above stays
 /// keyed on canonical paths.
@@ -942,11 +942,11 @@ fn reference_rows(run: &SymbolRun<'_>, refs: &[RefHit<'_>], name: &str) -> Vec<s
     refs.iter()
         .map(|reference| {
             let mut row = json!({
-                "target_file": label(reference.target_file),
+                "target": label(reference.target_file),
                 "kind": ref_kind_name(reference.kind),
                 "file": label(reference.file),
-                "offset": reference.range.offset,
-                "length": reference.range.length,
+                "off": reference.range.offset,
+                "len": reference.range.length,
             });
             // The convenience column: the qualified-name spelling,
             // emitted only when an armed import prefix resolved the use
@@ -962,8 +962,8 @@ fn reference_rows(run: &SymbolRun<'_>, refs: &[RefHit<'_>], name: &str) -> Vec<s
 }
 
 /// The minimal tier's declaration rows: the red-line locators only — the
-/// stable package-form `file` label, `kind`, `name`, `line`, `column`,
-/// `length` (the daemon's `dartq/query` minimal shaping, mirrored).
+/// stable package-form `file` label, `kind`, `name`, `line`, `col`,
+/// `len` (the daemon's `dartq/query` minimal shaping, mirrored).
 fn minimal_declaration_rows(run: &SymbolRun<'_>, decls: &[DeclHit<'_>]) -> Vec<serde_json::Value> {
     let packages = run.layout.engine().packages();
     let label = |file| crate::pkg_label::pkg_label(packages, run.layout.file_path(file));
@@ -976,15 +976,15 @@ fn minimal_declaration_rows(run: &SymbolRun<'_>, decls: &[DeclHit<'_>]) -> Vec<s
                 "kind": decl_kind_name(decl.kind),
                 "name": decl.name,
                 "line": line,
-                "column": column,
-                "length": decl.range.length,
+                "col": column,
+                "len": decl.range.length,
             })
         })
         .collect()
 }
 
-/// The minimal tier's reference rows: `target_file`/`kind`/`offset`/
-/// `length` — the qualified spelling and the use-file column are the
+/// The minimal tier's reference rows: `target`/`kind`/`off`/
+/// `len` — the qualified spelling and the use-file column are the
 /// compact tier's contribution (the daemon's minimal shaping, mirrored).
 fn minimal_reference_rows(run: &SymbolRun<'_>, refs: &[RefHit<'_>]) -> Vec<serde_json::Value> {
     let packages = run.layout.engine().packages();
@@ -992,10 +992,10 @@ fn minimal_reference_rows(run: &SymbolRun<'_>, refs: &[RefHit<'_>]) -> Vec<serde
     refs.iter()
         .map(|reference| {
             json!({
-                "target_file": label(reference.target_file),
+                "target": label(reference.target_file),
                 "kind": ref_kind_name(reference.kind),
-                "offset": reference.range.offset,
-                "length": reference.range.length,
+                "off": reference.range.offset,
+                "len": reference.range.length,
             })
         })
         .collect()
@@ -1152,7 +1152,7 @@ mod tests {
         // schema's optional reference-row string.
         let run = symbol(&mut engine, "Foo").expect("query");
         let json = to_json(&run, "Foo");
-        let use_files: Vec<Option<&str>> = json["references"]
+        let use_files: Vec<Option<&str>> = json["refs"]
             .as_array()
             .expect("references array")
             .iter()
@@ -1181,13 +1181,13 @@ mod tests {
 
         let run = symbol(&mut engine, "Foo").expect("query");
         let json = to_json(&run, "Foo");
-        assert_eq!(json["schema_version"], dartq_schema::SCHEMA_VERSION_QUERY);
+        assert_eq!(json["v"], dartq_schema::SCHEMA_VERSION_QUERY);
         // The qualified-name column rides armed-prefix rows only:
         // the bare sites keep the key omitted, the prefixed site spells
         // `<qualifier>.<name>` (the schema's optional string). Rows sort
         // by offset then use path: b (41), then c and d both 43 with the
         // path tiebreak.
-        let qualified: Vec<Option<&str>> = json["references"]
+        let qualified: Vec<Option<&str>> = json["refs"]
             .as_array()
             .expect("references array")
             .iter()
@@ -1294,9 +1294,9 @@ mod tests {
             json, single,
             "the not-found shape is the single-query face's own"
         );
-        assert_eq!(json["name"], "Nope");
-        assert_eq!(json["declarations"].as_array().expect("arrays").len(), 0);
-        assert_eq!(json["references"].as_array().expect("arrays").len(), 0);
+        assert_eq!(json["sym"], "Nope");
+        assert_eq!(json["decls"].as_array().expect("arrays").len(), 0);
+        assert_eq!(json["refs"].as_array().expect("arrays").len(), 0);
 
         fs_remove(&root);
     }
@@ -1438,7 +1438,7 @@ mod tests {
         );
 
         let json = to_json(&run, "Dog");
-        let deps = json["dependencies"].as_array().expect("array");
+        let deps = json["deps"].as_array().expect("array");
         assert_eq!(deps.len(), 1);
         assert_eq!(
             deps[0],
@@ -1454,7 +1454,7 @@ mod tests {
         let run = dependencies(&mut engine, "Animal").expect("query");
         assert!(run.dependencies.is_empty());
         let json = to_json(&run, "Animal");
-        assert!(json.get("dependencies").is_none());
+        assert!(json.get("deps").is_none());
         assert!(dartq_schema::validate(&json.to_string(), dartq_schema::Domain::Query).is_ok());
 
         fs_remove(&root);
@@ -1495,7 +1495,7 @@ mod tests {
             "the consumed symbol rides its library, the bare edge stands alone"
         );
         let json = to_json(&run, "C");
-        let deps = json["dependencies"].as_array().expect("array");
+        let deps = json["deps"].as_array().expect("array");
         assert_eq!(
             deps[0],
             json!({"path": "package:fixture/a.dart", "name": "Unused"})
@@ -1519,9 +1519,9 @@ mod tests {
             let json = to_json(&run, "Nope");
             let single = to_json(&symbol_after_analysis(&engine, "Nope"), "Nope");
             assert_eq!(json, single, "the not-found shape is the symbol face's own");
-            assert_eq!(json["name"], "Nope");
-            assert_eq!(json["declarations"].as_array().expect("arrays").len(), 0);
-            assert_eq!(json["references"].as_array().expect("arrays").len(), 0);
+            assert_eq!(json["sym"], "Nope");
+            assert_eq!(json["decls"].as_array().expect("arrays").len(), 0);
+            assert_eq!(json["refs"].as_array().expect("arrays").len(), 0);
         }
 
         fs_remove(&root);
@@ -1608,9 +1608,9 @@ mod tests {
         let row_for = |engine: &mut Engine, name: &str| {
             let run = symbol(engine, name).expect("query");
             let json = to_json(&run, name);
-            let row = json["declarations"]
+            let row = json["decls"]
                 .as_array()
-                .expect("declarations array")
+                .expect("decls array")
                 .iter()
                 .find(|row| row["name"] == json!(name))
                 .unwrap_or_else(|| panic!("the queried declaration {name}: {json}"))
@@ -1629,7 +1629,7 @@ mod tests {
             json!(["@Deprecated('use Other')"]),
             "the spelled name plus the verbatim argument group"
         );
-        assert!(row.get("signature").is_none());
+        assert!(row.get("sig").is_none());
 
         // The members: every kind's rendered face, the modifier keywords
         // in written order, the formal groups in source shape.
@@ -1642,17 +1642,17 @@ mod tests {
             ("named", "void named({required String s, int n})"),
         ] {
             let row = row_for(&mut engine, name);
-            assert_eq!(row["signature"], json!(expected), "signature of {name}");
+            assert_eq!(row["sig"], json!(expected), "signature of {name}");
             assert!(row.get("annotations").is_none(), "{name} is a member");
         }
 
         // The top-level executable's own face; the unnamed extension
         // member keeps the bare row (no facts face answers it).
         let row = row_for(&mut engine, "top");
-        assert_eq!(row["signature"], json!("int top(int a, {String? b})"));
+        assert_eq!(row["sig"], json!("int top(int a, {String? b})"));
         let row = row_for(&mut engine, "ext");
         assert_eq!(row["kind"], "method");
-        assert!(row.get("signature").is_none(), "no face, no signature key");
+        assert!(row.get("sig").is_none(), "no face, no signature key");
         assert!(row.get("annotations").is_none());
 
         fs_remove(&root);
@@ -1679,17 +1679,17 @@ mod tests {
             )
             .expect("tier-exact at minimal");
             assert!(
-                minimal["declarations"]
+                minimal["decls"]
                     .as_array()
-                    .expect("declarations")
+                    .expect("decls")
                     .iter()
                     .all(|row| row.get("container").is_none()
-                        && row.get("signature").is_none()
+                        && row.get("sig").is_none()
                         && row.get("annotations").is_none()),
                 "locators only: {name}"
             );
             assert!(minimal.get("implementations").is_none());
-            assert!(minimal.get("dependencies").is_none());
+            assert!(minimal.get("deps").is_none());
 
             // Compact and full answer the frozen shape verbatim.
             assert_eq!(

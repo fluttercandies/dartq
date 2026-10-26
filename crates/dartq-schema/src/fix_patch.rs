@@ -32,43 +32,43 @@ static FIX_PATCH_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "title": "dartq fix patch document (schema_version 1)",
         "type": "object",
         "additionalProperties": false,
-        "required": ["file", "schema_version", "edits"],
+        "required": ["file", "v", "edits"],
         "properties": {
-            "schema_version": { "const": SCHEMA_VERSION_FIX_PATCH },
+            "v": { "const": SCHEMA_VERSION_FIX_PATCH },
             "file": { "type": "string" },
             "edits": { "type": "array", "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["offset", "length", "replacement", "source"],
+                "required": ["off", "len", "text", "src"],
                 "properties": {
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "length": { "type": "integer", "minimum": 0 },
-                    "replacement": { "type": "string" },
+                    "off": { "type": "integer", "minimum": 0 },
+                    "len": { "type": "integer", "minimum": 0 },
+                    "text": { "type": "string" },
                     // The provenance tag (`edit_floor`,
                     // crates/dartq-commands/src/fix.rs:744-751): `builtin-lint`
                     // for the built-in rule rows, the plugin's manifest name
                     // for plugin rows. Never dropped — every tier emits it
                     //.
-                    "source": { "type": "string" },
+                    "src": { "type": "string" },
                     // The drift-correction locator: compact/full emit
                     // it, minimal omits it (crate docs, "Verbosity tiers";
                     // fix.rs:766-768, 778-780).
                     "anchor": {
                         "type": "object",
                         "additionalProperties": false,
-                        "required": ["line", "column"],
+                        "required": ["line", "col"],
                         "properties": {
                             "line": { "type": "integer", "minimum": 1 },
-                            "column": { "type": "integer", "minimum": 1 },
+                            "col": { "type": "integer", "minimum": 1 },
                             // Empty at line boundaries; the omission convention.
-                            "context_before": { "type": "string" },
-                            "context_after": { "type": "string" },
+                            "before": { "type": "string" },
+                            "after": { "type": "string" },
                         },
                     },
                     // The full tier's human-name rows (fix.rs:769-772 for
                     // the built-in rows, 781-784 for the plugin rows).
                     "rule": { "type": "string" },
-                    "message": { "type": "string" },
+                    "msg": { "type": "string" },
                     // Plugin rows only ("lower sorts first" — may be
                     // negative, fix.rs:139-141); structural validator, so
                     // the row-kind split is the emitter's obligation.
@@ -84,14 +84,14 @@ static FIX_PATCH_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     })
 });
 
-const PATCH_TOP: &[&str] = &["file", "schema_version", "edits"];
-const EDIT: &[&str] = &["offset", "length", "replacement", "source"];
-const EDIT_OPTIONAL: &[&str] = &["anchor", "rule", "message", "priority", "stale"];
+const PATCH_TOP: &[&str] = &["file", "v", "edits"];
+const EDIT: &[&str] = &["off", "len", "text", "src"];
+const EDIT_OPTIONAL: &[&str] = &["anchor", "rule", "msg", "priority", "stale"];
 
 pub(crate) fn validate_fix_patch(value: &Value) -> Result<(), SchemaViolation> {
     let root = object(value, "")?;
     exact_fields(root, PATCH_TOP, &[], "")?;
-    pinned_version(root, "schema_version", SCHEMA_VERSION_FIX_PATCH)?;
+    pinned_version(root, "v", SCHEMA_VERSION_FIX_PATCH)?;
     string(field(root, "file", "")?, "file")?;
     for (i, row) in rows(root, "edits")? {
         let p = format!("edits[{i}]");
@@ -103,8 +103,8 @@ pub(crate) fn validate_fix_patch(value: &Value) -> Result<(), SchemaViolation> {
         if let Some(rule) = obj.get("rule") {
             string(rule, &join(&p, "rule"))?;
         }
-        if let Some(message) = obj.get("message") {
-            string(message, &join(&p, "message"))?;
+        if let Some(message) = obj.get("msg") {
+            string(message, &join(&p, "msg"))?;
         }
         if let Some(priority) = obj.get("priority") {
             // Signed: "lower sorts first" (fix.rs:139-141), so negatives are
@@ -139,7 +139,7 @@ pub(crate) fn validate_fix_patch_at_tier(
         }
         if tier != Verbosity::Full {
             absent(obj, "rule", &p, tier)?;
-            absent(obj, "message", &p, tier)?;
+            absent(obj, "msg", &p, tier)?;
             absent(obj, "priority", &p, tier)?;
         }
     }
@@ -184,15 +184,15 @@ mod tests {
     fn tiers_reject_higher_tier_fields() {
         let doc = serde_json::json!({
             "file": "lib/foo.dart",
-            "schema_version": SCHEMA_VERSION_FIX_PATCH,
+            "v": SCHEMA_VERSION_FIX_PATCH,
             "edits": [{
-                "offset": 123,
-                "length": 8,
-                "replacement": "Bar",
-                "source": "builtin-lint",
-                "anchor": {"line": 10, "column": 7},
+                "off": 123,
+                "len": 8,
+                "text": "Bar",
+                "src": "builtin-lint",
+                "anchor": {"line": 10, "col": 7},
                 "rule": "unnecessary_new",
-                "message": "Unnecessary 'new' keyword.",
+                "msg": "Unnecessary 'new' keyword.",
                 "priority": 1,
                 "stale": true,
             }],
@@ -213,30 +213,30 @@ mod tests {
         // compact tier names them in turn.
         let no_rule = serde_json::json!({
             "file": "lib/foo.dart",
-            "schema_version": SCHEMA_VERSION_FIX_PATCH,
+            "v": SCHEMA_VERSION_FIX_PATCH,
             "edits": [{
-                "offset": 123,
-                "length": 8,
-                "replacement": "Bar",
-                "source": "fixer",
-                "anchor": {"line": 10, "column": 7},
-                "message": "insert const",
+                "off": 123,
+                "len": 8,
+                "text": "Bar",
+                "src": "fixer",
+                "anchor": {"line": 10, "col": 7},
+                "msg": "insert const",
                 "priority": 1,
             }],
         });
         let violation = validate_fix_patch_at_tier(&no_rule, Verbosity::Compact)
             .expect_err("compact must not carry the message");
-        assert_eq!(violation.path, "edits[0].message");
+        assert_eq!(violation.path, "edits[0].msg");
         assert_eq!(violation.expected, "omitted at the compact tier");
         let no_message = serde_json::json!({
             "file": "lib/foo.dart",
-            "schema_version": SCHEMA_VERSION_FIX_PATCH,
+            "v": SCHEMA_VERSION_FIX_PATCH,
             "edits": [{
-                "offset": 123,
-                "length": 8,
-                "replacement": "Bar",
-                "source": "fixer",
-                "anchor": {"line": 10, "column": 7},
+                "off": 123,
+                "len": 8,
+                "text": "Bar",
+                "src": "fixer",
+                "anchor": {"line": 10, "col": 7},
                 "priority": -1,
             }],
         });
@@ -250,12 +250,12 @@ mod tests {
         // the human names are the trims.
         let minimal = serde_json::json!({
             "file": "lib/foo.dart",
-            "schema_version": SCHEMA_VERSION_FIX_PATCH,
+            "v": SCHEMA_VERSION_FIX_PATCH,
             "edits": [{
-                "offset": 123,
-                "length": 8,
-                "replacement": "Bar",
-                "source": "builtin-lint",
+                "off": 123,
+                "len": 8,
+                "text": "Bar",
+                "src": "builtin-lint",
                 "stale": true,
             }],
         });
@@ -265,30 +265,30 @@ mod tests {
         // signed integer.
         let no_source = serde_json::json!({
             "file": "lib/foo.dart",
-            "schema_version": SCHEMA_VERSION_FIX_PATCH,
-            "edits": [{"offset": 123, "length": 8, "replacement": "Bar"}],
+            "v": SCHEMA_VERSION_FIX_PATCH,
+            "edits": [{"off": 123, "len": 8, "text": "Bar"}],
         });
         let violation = validate_fix_patch(&no_source).expect_err("provenance is required");
-        assert_eq!(violation.path, "edits[0].source");
+        assert_eq!(violation.path, "edits[0].src");
         assert_eq!(violation.found, "missing");
 
         let wrong_types = serde_json::json!({
             "file": "lib/foo.dart",
-            "schema_version": SCHEMA_VERSION_FIX_PATCH,
-            "edits": [{"offset": 123, "length": 8, "replacement": "Bar", "source": 7}],
+            "v": SCHEMA_VERSION_FIX_PATCH,
+            "edits": [{"off": 123, "len": 8, "text": "Bar", "src": 7}],
         });
         let violation = validate_fix_patch(&wrong_types).expect_err("source is a string");
-        assert_eq!(violation.path, "edits[0].source");
+        assert_eq!(violation.path, "edits[0].src");
         assert_eq!(violation.expected, "a string");
 
         let wrong_types = serde_json::json!({
             "file": "lib/foo.dart",
-            "schema_version": SCHEMA_VERSION_FIX_PATCH,
+            "v": SCHEMA_VERSION_FIX_PATCH,
             "edits": [{
-                "offset": 123,
-                "length": 8,
-                "replacement": "Bar",
-                "source": "fixer",
+                "off": 123,
+                "len": 8,
+                "text": "Bar",
+                "src": "fixer",
                 "priority": "high",
             }],
         });

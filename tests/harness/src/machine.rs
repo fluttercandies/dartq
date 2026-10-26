@@ -48,7 +48,10 @@ impl Severity {
     }
 }
 
-/// Output format. machine is the primary differential format; json cross-checks the other documented oracle format.
+/// Output format. The oracle side defaults to machine (json cross-checks
+/// the other documented oracle format); the dartq side is always json —
+/// the CLI's machine face retired (#2606), and its `--format=json` is the
+/// byte-parity oracle envelope this parser already handles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputFormat {
     Machine,

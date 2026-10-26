@@ -1,8 +1,8 @@
 # legs/06-fix-rename.sh — the writing verbs: `dartq fix` (apply is the
 # default) rewrites files in place and records every row's outcome; an
-# anchor made ambiguous by a concurrent edit is refused as `stale` and
-# the on-disk edit survives untouched; `dartq rename --write` applies its
-# edit set and refuses anything outside the workspace.
+# anchor a concurrent edit erases is refused as `stale` and the on-disk
+# edit survives untouched; `dartq rename --write` applies its edit set and
+# refuses anything outside the workspace.
 #
 # fix takes no --sdk flag (its engine comes from $DART_SDK), so this leg
 # exports the stub SDK for its duration.
@@ -22,14 +22,14 @@ legs_06_run() {
 
 int main() => 2;
 "
-  run_dartq_in fix-dry "$base/fx" fix --dry-run --format machine lib
+  run_dartq_in fix-dry "$base/fx" fix --dry-run lib
   assert_eq "$DQ_RC" 0 "the dry run proposes without writing"
-  assert_contains "$(cat "$(out_file fix-dry)")" '"edits"' \
-    "the machine document carries the edit set"
+  assert_contains "$(cat "$(out_file fix-dry)")" 'edits:[' \
+    "the lon document carries the edit set"
   assert_contains "$(cat "$base/fx/lib/main.dart")" "import 'helper.dart';" \
     "the dry run left the file untouched"
 
-  run_dartq_in fix-apply "$base/fx" fix --format machine lib
+  run_dartq_in fix-apply "$base/fx" fix lib
   assert_eq "$DQ_RC" 0 "the apply run exits clean"
   assert_contains "$(cat "$base/fx/lib/main.dart")" "int main() => 2;" \
     "the file was rewritten in place"
@@ -39,44 +39,81 @@ int main() => 2;
   assert_eq "$DQ_RC" 0 "the post-fix tree analyzes clean"
 
   # --- fix: changed-under-us is refused, not clobbered -------------------
-  # The deterministic drift trigger: a duplicate import line makes the
-  # fix's anchor relocation ambiguous (two matching lines), whatever the
-  # timing of the concurrent edit — before the collect (each diagnostic's
-  # anchor ambiguous against the twin line) or between collect and apply
-  # (the one diagnostic's anchor now ambiguous). Either way the outcome is
-  # `stale`, the run stays clean, and the on-disk bytes stay exactly what
-  # the concurrent editor wrote.
+  # The drift-correction contract: an edit whose anchor no longer holds
+  # anywhere in the apply-time text is refused as `stale`, and the bytes
+  # on disk stay exactly what the concurrent editor wrote.
+  #
+  # The concurrent write must land between the collect stage's read of
+  # main.dart and the apply stage's re-read of it. The fixture engineers
+  # that window open: `analysis_options.yaml` excludes lib/src from the
+  # engine pass (the pre-window — spawn, assembly, a two-file engine pass,
+  # the loop's own prefix — measures ~10 ms) while its `linter.rules`
+  # entry keeps the collect loop's enable set non-none, so every filler
+  # file under lib/src is stat+read+parsed by the loop (~0.25 s of
+  # window; the engine itself never touches them). The write at +50 ms
+  # lands well inside both margins. `cannot-ignore` keeps unused_import's
+  # ignore-comment offers out of the set, so the doc's single row is the
+  # mechanical import removal and the byte-exact verdicts below hold. A
+  # missed window (scheduling spike) answers `applied`, never a false
+  # `stale` — up to 4 attempts absorb only jitter; a genuinely broken
+  # drift correction still fails the leg.
   leg_begin fix-stale "a file changed under the fix run is refused as stale, not clobbered"
   make_pkg "$base/st" "st"
+  wf "$base/st/analysis_options.yaml" 'analyzer:
+  exclude:
+    - lib/src
+  cannot-ignore:
+    - unused_import
+linter:
+  rules:
+    - prefer_final_locals
+'
   wf "$base/st/lib/helper.dart" 'int helper() => 1;
 '
   wf "$base/st/lib/main.dart" "import 'helper.dart';
 
 int main() => 2;
 "
-  # Widen the collect→apply window: more files to walk first.
-  gen_files "$base/st" 120
-  "$DARTQ" fix --format machine "$base/st/lib" \
-    >"$EVIDENCE/fix-stale.out" 2>"$EVIDENCE/fix-stale.err" &
-  local fix_pid=$!
-  sleep 0.05
-  # The concurrent edit: the duplicate import line lands mid-run.
-  wf "$base/st/lib/main.dart" "import 'helper.dart';
-import 'helper.dart';
+  gen_files "$base/st" 2500 stalefill 60
+  local attempt=0 stale_rc=0 doc=""
+  while [ "$attempt" -lt 4 ]; do
+    attempt=$((attempt + 1))
+    wf "$base/st/lib/main.dart" "import 'helper.dart';
 
 int main() => 2;
 "
-  local stale_rc=0
-  wait "$fix_pid" || stale_rc=$?
+    "$DARTQ" fix "$base/st/lib" \
+      >"$EVIDENCE/fix-stale-$attempt.out" 2>"$EVIDENCE/fix-stale-$attempt.err" &
+    local fix_pid=$!
+    sleep 0.05
+    # The concurrent edit mid-collect: the unused import's URI changes, so
+    # the row's source slice survives nowhere in the apply-time text — the
+    # anchor is gone, which is the `stale` verdict.
+    wf "$base/st/lib/main.dart" "import 'renamed.dart';
+
+int main() => 2;
+"
+    stale_rc=0
+    wait "$fix_pid" || stale_rc=$?
+    doc="$(cat "$EVIDENCE/fix-stale-$attempt.out")"
+    case "$doc" in *outcome:stale*) break ;; esac
+  done
   assert_eq "$stale_rc" 0 "a stale outcome is data, not a failed run"
-  if grep -q '"stale"' "$EVIDENCE/fix-stale.out"; then
-    ok "the machine document records the stale outcome(s)"
-  else
-    bad "the machine document records the stale outcome(s)" \
-      "out=$(head -c 300 "$EVIDENCE/fix-stale.out") err=$(head -c 200 "$EVIDENCE/fix-stale.err")"
+  if [ "$attempt" -gt 1 ]; then
+    ok "the concurrent edit landed inside the collect-to-apply window (attempt $attempt)"
   fi
-  assert_contains "$(cat "$base/st/lib/main.dart")" "import 'helper.dart';
-import 'helper.dart';" "the concurrent edit's bytes survive (not reverted, not clobbered)"
+  if grep -q 'outcome:stale' "$EVIDENCE/fix-stale-$attempt.out"; then
+    ok "the lon document records the stale outcome"
+  else
+    bad "the lon document records the stale outcome" \
+      "attempts=4 out=$(head -c 300 "$EVIDENCE/fix-stale-4.out") err=$(head -c 200 "$EVIDENCE/fix-stale-4.err")"
+  fi
+  assert_contains "$doc" "summary:{applied:0 stale:1}" \
+    "the run applied nothing: the drifted row was refused whole"
+  assert_eq "$(cat "$base/st/lib/main.dart")" "import 'renamed.dart';
+
+int main() => 2;" \
+    "the concurrent edit's bytes survive (not reverted, not clobbered)"
 
   # --- rename --write: the clean apply ---------------------------------
   leg_begin rename-write "rename --write rewrites both files and prints the record"
@@ -90,7 +127,8 @@ int beta() => alpha();
 "
   run_dartq_in rename-dry "$base/rn" rename "lib/a.dart:1:5" --new-name zulu --sdk "$base/sdk"
   assert_eq "$DQ_RC" 0 "the dry run prints the edit set"
-  assert_contains "$(cat "$(out_file rename-dry)")" '"edits"' "the document carries the edit set"
+  assert_contains "$(cat "$(out_file rename-dry)")" 'new_name:zulu' \
+    "the lon document carries the vocabulary edit set"
   assert_contains "$(cat "$base/rn/lib/a.dart")" "alpha" "the dry run wrote nothing"
   run_dartq_in rename-write "$base/rn" rename "lib/a.dart:1:5" --new-name zulu \
     --sdk "$base/sdk" --write

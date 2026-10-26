@@ -96,7 +96,7 @@ fn print_usage() {
       (keys prefixed with the corpus dir name to stay unambiguous).
       TEMPLATE: whitespace-split argv; {{dir}} is replaced by the corpus dir
       (appended as last arg when absent), e.g.
-      --dartq-cmd \"cargo run -q -p dartq-cli -- check --format=machine\".
+      --dartq-cmd \"cargo run -q -p dartq-cli -- check --format=json\".
       --e2e-oracle: point the dartq side at dart analyze itself (both sides
       identical -> jaccard must be 1.000; strongest comparator self-check).
       Mutually exclusive with --dartq-cmd: e2e would silently win and the
@@ -209,8 +209,9 @@ fn print_usage() {
       assembly. Reports the same P50/P95/P99 shape, comparable against the
       batch arm. SDK root: --sdk PATH > <root>/bin/dart derived from
       --oracle-dart > DART_SDK.
-      token-cost: `dartq check --format=machine` stdout vs `dart analyze
-      --format=machine` stdout on the same corpus, tokenized with the
+      token-cost: `dartq check --format=json` stdout (the oracle-parity
+      envelope) vs `dart analyze --format=machine` stdout on the same corpus,
+      tokenized with the
       chars-per-4 heuristic (pluggable tokenizer trait; cl100k slots in
       behind it); reports both totals and the savings ratio.
       plugin-overhead: the cost the plugin subsystem adds per analyze cycle
@@ -423,11 +424,14 @@ fn run_compare(args: &[String]) -> Result<(String, bool), Outcome> {
     let oracle_side = build_filtered_side(&corpora, &oracle_diags, &filters);
     // Fail before the dartq run: a vacuous oracle side would pass at 1.0 without judging anything
     check_oracle_vacuity(&oracle_side, filters.error_in_scope(), opts.allow_vacuous)?;
-    // The dartq contract is always machine; only the e2e self-check (dartq side = dart analyze itself) follows the oracle format
+    // The dartq contract is the oracle-parity json envelope (`--format=json`,
+    // byte-identical to `dart analyze --format=json`; the CLI's machine face
+    // is retired — `--format=machine` is a usage error there). Only the e2e
+    // self-check (dartq side = dart analyze itself) follows the oracle format.
     let dartq_format = if opts.e2e_oracle {
         opts.oracle_format
     } else {
-        OutputFormat::Machine
+        OutputFormat::Json
     };
     let dartq_driver = build_dartq_driver(&opts, opts.oracle_format)?;
 

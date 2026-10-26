@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# token-cost-bench.sh — Output Token Cost harness: the dartq verbosity tiers
-# vs the official analyzer's machine format under one tokenizer caliber
-# (AI-audit finding G5; the evidence path for the P4 token-economy release
-# gate and the benchmark charter's Output Token Cost metric).
+# token-cost-bench.sh — Output Token Cost harness: the dartq output-format
+# axis (lon default vs json machine face) vs the official analyzer's machine
+# format under one tokenizer caliber (AI-audit finding G5; the evidence path
+# for the P4 token-economy release gate and the benchmark charter's Output
+# Token Cost metric).
 #
 # What it measures
 #
@@ -11,22 +12,23 @@
 # counts tokens with one deterministic caliber, uniform across legs:
 #
 #   corpus (a staged clone — the original tree is never written):
-#     compact : dartq analyze --format=machine --verbosity concise
-#     parity  : dartq analyze --format=machine --verbosity default
-#               (the byte-parity oracle row shape; the intra-tool reference)
-#     full    : dartq analyze --format=machine --verbosity verbose
-#     json    : dartq analyze --format=json
-#     oracle  : dart analyze --format=machine
+#     lon    : dartq analyze --format=lon (the constant default face — the
+#              product's real token cost; short-vocabulary {v diags:[...]})
+#     json   : dartq analyze --format=json (the oracle-parity envelope —
+#              the machine face's successor for jq consumers)
+#     oracle : dart analyze --format=machine
 #
 #   fixture (tests/bench/token-cost/single-error — exactly one diagnostic):
-#     the same five legs through the `check` face (scan+parse; the release
+#     the same three legs through the `check` face (scan+parse; the release
 #     gate's wording names `check`; needs no package context), with the
 #     oracle leg via `dart analyze --format=machine`.
 #
-# Tier semantics: `concise` keeps the identifying severity/type/code+span
-# prefix and drops the message (the compact token tier), `default` is the
-# byte-parity oracle row, `verbose` appends the correctionMessage — the
-# dartq CLI documents this axis as the token-cost sweep's tier axis.
+# Format semantics: `lon` is the canonical LON line over the vocabulary
+# projection — `{v diags:[{code sev file line col len msg doc?}]}`, one flat
+# row per diagnostic (the compact product face); `json` is the frozen
+# single-line oracle envelope (severity/type/code longhand). The CLI's
+# `-v/--verbosity` tiers were retired with the machine face (#2606) — the
+# format axis is the token-cost sweep's tier axis now.
 #
 # Caliber: the benchmark charter leaves the tokenizer unpinned, so the
 # harness uses a deterministic character-level approximation —
@@ -37,12 +39,12 @@
 # verbatim, so any other tokenizer can be re-applied offline.
 #
 # Gates (judged on the fixture, PASS/FAIL lines in summary.md/json):
-#   G1: the fixture's compact output is <= 120 tokens.
-#   G2: the fixture's compact output saves >= 50% vs the oracle machine
+#   G1: the fixture's lon output is <= 120 tokens.
+#   G2: the fixture's lon output saves >= 50% vs the oracle machine
 #       output for the same single-diagnostic content.
-#   The fixture must yield exactly one compact row — anything else is a
+#   The fixture must yield exactly one diagnostic — anything else is a
 #   fixture-integrity error (exit 2), not a gate verdict.
-# Corpus legs gate nothing: they are the per-tier distribution surface
+# Corpus legs gate nothing: they are the per-format distribution surface
 # (tokens, tokens/diag, median, P95, saving vs oracle) behind the
 # benchmark charter's median/P95 metric shape.
 #
@@ -174,13 +176,11 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "  stage: cp -Rc $CORPUS/. -> $OUT/staging/ (clonefile, cp fallback)${MAX_FILES:+; selective copy of files.manifest}"
   echo "    + synthesize staging/{pubspec.yaml,.dart_tool/package_config.json} when the corpus lacks them (self rootUri ../, languageVersion 3.13)"
   echo "  corpus legs on $OUT/staging:"
-  echo "    $dartq_bin analyze --format=machine --verbosity concise --sdk $sdk_desc <staging>"
-  echo "    $dartq_bin analyze --format=machine --verbosity default --sdk $sdk_desc <staging>"
-  echo "    $dartq_bin analyze --format=machine --verbosity verbose --sdk $sdk_desc <staging>"
+  echo "    $dartq_bin analyze --format=lon --sdk $sdk_desc <staging> (the constant default face)"
   echo "    $dartq_bin analyze --format=json --sdk $sdk_desc <staging>"
   echo "    $sdk_desc/bin/dart analyze --format=machine <staging>"
-  echo "  fixture legs (check face) on $FIXTURE: the same five, oracle via dart analyze --format=machine"
-  echo "  gates: G1 fixture compact <= 120 tokens; G2 fixture compact saving >= 50% vs fixture oracle"
+  echo "  fixture legs (check face) on $FIXTURE: the same three, oracle via dart analyze --format=machine"
+  echo "  gates: G1 fixture lon <= 120 tokens; G2 fixture lon saving >= 50% vs fixture oracle"
   echo "  outputs: $OUT/{versions.tsv,stats.txt,raw/,tokens.tsv,tokens-dist.tsv,summary.json,summary.md}"
   exit 0
 fi
@@ -270,25 +270,24 @@ run_leg() { # $1 leg name; rest = command words
 }
 
 echo "token-cost-bench: corpus legs on $STAGE"
-run_leg compact "$DARTQ_BIN" analyze --format=machine --verbosity concise --sdk "$DARTQ_DART_SDK" "$STAGE"
-run_leg parity "$DARTQ_BIN" analyze --format=machine --verbosity default --sdk "$DARTQ_DART_SDK" "$STAGE"
-run_leg full "$DARTQ_BIN" analyze --format=machine --verbosity verbose --sdk "$DARTQ_DART_SDK" "$STAGE"
+run_leg lon "$DARTQ_BIN" analyze --format=lon --sdk "$DARTQ_DART_SDK" "$STAGE"
 run_leg json "$DARTQ_BIN" analyze --format=json --sdk "$DARTQ_DART_SDK" "$STAGE"
 run_leg oracle "$DART" analyze --format=machine "$STAGE"
 
 echo "token-cost-bench: fixture legs on $FIXTURE (check face)"
-run_leg fixture-compact "$DARTQ_BIN" check --format=machine --verbosity concise "$FIXTURE"
-run_leg fixture-parity "$DARTQ_BIN" check --format=machine --verbosity default "$FIXTURE"
-run_leg fixture-full "$DARTQ_BIN" check --format=machine --verbosity verbose "$FIXTURE"
+run_leg fixture-lon "$DARTQ_BIN" check --format=lon "$FIXTURE"
 run_leg fixture-json "$DARTQ_BIN" check --format=json "$FIXTURE"
 run_leg fixture-oracle "$DART" analyze --format=machine "$FIXTURE"
 
 # --- fixture integrity -------------------------------------------------------
 # The gate surface is meaningful only for exactly one diagnostic row; drift
-# here is a fixture bug (infra error), not a gate verdict.
-FIXTURE_ROWS=$(wc -l <"$RAW/fixture-compact.txt" | tr -d ' ')
+# here is a fixture bug (infra error), not a gate verdict. The json leg is
+# the structural witness (the envelope always parses; the machine face is
+# retired and the lon line has no row count of its own in wc terms).
+FIXTURE_ROWS=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("diagnostics", [])))' "$RAW/fixture-json.txt") ||
+  die "fixture json leg did not parse — $FIXTURE run is not trustworthy"
 [ "$FIXTURE_ROWS" -eq 1 ] ||
-  die "fixture produced $FIXTURE_ROWS compact rows (expected exactly 1) — $FIXTURE drifted from the verified single-diagnostic shape; fix the fixture before trusting any gate"
+  die "fixture produced $FIXTURE_ROWS diagnostics (expected exactly 1) — $FIXTURE drifted from the verified single-diagnostic shape; fix the fixture before trusting any gate"
 
 # --- counting, gates, summaries ----------------------------------------------
 status=0
@@ -303,10 +302,11 @@ cpt = int(sys.argv[2])
 raw = out / "raw"
 raw_bytes = {p.name: p.stat().st_size for p in raw.glob("*.txt")}
 
-CORPUS_LEGS = ["compact", "parity", "full", "json", "oracle"]
-FIXTURE_LEGS = ["fixture-compact", "fixture-parity", "fixture-full", "fixture-json", "fixture-oracle"]
+CORPUS_LEGS = ["lon", "json", "oracle"]
+FIXTURE_LEGS = ["fixture-lon", "fixture-json", "fixture-oracle"]
 JSON_LEGS = {"json", "fixture-json"}
-GATE_TOKENS = 120   # the P4 release row's absolute compact ceiling
+LON_LEGS = {"lon", "fixture-lon"}
+GATE_TOKENS = 120   # the P4 release row's absolute lon ceiling
 GATE_SAVING = 50.0  # the P4 release row's relative saving floor
 
 
@@ -314,12 +314,51 @@ def tokens(chars):
     return math.ceil(chars / cpt)
 
 
+def lon_rows(text):
+    """The top-level {..} row objects of the diags array in a LON line.
+
+    LON quotes strings JSON-style; safe atoms (identifiers, numbers) cannot
+    contain braces or brackets, so a quote-aware depth scan splits the array
+    elements exactly. The row substring is measured verbatim (the payload a
+    consumer reads per diagnostic on the lon face).
+    """
+    start = text.find("diags:[")
+    if start < 0:
+        raise ValueError("lon payload has no diags array")
+    i = start + len("diags:[")
+    rows, depth, in_str, esc, row_start = [], 0, False, False, None
+    while i < len(text):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c in "{[":
+            if c == "{" and depth == 0:
+                row_start = i
+            depth += 1
+        elif c in "}]":
+            if c == "]" and depth == 0:
+                break  # end of the diags array
+            depth -= 1
+            if depth == 0 and c == "}":
+                rows.append(text[row_start:i + 1])
+        i += 1
+    return rows
+
+
 def measure(leg):
     """Per-leg totals + per-diagnostic token distribution.
 
     Totals count the whole captured payload (rows, separators, envelope);
     entries are per-diagnostic payloads: machine rows are one line each, the
-    JSON envelope is split into its compact per-diagnostic objects.
+    JSON envelope splits into its compact per-diagnostic objects, the LON
+    line splits into its diags row objects.
     """
     text = (raw / f"{leg}.txt").read_text(encoding="utf-8")
     total_chars = len(text)
@@ -327,6 +366,8 @@ def measure(leg):
         envelope = json.loads(text)
         entries = [json.dumps(d, ensure_ascii=False, separators=(",", ":"))
                    for d in envelope.get("diagnostics", [])]
+    elif leg in LON_LEGS:
+        entries = lon_rows(text)
     else:
         entries = [line for line in text.splitlines() if line]
     dist = [tokens(len(e)) for e in entries]
@@ -387,17 +428,16 @@ with (out / "tokens-dist.tsv").open("w", encoding="utf-8") as f:
         for i, t in enumerate(m["dist"], 1):
             f.write(f"{leg}\t{i}\t\t{t}\n")
 
-compact = legs["fixture-compact"]
-oracle = legs["fixture-oracle"]
+lon = legs["fixture-lon"]
 gates = [
     {"id": "G1",
-     "desc": "single-error fixture compact output <= 120 tokens",
-     "value": compact["tokens"], "threshold": GATE_TOKENS,
-     "pass": compact["tokens"] <= GATE_TOKENS},
+     "desc": "single-error fixture lon output <= 120 tokens",
+     "value": lon["tokens"], "threshold": GATE_TOKENS,
+     "pass": lon["tokens"] <= GATE_TOKENS},
     {"id": "G2",
-     "desc": "single-error fixture compact saving >= 50% vs oracle machine output",
-     "value": compact["saving_pct"], "threshold": GATE_SAVING,
-     "pass": compact["saving_pct"] is not None and compact["saving_pct"] >= GATE_SAVING},
+     "desc": "single-error fixture lon saving >= 50% vs oracle machine output",
+     "value": lon["saving_pct"], "threshold": GATE_SAVING,
+     "pass": lon["saving_pct"] is not None and lon["saving_pct"] >= GATE_SAVING},
 ]
 
 manifest = {}

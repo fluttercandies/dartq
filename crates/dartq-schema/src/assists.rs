@@ -43,24 +43,24 @@ static EDIT_ITEM: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["offset", "length", "replacement", "source"],
+        "required": ["off", "len", "text", "src"],
         "properties": {
-            "offset": { "type": "integer", "minimum": 0 },
-            "length": { "type": "integer", "minimum": 0 },
-            "replacement": { "type": "string" },
-            "source": { "type": "string" },
+            "off": { "type": "integer", "minimum": 0 },
+            "len": { "type": "integer", "minimum": 0 },
+            "text": { "type": "string" },
+            "src": { "type": "string" },
             // The compact tier's drift-correction locator (fix.rs:802,
             // 812-814); minimal omits it.
             "anchor": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["line", "column"],
+                "required": ["line", "col"],
                 "properties": {
                     "line": { "type": "integer", "minimum": 1 },
-                    "column": { "type": "integer", "minimum": 1 },
+                    "col": { "type": "integer", "minimum": 1 },
                     // Empty at line boundaries; the omission convention.
-                    "context_before": { "type": "string" },
-                    "context_after": { "type": "string" },
+                    "before": { "type": "string" },
+                    "after": { "type": "string" },
                 },
             },
         },
@@ -74,20 +74,20 @@ static ASSISTS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "title": "dartq assists document (schema_version 1)",
         "type": "object",
         "additionalProperties": false,
-        "required": ["file", "schema_version", "assists"],
+        "required": ["file", "v", "assists"],
         "properties": {
-            "schema_version": { "const": SCHEMA_VERSION_ASSISTS },
+            "v": { "const": SCHEMA_VERSION_ASSISTS },
             "file": { "type": "string" },
             "assists": { "type": "array", "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["message", "source", "edits"],
+                "required": ["msg", "src", "edits"],
                 "properties": {
                     // The row title rides every tier (assists_json removes
                     // only the priority at minimal, fix.rs:824-828).
-                    "message": { "type": "string" },
+                    "msg": { "type": "string" },
                     // The provenance tag: the plugin's manifest name.
-                    "source": { "type": "string" },
+                    "src": { "type": "string" },
                     // Signed ("lower sorts first", fix.rs:139-141);
                     // structural validator, so sign legality is the
                     // emitter's obligation.
@@ -100,34 +100,34 @@ static ASSISTS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "errors": { "type": "array", "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["plugin", "message"],
+                "required": ["plugin", "msg"],
                 "properties": {
                     "plugin": { "type": "string" },
-                    "message": { "type": "string" },
+                    "msg": { "type": "string" },
                 },
             }},
         },
     })
 });
 
-const ASSISTS_TOP: &[&str] = &["file", "schema_version", "assists"];
+const ASSISTS_TOP: &[&str] = &["file", "v", "assists"];
 const ASSISTS_ERROR: &[&str] = &["errors"];
-const ASSIST: &[&str] = &["message", "source", "edits"];
+const ASSIST: &[&str] = &["msg", "src", "edits"];
 const ASSIST_OPTIONAL: &[&str] = &["priority"];
-const EDIT: &[&str] = &["offset", "length", "replacement", "source"];
+const EDIT: &[&str] = &["off", "len", "text", "src"];
 const EDIT_OPTIONAL: &[&str] = &["anchor"];
 
 pub(crate) fn validate_assists(value: &Value) -> Result<(), SchemaViolation> {
     let root = object(value, "")?;
     exact_fields(root, ASSISTS_TOP, ASSISTS_ERROR, "")?;
-    pinned_version(root, "schema_version", SCHEMA_VERSION_ASSISTS)?;
+    pinned_version(root, "v", SCHEMA_VERSION_ASSISTS)?;
     string(field(root, "file", "")?, "file")?;
     for (i, row) in rows(root, "assists")? {
         let p = format!("assists[{i}]");
         let obj = object(row, &p)?;
         exact_fields(obj, ASSIST, ASSIST_OPTIONAL, &p)?;
-        string(field(obj, "message", &p)?, &join(&p, "message"))?;
-        string(field(obj, "source", &p)?, &join(&p, "source"))?;
+        string(field(obj, "msg", &p)?, &join(&p, "msg"))?;
+        string(field(obj, "src", &p)?, &join(&p, "src"))?;
         if let Some(priority) = obj.get("priority") {
             // Signed: "lower sorts first" (fix.rs:139-141), so negatives
             // are legal — the shared `integer` helper is non-negative only.
@@ -149,9 +149,9 @@ pub(crate) fn validate_assists(value: &Value) -> Result<(), SchemaViolation> {
     for (i, error) in rows_optional(root, "errors")? {
         let p = format!("errors[{i}]");
         let error = object(error, &p)?;
-        exact_fields(error, &["plugin", "message"], &[], &p)?;
+        exact_fields(error, &["plugin", "msg"], &[], &p)?;
         string(field(error, "plugin", &p)?, &join(&p, "plugin"))?;
-        string(field(error, "message", &p)?, &join(&p, "message"))?;
+        string(field(error, "msg", &p)?, &join(&p, "msg"))?;
     }
     Ok(())
 }
@@ -191,17 +191,17 @@ mod tests {
     fn document() -> serde_json::Value {
         json!({
             "file": "lib/foo.dart",
-            "schema_version": SCHEMA_VERSION_ASSISTS,
+            "v": SCHEMA_VERSION_ASSISTS,
             "assists": [{
-                "message": "Wrap in StatefulWidget",
-                "source": "assistant",
+                "msg": "Wrap in StatefulWidget",
+                "src": "assistant",
                 "priority": 1,
                 "edits": [{
-                    "offset": 19,
-                    "length": 4,
-                    "replacement": "StatefulWidget",
-                    "source": "assistant",
-                    "anchor": {"line": 2, "column": 16},
+                    "off": 19,
+                    "len": 4,
+                    "text": "StatefulWidget",
+                    "src": "assistant",
+                    "anchor": {"line": 2, "col": 16},
                 }],
             }],
         })
@@ -231,11 +231,11 @@ mod tests {
         assert_eq!(schema_keys(edit), const_names_from(EDIT, EDIT_OPTIONAL));
         assert_eq!(
             schema_keys(&edit["properties"]["anchor"]),
-            const_names(&["column", "context_after", "context_before", "line"])
+            const_names(&["col", "after", "before", "line"])
         );
         assert_eq!(
             schema_keys(&assists["properties"]["errors"]["items"]),
-            const_names(&["message", "plugin"])
+            const_names(&["msg", "plugin"])
         );
     }
 
@@ -263,18 +263,18 @@ mod tests {
 
         let minimal = json!({
             "file": "lib/foo.dart",
-            "schema_version": SCHEMA_VERSION_ASSISTS,
+            "v": SCHEMA_VERSION_ASSISTS,
             "assists": [{
-                "message": "Wrap in StatefulWidget",
-                "source": "assistant",
+                "msg": "Wrap in StatefulWidget",
+                "src": "assistant",
                 "edits": [{
-                    "offset": 19,
-                    "length": 4,
-                    "replacement": "StatefulWidget",
-                    "source": "assistant",
+                    "off": 19,
+                    "len": 4,
+                    "text": "StatefulWidget",
+                    "src": "assistant",
                 }],
             }],
-            "errors": [{"plugin": "offline", "message": "manifest not found"}],
+            "errors": [{"plugin": "offline", "msg": "manifest not found"}],
         });
         assert!(validate_assists_at_tier(&minimal, Verbosity::Minimal).is_ok());
     }
@@ -286,15 +286,15 @@ mod tests {
     fn unknown_fields_and_wrong_types_are_named() {
         let violation = validate_assists(&json!({
             "file": "lib/foo.dart",
-            "schema_version": SCHEMA_VERSION_ASSISTS,
+            "v": SCHEMA_VERSION_ASSISTS,
             "assists": [{
-                "message": "Wrap in StatefulWidget",
-                "source": "assistant",
+                "msg": "Wrap in StatefulWidget",
+                "src": "assistant",
                 "edits": [{
-                    "offset": 19,
-                    "length": 4,
-                    "replacement": "StatefulWidget",
-                    "source": "assistant",
+                    "off": 19,
+                    "len": 4,
+                    "text": "StatefulWidget",
+                    "src": "assistant",
                     "rule": "unnecessary_new",
                 }],
             }],
@@ -304,10 +304,10 @@ mod tests {
 
         let wrong = json!({
             "file": "lib/foo.dart",
-            "schema_version": SCHEMA_VERSION_ASSISTS,
+            "v": SCHEMA_VERSION_ASSISTS,
             "assists": [{
-                "message": "Wrap in StatefulWidget",
-                "source": "assistant",
+                "msg": "Wrap in StatefulWidget",
+                "src": "assistant",
                 "priority": "high",
                 "edits": [],
             }],

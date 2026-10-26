@@ -87,7 +87,7 @@ jobs:
             --corpus-dir tests/corpus/m0 \
             --manifest "$BENCH_OUT/edit-manifest.json" \
             --metric rss-100k --metric incremental-p95 --metric token-cost --metric cold \
-            --dartq-cmd "./target/release/dartq check --format=machine" \
+            --dartq-cmd "./target/release/dartq check --format=json" \
             --oracle-dart "$ORACLE_DART" \
             --with-oracle \
             --out "$BENCH_OUT"

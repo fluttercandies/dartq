@@ -2,46 +2,58 @@
 
 ## Face Selection
 
-Every output-bearing verb resolves `--format` from the terminal shape when
-the flag is absent. An explicit flag always wins — a piped
-`--format machine` stays machine; deterministic pipelines never flip.
+Every output-bearing verb carries one `--format <lon|json|text>` axis whose
+default is the constant `lon` — never the terminal's shape, so a piped run
+and a TTY run print the same bytes. An invalid spelling is the usage error
+(exit 64).
 
-| Verb | TTY face | Piped face (agent default) | `--format` values |
+| Verb | `lon` (default) | `json` | `text` |
 | --- | --- | --- | --- |
-| `analyze` | human groups | JSON envelope | `machine`, `default`, `json` |
-| `query` (all faces) | machine rows | JSON lines | `machine`, `json` |
-| `explain` | JSON (report's only format) | JSON | `json` |
-| `impact` | tier-invariant report | same | (none — shape is fixed) |
-| `rename` | machine edit set | same | (none) |
-| `fix` | human listing | JSON documents | `default`, `machine` |
-| `packages` | aligned table | `PKG`/`BOUNDARY` rows | `human`, `machine`, `json` |
-| `resolve` / `complete` | machine rows | JSON | `machine`, `json` |
-| `session` / `events` | JSON lines | JSON lines | (none) |
+| `analyze` | `{v diags:[…]}` document | oracle envelope (byte parity with `dart analyze --format=json`) | grouped human listing |
+| `query` (all faces) | the vocabulary answer, one line per row set | frozen v1 envelope | indented projection |
+| `explain` | the vocabulary report | frozen v1 report | indented projection |
+| `impact` / `compat` | the vocabulary report | frozen v1 report | indented projection |
+| `rename` | `{v … new_name edits:[{file off len}]}` | frozen document | indented projection |
+| `fix` / `assists` | the vocabulary patch documents, one line per file | frozen documents | the human listing |
+| `packages` | `{v root cfg? pkgs bounds}` | one JSON object per line | aligned table + hints |
+| `resolve` / `complete` | the vocabulary answer envelope | the daemon envelope | indented projection |
+| `session` / `events` | one vocabulary row per line | one JSON row per line | identity lines / indented rows |
+| `debug` | the daemon answer projected, one line | the answer verbatim | indented `status`; other faces ride lon |
 
 Diagnostic lines go to stdout only; usage and internal failures report on
 stderr and keep stdout empty.
 
-## analyze: the Machine Row
+## The lon Face and the Field Vocabulary
 
-`--format machine` prints one row per diagnostic, the byte-parity
-differential face:
+`lon` is canonical [Language Object Notation v1] — the JSON data model with
+record tables (`{users:[id name;1 Ada;2 Bob]}`), quote-free safe strings,
+and no commas between bare array items. The lon face prints the answer's
+fields through the short snake_case vocabulary (the same word list the
+daemon's `dartq/*` answers and the MCP content payloads carry):
 
-```
-SEVERITY|TYPE|CODE|FILE|LINE|COL|LENGTH|MESSAGE
-```
+`v` (schema_version) · `diags` · `sev` · `msg` · `doc` · `sym` · `decls` ·
+`refs` · `deps` · `off` · `len` · `col` · `sig` · `target` · `files` ·
+`tests` · `envs` · `lines` · `sig_changed` · `bases` · `ifaces` · `ctors` ·
+`new_name` · `age_s` · `stale_binary` · `text` · `src` · `before` ·
+`after` · `ts` · `decl_kind` · `pkgs` · `bounds` · `cfg` · `isolates` ·
+`main` · `bps` · `session_id`
 
-`--format json` prints one single-line envelope — byte parity with
-`dart analyze --format=json` (`version` key; advisories ride stderr).
+The json face keeps the long frozen spellings (`schema_version`,
+`declarations`, `references`, …) — jq consumers and the schema contracts
+are untouched.
 
-## analyze: Row Verbosity (`-v`)
+[Language Object Notation v1]: https://github.com/fluttercandies/lon/blob/main/spec/lon-v1.md
 
-Affects the machine face only; `default`/`json` faces are unchanged.
+## analyze: the Three Faces
 
-| Tier | Row shape |
-| --- | --- |
-| `concise` | severity/type/code + span prefix; the message field drops |
-| `default` | the oracle machine row verbatim |
-| `verbose` | the row plus `correctionMessage` as a ninth field (`-` when absent) |
+- `lon` (default): `{v:1 diags:[{code sev file line col len msg doc?}]}` —
+  one document, one flat row per diagnostic (`sev` is `ERROR`/`WARNING`/
+  `INFO`, `doc` the published docs URL when the registry marks one);
+  workspace advisories ride stderr as `Info • code • message` lines.
+- `json`: one single-line envelope — byte parity with
+  `dart analyze --format=json` (`version` key; advisories ride stderr).
+- `text`: diagnostics grouped by file, `sev code line:col msg` rows, the
+  count tail (`No issues found!` / `N issues found.`).
 
 ## Report Verbosity (`-v`) on query / explain / impact / compat
 
@@ -68,13 +80,13 @@ tiers emit the same bytes.
 | `--enable-experiment NAME[,NAME...]` | language experiments (dartdev spelling) |
 | `--no-plugins` | skip `analysis_options.yaml` plugin loading |
 
-## Query Row Grammar (machine)
+## Query Row Shapes
 
-- `DECL|file|container|kind|name|line|col|length` — a declaration row
-- `REF|...` — a resolved reference row (kinded on `references`/`callers`)
-- `implementations` / `dependencies` carry their own reserved row families
-  (IMPL/DEP), which never print at `minimal`
+The lon answer is `{v sym decls refs}` — decl rows
+`{file kind name container? line col len sig?}`, ref rows
+`{file kind off len target qualified?}` (`implementations` / `dependencies`
+carry their own arrays, which never print at `minimal`).
 
-`resolve`/`complete` answer `MISS` / an empty candidate set on an uncovered
-position (a non-identifier, an unresolved use, a past-end offset) — never
-an error.
+`resolve`/`complete` answer a null `hit` / an empty candidate set on an
+uncovered position (a non-identifier, an unresolved use, a past-end offset)
+— never an error.

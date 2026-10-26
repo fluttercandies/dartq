@@ -1,11 +1,13 @@
 //! The typed wire-shape vocabulary of the daemon's protocol surface: the
-//! value shapes (position, range, diagnostic) the diagnostic rows and
+//! value shapes (position, range, diagnostic) the diagnostic rows and the
 //! plugin findings carry, the `dartq/diagnostics` push params, and the
 //! `dartq/analyze` pull face — its entry type, the engine-diagnostic
-//! conversion, and the frozen v1 row/envelope builders. Positions are
+//! conversion, and the frozen v1 row/envelope builders. Push positions are
 //! zero-based lines with UTF-16 code-unit columns — the same UTF-16
-//! convention dartq spans already use; everything else about the protocol
-//! stays untyped [`serde_json::Value`].
+//! convention dartq spans already use; the pull rows flatten to the
+//! compact vocabulary (`code`/`sev`/`file`/`line`/`col`/`len`/`msg`,
+//! 1-based position, lowercase severity word). Everything else about the
+//! protocol stays untyped [`serde_json::Value`].
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -40,7 +42,6 @@ pub struct Range {
 /// One `dartq/diagnostics` entry. Only the fields dartq produces are
 /// modeled; the field set is closed on purpose.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Diagnostic {
     pub range: Range,
     /// 1 Error · 2 Warning · 3 Information.
@@ -51,14 +52,30 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+/// The compact vocabulary's severity word: 1 `error` · 2 `warning` ·
+/// 3 `info` (the pull rows' `sev` value; the push face keeps its 1/2/3
+/// scale).
+#[must_use]
+pub fn severity_word(severity: u8) -> &'static str {
+    match severity {
+        1 => "error",
+        2 => "warning",
+        _ => "info",
+    }
+}
+
 /// One `dartq/analyze` entry: the diagnostic flattened next to its
 /// document URI (the pull face returns the whole workspace, so every entry
-/// must carry its document).
-#[derive(Debug, Clone, Serialize)]
+/// must carry its document) plus the span's UTF-16 length — the quantity
+/// the flattened row's `len` carries, which the zero-based position pair
+/// alone cannot recover for a multi-line span.
+#[derive(Debug, Clone)]
 pub struct AnalyzeEntry {
     pub uri: String,
-    #[serde(flatten)]
     pub diagnostic: Diagnostic,
+    /// `range.end − range.start` in UTF-16 code units; carried for the
+    /// pull row builder, never serialized.
+    pub len: u32,
 }
 
 /// Converts one engine diagnostic to the wire shape over the engine's read
@@ -107,18 +124,25 @@ pub fn convert(engine: &Engine, diagnostic: &dartq_diagnostics::Diagnostic) -> O
     })
 }
 
-/// One compact/full `dartq/analyze` row: the entry's own serialization —
-/// the single source of the row bytes the pull face serves (the minimal
-/// tier builds its reduced row at the call site, `analyze_answer` in the
-/// commands module).
-///
-/// # Panics
-///
-/// Panics when the entry serialization fails — an internal invariant
-/// breach (`AnalyzeEntry` is schema-pinned and always serializes).
+/// One compact/full `dartq/analyze` row: the entry flattened to the
+/// compact vocabulary — `{code, sev, file, line, col, len, msg}` — the
+/// single source of the row bytes the pull face serves (the minimal tier
+/// builds its reduced row at the call site, `analyze_answer` in the
+/// commands module). `line`/`col` are 1-based (the push face's zero-based
+/// convention plus one); `doc` (the diagnostic's documentation) has no
+/// daemon-side source and the key is omitted entirely when absent.
 #[must_use]
 pub fn row(entry: &AnalyzeEntry) -> Value {
-    serde_json::to_value(entry).expect("analyze entry serializes")
+    let diagnostic = &entry.diagnostic;
+    json!({
+        "code": diagnostic.code,
+        "sev": severity_word(diagnostic.severity),
+        "file": entry.uri,
+        "line": diagnostic.range.start.line + 1,
+        "col": diagnostic.range.start.character + 1,
+        "len": entry.len,
+        "msg": diagnostic.message,
+    })
 }
 
 /// The frozen v1 envelope: the version stamp over the rows. `symbols` is
@@ -127,5 +151,5 @@ pub fn row(entry: &AnalyzeEntry) -> Value {
 /// `session_answer` adds it at the full tier.
 #[must_use]
 pub fn envelope(rows: &[Value]) -> Value {
-    json!({ "schema_version": SCHEMA_VERSION, "diagnostics": rows })
+    json!({ "v": SCHEMA_VERSION, "diags": rows })
 }

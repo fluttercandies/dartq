@@ -27,16 +27,18 @@
 //!   overlays, the daemon edit shape, and each step is one `analyze` pass,
 //!   no process restart). Reports the same P50/P95/P99 shape over the same
 //!   step set, comparable against the batch arm.
-//! - `token-cost`: `dartq check --format=machine` stdout vs
+//! - `token-cost`: `dartq check --format=json` stdout (the oracle-parity
+//!   envelope — the CLI's machine face is retired, #2606) vs
 //!   `dart analyze --format=machine` stdout on the same corpus, tokenized
 //!   with a pluggable [`Tokenizer`] (v1: the `chars-per-4` heuristic; a real
 //!   BPE such as cl100k slots in behind the same trait). Reports both totals
-//!   and the savings ratio, plus the per-file distribution (machine lines
-//!   grouped by their file field): median + P95 (nearest-rank) per side.
-//!   The verbosity-tier dimension is recorded honestly: the driven faces
-//!   (check/analyze machine output) are fixed-tier today — the CLI's `-v`
-//!   lives only on `explain` — so the report carries `tiers: ["fixed"]`
-//!   instead of inventing flags; real tiers are swept where they exist.
+//!   and the savings ratio, plus the per-file distribution (the oracle's
+//!   machine lines grouped by their file field; the dartq side's envelope
+//!   rows grouped by `location.file`): median + P95 (nearest-rank) per side.
+//!   The verbosity-tier dimension is recorded honestly: the driven faces are
+//!   fixed-tier (the `-v` tiers were retired with the machine face) — the
+//!   report carries `tiers: ["fixed"]`; the lon/json format-axis sweep lives
+//!   in `scripts/token-cost-bench.sh`.
 //! - `plugin-overhead`: the cost the plugin subsystem adds per analyze cycle
 //!   — per-cycle wall time of one feed+drain round trip
 //!   against a live plugin host (the `samples/compat` compatibility plugin,
@@ -109,7 +111,7 @@ use crate::oracle::{driver_timeout_from_env, run_captured};
 
 const DEFAULT_CORPUS: &str = "tests/corpus/m0";
 const DEFAULT_OUT: &str = "target/evidence/bench";
-const DEFAULT_DARTQ_CMD: &str = "cargo run -q -p dartq-cli -- check --format=machine";
+const DEFAULT_DARTQ_CMD: &str = "cargo run -q -p dartq-cli -- check --format=json";
 /// Tree-RSS watchdog threshold: 8 GiB in KiB (memory-incident discipline —
 /// the collector carries the same guard the serial phase runs under).
 const WATCHDOG_THRESHOLD_KIB: u64 = 8 * 1024 * 1024;
@@ -159,7 +161,7 @@ throughput — cite only large-corpus ratios as milestone evidence";
 /// The engine-face driver template (`cache-hit-rate` / `snapshot-size`): the
 /// trace sink and the content store are wired only on the `analyze` path
 /// (`analyze_plain` in dartq-cli) — `check` bypasses the engine entirely.
-const DEFAULT_ANALYZE_CMD: &str = "cargo run -q -p dartq-cli -- analyze --format=machine";
+const DEFAULT_ANALYZE_CMD: &str = "cargo run -q -p dartq-cli -- analyze --format=json";
 /// The startup driver template: the light CLI face in the json format — the
 /// envelope is always emitted even with zero diagnostics, so spawn → first
 /// stdout byte is measurable on any corpus (machine writes nothing when
@@ -201,23 +203,25 @@ analyze face); snapshot generations under <root>/snapshots are written by \
 the daemon session face and do not occur in a CLI-only run";
 
 /// The verbosity-tier surface of the faces the token-cost metric drives
-/// (#801): `check`/`analyze` machine output is fixed-tier today — the CLI's
-/// `-v` lives only on `explain` — so the sweep is the single fixed tier.
-/// Real tiers (`minimal`/`compact`/`full`) are swept where a driven face
-/// actually accepts them; none of the driven faces do, and no flags are
-/// invented to pretend otherwise.
+/// (#801, re-pinned #2606): `check`/`analyze` output is fixed-tier — the
+/// CLI's `-v` tiers were retired with the machine face, so the sweep is the
+/// single fixed tier. The daemon faces keep their `verbosity` param
+/// (minimal/compact/full); that tier family is swept where a driven face
+/// actually accepts it, and no CLI flags are invented to pretend otherwise.
 const FIXED_TIERS: [&str; 1] = ["fixed"];
 
 /// The verbatim tier definitions riding every token-cost report (the input
-/// set must define its dimensions): the schema's tier table
-/// as the CLI spells it, plus the
-/// `fixed` marker for the tierless faces this metric drives.
+/// set must define its dimensions): the daemon's tier table as the schema
+/// spells it, plus the `fixed` marker for the tierless faces this metric
+/// drives.
 const TIER_DEFINITIONS: &str = "minimal = the red-line floor: \
 locating fields only — a diagnostic's code + location, nothing prose-like; \
 compact = the default tier, each producer's baseline shape; full = compact \
-plus the cheaply-available extras named per face; `fixed` = the driven face \
-(check/analyze machine output) has no -v surface today, so the report's one \
-tier and its savings_ratio are the fixed face's";
+plus the cheaply-available extras named per face; `fixed` = the driven CLI \
+face (check/analyze --format=json) has no -v surface (the tiers were retired \
+with the machine face, #2606), so the report's one tier and its \
+savings_ratio are the fixed face's; the CLI's lon/json format axis is swept \
+by scripts/token-cost-bench.sh";
 
 // ---------------------------------------------------------------------------
 // CLI options
@@ -400,6 +404,7 @@ impl Tokenizer for CharsPer4 {
 /// sum to slightly more than the whole-stdout total (ceil rounding is not
 /// additive); the totals keep their whole-stdout definition so reports stay
 /// comparable across schema revisions.
+#[derive(Debug)]
 struct FileTokens {
     /// Tokens per file URI, in URI order (`BTreeMap`: deterministic reports).
     per_file: BTreeMap<String, u64>,
@@ -423,6 +428,51 @@ fn per_file_tokens(text: &str, tokenizer: &impl Tokenizer) -> FileTokens {
         }
     }
     result
+}
+
+/// Per-file token counts over the dartq side's json envelope (#2606): the
+/// CLI's machine face is retired, so the dartq leg arrives as the
+/// single-line `{version:1,diagnostics:[...]}` envelope — attribution parses
+/// it and tokenizes each diagnostic's compact re-serialization (the wire
+/// bytes its row occupies), attributing to `location.file`. The whole-stdout
+/// totals keep their definition (envelope brackets and separators count
+/// there only), so the per-file sums sit just under the total — the same
+/// relationship the machine face had. A diagnostic without a string
+/// `location.file` is the unattributed channel (the machine face's
+/// `unattributed_lines` precedent); a non-envelope stdout is an error, never
+/// a silently empty distribution (drive `--dartq-cmd` with `--format=json`).
+fn per_file_tokens_json(text: &str, tokenizer: &impl Tokenizer) -> Result<FileTokens, String> {
+    let root: serde_json::Value = serde_json::from_str(text).map_err(|e| {
+        format!(
+            "dartq stdout is not the {{version:1,diagnostics:[...]}} json envelope ({e}); \
+             drive --dartq-cmd with --format=json"
+        )
+    })?;
+    if root["version"].as_i64() != Some(1) {
+        return Err(format!(
+            "dartq json envelope has unsupported version `{}`",
+            root["version"]
+        ));
+    }
+    let Some(diags) = root["diagnostics"].as_array() else {
+        return Err("dartq json envelope has no diagnostics array".to_string());
+    };
+    let mut result = FileTokens {
+        per_file: BTreeMap::new(),
+        unattributed_lines: 0,
+    };
+    for diag in diags {
+        match (
+            diag["location"]["file"].as_str(),
+            serde_json::to_string(diag),
+        ) {
+            (Some(file), Ok(row)) => {
+                *result.per_file.entry(file.to_string()).or_default() += tokenizer.count(&row);
+            }
+            _ => result.unattributed_lines += 1,
+        }
+    }
+    Ok(result)
 }
 
 /// Median + P95 over a per-file token distribution (nearest-rank, so both
@@ -821,9 +871,9 @@ struct TokenCostReport {
     oracle_tokens_median: u64,
     #[serde(default)]
     oracle_tokens_p95: u64,
-    /// dartq output lines that matched no file (fewer than four `|` fields):
-    /// excluded from the per-file distribution, still inside the whole-stdout
-    /// totals.
+    /// dartq envelope rows without a string `location.file` (or that failed
+    /// to re-serialize): excluded from the per-file distribution, still
+    /// inside the whole-stdout totals.
     #[serde(default)]
     dartq_unattributed_lines: u64,
     #[serde(default)]
@@ -1719,11 +1769,13 @@ fn metric_incremental_resident(opts: &BenchOptions, corpus: &Path) -> Result<Str
     ))
 }
 
-/// `token-cost`: `dartq check --format=machine` stdout vs
-/// `dart analyze --format=machine` stdout, same corpus, same tokenizer.
-/// Whole-stdout totals plus the per-file distribution (machine lines grouped
-/// by file field, median + P95 per side); the tier dimension is honestly
-/// `fixed` — the driven faces accept no `-v` ([`FIXED_TIERS`]).
+/// `token-cost`: `dartq check --format=json` stdout (the oracle-parity
+/// envelope — the machine face retired, #2606) vs `dart analyze
+/// --format=machine` stdout, same corpus, same tokenizer. Whole-stdout
+/// totals plus the per-file distribution (the oracle's machine lines
+/// grouped by file field; the dartq side's envelope rows grouped by
+/// `location.file`, median + P95 per side); the tier dimension is honestly
+/// `fixed` — the driven face accepts no `-v` ([`FIXED_TIERS`]).
 #[allow(clippy::cast_possible_truncation)] // output byte counts fit u64 on every supported target
 fn metric_tokens(opts: &BenchOptions, corpus: &Path) -> Result<String, Outcome> {
     let driver = DartqDriver::from_template(&opts.dartq_cmd);
@@ -1775,7 +1827,7 @@ fn metric_tokens(opts: &BenchOptions, corpus: &Path) -> Result<String, Outcome> 
         Some(1.0 - dartq_tokens as f64 / oracle_tokens as f64)
     };
 
-    let dartq_files = per_file_tokens(dartq_text, &tokenizer);
+    let dartq_files = per_file_tokens_json(dartq_text, &tokenizer).map_err(Outcome::Error)?;
     let oracle_files = per_file_tokens(oracle_text, &tokenizer);
     let (dartq_tokens_median, dartq_tokens_p95) = token_distribution(&dartq_files);
     let (oracle_tokens_median, oracle_tokens_p95) = token_distribution(&oracle_files);
@@ -2466,6 +2518,52 @@ mod tests {
         let files = per_file_tokens("not machine output\n\nAnalysis completed.\n", &CharsPer4);
         assert!(files.per_file.is_empty());
         assert_eq!(files.unattributed_lines, 3);
+    }
+
+    #[test]
+    fn per_file_tokens_json_groups_envelope_rows_by_location_file() {
+        // The observed oracle/dartq json envelope shape, two files.
+        let envelope = concat!(
+            r#"{"version":1,"diagnostics":["#,
+            r#"{"code":"e1","severity":"ERROR","type":"COMPILE_TIME_ERROR","location":{"file":"/c/lib/a.dart","range":{"start":{"offset":2,"line":2,"column":11},"end":{"offset":3,"line":2,"column":12}}},"problemMessage":"Expected to find ';'."},"#,
+            r#"{"code":"w1","severity":"WARNING","type":"STATIC_WARNING","location":{"file":"/c/lib/b.dart","range":{"start":{"offset":9,"line":3,"column":7},"end":{"offset":10,"line":3,"column":8}}},"problemMessage":"The value of 'x' isn't used."}"#,
+            r#"]}"#,
+            "\n",
+        );
+        let files = per_file_tokens_json(envelope, &CharsPer4).expect("envelope must parse");
+        assert_eq!(files.per_file.len(), 2, "one group per location.file");
+        assert!(
+            files.per_file["/c/lib/a.dart"] > 0 && files.per_file["/c/lib/b.dart"] > 0,
+            "every row tokenized: {:?}",
+            files.per_file
+        );
+        assert_eq!(files.unattributed_lines, 0);
+    }
+
+    #[test]
+    fn per_file_tokens_json_rejects_non_envelope_stdout() {
+        // The retired machine face (or any prose) is an error, never a
+        // silently empty distribution.
+        let err = per_file_tokens_json(
+            "ERROR|SYNTACTIC_ERROR|E1|/c/lib/a.dart|2|11|1|m\n",
+            &CharsPer4,
+        )
+        .expect_err("machine rows must be rejected");
+        assert!(err.contains("--format=json"), "names the fix: {err}");
+        let err = per_file_tokens_json(r#"{"version":2,"diagnostics":[]}"#, &CharsPer4)
+            .expect_err("unsupported version must be rejected");
+        assert!(err.contains("version"), "cites the version: {err}");
+    }
+
+    #[test]
+    fn per_file_tokens_json_counts_rows_without_a_file() {
+        let envelope = concat!(
+            r#"{"version":1,"diagnostics":[{"code":"x","severity":"INFO"}]}"#,
+            "\n",
+        );
+        let files = per_file_tokens_json(envelope, &CharsPer4).expect("envelope must parse");
+        assert!(files.per_file.is_empty());
+        assert_eq!(files.unattributed_lines, 1);
     }
 
     #[test]

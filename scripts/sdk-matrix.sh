@@ -114,7 +114,7 @@ THRESHOLD="1.0"
 KNOWN_DIFFS="tests/corpus/regressions/known-diffs.json"
 OUT_ROOT="target/evidence/sdk-matrix"
 HARNESS="${HARNESS:-./target/debug/harness}"
-DEFAULT_DARTQ_CMD="./target/debug/dartq check --format=machine"
+DEFAULT_DARTQ_CMD="./target/debug/dartq check --format=json"
 DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
 
 # Version-skew diagnostic families (the removedIn codes + the language-version family), matched case-insensitively against the

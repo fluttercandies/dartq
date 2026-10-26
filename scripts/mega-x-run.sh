@@ -68,7 +68,7 @@
 #                   recorded evidence is never overwritten.
 #
 # Environment overrides: DARTQ_CMD (the dartq side; default
-# `./target/debug/dartq analyze --format=machine --sdk <fvm default
+# `./target/debug/dartq analyze --format=json --sdk <fvm default
 # dart-sdk>`, the m1-gate shape — also the replay batch face and, with
 # `daemon` swapped for `analyze`, the daemon face), DARTQ_BIN (replay leg's
 # binary when DARTQ_CMD is overridden; default ./target/debug/dartq),
@@ -184,7 +184,7 @@ dart_bin="$sdk_root/bin/dart"
 if dart_dir="$(cd "$(dirname "$dart_bin")" 2>/dev/null && pwd -P)"; then
   dart_bin="$dart_dir/dart"
 fi
-DEFAULT_DARTQ_CMD="./target/debug/dartq analyze --format=machine --sdk $sdk_root"
+DEFAULT_DARTQ_CMD="./target/debug/dartq analyze --format=json --sdk $sdk_root"
 DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
 DARTQ_BIN="${DARTQ_BIN:-./target/debug/dartq}"
 if [ "$DARTQ_CMD" = "$DEFAULT_DARTQ_CMD" ] && [ ! -x "$DARTQ_BIN" ]; then
@@ -530,7 +530,7 @@ edits="tests/corpus/mega-x/1k/edits.jsonl"
 if "$HARNESS" replay \
   --corpus-dir "tests/corpus/mega-x/1k" \
   --edits "$edits" \
-  --dartq-cmd "$DARTQ_BIN analyze --format=machine --sdk $sdk_root" \
+  --dartq-cmd "$DARTQ_BIN analyze --format=json --sdk $sdk_root" \
   --daemon-cmd "$DARTQ_BIN daemon {dir} --sdk $sdk_root" \
   --label x4-replay --out "$outdir" 2>"$errfile"; then
   cat "$errfile" >&2

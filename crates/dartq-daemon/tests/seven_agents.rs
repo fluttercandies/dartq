@@ -59,7 +59,7 @@ fn overlay_set(id: i64, name: &str, content: &str) -> Value {
     request(
         id,
         "dartq/overlay.set",
-        json!({"agentId": name, "files": {"lib/main.dart": content}}),
+        json!({"agent_id": name, "files": {"lib/main.dart": content}}),
     )
 }
 
@@ -85,7 +85,7 @@ fn answer_error(h: &common::Harness, id: i64) -> Value {
 
 /// The `code` spellings of an analyze/check answer's diagnostic rows.
 fn codes(result: &Value) -> Vec<&str> {
-    result["diagnostics"]
+    result["diags"]
         .as_array()
         .expect("diagnostics array")
         .iter()
@@ -95,11 +95,11 @@ fn codes(result: &Value) -> Vec<&str> {
 
 /// The rows' `message` texts.
 fn messages(result: &Value) -> Vec<String> {
-    result["diagnostics"]
+    result["diags"]
         .as_array()
         .expect("diagnostics array")
         .iter()
-        .map(|row| row["message"].as_str().expect("message").to_owned())
+        .map(|row| row["msg"].as_str().expect("message").to_owned())
         .collect()
 }
 
@@ -186,9 +186,9 @@ fn seven_agents_hold_isolated_views_over_one_workspace() {
     let mut matrix: Vec<Value> = (1..=7)
         .map(|i| {
             let params = if i >= 6 {
-                json!({"agentId": agent(i), "context": "t"})
+                json!({"agent_id": agent(i), "context": "t"})
             } else {
-                json!({"agentId": agent(i)})
+                json!({"agent_id": agent(i)})
             };
             request(
                 200 + i64::try_from(i).unwrap_or(i64::MAX),
@@ -249,7 +249,7 @@ fn seven_agents_hold_isolated_views_over_one_workspace() {
             request(
                 230 + i64::try_from(i).unwrap_or(i64::MAX),
                 "dartq/analyze",
-                json!({"agentId": agent(i)}),
+                json!({"agent_id": agent(i)}),
             )
         })
         .collect();
@@ -276,11 +276,11 @@ fn seven_agents_hold_isolated_views_over_one_workspace() {
     // Teardown ordering: eviction is per agent, sticks, and is idempotent —
     // the evicted view fails loud, survivors answer untouched.
     h.step(
-        &request(240, "dartq/overlay.clear", json!({"agentId": agent(4)})),
+        &request(240, "dartq/overlay.clear", json!({"agent_id": agent(4)})),
         1,
     );
     h.step(
-        &request(241, "dartq/analyze", json!({"agentId": agent(4)})),
+        &request(241, "dartq/analyze", json!({"agent_id": agent(4)})),
         1,
     );
     let error = answer_error(&h, 241);
@@ -293,16 +293,16 @@ fn seven_agents_hold_isolated_views_over_one_workspace() {
         "the error names the agent: {error}"
     );
     h.step(
-        &request(242, "dartq/overlay.clear", json!({"agentId": agent(4)})),
+        &request(242, "dartq/overlay.clear", json!({"agent_id": agent(4)})),
         1,
     );
     h.step(
-        &request(243, "dartq/analyze", json!({"agentId": agent(4)})),
+        &request(243, "dartq/analyze", json!({"agent_id": agent(4)})),
         1,
     );
     assert_eq!(answer_error(&h, 243)["code"], -32602, "eviction sticks");
     h.step(
-        &request(244, "dartq/analyze", json!({"agentId": agent(5)})),
+        &request(244, "dartq/analyze", json!({"agent_id": agent(5)})),
         1,
     );
     assert_isolated_view(&h, 244, &agent(5), &current);
@@ -358,16 +358,16 @@ fn agent_close_during_in_flight_work_keeps_shared_state_consistent() {
             request(
                 20 + i64::try_from(i).unwrap_or(i64::MAX),
                 "dartq/analyze",
-                json!({"agentId": agent(i)}),
+                json!({"agent_id": agent(i)}),
             )
         })
         .collect();
     batch.push(request(
         30,
         "dartq/overlay.clear",
-        json!({"agentId": agent(4)}),
+        json!({"agent_id": agent(4)}),
     ));
-    batch.push(request(31, "dartq/analyze", json!({"agentId": agent(4)})));
+    batch.push(request(31, "dartq/analyze", json!({"agent_id": agent(4)})));
     h.burst(&batch, 9);
 
     // The teardown acked...
@@ -405,8 +405,8 @@ fn agent_close_during_in_flight_work_keeps_shared_state_consistent() {
     h.burst(
         &[
             overlay_set(40, &agent(4), &overlay_buffer("agent4b")),
-            request(41, "dartq/analyze", json!({"agentId": agent(4)})),
-            request(42, "dartq/analyze", json!({"agentId": agent(1)})),
+            request(41, "dartq/analyze", json!({"agent_id": agent(4)})),
+            request(42, "dartq/analyze", json!({"agent_id": agent(1)})),
             request(43, "dartq/analyze", json!({})),
         ],
         4,
@@ -445,8 +445,8 @@ fn agent_population_exceeds_seven_up_to_the_documented_bound() {
     h.burst(&sets, 8);
     h.burst(
         &[
-            request(30, "dartq/analyze", json!({"agentId": agent(8)})),
-            request(31, "dartq/analyze", json!({"agentId": agent(1)})),
+            request(30, "dartq/analyze", json!({"agent_id": agent(8)})),
+            request(31, "dartq/analyze", json!({"agent_id": agent(1)})),
         ],
         2,
     );
@@ -485,9 +485,9 @@ fn agent_population_exceeds_seven_up_to_the_documented_bound() {
     // isolates like any of the seven.
     h.burst(
         &[
-            request(401, "dartq/overlay.clear", json!({"agentId": "agent9"})),
+            request(401, "dartq/overlay.clear", json!({"agent_id": "agent9"})),
             overlay_set(402, "overflow", &overlay_buffer("overflow")),
-            request(403, "dartq/analyze", json!({"agentId": "overflow"})),
+            request(403, "dartq/analyze", json!({"agent_id": "overflow"})),
         ],
         3,
     );
@@ -497,7 +497,7 @@ fn agent_population_exceeds_seven_up_to_the_documented_bound() {
 
     // The bulk staging never disturbed the earliest views.
     h.step(
-        &request(410, "dartq/analyze", json!({"agentId": agent(1)})),
+        &request(410, "dartq/analyze", json!({"agent_id": agent(1)})),
         1,
     );
     assert_isolated_view(&h, 410, &agent(1), &neighbors);

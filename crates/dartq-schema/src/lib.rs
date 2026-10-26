@@ -33,9 +33,11 @@
 //!
 //! # Versioning discipline
 //!
-//! * Every versioned output carries its contract version under
-//!   `schema_version` — except the diagnostics envelope, which keeps the
-//!   oracle's own `version` key (see "The `version` alias" below).
+//! * Every versioned output carries its contract version under `v` —
+//!   except the diagnostics envelope, which keeps the oracle's own
+//!   `version` key (see "The `version` alias" below), and the
+//!   compatibility report, which keeps its long-stamped `schema_version`
+//!   (the compatibility face's own frozen dialect).
 //! * A breaking output change bumps the major: the domain's
 //!   `SCHEMA_VERSION_*` constant moves, and every producer of the face must
 //!   move in the same release.
@@ -56,22 +58,21 @@
 //!   reference (`package:<name>/<path under the package's lib>`); a file
 //!   no package lib tree addresses keeps its canonical path — the
 //!   documented fallback. The `|name` suffix is the inline symbol
-//!   reference's (the impact report's `changed[].symbol`); the
-//!   row-shaped file columns (`file`, `path`, `target_file`) carry the
-//!   bare file label. The validator pins the `label|name` form
-//!   for the impact report's symbol refs and the session symbol table's
-//!   values. Internal-only data (e.g. the fix edit's verified original
-//!   slice, `fix.rs`'s `Edit.source` — the edit row's declared `source`
-//!   key carries the provenance tag, a different value) is never emitted;
-//!   the validator rejects anything undeclared.
+//!   reference's (the impact report's `sym[].sym`); the row-shaped file
+//!   columns (`file`, `path`, `target`) carry the bare file label. The
+//!   validator pins the `label|name` form for the impact report's symbol
+//!   refs and the session symbol table's values. Internal-only data
+//!   (e.g. the fix edit's verified original slice, `fix.rs`'s
+//!   `Edit.source` — the edit row's declared `src` key carries the
+//!   provenance tag, a different value) is never emitted; the validator
+//!   rejects anything undeclared.
 //! * Enum spellings are the shortest unambiguous form: kebab-case tags for
 //!   impact levels, declaration families, and reference relations; the
 //!   oracle's UPPERCASE spellings for diagnostic severities and types.
-//! * New faces pin their ranges to `[startOffset, endOffset)` pairs.
-//!   The oracle-derived faces keep their pinned older spellings (position
-//!   objects in the diagnostics envelope, `offset`+`length` in query/fix
-//!   rows); a face designed after the pair-form ruling adopts that form at
-//!   its schema review.
+//! * Ranges spell `off` + `len` (the short-vocabulary locator pair). The
+//!   oracle-derived faces keep their pinned older spellings (position
+//!   objects in the diagnostics envelope); the compat report keeps its
+//!   own frozen dialect.
 //!
 //! # The `version` alias
 //!
@@ -92,9 +93,9 @@
 //! * **compact** — the shape each producer emits today. It is the baseline
 //!   every fixture pins.
 //! * **minimal** — the red-line floor: locating fields are never
-//!   omissible (`code`/`file`/`range` or the face's equivalent, marked ● in
-//!   the tables). Token cost is trimmed by dropping prose and convenience
-//!   spellings, never location.
+//!   omissible (`code`/`file`/`off`+`len` or the face's equivalent,
+//!   marked ● in the tables). Token cost is trimmed by dropping prose and
+//!   convenience spellings, never location.
 //! * **full** — compact plus cheaply-available extras (per-face, listed
 //!   below). Deep content stays behind ids and dedicated endpoints
 //!; `full` never inlines unbounded objects.
@@ -130,26 +131,25 @@
 //! byte-pinned, and the human listing is the verbose presentation. The
 //! tiers bind the emitters that honor `--verbosity` (daemon/RPC faces).
 //!
-//! Fix patch documents (per edit — `file`/`offset`/`length`/
-//! `replacement` are the red line, and the provenance tag never drops
-//! either):
+//! Fix patch documents (per edit — `file`/`off`/`len`/`text` are the red
+//! line, and the provenance tag never drops either):
 //!
-//! | field                 | minimal | compact | full |
-//! |-----------------------|---------|---------|------|
-//! | `file`                | ●       | ●       | ●    |
-//! | `edits[].offset`      | ●       | ●       | ●    |
-//! | `edits[].length`      | ●       | ●       | ●    |
-//! | `edits[].replacement` | ●       | ●       | ●    |
-//! | `edits[].source`      | ●       | ●       | ●    |
-//! | `edits[].anchor`      |         | ●       | ●    |
-//! | `edits[].rule`        |         |         | ●    |
-//! | `edits[].message`     |         |         | ●    |
-//! | `edits[].priority`    |         |         | ●    |
+//! | field              | minimal | compact | full |
+//! |--------------------|---------|---------|------|
+//! | `file`             | ●       | ●       | ●    |
+//! | `edits[].off`      | ●       | ●       | ●    |
+//! | `edits[].len`      | ●       | ●       | ●    |
+//! | `edits[].text`     | ●       | ●       | ●    |
+//! | `edits[].src`      | ●       | ●       | ●    |
+//! | `edits[].anchor`   |         | ●       | ●    |
+//! | `edits[].rule`     |         |         | ●    |
+//! | `edits[].msg`      |         |         | ●    |
+//! | `edits[].priority` |         |         | ●    |
 //!
-//! `edits[].source` is the row's provenance tag — `builtin-lint` or the
-//! plugin's manifest name (`edit_floor`, `dartq-commands` fix.rs:744-751);
-//! not to be confused with `fix.rs`'s internal `Edit.source` slice, which
-//! never leaves the engine. `edits[].stale` may appear in any tier when an
+//! `edits[].src` is the row's provenance tag — `builtin-lint` or the
+//! plugin's manifest name (`edit_floor`, `dartq-commands` fix.rs); not to
+//! be confused with `fix.rs`'s internal `Edit.source` slice, which never
+//! leaves the engine. `edits[].stale` may appear in any tier when an
 //! applier marks an edit instead of dropping it. `stale` is the one
 //! absent-tolerant field left: no writer emits it today, so enabling it is
 //! additive.
@@ -157,21 +157,21 @@
 //! Query answers (`query symbol`; row locators are the red line — `kind` is
 //! the row's semantic code):
 //!
-//! | field                          | minimal | compact | full |
-//! |--------------------------------|---------|---------|------|
-//! | `name`                         | ●       | ●       | ●    |
-//! | `declarations[].file`          | ●       | ●       | ●    |
-//! | `declarations[].kind`          | ●       | ●       | ●    |
-//! | `declarations[].name`          | ●       | ●       | ●    |
-//! | `declarations[].line`/`column` | ●       | ●       | ●    |
-//! | `declarations[].length`        | ●       | ●       | ●    |
-//! | `declarations[].container`     |         | ●       | ●    |
-//! | `references[].target_file`     | ●       | ●       | ●    |
-//! | `references[].kind`            | ●       | ●       | ●    |
-//! | `references[].offset`/`length` | ●       | ●       | ●    |
-//! | `references[].qualified`       |         | ●       | ●    |
-//! | `implementations[]` (reserved) |         | opt     | opt  |
-//! | `dependencies[]` (reserved)    |         | opt     | opt  |
+//! | field                     | minimal | compact | full |
+//! |---------------------------|---------|---------|------|
+//! | `sym`                     | ●       | ●       | ●    |
+//! | `decls[].file`            | ●       | ●       | ●    |
+//! | `decls[].kind`            | ●       | ●       | ●    |
+//! | `decls[].name`            | ●       | ●       | ●    |
+//! | `decls[].line`/`col`      | ●       | ●       | ●    |
+//! | `decls[].len`             | ●       | ●       | ●    |
+//! | `decls[].container`       |         | ●       | ●    |
+//! | `refs[].target`           | ●       | ●       | ●    |
+//! | `refs[].kind`             | ●       | ●       | ●    |
+//! | `refs[].off`/`len`        | ●       | ●       | ●    |
+//! | `refs[].qualified`        |         | ●       | ●    |
+//! | `implementations[]`       |         | opt     | opt  |
+//! | `deps[]`                  |         | opt     | opt  |
 //!
 //! `symbols` and `since` are session fields, tier-independent — see "Token
 //! economics". The two reserved kind arrays are declared on frozen v1 for
@@ -197,50 +197,48 @@
 //! arrays for the `counts` object, so the AI still sees which sections
 //! exist and are empty; `full` equals `compact` today):
 //!
-//! | field                    | minimal | compact | full |
-//! |--------------------------|---------|---------|------|
-//! | `symbol`                 | ●       | ●       | ●    |
-//! | `declaration`            | ●       | ●       | ●    |
-//! | `declaration.container`  |         | ●       | ●    |
-//! | section arrays (7)       | counts  | ●       | ●    |
-//! | `references[].qualified` | (count) | ●       | ●    |
-//! | `counts`                 | ●       |         |      |
+//! | field                 | minimal | compact | full |
+//! |-----------------------|---------|---------|------|
+//! | `sym`                 | ●       | ●       | ●    |
+//! | `declaration`         | ●       | ●       | ●    |
+//! | `declaration.container` |       | ●       | ●    |
+//! | section arrays (7)    | counts  | ●       | ●    |
+//! | `refs[].qualified`    | (count) | ●       | ●    |
+//! | `counts`              | ●       |         |      |
 //!
 //! Check answer rows (the daemon's `dartq/check`; the row's code + file
-//! locator are the red line — `line`/`column`/`length` locate, `file`
-//! names the document. `severity`/`type` reuse the diagnostics envelope's
-//! spellings):
+//! locator are the red line — `line`/`col`/`len` locate, `file` names the
+//! document; `sev` is the lowercase word):
 //!
-//! | field              | minimal | compact | full |
-//! |--------------------|---------|---------|------|
-//! | `file`             | ●       | ●       | ●    |
-//! | `code`             | ●       | ●       | ●    |
-//! | `line`/`column`    | ●       | ●       | ●    |
-//! | `length`           | ●       | ●       | ●    |
-//! | `severity`         |         | ●       | ●    |
-//! | `type`             |         | ●       | ●    |
-//! | `message`          |         | ●       | ●    |
+//! | field           | minimal | compact | full |
+//! |-----------------|---------|---------|------|
+//! | `code`          | ●       | ●       | ●    |
+//! | `file`          | ●       | ●       | ●    |
+//! | `line`/`col`    | ●       | ●       | ●    |
+//! | `len`           | ●       | ●       | ●    |
+//! | `sev`           |         | ●       | ●    |
+//! | `msg`           |         | ●       | ●    |
 //!
 //! `full` equals `compact` plus the session economics (`symbols` — the
 //! short-id table over the rows' file paths). The two views (disk
 //! pipeline, agent overlay) emit the same row shape.
 //!
-//! Analyze answer entries (the daemon's `dartq/analyze`; the entry's
-//! code + locator are the red line — LSP positions, zero-based, unlike
-//! the CLI faces' 1-based rows):
+//! Analyze answer rows (the daemon's `dartq/analyze`; the row's code +
+//! locator are the red line — the flattened short-vocabulary row, `file`
+//! carrying the entry's document URI, `line`/`col` 1-based):
 //!
-//! | field                    | minimal | compact | full |
-//! |--------------------------|---------|---------|------|
-//! | `uri`                    | ●       | ●       | ●    |
-//! | `code`                   | ●       | ●       | ●    |
-//! | `range`                  | ●       | ●       | ●    |
-//! | `severity` (LSP 1/2/3)   |         | ●       | ●    |
-//! | `source`                 |         | ●       | ●    |
-//! | `message`                |         | ●       | ●    |
+//! | field        | minimal | compact | full |
+//! |--------------|---------|---------|------|
+//! | `code`       | ●       | ●       | ●    |
+//! | `file`       | ●       | ●       | ●    |
+//! | `line`/`col` | ●       | ●       | ●    |
+//! | `len`        | ●       | ●       | ●    |
+//! | `sev`        |         | ●       | ●    |
+//! | `msg`        |         | ●       | ●    |
 //!
 //! `full` equals `compact` plus the session economics (`symbols` over the
-//! entry URIs). No writer emits `since` on this face — the pull face has
-//! no delta parameter — so none is declared.
+//! row `file` values). No writer emits `since` on this face — the pull
+//! face has no delta parameter — so none is declared.
 //!
 //! Index export documents (`dartq index --full`; JSONL — one header line
 //! then one document per analyzed file; the document's `path` is the red
@@ -251,7 +249,7 @@
 //!
 //! | document field   | minimal | compact | full |
 //! |------------------|---------|---------|------|
-//! | `schema_version` | ●       | ●       | ●    |
+//! | `v`              | ●       | ●       | ●    |
 //! | `path`           | ●       | ●       | ●    |
 //! | `symbol_count`   | ●       | ●       | ●    |
 //! | `symbols`        |         | ●       | ●    |
@@ -273,7 +271,7 @@
 //! |-----------------------|---------|---------|------|
 //! | `diagnostic`          | ●       | ●       | ●    |
 //! | `why`                 |         | ●       | ●    |
-//! | `documentation`       |         | opt     | opt  |
+//! | `doc`                 |         | opt     | opt  |
 //! | `related`             |         | ●       | ●    |
 //! | `related.lines`       |         |         | ●    |
 //! | `fixes`               |         |         | ●    |
@@ -285,18 +283,18 @@
 //! patch's human-name rows: the writer drops only the priority and the
 //! edit anchors at minimal):
 //!
-//! | field                 | minimal | compact | full |
-//! |-----------------------|---------|---------|------|
-//! | `assists[].message`   | ●       | ●       | ●    |
-//! | `assists[].source`    | ●       | ●       | ●    |
-//! | `assists[].edits[]`   | ● floor | ● floor | ● floor |
-//! | `assists[].priority`  |         | ●       | ●    |
-//! | `assists[].edits[].anchor` |    | ●       | ●    |
-//! | `errors[]`            | opt     | opt     | opt  |
+//! | field                      | minimal | compact | full |
+//! |----------------------------|---------|---------|------|
+//! | `assists[].msg`            | ●       | ●       | ●    |
+//! | `assists[].src`            | ●       | ●       | ●    |
+//! | `assists[].edits[]`        | ● floor | ● floor | ● floor |
+//! | `assists[].priority`       |         | ●       | ●    |
+//! | `assists[].edits[].anchor` |         | ●       | ●    |
+//! | `errors[]`                 | opt     | opt     | opt  |
 //!
-//! The edits' floor is the fix patch's own — `offset`/`length`/
-//! `replacement` plus the provenance tag (`source`, the plugin's manifest
-//! name). `errors` rides any tier when a host could not serve the request.
+//! The edits' floor is the fix patch's own — `off`/`len`/`text` plus the
+//! provenance tag (`src`, the plugin's manifest name). `errors` rides any
+//! tier when a host could not serve the request.
 //!
 //! Tier-invariant faces: the impact report (every field is a locator or a
 //! verdict — nothing prose-like to trim; `since` is its token lever), the
@@ -463,7 +461,7 @@ pub enum Domain {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verbosity {
     /// The red-line floor: locating fields only — a diagnostic's
-    /// `code` + `location`, an edit's `offset`/`length`/`replacement`.
+    /// `code` + `location`, an edit's `off`/`len`/`text`.
     /// Nothing prose-like may ride along.
     Minimal,
     /// The default tier: each producer's baseline shape — the shape the

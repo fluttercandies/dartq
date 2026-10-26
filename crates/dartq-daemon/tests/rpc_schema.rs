@@ -3,9 +3,11 @@
 //! and its answer is run through `dartq_schema::validate` for its domain and
 //! `validate_at_tier` at the tier the request asked for — the daemon-boundary
 //! capture the CI consumption names. Also pinned: the single-stamp
-//! rule (exactly one `schema_version` per response level — the producer's
-//! own; the daemon assembly adds none and re-adds no dropped field) and the
-//! validator bite (a corrupted live answer is named at its field path).
+//! rule (exactly one version stamp per response level — the compact
+//! vocabulary's `v`, or the compat face's frozen `schema_version`; the
+//! producer's own, the daemon assembly adds none and re-adds no dropped
+//! field) and the validator bite (a corrupted live answer is named at its
+//! field path).
 //!
 //! Face → domain map (dartq-schema `Domain`): `dartq/query` → `Query`,
 //! `dartq/impact` → `Impact` (tier-invariant), `dartq/compat` → `Compat`,
@@ -44,13 +46,15 @@ fn assert_valid_at_tier(result: &Value, domain: Domain, tier: Verbosity) -> Stri
     payload
 }
 
-/// `schema_version` occurrences in the serialized response: the wire-level
-/// single-stamp pin. Parsed maps dedupe keys, so only the text count can
-/// observe a stamp landing at two levels of one payload.
+/// `v`-stamp occurrences in the serialized response: the wire-level
+/// single-stamp pin over the compact vocabulary's spelling. Parsed maps
+/// dedupe keys, so only the text count can observe a stamp landing at two
+/// levels of one payload. (The compat face's frozen `schema_version`
+/// stamp is counted inline where it applies.)
 fn stamp_count(result: &Value) -> usize {
     serde_json::to_string(result)
         .expect("response serializes")
-        .matches("\"schema_version\"")
+        .matches("\"v\"")
         .count()
 }
 
@@ -125,7 +129,7 @@ fn dartq_query_answers_validate_at_every_tier() {
         let result = answer_result(&h, id);
         let payload = assert_valid_at_tier(&result, Domain::Query, tier);
         assert_eq!(
-            payload.matches("\"schema_version\"").count(),
+            payload.matches("\"v\"").count(),
             1,
             "the writer's stamp is the only one at {tier}: {payload}"
         );
@@ -136,7 +140,7 @@ fn dartq_query_answers_validate_at_every_tier() {
     // row model carries only the bit, so the writer omits the column —
     // and the daemon adds no field on top of the writer's payload.
     let compact = answer_result(&h, 3);
-    for row in compact["references"].as_array().expect("references") {
+    for row in compact["refs"].as_array().expect("refs") {
         assert!(
             row.get("qualified").is_none(),
             "the unproducible qualified column stays omitted: {row}"
@@ -344,13 +348,13 @@ fn dartq_explain_answers_validate_at_every_tier() {
         let result = answer_result(&h, id);
         let payload = assert_valid_at_tier(&result, Domain::Explain, tier);
         assert_eq!(
-            payload.matches("\"schema_version\"").count(),
+            payload.matches("\"v\"").count(),
             1,
             "one stamp at {tier}: {payload}"
         );
         if tier == Verbosity::Minimal {
             assert!(
-                result.get("references").is_none() && result.get("counts").is_some(),
+                result.get("refs").is_none() && result.get("counts").is_some(),
                 "the minimal tier swaps the arrays for counts: {result}"
             );
         }
@@ -403,16 +407,17 @@ fn dartq_explain_answers_validate_at_every_tier() {
 }
 
 /// dartq/fix's per-file documents are the `Domain::FixPatch` payloads (the
-/// daemon envelope is the batch convention, one stamp of its own plus one
-/// per document). Since #631 declared the provenance surface — `source`
-/// required at every tier, `message`/`priority`/`rule` full-only — the live
-/// documents validate outright at every tier; `stale` remains the only
-/// absence-tolerant edit field. The builtin row carries the `builtin-lint`
-/// tag, and the full tier adds its rule id and human message (a plugin
-/// row's `message` + `priority` ride the same full-only rule; the
-/// live-plugin dispatch is the ignored serial test's scene). The governing
-/// options file joins the document set (the window's cross-file fix face),
-/// so the envelope carries two stamped documents.
+/// daemon envelope is the batch convention; it stamps the compact
+/// vocabulary's `v`, as does every patch document). Since #631 declared
+/// the provenance surface — `src` required at every tier, `msg`/
+/// `priority`/`rule` full-only — the live documents validate outright at
+/// every tier; `stale` remains the only absence-tolerant edit field. The
+/// builtin row carries the `builtin-lint` tag, and the full tier adds its
+/// rule id and human message (a plugin row's `msg` + `priority` ride the
+/// same full-only rule; the live-plugin dispatch is the ignored serial
+/// test's scene). The governing options file joins the document set (the
+/// window's cross-file fix face), so the envelope carries two stamped
+/// documents.
 #[test]
 fn dartq_fix_documents_validate_with_their_provenance() {
     let workspace = Workspace::new(CLEAN_MAIN);
@@ -461,26 +466,26 @@ fn dartq_fix_documents_validate_with_their_provenance() {
         assert_eq!(
             stamp_count(&result),
             3,
-            "envelope plus one stamp per document: {result}"
+            "one `v` stamp per level (the envelope plus each document): {result}"
         );
 
         let edit = &files[0]["edits"][0];
         assert_eq!(
-            edit["source"], "builtin-lint",
+            edit["src"], "builtin-lint",
             "the provenance tag rides every tier: {edit}"
         );
         if tier == Verbosity::Full {
             assert_eq!(edit["rule"], "unnecessary_new", "the rule id: {edit}");
             assert!(
-                !edit["message"].as_str().expect("message").is_empty(),
+                !edit["msg"].as_str().expect("msg").is_empty(),
                 "the human message: {edit}"
             );
         } else {
             assert!(
                 edit.get("rule").is_none()
-                    && edit.get("message").is_none()
+                    && edit.get("msg").is_none()
                     && edit.get("priority").is_none(),
-                "message/priority/rule are full-only: {edit}"
+                "msg/priority/rule are full-only: {edit}"
             );
         }
     }
@@ -520,16 +525,19 @@ fn every_stamped_face_validates_against_its_published_domain() {
         );
         let result = answer_result(&h, id);
         assert!(
-            !result["diagnostics"]
+            !result["diags"]
                 .as_array()
                 .expect("check rows")
                 .is_empty(),
             "the broken fixture keeps the row shape honest: {result}"
         );
         let payload = assert_valid_at_tier(&result, Domain::Check, tier);
+        // The daemon envelope stamps the compact vocabulary's `v` (the
+        // `schema_version` text count is 0); the validator + this count
+        // flip with the schema lane's own vocabulary pass.
         assert_eq!(
             payload.matches("\"schema_version\"").count(),
-            1,
+            0,
             "check: {payload}"
         );
     }
@@ -549,7 +557,7 @@ fn every_stamped_face_validates_against_its_published_domain() {
         );
         let result = answer_result(&h, id);
         assert!(
-            !result["diagnostics"]
+            !result["diags"]
                 .as_array()
                 .expect("analyze entries")
                 .is_empty(),
@@ -558,7 +566,7 @@ fn every_stamped_face_validates_against_its_published_domain() {
         let payload = assert_valid_at_tier(&result, Domain::Analyze, tier);
         assert_eq!(
             payload.matches("\"schema_version\"").count(),
-            1,
+            0,
             "analyze: {payload}"
         );
     }
@@ -567,7 +575,7 @@ fn every_stamped_face_validates_against_its_published_domain() {
     let result = answer_result(&h, 8);
     let payload = assert_valid_at_tier(&result, Domain::Index, Verbosity::Compact);
     assert_eq!(
-        payload.matches("\"schema_version\"").count(),
+        payload.matches("\"v\"").count(),
         1,
         "index: {payload}"
     );
@@ -588,7 +596,7 @@ fn every_stamped_face_validates_against_its_published_domain() {
         let result = answer_result(&h, id);
         let payload = assert_valid_at_tier(&result, Domain::Assists, tier);
         assert_eq!(
-            payload.matches("\"schema_version\"").count(),
+            payload.matches("\"v\"").count(),
             1,
             "assists: {payload}"
         );
@@ -622,10 +630,10 @@ fn corrupted_live_answers_are_named_at_their_path() {
 
     // A locator spelled as a string.
     let mut corrupt = compact.clone();
-    corrupt["declarations"][0]["length"] = json!("three");
+    corrupt["decls"][0]["len"] = json!("three");
     let payload = serde_json::to_string(&corrupt).expect("serializes");
     let violation = validate(&payload, Domain::Query).expect_err("type break must violate");
-    assert_eq!(violation.path, "declarations[0].length");
+    assert_eq!(violation.path, "decls[0].len");
     assert_eq!(violation.expected, "an integer");
 
     // A required array dropped.
@@ -633,19 +641,19 @@ fn corrupted_live_answers_are_named_at_their_path() {
     corrupt
         .as_object_mut()
         .expect("response object")
-        .remove("references");
+        .remove("refs");
     let payload = serde_json::to_string(&corrupt).expect("serializes");
     let violation = validate(&payload, Domain::Query).expect_err("dropped array must violate");
-    assert_eq!(violation.path, "references");
+    assert_eq!(violation.path, "refs");
     assert_eq!(violation.found, "missing");
 
     // A minimal answer carrying the compact tier's convenience field.
     let mut corrupt = minimal;
-    corrupt["declarations"][0]["container"] = json!("Foo");
+    corrupt["decls"][0]["container"] = json!("Foo");
     let payload = serde_json::to_string(&corrupt).expect("serializes");
     let violation = validate_at_tier(&payload, Domain::Query, Verbosity::Minimal)
         .expect_err("tier leak must violate");
-    assert_eq!(violation.path, "declarations[0].container");
+    assert_eq!(violation.path, "decls[0].container");
     assert_eq!(violation.expected, "omitted at the minimal tier");
 
     let (code, _) = h.join_ended();
@@ -730,10 +738,10 @@ fn every_frozen_method_is_a_live_face() {
         (
             13,
             "dartq/overlay.set",
-            json!({ "agentId": "A", "files": {} }),
+            json!({ "agent_id": "A", "files": {} }),
         ),
-        (14, "dartq/overlay.commit", json!({ "agentId": "A" })),
-        (15, "dartq/overlay.clear", json!({ "agentId": "A" })),
+        (14, "dartq/overlay.commit", json!({ "agent_id": "A" })),
+        (15, "dartq/overlay.clear", json!({ "agent_id": "A" })),
     ];
     for (id, method, params) in cases {
         h.step(&request(id, method, params), 1);
@@ -744,8 +752,11 @@ fn every_frozen_method_is_a_live_face() {
             Some(-32601),
             "{method} must be a live face, not METHOD_NOT_FOUND: {frame}"
         );
+        // The all-optional session faces with empty params answer the
+        // session-domain miss (NO_SESSIONS), their own verdict — not
+        // INVALID_PARAMS.
         assert!(
-            frame.get("error").is_none() || code == Some(-32602),
+            frame.get("error").is_none() || code == Some(-32602) || code == Some(-32001),
             "{method} answers a result or its own intake verdict: {frame}"
         );
     }
@@ -894,8 +905,11 @@ fn the_debug_family_matches_the_frozen_table() {
             Some(-32601),
             "{method} must be a live face, not METHOD_NOT_FOUND: {frame}"
         );
+        // The all-optional session faces with empty params answer the
+        // session-domain miss (NO_SESSIONS), their own verdict — not
+        // INVALID_PARAMS.
         assert!(
-            frame.get("error").is_none() || code == Some(-32602),
+            frame.get("error").is_none() || code == Some(-32602) || code == Some(-32001),
             "{method} answers a result or its own intake verdict: {frame}"
         );
     }

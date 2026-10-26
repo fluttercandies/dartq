@@ -39,12 +39,12 @@
 #                    trips here instead of at the tail coverage step
 #   trend-w5-A       run A: syntax universe (tests/corpus/syntax-codes.txt,
 #                    255 codes, ERROR, bar 1.0) over the check face
-#                    (`dartq check --format=machine`) on the trend corpora
+#                    (`dartq check --format=json`) on the trend corpora
 #                    tests/corpus/m0 + tests/corpus/m0-syntax — the exact
 #                    m0-gate.sh run-A shape, label trend-w5
 #   trend-w5-B       run B: union universe (255 + 36 - 1 overlap = 290,
 #                    composed and pinned exactly like m0-gate.sh) over the
-#                    analyze face (`dartq analyze --format=machine --sdk
+#                    analyze face (`dartq analyze --format=json --sdk
 #                    <fvm default dart-sdk>`), label trend-w5
 #   m1-r5            scripts/m1-gate.sh --label m1-r5 (ERROR, bar 1.0)
 #   acceptance       scripts/acceptance-gate.sh --label serial
@@ -60,9 +60,10 @@
 #                    freeze/registry drift, never hand-silenced.
 #   lints-new-gate   N5 (goal #1160): the 19-name promotion-wave
 #                    differential face over tests/corpus/lints-new. dartq
-#                    analyze (release face), machine rows filtered to the
-#                    19 rule codes and the corpus's own lib/ + packages/
-#                    trees, then a code|file|line multiset compare against
+#                    analyze --format=json (release face), envelope rows
+#                    filtered to the 19 rule codes and the corpus's own
+#                    lib/ + packages/ trees, then a code|file|line
+#                    multiset compare against
 #                    the corpus's expectations.json — the oracle-derived
 #                    ground truth (verified against the upstream tests'
 #                    diagnostic markers; the structurally-silent families
@@ -271,7 +272,7 @@
 #            --corpus-dir tests/corpus/pub-null-sections \
 #            --corpus-dir tests/corpus/pub-universe-shadow \
 #            --oracle-dart "$DART_BIN" \
-#            --dartq-cmd "./target/release/dartq analyze --format=machine --sdk $SDK_ROOT" \
+#            --dartq-cmd "./target/release/dartq analyze --format=json --sdk $SDK_ROOT" \
 #            --out target/evidence/regressions-replay/m0-merged
 #          (reused corpora are never re-anchored: each corpus keeps its
 #          assembled.dart_tool, so a new DARTQ_SDK_CHECKOUT is not re-diffed
@@ -299,9 +300,9 @@
 #          the corpus to force it through:
 #            "$DART_BIN" analyze --format=machine tests/corpus/sii-probes \
 #              > target/evidence/regressions-replay/sii.oracle.machine
-#./target/release/dartq analyze --format=machine --sdk "$SDK_ROOT" \
+#./target/release/dartq analyze --format=json --sdk "$SDK_ROOT" \
 #              tests/corpus/sii-probes \
-#              > target/evidence/regressions-replay/sii.dartq.machine)
+#              > target/evidence/regressions-replay/sii.dartq.json)
 #          (legs 4 and 5: the remaining #1347 pub roots, bare dump pairs in
 #          the leg-3 idiom — never `harness run`, which would die whole:
 #          pub-nested-example's configs sit at languageVersion 3.5/3.2,
@@ -311,14 +312,14 @@
 #          offline on the same lowercase (code, file) caliber:
 #            "$DART_BIN" analyze --format=machine tests/corpus/pub-nested-example \
 #              > target/evidence/regressions-replay/pub-nested-example.oracle.machine
-#./target/release/dartq analyze --format=machine --sdk "$SDK_ROOT" \
+#./target/release/dartq analyze --format=json --sdk "$SDK_ROOT" \
 #              tests/corpus/pub-nested-example \
-#              > target/evidence/regressions-replay/pub-nested-example.dartq.machine
+#              > target/evidence/regressions-replay/pub-nested-example.dartq.json
 #            "$DART_BIN" analyze --format=machine tests/corpus/pub-corrupt-config \
 #              > target/evidence/regressions-replay/pub-corrupt-config.oracle.machine
-#./target/release/dartq analyze --format=machine --sdk "$SDK_ROOT" \
+#./target/release/dartq analyze --format=json --sdk "$SDK_ROOT" \
 #              tests/corpus/pub-corrupt-config \
-#              > target/evidence/regressions-replay/pub-corrupt-config.dartq.machine
+#              > target/evidence/regressions-replay/pub-corrupt-config.dartq.json
 #          On pub-corrupt-config the oracle may emit its own error-tier row
 #          for the corrupt resolution while dartq answers with the bounded
 #          DARTQ_PACKAGE_CONFIG_INVALID containment face — that oracle-side
@@ -345,7 +346,7 @@
 #          target/debug/harness replay \
 #            --corpus-dir <dir from the case json's corpus field> \
 #            --edits tests/corpus/regressions/cases/<case>.edits.jsonl \
-#            --dartq-cmd "./target/release/dartq analyze --format=machine" \
+#            --dartq-cmd "./target/release/dartq analyze --format=json" \
 #            --daemon-cmd "./target/release/dartq daemon {dir}"
 #        Its exit codes are incremental-consistency verdicts, never
 #        retirement verdicts: exit 0 non-vacuous = incrementally
@@ -366,7 +367,7 @@
 #        m0-gate idiom, zero code changes — oracle leg
 #        `"$DART_BIN" analyze --format=machine
 #        tests/corpus/nested-versions` vs dartq leg
-#        `./target/release/dartq analyze --format=machine --sdk $SDK_ROOT
+#        `./target/release/dartq analyze --format=json --sdk $SDK_ROOT
 #        tests/corpus/nested-versions`, then a jq set-compare of lowercase
 #        (code,file) pairs per file against the README expectation
 #        inventory (tests/corpus/nested-versions/README.md, 17 files).
@@ -451,8 +452,8 @@ DART_BIN="$SDK_ROOT/bin/dart"
 # templates and the companion replay arm carry none); without the export
 # both replay arms die on a usage-tier "DART_SDK unset" error.
 export DART_SDK="$SDK_ROOT"
-CHECK_CMD="${DARTQ_CMD:-./target/release/dartq check --format=machine}"
-ANALYZE_CMD="${DARTQ_ANALYZE_CMD:-./target/release/dartq analyze --format=machine --sdk $SDK_ROOT}"
+CHECK_CMD="${DARTQ_CMD:-./target/release/dartq check --format=json}"
+ANALYZE_CMD="${DARTQ_ANALYZE_CMD:-./target/release/dartq analyze --format=json --sdk $SDK_ROOT}"
 # The live faces run by default in the serial window (the 2026-10-13 live
 # failure predates the #1137 discovery/spawn rewrite); an explicit 0 opts
 # out via a clean logged skip. Only the literal "1" runs them.
@@ -870,7 +871,7 @@ mega_run() { # perf + parity: 1k oracle leg (parity) + scale run (perf)
       return 2
     fi
     watchdog_run "mega-r1-oracleleg${TAG}" "$MEGA_CAP_KB" \
-      env DARTQ_CMD="./target/release/dartq analyze --format=machine --sdk $SDK_ROOT" \
+      env DARTQ_CMD="./target/release/dartq analyze --format=json --sdk $SDK_ROOT" \
       scripts/mega-run.sh --scale 1k --oracle-leg --strict --label "${LBL_MEGA}-oracleleg" || return 1
     leg_peak="$WATCH_PEAK_KB"
   fi
@@ -969,10 +970,19 @@ step_runner() { # <step> — runs every watchdogged phase of the step
     # itself exits 3; only a crash code or a watchdog kill fails the step.
     local analyze_rc=0
     watchdog_run "$1" "$(cap_for_step "$1")" \
-./target/release/dartq analyze --format=machine --sdk "$SDK_ROOT" \
+./target/release/dartq analyze --format=json --sdk "$SDK_ROOT" \
       tests/corpus/lints-new || analyze_rc=$?
     if [ "$analyze_rc" -gt 3 ] || grep -q '^WATCHDOG_KILL' "$WATCH_LOG"; then
       step_fail "dartq analyze over tests/corpus/lints-new exited $analyze_rc (crash or watchdog kill — issue tiers 1-3 are expected)"
+      return 1
+    fi
+    # The json envelope is one stdout line inside the watchdog log (the
+    # log also carries stderr and the trailing exit= marker); a missing
+    # envelope is a parse failure of this step, never an empty set.
+    local json_line=""
+    json_line="$(grep -m1 '^{"version":1,"diagnostics":' "$WATCH_LOG" || true)"
+    if [ -z "$json_line" ]; then
+      step_fail "N5 face: no json envelope in ${WATCH_LOG} (the analyze leg wrote no parsable output)"
       return 1
     fi
     local expected_set actual_set
@@ -981,36 +991,29 @@ step_runner() { # <step> — runs every watchdogged phase of the step
       $f.value | to_entries[] | $f.key as $file |
 .key as $code |.value[] | "\($code)|\($file)|\(.)"' \
       tests/corpus/lints-new/expectations.json | LC_ALL=C sort)"
-    # Machine row shape: SEVERITY|TYPE|CODE|FILE|LINE|COL|LENGTH[|MESSAGE].
-    # Filter to the 19 rule codes (stock diagnostics are out of face on
-    # both legs), normalize the file path to corpus-root-relative (dartq
-    # prints the canonical absolute path; the as-given and corpus-qualified
-    # relative shapes are kept for harness-replay logs), keep the corpus's
-    # own lib/ and packages/ trees only (vendored dependency rows are out
-    # of face), and lowercase the code to the rule name.
-    local codes_file="/tmp/serial_lints-new-codes${TAG}.txt"
-    jq -r '.rules[]' tests/corpus/lints-new/expectations.json >"$codes_file"
-    actual_set="$(awk -F'|' '
-      NR == FNR { codes[$0] = 1; next }
-      /^[A-Z]+\|/ && NF >= 6 {
-        file = $4
-        if (substr(file, 1, 23) == "tests/corpus/lints-new/")
-          file = substr(file, 24)
-        else if (substr(file, 1, 2) == "./")
-          file = substr(file, 3)
-        else if (file ~ /^\/.*tests\/corpus\/lints-new\//)
-          sub(/^.*tests\/corpus\/lints-new\//, "", file)
-        if (file !~ /^(lib|packages)\//) next
-        code = tolower($3)
-        if (!(code in codes)) next
-        print code "|" file "|" $5
-      }' "$codes_file" "$WATCH_LOG" | LC_ALL=C sort)"
+    # json envelope shape: {version, diagnostics:[{code, severity, type,
+    # location{file, range{start{line, ...}}}, ...}]}. Filter to the 19
+    # rule codes (stock diagnostics are out of face on both legs; json
+    # codes are already lowercase rule names), normalize the file path to
+    # corpus-root-relative (dartq prints the canonical absolute path; the
+    # as-given and corpus-qualified relative shapes are kept for
+    # harness-replay logs), keep the corpus's own lib/ and packages/ trees
+    # only (vendored dependency rows are out of face).
+    actual_set="$(jq -r --slurpfile exp tests/corpus/lints-new/expectations.json '
+      .diagnostics[]
+      | (.location.file
+         | sub("^.*tests/corpus/lints-new/"; "")
+         | sub("^\\./"; "")) as $file
+      | select($file | test("^(lib|packages)/"))
+      | select(.code as $c | $exp[0].rules | index($c))
+      | "\(.code)|\($file)|\(.location.range.start.line)"
+    ' <<<"$json_line" | LC_ALL=C sort)"
     if [ "$actual_set" = "$expected_set" ]; then
       echo "-- [$1] N5 face green: $(printf '%s\n' "$expected_set" | grep -c.) expected rows matched exactly"
       return 0
     fi
     {
-      echo "N5 lints-new drift (diff: expectations.json vs dartq machine rows):"
+      echo "N5 lints-new drift (diff: expectations.json vs dartq json envelope rows):"
       diff <(printf '%s\n' "$expected_set") <(printf '%s\n' "$actual_set") |
         sed 's/^/  | /' | head -40
     } >&2

@@ -49,7 +49,8 @@ PYEOF
 
   leg_begin compat-matrix "two SDK-shaped roots differentiate the matrix; a broken root is isolated"
   run_dartq_in compat-run "$base/w" compat lib/a.dart \
-    --sdk-root "$base/sdks/old" --sdk-root "$base/sdks/new" --sdk-root "$base/sdks/broken"
+    --sdk-root "$base/sdks/old" --sdk-root "$base/sdks/new" --sdk-root "$base/sdks/broken" \
+    --format json
   assert_eq "$DQ_RC" 0 "incompatible axes are the answer's data, not a failure"
   json_check "$(out_file compat-run)" "j['schema_version']==1" "the frozen JSON contract"
   json_check "$(out_file compat-run)" "len(j['matrix'])==3" "one row per --sdk-root, in CLI order"

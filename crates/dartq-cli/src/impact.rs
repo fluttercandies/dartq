@@ -12,7 +12,7 @@
 //! depends on this file's API surface". The daemon passes real before/after
 //! diffs through the same query.
 //!
-//! Output is the frozen JSON contract (`schema_version: 3`; the labels are
+//! Output is the frozen JSON contract (`v: 3`; the labels are
 //! the shared pkg_label projection — a file under a package's `lib` tree
 //! answers its `package:<name>/<path>` form, files outside one keep the
 //! canonical path), schema-valid at birth (the shared core's shaper
@@ -60,6 +60,11 @@ pub(crate) struct ImpactArgs {
     /// library-face name of the owning library seeds.
     #[arg(long = "symbol", value_name = "NAME")]
     pub(crate) symbols: Vec<String>,
+    /// Output format: `lon` (the default) or `json` (the frozen report,
+    /// both the same value — `sym`/`files`/`tests`/`envs`/`lines`/
+    /// `sig_changed`), or `text` (the indented report).
+    #[arg(long, value_enum, default_value_t = crate::OutputFormat::Lon)]
+    pub(crate) format: crate::OutputFormat,
 }
 
 /// Crash tier like the other engine faces: a panic aborts with exit 4 and
@@ -116,14 +121,18 @@ fn run(args: &ImpactArgs, out: &mut impl Write) -> u8 {
         }
     };
 
-    let written = out
-        .write_all(
-            serde_json::to_string(&to_json(&report))
-                .expect("the validated report serializes")
-                .as_bytes(),
-        )
-        .and_then(|()| out.write_all(b"\n"))
-        .and_then(|()| out.flush());
+    let written = match args.format {
+        crate::OutputFormat::Json => out
+            .write_all(
+                serde_json::to_string(&to_json(&report))
+                    .expect("the validated report serializes")
+                    .as_bytes(),
+            )
+            .and_then(|()| out.write_all(b"\n")),
+        crate::OutputFormat::Lon => crate::output::write_lon(out, &to_json(&report)),
+        crate::OutputFormat::Text => crate::output::write_text_value(out, &to_json(&report)),
+    }
+    .and_then(|()| out.flush());
     if let Err(error) = written {
         eprintln!("dartq: internal error: writing the impact report failed: {error}");
         return exit::INTERNAL_ERROR;
@@ -251,6 +260,7 @@ mod tests {
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
+            format: crate::OutputFormat::Json,
             symbols: Vec::new(),
         };
         let mut out: Vec<u8> = Vec::new();
@@ -259,15 +269,15 @@ mod tests {
 
         let json: serde_json::Value =
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["v"], 3);
         // Lib files answer their package-form references (the shared
         // pkg_label projection), ASCII-sorted, hypothetical signature
         // flags.
-        let symbols: Vec<&str> = json["changed"]
+        let symbols: Vec<&str> = json["sym"]
             .as_array()
-            .expect("changed")
+            .expect("sym")
             .iter()
-            .map(|row| row["symbol"].as_str().expect("symbol"))
+            .map(|row| row["sym"].as_str().expect("sym"))
             .collect();
         assert_eq!(
             symbols,
@@ -275,20 +285,20 @@ mod tests {
             "every face name, ASCII-sorted, hypothetical signature flags"
         );
         assert!(
-            json["changed"]
+            json["sym"]
                 .as_array()
-                .expect("changed")
+                .expect("sym")
                 .iter()
-                .all(|row| row["signature_changed"] == true),
+                .all(|row| row["sig_changed"] == true),
         );
 
         // The test tree file keeps its canonical path (no `package:` URI
         // addresses it — the documented fallback), and the path sort puts
         // it first: `/` sorts before `p` in `package:`.
         let test_path = root.canonicalize().expect("root").join("test/a_test.dart");
-        let affected: Vec<(String, &str)> = json["affected"]
+        let affected: Vec<(String, &str)> = json["files"]
             .as_array()
-            .expect("affected")
+            .expect("files")
             .iter()
             .map(|row| {
                 (
@@ -305,7 +315,7 @@ mod tests {
             ],
             "both import a directly; the import of the test resolves through the package URI"
         );
-        let tests: Vec<String> = json["affected_tests"]
+        let tests: Vec<String> = json["tests"]
             .as_array()
             .expect("tests")
             .iter()
@@ -318,7 +328,7 @@ mod tests {
         // layer's ERROR lands in the set, and the honest row is
         // incompatible.
         assert_eq!(
-            json["affected_environments"],
+            json["envs"],
             serde_json::json!([{ "label": "default", "compatible": false }]),
         );
 
@@ -338,6 +348,7 @@ mod tests {
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
             symbols: Vec::new(),
+            format: crate::OutputFormat::Json,
         };
         let mut compact: Vec<u8> = Vec::new();
         assert_eq!(run(&base, &mut compact), exit::CLEAN);
@@ -348,6 +359,7 @@ mod tests {
                 dir: base.dir.clone(),
                 sdk: base.sdk.clone(),
                 symbols: Vec::new(),
+                format: crate::OutputFormat::Json,
             };
             let mut out: Vec<u8> = Vec::new();
             assert_eq!(run(&args, &mut out), exit::CLEAN);
@@ -369,6 +381,7 @@ mod tests {
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
+            format: crate::OutputFormat::Json,
             symbols: Vec::new(),
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
@@ -387,17 +400,18 @@ mod tests {
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
+            format: crate::OutputFormat::Json,
             symbols: Vec::new(),
         };
         let mut out: Vec<u8> = Vec::new();
         assert_eq!(run(&args, &mut out), exit::CLEAN);
         let json: serde_json::Value =
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
-        let symbols: Vec<&str> = json["changed"]
+        let symbols: Vec<&str> = json["sym"]
             .as_array()
-            .expect("changed")
+            .expect("sym")
             .iter()
-            .map(|row| row["symbol"].as_str().expect("symbol"))
+            .map(|row| row["sym"].as_str().expect("sym"))
             .collect();
         assert_eq!(
             symbols,
@@ -418,6 +432,7 @@ mod tests {
             dir: root.clone(),
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
+            format: crate::OutputFormat::Json,
             symbols: Vec::new(),
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);
@@ -434,6 +449,7 @@ mod tests {
             dir: root.clone(),
             sdk: Some(root.join("no-such-sdk")),
             verbosity: Verbosity::Compact,
+            format: crate::OutputFormat::Json,
             symbols: Vec::new(),
         };
         assert_eq!(run(&args, &mut Vec::new()), exit::USAGE);

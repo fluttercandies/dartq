@@ -2,18 +2,20 @@
 //! proxy to the worktree's resident session over the same daemon-call
 //! transport the MCP server uses ([`crate::mcp`]). One engine, one
 //! protocol: every subcommand maps to exactly one `dartq/debug/*`
-//! daemon method with the daemon's own parameter spellings (`--wsUri`,
-//! `--wsUri`, `--dartDefines`, …), so the CLI and MCP faces are
+//! daemon method with the daemon's own snake_case parameter spellings
+//! (`--ws-uri`, `--dart-defines`, …), so the CLI and MCP faces are
 //! interchangeable — whatever one can drive, the other can too.
 //!
-//! Output contract: one JSON line per call on stdout — the daemon's
-//! answer verbatim (the debug face is a machine channel, like `session`
-//! and `events`). Exit tiers: 0 the answer rode stdout; 1 the daemon
-//! answered a domain error (one `{"error":{"code","message"}}` line on
-//! stdout — the debug family's `DARTQ/DEBUG/*` machine-code prefix
-//! rides the message); 64 usage (clap or an unresolvable worktree);
-//! 4 the proxy never got an answer (no resident session, transport,
-//! wedge).
+//! Output contract: the format axis on every subcommand (`--format
+//! lon|json|text`, `lon` the default — the daemon's answer as one
+//! canonical line; `json` the answer verbatim; `text` the indented
+//! `status` listing, every other face a write-ish
+//! operation whose record rides the lon spelling). Exit tiers: 0 the
+//! answer rode stdout; 1 the daemon answered a domain error (one
+//! `{"error":{"code","msg"}}` line on stdout — the debug family's
+//! `DARTQ/DEBUG/*` machine-code prefix rides the message); 64 usage
+//! (clap or an unresolvable worktree); 4 the proxy never got an answer
+//! (no resident session, transport, wedge).
 
 use std::path::{Path, PathBuf};
 
@@ -58,7 +60,7 @@ enum DebugCommand {
     /// the stack summary, and the top frame's variables with
     /// lazy-expansion handles. Not for: the program's output (`output`).
     Snapshot(SnapshotArgs),
-    /// Evaluate one Dart expression in a paused frame (`--frameIndex`)
+    /// Evaluate one Dart expression in a paused frame (`--frame-index`)
     /// or the isolate's root library. Use for: inspecting state the
     /// snapshot only names; verifying a fix from inside the app.
     Evaluate(EvaluateArgs),
@@ -97,7 +99,8 @@ enum DebugCommand {
     Output(OutputArgs),
 }
 
-/// The worktree every subcommand binds to — flattened into each.
+/// The worktree every subcommand binds to — flattened into each, with
+/// the shared format axis.
 #[derive(Args)]
 struct WorktreeArgs {
     /// The worktree whose resident session drives the debug face;
@@ -107,6 +110,11 @@ struct WorktreeArgs {
     /// Dart SDK root; defaults to `$DART_SDK`.
     #[arg(long)]
     sdk: Option<PathBuf>,
+    /// Output format: `lon` (the default), `json`, or `text` (the
+    /// indented `status` listing; the other faces ride the lon record —
+    /// a write's output is a record, not prose).
+    #[arg(long, value_enum, default_value_t = crate::OutputFormat::Lon)]
+    format: crate::OutputFormat,
 }
 
 #[derive(Args)]
@@ -124,15 +132,15 @@ struct LaunchArgs {
     args: Vec<String>,
     /// VM flags ahead of the script (Dart launches only — a Flutter
     /// launch rejects them; pass tool flags through `--flutterArgs`).
-    #[arg(long = "vmFlags", value_name = "FLAG", allow_hyphen_values = true)]
+    #[arg(long = "vm-flags", value_name = "FLAG", allow_hyphen_values = true)]
     vm_flags: Vec<String>,
     /// Release the start pause: the program runs immediately. The
     /// default pauses at start — the takeover window for arming
-    /// breakpoints. `--pauseOnStart` restores it.
-    #[arg(long = "no-pauseOnStart", overrides_with = "pause_on_start")]
+    /// breakpoints. `--pause-on-start` restores it.
+    #[arg(long = "no-pause-on-start", overrides_with = "pause_on_start")]
     no_pause_on_start: bool,
     /// The positive spelling — see `no_pause_on_start`.
-    #[arg(long = "pauseOnStart", hide = true, overrides_with = "no_pause_on_start")]
+    #[arg(long = "pause-on-start", hide = true, overrides_with = "no_pause_on_start")]
     pause_on_start: bool,
     /// Working directory for the launched program; relative resolves
     /// against the worktree root.
@@ -145,11 +153,11 @@ struct LaunchArgs {
     #[arg(long)]
     flavor: Option<String>,
     /// Flutter: `--dart-define` entries, `KEY=VALUE`; repeatable.
-    #[arg(long = "dartDefines", value_name = "KEY=VALUE")]
+    #[arg(long = "dart-defines", value_name = "KEY=VALUE")]
     dart_defines: Vec<String>,
     /// Flutter: extra `flutter run` arguments passed through verbatim;
     /// repeatable.
-    #[arg(long = "flutterArgs", value_name = "FLAG", allow_hyphen_values = true)]
+    #[arg(long = "flutter-args", value_name = "FLAG", allow_hyphen_values = true)]
     flutter_args: Vec<String>,
     #[command(flatten)]
     worktree: WorktreeArgs,
@@ -158,7 +166,7 @@ struct LaunchArgs {
 #[derive(Args)]
 struct AttachArgs {
     /// The VM service WebSocket URI to attach to.
-    #[arg(long = "wsUri", value_name = "WS_URI")]
+    #[arg(long = "ws-uri", value_name = "WS_URI")]
     ws_uri: String,
     #[command(flatten)]
     worktree: WorktreeArgs,
@@ -212,7 +220,7 @@ struct EvaluateArgs {
     expression: String,
     /// Evaluate in this frame of the paused isolate; absent evaluates
     /// in the isolate's root library.
-    #[arg(long = "frameIndex")]
+    #[arg(long = "frame-index")]
     frame_index: Option<u32>,
     #[arg(long)]
     isolate: Option<String>,
@@ -282,7 +290,7 @@ struct BreakpointAddArgs {
     column: Option<u32>,
     /// A function entry to break on (`functions/42`) — the alternative
     /// to the `--script`/`--line` pair.
-    #[arg(long = "functionId", value_name = "ID", conflicts_with_all = ["script", "line"])]
+    #[arg(long = "function-id", value_name = "ID", conflicts_with_all = ["script", "line"])]
     function_id: Option<String>,
     /// A Dart condition; the breakpoint fires only when it evaluates
     /// true.
@@ -301,7 +309,7 @@ struct BreakpointRemoveArgs {
     #[arg(short = 's', long = "session", value_name = "ID")]
     session: Option<u32>,
     /// The breakpoint id to remove.
-    #[arg(long = "breakpointId", value_name = "ID")]
+    #[arg(long = "breakpoint-id", value_name = "ID")]
     breakpoint_id: String,
     #[arg(long)]
     isolate: Option<String>,
@@ -366,7 +374,7 @@ struct OutputArgs {
     #[arg(long)]
     since: Option<u64>,
     /// At most this many bytes per page.
-    #[arg(long = "maxBytes", default_value_t = 4096)]
+    #[arg(long = "max-bytes", default_value_t = 4096)]
     max_bytes: usize,
     #[command(flatten)]
     worktree: WorktreeArgs,
@@ -459,10 +467,11 @@ impl StreamArg {
 // ---------------------------------------------------------------------------
 
 /// One parsed subcommand's proxy target: the worktree the session binds
-/// to, plus the daemon method and its parameters.
+/// to, the output format, plus the daemon method and its parameters.
 struct Request<'a> {
     dir: &'a Path,
     sdk: Option<&'a Path>,
+    format: crate::OutputFormat,
     method: &'static str,
     params: Value,
 }
@@ -478,14 +487,14 @@ impl DebugArgs {
                     "script": &args.script,
                     "kind": args.kind.wire(),
                     "args": &args.args,
-                    "vmFlags": &args.vm_flags,
-                    "dartDefines": &args.dart_defines,
-                    "flutterArgs": &args.flutter_args,
+                    "vm_flags": &args.vm_flags,
+                    "dart_defines": &args.dart_defines,
+                    "flutter_args": &args.flutter_args,
                 });
                 // The daemon's default is pause-on-start; only the
                 // explicit opt-out rides the wire.
                 if args.no_pause_on_start {
-                    params["pauseOnStart"] = json!(false);
+                    params["pause_on_start"] = json!(false);
                 }
                 if let Some(cwd) = &args.cwd {
                     params["cwd"] = json!(cwd);
@@ -499,35 +508,35 @@ impl DebugArgs {
                 (&args.worktree, "dartq/debug/launch", params)
             }
             DebugCommand::Attach(args) => {
-                (&args.worktree, "dartq/debug/attach", json!({"wsUri": &args.ws_uri}))
+                (&args.worktree, "dartq/debug/attach", json!({"ws_uri": &args.ws_uri}))
             }
             DebugCommand::Detach(args) => (
                 &args.worktree,
                 "dartq/debug/detach",
-                json!({"sessionId": args.session}),
+                json!({"session_id": args.session}),
             ),
             DebugCommand::Stop(args) => {
-                (&args.worktree, "dartq/debug/stop", json!({"sessionId": args.session}))
+                (&args.worktree, "dartq/debug/stop", json!({"session_id": args.session}))
             }
             DebugCommand::Status(args) => {
                 let mut params = json!({});
                 if let Some(id) = args.session {
-                    params["sessionId"] = json!(id);
+                    params["session_id"] = json!(id);
                 }
                 (&args.worktree, "dartq/debug/status", params)
             }
             DebugCommand::Snapshot(args) => (
                 &args.worktree,
                 "dartq/debug/snapshot",
-                json!({"sessionId": args.session, "isolate": &args.isolate}),
+                json!({"session_id": args.session, "isolate": &args.isolate}),
             ),
             DebugCommand::Evaluate(args) => {
                 let mut params = json!({
-                    "sessionId": args.session,
+                    "session_id": args.session,
                     "expression": &args.expression,
                 });
                 if let Some(frame) = args.frame_index {
-                    params["frameIndex"] = json!(frame);
+                    params["frame_index"] = json!(frame);
                 }
                 if let Some(isolate) = &args.isolate {
                     params["isolate"] = json!(isolate);
@@ -536,7 +545,7 @@ impl DebugArgs {
             }
             DebugCommand::Step(args) => {
                 let mut params = json!({
-                    "sessionId": args.session,
+                    "session_id": args.session,
                     "option": args.option.wire(),
                 });
                 if let Some(isolate) = &args.isolate {
@@ -545,14 +554,14 @@ impl DebugArgs {
                 (&args.worktree, "dartq/debug/step", params)
             }
             DebugCommand::Pause(args) => {
-                let mut params = json!({"sessionId": args.session});
+                let mut params = json!({"session_id": args.session});
                 if let Some(isolate) = &args.isolate {
                     params["isolate"] = json!(isolate);
                 }
                 (&args.worktree, "dartq/debug/pause", params)
             }
             DebugCommand::Resume(args) => {
-                let mut params = json!({"sessionId": args.session});
+                let mut params = json!({"session_id": args.session});
                 if let Some(isolate) = &args.isolate {
                     params["isolate"] = json!(isolate);
                 }
@@ -568,10 +577,10 @@ impl DebugArgs {
                             location["column"] = json!(column);
                         }
                     } else if let Some(function) = &args.function_id {
-                        location["functionId"] = json!(function);
+                        location["function_id"] = json!(function);
                     }
                     let mut params = json!({
-                        "sessionId": args.session,
+                        "session_id": args.session,
                         "location": location,
                     });
                     if let Some(condition) = &args.condition {
@@ -584,8 +593,8 @@ impl DebugArgs {
                 }
                 BreakpointCommand::Remove(args) => {
                     let mut params = json!({
-                        "sessionId": args.session,
-                        "breakpointId": &args.breakpoint_id,
+                        "session_id": args.session,
+                        "breakpoint_id": &args.breakpoint_id,
                     });
                     if let Some(isolate) = &args.isolate {
                         params["isolate"] = json!(isolate);
@@ -595,7 +604,7 @@ impl DebugArgs {
             },
             DebugCommand::ExceptionPause(args) => {
                 let mut params = json!({
-                    "sessionId": args.session,
+                    "session_id": args.session,
                     "mode": args.mode.wire(),
                 });
                 if let Some(isolate) = &args.isolate {
@@ -604,7 +613,7 @@ impl DebugArgs {
                 (&args.worktree, "dartq/debug/exceptionPause", params)
             }
             DebugCommand::Reload(args) => {
-                let mut params = json!({"sessionId": args.session});
+                let mut params = json!({"session_id": args.session});
                 if let Some(isolate) = &args.isolate {
                     params["isolate"] = json!(isolate);
                 }
@@ -614,11 +623,11 @@ impl DebugArgs {
                 (&args.worktree, "dartq/debug/reload", params)
             }
             DebugCommand::Restart(args) => {
-                (&args.worktree, "dartq/debug/restart", json!({"sessionId": args.session}))
+                (&args.worktree, "dartq/debug/restart", json!({"session_id": args.session}))
             }
             DebugCommand::Events(args) => {
                 let mut params = json!({
-                    "sessionId": args.session,
+                    "session_id": args.session,
                     "limit": args.limit,
                 });
                 if let Some(since) = args.since {
@@ -628,9 +637,9 @@ impl DebugArgs {
             }
             DebugCommand::Output(args) => {
                 let mut params = json!({
-                    "sessionId": args.session,
+                    "session_id": args.session,
                     "stream": args.stream.wire(),
-                    "maxBytes": args.max_bytes,
+                    "max_bytes": args.max_bytes,
                 });
                 if let Some(since) = args.since {
                     params["cursor"] = json!(since);
@@ -641,12 +650,13 @@ impl DebugArgs {
         let mut params = params;
         // An absent `-s` rides the daemon's sole-session default: the
         // selector is omitted from the wire, never sent as null.
-        if params.get("sessionId").is_some_and(Value::is_null) {
-            params.as_object_mut().expect("params are an object").remove("sessionId");
+        if params.get("session_id").is_some_and(Value::is_null) {
+            params.as_object_mut().expect("params are an object").remove("session_id");
         }
         Request {
             dir: &worktree.dir,
             sdk: worktree.sdk.as_deref(),
+            format: worktree.format,
             method,
             params,
         }
@@ -666,20 +676,39 @@ pub fn run_entry(args: &DebugArgs) -> u8 {
             return exit::USAGE;
         }
     };
+    let format = request.format;
+    let face_is_status = request.method == "dartq/debug/status";
     let mcp = Mcp::attach(root, request.sdk);
-    answer_tier(daemon_call(request.method, &request.params, &mcp))
+    answer_tier(daemon_call(request.method, &request.params, &mcp), format, face_is_status)
 }
 
 /// Prints one proxy outcome per the output contract and maps it to its
-/// exit tier.
-fn answer_tier(outcome: Result<Value, ProxyError>) -> u8 {
+/// exit tier. The error line is data on every format — the `msg` key of
+/// the debug family's error shape.
+fn answer_tier(
+    outcome: Result<Value, ProxyError>,
+    format: crate::OutputFormat,
+    face_is_status: bool,
+) -> u8 {
+    let emit = |value: &Value| match format {
+        crate::OutputFormat::Lon => println!("{}", crate::output::lon_line(value)),
+        crate::OutputFormat::Json => println!("{value}"),
+        // Only the status listing earns the prose face; every other
+        // subcommand is a write-ish operation whose record rides the lon
+        // spelling.
+        crate::OutputFormat::Text if face_is_status => println!(
+            "{}",
+            serde_json::to_string_pretty(value).expect("the value pretty-prints")
+        ),
+        crate::OutputFormat::Text => println!("{}", crate::output::lon_line(value)),
+    };
     match outcome {
         Ok(answer) => {
-            println!("{answer}");
+            emit(&answer);
             exit::CLEAN
         }
         Err(ProxyError::Daemon(code, message)) => {
-            println!("{}", json!({"error": {"code": code, "message": message}}));
+            emit(&json!({"error": {"code": code, "msg": message}}));
             exit::DEBUG_DOMAIN
         }
         Err(ProxyError::Transport(reason)) => {
@@ -713,22 +742,22 @@ mod tests {
                 "dartq/debug/launch",
                 json!({
                     "script": "bin/main.dart", "kind": "dart",
-                    "args": [], "vmFlags": [], "dartDefines": [], "flutterArgs": [],
+                    "args": [], "vm_flags": [], "dart_defines": [], "flutter_args": [],
                 }),
             ),
             (
                 &[
                     "launch", "--kind", "flutter", "--device", "macos", "--flavor", "dev",
-                    "--dartDefines", "A=1", "--dartDefines", "B=2", "--flutterArgs",
-                    "--no-devtools", "--vmFlags", "--enable-asserts", "--cwd", "bin",
-                    "--no-pauseOnStart", "lib/main.dart",
+                    "--dart-defines", "A=1", "--dart-defines", "B=2", "--flutter-args",
+                    "--no-devtools", "--vm-flags", "--enable-asserts", "--cwd", "bin",
+                    "--no-pause-on-start", "lib/main.dart",
                 ],
                 "dartq/debug/launch",
                 json!({
                     "script": "lib/main.dart", "kind": "flutter",
-                    "args": [], "vmFlags": ["--enable-asserts"],
-                    "dartDefines": ["A=1", "B=2"], "flutterArgs": ["--no-devtools"],
-                    "pauseOnStart": false, "cwd": "bin", "device": "macos", "flavor": "dev",
+                    "args": [], "vm_flags": ["--enable-asserts"],
+                    "dart_defines": ["A=1", "B=2"], "flutter_args": ["--no-devtools"],
+                    "pause_on_start": false, "cwd": "bin", "device": "macos", "flavor": "dev",
                 }),
             ),
             (
@@ -736,46 +765,46 @@ mod tests {
                 "dartq/debug/launch",
                 json!({
                     "script": "bin/main.dart", "kind": "dart",
-                    "args": ["--fast", "-x"], "vmFlags": [], "dartDefines": [],
-                    "flutterArgs": [],
+                    "args": ["--fast", "-x"], "vm_flags": [], "dart_defines": [],
+                    "flutter_args": [],
                 }),
             ),
             (
-                &["attach", "--wsUri", "ws://127.0.0.1:8181/ws"],
+                &["attach", "--ws-uri", "ws://127.0.0.1:8181/ws"],
                 "dartq/debug/attach",
-                json!({"wsUri": "ws://127.0.0.1:8181/ws"}),
+                json!({"ws_uri": "ws://127.0.0.1:8181/ws"}),
             ),
-            (&["detach", "-s", "3"], "dartq/debug/detach", json!({"sessionId": 3})),
-            (&["stop", "--session", "3"], "dartq/debug/stop", json!({"sessionId": 3})),
+            (&["detach", "-s", "3"], "dartq/debug/detach", json!({"session_id": 3})),
+            (&["stop", "--session", "3"], "dartq/debug/stop", json!({"session_id": 3})),
             (&["status"], "dartq/debug/status", json!({})),
-            (&["status", "-s", "2"], "dartq/debug/status", json!({"sessionId": 2})),
+            (&["status", "-s", "2"], "dartq/debug/status", json!({"session_id": 2})),
             (
                 &["snapshot", "--session", "1", "--isolate", "isolates/7"],
                 "dartq/debug/snapshot",
-                json!({"sessionId": 1, "isolate": "isolates/7"}),
+                json!({"session_id": 1, "isolate": "isolates/7"}),
             ),
             (
                 &[
-                    "evaluate", "-s", "1", "--frameIndex", "0", "--isolate",
+                    "evaluate", "-s", "1", "--frame-index", "0", "--isolate",
                     "isolates/7", "count + 1",
                 ],
                 "dartq/debug/evaluate",
-                json!({"sessionId": 1, "expression": "count + 1", "frameIndex": 0, "isolate": "isolates/7"}),
+                json!({"session_id": 1, "expression": "count + 1", "frame_index": 0, "isolate": "isolates/7"}),
             ),
             (
                 &["step", "--session", "1", "over"],
                 "dartq/debug/step",
-                json!({"sessionId": 1, "option": "over"}),
+                json!({"session_id": 1, "option": "over"}),
             ),
             (
                 &["pause", "-s", "1", "--isolate", "isolates/7"],
                 "dartq/debug/pause",
-                json!({"sessionId": 1, "isolate": "isolates/7"}),
+                json!({"session_id": 1, "isolate": "isolates/7"}),
             ),
             (
                 &["resume", "--session", "1"],
                 "dartq/debug/resume",
-                json!({"sessionId": 1}),
+                json!({"session_id": 1}),
             ),
             (
                 &[
@@ -785,54 +814,54 @@ mod tests {
                 ],
                 "dartq/debug/breakpointAdd",
                 json!({
-                    "sessionId": 1,
+                    "session_id": 1,
                     "location": {"script": "package:app/main.dart", "line": 12, "column": 5},
                     "condition": "x > 3",
                 }),
             ),
             (
-                &["breakpoint", "add", "--session", "1", "--functionId", "functions/42"],
+                &["breakpoint", "add", "--session", "1", "--function-id", "functions/42"],
                 "dartq/debug/breakpointAdd",
-                json!({"sessionId": 1, "location": {"functionId": "functions/42"}}),
+                json!({"session_id": 1, "location": {"function_id": "functions/42"}}),
             ),
             (
-                &["breakpoint", "rm", "-s", "1", "--breakpointId", "breakpoints/3"],
+                &["breakpoint", "rm", "-s", "1", "--breakpoint-id", "breakpoints/3"],
                 "dartq/debug/breakpointRemove",
-                json!({"sessionId": 1, "breakpointId": "breakpoints/3"}),
+                json!({"session_id": 1, "breakpoint_id": "breakpoints/3"}),
             ),
             (
                 &["exception-pause", "--session", "1", "uncaught"],
                 "dartq/debug/exceptionPause",
-                json!({"sessionId": 1, "mode": "uncaught"}),
+                json!({"session_id": 1, "mode": "uncaught"}),
             ),
             (
                 &["reload", "-s", "1", "--force"],
                 "dartq/debug/reload",
-                json!({"sessionId": 1, "force": true}),
+                json!({"session_id": 1, "force": true}),
             ),
-            (&["restart", "--session", "1"], "dartq/debug/restart", json!({"sessionId": 1})),
+            (&["restart", "--session", "1"], "dartq/debug/restart", json!({"session_id": 1})),
             (
                 &["events", "-s", "1", "--since", "41", "--limit", "8"],
                 "dartq/debug/events",
-                json!({"sessionId": 1, "limit": 8, "cursor": 41}),
+                json!({"session_id": 1, "limit": 8, "cursor": 41}),
             ),
             (
                 &["events", "--session", "1"],
                 "dartq/debug/events",
-                json!({"sessionId": 1, "limit": 64}),
+                json!({"session_id": 1, "limit": 64}),
             ),
             (
                 &[
                     "output", "-s", "1", "--stream", "stderr", "--since", "9",
-                    "--maxBytes", "512",
+                    "--max-bytes", "512",
                 ],
                 "dartq/debug/output",
-                json!({"sessionId": 1, "stream": "stderr", "maxBytes": 512, "cursor": 9}),
+                json!({"session_id": 1, "stream": "stderr", "max_bytes": 512, "cursor": 9}),
             ),
             (
                 &["output", "--session", "1"],
                 "dartq/debug/output",
-                json!({"sessionId": 1, "stream": "stdout", "maxBytes": 4096}),
+                json!({"session_id": 1, "stream": "stdout", "max_bytes": 4096}),
             ),
         ];
         for (argv, method, params) in cases {
@@ -870,7 +899,7 @@ mod tests {
     fn the_emitted_family_is_exactly_the_daemons_debug_requests() {
         let argvs: [&[&str]; 17] = [
             &["launch", "bin/main.dart"],
-            &["attach", "--wsUri", "ws://x"],
+            &["attach", "--ws-uri", "ws://x"],
             &["detach", "--session", "1"],
             &["stop", "-s", "1"],
             &["status"],
@@ -880,7 +909,7 @@ mod tests {
             &["pause", "-s", "1"],
             &["resume", "--session", "1"],
             &["breakpoint", "add", "-s", "1", "--script", "s.dart", "--line", "1"],
-            &["breakpoint", "rm", "--session", "1", "--breakpointId", "b/1"],
+            &["breakpoint", "rm", "--session", "1", "--breakpoint-id", "b/1"],
             &["exception-pause", "-s", "1", "all"],
             &["reload", "--session", "1"],
             &["restart", "-s", "1"],
@@ -896,7 +925,7 @@ mod tests {
     }
 
     /// The sole-session default: with no `-s`, every driving verb parses
-    /// and sends no `sessionId` at all (never `null`) — the daemon picks
+    /// and sends no `session_id` at all (never `null`) — the daemon picks
     /// the sole live session or answers the machine-coded miss.
     #[test]
     fn no_selector_omits_the_session_from_the_wire() {
@@ -905,12 +934,12 @@ mod tests {
             &["stop"],
             &["status"],
             &["snapshot", "--isolate", "isolates/1"],
-            &["evaluate", "n", "--frameIndex", "0"],
+            &["evaluate", "n", "--frame-index", "0"],
             &["step", "over"],
             &["pause"],
             &["resume"],
             &["breakpoint", "add", "--script", "s.dart", "--line", "1"],
-            &["breakpoint", "rm", "--breakpointId", "b/1"],
+            &["breakpoint", "rm", "--breakpoint-id", "b/1"],
             &["exception-pause", "all"],
             &["reload"],
             &["restart"],
@@ -920,23 +949,23 @@ mod tests {
         for argv in argvs {
             let parsed = parse(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
             let params = parsed.request().params;
-            assert!(params.get("sessionId").is_none(), "{argv:?}: {params}");
+            assert!(params.get("session_id").is_none(), "{argv:?}: {params}");
         }
         // Both explicit spellings land on the same wire key.
         for argv in [&["resume", "-s", "4"][..], &["resume", "--session", "4"][..]] {
-            assert_eq!(parse(argv).expect("parse").request().params, json!({"sessionId": 4}));
+            assert_eq!(parse(argv).expect("parse").request().params, json!({"session_id": 4}));
         }
     }
 
     /// The grammar's refusal set: required selectors, the mutually
-    /// exclusive breakpoint shapes, and the enum-spelled words — and the
-    /// retired camelCase `--sessionId` spelling.
+    /// exclusive breakpoint shapes, and the enum-spelled words — and
+    /// hyphenated selector spellings (`--session-id` is not a flag).
     #[test]
     fn malformed_requests_are_usage_errors() {
         for argv in [
             &["launch"][..],
             &["attach"][..],
-            &["resume", "--sessionId", "1"][..],
+            &["resume", "--session-id", "1"][..],
             &["snapshot", "--session", "1"][..],
             &["evaluate", "-s", "1"][..],
             &["step", "--session", "1"][..],
@@ -946,7 +975,7 @@ mod tests {
             &["breakpoint", "add", "--session", "1", "--script", "s.dart"][..],
             &["breakpoint", "add", "-s", "1", "--line", "5"][..],
             &["breakpoint", "add", "--session", "1", "--column", "3"][..],
-            &["breakpoint", "add", "-s", "1", "--functionId", "f/1", "--line", "5"][..],
+            &["breakpoint", "add", "-s", "1", "--function-id", "f/1", "--line", "5"][..],
             &["breakpoint", "rm", "--session", "1"][..],
             &["bogus"][..],
         ] {
@@ -959,16 +988,27 @@ mod tests {
     /// at 4.
     #[test]
     fn answer_tier_maps_outcomes_to_exit_codes() {
-        assert_eq!(answer_tier(Ok(json!({"ok": true}))), exit::CLEAN);
         assert_eq!(
-            answer_tier(Err(ProxyError::Daemon(
-                -32001,
-                "DARTQ/DEBUG/NO_SUCH_SESSION: session 1 is not live".into()
-            ))),
+            answer_tier(Ok(json!({"ok": true})), crate::OutputFormat::Lon, false),
+            exit::CLEAN
+        );
+        assert_eq!(
+            answer_tier(
+                Err(ProxyError::Daemon(
+                    -32001,
+                    "DARTQ/DEBUG/NO_SUCH_SESSION: session 1 is not live".into()
+                )),
+                crate::OutputFormat::Lon,
+                false
+            ),
             exit::DEBUG_DOMAIN
         );
         assert_eq!(
-            answer_tier(Err(ProxyError::Transport("no resident session".into()))),
+            answer_tier(
+                Err(ProxyError::Transport("no resident session".into())),
+                crate::OutputFormat::Lon,
+                false
+            ),
             exit::INTERNAL_ERROR
         );
     }

@@ -168,19 +168,47 @@ for line in open(sys.argv[1]):
 PYEOF
 }
 
-# assert_fields FILE ROWPREFIX COUNT DESCRIPTION — the first machine row
-# starting with ROWPREFIX must split into exactly COUNT `|`-fields.
-assert_fields() {
-  local file="$1" prefix="$2" count="$3" desc="$4"
-  if python3 - "$file" "$prefix" "$count" <<'PYEOF'
-import sys
-file, prefix, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
-rows = [l.rstrip("\n") for l in open(file) if l.startswith(prefix)]
-assert rows, f"no {prefix} row in {file}"
-fields = rows[0].split("|")
-assert len(fields) == count, f"{len(fields)} fields (want {count}): {rows[0]}"
+# pkg_row_check ROWS DIR NAME KIND SDK RESOLVED DESCRIPTION — the json
+# face's pkg rows carry the directory exactly once with these fields.
+pkg_row_check() {
+  local rows="$1" dir="$2" name="$3" kind="$4" sdk="$5" resolved="$6" desc="$7"
+  if python3 - "$rows" "$dir" "$name" "$kind" "$sdk" "$resolved" <<'PYEOF'
+import json, sys
+rows, dir_, name, kind, sdk, resolved = sys.argv[1:7]
+resolved = {"true": True, "false": False, "null": None}[resolved]
+name = None if name == "null" else name
+sdk = None if sdk == "null" else sdk
+hits = [
+    json.loads(line) for line in rows.splitlines() if line.strip()
+    if json.loads(line).get("type") == "pkg" and json.loads(line).get("dir") == dir_
+]
+assert len(hits) == 1, f"{len(hits)} pkg rows for {dir_}"
+row = hits[0]
+assert row["name"] == name, f"name {row['name']!r} (want {name!r})"
+assert row["kind"] == kind, f"kind {row['kind']!r} (want {kind!r})"
+assert row["sdk"] == sdk, f"sdk {row['sdk']!r} (want {sdk!r})"
+assert row["resolved"] == resolved, f"resolved {row['resolved']!r}"
 PYEOF
-  then ok "$desc"; else bad "$desc" "field count mismatch in $file"; fi
+  then ok "$desc"; else bad "$desc" "pkg row mismatch for $dir"; fi
+}
+
+# boundary_row_check ROWS DIR REASON DESCRIPTION — the json face's
+# boundary row for DIR carries the reason.
+boundary_row_check() {
+  local rows="$1" dir="$2" reason="$3" desc="$4"
+  if python3 - "$rows" "$dir" "$reason" <<'PYEOF'
+import json, sys
+rows, dir_, reason = sys.argv[1:4]
+for line in rows.splitlines():
+    if not line.strip():
+        continue
+    row = json.loads(line)
+    if row.get("type") == "boundary" and row.get("dir") == dir_:
+        assert row["reason"] == reason, f"reason {row['reason']!r} (want {reason!r})"
+        sys.exit(0)
+sys.exit(f"no boundary row for {dir_}")
+PYEOF
+  then ok "$desc"; else bad "$desc" "boundary row mismatch for $dir"; fi
 }
 
 # run_dartq ID ARGS... — runs the release binary, captures
@@ -256,17 +284,19 @@ make_stub_sdk() {
 '
 }
 
-# gen_files TREE COUNT [PREFIX] — COUNT tiny clean libraries under
-# lib/src/, the cheap way to make cold analysis observable in time.
+# gen_files TREE COUNT [PREFIX [LINES]] — COUNT generated libraries under
+# lib/src/, the cheap way to make cold analysis observable in time. LINES
+# (default 1) sizes each file: the fix-stale leg's collect-loop window is
+# built from LINES-sized fillers.
 gen_files() {
-  local tree="$1" count="$2" prefix="${3:-gen}"
+  local tree="$1" count="$2" prefix="${3:-gen}" lines="${4:-1}"
   mkdir -p "$tree/lib/src"
-  python3 - "$tree" "$count" "$prefix" <<'PYEOF'
+  python3 - "$tree" "$count" "$prefix" "$lines" <<'PYEOF'
 import sys
-tree, count, prefix = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+tree, count, prefix, lines = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
 for i in range(count):
     with open(f"{tree}/lib/src/{prefix}_{i:04d}.dart", "w") as f:
-        f.write(f"int {prefix}_{i:04d}() => {i};\n")
+        f.write(f"int {prefix}_{i:04d}() => {i};\n" * lines)
 PYEOF
 }
 

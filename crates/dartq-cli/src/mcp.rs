@@ -82,7 +82,7 @@ const TOOLS: &[Tool] = &[
 semantic/flow/lint). Use for: 'what is wrong with this code', pre-commit checks, whole-file \
 review context. Not for: symbol lookups (dartq_query), why a diagnostic fires (dartq_explain), \
 or blast-radius questions (dartq_impact). Arguments: the daemon analyze parameters \
-(verbosity, context, agent).",
+(verbosity, context, agent_id). Answers in canonical LON over the short field vocabulary.",
         kind: ToolKind::Daemon("dartq/analyze"),
     },
     Tool {
@@ -118,7 +118,7 @@ applying lint/quick fixes. Not for: rename edits (dartq_rename) or plugin assist
         name: "dartq_rename",
         description: "Rename one symbol across the workspace; returns the machine edit set \
 (dry-run semantics — the caller applies edits). Use for: identifier renames. Not for: \
-fix-class rewrites (dartq_fix). Arguments: {target: 'PATH:LINE:COL', newName}. Runs a cold \
+fix-class rewrites (dartq_fix). Arguments: {target: 'PATH:LINE:COL', new_name}. Runs a cold \
 analysis pass — expect it slower than the session-resident tools.",
         kind: ToolKind::Rename,
     },
@@ -404,9 +404,13 @@ fn call_tool(params: &Value, mcp: &Mcp, output: &mut impl Write) -> Result<Value
         ProxyError::Transport(reason) => reason,
     });
     notify(output, &token, 1);
+    // The content payload is the answer's canonical LON encoding — the
+    // compact AI-first face, the same word list the daemon's own answers
+    // carry. The MCP wrapper itself stays
+    // JSON (the protocol's wire); only the content text re-encodes.
     Ok(match outcome {
         Ok(value) => json!({
-            "content": [{"type": "text", "text": value.to_string()}],
+            "content": [{"type": "text", "text": crate::output::lon_line(&value)}],
             "isError": false,
         }),
         Err(reason) => json!({
@@ -565,10 +569,12 @@ fn read_frame(stream: &mut UnixStream) -> Result<Value, ReadError> {
         .map_err(|error| ReadError::Malformed(error.to_string()))
 }
 
-/// The rename face over a cold in-process engine (the rare tool).
+/// The rename face over a cold in-process engine (the rare tool). The
+/// answer is the vocabulary shape: `new_name` plus one `{file off len}`
+/// edit row per site.
 fn rename_call(params: &Value, _mcp: &Mcp) -> Result<Value, String> {
-    let target = params["target"].as_str().ok_or("arguments: {target: 'PATH:LINE:COL', newName}")?;
-    let new_name = params["newName"].as_str().ok_or("arguments: {target: 'PATH:LINE:COL', newName}")?;
+    let target = params["target"].as_str().ok_or("arguments: {target: 'PATH:LINE:COL', new_name}")?;
+    let new_name = params["new_name"].as_str().ok_or("arguments: {target: 'PATH:LINE:COL', new_name}")?;
     let (path, line, column) = parse_target(target)?;
     let (mut engine, _dir) = dartq_commands::workspace::open_engine(
         path.parent().unwrap_or(Path::new(".")),
@@ -589,11 +595,12 @@ fn rename_call(params: &Value, _mcp: &Mcp) -> Result<Value, String> {
         .map(|edit| {
             json!({
                 "file": layout.file_path(edit.file),
-                "range": {"start": edit.range.offset, "length": edit.range.length},
+                "off": edit.range.offset,
+                "len": edit.range.length,
             })
         })
         .collect();
-    Ok(json!({"newName": new_name, "edits": edits}))
+    Ok(json!({"new_name": new_name, "edits": edits}))
 }
 
 fn parse_target(spec: &str) -> Result<(PathBuf, u32, u32), String> {
@@ -752,8 +759,8 @@ mod tests {
         let analyze = answer(3)["result"].clone();
         assert!(analyze["isError"].as_bool() == Some(false), "{analyze}");
         assert!(
-            analyze["content"][0]["text"].as_str().unwrap_or_default().contains("diagnostics"),
-            "the daemon answer rides the MCP content"
+            analyze["content"][0]["text"].as_str().unwrap_or_default().contains("diags"),
+            "the daemon answer rides the MCP content in canonical LON (diagnostics → diags)"
         );
         let progress = answer(4)["result"]["content"][0]["text"].to_string();
         assert!(progress.contains("files_scanned"), "{progress}");

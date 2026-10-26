@@ -58,7 +58,7 @@ fn answer_error(h: &common::Harness, id: i64) -> Value {
 
 /// The `code` spellings of a check/analyze answer's diagnostic rows.
 fn codes(result: &Value) -> Vec<&str> {
-    result["diagnostics"]
+    result["diags"]
         .as_array()
         .expect("diagnostics array")
         .iter()
@@ -98,7 +98,7 @@ fn two_agents_edit_and_delta_over_one_base() {
         &request(
             4,
             "dartq/overlay.set",
-            json!({"agentId": "A", "files": {"lib/main.dart": CLEAN_MAIN}}),
+            json!({"agent_id": "A", "files": {"lib/main.dart": CLEAN_MAIN}}),
         ),
         1,
     );
@@ -106,7 +106,7 @@ fn two_agents_edit_and_delta_over_one_base() {
         &request(
             5,
             "dartq/overlay.set",
-            json!({"agentId": "B", "files": {"lib/main.dart": AGENT_B_MAIN}}),
+            json!({"agent_id": "B", "files": {"lib/main.dart": AGENT_B_MAIN}}),
         ),
         1,
     );
@@ -115,9 +115,9 @@ fn two_agents_edit_and_delta_over_one_base() {
     // isolated diagnostics — and the base view is untouched.
     h.burst(
         &[
-            request(6, "dartq/check", json!({"paths": ["lib"], "agentId": "A"})),
-            request(7, "dartq/check", json!({"paths": ["lib"], "agentId": "B"})),
-            request(8, "dartq/analyze", json!({"agentId": "A"})),
+            request(6, "dartq/check", json!({"paths": ["lib"], "agent_id": "A"})),
+            request(7, "dartq/check", json!({"paths": ["lib"], "agent_id": "B"})),
+            request(8, "dartq/analyze", json!({"agent_id": "A"})),
             request(9, "dartq/analyze", json!({})),
         ],
         4,
@@ -177,12 +177,12 @@ fn two_agents_edit_and_delta_over_one_base() {
             request(
                 10,
                 "dartq/check",
-                json!({"paths": ["lib"], "agentId": "B", "since": 2}),
+                json!({"paths": ["lib"], "agent_id": "B", "since": 2}),
             ),
             request(
                 11,
                 "dartq/check",
-                json!({"paths": ["lib"], "agentId": "B", "since": 1}),
+                json!({"paths": ["lib"], "agent_id": "B", "since": 1}),
             ),
             request(12, "dartq/check", json!({"paths": ["lib"], "since": 2})),
         ],
@@ -214,15 +214,15 @@ fn two_agents_edit_and_delta_over_one_base() {
 
     // Teardown evicts: a cleared agent answers INVALID_PARAMS, fail loud.
     h.step(
-        &request(13, "dartq/overlay.clear", json!({"agentId": "A"})),
+        &request(13, "dartq/overlay.clear", json!({"agent_id": "A"})),
         1,
     );
     h.step(
-        &request(14, "dartq/check", json!({"paths": ["lib"], "agentId": "A"})),
+        &request(14, "dartq/check", json!({"paths": ["lib"], "agent_id": "A"})),
         1,
     );
     let error = answer_error(&h, 14);
-    assert_eq!(error["code"], -32602, "unknown agentId: {error}");
+    assert_eq!(error["code"], -32602, "unknown agent_id: {error}");
     assert!(
         error["message"].as_str().unwrap_or("").contains('A'),
         "the error names the agent: {error}"
@@ -230,11 +230,11 @@ fn two_agents_edit_and_delta_over_one_base() {
 
     // Overlay-only state never leaks across teardown: B clears silently.
     h.step(
-        &request(15, "dartq/overlay.clear", json!({"agentId": "B"})),
+        &request(15, "dartq/overlay.clear", json!({"agent_id": "B"})),
         1,
     );
     h.step(
-        &request(16, "dartq/check", json!({"paths": ["lib"], "agentId": "B"})),
+        &request(16, "dartq/check", json!({"paths": ["lib"], "agent_id": "B"})),
         1,
     );
     assert_eq!(answer_error(&h, 16)["code"], -32602);
@@ -280,7 +280,7 @@ fn session_economics_save_bytes_and_stay_schema_valid() {
     assert_eq!(preamble.len(), 1, "one path announced: {first}");
     let (id, path) = preamble.iter().next().expect("entry");
     assert!(path.as_str().unwrap_or("").ends_with("lib/rows.dart"));
-    let rows = first["diagnostics"].as_array().expect("rows");
+    let rows = first["diags"].as_array().expect("rows");
     assert!(
         rows.len() >= 3,
         "the fixture carries repeated-path rows: {first}"
@@ -292,8 +292,8 @@ fn session_economics_save_bytes_and_stay_schema_valid() {
 
     // The counterfactual: the same answer with the path spelled out.
     let spelled = json!({
-        "schema_version": first["schema_version"],
-        "diagnostics": first["diagnostics"]
+        "v": first["v"],
+        "diags": first["diags"]
             .as_array()
             .expect("rows")
             .iter()
@@ -348,7 +348,7 @@ fn session_economics_save_bytes_and_stay_schema_valid() {
         "compact stays bare: {compact}"
     );
     assert!(compact.get("since").is_none());
-    for row in compact["diagnostics"].as_array().expect("rows") {
+    for row in compact["diags"].as_array().expect("rows") {
         assert_eq!(row["file"], *path, "compact spells the path");
     }
 
@@ -387,7 +387,7 @@ fn overlay_commit_writes_back_over_rpc() {
         &request(
             2,
             "dartq/overlay.set",
-            json!({"agentId": "A", "files": {"lib/main.dart": CLEAN_MAIN}}),
+            json!({"agent_id": "A", "files": {"lib/main.dart": CLEAN_MAIN}}),
         ),
         1,
     );
@@ -396,7 +396,7 @@ fn overlay_commit_writes_back_over_rpc() {
     // response, the merge's clear publish, and the analyze answer.
     h.burst(
         &[
-            request(3, "dartq/overlay.commit", json!({"agentId": "A"})),
+            request(3, "dartq/overlay.commit", json!({"agent_id": "A"})),
             request(4, "dartq/analyze", json!({})),
         ],
         3,
@@ -419,7 +419,7 @@ fn overlay_commit_writes_back_over_rpc() {
 
     // An unknown agent fails loud at intake.
     h.step(
-        &request(5, "dartq/overlay.commit", json!({"agentId": "ghost"})),
+        &request(5, "dartq/overlay.commit", json!({"agent_id": "ghost"})),
         1,
     );
     let error = answer_error(&h, 5);
@@ -454,7 +454,7 @@ fn tombstone_excludes_view_and_commit_deletes() {
         &request(
             2,
             "dartq/overlay.set",
-            json!({"agentId": "T", "files": {"lib/main.dart": 42}}),
+            json!({"agent_id": "T", "files": {"lib/main.dart": 42}}),
         ),
         1,
     );
@@ -471,13 +471,13 @@ fn tombstone_excludes_view_and_commit_deletes() {
         &request(
             3,
             "dartq/overlay.set",
-            json!({"agentId": "T", "files": {"lib/main.dart": null}}),
+            json!({"agent_id": "T", "files": {"lib/main.dart": null}}),
         ),
         1,
     );
     h.burst(
         &[
-            request(4, "dartq/analyze", json!({"agentId": "T"})),
+            request(4, "dartq/analyze", json!({"agent_id": "T"})),
             request(5, "dartq/analyze", json!({})),
         ],
         2,
@@ -500,11 +500,11 @@ fn tombstone_excludes_view_and_commit_deletes() {
         &request(
             6,
             "dartq/overlay.set",
-            json!({"agentId": "T", "files": {"lib/main.dart": CLEAN_MAIN}}),
+            json!({"agent_id": "T", "files": {"lib/main.dart": CLEAN_MAIN}}),
         ),
         1,
     );
-    h.step(&request(7, "dartq/analyze", json!({"agentId": "T"})), 1);
+    h.step(&request(7, "dartq/analyze", json!({"agent_id": "T"})), 1);
     assert!(
         codes(&answer_result(&h, 7)).is_empty(),
         "a content staging replaces the tombstone: {:?}",
@@ -518,11 +518,11 @@ fn tombstone_excludes_view_and_commit_deletes() {
         &request(
             8,
             "dartq/overlay.set",
-            json!({"agentId": "T", "files": {"lib/main.dart": null}}),
+            json!({"agent_id": "T", "files": {"lib/main.dart": null}}),
         ),
         1,
     );
-    h.step(&request(9, "dartq/overlay.commit", json!({"agentId": "T"})), 1);
+    h.step(&request(9, "dartq/overlay.commit", json!({"agent_id": "T"})), 1);
     assert!(
         !main_dart.exists(),
         "the committed tombstone deletes the worktree file"

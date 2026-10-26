@@ -43,7 +43,7 @@ use serde_json::{Value, json};
 use crate::diagnostics::{DIAGNOSTIC_TYPES, SEVERITIES};
 use crate::support::{
     absent, array, enum_spelling, exact_fields, field, join, non_negative, object,
-    pinned_version, range_pair, string,
+    pinned_version, string,
 };
 use crate::{SchemaViolation, Verbosity};
 
@@ -81,22 +81,23 @@ static DIAGNOSTIC_EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "title": "dartq diagnostic explain report (schema_version 1)",
         "type": "object",
         "additionalProperties": false,
-        "required": ["schema_version", "diagnostic"],
+        "required": ["v", "diagnostic"],
         "properties": {
-            "schema_version": { "const": SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN },
+            "v": { "const": SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN },
             // The selected row, echoed: identity, locating range, and the
             // emitted message/severity.
             "diagnostic": { "type": "object",
                 "additionalProperties": false,
-                "required": ["code", "severity", "message", "file", "range"],
+                "required": ["code", "sev", "msg", "file", "off", "len"],
                 "properties": {
                     "code": { "type": "string" },
-                    "severity": { "enum": SEVERITIES },
-                    "message": { "type": "string" },
+                    "sev": { "enum": SEVERITIES },
+                    "msg": { "type": "string" },
                     // The canonical file path — the diagnostics envelope's
                     // own spelling convention.
                     "file": { "type": "string" },
-                    "range": { "$ref": "#/definitions/range_pair" },
+                    "off": { "type": "integer", "minimum": 0 },
+                    "len": { "type": "integer", "minimum": 0 },
                 },
             },
             // The registry facts behind the code.
@@ -127,7 +128,7 @@ static DIAGNOSTIC_EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                 },
             },
             // The published docs page (`has_published_docs` only).
-            "documentation": { "type": "string" },
+            "doc": { "type": "string" },
             // The run's same-code rows: the total count and (full tier)
             // the other lines in this file.
             "related": { "type": "object",
@@ -143,22 +144,13 @@ static DIAGNOSTIC_EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "fixes": { "type": "array", "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["id", "source", "summary"],
+                "required": ["id", "src", "summary"],
                 "properties": {
                     "id": { "type": "string" },
-                    "source": { "enum": FIX_SOURCES },
+                    "src": { "enum": FIX_SOURCES },
                     "summary": { "type": "string" },
                 },
             }},
-        },
-        "definitions": {
-            // A `[startOffset, endOffset)` pair, UTF-16 code units.
-            "range_pair": {
-                "type": "array",
-                "items": { "type": "integer", "minimum": 0 },
-                "minItems": 2,
-                "maxItems": 2,
-            },
         },
     })
 });
@@ -169,29 +161,30 @@ static DIAGNOSTIC_EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 pub const RULE_GROUPS: &[&str] =
     &["core", "recommended", "diagnostic", "removed", "standalone"];
 
-const TOP: &[&str] = &["schema_version", "diagnostic"];
-const TOP_OPTIONAL: &[&str] = &["why", "documentation", "related", "fixes"];
-const DIAGNOSTIC: &[&str] = &["code", "severity", "message", "file", "range"];
+const TOP: &[&str] = &["v", "diagnostic"];
+const TOP_OPTIONAL: &[&str] = &["why", "doc", "related", "fixes"];
+const DIAGNOSTIC: &[&str] = &["code", "sev", "msg", "file", "off", "len"];
 const WHY: &[&str] = &["code_family", "trigger_kind"];
 const WHY_OPTIONAL: &[&str] = &["rule"];
 const RULE: &[&str] = &["name", "group"];
 const RULE_OPTIONAL: &[&str] = &["removed_since", "deprecated_since"];
 const RELATED: &[&str] = &["total"];
 const RELATED_OPTIONAL: &[&str] = &["lines"];
-const FIX_ROW: &[&str] = &["id", "source", "summary"];
+const FIX_ROW: &[&str] = &["id", "src", "summary"];
 
 pub(crate) fn validate_diagnostic_explain(value: &Value) -> Result<(), SchemaViolation> {
     let root = object(value, "")?;
     exact_fields(root, TOP, TOP_OPTIONAL, "")?;
-    pinned_version(root, "schema_version", SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN)?;
+    pinned_version(root, "v", SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN)?;
     let p = "diagnostic";
     let diag = object(field(root, "diagnostic", "")?, p)?;
     exact_fields(diag, DIAGNOSTIC, &[], p)?;
     string(field(diag, "code", p)?, &join(p, "code"))?;
-    enum_spelling(field(diag, "severity", p)?, &join(p, "severity"), SEVERITIES)?;
-    string(field(diag, "message", p)?, &join(p, "message"))?;
+    enum_spelling(field(diag, "sev", p)?, &join(p, "sev"), SEVERITIES)?;
+    string(field(diag, "msg", p)?, &join(p, "msg"))?;
     string(field(diag, "file", p)?, &join(p, "file"))?;
-    range_pair(field(diag, "range", p)?, &join(p, "range"))?;
+    non_negative(field(diag, "off", p)?, &join(p, "off"))?;
+    non_negative(field(diag, "len", p)?, &join(p, "len"))?;
     if let Some(why) = root.get("why") {
         let p = "why";
         let obj = object(why, p)?;
@@ -220,8 +213,8 @@ pub(crate) fn validate_diagnostic_explain(value: &Value) -> Result<(), SchemaVio
             }
         }
     }
-    if let Some(docs) = root.get("documentation") {
-        string(docs, "documentation")?;
+    if let Some(docs) = root.get("doc") {
+        string(docs, "doc")?;
     }
     if let Some(related) = root.get("related") {
         let p = "related";
@@ -241,7 +234,7 @@ pub(crate) fn validate_diagnostic_explain(value: &Value) -> Result<(), SchemaVio
             let obj = object(row, &p)?;
             exact_fields(obj, FIX_ROW, &[], &p)?;
             string(field(obj, "id", &p)?, &join(&p, "id"))?;
-            enum_spelling(field(obj, "source", &p)?, &join(&p, "source"), FIX_SOURCES)?;
+            enum_spelling(field(obj, "src", &p)?, &join(&p, "src"), FIX_SOURCES)?;
             string(field(obj, "summary", &p)?, &join(&p, "summary"))?;
         }
     }
@@ -285,23 +278,24 @@ mod tests {
     /// A full-tier report over a lint hit (the section-complete shape).
     fn full_report() -> Value {
         json!({
-            "schema_version": SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN,
+            "v": SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN,
             "diagnostic": {
                 "code": "unused_import",
-                "severity": "WARNING",
-                "message": "Unused import: 'dart:async'.",
+                "sev": "WARNING",
+                "msg": "Unused import: 'dart:async'.",
                 "file": "/w/lib/a.dart",
-                "range": [10, 22],
+                "off": 10,
+                "len": 12,
             },
             "why": {
                 "code_family": "STATIC_WARNING",
                 "trigger_kind": "unused-family",
             },
-            "documentation": "https://dart.dev/diagnostics/unused_import",
+            "doc": "https://dart.dev/diagnostics/unused_import",
             "related": { "total": 3, "lines": [4, 9] },
             "fixes": [{
                 "id": "remove-lexeme",
-                "source": "builtin-semantic",
+                "src": "builtin-semantic",
                 "summary": "Remove the reported lexeme.",
             }],
         })
@@ -310,13 +304,14 @@ mod tests {
     /// A minimal-tier report: the diagnostic echo alone.
     fn minimal_report() -> Value {
         json!({
-            "schema_version": SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN,
+            "v": SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN,
             "diagnostic": {
                 "code": "unused_import",
-                "severity": "WARNING",
-                "message": "Unused import: 'dart:async'.",
+                "sev": "WARNING",
+                "msg": "Unused import: 'dart:async'.",
                 "file": "/w/lib/a.dart",
-                "range": [10, 22],
+                "off": 10,
+                "len": 12,
             },
         })
     }
@@ -371,7 +366,7 @@ mod tests {
     fn each_tier_validates_its_own_shape() {
         assert!(validate_diagnostic_explain_at_tier(&minimal_report(), Verbosity::Minimal).is_ok());
         let compact = json!({
-            "schema_version": SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN,
+            "v": SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN,
             "diagnostic": minimal_report()["diagnostic"],
             "why": { "code_family": "STATIC_WARNING", "trigger_kind": "unused-family" },
             "related": { "total": 3 },
@@ -392,10 +387,10 @@ mod tests {
         assert_eq!(violation.expected, "omitted at the minimal tier");
 
         let compact_with_fixes = json!({
-            "schema_version": SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN,
+            "v": SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN,
             "diagnostic": minimal_report()["diagnostic"],
             "why": { "code_family": "LINT", "trigger_kind": "unclassified" },
-            "fixes": [{ "id": "x", "source": "builtin-lint", "summary": "s" }],
+            "fixes": [{ "id": "x", "src": "builtin-lint", "summary": "s" }],
         });
         let violation =
             validate_diagnostic_explain_at_tier(&compact_with_fixes, Verbosity::Compact)
@@ -403,7 +398,7 @@ mod tests {
         assert_eq!(violation.path, "fixes");
 
         let compact_with_lines = json!({
-            "schema_version": SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN,
+            "v": SCHEMA_VERSION_DIAGNOSTIC_EXPLAIN,
             "diagnostic": minimal_report()["diagnostic"],
             "related": { "total": 3, "lines": [4] },
         });
@@ -418,10 +413,10 @@ mod tests {
     #[test]
     fn violations_name_the_first_bad_field() {
         let mut bad = full_report();
-        bad["diagnostic"]["severity"] = json!("BLOCKER");
+        bad["diagnostic"]["sev"] = json!("BLOCKER");
         let violation =
             validate_diagnostic_explain(&bad).expect_err("unknown severity spelling");
-        assert_eq!(violation.path, "diagnostic.severity");
+        assert_eq!(violation.path, "diagnostic.sev");
 
         let mut bad = full_report();
         bad["why"]["trigger_kind"] = json!("magic");

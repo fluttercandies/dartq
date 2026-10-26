@@ -78,7 +78,7 @@
 //!
 //! `overlay.set`/`overlay.clear` stage per-agent `path → content` deltas on
 //! the session (bounded: cleared on teardown, capped count). A request
-//! carrying `agentId` must see that agent's view, so the drain partitions
+//! carrying `agent_id` must see that agent's view, so the drain partitions
 //! its read task's requests into view groups — base first (its analysis
 //! also feeds the publish diff; publishes never leak an agent view), then
 //! one group per agent in first-appearance order. Each group materializes
@@ -896,7 +896,7 @@ pub struct Session {
     /// into the same turn's publishes: the events fire only inside
     /// [`Self::service`], so the stage never outlives it.
     rejected_pushes: Vec<Publish>,
-    /// Per-agent overlay views, keyed by `agentId`. Bounded:
+    /// Per-agent overlay views, keyed by `agent_id`. Bounded:
     /// cleared on `overlay.clear`/session end, capped at `MAX_AGENTS`.
     agents: FxHashMap<String, AgentOverlay>,
     /// Paths currently deviating from ONE context's base view, with that
@@ -1404,6 +1404,24 @@ impl Session {
         Ok(())
     }
 
+    /// The watch face's boot tick (#2609): stages the base-view analysis
+    /// read — the same request-less, publish-carrying read [`Self::sweep`]
+    /// enqueues — while the workspace walk itself stays lazy: it rides this
+    /// turn's drain (`refresh_workspace_state`), the exact seam a client's
+    /// first analyze takes, so a `--watch` session still publishes its base
+    /// view with no client frame (#2591 retired the eager startup sweep
+    /// that used to carry it). A no-op once the workspace has been walked:
+    /// whatever engine-work intake set that flag already drained its own
+    /// publish duty, and re-analyzing a booted workspace would only repeat
+    /// the cold cost.
+    pub(crate) fn stage_base_view(&mut self) {
+        if self.discovered {
+            return;
+        }
+        self.publishes_due = true;
+        self.ensure_read(self.default_context, Tier::Normal);
+    }
+
     /// The drain-seam workspace refresh (#2591's lazy boot, #2596's
     /// freshness): the first engine-work turn discovers every context;
     /// every later one re-walks under the engine's (mtime, size) stamp
@@ -1834,7 +1852,7 @@ impl Session {
     }
 
     /// Whether `agent` has a live overlay view (the server's queue-time
-    /// `agentId` validation).
+    /// `agent_id` validation).
     pub(crate) fn has_agent(&self, agent: &str) -> bool {
         self.agents.contains_key(agent)
     }
@@ -1894,7 +1912,7 @@ impl Session {
     pub fn commit_overlay(&mut self, agent: &str) -> Result<usize, SessionError> {
         let Some(overlay) = self.agents.get(agent) else {
             return Err(SessionError::InvalidParams(format!(
-                "unknown agentId: {agent}"
+                "unknown agent_id: {agent}"
             )));
         };
         if overlay.files.is_empty() {
@@ -2879,7 +2897,7 @@ impl Session {
                     turn.answers.push((
                         id,
                         Err(SessionError::InvalidParams(format!(
-                            "unknown agentId: {agent}"
+                            "unknown agent_id: {agent}"
                         ))),
                     ));
                 }
@@ -2943,6 +2961,7 @@ impl Session {
                     wire::AnalyzeEntry {
                         uri: uri::from_path(path),
                         diagnostic: converted,
+                        len: diagnostic.range.length,
                     },
                 ))
             })
@@ -2969,6 +2988,7 @@ impl Session {
                 wire::AnalyzeEntry {
                     uri: uri::from_path(advisory.config_path()),
                     diagnostic: advisory_row(advisory),
+                    len: 0,
                 },
             );
         }
@@ -4295,21 +4315,22 @@ mod tests {
             },
         );
         let turn = session.service();
-        let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diagnostics"]
+        let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diags"]
             .as_array()
             .expect("diagnostics rows");
         assert!(!rows.is_empty(), "the pull is not empty");
         let lead = &rows[0];
-        assert_eq!(lead["uri"], config_uri.as_str(), "the advisory leads");
-        assert_eq!(lead["severity"], push_row.severity, "same severity");
-        assert_eq!(lead["code"], push_row.code, "same code");
-        assert_eq!(lead["source"], push_row.source, "same source");
-        assert_eq!(lead["message"], push_row.message, "same message");
+        assert_eq!(lead["file"], config_uri.as_str(), "the advisory leads");
         assert_eq!(
-            lead["range"],
-            serde_json::to_value(push_row.range).expect("the row's range serializes"),
-            "the row names a file, not a span"
+            lead["sev"],
+            wire::severity_word(push_row.severity),
+            "same severity"
         );
+        assert_eq!(lead["code"], push_row.code, "same code");
+        assert_eq!(lead["msg"], push_row.message, "same message");
+        assert_eq!(lead["line"], 1, "the row names a file, not a span");
+        assert_eq!(lead["col"], 1, "the row names a file, not a span");
+        assert_eq!(lead["len"], 0, "the row names a file, not a span");
         assert!(
             !turn.publishes.iter().any(|push| push.uri == config_uri),
             "the push stays exactly-once across pulls"
@@ -4335,11 +4356,11 @@ mod tests {
         let rows = turn.answers[0]
             .1
             .as_ref()
-            .expect("the post-edit pull answers")["diagnostics"]
+            .expect("the post-edit pull answers")["diags"]
             .as_array()
             .expect("diagnostics rows");
         assert_eq!(
-            rows[0]["uri"],
+            rows[0]["file"],
             config_uri.as_str(),
             "the advisory still leads after a source-only edit"
         );
@@ -4370,11 +4391,11 @@ mod tests {
         );
         let turn = session.service();
         let fresh_uri = uri::from_path(&fresh.path(".dart_tool/package_config.json"));
-        let rows = turn.answers[0].1.as_ref().expect("the fresh pull answers")["diagnostics"]
+        let rows = turn.answers[0].1.as_ref().expect("the fresh pull answers")["diags"]
             .as_array()
             .expect("diagnostics rows");
         assert!(
-            rows.iter().all(|row| row["uri"] != fresh_uri.as_str()),
+            rows.iter().all(|row| row["file"] != fresh_uri.as_str()),
             "a fresh assembly's pull never carries the advisory"
         );
     }
@@ -4437,20 +4458,20 @@ mod tests {
             pushes[0].diagnostics[0].code,
             "dartq/package_config_out_of_date"
         );
-        let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diagnostics"]
+        let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diags"]
             .as_array()
             .expect("diagnostics rows");
         assert_eq!(
-            rows[0]["uri"],
+            rows[0]["file"],
             config_uri.as_str(),
             "the healed verdict leads the pull"
         );
         assert!(
-            rows[0]["message"]
+            rows[0]["msg"]
                 .as_str()
                 .is_some_and(|message| message.contains("generated by Dart 3.9.0")),
             "the row names the fresh verdict: {}",
-            rows[0]["message"]
+            rows[0]["msg"]
         );
 
         // The heal: the resolution catches up (`dart pub get` rewrote the
@@ -4481,11 +4502,11 @@ mod tests {
             pushes[0].diagnostics.is_empty(),
             "the retraction is an empty set"
         );
-        let rows = turn.answers[0].1.as_ref().expect("the healed pull answers")["diagnostics"]
+        let rows = turn.answers[0].1.as_ref().expect("the healed pull answers")["diags"]
             .as_array()
             .expect("diagnostics rows");
         assert!(
-            rows.iter().all(|row| row["uri"] != config_uri.as_str()),
+            rows.iter().all(|row| row["file"] != config_uri.as_str()),
             "the cleared verdict no longer leads the pull"
         );
 
@@ -4562,11 +4583,11 @@ mod tests {
             turn.publishes.iter().all(|push| push.uri != config_uri),
             "an unchanged verdict never republishes, however often the event re-fires"
         );
-        let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diagnostics"]
+        let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diags"]
             .as_array()
             .expect("diagnostics rows");
         assert_eq!(
-            rows[0]["uri"],
+            rows[0]["file"],
             config_uri.as_str(),
             "the standing verdict still leads the pull"
         );
@@ -4647,7 +4668,7 @@ mod tests {
             [&RequestId::Num(2), &RequestId::Num(3)]
         );
         for (_, answer) in &turn.answers {
-            let entries = answer.as_ref().expect("both requests answer")["diagnostics"]
+            let entries = answer.as_ref().expect("both requests answer")["diags"]
                 .as_array()
                 .expect("diagnostics array");
             assert!(entries.is_empty(), "post-write view: {entries:?}");
@@ -4702,7 +4723,7 @@ mod tests {
             let value = answer
                 .as_ref()
                 .unwrap_or_else(|error| panic!("request {id:?} answers: {error:?}"));
-            let rows = value["diagnostics"].as_array().expect("rows");
+            let rows = value["diags"].as_array().expect("rows");
             assert_eq!(rows.len(), 2, "request {id:?} sees the same view");
         }
         // The full-tier answer shortened: rows carry `s1` and the preamble
@@ -4714,7 +4735,7 @@ mod tests {
             .1
             .as_ref()
             .expect("ok");
-        assert_eq!(full["diagnostics"][0]["uri"], "s1", "shortened");
+        assert_eq!(full["diags"][0]["file"], "s1", "shortened");
         assert!(
             full["symbols"]["s1"].is_string(),
             "the preamble names the path: {full}"
@@ -4725,7 +4746,7 @@ mod tests {
             "compact answers stay unshortened: {compact}"
         );
         assert_ne!(
-            compact["diagnostics"][0]["uri"], "s1",
+            compact["diags"][0]["file"], "s1",
             "the compact row keeps the full path"
         );
     }
@@ -4793,7 +4814,7 @@ mod tests {
             "the unchanged set stays diff-suppressed: {:?}",
             turn.publishes
         );
-        let entries = turn.answers[0].1.as_ref().expect("post-write answer")["diagnostics"]
+        let entries = turn.answers[0].1.as_ref().expect("post-write answer")["diags"]
             .as_array()
             .expect("diagnostics array");
         assert!(entries.is_empty(), "post-write view: {entries:?}");
@@ -5012,7 +5033,7 @@ mod tests {
         assert_eq!(*id, RequestId::Num(2));
         let answer = answer.as_ref().expect("the fix answers");
         assert_eq!(
-            answer["schema_version"],
+            answer["v"],
             serde_json::json!(commands::SCHEMA_VERSION)
         );
         assert!(answer["files"].is_array(), "the patch document: {answer}");
@@ -5583,7 +5604,7 @@ mod tests {
             "the cancelled id: {:?}",
             turn.answers[0]
         );
-        let entries = turn.answers[1].1.as_ref().expect("survivor answers Ok")["diagnostics"]
+        let entries = turn.answers[1].1.as_ref().expect("survivor answers Ok")["diags"]
             .as_array()
             .expect("diagnostics array");
         assert!(
@@ -5702,7 +5723,7 @@ mod tests {
             },
         );
         let turn = session.service();
-        let entries = turn.answers[0].1.as_ref().expect("post-batch answer")["diagnostics"]
+        let entries = turn.answers[0].1.as_ref().expect("post-batch answer")["diags"]
             .as_array()
             .expect("diagnostics array");
         assert!(
@@ -5760,11 +5781,11 @@ mod tests {
             },
         );
         let turn = session.service();
-        let entries = turn.answers[0].1.as_ref().expect("post-removal answer")["diagnostics"]
+        let entries = turn.answers[0].1.as_ref().expect("post-removal answer")["diags"]
             .as_array()
             .expect("diagnostics array");
         assert!(
-            entries.iter().all(|entry| !entry["uri"]
+            entries.iter().all(|entry| !entry["file"]
                 .as_str()
                 .is_some_and(|file| file.ends_with("main.dart"))),
             "the deleted file has no diagnostics: {entries:?}"
@@ -5903,11 +5924,11 @@ mod tests {
             },
         );
         let turn = session.service();
-        let entries = turn.answers[0].1.as_ref().expect("analyze answers")["diagnostics"]
+        let entries = turn.answers[0].1.as_ref().expect("analyze answers")["diags"]
             .as_array()
             .expect("diagnostics array");
         assert!(
-            entries.iter().any(|entry| entry["uri"]
+            entries.iter().any(|entry| entry["file"]
                 .as_str()
                 .is_some_and(|file| file.ends_with("extra.dart"))),
             "the new file's rows are in the merged view: {entries:?}"
@@ -6106,7 +6127,7 @@ mod tests {
             },
         );
         let turn = session.service();
-        let entries = turn.answers[0].1.as_ref().expect("analyze answers")["diagnostics"]
+        let entries = turn.answers[0].1.as_ref().expect("analyze answers")["diags"]
             .as_array()
             .expect("diagnostics array");
         assert!(
@@ -6242,7 +6263,7 @@ mod tests {
     /// The codes of a check/analyze answer's rows.
     fn answer_codes(answer: &Result<serde_json::Value, SessionError>) -> Vec<String> {
         match answer {
-            Ok(value) => value["diagnostics"]
+            Ok(value) => value["diags"]
                 .as_array()
                 .expect("diagnostics array")
                 .iter()
@@ -8964,7 +8985,7 @@ mod tests {
 
     /// The `context` param's wire contract at the parse edge: the
     /// engine-view faces carry it; the disk-view faces reject it (the
-    /// agentId rule, extended).
+    /// agent_id rule, extended).
     #[test]
     fn context_param_parses_on_engine_faces_and_rejects_on_disk_faces() {
         let request = crate::commands::parse(
@@ -8981,7 +9002,7 @@ mod tests {
             Path::new("/"),
         )
         .expect_err("fix rejects context");
-        assert!(error.contains("agentId/context/since"), "{error}");
+        assert!(error.contains("agent_id/context/since"), "{error}");
 
         let error = crate::commands::parse(
             "dartq/explain",
@@ -8989,7 +9010,7 @@ mod tests {
             Path::new("/"),
         )
         .expect_err("explain rejects context");
-        assert!(error.contains("agentId/context"), "{error}");
+        assert!(error.contains("agent_id/context"), "{error}");
     }
 
     /// dartq/analyze answers follow the CLI's severity-first printed order
@@ -9031,22 +9052,22 @@ mod tests {
             },
         );
         let turn = session.service();
-        let entries = turn.answers[0].1.as_ref().expect("analyze answers")["diagnostics"]
+        let entries = turn.answers[0].1.as_ref().expect("analyze answers")["diags"]
             .as_array()
             .expect("diagnostics array");
         assert_eq!(entries.len(), 2, "the warning plus the error: {entries:?}");
         assert_eq!(
-            entries[0]["uri"],
+            entries[0]["file"],
             uri::from_path(&workspace.path("lib/b.dart")),
             "the error sorts first despite b.dart sorting second: {entries:?}"
         );
-        assert_eq!(entries[0]["severity"], 1, "error first");
+        assert_eq!(entries[0]["sev"], "error", "error first");
         assert_eq!(
-            entries[1]["uri"],
+            entries[1]["file"],
             uri::from_path(&workspace.path("lib/a.dart")),
             "the warning follows: {entries:?}"
         );
-        assert_eq!(entries[1]["severity"], 2, "warning second");
+        assert_eq!(entries[1]["sev"], "warning", "warning second");
     }
 
     /// dartq/explain's `sdk` default is the session's resolved SDK root: a

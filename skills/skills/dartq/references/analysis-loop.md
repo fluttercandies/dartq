@@ -10,15 +10,14 @@ diagnose (analyze) -> understand (query/explain) -> scope (impact)
 ## 1. Diagnose
 
 ```bash
-dartq analyze                      # piped: single-line JSON envelope
-dartq analyze --format machine     # SEVERITY|TYPE|CODE|FILE|LINE|COL|LENGTH|MESSAGE rows
+dartq analyze                      # default: {v diags:[{code sev file line col len msg doc?}]}
+dartq analyze --format json        # the frozen oracle envelope (jq consumers)
+dartq analyze --format text        # grouped human listing
 dartq analyze --fast               # parser tier only — pure syntax, no engine
-dartq analyze -v concise           # rows without the message field (cheapest full set)
-dartq analyze -v verbose           # rows plus correctionMessage as a ninth field
 ```
 
-The diagnostic **set** is complete at every verbosity tier — tiers only
-change row fields. Exit codes: 0 clean/info-only, 1 fatal-infos, 2
+The diagnostic **set** is complete on every face — faces only change the
+encoding. Exit codes: 0 clean/info-only, 1 fatal-infos, 2
 fatal-warnings, 3 errors, 4 internal, 64 usage.
 
 Diagnose a code, not a file:
@@ -66,7 +65,7 @@ method and fix 40 call sites you did not know about".
 ## 4. Execute
 
 ```bash
-# Rename: dry run first — the edit set is machine-readable
+# Rename: dry run first — the edit set is the lon document
 dartq rename --new-name UserAccount lib/src/user.dart:8:10
 # then apply (refuses any file outside the workspace)
 dartq rename --write --new-name UserAccount lib/src/user.dart:8:10
@@ -99,5 +98,5 @@ write it only if clean.
 
 ## Depth
 
-Formats, tiers, and machine schemas per verb:
+Formats, the lon vocabulary, and tiers per verb:
 [formats-and-tiers.md](formats-and-tiers.md).

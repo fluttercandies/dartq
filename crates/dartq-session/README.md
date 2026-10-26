@@ -8,10 +8,15 @@ clients — through the same identity triple.
   `version` file, `.fvmrc`), and the running binary's content hash: two
   faces share one engine exactly when their triples agree.
 - **Election** — two simultaneous cold starters elect through an
-  exclusive `flock` on `.dart_tool/dartq/elect.lock`; the winner takes
-  over (stale sockets are unlinked and re-spawned), the loser waits and
-  attaches. A read-only checkout degrades to standalone — the
-  pre-session behavior, never an error.
+  exclusive `flock` on `.dart_tool/dartq/elect.lock`; the winner
+  attaches a live matching server (reaping every other daemon recorded
+  on the root — one daemon per root, ever), reaps a stale one (dead
+  pid, foreign triple, wedged heartbeat, dead socket: terminate, wait,
+  SIGKILL escalation) before reclaiming its socket and registry entry,
+  and spawns the replacement under a bring-up placeholder until its
+  first heartbeat; the loser waits for the live state and attaches. A
+  read-only checkout degrades to standalone — the pre-session behavior,
+  never an error.
 - **Registry and lifecycle** — a per-user registry (`~/.cache/dartq/
   sessions/`) backs `dartq session status`; the serve loop heartbeats
   `state.json`, reaps itself after an idle window, and the starter

@@ -97,29 +97,29 @@ fn batch_answers_every_pair_in_request_order() {
     assert_eq!(results.len(), 6, "3 symbols x 2 kinds: {results:?}");
     let names: Vec<&str> = results
         .iter()
-        .map(|envelope| envelope["name"].as_str().expect("name"))
+        .map(|envelope| envelope["sym"].as_str().expect("sym"))
         .collect();
     assert_eq!(names, ["Foo", "Foo", "foo", "foo", "meth", "meth"]);
 
     // Foo: the symbol face keeps the annotation use plus the invocation;
     // the callers face keeps the invocation only.
-    assert_eq!(results[0]["schema_version"], 1);
+    assert_eq!(results[0]["v"], 1);
     assert_eq!(
-        results[0]["references"].as_array().expect("refs").len(),
+        results[0]["refs"].as_array().expect("refs").len(),
         2,
         "reference @33 plus invoked @42"
     );
-    let caller_rows = results[1]["references"].as_array().expect("refs");
+    let caller_rows = results[1]["refs"].as_array().expect("refs");
     assert_eq!(caller_rows.len(), 1);
     assert_eq!(caller_rows[0]["kind"], "invoked");
-    assert_eq!(caller_rows[0]["offset"], 42);
+    assert_eq!(caller_rows[0]["off"], 42);
 
     // foo: one call site under both kinds; meth: declared, never used.
-    assert_eq!(results[2]["references"].as_array().expect("refs").len(), 1);
-    assert_eq!(results[3]["references"].as_array().expect("refs").len(), 1);
-    assert_eq!(results[4]["references"].as_array().expect("refs").len(), 0);
+    assert_eq!(results[2]["refs"].as_array().expect("refs").len(), 1);
+    assert_eq!(results[3]["refs"].as_array().expect("refs").len(), 1);
+    assert_eq!(results[4]["refs"].as_array().expect("refs").len(), 0);
     assert_eq!(
-        results[4]["declarations"].as_array().expect("decls").len(),
+        results[4]["decls"].as_array().expect("decls").len(),
         1
     );
 
@@ -191,8 +191,8 @@ fn single_symbol_request_still_parses_and_answers() {
         1,
     );
     let single = answer_result(&h, 2);
-    assert_eq!(single["schema_version"], 1);
-    assert_eq!(single["name"], "Foo");
+    assert_eq!(single["v"], 1);
+    assert_eq!(single["sym"], "Foo");
     assert_eq!(
         answer_result(&h, 3),
         json!([single]),

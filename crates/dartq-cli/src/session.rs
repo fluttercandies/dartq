@@ -13,13 +13,16 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::{Args, Subcommand};
+use serde_json::{Value, json};
 
 use dartq_session::{
     Ensured, EventLog, HEARTBEAT, IDLE_TIMEOUT, Layout, Record, Registry, SessionState,
     SessionTriple, ensure, pid_alive, terminate,
 };
 
+use crate::OutputFormat;
 use crate::exit;
+use crate::output::lon_line;
 
 /// `dartq session` — manage the resident analysis session.
 #[derive(Args)]
@@ -36,8 +39,9 @@ enum SessionCommand {
     /// in-process.
     Start(StartArgs),
     /// List the user's live sessions, grouped by checkout.
-    Status,
-    /// Stop the session of a worktree (or every one with `--all`).
+    Status(StatusArgs),
+    /// Stop the session of a worktree (or every one with `--all`). A
+    /// write operation: `--format text` falls back to the lon record.
     Stop(StopArgs),
     /// The resident serve loop — the detached process `start` spawns.
     /// Hidden: not a human verb.
@@ -53,6 +57,18 @@ struct StartArgs {
     /// Dart SDK root; defaults to `$DART_SDK`.
     #[arg(long)]
     sdk: Option<PathBuf>,
+    /// Output format: `lon` (the default), `json`, or `text` (the
+    /// identity lines).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Lon)]
+    format: OutputFormat,
+}
+
+#[derive(Args)]
+struct StatusArgs {
+    /// Output format: `lon` (the default), `json`, or `text` (the
+    /// aligned listing).
+    #[arg(long, value_enum, default_value_t = OutputFormat::Lon)]
+    format: OutputFormat,
 }
 
 #[derive(Args)]
@@ -63,6 +79,10 @@ struct StopArgs {
     /// Stop every live session in the registry.
     #[arg(long)]
     all: bool,
+    /// Output format: a write operation — `text` falls back to the lon
+    /// record; `lon` the default, `json` the frozen row.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Lon)]
+    format: OutputFormat,
 }
 
 #[derive(Args)]
@@ -78,7 +98,7 @@ struct ServeArgs {
 pub fn run_entry(args: &SessionArgs) -> u8 {
     match &args.command {
         SessionCommand::Start(start) => start_session(start),
-        SessionCommand::Status => status(),
+        SessionCommand::Status(status) => session_status(status),
         SessionCommand::Stop(stop) => stop_session(stop),
         SessionCommand::Serve(serve) => serve_loop(serve, IDLE_TIMEOUT),
     }
@@ -127,6 +147,36 @@ pub(crate) fn spawn_server(layout: &Layout, triple: &SessionTriple) -> io::Resul
         })
 }
 
+/// One row through the format axis. The rows are already vocabulary
+/// spellings; `text` renders the read faces' identity lines (the write
+/// faces pass `None` and their rows ride the lon spelling — a write's
+/// output is a record, not prose).
+fn print_row(format: OutputFormat, row: &Value, text: Option<String>) {
+    match format {
+        OutputFormat::Lon => println!("{}", lon_line(row)),
+        OutputFormat::Json => println!("{row}"),
+        OutputFormat::Text => match text {
+            Some(line) => println!("{line}"),
+            None => println!("{}", lon_line(row)),
+        },
+    }
+}
+
+/// The text identity line of a `session` row.
+fn session_text(row: &Value) -> String {
+    format!(
+        "session pid {} root {} (age {}s{})",
+        row["pid"],
+        row["root"].as_str().unwrap_or_default(),
+        row.get("age_s").and_then(Value::as_u64).unwrap_or(0),
+        if row.get("stale_binary").and_then(Value::as_bool).unwrap_or(false) {
+            ", stale binary"
+        } else {
+            ""
+        },
+    )
+}
+
 fn start_session(args: &StartArgs) -> u8 {
     let root = match std::fs::canonicalize(&args.dir) {
         Ok(root) => root,
@@ -147,24 +197,35 @@ fn start_session(args: &StartArgs) -> u8 {
     let registry = Registry::open();
     let triple_probe = SessionTriple::compute(&root, &sdk_root);
     for swept in registry.sweep_upgrades(&triple_probe.binary_hash) {
-        println!("{{\"type\":\"swept\",\"root\":{}}}", json_path(&swept));
+        let row = json!({"type": "swept", "root": swept.display().to_string()});
+        print_row(
+            args.format,
+            &row,
+            Some(format!("swept stale session at {}", swept.display())),
+        );
     }
     for evicted in registry.evict_past_cap() {
-        println!("{{\"type\":\"evicted\",\"root\":{}}}", json_path(&evicted));
+        let row = json!({"type": "evicted", "root": evicted.display().to_string()});
+        print_row(
+            args.format,
+            &row,
+            Some(format!("evicted capped session at {}", evicted.display())),
+        );
     }
     match ensure(&root, &sdk_root, &spawn_server) {
         Ensured::Attached(state) => {
-            print_state(&state, true);
+            print_state(args.format, &state, true);
             exit::CLEAN
         }
         Ensured::Standalone(reason) => {
-            println!("{{\"type\":\"standalone\",\"reason\":{}}}", serde_json::to_string(&reason).unwrap_or_default());
+            let row = json!({"type": "standalone", "reason": reason});
+            print_row(args.format, &row, Some(format!("standalone: {reason}")));
             exit::CLEAN
         }
     }
 }
 
-fn status() -> u8 {
+fn session_status(args: &StatusArgs) -> u8 {
     let registry = Registry::open();
     let binary = SessionTriple::compute(Path::new("."), Path::new(".")).binary_hash;
     // Grouped by checkout: same-root rows adjacent (the most recent
@@ -184,27 +245,38 @@ fn status() -> u8 {
         let layout = Layout::new(&root);
         let progress = dartq_session::Progress::from_trace(&layout.dir.join("trace.jsonl"));
         if progress.files_scanned > 0 {
-            let package = serde_json::to_string(&progress.current_package)
-                .unwrap_or_else(|_| "null".into());
-            println!(
-                "{{\"type\":\"progress\",\"root\":{},\"files_scanned\":{},\"current_package\":{}}}",
-                json_path(&root),
-                progress.files_scanned,
-                package,
+            let row = json!({
+                "type": "progress",
+                "root": root.display().to_string(),
+                "files_scanned": progress.files_scanned,
+                "current_package": progress.current_package,
+            });
+            let package = progress
+                .current_package
+                .as_deref()
+                .unwrap_or("analyzing");
+            print_row(
+                args.format,
+                &row,
+                Some(format!(
+                    "progress: {} files scanned ({package})",
+                    progress.files_scanned
+                )),
             );
         }
     }
     for record in live {
-        let age = SessionState::now_ms().saturating_sub(record.state.heartbeat_ms) / 1000;
-        println!(
-            "{{\"type\":\"session\",\"root\":{},\"pid\":{},\"sdk\":{},\"binary\":{},\"heartbeat_age_s\":{},\"stale_binary\":{}}}",
-            json_path(&record.state.triple.root),
-            record.state.pid,
-            json_path(&record.state.triple.sdk_root),
-            json_path(Path::new(&record.state.triple.binary_hash)),
-            age,
-            record.state.triple.binary_hash != binary,
-        );
+        let age_s = SessionState::now_ms().saturating_sub(record.state.heartbeat_ms) / 1000;
+        let row = json!({
+            "type": "session",
+            "root": record.state.triple.root.display().to_string(),
+            "pid": record.state.pid,
+            "sdk": record.state.triple.sdk_root.display().to_string(),
+            "binary": record.state.triple.binary_hash,
+            "age_s": age_s,
+            "stale_binary": record.state.triple.binary_hash != binary,
+        });
+        print_row(args.format, &row, Some(session_text(&row)));
     }
     exit::CLEAN
 }
@@ -218,7 +290,9 @@ fn stop_session(args: &StopArgs) -> u8 {
                 stopped += 1;
             }
         }
-        println!("{{\"type\":\"stopped\",\"count\":{stopped}}}");
+        // A write operation: no prose face — text rides the lon record.
+        let row = json!({"type": "stopped", "count": stopped});
+        print_row(args.format, &row, None);
         return exit::CLEAN;
     }
     let root = match std::fs::canonicalize(&args.dir) {
@@ -236,7 +310,8 @@ fn stop_session(args: &StopArgs) -> u8 {
     registry.remove(&root);
     let _ = std::fs::remove_file(&layout.socket);
     let _ = std::fs::remove_file(&layout.state);
-    println!("{{\"type\":\"stopped\",\"root\":{}}}", json_path(&root));
+    let row = json!({"type": "stopped", "root": root.display().to_string()});
+    print_row(args.format, &row, None);
     exit::CLEAN
 }
 
@@ -263,20 +338,26 @@ fn wait_gone(pid: u32) -> bool {
     false
 }
 
-fn json_path(path: &Path) -> String {
-    serde_json::to_string(&path.display().to_string()).unwrap_or_default()
-}
-
-fn print_state(state: &SessionState, attached: bool) {
-    println!(
-        "{{\"type\":\"session\",\"attached\":{},\"root\":{},\"pid\":{},\"sdk\":{},\"binary\":{},\"socket\":{}}}",
-        attached,
-        json_path(&state.triple.root),
-        state.pid,
-        json_path(&state.triple.sdk_root),
-        json_path(Path::new(&state.triple.binary_hash)),
-        json_path(&Layout::new(&state.triple.root).socket),
-    );
+fn print_state(format: OutputFormat, state: &SessionState, attached: bool) {
+    let row = json!({
+        "type": "session",
+        "attached": attached,
+        "root": state.triple.root.display().to_string(),
+        "pid": state.pid,
+        "sdk": state.triple.sdk_root.display().to_string(),
+        "binary": state.triple.binary_hash,
+        "socket": Layout::new(&state.triple.root).socket.display().to_string(),
+    });
+    let text = if attached {
+        Some(format!(
+            "attached session pid {} at {}",
+            state.pid,
+            Layout::new(&state.triple.root).socket.display()
+        ))
+    } else {
+        Some("session detached".to_owned())
+    };
+    print_row(format, &row, text);
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +684,7 @@ pub(crate) mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"dartq/analyze","params":{}}"#,
         );
         assert!(answer.contains("\"id\":1"), "answered: {answer}");
-        assert!(answer.contains("diagnostics"), "the analyze envelope: {answer}");
+        assert!(answer.contains("diags"), "the analyze envelope: {answer}");
         // The state file names the server and its triple.
         let state = SessionState::read(&layout).expect("state");
         assert!(pid_alive(state.pid));
@@ -836,7 +917,10 @@ pub(crate) mod tests {
             }
             _ => panic!("expected start"),
         }
-        assert!(matches!(parse(&["status"]).expect("parse").command, SessionCommand::Status));
+        assert!(matches!(
+            parse(&["status"]).expect("parse").command,
+            SessionCommand::Status(_)
+        ));
         let stop = parse(&["stop"]).expect("parse");
         match &stop.command {
             SessionCommand::Stop(args) => {

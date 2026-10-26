@@ -6,7 +6,8 @@
 #
 # Universe semantics being pinned: the ladder roots the scan at the
 # enclosing package; the walk-down never crosses a foreign tree (a
-# checkout marker or gitdir pointer prunes it and registers a BOUNDARY).
+# checkout marker or gitdir pointer prunes it and registers a boundary
+# row).
 
 legs_01_run() {
   local base="$E2E_WORK/pkgs"
@@ -37,19 +38,24 @@ environment:
 '
   wf "$wts/vendor/stale/.git" "gitdir: /gone/.git/worktrees/x
 "
-  run_dartq_in pkgs-nested "$wts" packages --format machine
+  # The default (lon) face: one canonical document over the inventory.
+  run_dartq_in pkgs-nested "$wts" packages
   assert_eq "$DQ_RC" 0 "packages exits clean over a tree holding foreign checkouts"
+  assert_contains "$(cat "$(out_file pkgs-nested)")" "pkgs:[" \
+    "the lon document carries the pkgs rows"
+  # The json face: the structured row checks.
+  run_dartq_in pkgs-nested-json "$wts" packages --format json
   local rows
-  rows="$(cat "$(out_file pkgs-nested)")"
-  assert_contains "$rows" "PKG|$wts|outer|independent|^3.5.0|yes" \
+  rows="$(cat "$(out_file pkgs-nested-json)")"
+  pkg_row_check "$rows" "$wts" outer independent "^3.5.0" true \
     "the scanned package itself is the one work point"
-  assert_contains "$rows" "BOUNDARY|$wts/vendor/main|nested-checkout" \
+  boundary_row_check "$rows" "$wts/vendor/main" nested-checkout \
     "the real clone is a nested-checkout boundary"
-  assert_contains "$rows" "BOUNDARY|$wts/vendor/linked|worktree-pointer" \
+  boundary_row_check "$rows" "$wts/vendor/linked" worktree-pointer \
     "the real linked worktree is a worktree-pointer boundary"
-  assert_contains "$rows" "BOUNDARY|$wts/vendor/stale|worktree-pointer" \
+  boundary_row_check "$rows" "$wts/vendor/stale" worktree-pointer \
     "the stale pointer registers as a worktree-pointer boundary"
-  assert_contains "$(printf '%s\n' "$rows" | grep "BOUNDARY|$wts/vendor/stale|")" "missing" \
+  assert_contains "$(printf '%s\n' "$rows" | grep "vendor/stale")" "missing" \
     "the stale pointer's detail says the target is missing"
   assert_not_contains "$rows" "main_pkg" "the foreign checkout is not a work point"
   assert_not_contains "$rows" "linked_pkg" "the linked worktree is not a work point"
@@ -59,15 +65,15 @@ environment:
   leg_begin pkgs-two-universes "two universes side by side stay separate"
   make_pkg "$base/uni_a" "uni_a"
   make_pkg "$base/uni_b" "uni_b"
-  run_dartq_in pkgs-uni-a "$base/uni_a" packages --format machine
+  run_dartq_in pkgs-uni-a "$base/uni_a" packages --format json
   assert_eq "$DQ_RC" 0 "universe A inventories clean"
   rows="$(cat "$(out_file pkgs-uni-a)")"
-  assert_contains "$rows" "PKG|$base/uni_a|uni_a|independent|^3.5.0|yes" \
+  pkg_row_check "$rows" "$base/uni_a" uni_a independent "^3.5.0" true \
     "universe A lists itself"
   assert_not_contains "$rows" "uni_b" "universe A never sees its sibling universe"
-  run_dartq_in pkgs-uni-b "$base/uni_b" packages --format machine
+  run_dartq_in pkgs-uni-b "$base/uni_b" packages --format json
   assert_eq "$DQ_RC" 0 "universe B inventories clean"
-  assert_contains "$(cat "$(out_file pkgs-uni-b)")" "PKG|$base/uni_b|uni_b|independent|^3.5.0|yes" \
+  assert_contains "$(cat "$(out_file pkgs-uni-b)")" "\"uni_b\"" \
     "universe B lists itself"
   assert_not_contains "$(cat "$(out_file pkgs-uni-b)")" "uni_a" \
     "universe B never sees its sibling universe"
@@ -81,15 +87,15 @@ environment:
   sdk: ^3.5.0
 '
   mkdir -p "$base/uni_a/vendor/fresh/lib"
-  run_dartq_in pkgs-fresh "$base/uni_a" packages --format machine
+  run_dartq_in pkgs-fresh "$base/uni_a" packages --format json
   assert_eq "$DQ_RC" 0 "unresolved packages are rows, not failures"
   rows="$(cat "$(out_file pkgs-fresh)")"
-  assert_contains "$rows" "PKG|$base/uni_a/vendor/copy|vendored_copy|independent|^3.5.0|yes" \
+  pkg_row_check "$rows" "$base/uni_a/vendor/copy" vendored_copy independent "^3.5.0" true \
     "the plain copy under the foreign tree is an independent work point"
-  assert_contains "$rows" "PKG|$base/uni_a/vendor/fresh|fresh_clone|independent|^3.5.0|no" \
+  pkg_row_check "$rows" "$base/uni_a/vendor/fresh" fresh_clone independent "^3.5.0" false \
     "the fresh clone is discovered but unresolved"
-  run_dartq_in pkgs-fresh-human "$base/uni_a" packages --format human
-  rows="$(cat "$(out_file pkgs-fresh-human)")"
+  run_dartq_in pkgs-fresh-text "$base/uni_a" packages --format text
+  rows="$(cat "$(out_file pkgs-fresh-text)")"
   assert_contains "$rows" "dart pub get" "the human face prints the pub-get hint"
   assert_contains "$rows" "in $base/uni_a/vendor/fresh (needs SDK ^3.5.0)" \
     "the hint names the package dir and its SDK constraint"
@@ -98,12 +104,16 @@ environment:
   leg_begin pkgs-broken-pubspec "broken pubspec keeps its NOTE row"
   wf "$base/uni_b/vendor/bad/pubspec.yaml" 'name: [unclosed
 '
-  run_dartq_in pkgs-broken "$base/uni_b" packages --format machine
+  run_dartq_in pkgs-broken "$base/uni_b" packages --format json
   assert_eq "$DQ_RC" 0 "a malformed pubspec degrades to a note, not a failure"
   rows="$(cat "$(out_file pkgs-broken)")"
-  assert_contains "$rows" "PKG|$base/uni_b/vendor/bad|-|independent|-|no" \
+  pkg_row_check "$rows" "$base/uni_b/vendor/bad" null independent null false \
     "the broken package is an unnamed unresolved row"
-  assert_contains "$rows" "NOTE|$base/uni_b/vendor/bad|" "the parse error rides a NOTE row"
+  # The note carries the pubspec's file name plus the yaml parser's own
+  # failure text ("did not find expected …"); the line/column numbers ride
+  # the library's error location and are deliberately not pinned.
+  assert_contains "$rows" "pubspec.yaml: did not find" \
+    "the parse error rides the row's note field"
 
   # --- 01.5 orphan workspace member ------------------------------------
   leg_begin pkgs-orphan-member "orphan workspace member refuses with navigation"

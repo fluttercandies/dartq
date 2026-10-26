@@ -30,7 +30,7 @@ Three files, one package (`fixture`):
 ## What the goldens pin
 
 - The element-face columns (#1560): the declaration row carries
-  `annotations` verbatim; members carry their rendered `signature` in the
+  `annotations` verbatim; members carry their rendered `sig` in the
   symbol tests' pinned spellings.
 - The package-form reference labels (#1556): `package:fixture/<rel>` for
   every `lib/` file, in declarations and both reference columns.

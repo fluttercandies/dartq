@@ -43,14 +43,14 @@ static INDEX_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "type": "object",
         "additionalProperties": false,
         "required": [
-            "schema_version",
+            "v",
             "files",
             "libraries",
             "symbols",
-            "references",
+            "refs",
         ],
         "properties": {
-            "schema_version": { "const": SCHEMA_VERSION_INDEX },
+            "v": { "const": SCHEMA_VERSION_INDEX },
             // Member files captured into the index (IndexRun::files).
             "files": { "type": "integer", "minimum": 0 },
             // Libraries whose reference surfaces were built
@@ -59,24 +59,24 @@ static INDEX_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             // Declaration rows indexed (IndexRun::symbols).
             "symbols": { "type": "integer", "minimum": 0 },
             // Resolved reference rows indexed (IndexRun::references).
-            "references": { "type": "integer", "minimum": 0 },
+            "refs": { "type": "integer", "minimum": 0 },
         },
     })
 });
 
 const INDEX_TOP: &[&str] = &[
-    "schema_version",
+    "v",
     "files",
     "libraries",
     "symbols",
-    "references",
+    "refs",
 ];
 
 pub(crate) fn validate_index(value: &Value) -> Result<(), SchemaViolation> {
     let root = object(value, "")?;
     exact_fields(root, INDEX_TOP, &[], "")?;
-    pinned_version(root, "schema_version", SCHEMA_VERSION_INDEX)?;
-    for key in ["files", "libraries", "symbols", "references"] {
+    pinned_version(root, "v", SCHEMA_VERSION_INDEX)?;
+    for key in ["files", "libraries", "symbols", "refs"] {
         non_negative(field(root, key, "")?, key)?;
     }
     Ok(())
@@ -105,14 +105,14 @@ mod tests {
     #[test]
     fn the_writer_totals_are_the_published_shape() {
         let doc = serde_json::json!({
-            "schema_version": SCHEMA_VERSION_INDEX,
+            "v": SCHEMA_VERSION_INDEX,
             "files": 3,
             "libraries": 3,
             "symbols": 5,
-            "references": 3,
+            "refs": 3,
         });
         assert!(validate_index(&doc).is_ok());
-        let empty = serde_json::json!({ "schema_version": SCHEMA_VERSION_INDEX });
+        let empty = serde_json::json!({ "v": SCHEMA_VERSION_INDEX });
         let violation = validate_index(&empty).expect_err("totals are required");
         assert_eq!(violation.path, "files");
         assert_eq!(violation.expected, "present");
@@ -123,21 +123,21 @@ mod tests {
     #[test]
     fn unknown_fields_and_non_counts_are_named() {
         let extra = serde_json::json!({
-            "schema_version": SCHEMA_VERSION_INDEX,
+            "v": SCHEMA_VERSION_INDEX,
             "files": 0,
             "libraries": 0,
             "symbols": 0,
-            "references": 0,
+            "refs": 0,
             "per_file": [],
         });
         let violation = validate_index(&extra).expect_err("undeclared field");
         assert_eq!(violation.path, "per_file");
         let wrong_type = serde_json::json!({
-            "schema_version": SCHEMA_VERSION_INDEX,
+            "v": SCHEMA_VERSION_INDEX,
             "files": 0,
             "libraries": 0,
             "symbols": "5",
-            "references": 0,
+            "refs": 0,
         });
         let violation = validate_index(&wrong_type).expect_err("a count is an integer");
         assert_eq!(violation.path, "symbols");

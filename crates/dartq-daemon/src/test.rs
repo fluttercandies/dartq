@@ -11,15 +11,22 @@
 //! - `dartq/test/run` — `{ args: [string], cwd? }`: start
 //!   `dartq test <args> --reporter=json` in `cwd` (relative to the
 //!   workspace root; default the root). `args` is `dart test`'s argument
-//!   grammar plus `--no-cache`/`--impacted[=REF]`. Answers `{ runId }`.
-//! - `dartq/test/status` — `{ runId? }`: one run (`state`, `exitCode`,
+//!   grammar plus `--no-cache`/`--impacted[=REF]`. Answers `{ run_id }`.
+//! - `dartq/test/status` — `{ run_id? }`: one run (`state`, `exit_code`,
 //!   `passed`/`failed`/`skipped` as the runner counts them, `events`,
 //!   `stderr`), or `{ runs }` for every known run.
-//! - `dartq/test/events` — `{ runId, cursor?, limit? }`: the run's protocol
+//! - `dartq/test/events` — `{ run_id, cursor?, limit? }`: the run's protocol
 //!   events from `cursor`, at most `limit` (default 200, at most 2000).
-//! - `dartq/test/cancel` — `{ runId }`: stop a running run.
+//! - `dartq/test/cancel` — `{ run_id }`: stop a running run.
 //! - `dartq/test/probe` — `{}`: the `dart` a run would use and the
 //!   workspace's `test` package version, read without spawning anything.
+//!
+//! The `--impacted` selection is the child's — resolved by the one shared
+//! implementation (`dartq_commands::impact::impacted_tests`, the CLI test
+//! face's own selection), so both faces answer from the same function for
+//! the same input. Its conservative fallback (no repository, an unbounded
+//! input, or a semantic graph that cannot assemble) is the full run,
+//! announced on the child's stderr — surfaced here as the run's `stderr`.
 //!
 //! Every face answers at intake without blocking. The newest
 //! [`MAX_FINISHED`] finished runs are kept.
@@ -160,14 +167,14 @@ struct RunParams {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 struct StatusParams {
     #[serde(default)]
     run_id: Option<u64>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 struct EventsParams {
     run_id: u64,
     #[serde(default)]
@@ -177,7 +184,7 @@ struct EventsParams {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 struct CancelParams {
     run_id: u64,
 }
@@ -201,7 +208,7 @@ pub(crate) fn handle(manager: &mut TestManager, method: &str, params: &Value, ro
                 return Err(TestError::InvalidParams(format!("cwd {} is not a directory", cwd.display())));
             }
             let id = manager.start(&params.args, &cwd)?;
-            Ok(json!({ "runId": id }))
+            Ok(json!({ "run_id": id }))
         }
         TEST_STATUS => {
             let params: StatusParams = decode(params)?;
@@ -223,10 +230,10 @@ pub(crate) fn handle(manager: &mut TestManager, method: &str, params: &Value, ro
             let page: Vec<Value> =
                 progress.events[cursor..end].iter().map(|line| serde_json::from_str(line).unwrap_or(Value::Null)).collect();
             Ok(json!({
-                "runId": params.run_id,
+                "run_id": params.run_id,
                 "events": page,
-                "nextCursor": end,
-                "hasMore": end < total || progress.exit.is_none(),
+                "next_cursor": end,
+                "has_more": end < total || progress.exit.is_none(),
             }))
         }
         TEST_CANCEL => {
@@ -239,7 +246,7 @@ pub(crate) fn handle(manager: &mut TestManager, method: &str, params: &Value, ro
                     terminate(child);
                 }
             }
-            Ok(json!({ "runId": params.run_id, "cancelled": running }))
+            Ok(json!({ "run_id": params.run_id, "cancelled": running }))
         }
         TEST_PROBE => {
             let _: ProbeParams = decode(params)?;
@@ -249,7 +256,7 @@ pub(crate) fn handle(manager: &mut TestManager, method: &str, params: &Value, ro
                 .and_then(|lock| lock.package("test").map(|package| package.version.to_string()));
             Ok(json!({
                 "dart": dartq_test::host::find("dart").map(|path| path.display().to_string()),
-                "testPackage": test,
+                "test_package": test,
             }))
         }
         _ => Err(TestError::InvalidParams(format!("unknown method: {method}"))),
@@ -347,9 +354,9 @@ impl TestManager {
             Some(_) => "done",
         };
         Ok(json!({
-            "runId": id,
+            "run_id": id,
             "state": state,
-            "exitCode": progress.exit,
+            "exit_code": progress.exit,
             "passed": progress.tally.passed,
             "failed": progress.tally.failed,
             "skipped": progress.tally.skipped,
@@ -437,7 +444,7 @@ mod tests {
             let error = handle(&mut manager, method, &params, &root).expect_err("rejected");
             assert!(matches!(error, TestError::InvalidParams(_)), "{method}: {error:?}");
         }
-        assert!(matches!(handle(&mut manager, TEST_STATUS, &json!({ "runId": 7 }), &root), Err(TestError::NoSuchRun(7))));
+        assert!(matches!(handle(&mut manager, TEST_STATUS, &json!({ "run_id": 7 }), &root), Err(TestError::NoSuchRun(7))));
         assert_eq!(handle(&mut manager, TEST_STATUS, &json!({}), &root).expect("status"), json!({ "runs": [] }));
     }
 }

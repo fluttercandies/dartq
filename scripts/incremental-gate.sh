@@ -214,7 +214,7 @@ run_replay() { # <pkg_dir> <edits_file> <replay_label> <out_dir>
   "$HARNESS_BIN" replay \
     --corpus-dir "$1" \
     --edits "$2" \
-    --dartq-cmd "$DARTQ_BIN analyze --format=machine --sdk $SDK" \
+    --dartq-cmd "$DARTQ_BIN analyze --format=json --sdk $SDK" \
     --daemon-cmd "$DARTQ_BIN daemon {dir} --sdk $SDK" \
     --label "$3" \
     --out "$4"

@@ -143,10 +143,12 @@ dependencies:
   fi
   # After: the next command sees the new universe — clean analyze, dep a
   # work point.
-  run_dartq_in pg-packages "$base/pg" packages --format machine
+  run_dartq_in pg-packages "$base/pg" packages --format json
   assert_eq "$DQ_RC" 0 "packages reads the post-pub-get universe"
-  assert_contains "$(cat "$(out_file pg-packages)")" "|dep|path-dependency|" \
+  assert_contains "$(cat "$(out_file pg-packages)")" '"kind":"path-dependency"' \
     "the path dependency is now a work point (kinded by its consumer)"
+  assert_contains "$(cat "$(out_file pg-packages)")" '"name":"dep"' \
+    "the dependency names itself"
   run_dartq_in pg-after "$base/pg" analyze --sdk-path "$DARTQ_DART_SDK"
   assert_eq "$DQ_RC" 0 "the once-dangling import now resolves (no stale universe)"
   # The resident engine answers over the same changed tree.
@@ -155,7 +157,7 @@ dependencies:
   {"id": 1, "method": "initialize", "params": {}},
   {"id": 2, "method": "tools/call",
    "params": {"name": "dartq_analyze", "arguments": {}},
-   "expect": ["result.isError: false", "result.content.0.text contains=diagnostics"]}
+   "expect": ["result.isError: false", "result.content.0.text contains=diags"]}
 ]}
 SCRIPT
   python3 "$E2E_ROOT/lib/mcp_driver.py" "$DARTQ" "$base/pg" "$DARTQ_DART_SDK" \

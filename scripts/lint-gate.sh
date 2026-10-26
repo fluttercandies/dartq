@@ -66,7 +66,7 @@
 #                   oracle that silently produced nothing).
 #
 # Environment overrides: FVM_HOME (default ~/fvm), DARTQ_CMD (default
-# `./target/debug/dartq analyze --format=machine --sdk <fvm default
+# `./target/debug/dartq analyze --format=json --sdk <fvm default
 # dart-sdk>`), DARTQ_HARNESS_ORACLE_TIMEOUT_MS (forwarded),
 # DARTQ_ORACLE_VERSION (the expected oracle pin, default 3.13.1),
 # DARTQ_ORACLE_VERSION_CHECK (=off accepts a deliberate off-caliber oracle
@@ -274,7 +274,7 @@ if [ ! -x "$dart_bin" ]; then
   exit 2
 fi
 
-DEFAULT_DARTQ_CMD="./target/debug/dartq analyze --format=machine --sdk $sdk_root"
+DEFAULT_DARTQ_CMD="./target/debug/dartq analyze --format=json --sdk $sdk_root"
 DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
 if [ "$DARTQ_CMD" = "$DEFAULT_DARTQ_CMD" ] && [ ! -x "./target/debug/dartq" ]; then
   echo "lint-gate: ./target/debug/dartq not found — build it first: cargo build -p dartq-cli (or set DARTQ_CMD=<cmd>)" >&2

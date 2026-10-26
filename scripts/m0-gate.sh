@@ -57,9 +57,9 @@
 # re-pins the expectation, DARTQ_ORACLE_VERSION_CHECK=off accepts a
 # deliberate off-caliber oracle as a warning), DARTQ_CMD (run A's dartq
 # side, the check face;
-# default `./target/release/dartq check --format=machine` — the recorded M0
+# default `./target/release/dartq check --format=json` — the recorded M0
 # shape), DARTQ_ANALYZE_CMD (run B's dartq side, the analyze face; default
-# `./target/release/dartq analyze --format=machine --sdk <fvm default
+# `./target/release/dartq analyze --format=json --sdk <fvm default
 # dart-sdk>` — the m1-gate shape against the release binary).
 #
 # Exit codes: 0 both calibers met the 100% caliber (diff planes empty after
@@ -159,9 +159,9 @@ dart_bin="$sdk_root/bin/dart"
 # Run A drives the check face (scan+parse tier), run B the analyze face
 # (engine tier with the semantic diagnoser) — the union universe includes
 # the 36 semantic-tier codes, which only the analyze face can emit.
-DEFAULT_CHECK_CMD="./target/release/dartq check --format=machine"
+DEFAULT_CHECK_CMD="./target/release/dartq check --format=json"
 CHECK_CMD="${DARTQ_CMD:-$DEFAULT_CHECK_CMD}"
-DEFAULT_ANALYZE_CMD="./target/release/dartq analyze --format=machine --sdk $sdk_root"
+DEFAULT_ANALYZE_CMD="./target/release/dartq analyze --format=json --sdk $sdk_root"
 ANALYZE_CMD="${DARTQ_ANALYZE_CMD:-$DEFAULT_ANALYZE_CMD}"
 
 # The union code universe: both sources comment-stripped, first field per

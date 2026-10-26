@@ -6,15 +6,18 @@ description: Use when working in any Dart or Flutter codebase — before reachin
 # dartq
 
 dartq is a drop-in Rust toolchain for Dart and Flutter analysis, testing, and
-debugging. AI agents are its first-class users: piped output is machine output,
-every face has a stable schema, and one resident engine per worktree serves
-CLI, events, and MCP clients alike.
+debugging. AI agents are its first-class users: every output-bearing verb
+defaults to LON (the compact canonical encoding of the JSON data model) over
+a short snake_case field vocabulary, every face has a stable schema, and one
+resident engine per worktree serves CLI, events, and MCP clients alike.
 
 ## The Contract (memorize these three lines)
 
-1. **Piped = machine.** When stdout is not a TTY, commands emit machine faces
-   (JSON envelope, pipe-separated rows) with zero prose. An explicit `--format`
-   always wins.
+1. **`--format lon` is the default — always.** One canonical LON line (or
+   one per row), never sniffing the terminal: a piped run and a TTY run
+   print the same bytes. `--format json` asks for the frozen single-line
+   JSON shapes (jq consumers); `--format text` the human faces (write
+   operations fall back to lon — their output is a record, not prose).
 2. **Exit codes follow dart.** `analyze`: 0 clean/info-only, 1 fatal infos,
    2 fatal warnings, 3 errors, 4 internal failure, 64 usage. `test`: dart
    test's own codes (0 pass, 1 fail, 64 usage, 65 data error, 79 no tests).
@@ -59,19 +62,23 @@ under `references/`. Load the one that matches the task:
 
 ## Defaults That Surprise Newcomers
 
-- `dartq analyze` piped prints the **single-line JSON envelope** (byte parity
-  with `dart analyze --format=json`), not human prose. Ask for
-  `--format machine` for `SEVERITY|TYPE|CODE|FILE|LINE|COL|LENGTH|MESSAGE`
-  rows, or `--format default` for the human grouping.
-- `query`, `packages`, and `fix` flip the other way when piped: machine rows
-  or JSON documents instead of their TTY tables.
+- `dartq analyze` prints `{v:1 diags:[{code sev file line col len msg doc?}]}` —
+  one LON document, one flat row per diagnostic. `--format json` asks for the
+  oracle envelope (byte parity with `dart analyze --format=json`);
+  `--format text` the grouped human listing (`sev code line:col msg` rows).
+- The lon face carries the short field vocabulary everywhere: `v`, `diags`,
+  `sev`, `msg`, `doc`, `decls`, `refs`, `off`, `len`, `col`, `sig`, `sym`,
+  `deps`, `envs`, `sig_changed`, `new_name`, `age_s` — the same word list the
+  daemon and MCP faces speak. The json face keeps the long frozen spellings.
 - Engine faces need a resolved workspace: `pubspec.yaml` plus
   `.dart_tool/package_config.json` (run `dart pub get` first). `--fast` and
   `--sdk-path`/`$DART_SDK` control the rest.
-- `debug` is a machine channel like `session`/`events`: one JSON line per
-  call, the sole live session driven by default (`-s <ID>` picks one when
-  several are live), and a domain failure answers one `{"error":…}` line
-  with a `DARTQ/DEBUG/*` machine code at exit 1.
+- `debug` carries the same tri-axis (lon default, one line per call); the
+  sole live session is driven by default (`-s <ID>` picks one when several
+  are live), and a domain failure answers one `{"error":{code,msg}}` line
+  with a `DARTQ/DEBUG/*` machine code at exit 1. Its flags are kebab-case
+  (`--ws-uri`, `--frame-index`, `--breakpoint-id`) and its wire/answer
+  fields snake_case (`session_id`, `isolates`, `main`, `ws_uri`).
 
 ## Not Sure dartq Is Installed?
 

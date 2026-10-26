@@ -41,26 +41,26 @@ fn dartq_native_faces_are_frozen_at_v1() {
 fn compact_fix_patch_passes_validation() {
     let doc = serde_json::json!({
         "file": "lib/foo.dart",
-        "schema_version": SCHEMA_VERSION_FIX_PATCH,
+        "v": SCHEMA_VERSION_FIX_PATCH,
         "edits": [
             {
-                "offset": 123,
-                "length": 8,
-                "replacement": "Bar",
-                "source": "builtin-lint",
+                "off": 123,
+                "len": 8,
+                "text": "Bar",
+                "src": "builtin-lint",
                 "anchor": {
                     "line": 10,
-                    "column": 7,
-                    "context_before": "final Fo",
-                    "context_after": "() = ",
+                    "col": 7,
+                    "before": "final Fo",
+                    "after": "() = ",
                 },
             },
             {
-                "offset": 0,
-                "length": 4,
-                "replacement": "new",
-                "source": "fixer",
-                "anchor": {"line": 1, "column": 1},
+                "off": 0,
+                "len": 4,
+                "text": "new",
+                "src": "fixer",
+                "anchor": {"line": 1, "col": 1},
             },
         ],
     });
@@ -75,12 +75,12 @@ fn compact_fix_patch_passes_validation() {
 fn minimal_fix_patch_passes_validation() {
     let doc = serde_json::json!({
         "file": "lib/foo.dart",
-        "schema_version": SCHEMA_VERSION_FIX_PATCH,
+        "v": SCHEMA_VERSION_FIX_PATCH,
         "edits": [{
-            "offset": 123,
-            "length": 8,
-            "replacement": "Bar",
-            "source": "builtin-lint",
+            "off": 123,
+            "len": 8,
+            "text": "Bar",
+            "src": "builtin-lint",
         }],
     });
     validate_ok(&doc.to_string(), Domain::FixPatch);
@@ -95,15 +95,15 @@ fn minimal_fix_patch_passes_validation() {
 fn full_tier_fix_extras_pass_validation() {
     let doc = serde_json::json!({
         "file": "lib/foo.dart",
-        "schema_version": SCHEMA_VERSION_FIX_PATCH,
+        "v": SCHEMA_VERSION_FIX_PATCH,
         "edits": [{
-            "offset": 123,
-            "length": 8,
-            "replacement": "Bar",
-            "source": "builtin-lint",
-            "anchor": {"line": 10, "column": 7, "context_before": "final Fo"},
+            "off": 123,
+            "len": 8,
+            "text": "Bar",
+            "src": "builtin-lint",
+            "anchor": {"line": 10, "col": 7, "before": "final Fo"},
             "rule": "unnecessary_new",
-            "message": "Unnecessary 'new' keyword.",
+            "msg": "Unnecessary 'new' keyword.",
             "priority": 1,
             "stale": false,
         }],
@@ -116,11 +116,11 @@ fn full_tier_fix_extras_pass_validation() {
 fn fix_edit_without_replacement_is_named() {
     let doc = serde_json::json!({
         "file": "lib/foo.dart",
-        "schema_version": SCHEMA_VERSION_FIX_PATCH,
-        "edits": [{"offset": 123, "length": 8}],
+        "v": SCHEMA_VERSION_FIX_PATCH,
+        "edits": [{"off": 123, "len": 8}],
     });
     let violation = violation_of(&doc.to_string(), Domain::FixPatch);
-    assert_eq!(violation.path, "edits[0].replacement");
+    assert_eq!(violation.path, "edits[0].text");
     assert_eq!(violation.found, "missing");
 }
 
@@ -130,11 +130,11 @@ fn fix_edit_without_replacement_is_named() {
 fn fix_edit_without_provenance_is_named() {
     let doc = serde_json::json!({
         "file": "lib/foo.dart",
-        "schema_version": SCHEMA_VERSION_FIX_PATCH,
-        "edits": [{"offset": 123, "length": 8, "replacement": "Bar"}],
+        "v": SCHEMA_VERSION_FIX_PATCH,
+        "edits": [{"off": 123, "len": 8, "text": "Bar"}],
     });
     let violation = violation_of(&doc.to_string(), Domain::FixPatch);
-    assert_eq!(violation.path, "edits[0].source");
+    assert_eq!(violation.path, "edits[0].src");
     assert_eq!(violation.found, "missing");
 }
 
@@ -142,13 +142,13 @@ fn fix_edit_without_provenance_is_named() {
 fn fix_anchor_without_line_is_named() {
     let doc = serde_json::json!({
         "file": "lib/foo.dart",
-        "schema_version": SCHEMA_VERSION_FIX_PATCH,
+        "v": SCHEMA_VERSION_FIX_PATCH,
         "edits": [{
-            "offset": 123,
-            "length": 8,
-            "replacement": "Bar",
-            "source": "builtin-lint",
-            "anchor": {"column": 7},
+            "off": 123,
+            "len": 8,
+            "text": "Bar",
+            "src": "builtin-lint",
+            "anchor": {"col": 7},
         }],
     });
     let violation = violation_of(&doc.to_string(), Domain::FixPatch);
@@ -160,18 +160,18 @@ fn fix_anchor_without_line_is_named() {
 fn fix_offset_type_error_is_named() {
     let doc = serde_json::json!({
         "file": "lib/foo.dart",
-        "schema_version": SCHEMA_VERSION_FIX_PATCH,
-        "edits": [{"offset": "123", "length": 8, "replacement": "Bar"}],
+        "v": SCHEMA_VERSION_FIX_PATCH,
+        "edits": [{"off": "123", "len": 8, "text": "Bar"}],
     });
     let violation = violation_of(&doc.to_string(), Domain::FixPatch);
-    assert_eq!(violation.path, "edits[0].offset");
+    assert_eq!(violation.path, "edits[0].off");
     assert_eq!(violation.expected, "an integer");
 }
 
 #[test]
 fn fix_missing_file_is_named() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_FIX_PATCH,
+        "v": SCHEMA_VERSION_FIX_PATCH,
         "edits": [],
     });
     let violation = violation_of(&doc.to_string(), Domain::FixPatch);
@@ -183,29 +183,29 @@ fn fix_missing_file_is_named() {
 // Query answer
 // ---------------------------------------------------------------------------
 
-/// Transcript of `to_json` (`crates/dartq-commands/src/query.rs`): `name` +
-/// `declarations` + `references`, `snake_case` fields. `container` is a total
+/// Transcript of `to_json` (`crates/dartq-commands/src/query.rs`): `sym` +
+/// `decls` + `refs`, `snake_case` fields. `container` is a total
 /// column — null for the top-level row, spelled `-` on the machine face.
 /// `qualified` is the optional qualified-name convenience spelling: the
 /// writer omits it today because the index row carries only the
 /// `isQualified` bit, not the qualifier spelling. Each reference row names
-/// its use file. `schema_version` is the v1 addition (maintainer
-/// ruling: every dartq-native face carries it); the writer stamps
+/// its use file. `v` is the v1 addition (maintainer ruling: every
+/// dartq-native face carries a version stamp); the writer stamps
 /// `crate::SCHEMA_VERSION`.
 #[test]
 fn compact_query_answer_passes_validation() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_QUERY,
-        "name": "fb",
-        "declarations": [
+        "v": SCHEMA_VERSION_QUERY,
+        "sym": "fb",
+        "decls": [
             {
                 "file": "/w/lib/a.dart",
                 "container": null,
                 "kind": "class",
                 "name": "fb",
                 "line": 3,
-                "column": 7,
-                "length": 2,
+                "col": 7,
+                "len": 2,
             },
             {
                 "file": "/w/lib/a.dart",
@@ -213,17 +213,17 @@ fn compact_query_answer_passes_validation() {
                 "kind": "method",
                 "name": "fb=",
                 "line": 8,
-                "column": 3,
-                "length": 3,
+                "col": 3,
+                "len": 3,
             },
         ],
-        "references": [
+        "refs": [
             {
-                "target_file": "/w/lib/b.dart",
+                "target": "/w/lib/b.dart",
                 "kind": "invoked",
                 "file": "/w/lib/c.dart",
-                "offset": 42,
-                "length": 2,
+                "off": 42,
+                "len": 2,
             },
         ],
     });
@@ -234,21 +234,21 @@ fn compact_query_answer_passes_validation() {
 #[test]
 fn query_qualified_null_is_named() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_QUERY,
-        "name": "fb",
-        "declarations": [],
-        "references": [
+        "v": SCHEMA_VERSION_QUERY,
+        "sym": "fb",
+        "decls": [],
+        "refs": [
             {
-                "target_file": "/w/lib/b.dart",
+                "target": "/w/lib/b.dart",
                 "kind": "read",
                 "qualified": null,
-                "offset": 7,
-                "length": 2,
+                "off": 7,
+                "len": 2,
             },
         ],
     });
     let violation = violation_of(&doc.to_string(), Domain::Query);
-    assert_eq!(violation.path, "references[0].qualified");
+    assert_eq!(violation.path, "refs[0].qualified");
     assert_eq!(violation.expected, "a string");
 }
 
@@ -257,46 +257,46 @@ fn query_qualified_null_is_named() {
 #[test]
 fn query_answer_rows_across_tiers_pass_validation() {
     let compact = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_QUERY,
-        "name": "fb",
-        "declarations": [
+        "v": SCHEMA_VERSION_QUERY,
+        "sym": "fb",
+        "decls": [
             {
                 "file": "/w/lib/a.dart",
                 "container": null,
                 "kind": "class",
                 "name": "fb",
                 "line": 3,
-                "column": 7,
-                "length": 2,
+                "col": 7,
+                "len": 2,
             },
         ],
-        "references": [
+        "refs": [
             {
-                "target_file": "/w/lib/b.dart",
+                "target": "/w/lib/b.dart",
                 "kind": "invoked",
                 "qualified": "fb.fma()",
-                "offset": 42,
-                "length": 2,
+                "off": 42,
+                "len": 2,
             },
         ],
     });
     validate_ok(&compact.to_string(), Domain::Query);
 
     let minimal = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_QUERY,
-        "name": "fb",
-        "declarations": [
+        "v": SCHEMA_VERSION_QUERY,
+        "sym": "fb",
+        "decls": [
             {
                 "file": "/w/lib/a.dart",
                 "kind": "class",
                 "name": "fb",
                 "line": 3,
-                "column": 7,
-                "length": 2,
+                "col": 7,
+                "len": 2,
             },
         ],
-        "references": [
-            {"target_file": "/w/lib/b.dart", "kind": "invoked", "offset": 42, "length": 2},
+        "refs": [
+            {"target": "/w/lib/b.dart", "kind": "invoked", "off": 42, "len": 2},
         ],
     });
     validate_ok(&minimal.to_string(), Domain::Query);
@@ -307,10 +307,10 @@ fn query_answer_rows_across_tiers_pass_validation() {
 #[test]
 fn query_answer_with_session_fields_passes_validation() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_QUERY,
-        "name": "fb",
-        "declarations": [],
-        "references": [],
+        "v": SCHEMA_VERSION_QUERY,
+        "sym": "fb",
+        "decls": [],
+        "refs": [],
         "symbols": {"s1": "package:foo/a.dart|fb"},
         "since": 1_700_000_000,
     });
@@ -321,13 +321,13 @@ fn query_answer_with_session_fields_passes_validation() {
 #[test]
 fn query_reference_without_offset_is_named() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_QUERY,
-        "name": "fb",
-        "declarations": [],
-        "references": [{"target_file": "/w/lib/b.dart", "kind": "read"}],
+        "v": SCHEMA_VERSION_QUERY,
+        "sym": "fb",
+        "decls": [],
+        "refs": [{"target": "/w/lib/b.dart", "kind": "read"}],
     });
     let violation = violation_of(&doc.to_string(), Domain::Query);
-    assert_eq!(violation.path, "references[0].offset");
+    assert_eq!(violation.path, "refs[0].off");
     assert_eq!(violation.found, "missing");
 }
 
@@ -337,18 +337,18 @@ fn query_reference_without_offset_is_named() {
 #[test]
 fn query_reference_use_file_is_optional() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_QUERY,
-        "name": "fb",
-        "declarations": [],
-        "references": [
+        "v": SCHEMA_VERSION_QUERY,
+        "sym": "fb",
+        "decls": [],
+        "refs": [
             {
-                "target_file": "/w/lib/a.dart",
+                "target": "/w/lib/a.dart",
                 "kind": "invoked",
                 "file": "/w/lib/p.dart",
-                "offset": 9,
-                "length": 4,
+                "off": 9,
+                "len": 4,
             },
-            {"target_file": "/w/lib/a.dart", "kind": "read", "offset": 21, "length": 2},
+            {"target": "/w/lib/a.dart", "kind": "read", "off": 21, "len": 2},
         ],
     });
     validate_ok(&doc.to_string(), Domain::Query);
@@ -359,15 +359,15 @@ fn query_reference_use_file_is_optional() {
 #[test]
 fn query_reference_file_type_error_is_named() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_QUERY,
-        "name": "fb",
-        "declarations": [],
-        "references": [
-            {"target_file": "/w/lib/a.dart", "kind": "read", "file": 17, "offset": 9, "length": 4},
+        "v": SCHEMA_VERSION_QUERY,
+        "sym": "fb",
+        "decls": [],
+        "refs": [
+            {"target": "/w/lib/a.dart", "kind": "read", "file": 17, "off": 9, "len": 4},
         ],
     });
     let violation = violation_of(&doc.to_string(), Domain::Query);
-    assert_eq!(violation.path, "references[0].file");
+    assert_eq!(violation.path, "refs[0].file");
     assert_eq!(violation.expected, "a string");
 }
 
@@ -376,21 +376,21 @@ fn query_reference_file_type_error_is_named() {
 #[test]
 fn query_unknown_declaration_kind_is_named() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_QUERY,
-        "name": "fb",
-        "declarations": [{
+        "v": SCHEMA_VERSION_QUERY,
+        "sym": "fb",
+        "decls": [{
             "file": "/w/lib/a.dart",
             "container": null,
             "kind": "struct",
             "name": "fb",
             "line": 3,
-            "column": 7,
-            "length": 2,
+            "col": 7,
+            "len": 2,
         }],
-        "references": [],
+        "refs": [],
     });
     let violation = violation_of(&doc.to_string(), Domain::Query);
-    assert_eq!(violation.path, "declarations[0].kind");
+    assert_eq!(violation.path, "decls[0].kind");
     assert!(violation.expected.contains("\"extension-type\""));
 }
 
@@ -398,43 +398,43 @@ fn query_unknown_declaration_kind_is_named() {
 #[test]
 fn query_internal_file_id_is_undeclared() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_QUERY,
-        "name": "fb",
-        "declarations": [{
+        "v": SCHEMA_VERSION_QUERY,
+        "sym": "fb",
+        "decls": [{
             "file": "/w/lib/a.dart",
             "container": null,
             "kind": "class",
             "name": "fb",
             "line": 3,
-            "column": 7,
-            "length": 2,
+            "col": 7,
+            "len": 2,
             "file_id": 17,
         }],
-        "references": [],
+        "refs": [],
     });
     let violation = violation_of(&doc.to_string(), Domain::Query);
-    assert_eq!(violation.path, "declarations[0].file_id");
+    assert_eq!(violation.path, "decls[0].file_id");
     assert_eq!(violation.found, "an undeclared field");
 }
 
 #[test]
 fn query_container_type_error_is_named() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_QUERY,
-        "name": "fb",
-        "declarations": [{
+        "v": SCHEMA_VERSION_QUERY,
+        "sym": "fb",
+        "decls": [{
             "file": "/w/lib/a.dart",
             "container": 3,
             "kind": "class",
             "name": "fb",
             "line": 3,
-            "column": 7,
-            "length": 2,
+            "col": 7,
+            "len": 2,
         }],
-        "references": [],
+        "refs": [],
     });
     let violation = violation_of(&doc.to_string(), Domain::Query);
-    assert_eq!(violation.path, "declarations[0].container");
+    assert_eq!(violation.path, "decls[0].container");
     assert_eq!(violation.expected, "a string");
 }
 
@@ -635,11 +635,11 @@ fn run_metrics_bad_files_type_is_named() {
 #[test]
 fn compact_index_run_passes_validation() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_INDEX,
+        "v": SCHEMA_VERSION_INDEX,
         "files": 3,
         "libraries": 3,
         "symbols": 5,
-        "references": 3,
+        "refs": 3,
     });
     validate_ok(&doc.to_string(), Domain::Index);
 }
@@ -649,20 +649,20 @@ fn compact_index_run_passes_validation() {
 #[test]
 fn index_run_zero_totals_pass_and_extras_fail() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_INDEX,
+        "v": SCHEMA_VERSION_INDEX,
         "files": 0,
         "libraries": 0,
         "symbols": 0,
-        "references": 0,
+        "refs": 0,
     });
     validate_ok(&doc.to_string(), Domain::Index);
 
     let extra = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_INDEX,
+        "v": SCHEMA_VERSION_INDEX,
         "files": 0,
         "libraries": 0,
         "symbols": 0,
-        "references": 0,
+        "refs": 0,
         "unresolved": 7,
     });
     let violation = violation_of(&extra.to_string(), Domain::Index);
@@ -680,34 +680,32 @@ fn index_run_zero_totals_pass_and_extras_fail() {
 // ---------------------------------------------------------------------------
 
 /// Transcript of `check_row` at its compact tier
-/// (`crates/dartq-daemon/src/commands.rs:972-981`) inside the
-/// `session_answer` envelope (commands.rs:1008): the machine line's field
-/// set as JSON rows, `severity`/`type` carrying the diagnostics domain's
-/// own spellings. `symbols`/`since` ride absent-tolerant.
+/// (`crates/dartq-daemon/src/commands.rs`, the check section) inside the
+/// `session_answer` envelope: the flattened short-vocabulary rows
+/// (`code`/`sev`/`file`/`line`/`col`/`len`/`msg`, `sev` the lowercase
+/// word). `symbols`/`since` ride absent-tolerant.
 #[test]
 fn compact_check_answer_passes_validation() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_CHECK,
-        "diagnostics": [
+        "v": SCHEMA_VERSION_CHECK,
+        "diags": [
             {
-                "file": "/w/lib/a.dart",
-                "severity": "ERROR",
-                "type": "COMPILE_TIME_ERROR",
                 "code": "undefined_identifier",
+                "sev": "error",
+                "file": "/w/lib/a.dart",
                 "line": 3,
-                "column": 7,
-                "length": 2,
-                "message": "Undefined name 'fa'.",
+                "col": 7,
+                "len": 2,
+                "msg": "Undefined name 'fa'.",
             },
             {
-                "file": "/w/lib/b.dart",
-                "severity": "WARNING",
-                "type": "STATIC_WARNING",
                 "code": "dead_null_aware_expression",
+                "sev": "warning",
+                "file": "/w/lib/b.dart",
                 "line": 12,
-                "column": 3,
-                "length": 5,
-                "message": "The value of the expression is dead.",
+                "col": 3,
+                "len": 5,
+                "msg": "The value of the expression is dead.",
             },
         ],
         "since": 42,
@@ -721,123 +719,118 @@ fn compact_check_answer_passes_validation() {
 #[test]
 fn minimal_check_rows_pass_and_negatives_are_named() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_CHECK,
-        "diagnostics": [{
-            "file": "/w/lib/a.dart",
+        "v": SCHEMA_VERSION_CHECK,
+        "diags": [{
             "code": "undefined_identifier",
+            "file": "/w/lib/a.dart",
             "line": 3,
-            "column": 7,
-            "length": 2,
+            "col": 7,
+            "len": 2,
         }],
     });
     validate_ok(&doc.to_string(), Domain::Check);
     assert!(validate_at_tier(&doc.to_string(), Domain::Check, Verbosity::Minimal).is_ok());
 
     let extra = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_CHECK,
-        "diagnostics": [{
-            "file": "/w/lib/a.dart",
+        "v": SCHEMA_VERSION_CHECK,
+        "diags": [{
             "code": "undefined_identifier",
+            "file": "/w/lib/a.dart",
             "line": 3,
-            "column": 7,
-            "length": 2,
+            "col": 7,
+            "len": 2,
             "correctionMessage": "use fb",
         }],
     });
     let violation = violation_of(&extra.to_string(), Domain::Check);
-    assert_eq!(violation.path, "diagnostics[0].correctionMessage");
+    assert_eq!(violation.path, "diags[0].correctionMessage");
 
     let wrong = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_CHECK,
-        "diagnostics": [{
-            "file": "/w/lib/a.dart",
-            "severity": "Fatal",
+        "v": SCHEMA_VERSION_CHECK,
+        "diags": [{
             "code": "undefined_identifier",
+            "sev": "Fatal",
+            "file": "/w/lib/a.dart",
             "line": 3,
-            "column": 7,
-            "length": 2,
+            "col": 7,
+            "len": 2,
         }],
     });
     let violation = violation_of(&wrong.to_string(), Domain::Check);
-    assert_eq!(violation.path, "diagnostics[0].severity");
+    assert_eq!(violation.path, "diags[0].sev");
 }
 
 // ---------------------------------------------------------------------------
 // Analyze answer (daemon `dartq/analyze`)
 // ---------------------------------------------------------------------------
 
-/// Transcript of the compact `analyze_answer` entry
-/// (`crates/dartq-daemon/src/commands.rs:934-936`) — the
-/// `lsp::AnalyzeEntry` serialization (lsp.rs:105-110 over the LSP
-/// `Diagnostic` shape of lsp.rs:83-91). Positions are LSP: zero-based lines and
-/// UTF-16 columns, unlike the CLI faces' 1-based rows.
+/// Transcript of the compact `analyze_answer` row
+/// (`crates/dartq-daemon/src/commands.rs`, the analyze section, over
+/// `wire::row`): the entry flattened onto the short vocabulary —
+/// `{code, sev, file, line, col, len, msg}` with `file` carrying the
+/// document URI and `line`/`col` 1-based.
 #[test]
 fn compact_analyze_answer_passes_validation() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_ANALYZE,
-        "diagnostics": [{
-            "uri": "file:///w/lib/a.dart",
-            "range": {
-                "start": {"line": 2, "character": 6},
-                "end": {"line": 2, "character": 8},
-            },
-            "severity": 1,
+        "v": SCHEMA_VERSION_ANALYZE,
+        "diags": [{
             "code": "undefined_identifier",
-            "source": "dartq",
-            "message": "Undefined name 'fa'.",
+            "sev": "error",
+            "file": "file:///w/lib/a.dart",
+            "line": 3,
+            "col": 7,
+            "len": 2,
+            "msg": "Undefined name 'fa'.",
         }],
     });
     validate_ok(&doc.to_string(), Domain::Analyze);
 }
 
-/// The minimal tier (`analyze_answer`, commands.rs:929-933): `uri` + `code` +
-/// `range`; the LSP severity is one of the produced values and undeclared
-/// entries fields are named.
+/// The minimal tier (`analyze_answer`'s reduced row): `code` + the
+/// locator; the severity word spelling is exact and undeclared row fields
+/// are named.
 #[test]
 fn minimal_analyze_entries_pass_and_negatives_are_named() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_ANALYZE,
-        "diagnostics": [{
-            "uri": "file:///w/lib/a.dart",
+        "v": SCHEMA_VERSION_ANALYZE,
+        "diags": [{
             "code": "undefined_identifier",
-            "range": {
-                "start": {"line": 2, "character": 6},
-                "end": {"line": 2, "character": 8},
-            },
+            "file": "file:///w/lib/a.dart",
+            "line": 3,
+            "col": 7,
+            "len": 2,
         }],
     });
     validate_ok(&doc.to_string(), Domain::Analyze);
     assert!(validate_at_tier(&doc.to_string(), Domain::Analyze, Verbosity::Minimal).is_ok());
 
     let wrong = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_ANALYZE,
-        "diagnostics": [{
-            "uri": "file:///w/lib/a.dart",
+        "v": SCHEMA_VERSION_ANALYZE,
+        "diags": [{
             "code": "undefined_identifier",
-            "range": {
-                "start": {"line": 2, "character": 6},
-                "end": {"line": 2, "character": 8},
-            },
-            "severity": 4,
+            "sev": "Fatal",
+            "file": "file:///w/lib/a.dart",
+            "line": 3,
+            "col": 7,
+            "len": 2,
         }],
     });
     let violation = violation_of(&wrong.to_string(), Domain::Analyze);
-    assert_eq!(violation.path, "diagnostics[0].severity");
+    assert_eq!(violation.path, "diags[0].sev");
 
     let extra = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_ANALYZE,
-        "diagnostics": [{
-            "uri": "file:///w/lib/a.dart",
+        "v": SCHEMA_VERSION_ANALYZE,
+        "diags": [{
             "code": "undefined_identifier",
-            "range": {
-                "start": {"line": 2, "character": 6},
-                "end": {"line": 2, "character": 8},
-            },
+            "file": "file:///w/lib/a.dart",
+            "line": 3,
+            "col": 7,
+            "len": 2,
             "tags": [1],
         }],
     });
     let violation = violation_of(&extra.to_string(), Domain::Analyze);
-    assert_eq!(violation.path, "diagnostics[0].tags");
+    assert_eq!(violation.path, "diags[0].tags");
 }
 
 // ---------------------------------------------------------------------------
@@ -854,39 +847,39 @@ fn minimal_analyze_entries_pass_and_negatives_are_named() {
 fn compact_assists_document_passes_validation() {
     let doc = serde_json::json!({
         "file": "lib/foo.dart",
-        "schema_version": SCHEMA_VERSION_ASSISTS,
+        "v": SCHEMA_VERSION_ASSISTS,
         "assists": [
             {
-                "message": "Wrap in StatefulWidget",
-                "source": "assistant",
+                "msg": "Wrap in StatefulWidget",
+                "src": "assistant",
                 "priority": 1,
                 "edits": [{
-                    "offset": 19,
-                    "length": 4,
-                    "replacement": "StatefulWidget",
-                    "source": "assistant",
+                    "off": 19,
+                    "len": 4,
+                    "text": "StatefulWidget",
+                    "src": "assistant",
                     "anchor": {
                         "line": 2,
-                        "column": 16,
-                        "context_before": "class Foo ",
-                        "context_after": "{}",
+                        "col": 16,
+                        "before": "class Foo ",
+                        "after": "{}",
                     },
                 }],
             },
             {
-                "message": "Import 'package:flutter/widgets.dart'",
-                "source": "importer",
+                "msg": "Import 'package:flutter/widgets.dart'",
+                "src": "importer",
                 "priority": -2,
                 "edits": [{
-                    "offset": 0,
-                    "length": 0,
-                    "replacement": "import 'package:flutter/widgets.dart';\n",
-                    "source": "importer",
-                    "anchor": {"line": 1, "column": 1},
+                    "off": 0,
+                    "len": 0,
+                    "text": "import 'package:flutter/widgets.dart';\n",
+                    "src": "importer",
+                    "anchor": {"line": 1, "col": 1},
                 }],
             },
         ],
-        "errors": [{"plugin": "offline", "message": "manifest not found"}],
+        "errors": [{"plugin": "offline", "msg": "manifest not found"}],
     });
     validate_ok(&doc.to_string(), Domain::Assists);
 }
@@ -898,15 +891,15 @@ fn compact_assists_document_passes_validation() {
 fn minimal_assists_pass_and_negatives_are_named() {
     let doc = serde_json::json!({
         "file": "lib/foo.dart",
-        "schema_version": SCHEMA_VERSION_ASSISTS,
+        "v": SCHEMA_VERSION_ASSISTS,
         "assists": [{
-            "message": "Wrap in StatefulWidget",
-            "source": "assistant",
+            "msg": "Wrap in StatefulWidget",
+            "src": "assistant",
             "edits": [{
-                "offset": 19,
-                "length": 4,
-                "replacement": "StatefulWidget",
-                "source": "assistant",
+                "off": 19,
+                "len": 4,
+                "text": "StatefulWidget",
+                "src": "assistant",
             }],
         }],
     });
@@ -915,17 +908,17 @@ fn minimal_assists_pass_and_negatives_are_named() {
 
     let full = serde_json::json!({
         "file": "lib/foo.dart",
-        "schema_version": SCHEMA_VERSION_ASSISTS,
+        "v": SCHEMA_VERSION_ASSISTS,
         "assists": [{
-            "message": "Wrap in StatefulWidget",
-            "source": "assistant",
+            "msg": "Wrap in StatefulWidget",
+            "src": "assistant",
             "priority": 1,
             "edits": [{
-                "offset": 19,
-                "length": 4,
-                "replacement": "StatefulWidget",
-                "source": "assistant",
-                "anchor": {"line": 2, "column": 16},
+                "off": 19,
+                "len": 4,
+                "text": "StatefulWidget",
+                "src": "assistant",
+                "anchor": {"line": 2, "col": 16},
             }],
         }],
     });
@@ -936,15 +929,15 @@ fn minimal_assists_pass_and_negatives_are_named() {
 
     let patch_row = serde_json::json!({
         "file": "lib/foo.dart",
-        "schema_version": SCHEMA_VERSION_ASSISTS,
+        "v": SCHEMA_VERSION_ASSISTS,
         "assists": [{
-            "message": "Wrap in StatefulWidget",
-            "source": "assistant",
+            "msg": "Wrap in StatefulWidget",
+            "src": "assistant",
             "edits": [{
-                "offset": 19,
-                "length": 4,
-                "replacement": "StatefulWidget",
-                "source": "assistant",
+                "off": 19,
+                "len": 4,
+                "text": "StatefulWidget",
+                "src": "assistant",
                 "rule": "unnecessary_new",
             }],
         }],
@@ -965,13 +958,13 @@ fn minimal_assists_pass_and_negatives_are_named() {
 fn fix_patch_is_exact_at_its_tier() {
     let compact = serde_json::json!({
         "file": "lib/foo.dart",
-        "schema_version": SCHEMA_VERSION_FIX_PATCH,
+        "v": SCHEMA_VERSION_FIX_PATCH,
         "edits": [{
-            "offset": 123,
-            "length": 8,
-            "replacement": "Bar",
-            "source": "builtin-lint",
-            "anchor": {"line": 10, "column": 7},
+            "off": 123,
+            "len": 8,
+            "text": "Bar",
+            "src": "builtin-lint",
+            "anchor": {"line": 10, "col": 7},
         }],
     });
     assert!(validate_at_tier(&compact.to_string(), Domain::FixPatch, Verbosity::Compact).is_ok());
@@ -984,15 +977,15 @@ fn fix_patch_is_exact_at_its_tier() {
     // turn (`rule`, then `message`, then `priority` — fix.rs:769-784).
     let full = serde_json::json!({
         "file": "lib/foo.dart",
-        "schema_version": SCHEMA_VERSION_FIX_PATCH,
+        "v": SCHEMA_VERSION_FIX_PATCH,
         "edits": [{
-            "offset": 123,
-            "length": 8,
-            "replacement": "Bar",
-            "source": "fixer",
-            "anchor": {"line": 10, "column": 7},
+            "off": 123,
+            "len": 8,
+            "text": "Bar",
+            "src": "fixer",
+            "anchor": {"line": 10, "col": 7},
             "rule": "unnecessary_new",
-            "message": "insert const",
+            "msg": "insert const",
             "priority": 1,
         }],
     });
@@ -1009,13 +1002,13 @@ fn fix_patch_is_exact_at_its_tier() {
         .remove("rule");
     let violation = validate_at_tier(&no_rule.to_string(), Domain::FixPatch, Verbosity::Compact)
         .expect_err("compact must not carry the message");
-    assert_eq!(violation.path, "edits[0].message");
+    assert_eq!(violation.path, "edits[0].msg");
     assert_eq!(violation.expected, "omitted at the compact tier");
 
     no_rule["edits"][0]
         .as_object_mut()
         .expect("edit row")
-        .remove("message");
+        .remove("msg");
     let violation = validate_at_tier(&no_rule.to_string(), Domain::FixPatch, Verbosity::Compact)
         .expect_err("compact must not carry the priority");
     assert_eq!(violation.path, "edits[0].priority");
@@ -1028,43 +1021,43 @@ fn fix_patch_is_exact_at_its_tier() {
 #[test]
 fn query_answer_is_exact_at_its_tier() {
     let compact = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_QUERY,
-        "name": "fb",
-        "declarations": [{
+        "v": SCHEMA_VERSION_QUERY,
+        "sym": "fb",
+        "decls": [{
             "file": "/w/lib/a.dart",
             "container": null,
             "kind": "class",
             "name": "fb",
             "line": 3,
-            "column": 7,
-            "length": 2,
+            "col": 7,
+            "len": 2,
         }],
-        "references": [
+        "refs": [
             {
-                "target_file": "/w/lib/b.dart",
+                "target": "/w/lib/b.dart",
                 "kind": "invoked",
                 "qualified": "fb.fma()",
-                "offset": 42,
-                "length": 2,
+                "off": 42,
+                "len": 2,
             },
         ],
     });
     assert!(validate_at_tier(&compact.to_string(), Domain::Query, Verbosity::Compact).is_ok());
     let violation = validate_at_tier(&compact.to_string(), Domain::Query, Verbosity::Minimal)
         .expect_err("minimal must not carry the convenience spellings");
-    assert_eq!(violation.path, "declarations[0].container");
+    assert_eq!(violation.path, "decls[0].container");
     assert_eq!(violation.expected, "omitted at the minimal tier");
 
     // With the container dropped, the reference row's `qualified` is named
     // on its own.
     let mut minimal = compact;
-    minimal["declarations"][0]
+    minimal["decls"][0]
         .as_object_mut()
         .expect("object")
         .remove("container");
     let violation = validate_at_tier(&minimal.to_string(), Domain::Query, Verbosity::Minimal)
         .expect_err("minimal must not carry the qualified spelling");
-    assert_eq!(violation.path, "references[0].qualified");
+    assert_eq!(violation.path, "refs[0].qualified");
     assert_eq!(violation.expected, "omitted at the minimal tier");
 }
 
@@ -1124,11 +1117,11 @@ fn run_metrics_are_tier_invariant() {
 #[test]
 fn index_run_is_tier_invariant() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_INDEX,
+        "v": SCHEMA_VERSION_INDEX,
         "files": 3,
         "libraries": 3,
         "symbols": 5,
-        "references": 3,
+        "refs": 3,
     });
     for tier in [Verbosity::Minimal, Verbosity::Compact, Verbosity::Full] {
         assert!(
@@ -1146,28 +1139,28 @@ fn index_run_is_tier_invariant() {
 #[test]
 fn query_reserved_kind_arrays_are_exact_at_their_tier() {
     let doc = serde_json::json!({
-        "schema_version": SCHEMA_VERSION_QUERY,
-        "name": "fb",
-        "declarations": [{
+        "v": SCHEMA_VERSION_QUERY,
+        "sym": "fb",
+        "decls": [{
             "file": "/w/lib/a.dart",
             "container": null,
             "kind": "class",
             "name": "fb",
             "line": 3,
-            "column": 7,
-            "length": 2,
+            "col": 7,
+            "len": 2,
         }],
-        "references": [],
+        "refs": [],
         "implementations": [{
             "file": "/w/lib/sub.dart",
             "container": "Sub",
             "kind": "class",
             "name": "Sub",
             "line": 4,
-            "column": 7,
-            "length": 3,
+            "col": 7,
+            "len": 3,
         }],
-        "dependencies": [{ "path": "/w/lib/app.dart" }],
+        "deps": [{ "path": "/w/lib/app.dart" }],
     });
     assert!(validate_at_tier(&doc.to_string(), Domain::Query, Verbosity::Compact).is_ok());
     assert!(validate_at_tier(&doc.to_string(), Domain::Query, Verbosity::Full).is_ok());
@@ -1187,8 +1180,8 @@ fn query_reserved_kind_arrays_are_exact_at_their_tier() {
     minimal
         .as_object_mut()
         .expect("object")
-        .remove("dependencies");
-    minimal["declarations"][0]
+        .remove("deps");
+    minimal["decls"][0]
         .as_object_mut()
         .expect("object")
         .remove("container");

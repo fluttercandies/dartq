@@ -21,11 +21,12 @@
 //!   memory before any file changes on disk (a read or patch failure leaves
 //!   nothing mutated), and a write failing midway prints which files were
 //!   already mutated before the internal-error exit;
-//! - `--format=machine` emits one single-line JSON document per patched
-//!   file — empty context strings omitted; an apply run records each
-//!   row's outcome (`applied`/`stale`) plus the document-level summary,
-//!   so an all-stale run (a safe no-op, still exit 0) stays legible to
-//!   the machine consumer; the default format is a human listing;
+//! - `--format` is the shared axis: `lon` (the default) prints each
+//!   file's patch document as one canonical LON line
+//!   (`off`/`len`/`text`/`src`/`before`/`after`),
+//!   `json` the single-line documents, `text` the human listing
+//!   (write operations have no prose face — the default applies either
+//!   way, the listing is the `--dry-run` reading aid);
 //! - exit tiers follow the query faces: 0 on success (zero fixes included;
 //!   stale entries are safe no-ops, not failures), 64 usage, 4 internal.
 
@@ -33,7 +34,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use clap::{Args, ValueEnum};
+use clap::Args;
 use dartq_commands::Verbosity;
 use dartq_commands::discover::DiscoverError;
 use dartq_commands::fix::{self, EditOutcome, FileFixSet, PluginHosts};
@@ -47,10 +48,11 @@ pub(crate) struct FixArgs {
     /// Only output the patches; never write files.
     #[arg(long)]
     pub(crate) dry_run: bool,
-    /// Output format; absent falls to the terminal's shape — the human
-    /// listing on a TTY, machine JSON documents piped.
-    #[arg(long, value_enum)]
-    pub(crate) format: Option<FixFormat>,
+    /// Output format: `lon` (the default, the vocabulary-projected patch
+    /// documents, one canonical line per file), `json` (the frozen
+    /// single-line documents), or `text` (the human listing).
+    #[arg(long, value_enum, default_value_t = crate::OutputFormat::Lon)]
+    pub(crate) format: crate::OutputFormat,
     /// Apply only the fixes whose diagnostic code matches one of these
     /// (comma-separated; case-insensitive exact match — the upstream
     /// `dart fix --code` selection).
@@ -71,42 +73,22 @@ pub(crate) struct AssistsArgs {
     /// The UTF-16 length of the target span (default: zero).
     #[arg(long, default_value_t = 0)]
     pub(crate) length: u64,
-    /// Output format; absent falls to the terminal's shape — the human
-    /// listing on a TTY, machine JSON documents piped.
-    #[arg(long, value_enum)]
-    pub(crate) format: Option<FixFormat>,
+    /// Output format: `lon` (the default), `json`, or `text` (the human
+    /// listing).
+    #[arg(long, value_enum, default_value_t = crate::OutputFormat::Lon)]
+    pub(crate) format: crate::OutputFormat,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-pub(crate) enum FixFormat {
-    /// Human listing (rule, location, applied/stale status).
-    Default,
-    /// One single-line JSON document per patched file; an apply run adds
-    /// each row's `outcome` (`applied`/`stale`) and the document `summary`
-    /// (a dry run emits bare proposals).
-    Machine,
-}
-
-/// The resolved output format: an explicit `--format` wins; absent falls
-/// to the terminal's shape — the human listing on a TTY, machine JSON
-/// piped.
-fn effective_format(format: Option<FixFormat>) -> FixFormat {
-    format.unwrap_or(if crate::non_tty_stdout() {
-        FixFormat::Machine
-    } else {
-        FixFormat::Default
-    })
-}
-
-/// Machine format: one single-line patch document per file with rows —
-/// the proposal shape on a dry run, the apply record (one `outcome` per
-/// row plus the `summary`) once the run writes, the statuses the apply
-/// stage reported in row order.
-fn write_machine(
+/// The data faces' shared patch-document writer: one document per file
+/// with rows — the proposal shape on a dry run, the apply record (one
+/// `outcome` per row plus the `summary`) once the run writes, the
+/// statuses the apply stage reported in row order.
+fn write_documents(
     out: &mut impl Write,
     per_file: &[FileFixSet],
     statuses: &[Vec<EditOutcome>],
     dry_run: bool,
+    format: crate::OutputFormat,
 ) -> io::Result<()> {
     for (index, set) in per_file.iter().enumerate() {
         if set.fixes.is_empty() && set.plugin.is_empty() {
@@ -116,7 +98,11 @@ fn write_machine(
             (false, Some(outcomes)) => fix::patch_json_applied(set, Verbosity::Compact, outcomes),
             _ => fix::patch_json(set, Verbosity::Compact),
         };
-        writeln!(out, "{document}")?;
+        match format {
+            crate::OutputFormat::Json => writeln!(out, "{document}")?,
+            crate::OutputFormat::Lon => crate::output::write_lon(out, &document)?,
+            crate::OutputFormat::Text => crate::output::write_text_value(out, &document)?,
+        }
     }
     Ok(())
 }
@@ -349,7 +335,7 @@ fn run(args: &FixArgs, out: &mut impl Write) -> u8 {
     report_errors(&mut hosts);
     hosts.shutdown();
     let per_file = fix::select_by_codes(per_file, &args.code);
-    apply_and_report(&per_file, args.dry_run, effective_format(args.format), out)
+    apply_and_report(&per_file, args.dry_run, args.format, out)
 }
 
 /// One assists run: the plugin hosts' proposals for one file, anchored
@@ -379,11 +365,14 @@ fn run_assists(args: &AssistsArgs, out: &mut impl Write) -> u8 {
     report_errors(&mut hosts);
     hosts.shutdown();
 
-    let written = match effective_format(args.format) {
-        FixFormat::Machine => {
+    let written = match args.format {
+        crate::OutputFormat::Json => {
             writeln!(out, "{}", fix::assists_json(&answer, Verbosity::Compact))
         }
-        FixFormat::Default => write_assists_human(out, &answer),
+        crate::OutputFormat::Lon => {
+            crate::output::write_lon(out, &fix::assists_json(&answer, Verbosity::Compact))
+        }
+        crate::OutputFormat::Text => write_assists_human(out, &answer),
     }
     .and_then(|()| out.flush());
     if let Err(error) = written {
@@ -434,7 +423,7 @@ fn report_capacity(path: &str, len: u64) {
 fn apply_and_report(
     per_file: &[FileFixSet],
     dry_run: bool,
-    format: FixFormat,
+    format: crate::OutputFormat,
     out: &mut impl Write,
 ) -> u8 {
     let mut staged: Vec<(&str, String, Vec<EditOutcome>)> = Vec::new();
@@ -536,8 +525,10 @@ fn apply_and_report(
     }
 
     let written = match format {
-        FixFormat::Machine => write_machine(out, per_file, &statuses, dry_run),
-        FixFormat::Default => write_human(out, per_file, &statuses, dry_run),
+        crate::OutputFormat::Json | crate::OutputFormat::Lon => {
+            write_documents(out, per_file, &statuses, dry_run, format)
+        }
+        crate::OutputFormat::Text => write_human(out, per_file, &statuses, dry_run),
     }
     .and_then(|()| out.flush());
     if let Err(error) = written {
@@ -555,7 +546,7 @@ mod tests {
     use dartq_source::LineIndex;
 
     /// The CLI face: defaults and flags; the zero-fix run prints the human
-    /// summary (machine face stays silent) and exits clean; a missing
+    /// summary (the data faces stay silent) and exits clean; a missing
     /// target is the usage tier.
     #[test]
     fn fix_cli_defaults_flags_and_zero_fix_run() {
@@ -572,17 +563,21 @@ mod tests {
 
         let args = parse(&["fix"]);
         assert!(!args.dry_run, "apply is the default");
-        assert!(args.format.is_none(), "absent --format resolves by terminal shape");
+        assert!(
+            matches!(args.format, crate::OutputFormat::Lon),
+            "lon is the constant default"
+        );
         assert_eq!(args.paths, vec![PathBuf::from(".")], "default target cwd");
 
-        let args = parse(&["fix", "--dry-run", "--format=machine", "/tmp/w"]);
+        let args = parse(&["fix", "--dry-run", "--format=json", "/tmp/w"]);
         assert!(args.dry_run);
-        assert!(matches!(args.format, Some(FixFormat::Machine)));
+        assert!(matches!(args.format, crate::OutputFormat::Json));
         assert_eq!(args.paths, vec![PathBuf::from("/tmp/w")]);
 
         for rejected in [
             &["fix", "--format"][..],
             &["fix", "--format=yaml"][..],
+            &["fix", "--format=machine"][..],
             &["fix", "--bogus"][..],
         ] {
             assert!(
@@ -598,14 +593,14 @@ mod tests {
         let target = root.to_str().expect("utf-8 temp path");
 
         let mut out = Vec::new();
-        let args = parse(&["fix", "--dry-run", "--format=default", target]);
+        let args = parse(&["fix", "--dry-run", "--format=text", target]);
         assert_eq!(run(&args, &mut out), exit::CLEAN);
         assert_eq!(String::from_utf8(out).expect("utf-8"), "No fixes found.\n");
 
         let mut out = Vec::new();
-        let args = parse(&["fix", "--format=machine", "--dry-run", target]);
+        let args = parse(&["fix", "--format=lon", "--dry-run", target]);
         assert_eq!(run(&args, &mut out), exit::CLEAN);
-        assert!(out.is_empty(), "machine face prints nothing without fixes");
+        assert!(out.is_empty(), "the lon face prints nothing without fixes");
 
         let mut out = Vec::new();
         let args = parse(&["fix", "/nonexistent/dq_fix_target"]);
@@ -705,7 +700,7 @@ mod tests {
 
         let mut out = Vec::new();
         assert_eq!(
-            apply_and_report(&per_file, true, FixFormat::Default, &mut out),
+            apply_and_report(&per_file, true, crate::OutputFormat::Text, &mut out),
             exit::CLEAN
         );
         let text = String::from_utf8(out).expect("utf-8");
@@ -718,7 +713,7 @@ mod tests {
 
         let mut out = Vec::new();
         assert_eq!(
-            apply_and_report(&per_file, false, FixFormat::Default, &mut out),
+            apply_and_report(&per_file, false, crate::OutputFormat::Text, &mut out),
             exit::CLEAN
         );
         assert_eq!(
@@ -740,13 +735,14 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// The machine face's two documents: a dry run keeps the proposal
-    /// shape (no `outcome`, no `summary` — the rows are proposals); an
-    /// apply run records every row's outcome plus the summary, so an
-    /// all-stale run — a safe no-op that writes nothing and exits 0 — is
-    /// still legible to the machine consumer.
+    /// The data faces' two documents: a dry run keeps the proposal shape
+    /// (no `outcome`, no `summary` — the rows are proposals); an apply run
+    /// records every row's outcome plus the summary, so an all-stale run —
+    /// a safe no-op that writes nothing and exits 0 — is still legible to
+    /// the consumer. The lon face carries the patch rows' own spellings
+    /// (`off`/`len`/`text`/`src`).
     #[test]
-    fn machine_face_proposes_on_dry_run_and_records_on_apply() {
+    fn lon_face_proposes_on_dry_run_and_records_on_apply() {
         let root = std::env::temp_dir().join(format!("dq_cli_fix_machine_{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("mkdir");
@@ -756,14 +752,18 @@ mod tests {
 
         let mut out = Vec::new();
         assert_eq!(
-            apply_and_report(&per_file, true, FixFormat::Machine, &mut out),
+            apply_and_report(&per_file, true, crate::OutputFormat::Lon, &mut out),
             exit::CLEAN
         );
         let line = String::from_utf8(out).expect("utf-8");
-        assert!(
-            line.contains("\"edits\":[{"),
-            "one proposal document: {line}"
-        );
+        let document: serde_json::Value =
+            lon::from_str(line.trim_end()).expect("one lon document");
+        let edits = document["edits"].as_array().expect("edits");
+        assert_eq!(edits.len(), 1, "one proposal document: {line}");
+        assert_eq!(edits[0]["off"], 19, "offset → off");
+        assert_eq!(edits[0]["len"], 4, "length → len");
+        assert_eq!(edits[0]["text"], "", "replacement → text (the deletion)");
+        assert_eq!(edits[0]["src"], "builtin-lint", "source → src");
         assert!(
             !line.contains("outcome") && !line.contains("summary"),
             "proposals carry neither field: {line}"
@@ -776,13 +776,16 @@ mod tests {
 
         let mut out = Vec::new();
         assert_eq!(
-            apply_and_report(&per_file, false, FixFormat::Machine, &mut out),
+            apply_and_report(&per_file, false, crate::OutputFormat::Lon, &mut out),
             exit::CLEAN
         );
         let line = String::from_utf8(out).expect("utf-8");
-        assert!(line.contains("\"outcome\":\"applied\""), "{line}");
-        assert!(
-            line.contains("\"summary\":{\"applied\":1,\"stale\":0}"),
+        let document: serde_json::Value =
+            lon::from_str(line.trim_end()).expect("one lon document");
+        assert_eq!(document["edits"][0]["outcome"], "applied", "{line}");
+        assert_eq!(
+            document["summary"],
+            serde_json::json!({"applied": 1, "stale": 0}),
             "{line}"
         );
         assert_eq!(
@@ -796,13 +799,16 @@ mod tests {
         fs::write(&path, "void f() { var a = B(); }\n").expect("write");
         let mut out = Vec::new();
         assert_eq!(
-            apply_and_report(&per_file, false, FixFormat::Machine, &mut out),
+            apply_and_report(&per_file, false, crate::OutputFormat::Lon, &mut out),
             exit::CLEAN
         );
         let line = String::from_utf8(out).expect("utf-8");
-        assert!(line.contains("\"outcome\":\"stale\""), "{line}");
-        assert!(
-            line.contains("\"summary\":{\"applied\":0,\"stale\":1}"),
+        let document: serde_json::Value =
+            lon::from_str(line.trim_end()).expect("one lon document");
+        assert_eq!(document["edits"][0]["outcome"], "stale", "{line}");
+        assert_eq!(
+            document["summary"],
+            serde_json::json!({"applied": 0, "stale": 1}),
             "{line}"
         );
         assert_eq!(
@@ -836,7 +842,7 @@ mod tests {
 
         let per_file = vec![unnecessary_new_fix(&first), unnecessary_new_fix(&second)];
         let mut out = Vec::new();
-        let code = apply_and_report(&per_file, false, FixFormat::Default, &mut out);
+        let code = apply_and_report(&per_file, false, crate::OutputFormat::Text, &mut out);
         // Restore the mode before asserting so cleanup cannot fail on it.
         fs::set_permissions(&second, fs::Permissions::from_mode(0o644)).expect("restore mode");
         assert_eq!(code, exit::INTERNAL_ERROR);
@@ -874,7 +880,7 @@ mod tests {
         let per_file = vec![unnecessary_new_fix(&huge)];
         let mut out = Vec::new();
         assert_eq!(
-            apply_and_report(&per_file, false, FixFormat::Default, &mut out),
+            apply_and_report(&per_file, false, crate::OutputFormat::Text, &mut out),
             exit::INTERNAL_ERROR
         );
         assert!(out.is_empty(), "stdout stays empty on internal errors");
@@ -889,9 +895,9 @@ mod tests {
 
     /// The assists face: argument defaults, the usage tier on a missing
     /// target, and the plugin-less run (no plugins under the working
-    /// directory): the built-in producers still propose — the default
-    /// human run lists the async-body assist one row per edit, the
-    /// off-selection machine run carries the empty assist list.
+    /// directory): the built-in producers still propose — the text run
+    /// lists the async-body assist one row per edit, the json run carries
+    /// the empty assist list.
     #[test]
     fn assists_cli_defaults_and_zero_plugin_run() {
         fn parse(args: &[&str]) -> AssistsArgs {
@@ -914,7 +920,10 @@ mod tests {
         let args = parse(&["assists", path.to_str().expect("utf-8")]);
         assert_eq!(args.offset, 0, "assists default to the file start");
         assert_eq!(args.length, 0);
-        assert!(args.format.is_none());
+        assert!(
+            matches!(args.format, crate::OutputFormat::Lon),
+            "lon is the constant default"
+        );
 
         let args = parse(&[
             "assists",
@@ -923,22 +932,22 @@ mod tests {
             "19",
             "--length",
             "4",
-            "--format=machine",
+            "--format=json",
         ]);
         assert_eq!(args.offset, 19);
         assert_eq!(args.length, 4);
-        assert!(matches!(args.format, Some(FixFormat::Machine)));
+        assert!(matches!(args.format, crate::OutputFormat::Json));
 
         let mut out = Vec::new();
         assert_eq!(run_assists(&args, &mut out), exit::CLEAN);
         let text = String::from_utf8(out).expect("utf-8");
         assert!(
-            text.contains("\"assists\":[]") && text.contains("\"schema_version\":1"),
-            "the machine document carries the empty assist list: {text}"
+            text.contains("\"assists\":[]") && text.contains("\"v\":1"),
+            "the json document carries the empty assist list: {text}"
         );
 
         let mut out = Vec::new();
-        let args = parse(&["assists", "--format=default", path.to_str().expect("utf-8")]);
+        let args = parse(&["assists", "--format=text", path.to_str().expect("utf-8")]);
         assert_eq!(run_assists(&args, &mut out), exit::CLEAN);
         // Offset 0 sits at the body's first token end, so the builtin
         // async-body assist proposes (the official guard declines only
@@ -993,7 +1002,7 @@ mod tests {
         // Dry-run: the proposal names the created file, nothing on disk.
         let mut out = Vec::new();
         assert_eq!(
-            apply_and_report(&per_file, true, FixFormat::Default, &mut out),
+            apply_and_report(&per_file, true, crate::OutputFormat::Text, &mut out),
             exit::CLEAN
         );
         assert!(
@@ -1013,7 +1022,7 @@ mod tests {
         // row reports applied.
         let mut out = Vec::new();
         assert_eq!(
-            apply_and_report(&per_file, false, FixFormat::Default, &mut out),
+            apply_and_report(&per_file, false, crate::OutputFormat::Text, &mut out),
             exit::CLEAN
         );
         assert_eq!(fs::read_to_string(&target).expect("born text"), born);
@@ -1026,7 +1035,7 @@ mod tests {
         // the row stale and leaves the file's bytes alone.
         let mut out = Vec::new();
         assert_eq!(
-            apply_and_report(&per_file, false, FixFormat::Default, &mut out),
+            apply_and_report(&per_file, false, crate::OutputFormat::Text, &mut out),
             exit::CLEAN
         );
         assert_eq!(

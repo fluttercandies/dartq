@@ -449,8 +449,8 @@ pub(crate) fn insertion_point(
     }
 }
 
-/// The machine document for one file's evidence rows — `file`,
-/// `schema_version`, and the `evidence` rows in their emission order: the
+/// The machine document for one file's evidence rows — `file`, `v`, and
+/// the `evidence` rows in their emission order: the
 /// decision-of-record code and span, the taken miss name (`name` omitted
 /// for the container-keyed arms), and the byte insertion point (omitted
 /// where the capture supplies no honest position — a consumer never sees
@@ -466,8 +466,8 @@ pub fn evidence_json(file: &FileEvidence) -> serde_json::Value {
         .map(|row| {
             let mut json = serde_json::json!({
                 "code": row.code,
-                "offset": row.range.start,
-                "length": row.range.end - row.range.start,
+                "off": row.range.start,
+                "len": row.range.end - row.range.start,
             });
             let object = json.as_object_mut().expect("evidence row object");
             if let Some(name) = &row.name {
@@ -488,7 +488,7 @@ pub fn evidence_json(file: &FileEvidence) -> serde_json::Value {
         .collect();
     serde_json::json!({
         "file": file.path,
-        "schema_version": SCHEMA_VERSION,
+        "v": SCHEMA_VERSION,
         "evidence": rows,
     })
 }

@@ -33,7 +33,7 @@
 # Environment overrides: REPRO_CORPUS (corpus dir; default tests/corpus/m0,
 # point it at the full mega/1k face for the heavy run), FVM_HOME (default
 # ~/fvm), DARTQ_CMD (the dartq side of the harness; default the m0-gate
-# shape `./target/release/dartq analyze --format=machine --sdk <fvm default
+# shape `./target/release/dartq analyze --format=json --sdk <fvm default
 # dart-sdk>` — the release face the m0 corpus was e2e-verified with).
 #
 # Exit codes: 0 gate met (all runs byte-identical, seal written); 1
@@ -93,7 +93,7 @@ command -v jq >/dev/null 2>&1 || { echo "repro-gate: jq is required for the seal
 
 FVM_HOME="${FVM_HOME:-$HOME/fvm}"
 sdk_root="$FVM_HOME/default/bin/cache/dart-sdk"
-DEFAULT_DARTQ_CMD="./target/release/dartq analyze --format=machine --sdk $sdk_root"
+DEFAULT_DARTQ_CMD="./target/release/dartq analyze --format=json --sdk $sdk_root"
 DARTQ_CMD="${DARTQ_CMD:-$DEFAULT_DARTQ_CMD}"
 
 # --- plan --------------------------------------------------------------------

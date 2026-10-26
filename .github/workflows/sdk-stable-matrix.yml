@@ -73,7 +73,7 @@ jobs:
     env:
       VERSION: ${{ matrix.version }}
       HARNESS: ./target/release/harness
-      DARTQ_CMD: ./target/release/dartq check --format=machine
+      DARTQ_CMD: ./target/release/dartq check --format=json
       GATE_OUT: target/evidence/sdk-matrix/override
     steps:
       - uses: actions/checkout@v4

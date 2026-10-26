@@ -56,6 +56,9 @@ crossbeam-channel = "0.5"
 filetime = "0.2"
 hex = "0.4"
 libc = "0.2"
+# The CLI/MCP output face's default encoding: LON, the compact canonical
+# text encoding of the JSON data model (serde/serde_json aside, zero deps).
+lon = "0.1"
 memchr = "2"
 memmap2 = "0.9"
 # Locks on the engine's shared pools: poisoning does not exist in this

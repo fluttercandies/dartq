@@ -77,7 +77,10 @@ pub(crate) enum Incoming {
     Eof,
     /// `--watch` intake: the debounced batch of paths
     /// whose on-disk content changed or vanished since the last batch —
-    /// synced like a `dartq/sync` report at the turn's drain.
+    /// synced like a `dartq/sync` report at the turn's drain. An empty
+    /// batch is the watch face's boot tick (a shape the debouncer never
+    /// produces — it flushes only non-empty sets): the substrate armed, and
+    /// the face guarantees the base view from there on.
     Watch {
         touched: Vec<PathBuf>,
     },
@@ -550,7 +553,7 @@ fn handle_request(session: &mut Session, request: Request) -> Option<Response> {
                         return Some(Response::error(
                             Some(id),
                             codes::INVALID_PARAMS,
-                            format!("unknown agentId: {agent}"),
+                            format!("unknown agent_id: {agent}"),
                         ));
                     }
                     if let Some(tag) = staged.context()
@@ -580,7 +583,7 @@ fn handle_request(session: &mut Session, request: Request) -> Option<Response> {
 /// (the staging is the effect; the next request naming the agent observes
 /// it).
 fn overlay_ack() -> Value {
-    json!({ "schema_version": commands::SCHEMA_VERSION })
+    json!({ "v": commands::SCHEMA_VERSION })
 }
 
 /// Answers the overlay faces at intake: they mutate session bookkeeping or
@@ -611,7 +614,7 @@ fn overlay_response(
                 Ok(committed) => Response::ok(
                     id,
                     json!({
-                        "schema_version": commands::SCHEMA_VERSION,
+                        "v": commands::SCHEMA_VERSION,
                         "committed": committed,
                     }),
                 ),
@@ -659,7 +662,17 @@ fn test_response(
 /// batch re-evaluates the session's workspace advisory
 /// ([`Session::refresh_workspace_advisory`]) — while the config bytes
 /// themselves never stage as analysis content.
+///
+/// The empty batch is the boot tick: under the lazy-boot posture (#2591)
+/// nothing else stages the base view on a quiet workspace, so the armed
+/// watch face stages it itself ([`Session::stage_base_view`]) — the cold
+/// walk pays in this turn's own drain, exactly where a client's first
+/// analysis-needing request would pay it.
 fn handle_watch(session: &mut Session, touched: Vec<PathBuf>) {
+    if touched.is_empty() {
+        session.stage_base_view();
+        return;
+    }
     let root = session.workspace_root().to_path_buf();
     let mut sources = Vec::new();
     let mut refreshed = false;
@@ -960,7 +973,7 @@ mod tests {
             .find(|frame| frame["id"] == 1)
             .expect("analyze answer");
         assert!(
-            analyze["result"]["diagnostics"]
+            analyze["result"]["diags"]
                 .as_array()
                 .expect("array")
                 .iter()
@@ -1167,14 +1180,14 @@ mod tests {
         };
         let first = analyze(&client, &output, 1);
         assert!(
-            first["result"]["diagnostics"] == json!([]),
+            first["result"]["diags"] == json!([]),
             "the clean tree answers clean: {first}"
         );
 
         fs::write(&main, BROKEN_MAIN).expect("inject the error");
         let second = analyze(&client, &output, 2);
         assert!(
-            second["result"]["diagnostics"]
+            second["result"]["diags"]
                 .as_array()
                 .expect("array")
                 .iter()
@@ -1186,7 +1199,7 @@ mod tests {
         fs::write(workspace.path("lib/extra.dart"), "int broken(\n").expect("add file");
         let third = analyze(&client, &output, 3);
         assert!(
-            third["result"]["diagnostics"]
+            third["result"]["diags"]
                 .as_array()
                 .expect("array")
                 .iter()
@@ -1197,7 +1210,7 @@ mod tests {
         fs::write(&main, CLEAN_MAIN).expect("revert");
         let fourth = analyze(&client, &output, 4);
         assert!(
-            fourth["result"]["diagnostics"] == json!([]),
+            fourth["result"]["diags"] == json!([]),
             "the reverted tree is clean again (no stale rows): {fourth}"
         );
 
@@ -1281,7 +1294,7 @@ mod tests {
             "the analyze request never answered",
         );
         assert!(
-            analyze["result"]["diagnostics"]
+            analyze["result"]["diags"]
                 .as_array()
                 .expect("array")
                 .iter()
@@ -1369,7 +1382,7 @@ mod tests {
         batch.extend_from_slice(&framed(&request(
             1,
             "dartq/debug/attach",
-            json!({ "wsUri": format!("ws://127.0.0.1:{stall_port}/auth=/ws") }),
+            json!({ "ws_uri": format!("ws://127.0.0.1:{stall_port}/auth=/ws") }),
         )));
         batch.extend_from_slice(&framed(&request(2, "dartq/test/status", json!({}))));
         client.send(batch).expect("batch send");
@@ -1522,7 +1535,7 @@ mod tests {
             .expect("transport does not fail on memory pipes");
         assert_eq!(code, EXIT_CLEAN);
         assert_eq!(
-            analyze["result"]["diagnostics"],
+            analyze["result"]["diags"],
             json!([]),
             "the view converged to the touched disk state: {analyze}"
         );

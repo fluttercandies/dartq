@@ -1213,9 +1213,9 @@ mod query_server_tests {
 
         let symbol = serve_query(&engine, &query(QueryKind::Symbol, Some("fa"), None, None))
             .expect("symbol");
-        assert_eq!(symbol["schema_version"], 1);
-        assert_eq!(symbol["name"], "fa");
-        let declarations = symbol["declarations"].as_array().expect("declarations");
+        assert_eq!(symbol["v"], 1);
+        assert_eq!(symbol["sym"], "fa");
+        let declarations = symbol["decls"].as_array().expect("decls");
         assert_eq!(declarations.len(), 1);
         assert_eq!(declarations[0]["name"], "fa");
         assert_eq!(declarations[0]["kind"], "function");
@@ -1232,7 +1232,7 @@ mod query_server_tests {
         // `callers` keeps the invocation-shaped subset: `fa(1)` in main.
         let callers = serve_query(&engine, &query(QueryKind::Callers, Some("fa"), None, None))
             .expect("callers");
-        let references = callers["references"].as_array().expect("references");
+        let references = callers["refs"].as_array().expect("refs");
         assert_eq!(references.len(), 1);
         assert_eq!(references[0]["kind"], "invoked");
 
@@ -1247,7 +1247,7 @@ mod query_server_tests {
         )
         .expect("dependencies");
         assert!(
-            dependencies.get("dependencies").is_none(),
+            dependencies.get("deps").is_none(),
             "a.dart imports nothing — the additive array is omitted: {dependencies:?}"
         );
     }

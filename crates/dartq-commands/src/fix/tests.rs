@@ -347,9 +347,9 @@
         assert_eq!(row.plugin, BUILTIN_ASSIST_SOURCE);
         let json = assists_json(&answer, Verbosity::Compact);
         let text = json.to_string();
-        assert!(text.contains("\"source\":\"builtin-assist\""), "{text}");
+        assert!(text.contains("\"src\":\"builtin-assist\""), "{text}");
         assert!(
-            text.contains("\"message\":\"Convert to single quoted string\""),
+            text.contains("\"msg\":\"Convert to single quoted string\""),
             "{text}"
         );
         std::fs::remove_dir_all(&root).ok();
@@ -1212,8 +1212,8 @@
         );
 
         let keys: Vec<_> = doc.as_object().expect("document object").keys().collect();
-        assert_eq!(keys, ["edits", "file", "schema_version"]);
-        assert_eq!(doc["schema_version"], 1);
+        assert_eq!(keys, ["edits", "file", "v"]);
+        assert_eq!(doc["v"], 1);
         assert_eq!(doc["file"], "/abs/t.dart");
         let text = doc.to_string();
         dartq_schema::validate(&text, dartq_schema::Domain::FixPatch).expect("schema-valid");
@@ -1232,23 +1232,20 @@
         );
         for (edit, expected_source) in edits.iter().zip(["builtin-lint", "live"]) {
             let keys: Vec<_> = edit.as_object().expect("edit object").keys().collect();
-            assert_eq!(
-                keys,
-                ["anchor", "length", "offset", "replacement", "source"]
-            );
-            assert_eq!(edit["source"], expected_source);
+            assert_eq!(keys, ["anchor", "len", "off", "src", "text"]);
+            assert_eq!(edit["src"], expected_source);
         }
-        assert_eq!(edits[0]["offset"], 19);
-        assert_eq!(edits[0]["length"], 4);
-        assert_eq!(edits[0]["replacement"], "");
+        assert_eq!(edits[0]["off"], 19);
+        assert_eq!(edits[0]["len"], 4);
+        assert_eq!(edits[0]["text"], "");
 
         let anchor = &edits[0]["anchor"];
         let keys: Vec<_> = anchor.as_object().expect("anchor object").keys().collect();
-        assert_eq!(keys, ["column", "context_after", "context_before", "line"]);
+        assert_eq!(keys, ["after", "before", "col", "line"]);
         assert_eq!(anchor["line"], 1);
-        assert_eq!(anchor["column"], 20);
-        assert_eq!(anchor["context_before"], "var a = ");
-        assert_eq!(anchor["context_after"], "B(); }");
+        assert_eq!(anchor["col"], 20);
+        assert_eq!(anchor["before"], "var a = ");
+        assert_eq!(anchor["after"], "B(); }");
 
         // The minimal tier keeps the locator floor and the provenance,
         // drops the anchor; the full tier adds the human names.
@@ -1263,7 +1260,7 @@
             .expect("edit object")
             .keys()
             .collect();
-        assert_eq!(keys, ["length", "offset", "replacement", "source"]);
+        assert_eq!(keys, ["len", "off", "src", "text"]);
         dartq_schema::validate_at_tier(
             &minimal.to_string(),
             dartq_schema::Domain::FixPatch,
@@ -1279,15 +1276,7 @@
             .collect();
         assert_eq!(
             builtin,
-            [
-                "anchor",
-                "length",
-                "message",
-                "offset",
-                "replacement",
-                "rule",
-                "source"
-            ]
+            ["anchor", "len", "msg", "off", "rule", "src", "text"]
         );
         assert_eq!(full["edits"][0]["rule"], "unnecessary_new");
         let plugin_row: Vec<_> = full["edits"][1]
@@ -1297,17 +1286,9 @@
             .collect();
         assert_eq!(
             plugin_row,
-            [
-                "anchor",
-                "length",
-                "message",
-                "offset",
-                "priority",
-                "replacement",
-                "source"
-            ]
+            ["anchor", "len", "msg", "off", "priority", "src", "text"]
         );
-        assert_eq!(full["edits"][1]["message"], "insert const");
+        assert_eq!(full["edits"][1]["msg"], "insert const");
         assert_eq!(full["edits"][1]["priority"], 1);
         dartq_schema::validate_at_tier(
             &full.to_string(),
@@ -1336,8 +1317,8 @@
         );
         let anchor = &doc["edits"][0]["anchor"];
         let keys: Vec<_> = anchor.as_object().expect("anchor object").keys().collect();
-        assert_eq!(keys, ["column", "context_after", "line"]);
-        assert_eq!(anchor["context_after"], " a;");
+        assert_eq!(keys, ["after", "col", "line"]);
+        assert_eq!(anchor["after"], " a;");
         dartq_schema::validate(&doc.to_string(), dartq_schema::Domain::FixPatch)
             .expect("the omitted-context document is schema-valid");
     }
@@ -1367,7 +1348,7 @@
             .expect("document object")
             .keys()
             .collect();
-        assert_eq!(keys, ["edits", "file", "schema_version", "summary"]);
+        assert_eq!(keys, ["edits", "file", "summary", "v"]);
         assert_eq!(applied["summary"]["applied"], 1);
         assert_eq!(applied["summary"]["stale"], 1);
         for (row, outcome) in applied["edits"]
@@ -1379,17 +1360,10 @@
             let keys: Vec<_> = row.as_object().expect("edit object").keys().collect();
             assert_eq!(
                 keys,
-                [
-                    "anchor",
-                    "length",
-                    "offset",
-                    "outcome",
-                    "replacement",
-                    "source"
-                ]
+                ["anchor", "len", "off", "outcome", "src", "text"]
             );
             assert_eq!(row["outcome"], outcome.1);
-            assert_eq!(row["source"], outcome.0);
+            assert_eq!(row["src"], outcome.0);
         }
 
         // The all-stale record: the run wrote nothing, the summary says so.
@@ -1407,7 +1381,7 @@
             .expect("document object")
             .keys()
             .collect();
-        assert_eq!(keys, ["edits", "file", "schema_version"]);
+        assert_eq!(keys, ["edits", "file", "v"]);
         let text = proposal.to_string();
         assert!(
             !text.contains("outcome") && !text.contains("summary"),
@@ -1655,7 +1629,7 @@
 
         // The document carries the builtin provenance on the row.
         let doc = patch_json(&sets[0].clone(), Verbosity::Compact);
-        assert_eq!(doc["edits"][0]["source"], BUILTIN_SOURCE);
+        assert_eq!(doc["edits"][0]["src"], BUILTIN_SOURCE);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1810,13 +1784,13 @@
         };
         let compact = assists_json(&answer, Verbosity::Compact);
         assert_eq!(compact["file"], "lib/t.dart");
-        assert_eq!(compact["schema_version"], SCHEMA_VERSION);
+        assert_eq!(compact["v"], SCHEMA_VERSION);
         let row = &compact["assists"][0];
-        assert_eq!(row["message"], "insert const");
-        assert_eq!(row["source"], "fixer");
+        assert_eq!(row["msg"], "insert const");
+        assert_eq!(row["src"], "fixer");
         assert_eq!(row["priority"], 1);
-        assert_eq!(row["edits"][0]["offset"], 19);
-        assert_eq!(row["edits"][0]["replacement"], "const ");
+        assert_eq!(row["edits"][0]["off"], 19);
+        assert_eq!(row["edits"][0]["text"], "const ");
         assert_eq!(row["edits"][0]["anchor"]["line"], 1);
         assert_eq!(compact["errors"][0]["plugin"], "dead");
         let keys: Vec<_> = compact
@@ -1824,12 +1798,12 @@
             .expect("document object")
             .keys()
             .collect();
-        assert_eq!(keys, ["assists", "errors", "file", "schema_version"]);
+        assert_eq!(keys, ["assists", "errors", "file", "v"]);
 
         let minimal = assists_json(&answer, Verbosity::Minimal);
         let row = &minimal["assists"][0];
         let keys: Vec<_> = row.as_object().expect("assists row").keys().collect();
-        assert_eq!(keys, ["edits", "message", "source"], "priority drops");
+        assert_eq!(keys, ["edits", "msg", "src"], "priority drops");
         let keys: Vec<_> = row["edits"][0]
             .as_object()
             .expect("edit row")
@@ -1837,7 +1811,7 @@
             .collect();
         assert_eq!(
             keys,
-            ["length", "offset", "replacement", "source"],
+            ["len", "off", "src", "text"],
             "anchor drops"
         );
 
@@ -2187,7 +2161,7 @@
         };
         let document = patch_json(&set, Verbosity::Full);
         let row = &document["edits"][0];
-        assert_eq!(row["source"], BUILTIN_SEMANTIC_SOURCE);
+        assert_eq!(row["src"], BUILTIN_SEMANTIC_SOURCE);
         assert_eq!(row["rule"], "unused_import");
     }
 
@@ -7441,13 +7415,13 @@
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["evidence", "file", "schema_version"]);
-        assert_eq!(document["schema_version"], SCHEMA_VERSION);
+        assert_eq!(keys, ["evidence", "file", "v"]);
+        assert_eq!(document["v"], SCHEMA_VERSION);
         let row = &document["evidence"][0];
         assert_eq!(row["code"], "undefined_method");
         let at_helper = source.find("helper").unwrap() as u32;
-        assert_eq!(row["offset"], at_helper);
-        assert_eq!(row["length"], 6);
+        assert_eq!(row["off"], at_helper);
+        assert_eq!(row["len"], 6);
         assert_eq!(row["name"]["spelling"], "helper");
         assert_eq!(row["name"]["use"], "invoke");
         assert_eq!(row["name"]["qualified"], false);
@@ -8402,9 +8376,9 @@
         let doc = patch_json(&set, Verbosity::Compact);
         let text = doc.to_string();
         dartq_schema::validate(&text, dartq_schema::Domain::FixPatch).expect("schema-valid");
-        assert_eq!(doc["edits"][0]["source"], BUILTIN_SEMANTIC_SOURCE);
+        assert_eq!(doc["edits"][0]["src"], BUILTIN_SEMANTIC_SOURCE);
         assert_eq!(
-            doc["edits"][0]["replacement"],
+            doc["edits"][0]["text"],
             "import 'package:app/util.dart';\n\n"
         );
     }
@@ -8645,7 +8619,7 @@
         let doc = patch_json(&set, Verbosity::Compact);
         let text = doc.to_string();
         dartq_schema::validate(&text, dartq_schema::Domain::FixPatch).expect("schema-valid");
-        assert_eq!(doc["edits"][0]["source"], BUILTIN_SEMANTIC_SOURCE);
+        assert_eq!(doc["edits"][0]["src"], BUILTIN_SEMANTIC_SOURCE);
     }
 
     /// `invalid_constant` on a `const`-headed variable list — the

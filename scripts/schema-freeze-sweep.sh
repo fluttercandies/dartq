@@ -5,10 +5,16 @@
 #
 # Faces swept, and what each asserts:
 #
-#   cli-check-machine    `dartq check --format machine`: 8-field pipe rows
-#                        SEVERITY|TYPE|CODE|FILE|LINE|COL|LEN|MESSAGE, 1-based
-#                        locators, the oracle message text, exit 3 on errors —
-#                        and the clean-run face: exit 0, empty stdout.
+#   cli-check-machine-parity  the machine face is retired on the CLI
+#                        (`--format machine` and `--verbosity` are usage
+#                        errors, exit 64 — pinned); its frozen contract rides
+#                        the json face: `dartq check --format json` rows
+#                        re-encoded to the oracle's 8-field machine rows
+#                        (SEVERITY|TYPE|CODE|FILE|LINE|COL|LEN|MESSAGE) and
+#                        byte-compared with a live
+#                        `dart analyze --format=machine` leg over the same
+#                        probe; the clean-run face: exit 0, the
+#                        empty-diagnostics envelope.
 #   cli-check-json       `dartq check --format json`: the oracle envelope
 #                        {"version":1,"diagnostics":[...]} with the frozen
 #                        row key set (code/severity/type/location/
@@ -20,28 +26,30 @@
 #                        `run()` — the session answers real requests from
 #                        frame one), so the lightest real request,
 #                        `dartq/index`, answers the frozen index envelope
-#                        {schema_version, files, libraries, symbols,
-#                        references} with no handshake at all.
+#                        {v, files, libraries, symbols, references} with no
+#                        handshake at all (short-vocabulary spellings, the
+#                        #2602/#2603 re-projection).
 #   rpc-overlay-ack      `dartq/overlay.set` / `dartq/overlay.clear` answers:
-#                        exactly {schema_version: 1}.
+#                        exactly {v: 1}.
 #   rpc-check-tiers      `dartq/check` at minimal/compact/full: the frozen
-#                        envelope and per-tier row key sets, and the
-#                        short-id clause — the full tier substitutes rows'
-#                        file paths with sN ids backed by the `symbols`
-#                        table; minimal/compact stay unshortened.
-#   rpc-fix-answer       `dartq/fix` at compact/full: {schema_version, files}
-#                        of patch documents {file, schema_version,
-#                        edits[]}; every edit rides the red-line floor
-#                        (offset/length/replacement/source) plus the anchor
-#                        at compact; full adds the builtin rule/message
-#                        columns (priority is plugin-row-only).
+#                        envelope {v, diags} and per-tier row key sets
+#                        (minimal: code/file/line/col/len; compact/full add
+#                        lowercase sev + msg), and the short-id clause —
+#                        the full tier substitutes rows' file paths with sN
+#                        ids backed by the `symbols` table; minimal/compact
+#                        stay unshortened.
+#   rpc-fix-answer       `dartq/fix` at compact/full: {v, files} of patch
+#                        documents {file, v, edits[]}; every edit rides the
+#                        red-line floor (off/len/text/src) plus the anchor
+#                        at compact; full adds the builtin rule/msg columns
+#                        (priority is plugin-row-only).
 #   rpc-fix-rejects      `dartq/fix` with agentId/context/since is answered
 #                        INVALID_PARAMS (-32602) naming the disk-view rule —
 #                        never an answer payload.
-#   rpc-assists          `dartq/assists`: the document {file, schema_version,
-#                        assists[]} whose rows carry the message/source/edits
-#                        tuple (priority optional; no plugin in the fixture,
-#                        so the tier split on rows stays the unit fixtures').
+#   rpc-assists          `dartq/assists`: the document {file, v, assists[]}
+#                        whose rows carry the msg/src/edits tuple (priority
+#                        optional; no plugin in the fixture, so the tier
+#                        split on rows stays the unit fixtures').
 #   rpc-assists-rejects  `dartq/assists` with a session field: same
 #                        INVALID_PARAMS rejection.
 #
@@ -70,7 +78,8 @@
 # passed to the daemon as --sdk), DARTQ_SWEEP_TIMEOUT (whole RPC conversation
 # budget in seconds, default 240).
 #
-# Requires: cargo, jq, python3. No network.
+# Requires: cargo, jq, python3, and the SDK's dart (the machine-parity leg).
+# No network.
 #
 # Exit codes: 0 every face passed; 1 at least one face mismatch — the frozen
 # v1 surface drifted; 2 environment error — missing tool, build failure, or
@@ -116,6 +125,7 @@ done
 
 DARTQ_BIN="${DARTQ_BIN:-./target/debug/dartq}"
 SDK="${DARTQ_SWEEP_SDK:-${DART_SDK:-$HOME/fvm/default/bin/cache/dart-sdk}}"
+DART="$SDK/bin/dart"
 TIMEOUT_SECS="${DARTQ_SWEEP_TIMEOUT:-240}"
 
 if [ "$no_build" -eq 0 ]; then
@@ -131,6 +141,10 @@ fi
 }
 [ -d "$SDK" ] || {
   echo "schema-freeze-sweep: SDK root not found at $SDK — set DARTQ_SWEEP_SDK or DART_SDK" >&2
+  exit 2
+}
+[ -x "$DART" ] || {
+  echo "schema-freeze-sweep: oracle dart not found at $DART (the machine-parity face drives it)" >&2
   exit 2
 }
 
@@ -240,30 +254,92 @@ all_match() { # <file> <ere>
   [ "$(grep -cvE "$2" "$1")" -eq 0 ]
 }
 
-# --- face: cli-check-machine ---------------------------------------------------
-machine_out="$work/machine.txt"
-# The machine CODE field is the oracle's uppercase spelling — emitMachineFormat
-# prints `error.code?.toUpperCase()` — so the frozen shape pins uppercase like
-# the severity/type fields (byte parity with `dart analyze --format=machine`).
-machine_shape='^(ERROR|WARNING|INFO)\|[A-Z_]+\|[A-Z_]+\|.+\|[0-9]+\|[0-9]+\|[0-9]+\|.+$'
-face cli-check-machine
+# --- face: cli-check-machine-parity ---------------------------------------------
+# The CLI's machine face is retired (`--format machine` / `--verbosity` are
+# usage errors, pinned below); the frozen machine contract is verified through
+# the json face: dartq's envelope rows are re-encoded to the oracle's machine
+# rows and byte-compared against a live `dart analyze --format=machine` leg
+# over the same probe FILE. Byte parity is the bar — any drift in casing,
+# escaping, locators, or message text fails the face. Both legs scope to the
+# probe file (not the fixture dir): the check face is options-free while the
+# oracle reads analysis_options.yaml, so the dir view differs by design (the
+# options-enabled lint rows); the file view is the shared diagnostic set.
+machine_out="$work/machine-built.txt"
+oracle_out="$work/machine-oracle.txt"
+# Re-encoder: json envelope (stdin) -> oracle machine rows (stdout). The json
+# fields carry everything the machine row needs: severity/type verbatim
+# (uppercase in both), the machine CODE spelling = json code uppercased
+# (emitMachineFormat prints `error.code?.toUpperCase()`), 1-based
+# line/column, length = end.offset - start.offset, and the FILE/MESSAGE
+# escaping set (backslash, pipe, LF, CR).
+cat >"$work/machine_from_json.py" <<'PYEOF'
+#!/usr/bin/env python3
+import json
+import sys
+
+def esc(field):
+    return (field.replace("\\", "\\\\").replace("|", "\\|")
+            .replace("\n", "\\n").replace("\r", "\\r"))
+
+doc = json.load(sys.stdin)
+if doc.get("version") != 1:
+    sys.exit("machine_from_json: unsupported envelope version %r" % (doc.get("version"),))
+for diag in doc.get("diagnostics", []):
+    try:
+        rng = diag["location"]["range"]
+        print("|".join([
+            diag["severity"],
+            diag["type"],
+            diag["code"].upper(),
+            esc(diag["location"]["file"]),
+            str(rng["start"]["line"]),
+            str(rng["start"]["column"]),
+            str(rng["end"]["offset"] - rng["start"]["offset"]),
+            esc(diag["problemMessage"]),
+        ]))
+    except (KeyError, TypeError) as error:
+        sys.exit("machine_from_json: malformed diagnostic (%s): %r" % (error, diag))
+PYEOF
+face cli-check-machine-parity
 rc=0
-"$DARTQ_BIN" check --format machine "$fx" >"$machine_out" 2>"$work/machine.err" || rc=$?
+"$DARTQ_BIN" check --format json "$probe_file" >"$work/probe.json" 2>"$work/probe.err" || rc=$?
 chk "error fixture exits 3 (ERRORS)" [ "$rc" -eq 3 ]
-chk "three machine rows (one per directive)" [ "$(wc -l <"$machine_out" | tr -d ' ')" -eq 3 ]
-chk "every row matches the 8-field machine shape" all_match "$machine_out" "$machine_shape"
-chk "rows are ERROR|COMPILE_TIME_ERROR|URI_DOES_NOT_EXIST" \
-  all_match "$machine_out" '^ERROR\|COMPILE_TIME_ERROR\|URI_DOES_NOT_EXIST\|'
-chk "first row pins locator + oracle message (the URI literal: 1|8, length 14)" \
-  grep -Eq "^ERROR\|COMPILE_TIME_ERROR\|URI_DOES_NOT_EXIST\|.*main\.dart\|1\|8\|14\|Target of URI doesn't exist: 'missing.dart'\." "$machine_out"
+chk "envelope carries three diagnostic rows (one per directive)" \
+  jq_eq "$work/probe.json" '.diagnostics | length' 3
+if python3 "$work/machine_from_json.py" <"$work/probe.json" >"$machine_out" 2>"$work/probe.build.err"; then
+  chk "three machine rows reconstructed" [ "$(wc -l <"$machine_out" | tr -d ' ')" -eq 3 ]
+  chk "rows are ERROR|COMPILE_TIME_ERROR|URI_DOES_NOT_EXIST" \
+    all_match "$machine_out" '^ERROR\|COMPILE_TIME_ERROR\|URI_DOES_NOT_EXIST\|'
+  chk "first row pins locator + oracle message (the URI literal: 1|8, length 14)" \
+    grep -Eq "^ERROR\|COMPILE_TIME_ERROR\|URI_DOES_NOT_EXIST\|.*main\.dart\|1\|8\|14\|Target of URI doesn't exist: 'missing.dart'\." "$machine_out"
+else
+  printf '   FAIL machine-row reconstruction from the json envelope\n'
+  sed 's/^/        /' "$work/probe.build.err"
+  face_fail=1
+fi
+orc=0
+"$DART" analyze --format=machine --no-fatal-warnings "$probe_file" >"$oracle_out" 2>"$work/oracle.err" || orc=$?
+chk "oracle machine leg exits inside the issue tiers (got $orc, errors mean 3)" [ "$orc" -le 3 ]
+chk "reconstructed rows are byte-identical to the oracle machine output" \
+  cmp -s "$oracle_out" "$machine_out"
+
+# The retired faces: the machine value and the verbosity flag are usage
+# errors on the CLI now (the freeze that #2606 cast).
+rc=0
+"$DARTQ_BIN" check --format machine "$fx" >/dev/null 2>"$work/retired-machine.err" || rc=$?
+chk "--format machine is retired: usage error 64" [ "$rc" -eq 64 ]
+rc=0
+"$DARTQ_BIN" check --format json --verbosity concise "$fx" >/dev/null 2>&1 || rc=$?
+chk "--verbosity is retired: usage error 64" [ "$rc" -eq 64 ]
 
 clean_dir="$work/clean"
 mkdir -p "$clean_dir"
 printf 'void main() {}\n' >"$clean_dir/main.dart"
 rc=0
-"$DARTQ_BIN" check --format machine "$clean_dir" >"$work/clean.txt" 2>/dev/null || rc=$?
+"$DARTQ_BIN" check --format json "$clean_dir" >"$work/clean.txt" 2>/dev/null || rc=$?
 chk "clean fixture exits 0" [ "$rc" -eq 0 ]
-chk "clean machine face prints nothing" [ ! -s "$work/clean.txt" ]
+chk "clean json face prints exactly the empty-diagnostics envelope" \
+  [ "$(cat "$work/clean.txt")" = '{"version":1,"diagnostics":[]}' ]
 end_face
 
 # --- face: cli-check-json ------------------------------------------------------
@@ -298,11 +374,11 @@ cat >"$work/steps.json" <<'EOF'
   {"id": 4, "method": "dartq/check", "params": {"paths": ["lib/deeply/nested/freeze/probe/main.dart"], "verbosity": "full"}},
   {"id": 5, "method": "dartq/fix", "params": {"paths": ["lib/fixme.dart"], "verbosity": "compact"}},
   {"id": 6, "method": "dartq/fix", "params": {"paths": ["lib/fixme.dart"], "verbosity": "full"}},
-  {"id": 7, "method": "dartq/fix", "params": {"paths": ["lib/fixme.dart"], "agentId": "sweep-probe", "context": "default", "since": 1}},
+  {"id": 7, "method": "dartq/fix", "params": {"paths": ["lib/fixme.dart"], "agent_id": "sweep-probe", "context": "default", "since": 1}},
   {"id": 8, "method": "dartq/assists", "params": {"path": "lib/fixme.dart", "verbosity": "compact"}},
   {"id": 9, "method": "dartq/assists", "params": {"path": "lib/fixme.dart", "since": 1}},
-  {"id": 10, "method": "dartq/overlay.set", "params": {"agentId": "sweep-probe", "files": {}}},
-  {"id": 11, "method": "dartq/overlay.clear", "params": {"agentId": "sweep-probe"}}
+  {"id": 10, "method": "dartq/overlay.set", "params": {"agent_id": "sweep-probe", "files": {}}},
+  {"id": 11, "method": "dartq/overlay.clear", "params": {"agent_id": "sweep-probe"}}
 ]
 EOF
 
@@ -471,38 +547,38 @@ done
 body="$work/body_1.json"
 face rpc-session-ready
 chk "the first request (dartq/index) answers without error" jq_true "$body" '.error == null'
-chk "the answer is the frozen index envelope (schema_version + the four tallies)" jq_true "$body" \
-  '(.result | keys | sort) == ["files", "libraries", "references", "schema_version", "symbols"]'
-chk "schema_version is the frozen 1" jq_eq "$body" '.result.schema_version' 1
+chk "the answer is the frozen index envelope (v + the four tallies)" jq_true "$body" \
+  '(.result | keys | sort) == ["files", "libraries", "refs", "symbols", "v"]'
+chk "v is the frozen 1" jq_eq "$body" '.result.v' 1
 end_face
 
 # --- face: rpc-overlay-ack -----------------------------------------------------
 face rpc-overlay-ack
-chk "overlay.set answers exactly {schema_version: 1}" jq_true "$work/body_10.json" \
-  '(.result | keys) == ["schema_version"] and .result.schema_version == 1'
-chk "overlay.clear answers exactly {schema_version: 1}" jq_true "$work/body_11.json" \
-  '(.result | keys) == ["schema_version"] and .result.schema_version == 1'
+chk "overlay.set answers exactly {v: 1}" jq_true "$work/body_10.json" \
+  '(.result | keys) == ["v"] and .result.v == 1'
+chk "overlay.clear answers exactly {v: 1}" jq_true "$work/body_11.json" \
+  '(.result | keys) == ["v"] and .result.v == 1'
 end_face
 
 # --- face: rpc-check-tiers -----------------------------------------------------
 face rpc-check-tiers
 body="$work/body_2.json"
-chk "minimal: envelope is exactly {schema_version, diagnostics}" jq_true "$body" \
-  '(.result | keys | sort) == ["diagnostics", "schema_version"]'
-chk "minimal: schema_version is 1" jq_eq "$body" '.result.schema_version' 1
-chk "minimal: rows carry only the red line (file/code/line/column/length)" jq_true "$body" \
-  '[.result.diagnostics[] | (keys | sort) == ["code", "column", "file", "length", "line"]] | all'
+chk "minimal: envelope is exactly {v, diags}" jq_true "$body" \
+  '(.result | keys | sort) == ["diags", "v"]'
+chk "minimal: v is 1" jq_eq "$body" '.result.v' 1
+chk "minimal: rows carry only the red line (code/file/line/col/len)" jq_true "$body" \
+  '[.result.diags[] | (keys | sort) == ["code", "col", "file", "len", "line"]] | all'
 chk "minimal: three uri_does_not_exist rows on the probe file" jq_true "$body" \
-  '(.result.diagnostics | length) == 3 and ([.result.diagnostics[].code] | all(. == "uri_does_not_exist"))'
-chk "minimal: paths stay unshortened" jq_eq "$body" '.result.diagnostics[0].file' "$probe_file"
+  '(.result.diags | length) == 3 and ([.result.diags[].code] | all(. == "uri_does_not_exist"))'
+chk "minimal: paths stay unshortened" jq_eq "$body" '.result.diags[0].file' "$probe_file"
 
 body="$work/body_3.json"
-chk "compact: rows carry exactly the frozen 8-field set" jq_true "$body" \
-  '[.result.diagnostics[] | (keys | sort) == ["code", "column", "file", "length", "line", "message", "severity", "type"]] | all'
-chk "compact: severity/type spellings and non-empty message" jq_true "$body" \
-  '[.result.diagnostics[] | .severity == "ERROR" and .type == "COMPILE_TIME_ERROR" and (.message | length > 0)] | all'
+chk "compact: rows carry exactly the frozen 7-field set" jq_true "$body" \
+  '[.result.diags[] | (keys | sort) == ["code", "col", "file", "len", "line", "msg", "sev"]] | all'
+chk "compact: lowercase sev spelling and non-empty msg" jq_true "$body" \
+  '[.result.diags[] | .sev == "error" and (.msg | length > 0)] | all'
 chk "compact: no session economics on the answer" jq_true "$body" \
-  '(.result | keys | sort) == ["diagnostics", "schema_version"]'
+  '(.result | keys | sort) == ["diags", "v"]'
 
 body="$work/body_4.json"
 chk "full: the short-id table rides the answer" jq_true "$body" \
@@ -511,9 +587,9 @@ chk "full: table keys are the frozen sN form" jq_true "$body" \
   '[.result.symbols | keys[] | test("^s[0-9]+$")] | all'
 chk "full: the table's value is the substituted-out path" jq_eq "$body" '.result.symbols.s1' "$probe_file"
 chk "full: rows reference the table instead of spelling paths" jq_true "$body" \
-  '([.result.diagnostics[].file] | unique) == ["s1"]'
-chk "full: rows keep the compact 8-field set" jq_true "$body" \
-  '[.result.diagnostics[] | (keys | sort) == ["code", "column", "file", "length", "line", "message", "severity", "type"]] | all'
+  '([.result.diags[].file] | unique) == ["s1"]'
+chk "full: rows keep the compact 7-field set" jq_true "$body" \
+  '[.result.diags[] | (keys | sort) == ["code", "col", "file", "len", "line", "msg", "sev"]] | all'
 end_face
 
 # --- face: rpc-fix-answer ------------------------------------------------------
@@ -528,25 +604,25 @@ end_face
 # bare CLI pass without `--sdk`. Additive-only: no field moved, v1 stands.
 face rpc-fix-answer
 body="$work/body_5.json"
-chk "compact: the intake answer is {schema_version, files}" jq_true "$body" \
-  '(.result | keys | sort) == ["files", "schema_version"]'
-chk "compact: schema_version is 1" jq_eq "$body" '.result.schema_version' 1
+chk "compact: the intake answer is {v, files}" jq_true "$body" \
+  '(.result | keys | sort) == ["files", "v"]'
+chk "compact: v is 1" jq_eq "$body" '.result.v' 1
 chk "compact: the cross-file document set (hit file first, options second)" jq_true "$body" \
   '(.result.files | length) == 2 and (.result.files[0].file | endswith("fixme.dart")) and (.result.files[1].file | endswith("analysis_options.yaml"))'
-chk "compact: file rows are exactly {file, schema_version, edits}" jq_true "$body" \
-  '[.result.files[] | (keys | sort) == ["edits", "file", "schema_version"] and .schema_version == 1] | all'
+chk "compact: file rows are exactly {file, v, edits}" jq_true "$body" \
+  '[.result.files[] | (keys | sort) == ["edits", "file", "v"] and .v == 1] | all'
 chk "compact: edits ride the red-line floor plus the anchor" jq_true "$body" \
-  '[.result.files[].edits[] | (keys | sort) == ["anchor", "length", "offset", "replacement", "source"]] | all'
+  '[.result.files[].edits[] | (keys | sort) == ["anchor", "len", "off", "src", "text"]] | all'
 chk "compact: builtin provenance spellings and a located anchor on every edit" jq_true "$body" \
-  '[.result.files[].edits[] | (.source == "builtin-lint" or .source == "builtin-semantic" or .source == "builtin-ignore") and (.anchor | has("line") and has("column"))] | all'
+  '[.result.files[].edits[] | (.src == "builtin-lint" or .src == "builtin-semantic" or .src == "builtin-ignore") and (.anchor | has("line") and has("col"))] | all'
 chk "compact: the probe lint deletions are present and builtin-lint" jq_true "$body" \
-  '[.result.files[0].edits[] | select(.source == "builtin-lint" and .replacement == "")] | length >= 1'
+  '[.result.files[0].edits[] | select(.src == "builtin-lint" and .text == "")] | length >= 1'
 
 body="$work/body_6.json"
-chk "full: edits add the builtin rule/message columns" jq_true "$body" \
-  '[.result.files[].edits[] | (keys | sort) == ["anchor", "length", "message", "offset", "replacement", "rule", "source"]] | all'
-chk "full: rule and message are strings" jq_true "$body" \
-  '[.result.files[].edits[] | (.rule | type == "string") and (.message | type == "string")] | all'
+chk "full: edits add the builtin rule/msg columns" jq_true "$body" \
+  '[.result.files[].edits[] | (keys | sort) == ["anchor", "len", "msg", "off", "rule", "src", "text"]] | all'
+chk "full: rule and msg are strings" jq_true "$body" \
+  '[.result.files[].edits[] | (.rule | type == "string") and (.msg | type == "string")] | all'
 end_face
 
 # --- face: rpc-fix-rejects -----------------------------------------------------
@@ -561,12 +637,12 @@ end_face
 # --- face: rpc-assists ---------------------------------------------------------
 face rpc-assists
 body="$work/body_8.json"
-chk "the document is exactly {file, schema_version, assists}" jq_true "$body" \
-  '(.result | keys | sort) == ["assists", "file", "schema_version"]'
-chk "schema_version is 1" jq_eq "$body" '.result.schema_version' 1
+chk "the document is exactly {file, v, assists}" jq_true "$body" \
+  '(.result | keys | sort) == ["assists", "file", "v"]'
+chk "v is 1" jq_eq "$body" '.result.v' 1
 chk "the document names the probed file" jq_true "$body" '.result.file | endswith("fixme.dart")'
-chk "rows (if any) carry the message/source/edits tuple" jq_true "$body" \
-  '[.result.assists[] | ((keys | sort) - ["priority"]) == ["edits", "message", "source"]] | all'
+chk "rows (if any) carry the msg/src/edits tuple" jq_true "$body" \
+  '[.result.assists[] | ((keys | sort) - ["priority"]) == ["edits", "msg", "src"]] | all'
 end_face
 
 # --- face: rpc-assists-rejects -------------------------------------------------

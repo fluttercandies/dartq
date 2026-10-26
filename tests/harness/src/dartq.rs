@@ -30,7 +30,8 @@ pub(crate) enum DartqProbe {
 }
 
 impl DartqDriver {
-    /// Template looks like `cargo run -q -p dartq-cli -- check --format=machine`.
+    /// Template looks like `cargo run -q -p dartq-cli -- check --format=json`
+    /// (the json envelope — the CLI's machine face retired, #2606).
     /// Split on whitespace into argv (spaces inside paths do not break argv: `{dir}` replacement happens after splitting).
     /// If any argument contains the `{dir}` placeholder it is replaced with the corpus directory; otherwise the corpus directory is appended as the last argument.
     /// Adding `--no-fatal-warnings` makes both sides exit {0, 3} symmetrically

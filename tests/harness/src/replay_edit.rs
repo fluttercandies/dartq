@@ -367,104 +367,107 @@ pub(crate) fn canonical_from_machine(
     diag: &MachineDiag,
     source: &str,
 ) -> Result<CanonicalDiag, String> {
+    canonical_from_locator(
+        &diag.code,
+        tier(diag.severity),
+        diag.line,
+        diag.col,
+        diag.length,
+        &diag.message,
+        source,
+    )
+}
+
+/// The shared locator→canonical core of both comparison faces: a 1-based
+/// line/col plus UTF-16 length over `source`, normalized to the canonical
+/// 0-based UTF-16 positions (the end position derived with the engine's
+/// own [`LineIndex`], so the faces' span conventions cannot drift apart).
+fn canonical_from_locator(
+    code: &str,
+    severity: u8,
+    line: u32,
+    col: u32,
+    length: u32,
+    message: &str,
+    source: &str,
+) -> Result<CanonicalDiag, String> {
     let table = line_table(source);
-    if diag.line == 0 || diag.line as usize > table.starts.len() || diag.col == 0 {
+    if line == 0 || line as usize > table.starts.len() || col == 0 {
         return Err(format!(
-            "machine diagnostic has out-of-range position {}:{}",
-            diag.line, diag.col
+            "diagnostic has out-of-range position {line}:{col}"
         ));
     }
-    let start = table.starts[(diag.line - 1) as usize] + (diag.col - 1);
+    let start = table.starts[(line - 1) as usize] + (col - 1);
     let end = start
-        .checked_add(diag.length)
-        .ok_or_else(|| "machine diagnostic span overflows u32".to_string())?;
+        .checked_add(length)
+        .ok_or_else(|| "diagnostic span overflows u32".to_string())?;
     if end > utf16_len_of(source) {
         return Err(format!(
-            "machine diagnostic span [{start}, {end}) exceeds the text length"
+            "diagnostic span [{start}, {end}) exceeds the text length"
         ));
     }
     let index = LineIndex::new(source);
     let (end_line, end_col) = index.line_col_utf16(source, end);
     Ok(CanonicalDiag {
-        code: diag.code.to_lowercase(),
-        severity: tier(diag.severity),
-        start_line: diag.line - 1,
-        start_col: diag.col - 1,
+        code: code.to_lowercase(),
+        severity,
+        start_line: line - 1,
+        start_col: col - 1,
         end_line: end_line - 1,
         end_col: end_col - 1,
-        message: diag.message.clone(),
+        message: message.to_owned(),
     })
 }
 
-/// Normalizes one `dartq/analyze` entry (an `lsp::AnalyzeEntry` JSON with
-/// `uri` flattened next to the LSP `Diagnostic` fields). Returns the
-/// entry's decoded path alongside the canonical form so the caller can
-/// key by corpus-relative location.
-pub(crate) fn canonical_from_lsp(entry: &Value) -> Result<(PathBuf, CanonicalDiag), String> {
+/// Decodes one `dartq/analyze` compact row's `file` field (the entry's
+/// `file://` URI) to a path — the row's location key.
+pub(crate) fn row_path(entry: &Value) -> Result<PathBuf, String> {
+    let file = entry
+        .get("file")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "analyze row field `file` missing or not a string".to_string())?;
+    file_uri_to_path(file)
+}
+
+/// Normalizes one `dartq/analyze` compact row (`{code, sev, file, line,
+/// col, len, msg}` — the short-vocabulary pull face) against its file's
+/// post-edit text. The locator caliber matches the batch face's row, so
+/// both normalize through the same [`canonical_from_locator`] core.
+pub(crate) fn canonical_from_row(entry: &Value, source: &str) -> Result<CanonicalDiag, String> {
     let object = entry
         .as_object()
-        .ok_or_else(|| "analyze entry is not an object".to_string())?;
+        .ok_or_else(|| "analyze row is not an object".to_string())?;
     let string_field = |name: &str| -> Result<String, String> {
         object
             .get(name)
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .ok_or_else(|| format!("analyze entry field `{name}` missing or not a string"))
+            .ok_or_else(|| format!("analyze row field `{name}` missing or not a string"))
     };
-    let uri = string_field("uri")?;
-    let path = file_uri_to_path(&uri)?;
-    let position = |container: &Value, at: &str| -> Result<(u32, u32), String> {
-        let line = container
-            .get("line")
+    let num_field = |name: &str| -> Result<u32, String> {
+        object
+            .get(name)
             .and_then(Value::as_u64)
-            .ok_or_else(|| format!("analyze entry `{at}.line` missing or not a number"))?;
-        let character = container
-            .get("character")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| format!("analyze entry `{at}.character` missing or not a number"))?;
-        let line = u32::try_from(line).map_err(|_| format!("`{at}.line` exceeds u32"))?;
-        let character =
-            u32::try_from(character).map_err(|_| format!("`{at}.character` exceeds u32"))?;
-        Ok((line, character))
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| format!("analyze row field `{name}` missing or not a u32"))
     };
-    let range = object
-        .get("range")
-        .ok_or_else(|| "analyze entry field `range` missing".to_string())?;
-    let (start_line, start_col) = position(
-        range
-            .get("start")
-            .ok_or_else(|| "analyze entry `range.start` missing".to_string())?,
-        "range.start",
-    )?;
-    let (end_line, end_col) = position(
-        range
-            .get("end")
-            .ok_or_else(|| "analyze entry `range.end` missing".to_string())?,
-        "range.end",
-    )?;
-    let severity = object
-        .get("severity")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "analyze entry field `severity` missing or not a number".to_string())?;
-    if !(1..=3).contains(&severity) {
-        return Err(format!("analyze entry severity {severity} outside 1..=3"));
-    }
-    Ok((
-        path,
-        CanonicalDiag {
-            code: string_field("code")?.to_lowercase(),
-            severity: u8::try_from(severity).expect("checked 1..=3 above"),
-            start_line,
-            start_col,
-            end_line,
-            end_col,
-            message: string_field("message")?,
-        },
-    ))
+    let severity = match string_field("sev")?.as_str() {
+        "error" => 1,
+        "warning" => 2,
+        "info" => 3,
+        other => return Err(format!("analyze row sev `{other}` outside error|warning|info")),
+    };
+    canonical_from_locator(
+        &string_field("code")?,
+        severity,
+        num_field("line")?,
+        num_field("col")?,
+        num_field("len")?,
+        &string_field("msg")?,
+        source,
+    )
 }
 
-/// `file://` URI → filesystem path, percent-decoded. The daemon's `uri`
-/// module does the inverse mapping; this is the client twin.
 pub(crate) fn file_uri_to_path(uri: &str) -> Result<PathBuf, String> {
     let rest = uri
         .strip_prefix("file://")
@@ -707,18 +710,21 @@ mod tests {
     /// Both faces describing the same diagnostic must normalize to the
     /// same canonical bytes — the comparison's core pin.
     #[test]
-    fn machine_and_lsp_faces_normalize_to_one_canonical_form() {
+    fn machine_and_row_faces_normalize_to_one_canonical_form() {
         let source = "int a = 1;\nint b = 2;\n";
         let machine = canonical_from_machine(
             &machine_diag("EXPECTED_TOKEN", "/c/lib/a.dart", 2, 5, 3, "Expected ';'."),
             source,
         )
         .expect("machine canonical");
-        let lsp = r#"{"uri":"file:///c/lib/a.dart","range":{"start":{"line":1,"character":4},"end":{"line":1,"character":7}},"severity":1,"code":"expected_token","source":"dartq","message":"Expected ';'."}"#;
-        let (path, lsp_canonical) =
-            canonical_from_lsp(&serde_json::from_str(lsp).expect("json")).expect("lsp canonical");
-        assert_eq!(path, PathBuf::from("/c/lib/a.dart"));
-        assert_eq!(machine.key(), lsp_canonical.key(), "keys must be equal");
+        let row = r#"{"code":"expected_token","sev":"error","file":"file:///c/lib/a.dart","line":2,"col":5,"len":3,"msg":"Expected ';'."}"#;
+        let row_value = serde_json::from_str::<Value>(row).expect("json");
+        assert_eq!(
+            row_path(&row_value).expect("row path"),
+            PathBuf::from("/c/lib/a.dart")
+        );
+        let row_canonical = canonical_from_row(&row_value, source).expect("row canonical");
+        assert_eq!(machine.key(), row_canonical.key(), "keys must be equal");
         // End position came from the engine index: line 2 col 5 + 3 units
         // of `b =` → end lands at col 8 (one-based), i.e. 0-based 7.
         assert_eq!(machine.end_line, 1);
@@ -735,28 +741,27 @@ mod tests {
             source,
         )
         .expect("canonical");
-        let lsp_for = |end_char: u64, severity: u64, message: &str| {
+        let row_for = |len: u64, sev: &str, message: &str| {
             let json = format!(
-                r#"{{"uri":"file:///c/a.dart","range":{{"start":{{"line":1,"character":4}},"end":{{"line":1,"character":{end_char}}}}},"severity":{severity},"code":"expected_token","source":"dartq","message":"{message}"}}"#
+                r#"{{"code":"expected_token","sev":"{sev}","file":"file:///c/a.dart","line":2,"col":5,"len":{len},"msg":"{message}"}}"#
             );
-            canonical_from_lsp(&serde_json::from_str(&json).expect("json"))
+            canonical_from_row(&serde_json::from_str(&json).expect("json"), source)
                 .expect("canonical")
-                .1
         };
         assert_ne!(
             base.key(),
-            lsp_for(8, 1, "Expected ';'.").key(),
-            "end drift"
+            row_for(4, "error", "Expected ';'.").key(),
+            "end drift (length)"
         );
         assert_ne!(
             base.key(),
-            lsp_for(7, 2, "Expected ';'.").key(),
+            row_for(3, "warning", "Expected ';'.").key(),
             "severity drift"
         );
-        assert_ne!(base.key(), lsp_for(7, 1, "Other.").key(), "message drift");
+        assert_ne!(base.key(), row_for(3, "error", "Other.").key(), "message drift");
         assert_eq!(
             base.key(),
-            lsp_for(7, 1, "Expected ';'.").key(),
+            row_for(3, "error", "Expected ';'.").key(),
             "equal faces"
         );
     }

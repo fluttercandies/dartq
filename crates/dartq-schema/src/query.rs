@@ -51,7 +51,7 @@ static DECLARATION_ITEM: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["file", "kind", "name", "line", "column", "length"],
+        "required": ["file", "kind", "name", "line", "col", "len"],
         "properties": {
             "file": { "type": "string" },
             // The member container's name; top-level rows omit the key
@@ -62,11 +62,11 @@ static DECLARATION_ITEM: LazyLock<Value> = LazyLock::new(|| {
             "kind": { "enum": DECL_KINDS },
             "name": { "type": "string" },
             "line": { "type": "integer", "minimum": 1 },
-            "column": { "type": "integer", "minimum": 1 },
-            "length": { "type": "integer", "minimum": 0 },
+            "col": { "type": "integer", "minimum": 1 },
+            "len": { "type": "integer", "minimum": 0 },
             // Additive optional on frozen v1: the rendered signature face
             // (members and top-level executables; never a lossy one).
-            "signature": { "type": "string" },
+            "sig": { "type": "string" },
             // Additive optional on frozen v1: the container face's
             // annotations, `@name(args)` spellings in written order.
             "annotations": { "type": "array", "items": { "type": "string" } },
@@ -78,24 +78,24 @@ static QUERY_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
         "$id": "dartq/schema/v1/query-answer.json",
-        "title": "dartq query answer (schema_version 1)",
+        "title": "dartq query answer (v 1)",
         "type": "object",
         "additionalProperties": false,
-        "required": ["schema_version", "name", "declarations", "references"],
+        "required": ["v", "sym", "decls", "refs"],
         "properties": {
-            "schema_version": { "const": SCHEMA_VERSION_QUERY },
-            "name": { "type": "string" },
-            "declarations": { "type": "array", "items": DECLARATION_ITEM.clone() },
-            "references": { "type": "array", "items": {
+            "v": { "const": SCHEMA_VERSION_QUERY },
+            "sym": { "type": "string" },
+            "decls": { "type": "array", "items": DECLARATION_ITEM.clone() },
+            "refs": { "type": "array", "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["target_file", "kind", "offset", "length"],
+                "required": ["target", "kind", "off", "len"],
                 "properties": {
-                    "target_file": { "type": "string" },
+                    "target": { "type": "string" },
                     "kind": { "enum": REF_KINDS },
                     "qualified": { "type": "string" },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "length": { "type": "integer", "minimum": 0 },
+                    "off": { "type": "integer", "minimum": 0 },
+                    "len": { "type": "integer", "minimum": 0 },
                     // Additive optional on frozen v1 (#361): the use-site
                     // file of the row, present when the producer knows it.
                     // The query producers emit it (wired with the freeze);
@@ -108,7 +108,7 @@ static QUERY_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             // non-locating detail sections — the minimal tier drops them
             // (`validate_query_at_tier`).
             "implementations": { "type": "array", "items": DECLARATION_ITEM.clone() },
-            "dependencies": { "type": "array", "items": {
+            "deps": { "type": "array", "items": {
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["path"],
@@ -163,13 +163,13 @@ pub const REF_KINDS: &[&str] = &[
     "override",
 ];
 
-const QUERY_TOP: &[&str] = &["schema_version", "name", "declarations", "references"];
+const QUERY_TOP: &[&str] = &["v", "sym", "decls", "refs"];
 const QUERY_SESSION: &[&str] = &["symbols", "since"];
 // The reserved additive kind arrays (crate docs): declared, no writer yet.
-const QUERY_ADDITIVE: &[&str] = &["implementations", "dependencies"];
-const DECLARATION: &[&str] = &["file", "kind", "name", "line", "column", "length"];
-const DECLARATION_OPTIONAL: &[&str] = &["container", "signature", "annotations"];
-const REFERENCE: &[&str] = &["target_file", "kind", "offset", "length"];
+const QUERY_ADDITIVE: &[&str] = &["implementations", "deps"];
+const DECLARATION: &[&str] = &["file", "kind", "name", "line", "col", "len"];
+const DECLARATION_OPTIONAL: &[&str] = &["container", "sig", "annotations"];
+const REFERENCE: &[&str] = &["target", "kind", "off", "len"];
 const REFERENCE_OPTIONAL: &[&str] = &["qualified", "file"];
 const DEPENDENCY: &[&str] = &["path"];
 const DEPENDENCY_OPTIONAL: &[&str] = &["name"];
@@ -186,15 +186,15 @@ fn validate_declaration_row(
     string(field(obj, "name", p)?, &join(p, "name"))?;
     let line = join(p, "line");
     one_based(field(obj, "line", p)?, &line)?;
-    let column = join(p, "column");
-    one_based(field(obj, "column", p)?, &column)?;
-    let length = join(p, "length");
-    non_negative(field(obj, "length", p)?, &length)?;
+    let column = join(p, "col");
+    one_based(field(obj, "col", p)?, &column)?;
+    let length = join(p, "len");
+    non_negative(field(obj, "len", p)?, &length)?;
     if let Some(container) = obj.get("container") {
         string_or_null(container, &join(p, "container"))?;
     }
-    if let Some(signature) = obj.get("signature") {
-        string(signature, &join(p, "signature"))?;
+    if let Some(signature) = obj.get("sig") {
+        string(signature, &join(p, "sig"))?;
     }
     if let Some(annotations) = obj.get("annotations") {
         for (i, annotation) in array(annotations, &join(p, "annotations"))?
@@ -217,23 +217,23 @@ pub(crate) fn validate_query(value: &Value) -> Result<(), SchemaViolation> {
         .copied()
         .collect();
     exact_fields(root, QUERY_TOP, &optional, "")?;
-    pinned_version(root, "schema_version", SCHEMA_VERSION_QUERY)?;
-    string(field(root, "name", "")?, "name")?;
+    pinned_version(root, "v", SCHEMA_VERSION_QUERY)?;
+    string(field(root, "sym", "")?, "sym")?;
     session_fields(root)?;
-    for (i, row) in rows(root, "declarations")? {
-        let p = format!("declarations[{i}]");
+    for (i, row) in rows(root, "decls")? {
+        let p = format!("decls[{i}]");
         validate_declaration_row(object(row, &p)?, &p)?;
     }
-    for (i, row) in rows(root, "references")? {
-        let p = format!("references[{i}]");
+    for (i, row) in rows(root, "refs")? {
+        let p = format!("refs[{i}]");
         let obj = object(row, &p)?;
         exact_fields(obj, REFERENCE, REFERENCE_OPTIONAL, &p)?;
-        string(field(obj, "target_file", &p)?, &join(&p, "target_file"))?;
+        string(field(obj, "target", &p)?, &join(&p, "target"))?;
         enum_spelling(field(obj, "kind", &p)?, &join(&p, "kind"), REF_KINDS)?;
-        let offset = join(&p, "offset");
-        non_negative(field(obj, "offset", &p)?, &offset)?;
-        let length = join(&p, "length");
-        non_negative(field(obj, "length", &p)?, &length)?;
+        let offset = join(&p, "off");
+        non_negative(field(obj, "off", &p)?, &offset)?;
+        let length = join(&p, "len");
+        non_negative(field(obj, "len", &p)?, &length)?;
         if let Some(qualified) = obj.get("qualified") {
             string(qualified, &join(&p, "qualified"))?;
         }
@@ -247,8 +247,8 @@ pub(crate) fn validate_query(value: &Value) -> Result<(), SchemaViolation> {
         let p = format!("implementations[{i}]");
         validate_declaration_row(object(row, &p)?, &p)?;
     }
-    for (i, row) in rows_optional(root, "dependencies")? {
-        let p = format!("dependencies[{i}]");
+    for (i, row) in rows_optional(root, "deps")? {
+        let p = format!("deps[{i}]");
         let obj = object(row, &p)?;
         exact_fields(obj, DEPENDENCY, DEPENDENCY_OPTIONAL, &p)?;
         string(field(obj, "path", &p)?, &join(&p, "path"))?;
@@ -277,16 +277,16 @@ pub(crate) fn validate_query_at_tier(
     }
     let root = object(value, "")?;
     absent(root, "implementations", "", tier)?;
-    absent(root, "dependencies", "", tier)?;
-    for (i, row) in rows(root, "declarations")? {
-        let p = format!("declarations[{i}]");
+    absent(root, "deps", "", tier)?;
+    for (i, row) in rows(root, "decls")? {
+        let p = format!("decls[{i}]");
         let obj = object(row, &p)?;
         absent(obj, "container", &p, tier)?;
-        absent(obj, "signature", &p, tier)?;
+        absent(obj, "sig", &p, tier)?;
         absent(obj, "annotations", &p, tier)?;
     }
-    for (i, row) in rows(root, "references")? {
-        let p = format!("references[{i}]");
+    for (i, row) in rows(root, "refs")? {
+        let p = format!("refs[{i}]");
         absent(object(row, &p)?, "qualified", &p, tier)?;
     }
     Ok(())
@@ -311,7 +311,7 @@ mod tests {
         top.sort_unstable();
         assert_eq!(schema_keys(query), top);
         // One declaration-row shape serves both declaration-bearing arrays.
-        let declarations = &query["properties"]["declarations"]["items"];
+        let declarations = &query["properties"]["decls"]["items"];
         assert_eq!(
             declarations,
             &query["properties"]["implementations"]["items"]
@@ -323,7 +323,7 @@ mod tests {
             .collect();
         decl_fields.sort_unstable();
         assert_eq!(schema_keys(declarations), decl_fields);
-        let references = &query["properties"]["references"]["items"];
+        let references = &query["properties"]["refs"]["items"];
         let mut ref_fields: Vec<String> = REFERENCE
             .iter()
             .chain(REFERENCE_OPTIONAL.iter())
@@ -331,7 +331,7 @@ mod tests {
             .collect();
         ref_fields.sort_unstable();
         assert_eq!(schema_keys(references), ref_fields);
-        let dependencies = &query["properties"]["dependencies"]["items"];
+        let dependencies = &query["properties"]["deps"]["items"];
         let mut dep_fields: Vec<String> = DEPENDENCY
             .iter()
             .chain(DEPENDENCY_OPTIONAL.iter())
@@ -344,8 +344,8 @@ mod tests {
     #[test]
     fn enum_spellings_match_the_declared_lists() {
         let query = query_schema();
-        let decl_enum = &query["properties"]["declarations"]["items"]["properties"]["kind"];
-        let ref_enum = &query["properties"]["references"]["items"]["properties"]["kind"];
+        let decl_enum = &query["properties"]["decls"]["items"]["properties"]["kind"];
+        let ref_enum = &query["properties"]["refs"]["items"]["properties"]["kind"];
         for (property, declared) in [(decl_enum, DECL_KINDS), (ref_enum, REF_KINDS)] {
             let spellings: Vec<&str> = property["enum"]
                 .as_array()
@@ -364,15 +364,15 @@ mod tests {
     #[test]
     fn override_reference_kind_validates() {
         let doc = serde_json::json!({
-            "schema_version": SCHEMA_VERSION_QUERY,
-            "name": "m",
-            "declarations": [],
-            "references": [{
-                "target_file": "/w/lib/base.dart",
+            "v": SCHEMA_VERSION_QUERY,
+            "sym": "m",
+            "decls": [],
+            "refs": [{
+                "target": "/w/lib/base.dart",
                 "kind": "override",
                 "file": "/w/lib/sub.dart",
-                "offset": 44,
-                "length": 1,
+                "off": 44,
+                "len": 1,
             }],
         });
         assert!(validate_query(&doc).is_ok());
@@ -380,9 +380,9 @@ mod tests {
         assert!(validate_query_at_tier(&doc, Verbosity::Minimal).is_ok());
 
         let mut bad = doc.clone();
-        bad["references"][0]["kind"] = serde_json::json!("overridden");
+        bad["refs"][0]["kind"] = serde_json::json!("overridden");
         let violation = validate_query(&bad).expect_err("unknown spelling");
-        assert_eq!(violation.path, "references[0].kind");
+        assert_eq!(violation.path, "refs[0].kind");
     }
 
     /// Tier exactness: a minimal answer omits the convenience spellings;
@@ -390,28 +390,28 @@ mod tests {
     #[test]
     fn minimal_tier_rejects_convenience_spellings() {
         let doc = serde_json::json!({
-            "schema_version": SCHEMA_VERSION_QUERY,
-            "name": "fb",
-            "declarations": [{
+            "v": SCHEMA_VERSION_QUERY,
+            "sym": "fb",
+            "decls": [{
                 "file": "/w/lib/a.dart",
                 "container": "fb",
                 "kind": "class",
                 "name": "fb",
                 "line": 3,
-                "column": 7,
-                "length": 2,
+                "col": 7,
+                "len": 2,
             }],
-            "references": [{
-                "target_file": "/w/lib/b.dart",
+            "refs": [{
+                "target": "/w/lib/b.dart",
                 "kind": "invoked",
                 "qualified": "fb.fma()",
-                "offset": 42,
-                "length": 2,
+                "off": 42,
+                "len": 2,
             }],
         });
         let violation = validate_query_at_tier(&doc, Verbosity::Minimal)
             .expect_err("minimal must not carry the container");
-        assert_eq!(violation.path, "declarations[0].container");
+        assert_eq!(violation.path, "decls[0].container");
         assert_eq!(violation.expected, "omitted at the minimal tier");
         assert!(validate_query_at_tier(&doc, Verbosity::Compact).is_ok());
         assert!(validate_query_at_tier(&doc, Verbosity::Full).is_ok());
@@ -424,23 +424,23 @@ mod tests {
     #[test]
     fn element_face_columns_validate_and_minimal_drops_them() {
         let mut doc = serde_json::json!({
-            "schema_version": SCHEMA_VERSION_QUERY,
-            "name": "limit",
-            "declarations": [{
+            "v": SCHEMA_VERSION_QUERY,
+            "sym": "limit",
+            "decls": [{
                 "file": "/w/lib/a.dart",
                 "container": "Widget",
                 "kind": "field",
                 "name": "limit",
                 "line": 3,
-                "column": 21,
-                "length": 5,
-                "signature": "static final int limit",
+                "col": 21,
+                "len": 5,
+                "sig": "static final int limit",
             }],
-            "references": [],
+            "refs": [],
         });
         assert!(validate_query(&doc).is_ok());
 
-        doc["declarations"][0]["annotations"] = serde_json::json!(["@Deprecated('use Other')"]);
+        doc["decls"][0]["annotations"] = serde_json::json!(["@Deprecated('use Other')"]);
         assert!(validate_query(&doc).is_ok());
         assert!(validate_query_at_tier(&doc, Verbosity::Compact).is_ok());
         assert!(validate_query_at_tier(&doc, Verbosity::Full).is_ok());
@@ -449,24 +449,24 @@ mod tests {
         // convenience spellings, one violation at a time.
         let violation = validate_query_at_tier(&doc, Verbosity::Minimal)
             .expect_err("minimal must not carry the container");
-        assert_eq!(violation.path, "declarations[0].container");
-        doc["declarations"][0]
+        assert_eq!(violation.path, "decls[0].container");
+        doc["decls"][0]
             .as_object_mut()
             .expect("object")
             .remove("container");
         let violation = validate_query_at_tier(&doc, Verbosity::Minimal)
             .expect_err("minimal must not carry the signature");
-        assert_eq!(violation.path, "declarations[0].signature");
-        doc["declarations"][0]
+        assert_eq!(violation.path, "decls[0].sig");
+        doc["decls"][0]
             .as_object_mut()
             .expect("object")
-            .remove("signature");
+            .remove("sig");
         let violation = validate_query_at_tier(&doc, Verbosity::Minimal)
             .expect_err("minimal must not carry the annotations");
-        assert_eq!(violation.path, "declarations[0].annotations");
+        assert_eq!(violation.path, "decls[0].annotations");
 
         // Absent is the everyday shape: rows without a matching face.
-        doc["declarations"][0]
+        doc["decls"][0]
             .as_object_mut()
             .expect("object")
             .remove("annotations");
@@ -475,16 +475,16 @@ mod tests {
         assert!(validate_query_at_tier(&bare, Verbosity::Minimal).is_ok());
 
         // Wrong types are named.
-        doc["declarations"][0]["signature"] = serde_json::json!(42);
+        doc["decls"][0]["sig"] = serde_json::json!(42);
         let violation = validate_query(&doc).expect_err("non-string signature");
-        assert_eq!(violation.path, "declarations[0].signature");
-        doc["declarations"][0]["signature"] = serde_json::json!("static final int limit");
-        doc["declarations"][0]["annotations"] = serde_json::json!("@Deprecated");
+        assert_eq!(violation.path, "decls[0].sig");
+        doc["decls"][0]["sig"] = serde_json::json!("static final int limit");
+        doc["decls"][0]["annotations"] = serde_json::json!("@Deprecated");
         let violation = validate_query(&doc).expect_err("non-array annotations");
-        assert_eq!(violation.path, "declarations[0].annotations");
-        doc["declarations"][0]["annotations"] = serde_json::json!([42]);
+        assert_eq!(violation.path, "decls[0].annotations");
+        doc["decls"][0]["annotations"] = serde_json::json!([42]);
         let violation = validate_query(&doc).expect_err("non-string annotation entry");
-        assert_eq!(violation.path, "declarations[0].annotations[0]");
+        assert_eq!(violation.path, "decls[0].annotations[0]");
     }
 
     /// The reserved additive kind arrays: present, their rows validate under
@@ -494,28 +494,28 @@ mod tests {
     #[test]
     fn reserved_kind_arrays_validate_and_minimal_drops_them() {
         let mut doc = serde_json::json!({
-            "schema_version": SCHEMA_VERSION_QUERY,
-            "name": "fb",
-            "declarations": [{
+            "v": SCHEMA_VERSION_QUERY,
+            "sym": "fb",
+            "decls": [{
                 "file": "/w/lib/a.dart",
                 "container": null,
                 "kind": "class",
                 "name": "fb",
                 "line": 3,
-                "column": 7,
-                "length": 2,
+                "col": 7,
+                "len": 2,
             }],
-            "references": [],
+            "refs": [],
             "implementations": [{
                 "file": "/w/lib/sub.dart",
                 "container": "Sub",
                 "kind": "class",
                 "name": "Sub",
                 "line": 4,
-                "column": 7,
-                "length": 3,
+                "col": 7,
+                "len": 3,
             }],
-            "dependencies": [{ "path": "/w/lib/app.dart" }],
+            "deps": [{ "path": "/w/lib/app.dart" }],
         });
         assert!(validate_query(&doc).is_ok());
         assert!(validate_query_at_tier(&doc, Verbosity::Compact).is_ok());
@@ -537,8 +537,8 @@ mod tests {
         minimal
             .as_object_mut()
             .expect("object")
-            .remove("dependencies");
-        minimal["declarations"][0]
+            .remove("deps");
+        minimal["decls"][0]
             .as_object_mut()
             .expect("object")
             .remove("container");
@@ -551,8 +551,8 @@ mod tests {
             "kind": "class",
             "name": "Sub",
             "line": 4,
-            "column": 7,
-            "length": 3,
+            "col": 7,
+            "len": 3,
             "override_depth": 2,
         }]);
         let violation = validate_query(&doc).expect_err("undeclared field");

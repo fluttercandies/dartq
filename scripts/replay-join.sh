@@ -17,12 +17,13 @@
 #         --corpus-dir tests/corpus/pub-null-sections
 #         --corpus-dir tests/corpus/pub-universe-shadow
 #         --oracle-dart "$DART_BIN"
-#         --dartq-cmd "./target/release/dartq analyze --format=machine --sdk $SDK_ROOT"
+#         --dartq-cmd "./target/release/dartq analyze --format=json --sdk $SDK_ROOT"
 #         --out $REPLAY_DIR/m0-merged
 #   $REPLAY_DIR/m1/report.json + raw-outputs.json   (same shape over
 #       --corpus-dir tests/corpus/m1-semantic)
-#   $REPLAY_DIR/sii.oracle.machine + sii.dartq.machine  (bare `analyze
-#       --format=machine` dump pair over tests/corpus/sii-probes)
+#   $REPLAY_DIR/sii.oracle.machine + sii.dartq.json  (bare dump pair
+#       over tests/corpus/sii-probes: oracle machine, dartq json envelope —
+#       the CLI's machine face retired, #2606)
 #
 #   The #1347 pub-nested-example / pub-corrupt-config dump pairs
 #   (pub-*.oracle.machine / pub-*.dartq.machine, same directory) are
@@ -35,7 +36,7 @@
 # report.json's oracle_only + dartq_only arrays — the comparator's own diff
 # output (codes already lowercase entry-key form, files label-prefixed for
 # multi-corpus runs, `m0/...` and `m0-syntax/...`, unlabeled for single
-# corpus). The sii leg diffs the two machine files on the same caliber.
+# corpus). The sii leg diffs the two dumps on the same caliber.
 #
 # Decisions baked in (zero-questions defaults):
 #   - Entry -> leg mapping by the corpus path embedded in the entry's reason
@@ -187,6 +188,33 @@ def parse_machine_file(path, what):
     return rows
 
 
+def parse_dartq_json_file(path, what):
+    # The dartq dump side: `dartq analyze --format=json`, the single-line
+    # oracle-parity envelope (the CLI's machine face retired, #2606). Same
+    # (lowercase code, file) caliber as the machine parser — json codes are
+    # already lowercase, file paths ride location.file unescaped.
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except OSError as exc:
+        die(f"cannot read {what} {path}: {exc}", 1)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        die(f"{what} {path} is not the json envelope: {exc}", 1)
+    if doc.get("version") != 1:
+        die(f"{what} {path} has unsupported envelope version {doc.get('version')!r}", 1)
+    for idx, diag in enumerate(doc.get("diagnostics", [])):
+        try:
+            rows.append((str(diag["code"]).lower(), str(diag["location"]["file"])))
+        except (KeyError, TypeError) as exc:
+            die(
+                f"{what} {path} diagnostic {idx + 1} lacks {exc} "
+                "(the envelope row shape drifted)",
+                1,
+            )
+    return rows
+
+
 def sii_rel_file(path):
     # Normalize a bare-dump machine row path to corpus-relative: strip a
     # leading ./ then the corpus-dir component (handles both the
@@ -274,7 +302,7 @@ def leg_file_key(corpus, file, label):
 def main():
     preflight_path(KNOWN_DIFFS, "known-diffs table")
     sii_oracle_path = os.path.join(REPLAY_DIR, "sii.oracle.machine")
-    sii_dartq_path = os.path.join(REPLAY_DIR, "sii.dartq.machine")
+    sii_dartq_path = os.path.join(REPLAY_DIR, "sii.dartq.json")
 
     table = load_json(KNOWN_DIFFS, "known-diffs table")
     entries = table.get("entries")
@@ -292,9 +320,9 @@ def main():
     legs = {name: load_harness_leg(name) for name in HARNESS_LEGS}
 
     preflight_path(sii_oracle_path, "sii oracle machine dump")
-    preflight_path(sii_dartq_path, "sii dartq machine dump")
+    preflight_path(sii_dartq_path, "sii dartq json dump")
     sii_oracle = parse_machine_file(sii_oracle_path, "sii oracle machine dump")
-    sii_dartq = parse_machine_file(sii_dartq_path, "sii dartq machine dump")
+    sii_dartq = parse_dartq_json_file(sii_dartq_path, "sii dartq json dump")
     sii_oracle_set = {(code, sii_rel_file(f)) for code, f in sii_oracle}
     sii_dartq_set = {(code, sii_rel_file(f)) for code, f in sii_dartq}
     sii_oracle_rows = {}
@@ -404,7 +432,7 @@ def main():
             },
             "sii": {
                 "oracle_machine": sii_oracle_path,
-                "dartq_machine": sii_dartq_path,
+                "dartq_json": sii_dartq_path,
                 "oracle_rows": len(sii_oracle),
                 "dartq_rows": len(sii_dartq),
                 "diff_rows": legs["sii"]["diff_rows"],

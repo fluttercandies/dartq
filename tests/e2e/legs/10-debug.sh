@@ -35,24 +35,24 @@ legs_10_run() {
 '
   run_dartq dbg-start session start "$base/w1" --sdk "$base/sdk"
   assert_eq "$DQ_RC" 0 "the session starts"
-  run_dartq dbg-status debug status --dir "$base/w1" --sdk "$base/sdk"
+  run_dartq dbg-status debug status --dir "$base/w1" --sdk "$base/sdk" --format json
   assert_eq "$DQ_RC" 0 "status on the empty registry is clean"
   assert_eq "$(cat "$(out_file dbg-status)")" "[]" \
     "status prints the daemon answer verbatim — one JSON line"
-  run_dartq dbg-none debug resume --dir "$base/w1" --sdk "$base/sdk"
+  run_dartq dbg-none debug resume --dir "$base/w1" --sdk "$base/sdk" --format json
   assert_eq "$DQ_RC" 1 "no -s with zero live sessions is the domain tier"
   json_check "$(out_file dbg-none)" \
-    "j['error']['code']==-32001 and j['error']['message'].startswith('DARTQ/DEBUG/NO_SESSIONS') and 'launch or attach' in j['error']['message']" \
+    "j['error']['code']==-32001 and j['error']['msg'].startswith('DARTQ/DEBUG/NO_SESSIONS') and 'launch or attach' in j['error']['msg']" \
     "the zero-session miss names the way out (launch or attach)"
-  run_dartq dbg-miss debug status -s 7 --dir "$base/w1" --sdk "$base/sdk"
+  run_dartq dbg-miss debug status -s 7 --dir "$base/w1" --sdk "$base/sdk" --format json
   assert_eq "$DQ_RC" 1 "an explicit unknown -s is the domain tier"
   json_check "$(out_file dbg-miss)" \
-    "j['error']['code']==-32001 and j['error']['message'].startswith('DARTQ/DEBUG/NO_SUCH_SESSION')" \
+    "j['error']['code']==-32001 and j['error']['msg'].startswith('DARTQ/DEBUG/NO_SUCH_SESSION')" \
     "the error line carries the -32001 code and the DARTQ/DEBUG machine code"
-  run_dartq dbg-detach-miss debug detach --session 7 --dir "$base/w1" --sdk "$base/sdk"
+  run_dartq dbg-detach-miss debug detach --session 7 --dir "$base/w1" --sdk "$base/sdk" --format json
   assert_eq "$DQ_RC" 1 "the long --session spelling reaches the same miss"
-  run_dartq dbg-camel debug resume --sessionId 7 --dir "$base/w1"
-  assert_eq "$DQ_RC" 64 "the retired camelCase --sessionId is usage"
+  run_dartq dbg-camel debug resume --session-id 7 --dir "$base/w1"
+  assert_eq "$DQ_RC" 64 "the hyphenated --session-id spelling is usage (only -s/--session)"
   run_dartq dbg-step-bad debug step -s 1 sideways --dir "$base/w1"
   assert_eq "$DQ_RC" 64 "an unknown step option is usage"
   run_dartq dbg-bogus debug bogus --dir "$base/w1"
@@ -73,7 +73,7 @@ legs_10_run() {
   make_pkg "$long_root" "longpkg"
   wf "$long_root/lib/main.dart" 'int main() => 1;
 '
-  run_dartq_in dbg-long-status "$long_root/lib" debug status --dir "$long_root" --sdk "$base/sdk"
+  run_dartq_in dbg-long-status "$long_root/lib" debug status --dir "$long_root" --sdk "$base/sdk" --format json
   assert_eq "$DQ_RC" 0 "the relocated-tree session answers"
   assert_eq "$(cat "$(out_file dbg-long-status)")" "[]" "its empty debug registry lists empty"
   if [ -e "$long_root/.dart_tool/dartq/session.sock.point" ]; then
@@ -96,7 +96,7 @@ environment:
   make_pkg "$member" "member"
   wf "$member/lib/main.dart" 'int main() => 1;
 '
-  run_dartq_in dbg-member-status "$member" debug status --dir . --sdk "$base/sdk"
+  run_dartq_in dbg-member-status "$member" debug status --dir . --sdk "$base/sdk" --format json
   assert_eq "$DQ_RC" 0 "the member-subdirectory session answers"
   assert_eq "$(cat "$(out_file dbg-member-status)")" "[]" "the member's empty debug registry lists empty"
   run_dartq dbg-member-stop session stop "$member"
@@ -136,16 +136,16 @@ void main() {
   assert_eq "$DQ_RC" 0 "the loop tree's session starts on the real SDK"
 
   # Paused-on-start takeover: launch → arm → resume.
-  run_dartq dbg-launch debug launch bin/loop.dart --dir "$tree" --sdk "$DARTQ_DART_SDK"
+  run_dartq dbg-launch debug launch bin/loop.dart --dir "$tree" --sdk "$DARTQ_DART_SDK" --format json
   assert_eq "$DQ_RC" 0 "launch answers clean"
   json_check "$(out_file dbg-launch)" \
-    "j['sessionId']>0 and len(j['isolateIds'])>0 and j['mainIsolate']" \
+    "j['session_id']>0 and len(j['isolates'])>0 and j['main']" \
     "the launch answer carries the session id and the isolate set"
   local sid isolate bpid
-  sid="$(python3 -c "import json; print(json.load(open('$(out_file dbg-launch)'))['sessionId'])")"
-  isolate="$(python3 -c "import json; print(json.load(open('$(out_file dbg-launch)'))['mainIsolate'])")"
+  sid="$(python3 -c "import json; print(json.load(open('$(out_file dbg-launch)'))['session_id'])")"
+  isolate="$(python3 -c "import json; print(json.load(open('$(out_file dbg-launch)'))['main'])")"
   run_dartq dbg-bp-add debug breakpoint add \
-    --script "file://$tree/bin/loop.dart" --line 3 --dir "$tree" --sdk "$DARTQ_DART_SDK"
+    --script "file://$tree/bin/loop.dart" --line 3 --dir "$tree" --sdk "$DARTQ_DART_SDK" --format json
   assert_eq "$DQ_RC" 0 "the line breakpoint arms while paused"
   json_check "$(out_file dbg-bp-add)" "len(j['id'])>0" "the arm answer carries the breakpoint id"
   bpid="$(python3 -c "import json; print(json.load(open('$(out_file dbg-bp-add)'))['id'])")"
@@ -155,21 +155,21 @@ void main() {
   # tight loop) — the snapshot waits for the pause, bounded by the
   # session config.
   run_dartq dbg-snap debug snapshot --isolate "$isolate" \
-    --dir "$tree" --sdk "$DARTQ_DART_SDK"
+    --dir "$tree" --sdk "$DARTQ_DART_SDK" --format json
   assert_eq "$DQ_RC" 0 "the app hits the breakpoint; the snapshot answers"
   json_check "$(out_file dbg-snap)" \
     "j['reason']['kind']=='breakpoint' and j['location']['line']==3" \
     "the stop names the breakpoint at line 3"
-  run_dartq dbg-eval debug evaluate --frameIndex 0 'n + 40' \
-    --dir "$tree" --sdk "$DARTQ_DART_SDK"
+  run_dartq dbg-eval debug evaluate --frame-index 0 'n + 40' \
+    --dir "$tree" --sdk "$DARTQ_DART_SDK" --format json
   assert_eq "$DQ_RC" 0 "evaluation in the paused frame answers"
   json_check "$(out_file dbg-eval)" "j['value']=='40'" "the frame's n is 0; n + 40 evaluates to 40"
-  run_dartq dbg-step debug step over --dir "$tree" --sdk "$DARTQ_DART_SDK"
+  run_dartq dbg-step debug step over --dir "$tree" --sdk "$DARTQ_DART_SDK" --format json
   assert_eq "$DQ_RC" 0 "step-over answers with the next snapshot"
   json_check "$(out_file dbg-step)" "j['reason']['kind']=='step'" "the stop names the step"
   run_dartq dbg-exc debug exception-pause uncaught --dir "$tree" --sdk "$DARTQ_DART_SDK"
   assert_eq "$DQ_RC" 0 "the exception pause mode sets on the stopped isolate"
-  run_dartq dbg-bp-rm debug breakpoint rm --breakpointId "$bpid" \
+  run_dartq dbg-bp-rm debug breakpoint rm --breakpoint-id "$bpid" \
     --dir "$tree" --sdk "$DARTQ_DART_SDK"
   assert_eq "$DQ_RC" 0 "the breakpoint removes"
   run_dartq dbg-resume2 debug resume --dir "$tree" --sdk "$DARTQ_DART_SDK"
@@ -179,7 +179,7 @@ void main() {
   # next print carries the change (the edit-reload half of the loop).
   wf "$tree/lib/msg.dart" "String message() => 'v2';
 "
-  run_dartq dbg-reload debug reload --dir "$tree" --sdk "$DARTQ_DART_SDK"
+  run_dartq dbg-reload debug reload --dir "$tree" --sdk "$DARTQ_DART_SDK" --format json
   assert_eq "$DQ_RC" 0 "hot reload answers"
   json_check "$(out_file dbg-reload)" "j['ok']==True" "the reload succeeded"
   DBG_NEEDLE="v2"
@@ -188,22 +188,22 @@ void main() {
   else
     bad "the reloaded program prints v2" "no v2 line within 15 s: $(tail -c 200 "$EVIDENCE/dbg-out-poll.out" 2>/dev/null)"
   fi
-  run_dartq dbg-events debug events --limit 8 --dir "$tree" --sdk "$DARTQ_DART_SDK"
+  run_dartq dbg-events debug events --limit 8 --dir "$tree" --sdk "$DARTQ_DART_SDK" --format json
   assert_eq "$DQ_RC" 0 "the cursor-paged event read answers"
-  json_check "$(out_file dbg-events)" "len(j['events'])>0 and 'nextCursor' in j" \
+  json_check "$(out_file dbg-events)" "len(j['events'])>0 and 'next_cursor' in j" \
     "the events page carries entries and the next cursor"
 
   # Endings, per the ownership contract: detach leaves the program
   # running (the ws URI answers); a re-attach reaches it but its stop
   # ends the debug session only (an attached program was never ours);
   # the zero-orphan guarantee is a launched session stopped directly.
-  run_dartq dbg-detach debug detach --dir "$tree" --sdk "$DARTQ_DART_SDK"
+  run_dartq dbg-detach debug detach --dir "$tree" --sdk "$DARTQ_DART_SDK" --format json
   assert_eq "$DQ_RC" 0 "detach answers"
   local wsuri
-  wsuri="$(python3 -c "import json; print(json.load(open('$(out_file dbg-detach)'))['wsUri'])")"
+  wsuri="$(python3 -c "import json; print(json.load(open('$(out_file dbg-detach)'))['ws_uri'])")"
   case "$wsuri" in
     ws://*) ok "detach returns the re-attach handle ($wsuri)" ;;
-    *) bad "detach returns the re-attach handle" "wsUri: [$wsuri]" ;;
+    *) bad "detach returns the re-attach handle" "ws_uri: [$wsuri]" ;;
   esac
   sleep 0.5
   if ps -axo command= | grep -F "$tree/bin/loop.dart" | grep -v grep >/dev/null; then
@@ -211,22 +211,22 @@ void main() {
   else
     bad "the detached program keeps running" "no bin/loop.dart process after detach"
   fi
-  run_dartq dbg-attach debug attach --wsUri "$wsuri" --dir "$tree" --sdk "$DARTQ_DART_SDK"
+  run_dartq dbg-attach debug attach --ws-uri "$wsuri" --dir "$tree" --sdk "$DARTQ_DART_SDK" --format json
   assert_eq "$DQ_RC" 0 "re-attach reaches the still-running program"
-  json_check "$(out_file dbg-attach)" "j['sessionId']>$sid" "the re-attach owns a fresh session id"
+  json_check "$(out_file dbg-attach)" "j['session_id']>$sid" "the re-attach owns a fresh session id"
   local sid2
-  sid2="$(python3 -c "import json; print(json.load(open('$(out_file dbg-attach)'))['sessionId'])")"
+  sid2="$(python3 -c "import json; print(json.load(open('$(out_file dbg-attach)'))['session_id'])")"
   # Two live sessions (the re-attach plus a fresh launch): the
   # selector-free face refuses to guess and lists every candidate; the
   # explicit -s / --session spellings disambiguate.
-  run_dartq dbg-launch2 debug launch bin/loop.dart --dir "$tree" --sdk "$DARTQ_DART_SDK"
+  run_dartq dbg-launch2 debug launch bin/loop.dart --dir "$tree" --sdk "$DARTQ_DART_SDK" --format json
   assert_eq "$DQ_RC" 0 "a second launch opens a second session"
   local sid3
-  sid3="$(python3 -c "import json; print(json.load(open('$(out_file dbg-launch2)'))['sessionId'])")"
-  run_dartq dbg-ambiguous debug resume --dir "$tree" --sdk "$DARTQ_DART_SDK"
+  sid3="$(python3 -c "import json; print(json.load(open('$(out_file dbg-launch2)'))['session_id'])")"
+  run_dartq dbg-ambiguous debug resume --dir "$tree" --sdk "$DARTQ_DART_SDK" --format json
   assert_eq "$DQ_RC" 1 "no -s with two live sessions is the domain tier"
   json_check "$(out_file dbg-ambiguous)" \
-    "j['error']['message'].startswith('DARTQ/DEBUG/AMBIGUOUS_SESSION') and '#$sid2 attach ws://' in j['error']['message'] and '#$sid3 dart bin/loop.dart' in j['error']['message']" \
+    "j['error']['msg'].startswith('DARTQ/DEBUG/AMBIGUOUS_SESSION') and '#$sid2 attach ws://' in j['error']['msg'] and '#$sid3 dart bin/loop.dart' in j['error']['msg']" \
     "the ambiguity lists both candidates (id + kind + script / ws URI)"
   run_dartq dbg-stop-reattach debug stop -s "$sid2" --dir "$tree" --sdk "$DARTQ_DART_SDK"
   assert_eq "$DQ_RC" 0 "-s picks the re-attached session to stop"

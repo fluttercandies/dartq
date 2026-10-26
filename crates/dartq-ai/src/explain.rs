@@ -8,16 +8,16 @@
 //! the caller owns — it never sees the engine or the storage. The inputs
 //! are borrowed faces, each mapped to a report section:
 //!
-//! | Section           | Input face                                             |
+//! | Section (wire)    | Input face                                             |
 //! |-------------------|--------------------------------------------------------|
 //! | `declaration`     | the name's declaration hits (`SymbolDeclHit`)          |
-//! | `inheritance`     | the primary declaration's `extends` supertype edges    |
-//! | `interfaces`      | the remaining clause edges (`with`/`on`/`implements`)  |
-//! | `constructors`    | the caller-rendered constructor facts of the container |
+//! | `bases`           | the primary declaration's `extends` supertype edges    |
+//! | `ifaces`          | the remaining clause edges (`with`/`on`/`implements`)  |
+//! | `ctors`           | the caller-rendered constructor facts of the container |
 //! | `methods`         | the declaring container's rows via the `decls_of` probe |
-//! | `references`      | resolved [`RefRow`]s targeting the primary declaration |
-//! | `dependencies`    | the declaring library's importers ([`RevImportGraph`]) |
-//! | `affected_tests`  | the declaring library's [`TestGraph`] rows             |
+//! | `refs`            | resolved [`RefRow`]s targeting the primary declaration |
+//! | `deps`            | the declaring library's importers ([`RevImportGraph`]) |
+//! | `tests`           | the declaring library's [`TestGraph`] rows             |
 //!
 //! The supertype split follows the clause each edge was written in (the
 //! `supertypes_of` face carries the index's resolved edges as
@@ -39,24 +39,24 @@
 //! * `declaration` — the primary declaration is the path-ascending first
 //!   hit (a name declared in several files resolves to the first path; the
 //!   remaining hits are the query face's domain).
-//! * `inheritance`/`interfaces` — ascending by supertype name, then by
+//! * `bases`/`ifaces` — ascending by supertype name, then by
 //!   target file path; unresolved rows (a supertype outside the analyzed
 //!   set, no file) sort before resolved rows of the same name.
 //! * `methods` — ascending by member name, then by range start. Fields,
 //!   getters, and setters ride the array under their own `kind` (there are
 //!   no separate member sections).
-//! * `constructors` — ascending by constructor name (the unnamed face's
+//! * `ctors` — ascending by constructor name (the unnamed face's
 //!   bare container name sorts before the `A.named` selectors).
-//! * `references` — ascending by use-site file path, then by range start.
+//! * `refs` — ascending by use-site file path, then by range start.
 //!   Rows for same-named declarations in other files are filtered out, so
 //!   a caller may hand the whole by-name reference union.
-//! * `dependencies` — ascending by library path, deduplicated. The rows
+//! * `deps` — ascending by library path, deduplicated. The rows
 //!   are the **reverse** edges: the libraries that import the declaring
 //!   library (the shared [`RevImportGraph`] CSR — who depends on the
 //!   symbol, the same orientation `affected_tests` answers). Symbol-level
 //!   forward narrowing (which imports feed this symbol's resolution)
 //!   waits for the engine's resolution faces.
-//! * `affected_tests` — ascending by test library path, deduplicated.
+//! * `tests` — ascending by test library path, deduplicated.
 //!
 //! # Verbosity
 //!
@@ -120,7 +120,7 @@ pub struct SymbolDeclHit<'a> {
     pub decl: &'a DeclRow,
 }
 
-/// The explain report, JSON contract `schema_version: 1`.
+/// The explain report, JSON contract `v: 1` (the short-vocabulary envelope).
 ///
 /// Section arrays are `Some` at [`Verbosity::Compact`] and
 /// [`Verbosity::Full`] (empty sections included — the seam is visible),
@@ -128,36 +128,41 @@ pub struct SymbolDeclHit<'a> {
 /// replaces them. `declaration` is `None` when the symbol is unknown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplainReport {
-    /// The output contract version ([`EXPLAIN_SCHEMA_VERSION`]).
+    /// The output contract version ([`EXPLAIN_SCHEMA_VERSION`]). Wire: `v`.
+    #[serde(rename = "v")]
     pub schema_version: u32,
-    /// The queried name, as spelled by the caller.
+    /// The queried name, as spelled by the caller. Wire: `sym`.
+    #[serde(rename = "sym")]
     pub symbol: String,
     /// The primary declaration; `None` when the name declares nowhere.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declaration: Option<DeclarationRow>,
     /// Direct supertypes (the `extends` clause / mixin application head).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Wire: `bases`.
+    #[serde(rename = "bases", skip_serializing_if = "Option::is_none")]
     pub inheritance: Option<Vec<SuperTypeRow>>,
     /// Implemented/mixed-in types: the `with`/`on`/`implements` supertype
-    /// edges, each row naming its clause.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// edges, each row naming its clause. Wire: `ifaces`.
+    #[serde(rename = "ifaces", skip_serializing_if = "Option::is_none")]
     pub interfaces: Option<Vec<SuperTypeRow>>,
     /// Declared constructors: the unnamed face under the container's own
-    /// name, named ones under the `A.named` selector spelling.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// name, named ones under the `A.named` selector spelling. Wire:
+    /// `ctors`.
+    #[serde(rename = "ctors", skip_serializing_if = "Option::is_none")]
     pub constructors: Option<Vec<ConstructorRow>>,
     /// The container's members: methods, getters, setters, and fields,
     /// kind-tagged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub methods: Option<Vec<MemberRow>>,
-    /// Resolved use sites of the primary declaration.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Resolved use sites of the primary declaration. Wire: `refs`.
+    #[serde(rename = "refs", skip_serializing_if = "Option::is_none")]
     pub references: Option<Vec<ReferenceRow>>,
     /// The libraries that import the declaring library (reverse edges).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Wire: `deps`.
+    #[serde(rename = "deps", skip_serializing_if = "Option::is_none")]
     pub dependencies: Option<Vec<DependencyRow>>,
-    /// The test libraries exercising the declaring library.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The test libraries exercising the declaring library. Wire: `tests`.
+    #[serde(rename = "tests", skip_serializing_if = "Option::is_none")]
     pub affected_tests: Option<Vec<AffectedTest>>,
     /// Per-section row counts (`minimal` only, replacing the arrays).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -177,8 +182,10 @@ pub struct DeclarationRow {
     /// trimmed at `minimal` (a convenience field, never a locator).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container: Option<String>,
-    /// The name token's span, `[startOffset, endOffset)`.
-    pub range: [u32; 2],
+    /// The name token's start offset (UTF-16 code units).
+    pub off: u32,
+    /// The name token's span length.
+    pub len: u32,
 }
 
 /// One supertype row of `inheritance`/`interfaces`.
@@ -221,7 +228,8 @@ pub struct ConstructorRow {
     /// The member family — always [`MEMBER_KIND_CONSTRUCTOR`].
     pub kind: String,
     /// The rendered parameter face, the caller's [`ConstructorFact`]
-    /// signature.
+    /// signature. Wire: `sig`.
+    #[serde(rename = "sig")]
     pub signature: String,
 }
 
@@ -232,8 +240,10 @@ pub struct MemberRow {
     pub name: String,
     /// The member family: `method`, `getter`, `setter`, or `field`.
     pub kind: String,
-    /// The name token's span, `[startOffset, endOffset)`.
-    pub range: [u32; 2],
+    /// The name token's start offset (UTF-16 code units).
+    pub off: u32,
+    /// The name token's span length.
+    pub len: u32,
 }
 
 /// One reference row of `references`.
@@ -243,8 +253,10 @@ pub struct ReferenceRow {
     pub file: String,
     /// The relation kind (the frozen v1 spelling, [`ref_kind_name`]).
     pub kind: String,
-    /// The use site's span, `[startOffset, endOffset)`.
-    pub range: [u32; 2],
+    /// The use site's start offset (UTF-16 code units).
+    pub off: u32,
+    /// The use site's span length.
+    pub len: u32,
     /// The use has an explicit qualifier and cannot be shadowed by a
     /// local declaration.
     pub qualified: bool,
@@ -271,19 +283,25 @@ pub struct DependencyRow {
 /// section, always all seven (a zero is a value, not an absent section).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SectionCounts {
-    /// Rows `inheritance` would carry.
+    /// Rows `inheritance` would carry (wire: `bases`).
+    #[serde(rename = "bases")]
     pub inheritance: u32,
-    /// Rows `interfaces` would carry.
+    /// Rows `interfaces` would carry (wire: `ifaces`).
+    #[serde(rename = "ifaces")]
     pub interfaces: u32,
-    /// Rows `constructors` would carry.
+    /// Rows `constructors` would carry (wire: `ctors`).
+    #[serde(rename = "ctors")]
     pub constructors: u32,
     /// Rows `methods` would carry.
     pub methods: u32,
-    /// Rows `references` would carry.
+    /// Rows `references` would carry (wire: `refs`).
+    #[serde(rename = "refs")]
     pub references: u32,
-    /// Rows `dependencies` would carry.
+    /// Rows `dependencies` would carry (wire: `deps`).
+    #[serde(rename = "deps")]
     pub dependencies: u32,
-    /// Rows `affected_tests` would carry.
+    /// Rows `affected_tests` would carry (wire: `tests`).
+    #[serde(rename = "tests")]
     pub affected_tests: u32,
 }
 
@@ -544,10 +562,8 @@ fn declaration_row<'d, 'f>(
         name: strings.resolve(hit.decl.name).to_owned(),
         kind: decl_kind_name(hit.decl.kind).to_owned(),
         container,
-        range: [
-            hit.decl.range.offset,
-            hit.decl.range.offset + hit.decl.range.length,
-        ],
+        off: hit.decl.range.offset,
+        len: hit.decl.range.length,
     }
 }
 
@@ -576,10 +592,11 @@ fn member_rows<'d>(
         .map(|row| MemberRow {
             name: strings.resolve(row.name).to_owned(),
             kind: decl_kind_name(row.kind).to_owned(),
-            range: [row.range.offset, row.range.offset + row.range.length],
+            off: row.range.offset,
+            len: row.range.length,
         })
         .collect();
-    rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.range.cmp(&b.range)));
+    rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.off.cmp(&b.off)));
     rows
 }
 
@@ -643,13 +660,14 @@ fn reference_rows<'f>(
             .map(|row| ReferenceRow {
                 file: file_label_of(row.file).to_owned(),
                 kind: ref_kind_name(row.kind).to_owned(),
-                range: [row.range.offset, row.range.offset + row.range.length],
+                off: row.range.offset,
+                len: row.range.length,
                 qualified: row.qualified(),
             })
             .collect(),
         None => Vec::new(),
     };
-    rows.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.range.cmp(&b.range)));
+    rows.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.off.cmp(&b.off)));
     rows
 }
 
@@ -886,38 +904,39 @@ mod tests {
         assert_eq!(
             value,
             serde_json::json!({
-                "schema_version": 1,
-                "symbol": "Foo",
+                "v": 1,
+                "sym": "Foo",
                 "declaration": {
                     "file": "a.dart",
                     "name": "Foo",
                     "kind": "class",
-                    "range": [40, 43],
+                    "off": 40,
+                    "len": 3,
                 },
-                "inheritance": [{"name": "Bar", "file": "a.dart", "clause": "extends"}],
-                "interfaces": [
+                "bases": [{"name": "Bar", "file": "a.dart", "clause": "extends"}],
+                "ifaces": [
                     {"name": "Mix", "file": "b.dart", "clause": "with"},
                     {"name": "Remote", "clause": "implements"},
                 ],
-                "constructors": [
-                    {"name": "Foo", "kind": "constructor", "signature": "Foo()"},
-                    {"name": "Foo.named", "kind": "constructor", "signature": "Foo.named(int x)"},
+                "ctors": [
+                    {"name": "Foo", "kind": "constructor", "sig": "Foo()"},
+                    {"name": "Foo.named", "kind": "constructor", "sig": "Foo.named(int x)"},
                 ],
                 "methods": [
-                    {"name": "area", "kind": "method", "range": [90, 93]},
-                    {"name": "label", "kind": "field", "range": [70, 73]},
+                    {"name": "area", "kind": "method", "off": 90, "len": 3},
+                    {"name": "label", "kind": "field", "off": 70, "len": 3},
                 ],
-                "references": [
-                    {"file": "b.dart", "kind": "reference", "range": [10, 13], "qualified": false},
-                    {"file": "b.dart", "kind": "invoked", "range": [50, 53], "qualified": false},
-                    {"file": "c.dart", "kind": "invoked", "range": [300, 303], "qualified": false},
+                "refs": [
+                    {"file": "b.dart", "kind": "reference", "off": 10, "len": 3, "qualified": false},
+                    {"file": "b.dart", "kind": "invoked", "off": 50, "len": 3, "qualified": false},
+                    {"file": "c.dart", "kind": "invoked", "off": 300, "len": 3, "qualified": false},
                 ],
-                "dependencies": [
+                "deps": [
                     {"path": "package:t/a_test.dart"},
                     {"path": "package:t/b.dart"},
                     {"path": "package:t/c.dart"},
                 ],
-                "affected_tests": [{"path": "package:t/a_test.dart"}],
+                "tests": [{"path": "package:t/a_test.dart"}],
             }),
             "every section present, sorted by its documented key"
         );
@@ -964,7 +983,7 @@ mod tests {
             })
         );
         let value = serde_json::to_value(&report).expect("serialize");
-        assert!(value.get("inheritance").is_none(), "arrays are dropped");
+        assert!(value.get("bases").is_none(), "arrays are dropped");
         assert_eq!(value["counts"]["methods"], 2);
     }
 

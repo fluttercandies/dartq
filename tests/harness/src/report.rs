@@ -1096,15 +1096,22 @@ fn tildify_home(cmd: &str) -> String {
 /// The replay argv's `--daemon-cmd` template, derived from the run's dartq
 /// command: same program, `daemon` subcommand, non-analysis flags kept, the
 /// corpus dir as the literal `{dir}` placeholder the replay template
-/// contract substitutes. `./dartq analyze --format=machine --sdk X` ->
+/// contract substitutes. `./dartq analyze --format=json --sdk X` ->
 /// `./dartq daemon {dir} --sdk X` (the daemon's dir argument is the
 /// untouched positional — there is no `--dir` flag).
 fn daemon_template(dartq_cmd: &str) -> String {
     let mut parts = dartq_cmd.split_whitespace();
     let program = parts.next().unwrap_or_default().to_string();
     let mut argv = vec![program, "daemon".to_string(), "{dir}".to_string()];
+    let mut skip_value = false;
     for arg in parts {
-        if matches!(arg, "analyze" | "check" | "--format=machine") {
+        if skip_value {
+            // The value token of a space-spelled `--format json` pair.
+            skip_value = false;
+            continue;
+        }
+        if matches!(arg, "analyze" | "check" | "--format") || arg.starts_with("--format=") {
+            skip_value = arg == "--format";
             continue;
         }
         argv.push(arg.to_string());
@@ -1681,14 +1688,36 @@ mod tests {
         fs::remove_dir_all(&out).ok();
     }
 
-    /// Attribution report (dartq crash tier): `dartq_panic_files` with corpus
+    /// `daemon_template` drops every analysis-only token: the subcommand, both
+/// `--format` spellings (`=` and the space pair), keeping everything else
+/// (#2606: the dartq templates now say `--format=json`; the retired
+/// `--format=machine` spelling stays dropped too).
+#[test]
+fn daemon_template_drops_format_spellings() {
+    assert_eq!(
+        daemon_template("./dartq analyze --format=json --sdk X"),
+        "./dartq daemon {dir} --sdk X"
+    );
+    assert_eq!(
+        daemon_template("./dartq analyze --format json --sdk X"),
+        "./dartq daemon {dir} --sdk X",
+        "the space spelling drops its value token too"
+    );
+    assert_eq!(
+        daemon_template("./dartq check --format=machine"),
+        "./dartq daemon {dir}",
+        "the retired machine spelling still drops"
+    );
+}
+
+/// Attribution report (dartq crash tier): `dartq_panic_files` with corpus
     /// labels, the not-judged gate marker, partial flag and probe accounting.
     #[test]
     fn panic_report_carries_attribution_fields() {
         let meta = RunMeta {
             corpus_dir: "/corpus".into(),
             oracle_cmd: "dart analyze machine".into(),
-            dartq_cmd: "dartq check --format=machine".into(),
+            dartq_cmd: "dartq check --format=json".into(),
             oracle_version: "Dart SDK version: 3.9.4 (stable) on \"macos_arm64\"".into(),
             threshold: 0.99,
             severity_filter: "all".into(),
@@ -1725,7 +1754,7 @@ mod tests {
                 .contains("not judged"),
             "the panic path never claims a verdict"
         );
-        assert_eq!(parsed["meta"]["dartq_cmd"], "dartq check --format=machine");
+        assert_eq!(parsed["meta"]["dartq_cmd"], "dartq check --format=json");
 
         fs::remove_dir_all(&out).ok();
     }
@@ -1792,7 +1821,7 @@ mod tests {
             dir,
             known,
             report_path,
-            dartq_cmd: "./target/debug/dartq analyze --format=machine --sdk /sdk",
+            dartq_cmd: "./target/debug/dartq analyze --format=json --sdk /sdk",
             oracle_cmd: "dart analyze --format=machine",
             captured_at,
         }
@@ -1896,7 +1925,7 @@ mod tests {
         assert_eq!(parsed["source"], "int a = 1;\nint b = 2;\n");
         assert_eq!(
             parsed["source_run"]["dartq_cmd"],
-            "./target/debug/dartq analyze --format=machine --sdk /sdk"
+            "./target/debug/dartq analyze --format=json --sdk /sdk"
         );
         assert_eq!(
             parsed["source_run"]["report"],

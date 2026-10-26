@@ -32,7 +32,7 @@ SCRIPT
   assert_eq "$?" 0 "the MCP client drove one analyze over the session"
 
   # The full read carries the lifecycle records; every line parses.
-  run_dartq_in ev-full "$base/ev" events session "$base/ev" --limit 100
+  run_dartq_in ev-full "$base/ev" events session "$base/ev" --limit 100 --format json
   assert_eq "$DQ_RC" 0 "the session handle reads clean"
   jsonl_check "$(out_file ev-full)" "'event' in j" "every event line carries its event name"
   local names total
@@ -48,14 +48,14 @@ for line in open('$(out_file ev-full)'):
 
   # Pagination: limit 1 gives exactly the first record and its seq; the
   # --since read returns exactly the remainder, all past the cursor.
-  run_dartq_in ev-page1 "$base/ev" events session "$base/ev" --limit 1
+  run_dartq_in ev-page1 "$base/ev" events session "$base/ev" --limit 1 --format json
   assert_eq "$(jsonl_count "$(out_file ev-page1)")" 1 "limit 1 reads one event"
   total="$(jsonl_count "$(out_file ev-full)")"
   first_seq="$(python3 -c "
 import json
 print(json.loads(open('$(out_file ev-page1)').read())['seq'])
 ")"
-  run_dartq_in ev-rest "$base/ev" events session "$base/ev" --since "$first_seq" --limit 100
+  run_dartq_in ev-rest "$base/ev" events session "$base/ev" --since "$first_seq" --limit 100 --format json
   assert_eq "$(jsonl_count "$(out_file ev-rest)")" "$((total - 1))" \
     "--since <seq> returns exactly the remaining events"
   jsonl_check "$(out_file ev-rest)" "j['seq']>$first_seq" "every paged event's seq is past the cursor"
@@ -68,7 +68,7 @@ print(json.loads(open('$(out_file ev-page1)').read())['seq'])
   gen_files "$base/big" 800
   run_dartq_in big-start "$base/big" session start "$base/big" --sdk "$base/sdk"
   assert_eq "$DQ_RC" 0 "the big-tree session starts"
-  run_dartq_in big-progress-0 "$base/big" events progress "$base/big"
+  run_dartq_in big-progress-0 "$base/big" events progress "$base/big" --format json
   assert_eq "$DQ_RC" 0 "a pre-analysis progress read is clean (may print nothing)"
   cat >"$EVIDENCE/big-mcp.json" <<'SCRIPT'
 {"requests": [
@@ -82,14 +82,14 @@ SCRIPT
   python3 "$E2E_ROOT/lib/mcp_driver.py" "$DARTQ" "$base/big" "$base/sdk" \
     "$EVIDENCE/big-mcp.json" >"$EVIDENCE/big-mcp.log" 2>&1
   assert_eq "$?" 0 "the cold analysis ran over the resident engine"
-  run_dartq_in big-progress "$base/big" events progress "$base/big"
+  run_dartq_in big-progress "$base/big" events progress "$base/big" --format json
   assert_eq "$DQ_RC" 0 "the progress handle reads clean"
   json_check "$(out_file big-progress)" \
     "j['type']=='progress' and j['files_scanned']>=800 and j['cursor']==j['files_scanned']" \
     "the snapshot counts the swept tree and echoes the cursor"
   json_check "$(out_file big-progress)" "j['current_package'] is not None" \
     "the current package is named"
-  run_dartq_in big-progress-done "$base/big" events progress "$base/big" --since 999999
+  run_dartq_in big-progress-done "$base/big" events progress "$base/big" --since 999999 --format json
   assert_eq "$DQ_RC" 0 "a past-end cursor reads clean"
   assert_eq "$(wc -c <"$(out_file big-progress-done)" | tr -d ' ')" 0 \
     "a past-end cursor prints nothing"
@@ -107,7 +107,7 @@ SCRIPT
   run_dartq_in tf-start "$tf" session start "$tf" --sdk "$DARTQ_DART_SDK"
   assert_eq "$DQ_RC" 0 "the testface session starts on the real SDK"
   # The tool result body is the daemon answer stringified into the text
-  # content field: runId / exitCode live inside result.content[0].text.
+  # content field: run_id / exit_code live inside the LON content text.
   cat >"$EVIDENCE/tf-mcp.json" <<'SCRIPT'
 {"requests": [
   {"id": 1, "method": "initialize", "params": {},
@@ -116,13 +116,13 @@ SCRIPT
    "params": {"name": "dartq_test",
               "arguments": {"args": ["test/pass_test.dart"]}},
    "expect": ["result.isError: false",
-              "result.content.0.text contains=runId"]},
+              "result.content.0.text contains=run_id"]},
   {"id": 3, "method": "tools/call",
    "params": {"name": "dartq_test_status", "arguments": {}},
-   "repeat_until": {"when": ["result.content.0.text contains=exitCode"],
+   "repeat_until": {"when": ["result.content.0.text contains=exit_code"],
                     "tries": 60, "delay_s": 2.0},
    "expect": ["result.isError: false",
-              "result.content.0.text contains=exitCode"]},
+              "result.content.0.text contains=exit_code"]},
   {"id": 4, "method": "tools/call",
    "params": {"name": "dartq_events",
               "arguments": {"handle": "session", "limit": 2}},
@@ -135,7 +135,7 @@ SCRIPT
   assert_contains "$(cat "$EVIDENCE/tf-mcp.log")" '"pass": true' \
     "every scripted expectation passed"
   # The same log reads through the CLI face, cursor-paginated.
-  run_dartq_in tf-cli-events "$tf" events session "$tf" --limit 3
+  run_dartq_in tf-cli-events "$tf" events session "$tf" --limit 3 --format json
   assert_eq "$DQ_RC" 0 "the CLI events face reads the same log"
   run_dartq_in tf-stop "$tf" session stop "$tf"
   assert_eq "$DQ_RC" 0 "testface teardown"

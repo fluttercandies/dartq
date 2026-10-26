@@ -6,9 +6,9 @@
 //! one implementation the daemon's RPC face will share. This binary adds
 //! argument parsing, the crash tier, and the usage-tier mapping.
 //!
-//! Output is the unified JSON contract (`schema_version: 1`), one
-//! single-line object — the impact/compat convention for the newer command
-//! family, not the query faces' machine grammar.
+//! Output is the unified JSON contract (`v: 1`), one single-line object
+//! — the impact/compat convention for the newer command family, not the
+//! query faces' machine grammar.
 
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
@@ -44,6 +44,12 @@ pub(crate) struct IndexArgs {
     /// tier table).
     #[arg(short = 'v', long, value_enum, default_value_t = Verbosity::Compact)]
     pub(crate) verbosity: Verbosity,
+    /// Output format for the summary face: `lon` (the default) or
+    /// `json` (both the same value), or `text` (the indented report).
+    /// The `--full` export stream is the commands crate's JSONL writer
+    /// and stays JSON regardless.
+    #[arg(long, value_enum, default_value_t = crate::OutputFormat::Lon)]
+    pub(crate) format: crate::OutputFormat,
 }
 
 /// Crash tier like the other engine faces: a panic aborts with exit 4. The
@@ -83,14 +89,15 @@ fn run_checked(args: &IndexArgs, out: &mut impl Write) -> u8 {
         }
     };
 
-    let written = out
-        .write_all(
-            serde_json::to_string(&built.to_json())
-                .expect("IndexRun serializes")
-                .as_bytes(),
-        )
-        .and_then(|()| out.write_all(b"\n"))
-        .and_then(|()| out.flush());
+    let report = built.to_json();
+    let written = match args.format {
+        crate::OutputFormat::Json => out
+            .write_all(serde_json::to_string(&report).expect("IndexRun serializes").as_bytes())
+            .and_then(|()| out.write_all(b"\n")),
+        crate::OutputFormat::Lon => crate::output::write_lon(out, &report),
+        crate::OutputFormat::Text => crate::output::write_text_value(out, &report),
+    }
+    .and_then(|()| out.flush());
     if let Err(error) = written {
         eprintln!("dartq: internal error: writing the index report failed: {error}");
         return exit::INTERNAL_ERROR;
@@ -174,6 +181,7 @@ mod tests {
             dir: root.to_path_buf(),
             sdk: Some(root.join("sdk")),
             verbosity: Verbosity::Compact,
+            format: crate::OutputFormat::Json,
         }
     }
 
@@ -188,11 +196,11 @@ mod tests {
         assert_eq!(run(&args(&root), &mut out), exit::CLEAN);
         let json: serde_json::Value =
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["v"], 1);
         assert_eq!(json["files"], 2);
         assert_eq!(json["libraries"], 2);
         assert_eq!(json["symbols"], 4);
-        assert_eq!(json["references"], 2);
+        assert_eq!(json["refs"], 2);
 
         let missing = IndexArgs {
             dir: root.join("nope"),
@@ -226,7 +234,7 @@ mod tests {
         assert!(header.get("occurrences").is_none());
         for line in &lines[1..] {
             let doc: serde_json::Value = serde_json::from_str(line).expect("document");
-            assert_eq!(doc["schema_version"], 1);
+            assert_eq!(doc["v"], 1);
             assert!(doc["path"].is_string());
             assert!(doc["declarations"].is_array());
         }

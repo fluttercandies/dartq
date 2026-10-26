@@ -15,7 +15,7 @@
 //! Header (always line 1):
 //!
 //! ```json
-//! {"schema_version":1,"documents":3,"declarations":5}
+//! {"v":1,"documents":3,"declarations":5}
 //! ```
 //!
 //! `documents` counts the document lines that follow; `declarations` sums
@@ -27,7 +27,7 @@
 //! Document (one per analyzed file, ascending by canonical path):
 //!
 //! ```json
-//! {"schema_version":1,"path":"package:t/a.dart","symbol_count":2,
+//! {"v":1,"path":"package:t/a.dart","symbol_count":2,
 //!  "symbols":{"s1":"package:t/a.dart|Foo","s2":"package:t/a.dart|top"},
 //!  "declarations":[{"symbol":"s1","kind":"class","name":"Foo","range":[0,3]}],
 //!  "occurrences":[{"symbol":"s2","kind":"invoked","range":[40,42]}],
@@ -130,9 +130,9 @@ static INDEX_EXPORT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "title": "dartq index export document (schema_version 1)",
         "type": "object",
         "additionalProperties": false,
-        "required": ["schema_version", "path", "symbol_count"],
+        "required": ["v", "path", "symbol_count"],
         "properties": {
-            "schema_version": { "const": SCHEMA_VERSION_INDEX_EXPORT },
+            "v": { "const": SCHEMA_VERSION_INDEX_EXPORT },
             // The stable package-form file reference (pkg_label).
             "path": { "type": "string" },
             // The document's declaration-row count (the minimal tier's
@@ -188,10 +188,10 @@ static INDEX_EXPORT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
     })
 });
 
-const HEADER: &[&str] = &["schema_version", "documents", "declarations"];
+const HEADER: &[&str] = &["v", "documents", "declarations"];
 const HEADER_FULL: &[&str] = &["occurrences", "supertypes"];
 
-const DOCUMENT: &[&str] = &["schema_version", "path", "symbol_count"];
+const DOCUMENT: &[&str] = &["v", "path", "symbol_count"];
 const DOCUMENT_OPTIONAL: &[&str] =
     &["symbols", "declarations", "occurrences", "supertypes"];
 const DECLARATION: &[&str] = &["symbol", "kind", "name", "range"];
@@ -220,7 +220,7 @@ pub(crate) fn validate_index_export(value: &Value) -> Result<(), SchemaViolation
 
 fn validate_header(root: &serde_json::Map<String, Value>) -> Result<(), SchemaViolation> {
     exact_fields(root, HEADER, HEADER_FULL, "")?;
-    pinned_version(root, "schema_version", SCHEMA_VERSION_INDEX_EXPORT)?;
+    pinned_version(root, "v", SCHEMA_VERSION_INDEX_EXPORT)?;
     for key in ["documents", "declarations", "occurrences", "supertypes"] {
         if let Some(count) = root.get(key) {
             non_negative(count, key)?;
@@ -231,7 +231,7 @@ fn validate_header(root: &serde_json::Map<String, Value>) -> Result<(), SchemaVi
 
 fn validate_document(root: &serde_json::Map<String, Value>) -> Result<(), SchemaViolation> {
     exact_fields(root, DOCUMENT, DOCUMENT_OPTIONAL, "")?;
-    pinned_version(root, "schema_version", SCHEMA_VERSION_INDEX_EXPORT)?;
+    pinned_version(root, "v", SCHEMA_VERSION_INDEX_EXPORT)?;
     string(field(root, "path", "")?, "path")?;
     non_negative(field(root, "symbol_count", "")?, "symbol_count")?;
     if let Some(symbols) = root.get("symbols") {
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn header_and_document_shapes_validate() {
         let header = json!({
-            "schema_version": SCHEMA_VERSION_INDEX_EXPORT,
+            "v": SCHEMA_VERSION_INDEX_EXPORT,
             "documents": 2,
             "declarations": 5,
         });
@@ -374,7 +374,7 @@ mod tests {
         assert!(validate_index_export_at_tier(&header, Verbosity::Full).is_ok());
 
         let full_header = json!({
-            "schema_version": SCHEMA_VERSION_INDEX_EXPORT,
+            "v": SCHEMA_VERSION_INDEX_EXPORT,
             "documents": 2,
             "declarations": 5,
             "occurrences": 7,
@@ -388,7 +388,7 @@ mod tests {
         assert_eq!(violation.expected, "omitted at the compact tier");
 
         let minimal_doc = json!({
-            "schema_version": SCHEMA_VERSION_INDEX_EXPORT,
+            "v": SCHEMA_VERSION_INDEX_EXPORT,
             "path": "package:t/a.dart",
             "symbol_count": 2,
         });
@@ -400,7 +400,7 @@ mod tests {
         }
 
         let compact_doc = json!({
-            "schema_version": SCHEMA_VERSION_INDEX_EXPORT,
+            "v": SCHEMA_VERSION_INDEX_EXPORT,
             "path": "package:t/a.dart",
             "symbol_count": 1,
             "symbols": {"s1": "package:t/a.dart|Foo"},
@@ -418,7 +418,7 @@ mod tests {
         assert_eq!(violation.path, "symbols");
 
         let full_doc = json!({
-            "schema_version": SCHEMA_VERSION_INDEX_EXPORT,
+            "v": SCHEMA_VERSION_INDEX_EXPORT,
             "path": "package:t/b.dart",
             "symbol_count": 1,
             "symbols": {"s1": "package:t/b.dart|B"},
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn violations_name_the_first_bad_field() {
         let bad_kind = json!({
-            "schema_version": SCHEMA_VERSION_INDEX_EXPORT,
+            "v": SCHEMA_VERSION_INDEX_EXPORT,
             "path": "package:t/b.dart",
             "symbol_count": 0,
             "occurrences": [{
@@ -466,7 +466,7 @@ mod tests {
         assert_eq!(violation.path, "occurrences[0].kind");
 
         let bad_range = json!({
-            "schema_version": SCHEMA_VERSION_INDEX_EXPORT,
+            "v": SCHEMA_VERSION_INDEX_EXPORT,
             "path": "package:t/b.dart",
             "symbol_count": 1,
             "declarations": [{
@@ -477,7 +477,7 @@ mod tests {
         assert_eq!(violation.path, "declarations[0].range");
 
         let extra = json!({
-            "schema_version": SCHEMA_VERSION_INDEX_EXPORT,
+            "v": SCHEMA_VERSION_INDEX_EXPORT,
             "path": "package:t/b.dart",
             "symbol_count": 0,
             "language": "dart",
@@ -485,7 +485,7 @@ mod tests {
         let violation = validate_index_export(&extra).expect_err("undeclared field");
         assert_eq!(violation.path, "language");
 
-        let neither = json!({"schema_version": SCHEMA_VERSION_INDEX_EXPORT});
+        let neither = json!({"v": SCHEMA_VERSION_INDEX_EXPORT});
         assert!(validate_index_export(&neither).is_err());
     }
 }

@@ -5,7 +5,7 @@
 # Sweeps one generated mega-x tree (corpus-gen --scale <1k|10k|100k>
 # --seed 0, optionally --layout workspace / --version-ladder) through the
 # standard differential harness: oracle `dart analyze` vs `dartq analyze
-# --format=machine`, all severities judged, divergences persisted in the
+# --format=json`, all severities judged, divergences persisted in the
 # standard regression-case-v1 format. No bespoke diff logic — the harness
 # owns the (severity, code, file) caliber.
 #
@@ -78,7 +78,7 @@
 #                          required unless --dry-run.
 #        DARTQ_CMD           dartq side template; default
 #                          "./target/release/dartq analyze
-#                          --format=machine --sdk <DARTQ_DART_SDK>".
+#                          --format=json --sdk <DARTQ_DART_SDK>".
 #        HARNESS_BIN         default ./target/release/harness.
 set -euo pipefail
 # Locale-stable byte order for the sort/uniq summary sites.
@@ -169,7 +169,7 @@ scan_stats "$CORPUS"
 
 if [ "$DRY_RUN" -eq 1 ]; then
   sdk_desc="${DARTQ_DART_SDK:-<DARTQ_DART_SDK unset>}"
-  dartq_cmd="${DARTQ_CMD:-./target/release/dartq analyze --format=machine --sdk $sdk_desc}"
+  dartq_cmd="${DARTQ_CMD:-./target/release/dartq analyze --format=json --sdk $sdk_desc}"
   echo "mega-x-sweep: DRY RUN — statistics above; real run would execute:"
   echo "  materialize: cp -Rc $CORPUS -> target/evidence/mega-x-sweep/$LABEL/staging (clonefile, cp fallback)" \
     "$( [ "$SKIP_ZADV" -eq 1 ] && echo '; rm -rf staging/zadv ' )" \
@@ -200,7 +200,7 @@ if [ ! -x "$HARNESS_BIN" ] || [ ! -x ./target/release/dartq ]; then
   echo "mega-x-sweep: harness/dartq binaries missing after build" >&2
   exit 2
 fi
-DARTQ_CMD="${DARTQ_CMD:-./target/release/dartq analyze --format=machine --sdk $DARTQ_DART_SDK}"
+DARTQ_CMD="${DARTQ_CMD:-./target/release/dartq analyze --format=json --sdk $DARTQ_DART_SDK}"
 
 OUT="target/evidence/mega-x-sweep/$LABEL"
 if [ -d "$OUT" ]; then

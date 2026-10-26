@@ -43,9 +43,12 @@ pass its path as the `DIR` argument) so tools bind the right session.
 
 The server's `tools/list` carries every tool's parameter schema and a
 when-to-use / not-for description — including the full debug family
-(`dartq_debug_*`, the `dartq debug` verbs' mirror). Ask the host to list
-tools instead of loading a catalog here; the live answer is always
-current, a copied one only drifts.
+(`dartq_debug_*`, the `dartq debug` verbs' mirror). Tool arguments are
+snake_case (`new_name`, `session_id` where a tool names one) and every
+`tools/call` answer rides `content[0].text` as **canonical LON** over the
+short field vocabulary — the same encoding the CLI's `--format lon`
+default prints. Ask the host to list tools instead of loading a catalog
+here; the live answer is always current, a copied one only drifts.
 
 ## Resource
 

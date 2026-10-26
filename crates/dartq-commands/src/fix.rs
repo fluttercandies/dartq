@@ -7,11 +7,11 @@
 //! The machine document is the fix-patch schema verbatim:
 //!
 //! ```json
-//! { "file": "lib/foo.dart", "schema_version": 1,
+//! { "file": "lib/foo.dart", "v": 1,
 //!   "edits": [
-//!     { "offset": 123, "length": 8, "replacement": "Bar",
-//!       "anchor": { "line": 10, "column": 7, "context_before": "final Fo",
-//!                   "context_after": "() = " } } ] }
+//!     { "off": 123, "len": 8, "text": "Bar",
+//!       "anchor": { "line": 10, "col": 7, "before": "final Fo",
+//!                   "after": "() = " } } ] }
 //! ```
 //!
 //! `offset`/`length` are the engine's UTF-16 `[offset, offset + length)`
@@ -638,32 +638,29 @@ pub fn apply(text: &str, edits: &[Edit]) -> (String, Vec<EditOutcome>) {
 fn anchor_json(anchor: &Anchor) -> serde_json::Map<String, serde_json::Value> {
     let mut json = serde_json::Map::new();
     json.insert("line".into(), anchor.line.into());
-    json.insert("column".into(), anchor.column.into());
+    json.insert("col".into(), anchor.column.into());
     if !anchor.context_before.is_empty() {
-        json.insert(
-            "context_before".into(),
-            anchor.context_before.clone().into(),
-        );
+        json.insert("before".into(), anchor.context_before.clone().into());
     }
     if !anchor.context_after.is_empty() {
-        json.insert("context_after".into(), anchor.context_after.clone().into());
+        json.insert("after".into(), anchor.context_after.clone().into());
     }
     json
 }
 
-/// One edit row at its locator floor: offset/length/replacement plus the
-/// provenance tag — the red line the patch rows never drop (the minimal
-/// tier trims prose and convenience, never location).
+/// One edit row at its locator floor: off/len/text plus the provenance
+/// tag — the red line the patch rows never drop (the minimal tier trims
+/// prose and convenience, never location).
 fn edit_floor(edit: &Edit, source: &str) -> serde_json::Map<String, serde_json::Value> {
     let mut row = serde_json::Map::new();
-    row.insert("offset".into(), edit.offset.into());
-    row.insert("length".into(), edit.length.into());
-    row.insert("replacement".into(), edit.replacement.clone().into());
-    row.insert("source".into(), source.into());
+    row.insert("off".into(), edit.offset.into());
+    row.insert("len".into(), edit.length.into());
+    row.insert("text".into(), edit.replacement.clone().into());
+    row.insert("src".into(), source.into());
     row
 }
 
-/// The document for one file — `file`, `schema_version`, and the
+/// The document for one file — `file`, `v`, and the
 /// `edits`: the built-in rows first, then each plugin change's edits
 /// flattened in change order, every row carrying its provenance tag
 /// (`builtin-lint`, or the plugin's manifest name). Empty context strings
@@ -714,7 +711,7 @@ fn patch_document(
         }
         if verbosity == Verbosity::Full {
             row.insert("rule".into(), fix.rule.into());
-            row.insert("message".into(), fix.message.clone().into());
+            row.insert("msg".into(), fix.message.clone().into());
         }
         if let Some(outcome) = labels.next() {
             row.insert("outcome".into(), outcome_label(outcome).into());
@@ -728,7 +725,7 @@ fn patch_document(
                 row.insert("anchor".into(), anchor_json(&edit.anchor).into());
             }
             if verbosity == Verbosity::Full {
-                row.insert("message".into(), fix.message.clone().into());
+                row.insert("msg".into(), fix.message.clone().into());
                 row.insert("priority".into(), fix.priority.into());
             }
             if let Some(outcome) = labels.next() {
@@ -739,7 +736,7 @@ fn patch_document(
     }
     let mut document = serde_json::json!({
         "file": set.path,
-        "schema_version": SCHEMA_VERSION,
+        "v": SCHEMA_VERSION,
         "edits": edits,
     });
     if let Some(outcomes) = outcomes {
@@ -765,7 +762,7 @@ fn outcome_label(outcome: &EditOutcome) -> &'static str {
 }
 
 /// The assists document for one file: the plugin changes in priority
-/// order, each carrying its provenance (`source`), title, priority, and
+/// order, each carrying its provenance (`src`), title, priority, and
 /// anchored edits (the anchor drops at the minimal tier); the hosts that
 /// could not serve the request answer in `errors` (omitted when empty).
 ///
@@ -793,8 +790,8 @@ pub fn assists_json(answer: &AssistAnswer, verbosity: Verbosity) -> serde_json::
                 })
                 .collect();
             let mut row = serde_json::json!({
-                "message": fix.message,
-                "source": fix.plugin,
+                "msg": fix.message,
+                "src": fix.plugin,
                 "priority": fix.priority,
                 "edits": edits,
             });
@@ -808,7 +805,7 @@ pub fn assists_json(answer: &AssistAnswer, verbosity: Verbosity) -> serde_json::
         .collect();
     let mut document = serde_json::json!({
         "file": answer.file,
-        "schema_version": SCHEMA_VERSION,
+        "v": SCHEMA_VERSION,
         "assists": assists,
     });
     if !answer.errors.is_empty() {
@@ -818,7 +815,7 @@ pub fn assists_json(answer: &AssistAnswer, verbosity: Verbosity) -> serde_json::
                 .iter()
                 .map(|error| serde_json::json!({
                     "plugin": error.plugin,
-                    "message": error.message,
+                    "msg": error.message,
                 }))
                 .collect::<Vec<_>>()
         );

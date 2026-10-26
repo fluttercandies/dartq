@@ -24,8 +24,8 @@ dartq session stop        # end this worktree's session
 dartq session stop --all  # end every live session
 ```
 
-Output is JSON lines on every face — the management channel is a machine
-channel. `start` on an unwritable or foreign tree **degrades to
+Output is one row per line (lon by default, `--format json` for JSON
+rows). `start` on an unwritable or foreign tree **degrades to
 standalone, printed, never an error**: the command proceeds in-process.
 
 ## Watching a Cold Analysis
@@ -46,7 +46,7 @@ dartq events session --since 17 --limit 50   # cursor-paginated by `seq`
 checkout the discovery ladder finds — not just the directory you stand in:
 
 ```bash
-dartq packages                  # TTY table / piped machine rows
+dartq packages                  # the default: {v root pkgs bounds}
 dartq packages --format json    # one JSON object per line
 ```
 

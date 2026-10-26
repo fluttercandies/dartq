@@ -43,6 +43,7 @@
 //!
 //! [`LibraryChange::hypothetical`]: dartq_ai::impact::LibraryChange::hypothetical
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -376,6 +377,119 @@ pub fn impact_after_analysis_with_symbols(
     symbols: &[String],
 ) -> Result<query::ImpactReport, ImpactError> {
     impact_after_analysis_with_persisted_facts(engine, target, &unpersisted, symbols)
+}
+
+/// The `dartq test --impacted` selection — the one implementation the CLI's
+/// test faces and the daemon's `dartq/test/run` share (the daemon spawns a
+/// `dartq test` child, whose selection this is): the changed `_test.dart`
+/// files plus every suite the semantic impact graph reports for the changed
+/// libraries, as root-relative `/`-joined spellings.
+///
+/// `Err(reason)` is the conservative fallback — run the full selection —
+/// taken when the change cannot be bounded: no repository (or `base` does
+/// not resolve), a change whose blast radius no selection can approximate
+/// (a pubspec, an options file, generated code), or a workspace whose
+/// semantic graph cannot assemble. The reason is the diagnostic the caller
+/// prints (the CLI's `dartq test: {reason} — running everything` line);
+/// there is no narrower heuristic to fall back to — the retired
+/// same-package-tests guess is gone, and the fallback is the full run,
+/// never a guess.
+///
+/// `sdk` is the SDK root override ([`open_engine`]'s `None` = discovery);
+/// production callers pass `None` — the parameter exists so a pinned
+/// assembly is possible (and testable).
+///
+/// [`open_engine`]: crate::workspace::open_engine
+pub fn impacted_tests(
+    root: &Path,
+    sdk: Option<&Path>,
+    base: &str,
+) -> Result<Vec<String>, String> {
+    let changed = changed_since(root, base)
+        .ok_or_else(|| format!("cannot diff against {base} (no git repository?)"))?;
+    let mut selected: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut sources = Vec::new();
+    for relative in &changed {
+        let path = if relative.is_absolute() { relative.clone() } else { root.join(relative) };
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        if matches!(
+            name,
+            "pubspec.yaml"
+                | "pubspec.lock"
+                | "analysis_options.yaml"
+                | "build.yaml"
+                | "dartq.yaml"
+                | "dart_test.yaml"
+        ) || name.ends_with(".g.dart")
+            || name.ends_with(".freezed.dart")
+            || name.ends_with(".mocks.dart")
+        {
+            return Err(format!("{} changed", path.display()));
+        }
+        if name.ends_with(".dart") {
+            if name.ends_with("_test.dart") && path.is_file() {
+                selected.insert(path.clone());
+            }
+            sources.push(path);
+        }
+    }
+    if !sources.is_empty() {
+        let tests = (|| -> Result<Vec<PathBuf>, String> {
+            let (mut engine, _dir) = crate::workspace::open_engine(root, sdk)
+                .map_err(|error| format!("cannot assemble the workspace: {error}"))?;
+            crate::analyze::run_overlaid(&mut engine, &[], &[])
+                .map_err(|error| format!("the analysis pass failed: {error}"))?;
+            let mut tests = Vec::new();
+            for seed in &sources {
+                let report = impact_after_analysis(&engine, seed)
+                    .map_err(|error| {
+                        format!("{} is outside the analyzed workspace: {error}", seed.display())
+                    })?;
+                tests.extend(
+                    report
+                        .affected_tests
+                        .into_iter()
+                        .map(|test| PathBuf::from(test.path))
+                        .filter(|path| path.is_absolute()),
+                );
+            }
+            Ok(tests)
+        })();
+        match tests {
+            Ok(tests) => selected.extend(tests),
+            Err(reason) => return Err(reason),
+        }
+    }
+    Ok(selected
+        .into_iter()
+        .filter_map(|path| path.strip_prefix(root).ok().map(|rel| rel.to_string_lossy().replace('\\', "/")))
+        .filter(|rel| rel.ends_with("_test.dart"))
+        .collect())
+}
+
+/// Files that differ from `base` in the working tree — committed since,
+/// staged, unstaged, and untracked (not ignored) — relative to `root`.
+/// `None` when there is no repository or `base` does not resolve.
+fn changed_since(root: &Path, base: &str) -> Option<Vec<PathBuf>> {
+    let git = |args: &[&str]| -> Option<Vec<PathBuf>> {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        out.status.success().then(|| {
+            out.stdout
+                .split(|&b| b == 0)
+                .filter(|path| !path.is_empty())
+                .map(|path| PathBuf::from(String::from_utf8_lossy(path).into_owned()))
+                .collect()
+        })
+    };
+    let mut changed = git(&["diff", "--name-only", "-z", "--relative", base, "--"])?;
+    changed.extend(git(&["ls-files", "-z", "--others", "--exclude-standard"])?);
+    Some(changed)
 }
 
 /// The persisted-facts hint the query consults before seeding (the #341
@@ -834,6 +948,96 @@ mod tests {
             after.affected_tests
         );
 
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `--impacted` selection's input shape: the workspace fixture with
+    /// everything committed, then `lib/a.dart` modified — one unstaged
+    /// change against `HEAD`.
+    fn git_workspace(tag: &str, libraries: &[(&str, &str)]) -> PathBuf {
+        let root = workspace(tag, libraries);
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_AUTHOR_NAME", "fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.com")
+                .env("GIT_COMMITTER_NAME", "fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.com")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("git runs")
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "fixture"]);
+        std::fs::write(root.join("lib/a.dart"), "class A2 {}\n").expect("modify a.dart");
+        // The callers' root is canonical (`current_dir().canonicalize()`),
+        // and the selection strips it off the engine's canonical paths —
+        // on macOS the temp dir's `/var` spelling differs from its
+        // canonical `/private/var` form.
+        root.canonicalize().expect("root")
+    }
+
+    /// The selection is the semantic reach — the one answer every test face
+    /// (the CLI run and the daemon's child) shares for the same input: with
+    /// `lib/a.dart` changed since `HEAD`, the suite whose import reaches it
+    /// is selected and the same-package suite that imports nothing of it
+    /// stays out — the discrimination the retired same-package heuristic
+    /// could not make.
+    #[test]
+    fn impacted_tests_select_the_semantic_reach() {
+        let root = git_workspace(
+            "impact_sel_reach",
+            &[
+                ("lib/a.dart", "class A {}\n"),
+                ("lib/b.dart", "import 'a.dart';\nclass B {}\n"),
+                (
+                    "test/a_test.dart",
+                    "import 'package:fixture/a.dart';\nvoid main() {}\n",
+                ),
+                ("test/other_test.dart", "void main() {}\n"),
+            ],
+        );
+        let selected =
+            impacted_tests(&root, Some(&root.join("sdk")), "HEAD").expect("bounded selection");
+        assert_eq!(
+            selected,
+            vec!["test/a_test.dart".to_owned()],
+            "the changed lib file's semantic reach alone"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The no-repository boundary: nothing to diff against, so the selection
+    /// refuses — the caller's full run — with the diagnostic naming the
+    /// base.
+    #[test]
+    fn impacted_tests_without_a_repository_run_everything() {
+        let root = workspace("impact_sel_norepo", &[("lib/a.dart", "class A {}\n")]);
+        let reason = impacted_tests(&root, Some(&root.join("sdk")), "HEAD")
+            .expect_err("the full-run fallback");
+        assert_eq!(reason, "cannot diff against HEAD (no git repository?)");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The graph-unavailable boundary: the change is bounded by a
+    /// repository, but the workspace's semantic graph cannot assemble (here:
+    /// an unusable SDK root) — the conservative full run, never a partial
+    /// guess.
+    #[test]
+    fn impacted_tests_fall_back_when_the_graph_cannot_assemble() {
+        let root = git_workspace("impact_sel_noengine", &[("lib/a.dart", "class A {}\n")]);
+        let reason = impacted_tests(&root, Some(&root.join("no-such-sdk")), "HEAD")
+            .expect_err("the full-run fallback");
+        assert!(
+            reason.starts_with("cannot assemble the workspace:"),
+            "names the assembly failure: {reason}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

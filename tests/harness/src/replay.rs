@@ -321,24 +321,27 @@ fn relative_key(path: &Path, root: &Path) -> String {
         .to_string()
 }
 
-/// Normalizes a `dartq/analyze` result (the incremental face). `root` is
-/// the daemon's workspace dir — the same materialized copy the full
-/// face analyzes — so in-corpus paths strip to corpus-relative keys.
-/// Rows in the `dartq/*` namespace (the workspace advisory the pull
-/// answer embeds, the memory-degradation ladder) are dartq-internal
-/// telemetry, not diagnostics — the CLI machine face carries the same
-/// advisory on stderr, never in the compared rows — so both faces drop
-/// them before the incremental-consistency compare.
-fn normalize_lsp_workspace(result: &Value, root: &Path) -> Result<WorkspaceDiags, String> {
+/// Normalizes a `dartq/analyze` result (the incremental face): the compact
+/// `{v, diags}` envelope with `{code, sev, file, line, col, len, msg}` rows
+/// (the short-vocabulary pull face, #2602/#2603). `root` is the daemon's
+/// workspace dir — the same materialized copy the full face analyzes — so
+/// in-corpus paths strip to corpus-relative keys. Rows in the `dartq/*`
+/// namespace (the workspace advisory the pull answer embeds, the
+/// memory-degradation ladder) are dartq-internal telemetry, not
+/// diagnostics — the CLI faces carry the same advisory on stderr, never in
+/// the compared rows — so both faces drop them before the
+/// incremental-consistency compare.
+fn normalize_row_workspace(result: &Value, root: &Path) -> Result<WorkspaceDiags, String> {
     let entries = result
-        .get("diagnostics")
+        .get("diags")
         .and_then(Value::as_array)
         .ok_or_else(|| {
             format!(
-                "dartq/analyze result carries no `diagnostics` array: {}",
+                "dartq/analyze result carries no `diags` array: {}",
                 serde_json::to_string(result).unwrap_or_else(|_| "<unserializable>".into())
             )
         })?;
+    let mut sources: FxHashMap<PathBuf, String> = FxHashMap::default();
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         if entry
@@ -348,8 +351,22 @@ fn normalize_lsp_workspace(result: &Value, root: &Path) -> Result<WorkspaceDiags
         {
             continue;
         }
-        let (path, canonical) = replay_edit::canonical_from_lsp(entry)?;
-        out.push((relative_key(&path, root), canonical));
+        let file = replay_edit::row_path(entry)?;
+        let key = relative_key(&file, root);
+        let source = match sources.entry(file) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let text = std::fs::read_to_string(entry.key()).map_err(|e| {
+                    format!(
+                        "reading {} for position normalization: {e}",
+                        entry.key().display()
+                    )
+                })?;
+                entry.insert(text)
+            }
+        };
+        let canonical = replay_edit::canonical_from_row(entry, source)?;
+        out.push((key, canonical));
     }
     Ok(out)
 }
@@ -526,7 +543,7 @@ const USAGE: &str = r#"usage:
   TEMPLATE: whitespace-split argv; {dir} is replaced by the replay's
   materialized workspace copy (appended as last arg when absent) — both
   faces analyze that same copy, e.g.
-      --dartq-cmd "cargo run -q -p dartq-cli -- analyze --format=machine"
+      --dartq-cmd "cargo run -q -p dartq-cli -- analyze --format=json"
       --daemon-cmd "cargo run -q -p dartq-cli -- daemon"
   --label NAME: report directory suffix (default replay-r1). Report:
   <out>/<label>/{report.json,report.md}.
@@ -859,14 +876,15 @@ fn run_steps(
 
         // Incremental face: the post-step whole-workspace pull over the
         // replay agent's overlay view.
-        let incremental = normalize_lsp_workspace(
+        let incremental = normalize_row_workspace(
             &daemon.call("dartq/analyze", &json!({"agentId": REPLAY_AGENT}))?,
             copy,
         )?;
 
         // Full-recompute face: the same universe on disk, analyzed fresh
-        // by the batch driver.
-        let diags = match batch.probe(copy, OutputFormat::Machine) {
+        // by the batch driver (json envelope — the CLI's machine face is
+        // retired).
+        let diags = match batch.probe(copy, OutputFormat::Json) {
             DartqProbe::Measured(diags) => diags,
             DartqProbe::Panic => {
                 return Err(format!(
@@ -1053,22 +1071,39 @@ mod tests {
     }
 
     #[test]
-    fn lsp_workspace_normalizes_with_corpus_relative_keys() {
+    fn row_workspace_normalizes_with_corpus_relative_keys() {
+        // The row face reads each row's file for position normalization, so
+        // both rows address real files (the daemon emits canonical paths).
+        let root = std::env::temp_dir().join(format!("dq_rows_{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("dq_rows_out_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("lib")).expect("mkdir");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        std::fs::write(root.join("lib/a.dart"), "int a = 1;\nint b = 2;\n").expect("a");
+        std::fs::write(outside.join("x.dart"), "int q = 1;\n").expect("x");
+        let root = root.canonicalize().expect("canon root");
+        let outside_file = outside.canonicalize().expect("canon out").join("x.dart");
         let result = json!({
-            "schema_version": 1,
-            "diagnostics": [
-                {"uri": "file:///corpus/lib/a.dart", "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 7}}, "severity": 1, "code": "expected_token", "source": "dartq", "message": "Expected ';'."},
-                {"uri": "file:///elsewhere/pub/cache/x.dart", "range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "severity": 2, "code": "Some_Code", "source": "dartq", "message": "m"},
+            "v": 1,
+            "diags": [
+                {"code": "expected_token", "sev": "error", "file": path_to_uri(&root.join("lib/a.dart")),
+                 "line": 2, "col": 5, "len": 3, "msg": "Expected ';'."},
+                {"code": "Some_Code", "sev": "warning", "file": path_to_uri(&outside_file),
+                 "line": 1, "col": 5, "len": 1, "msg": "m"},
             ],
         });
-        let diags = normalize_lsp_workspace(&result, Path::new("/corpus")).expect("normalizes");
+        let diags = normalize_row_workspace(&result, &root).expect("normalizes");
         assert_eq!(diags.len(), 2);
         assert_eq!(diags[0].0, "lib/a.dart", "in-corpus path becomes relative");
         assert_eq!(
-            diags[1].0, "/elsewhere/pub/cache/x.dart",
+            diags[1].0,
+            outside_file.display().to_string(),
             "out-of-corpus path stays absolute (visible, not dropped)"
         );
         assert_eq!(diags[1].1.code, "some_code", "codes normalize to lowercase");
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(outside_file.parent().expect("parent")).ok();
     }
 
     #[test]
@@ -1089,15 +1124,18 @@ mod tests {
         let normalized = normalize_machine_workspace(&diags, &dir).expect("normalizes");
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].0, "lib/a.dart");
+        let source = std::fs::read_to_string(dir.join("lib/a.dart")).expect("source");
         assert_eq!(
             normalized[0].1.key(),
-            replay_edit::canonical_from_lsp(&json!({
-                "uri": format!("file://{}", path_to_uri(&dir.join("lib/a.dart"))),
-                "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 7}},
-                "severity": 1, "code": "expected_token", "source": "dartq", "message": "Expected ';'.",
-            }))
-            .expect("lsp")
-            .1
+            replay_edit::canonical_from_row(
+                &json!({
+                    "code": "expected_token", "sev": "error",
+                    "file": path_to_uri(&dir.join("lib/a.dart")),
+                    "line": 2, "col": 5, "len": 3, "msg": "Expected ';'.",
+                }),
+                &source,
+            )
+            .expect("row")
             .key(),
             "both faces must land on one canonical key"
         );

@@ -47,7 +47,7 @@ int main() => alpha();
    "expect": ["result.isError: false", "result.content.0.text contains=files_scanned"]},
   {"id": 7, "method": "tools/call",
    "params": {"name": "dartq_rename",
-              "arguments": {"target": "@TREE@/lib/alpha.dart:1:5", "newName": "zulu"}},
+              "arguments": {"target": "@TREE@/lib/alpha.dart:1:5", "new_name": "zulu"}},
    "expect": ["result.isError: false",
               "result.content.0.text contains=zulu"]},
   {"id": 8, "method": "tools/call",

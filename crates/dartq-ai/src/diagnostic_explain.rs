@@ -74,7 +74,8 @@ pub struct DiagnosticEcho {
     pub message: String,
     /// The canonical file path (the diagnostics envelope's own spelling).
     pub file: String,
-    /// The `[startOffset, endOffset)` UTF-16 pair.
+    /// The `[startOffset, endOffset)` UTF-16 pair — split into `off`+`len`
+    /// on the wire view.
     pub range: [u32; 2],
 }
 
@@ -101,7 +102,8 @@ pub struct FixRow {
     /// The fix family's stable id (the action-kind spelling).
     pub id: String,
     /// The pipeline that reports the code (`builtin-lint`/`builtin-semantic`/
-    /// `builtin-parser`).
+    /// `builtin-parser`). Wire: `src`.
+    #[serde(rename = "src")]
     pub source: String,
     /// One sentence naming the transform the family runs.
     pub summary: String,
@@ -118,7 +120,7 @@ pub struct WhyFace {
     pub rule: Option<RuleFact>,
 }
 
-/// The report, JSON contract `schema_version: 1`.
+/// The report, JSON contract `v: 1` (the short-vocabulary envelope).
 ///
 /// `why`/`related`/`documentation` are `Some` at [`Verbosity::Compact`]
 /// and [`Verbosity::Full`], `None` at [`Verbosity::Minimal`];
@@ -126,6 +128,8 @@ pub struct WhyFace {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiagnosticExplainReport {
     /// The output contract version ([`DIAGNOSTIC_EXPLAIN_SCHEMA_VERSION`]).
+    /// Wire: `v`.
+    #[serde(rename = "v")]
     pub schema_version: u32,
     /// The selected diagnostic row, echoed.
     pub diagnostic: DiagnosticEchoView,
@@ -133,7 +137,8 @@ pub struct DiagnosticExplainReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub why: Option<WhySection>,
     /// The published docs URL; `None` when the code publishes no page.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Wire: `doc`.
+    #[serde(rename = "doc", skip_serializing_if = "Option::is_none")]
     pub documentation: Option<String>,
     /// The run's same-code neighbours.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,14 +153,18 @@ pub struct DiagnosticExplainReport {
 pub struct DiagnosticEchoView {
     /// The diagnostic code.
     pub code: String,
-    /// The machine severity spelling.
+    /// The machine severity spelling. Wire: `sev`.
+    #[serde(rename = "sev")]
     pub severity: String,
-    /// The emitted message.
+    /// The emitted message. Wire: `msg`.
+    #[serde(rename = "msg")]
     pub message: String,
     /// The canonical file path.
     pub file: String,
-    /// `[startOffset, endOffset)`, UTF-16 code units.
-    pub range: [u32; 2],
+    /// The span's start offset, UTF-16 code units.
+    pub off: u32,
+    /// The span length.
+    pub len: u32,
 }
 
 /// The serialized `why` object.
@@ -249,7 +258,8 @@ pub fn explain_diagnostic(
             severity: echo.severity,
             message: echo.message,
             file: echo.file,
-            range: echo.range,
+            off: echo.range[0],
+            len: echo.range[1].saturating_sub(echo.range[0]),
         },
         why: sectioned.then(|| WhySection {
             code_family: why.code_family,

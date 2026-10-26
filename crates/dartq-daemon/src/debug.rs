@@ -6,7 +6,7 @@
 //! takes any live VM service URI, including one owned by a running
 //! `flutter run`.
 //!
-//! Every session-bearing face takes an optional `sessionId`: absent
+//! Every session-bearing face takes an optional `session_id`: absent
 //! drives the sole live session (the common shape — one interaction,
 //! one session); zero live sessions and several live sessions are
 //! machine-coded domain misses, the several case listing every
@@ -135,7 +135,7 @@ impl DebugError {
                 codes::DEBUG_SESSION,
                 format!(
                     "DARTQ/DEBUG/AMBIGUOUS_SESSION: several debug sessions are live \
-                     ({candidates}) — name one (CLI `-s <ID>`, MCP `sessionId`)"
+                     ({candidates}) — name one (CLI `-s <ID>`, MCP `session_id`)"
                 ),
             ),
             Self::Vm(error) => (codes::DEBUG_SESSION, format!("DARTQ/DEBUG/VM: {error}")),
@@ -193,7 +193,7 @@ impl DebugManager {
 }
 
 /// One candidate line of the ambiguity listing: `#id kind script` for a
-/// launch, `#id attach <wsUri>` for an attach.
+/// launch, `#id attach <ws_uri>` for an attach.
 fn session_line(managed: &ManagedSession, id: u32) -> String {
     match &managed.origin {
         Origin::Launch { script, kind } => {
@@ -205,7 +205,7 @@ fn session_line(managed: &ManagedSession, id: u32) -> String {
 
 /// Resolves the request's session selector: an explicit id names that
 /// session; absent drives the sole live session — the common shape, and
-/// the reason `sessionId` is optional on every session-bearing face.
+/// the reason `session_id` is optional on every session-bearing face.
 /// Zero live sessions and several live sessions are the machine-coded
 /// domain misses (the several case lists every candidate so the caller
 /// can pick).
@@ -326,12 +326,11 @@ impl DebugDispatch {
 
 // The faces' parameter payloads (`#[serde(default)]` keeps every field
 // optional beyond the contract-critical ones, the analysis faces'
-// convention). `sessionId` itself is optional on every session-bearing
+// convention). `session_id` itself is optional on every session-bearing
 // face: absent drives the sole live session ([`select_session`]) — the
 // AI-first default, since most interactions hold exactly one session.
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct LaunchParams {
     script: PathBuf,
     /// `dart` (default) or `flutter`.
@@ -365,30 +364,26 @@ fn default_pause_on_start() -> bool {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct AttachParams {
     ws_uri: String,
 }
 
 /// The `detach`/`stop`/`restart` payload: the selector alone.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SessionParams {
     #[serde(default)]
     session_id: Option<u32>,
 }
 
-/// The `status` payload: `sessionId` optional — absent lists every
+/// The `status` payload: `session_id` optional — absent lists every
 /// session.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct StatusParams {
     #[serde(default)]
     session_id: Option<u32>,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct IsolateParams {
     #[serde(default)]
     session_id: Option<u32>,
@@ -397,7 +392,6 @@ struct IsolateParams {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct BreakpointAddParams {
     #[serde(default)]
     session_id: Option<u32>,
@@ -410,9 +404,8 @@ struct BreakpointAddParams {
 
 /// One breakpoint target, mirroring [`BreakpointLocationSpec`]: a source
 /// line (`script` + `line`, optional `column`) or a function entry
-/// (`functionId`).
+/// (`function_id`).
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct BreakpointLocationParams {
     #[serde(default)]
     script: Option<String>,
@@ -425,7 +418,6 @@ struct BreakpointLocationParams {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct BreakpointRemoveParams {
     #[serde(default)]
     session_id: Option<u32>,
@@ -435,7 +427,6 @@ struct BreakpointRemoveParams {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ExceptionPauseParams {
     #[serde(default)]
     session_id: Option<u32>,
@@ -445,7 +436,6 @@ struct ExceptionPauseParams {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct StepParams {
     #[serde(default)]
     session_id: Option<u32>,
@@ -456,7 +446,6 @@ struct StepParams {
 
 /// The `reload` payload.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ReloadParams {
     #[serde(default)]
     session_id: Option<u32>,
@@ -468,7 +457,6 @@ struct ReloadParams {
 
 /// The `restart` payload.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct RestartParams {
     #[serde(default)]
     session_id: Option<u32>,
@@ -477,7 +465,6 @@ struct RestartParams {
 /// The `evaluate` payload: a frame index evaluates in that frame of
 /// the paused isolate; without one the isolate's root library answers.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct EvaluateParams {
     #[serde(default)]
     session_id: Option<u32>,
@@ -489,7 +476,6 @@ struct EvaluateParams {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct SnapshotParams {
     #[serde(default)]
     session_id: Option<u32>,
@@ -497,7 +483,6 @@ struct SnapshotParams {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct EventsParams {
     #[serde(default)]
     session_id: Option<u32>,
@@ -513,7 +498,6 @@ fn default_event_limit() -> usize {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct OutputParams {
     #[serde(default)]
     session_id: Option<u32>,
@@ -568,7 +552,7 @@ fn split_define(entry: &str) -> Result<(String, String), DebugError> {
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .ok_or_else(|| {
             DebugError::InvalidParams(format!(
-                "dartDefines entries must be KEY=VALUE, got {entry:?}"
+                "dart_defines entries must be KEY=VALUE, got {entry:?}"
             ))
         })
 }
@@ -650,7 +634,7 @@ pub(crate) fn handle(
             let decoded =
                 serde_json::from_value::<AttachParams>(params.clone()).map_err(invalid)?;
             if decoded.ws_uri.is_empty() {
-                return Err(DebugError::InvalidParams("wsUri must be a non-empty string".into()));
+                return Err(DebugError::InvalidParams("ws_uri must be a non-empty string".into()));
             }
             let session = DebugSession::attach(&decoded.ws_uri).map_err(DebugError::Vm)?;
             let id = manager.register(Origin::Attach(decoded.ws_uri), session);
@@ -668,7 +652,7 @@ pub(crate) fn handle(
             managed.session.detach();
             let ws_uri = managed.session.ws_uri().to_owned();
             manager.sessions.remove(&id);
-            Ok(json!({ "ok": true, "wsUri": ws_uri }))
+            Ok(json!({ "ok": true, "ws_uri": ws_uri }))
         }
         DEBUG_STOP => {
             let decoded =
@@ -723,7 +707,7 @@ pub(crate) fn handle(
                     None => {
                         return Err(DebugError::InvalidParams(
                             "location must name {script, line} (line breakpoints) or \
-                             {functionId} (function entry)"
+                             {function_id} (function entry)"
                                 .into(),
                         ));
                     }
@@ -912,28 +896,28 @@ fn user_isolate_ids(session: &DebugSession) -> Vec<&str> {
 /// The `launch`/`attach` answer: the fresh session's id and isolate set.
 fn session_opened_row(id: u32, session: &DebugSession) -> Value {
     json!({
-        "sessionId": id,
-        "isolateIds": user_isolate_ids(session),
-        "mainIsolate": session.main_isolate(),
+        "session_id": id,
+        "isolates": user_isolate_ids(session),
+        "main": session.main_isolate(),
     })
 }
 
-/// One `status` row: the origin (script or wsUri), the isolate set, and
+/// One `status` row: the origin (script or ws_uri), the isolate set, and
 /// the breakpoint tally.
 fn status_row(id: u32, managed: &ManagedSession) -> Value {
     let session = &managed.session;
     let mut row = json!({
-        "sessionId": id,
-        "mainIsolate": session.main_isolate(),
-        "isolateIds": user_isolate_ids(session),
-        "breakpointCount": session.breakpoints().count(),
+        "session_id": id,
+        "main": session.main_isolate(),
+        "isolates": user_isolate_ids(session),
+        "bps": session.breakpoints().count(),
     });
     match &managed.origin {
         Origin::Launch { script, kind } => {
             row["script"] = json!(script.display().to_string());
             row["kind"] = json!(launch_kind_word(*kind));
         }
-        Origin::Attach(uri) => row["wsUri"] = json!(uri),
+        Origin::Attach(uri) => row["ws_uri"] = json!(uri),
     }
     row
 }
@@ -941,7 +925,7 @@ fn status_row(id: u32, managed: &ManagedSession) -> Value {
 /// A hot-restart outcome: the re-armed breakpoints and the drops.
 fn restart_row(outcome: &RestartOutcome) -> Value {
     json!({
-        "reArmed": outcome.re_armed.iter().map(breakpoint_row).collect::<Vec<_>>(),
+        "re_armed": outcome.re_armed.iter().map(breakpoint_row).collect::<Vec<_>>(),
         "dropped": outcome.dropped,
     })
 }
@@ -971,7 +955,7 @@ fn vm_object_row(object: &VmObject) -> Value {
                 .unwrap_or_else(|| sentinel.kind.as_str().to_owned()),
         }),
         VmObject::Error { kind, message } => {
-            json!({ "kind": "error", "errorKind": kind, "message": message })
+            json!({ "kind": "error", "error_kind": kind, "message": message })
         }
         VmObject::Other(raw) => json!({ "kind": "other", "raw": raw }),
     }
@@ -996,7 +980,7 @@ fn snapshot_row(snapshot: &StoppedSnapshot) -> Value {
         "location": frame_location_row(&snapshot.location),
         "stack": snapshot.stack.iter().map(frame_summary_row).collect::<Vec<_>>(),
         "variables": snapshot.variables.iter().map(variable_row).collect::<Vec<_>>(),
-        "atAsyncSuspension": snapshot.at_async_suspension,
+        "at_async_suspension": snapshot.at_async_suspension,
     })
 }
 
@@ -1017,9 +1001,9 @@ fn reason_row(reason: &StoppedReason) -> Value {
             message,
         } => json!({ "kind": "conditionError", "breakpoints": breakpoints, "message": message }),
         StoppedReason::ConditionalResumeLimit { auto_resumes } => {
-            json!({ "kind": "conditionalResumeLimit", "autoResumes": auto_resumes })
+            json!({ "kind": "conditionalResumeLimit", "auto_resumes": auto_resumes })
         }
-        StoppedReason::Other(kind) => json!({ "kind": "other", "eventKind": kind.as_str() }),
+        StoppedReason::Other(kind) => json!({ "kind": "other", "event_kind": kind.as_str() }),
     }
 }
 
@@ -1028,8 +1012,8 @@ fn frame_location_row(location: &FrameLocation) -> Value {
     json!({
         "line": location.line,
         "column": location.column,
-        "scriptUri": location.script_uri,
-        "scriptId": location.script_id,
+        "script_uri": location.script_uri,
+        "script_id": location.script_id,
         "function": location.function,
     })
 }
@@ -1060,7 +1044,7 @@ fn variable_row(variable: &Variable) -> Value {
 fn events_row(batch: &EventBatch) -> Value {
     json!({
         "events": batch.events.iter().map(event_row).collect::<Vec<_>>(),
-        "nextCursor": batch.next_cursor,
+        "next_cursor": batch.next_cursor,
         "dropped": batch.dropped,
     })
 }
@@ -1069,7 +1053,7 @@ fn events_row(batch: &EventBatch) -> Value {
 fn event_row(event: &SessionEvent) -> Value {
     let mut row = json!({
         "cursor": event.cursor,
-        "streamId": event.stream_id,
+        "stream_id": event.stream_id,
         "kind": event.event.kind.as_str(),
         "isolate": event.event.isolate.as_ref().map(|isolate| isolate.id.clone()),
         "event": serde_json::to_value(&event.event).expect("protocol event serializes"),
@@ -1086,7 +1070,7 @@ fn event_row(event: &SessionEvent) -> Value {
 fn output_row(batch: &OutputBatch) -> Value {
     json!({
         "text": String::from_utf8_lossy(&batch.bytes),
-        "nextCursor": batch.next_cursor,
+        "next_cursor": batch.next_cursor,
         "dropped": batch.dropped,
     })
 }
@@ -1117,8 +1101,8 @@ mod tests {
         let decoded: LaunchParams = serde_json::from_value(json!({
             "script": "bin/main.dart",
             "args": ["--fast"],
-            "vmFlags": ["--enable-asserts"],
-            "pauseOnStart": false,
+            "vm_flags": ["--enable-asserts"],
+            "pause_on_start": false,
             "cwd": "bin"
         }))
         .expect("decodes");
@@ -1132,8 +1116,8 @@ mod tests {
             "kind": "flutter",
             "device": "macos",
             "flavor": "dev",
-            "dartDefines": ["PROBE=1"],
-            "flutterArgs": ["--no-devtools"]
+            "dart_defines": ["PROBE=1"],
+            "flutter_args": ["--no-devtools"]
         }))
         .expect("decodes");
         assert_eq!(flutter.kind.as_deref(), Some("flutter"));
@@ -1176,7 +1160,7 @@ mod tests {
     #[test]
     fn breakpoint_location_params_decode_line_and_function_shapes() {
         let line: BreakpointAddParams = serde_json::from_value(json!({
-            "sessionId": 1,
+            "session_id": 1,
             "location": { "script": "package:app/main.dart", "line": 12, "column": 5 },
             "condition": "x > 3"
         }))
@@ -1188,8 +1172,8 @@ mod tests {
         assert!(line.location.function_id.is_none());
 
         let function: BreakpointAddParams = serde_json::from_value(json!({
-            "sessionId": 1,
-            "location": { "functionId": "functions/42" }
+            "session_id": 1,
+            "location": { "function_id": "functions/42" }
         }))
         .expect("decodes");
         assert_eq!(function.location.function_id.as_deref(), Some("functions/42"));
@@ -1200,7 +1184,7 @@ mod tests {
         // optional) — the half-filled line form is rejected at dispatch,
         // below, where the location is assembled.
         let half: BreakpointAddParams = serde_json::from_value(json!({
-            "sessionId": 1,
+            "session_id": 1,
             "location": { "script": "package:app/main.dart" }
         }))
         .expect("decodes");
@@ -1225,17 +1209,17 @@ mod tests {
         assert!(parse_pause_mode("All").is_none());
 
         let events: EventsParams =
-            serde_json::from_value(json!({ "sessionId": 1 })).expect("decodes");
+            serde_json::from_value(json!({ "session_id": 1 })).expect("decodes");
         assert_eq!(events.cursor, 0);
         assert_eq!(events.limit, default_event_limit());
 
         let output: OutputParams =
-            serde_json::from_value(json!({ "sessionId": 1, "stream": "stdout" }))
+            serde_json::from_value(json!({ "session_id": 1, "stream": "stdout" }))
                 .expect("decodes");
         assert_eq!(output.cursor, 0);
         assert_eq!(output.max_bytes, default_max_bytes());
         assert!(
-            serde_json::from_value::<OutputParams>(json!({ "sessionId": 1, "stream": "stdin" }))
+            serde_json::from_value::<OutputParams>(json!({ "session_id": 1, "stream": "stdin" }))
                 .is_ok(),
             "the stream word is validated at dispatch, not by serde"
         );
@@ -1302,13 +1286,13 @@ mod tests {
             assert_eq!(row["reason"]["kind"], *kind, "the reason tag: {row}");
             assert_eq!(row["isolate"], "isolates/7");
             assert_eq!(row["location"]["line"], 12);
-            assert_eq!(row["location"]["scriptUri"], "package:app/main.dart");
+            assert_eq!(row["location"]["script_uri"], "package:app/main.dart");
             assert_eq!(row["stack"][0]["index"], 0);
             assert_eq!(row["stack"][0]["location"]["function"], "main");
             assert_eq!(row["variables"][0]["name"], "count");
             assert_eq!(row["variables"][0]["value"], "42");
             assert_eq!(row["variables"][0]["handle"], "objects/9");
-            assert_eq!(row["atAsyncSuspension"], true);
+            assert_eq!(row["at_async_suspension"], true);
         }
         // The reason payloads ride along for the compound kinds.
         let breakpoint = snapshot_row(&StoppedSnapshot {
@@ -1333,7 +1317,7 @@ mod tests {
             variables: Vec::new(),
             at_async_suspension: false,
         });
-        assert_eq!(other["reason"]["eventKind"], "WriteEvent");
+        assert_eq!(other["reason"]["event_kind"], "WriteEvent");
     }
 
     /// A leaf variable serializes its absent handle as `null`, and a
@@ -1379,7 +1363,7 @@ mod tests {
             dropped: vec!["rpc error 102: script gone".into()],
         };
         let row = restart_row(&outcome);
-        assert_eq!(row["reArmed"][0]["id"], "breakpoints/1");
+        assert_eq!(row["re_armed"][0]["id"], "breakpoints/1");
         assert_eq!(row["dropped"][0], "rpc error 102: script gone");
 
         let instance = serde_json::from_value::<dartq_debug::Instance>(json!({
@@ -1420,7 +1404,7 @@ mod tests {
         };
         let row = event_row(&recorded);
         assert_eq!(row["cursor"], 41);
-        assert_eq!(row["streamId"], "Debug");
+        assert_eq!(row["stream_id"], "Debug");
         assert_eq!(row["kind"], "PauseBreakpoint");
         assert_eq!(row["isolate"], Value::Null);
         assert_eq!(row["event"]["timestamp"], 1729);
@@ -1442,11 +1426,11 @@ mod tests {
         };
         let row = output_row(&batch);
         assert_eq!(row["text"], "ok\u{fffd}bad");
-        assert_eq!(row["nextCursor"], 9);
+        assert_eq!(row["next_cursor"], 9);
         assert_eq!(row["dropped"], 2);
     }
 
-    /// The sole-session selector: an absent `sessionId` never reaches a
+    /// The sole-session selector: an absent `session_id` never reaches a
     /// VM against an empty registry — every session-bearing face answers
     /// the machine-coded `NO_SESSIONS` miss naming the way out, and an
     /// explicit id keeps its own `NO_SUCH_SESSION` miss. The several-
@@ -1469,7 +1453,7 @@ mod tests {
             (DEBUG_RELOAD, json!({})),
             (DEBUG_RESTART, json!({})),
             (DEBUG_EXCEPTION_PAUSE, json!({"mode": "all"})),
-            (DEBUG_BREAKPOINT_REMOVE, json!({"breakpointId": "breakpoints/1"})),
+            (DEBUG_BREAKPOINT_REMOVE, json!({"breakpoint_id": "breakpoints/1"})),
             (
                 DEBUG_BREAKPOINT_ADD,
                 json!({"location": {"script": "package:app/main.dart", "line": 1}}),
@@ -1487,7 +1471,7 @@ mod tests {
             assert!(message.contains("launch or attach"), "{method}: {message}");
         }
         // An explicit id keeps its own miss.
-        let (code, message) = handle(&mut manager, DEBUG_RESUME, &json!({"sessionId": 9}), root)
+        let (code, message) = handle(&mut manager, DEBUG_RESUME, &json!({"session_id": 9}), root)
             .expect_err("miss")
             .wire();
         assert_eq!(code, codes::DEBUG_SESSION);
@@ -1498,7 +1482,7 @@ mod tests {
     }
 
     /// The dispatch wiring is hermetically exercisable without a live
-    /// session: the empty registry lists empty, every sessionId-bearing
+    /// session: the empty registry lists empty, every session_id-bearing
     /// face answers the machine-coded miss, and bad params answer the
     /// shared `INVALID_PARAMS` tier.
     #[test]
@@ -1510,19 +1494,19 @@ mod tests {
         assert_eq!(answer, json!([]));
 
         for (method, params) in [
-            (DEBUG_DETACH, json!({ "sessionId": 1 })),
-            (DEBUG_STOP, json!({ "sessionId": 1 })),
-            (DEBUG_RESUME, json!({ "sessionId": 1 })),
-            (DEBUG_PAUSE, json!({ "sessionId": 1, "isolate": "isolates/1" })),
-            (DEBUG_SNAPSHOT, json!({ "sessionId": 1, "isolate": "isolates/1" })),
-            (DEBUG_EVENTS, json!({ "sessionId": 1 })),
-            (DEBUG_OUTPUT, json!({ "sessionId": 1, "stream": "stdout" })),
-            (DEBUG_BREAKPOINT_REMOVE, json!({ "sessionId": 1, "breakpointId": "breakpoints/1" })),
-            (DEBUG_EXCEPTION_PAUSE, json!({ "sessionId": 1, "mode": "none" })),
-            (DEBUG_STEP, json!({ "sessionId": 1, "option": "into" })),
-            (DEBUG_RELOAD, json!({ "sessionId": 1 })),
-            (DEBUG_RESTART, json!({ "sessionId": 1 })),
-            (DEBUG_EVALUATE, json!({ "sessionId": 1, "expression": "1 + 1" })),
+            (DEBUG_DETACH, json!({ "session_id": 1 })),
+            (DEBUG_STOP, json!({ "session_id": 1 })),
+            (DEBUG_RESUME, json!({ "session_id": 1 })),
+            (DEBUG_PAUSE, json!({ "session_id": 1, "isolate": "isolates/1" })),
+            (DEBUG_SNAPSHOT, json!({ "session_id": 1, "isolate": "isolates/1" })),
+            (DEBUG_EVENTS, json!({ "session_id": 1 })),
+            (DEBUG_OUTPUT, json!({ "session_id": 1, "stream": "stdout" })),
+            (DEBUG_BREAKPOINT_REMOVE, json!({ "session_id": 1, "breakpoint_id": "breakpoints/1" })),
+            (DEBUG_EXCEPTION_PAUSE, json!({ "session_id": 1, "mode": "none" })),
+            (DEBUG_STEP, json!({ "session_id": 1, "option": "into" })),
+            (DEBUG_RELOAD, json!({ "session_id": 1 })),
+            (DEBUG_RESTART, json!({ "session_id": 1 })),
+            (DEBUG_EVALUATE, json!({ "session_id": 1, "expression": "1 + 1" })),
         ] {
             let error = handle(&mut manager, method, &params, root)
                 .err()
@@ -1537,23 +1521,23 @@ mod tests {
 
         // Param-shape failures answer the shared tier before any session
         // lookup: a missing script, an unknown step option, a bad stream
-        // word, an empty wsUri, and a half-filled line location (a script
+        // word, an empty ws_uri, and a half-filled line location (a script
         // without a line names no position).
         for (method, params) in [
             (DEBUG_LAUNCH, json!({})),
             (DEBUG_LAUNCH, json!({ "script": "lib/main.dart", "kind": "swift" })),
             (
                 DEBUG_LAUNCH,
-                json!({ "script": "lib/main.dart", "kind": "flutter", "dartDefines": ["NOVALUE"] }),
+                json!({ "script": "lib/main.dart", "kind": "flutter", "dart_defines": ["NOVALUE"] }),
             ),
-            (DEBUG_STEP, json!({ "sessionId": 1, "option": "sideways" })),
-            (DEBUG_OUTPUT, json!({ "sessionId": 1, "stream": "stdin" })),
-            (DEBUG_ATTACH, json!({ "wsUri": "" })),
-            (DEBUG_EXCEPTION_PAUSE, json!({ "sessionId": 1, "mode": "sometimes" })),
-            (DEBUG_EVALUATE, json!({ "sessionId": 1, "expression": "" })),
+            (DEBUG_STEP, json!({ "session_id": 1, "option": "sideways" })),
+            (DEBUG_OUTPUT, json!({ "session_id": 1, "stream": "stdin" })),
+            (DEBUG_ATTACH, json!({ "ws_uri": "" })),
+            (DEBUG_EXCEPTION_PAUSE, json!({ "session_id": 1, "mode": "sometimes" })),
+            (DEBUG_EVALUATE, json!({ "session_id": 1, "expression": "" })),
             (
                 DEBUG_BREAKPOINT_ADD,
-                json!({ "sessionId": 1, "location": { "script": "package:app/main.dart" } }),
+                json!({ "session_id": 1, "location": { "script": "package:app/main.dart" } }),
             ),
             ("dartq/debug/nope", json!({})),
         ] {
