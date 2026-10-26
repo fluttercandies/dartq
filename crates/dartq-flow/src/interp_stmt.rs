@@ -223,6 +223,10 @@ impl Interp<'_> {
             }
             Ev::WhileBodyBegin => {
                 if self.collecting() {
+                    // The condition's value leaves the stack here in every
+                    // mode (the leak note at `SwitchBlockBegin`).
+                    self.flush_null_shorts_above(self.consumer_base(1));
+                    self.exprs.pop();
                     return true;
                 }
                 // The condition ends: rejoin the null-shorting its own `?`
@@ -300,6 +304,10 @@ impl Interp<'_> {
             }
             Ev::DoEnd { while_range } => {
                 if self.collecting() {
+                    // The do-while condition's value leaves the stack here
+                    // in every mode (the leak note at `SwitchBlockBegin`).
+                    self.flush_null_shorts_above(self.consumer_base(1));
+                    self.exprs.pop();
                     return true;
                 }
                 // The condition ends: rejoin the null-shorting its own `?`
@@ -620,6 +628,15 @@ impl Interp<'_> {
             }
             Ev::SwitchBlockBegin => {
                 if self.collecting() {
+                    // The scrutinee's value leaves the stack at this event
+                    // in every mode: a collect run that skips the pop leaks
+                    // the slot, and every later pop — an assignment target
+                    // reading the wrong expression — silently stops
+                    // recording its write, so the walk's AssignedVariables
+                    // sets come back empty (a closure containing a switch
+                    // then demotes nothing at later closure entries).
+                    self.flush_null_shorts_above(self.consumer_base(1));
+                    self.exprs.pop();
                     return true;
                 }
                 // The scrutinee ends: rejoin null-shorting opened inside it
@@ -828,6 +845,10 @@ impl Interp<'_> {
             }
             Ev::SwitchExprBlockBegin => {
                 if self.collecting() {
+                    // The scrutinee's value leaves the stack here in every
+                    // mode (the leak note at `SwitchBlockBegin`).
+                    self.flush_null_shorts_above(self.consumer_base(1));
+                    self.exprs.pop();
                     return true;
                 }
                 // The scrutinee ends: rejoin null-shorting opened inside it
@@ -900,6 +921,13 @@ impl Interp<'_> {
             }
             Ev::SwitchExprCaseEnd { has_guard, begin } => {
                 if self.collecting() {
+                    // The case value — and the guard's value behind it,
+                    // when present — leaves the stack here in every mode
+                    // (the leak note at `SwitchBlockBegin`).
+                    self.exprs.pop();
+                    if *has_guard {
+                        self.exprs.pop();
+                    }
                     return true;
                 }
                 // The latched match-time row (see `SwitchExprCasePattern`).
@@ -1196,12 +1224,44 @@ impl Interp<'_> {
                 // snapshot depth to leave the initializer-face row to the
                 // semantic as-cast tail face.
                 self.init_exec_depth = Some(self.exec_frame_depth());
+                // A late local's initializer is a deferred context (official
+                // `lateInitializer_begin` = `_functionExpression_begin`,
+                // flow_analysis.dart:7266-7282: `late x = e` acts as
+                // `late x = LAZY_MAGIC(() => e)`): it runs at the first
+                // read, not at the declaration, so everything written
+                // anywhere reads as maybe-assigned inside it — the same
+                // conservative join a closure entry applies — and the
+                // initializer's interior flow effects restore at its end
+                // instead of leaking into the enclosing statement. State
+                // only: the value and the declaration's own initialize
+                // write flow through `InitializerEnd` unchanged, and no
+                // executable frame opens (no scope, no body-completion
+                // fact, no dead-window close — those stay the enclosing
+                // statement's).
+                if self.decl.late {
+                    self.late_init_saved.push(Some(self.current.clone()));
+                    let anywhere_written = self.anywhere.written.clone();
+                    let anywhere_captured = self.anywhere.captured.clone();
+                    self.cjoin(&anywhere_written, &anywhere_captured);
+                } else {
+                    self.late_init_saved.push(None);
+                }
             }
             Ev::LocalFnName { name } => {
                 self.local_fns.insert(*name);
             }
             Ev::InitializerEnd => {
                 self.init_exec_depth = None;
+                // The deferred-context pair closes (the late note at
+                // `InitializerBegin`): a late initializer's interior state
+                // restores — the declaration's own initialize write below
+                // applies to the enclosing state, exactly as the official's
+                // `lateInitializer_end` (`_functionExpression_end`) returns
+                // to the declaration site before the late local's lazy
+                // machinery takes over.
+                if let Some(Some(saved)) = self.late_init_saved.pop() {
+                    self.current = saved;
+                }
                 // The initializer expression ends: rejoin null-shorting
                 // opened inside it (`var v = x?.y` — official
                 // `finishNullShorting` at the initializer's boundary); an

@@ -989,6 +989,14 @@ pub(crate) struct Interp<'o> {
     /// Open declarations' base indices into `pending_inits` (one per
     /// `VarDeclBegin`, paired at `VarDeclEnd`).
     pub(crate) pending_decl_bases: Vec<usize>,
+    /// Open late initializers' saved states (one per `InitializerBegin`,
+    /// `None` for a non-late pair so the matching `InitializerEnd` pops
+    /// without restoring — a non-late declaration nested inside a late
+    /// initializer's expression must not eat the outer pair's saved
+    /// state). Mirrors `Frame::Exec`'s closure save/restore
+    /// ([`Interp::exec_end`]) for the deferred contexts the recorder
+    /// frames no executable for.
+    pub(crate) late_init_saved: Vec<Option<State>>,
     pub(crate) pattern: Option<PatternState>,
     pub(crate) pattern_depth: usize,
     /// The open logical-or alternation's latch (depth-1 refutable
@@ -1223,6 +1231,7 @@ impl<'o> Interp<'o> {
             pending_ty: None,
             pending_writes: Vec::new(),
             pending_inits: Vec::new(),
+            late_init_saved: Vec::new(),
             pending_decl_bases: Vec::new(),
             pattern: None,
             pattern_depth: 0,
@@ -3197,6 +3206,12 @@ impl Interp<'_> {
     /// joins the body's writes.
     fn for_in_parts(&mut self, events: &[Ev], i: usize, match_of: &[u32]) {
         if self.collect.is_some() {
+            // The iterable's value leaves the stack at this marker in
+            // every mode (the leak note at `SwitchBlockBegin` in
+            // interp_stmt.rs): a collect run that skips the pop leaks the
+            // slot and misaligns every later pop in the walk.
+            self.flush_null_shorts_above(self.exprs.len().saturating_sub(1));
+            self.exprs.pop();
             return;
         }
         let end = (i..events.len())
