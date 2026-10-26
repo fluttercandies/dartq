@@ -134,6 +134,12 @@ pub(crate) struct PatternState {
     pub unmatched: State,
     /// The scrutinee/matched value when it is a simple variable read.
     pub scrutinee: Option<u32>,
+    /// The scrutinee expression's own type and written-argument tree when
+    /// it is anything but a simple variable read (`transformer?.value`):
+    /// the null-check pattern's declared binder takes this face's non-null
+    /// projection exactly as the variable path does — no promotable
+    /// reference exists, so only the binder (and the unmatched join) care.
+    pub scrutinee_ty: Option<(Ty, u32)>,
     /// The pattern's `when`-guard expression, if one fired.
     pub guard: Option<crate::interp_expr::Expr>,
     /// The state at `GuardBegin`: the guard-false arm for the close's

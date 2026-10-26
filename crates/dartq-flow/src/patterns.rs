@@ -61,7 +61,9 @@ impl Interp<'_> {
                         // the promotion away at the chain join.
                         self.split_cur();
                         // An if-case's scrutinee expression is on the stack.
-                        let scrutinee = self.exprs.pop().and_then(|e| e.reference);
+                        let popped = self.exprs.pop();
+                        let scrutinee = popped.as_ref().and_then(|e| e.reference);
+                        let scrutinee_ty = popped.map(|e| (e.ty, e.args));
                         let unmatched = self.current.clone().set_unreachable(&mut self.reach);
                         self.vacuous_object = None;
                         self.vacuous_fields.clear();
@@ -70,6 +72,7 @@ impl Interp<'_> {
                             kind: PatternKind::Decl,
                             unmatched,
                             scrutinee,
+                            scrutinee_ty,
                             guard: None,
                             pre_guard: None,
                             pending_decls: Vec::new(),
@@ -225,65 +228,89 @@ impl Interp<'_> {
                 if self.pattern_depth != 1 {
                     return;
                 }
-                if let Some(var) = self.pattern_scrutinee() {
-                    let model = self.current.model(var);
-                    let (matched, matched_args) = (
-                        self.promoted_type_of(var, &model),
-                        self.promoted_args_of(var, &model),
-                    );
-                    // A matched value already known non-null is guaranteed to
-                    // match: the official promotes nothing and leaves
-                    // `_unmatched` untouched (the arm cannot fall through).
-                    let guaranteed = self.classify(matched) == Classification::NonNullable;
-                    let (non_null, non_null_args) =
-                        self.promote_to_non_null(matched, matched_args);
-                    if !guaranteed {
-                        // Official order matters here: `_unmatched` joins the
-                        // state BEFORE the promotion (the matched value is
-                        // still nullable on the failure arm), and only then
-                        // does `_setCurrent(ifNotNull)` replace `current`.
-                        // Joining the promoted state instead would carry the
-                        // non-null face into the next clause's entry state and
-                        // kill a later `case null:` arm
-                        // (the riverpod `notifier_provider.dart` shape).
-                        let before = self.current.clone();
-                        self.current = self.current.clone().finish_type_test(
-                            self.ops,
-                            &mut self.lists,
-                            var,
-                            None,
-                            Some((non_null, non_null_args)),
-                            self.args,
-                            self.names,
+                let scrutinee_var = self.pattern_scrutinee();
+                let scrutinee_expr = self.pattern.as_ref().and_then(|p| p.scrutinee_ty);
+                let (non_null, non_null_args) = match scrutinee_var {
+                    Some(var) => {
+                        let model = self.current.model(var);
+                        let (matched, matched_args) = (
+                            self.promoted_type_of(var, &model),
+                            self.promoted_args_of(var, &model),
                         );
-                        self.join_unmatched(before);
+                        // A matched value already known non-null is
+                        // guaranteed to match: the official promotes nothing
+                        // and leaves `_unmatched` untouched (the arm cannot
+                        // fall through).
+                        let guaranteed =
+                            self.classify(matched) == Classification::NonNullable;
+                        let (non_null, non_null_args) =
+                            self.promote_to_non_null(matched, matched_args);
+                        if !guaranteed {
+                            // Official order matters here: `_unmatched` joins
+                            // the state BEFORE the promotion (the matched
+                            // value is still nullable on the failure arm),
+                            // and only then does `_setCurrent(ifNotNull)`
+                            // replace `current`. Joining the promoted state
+                            // instead would carry the non-null face into the
+                            // next clause's entry state and kill a later
+                            // `case null:` arm
+                            // (the riverpod `notifier_provider.dart` shape).
+                            let before = self.current.clone();
+                            self.current = self.current.clone().finish_type_test(
+                                self.ops,
+                                &mut self.lists,
+                                var,
+                                None,
+                                Some((non_null, non_null_args)),
+                                self.args,
+                                self.names,
+                            );
+                            self.join_unmatched(before);
+                        }
+                        (non_null, non_null_args)
                     }
-                    // The declared variable beside the null check (`case var
-                    // x?`) is declared untyped (`NoType` leaves
-                    // [`Ty::UNKNOWN`]) by the event that precedes this one;
-                    // official `_handleNullCheckPattern` hands the
-                    // sub-pattern the non-null matched type, and
-                    // `DeclaredVariablePattern` declares the variable with
-                    // it. An explicit annotation keeps its own type
-                    // (`declare` prefers the written one). A guaranteed match
-                    // stores the matched type as it stands, already non-null.
-                    if let Some((name, _)) = self
-                        .pattern
-                        .as_ref()
-                        .and_then(|p| p.pending_decls.last().copied())
-                        && let Some(Resolved::Local(child)) = self.resolve(name)
-                        && let Some(meta) = self.vars.get_mut(child as usize)
-                        && meta.ty == Ty::UNKNOWN
-                    {
-                        meta.ty = non_null;
-                        meta.args = non_null_args;
+                    // A NON-variable matched value (`transformer?.value case
+                    // final transformer?`): no promotable reference exists,
+                    // so the null path joins `unmatched` with the state as
+                    // it stands (official `_handleNullTestPattern`'s failure
+                    // arm over an unpromotable value) and the matched state
+                    // keeps itself — only the declared binder cares about
+                    // the face, which the expression's own type supplies.
+                    None => {
+                        let Some((ty, args)) = scrutinee_expr else {
+                            return;
+                        };
+                        let guaranteed = self.classify(ty) == Classification::NonNullable;
+                        if !guaranteed {
+                            let before = self.current.clone();
+                            self.join_unmatched(before);
+                        }
+                        self.promote_to_non_null(ty, args)
                     }
-                } else {
-                    // A non-variable scrutinee promotes no reference, but the
-                    // pattern can still fail: the live state joins the
-                    // failure arm unchanged.
-                    let cur = self.current.clone();
-                    self.join_unmatched(cur);
+                };
+                // The declared variable beside the null check (`case var
+                // x?`) is declared untyped (`NoType` leaves
+                // [`Ty::UNKNOWN`]) by the event that precedes this one;
+                // official `_handleNullCheckPattern` hands the
+                // sub-pattern the non-null matched type, and
+                // `DeclaredVariablePattern` declares the variable with
+                // it. An explicit annotation keeps its own type
+                // (`declare` prefers the written one). A guaranteed match
+                // stores the matched type as it stands, already non-null.
+                // Both scrutinee shapes reach here: the variable path's
+                // promoted face and the expression path's own non-null
+                // type (`transformer?.value case final t?` binds `t` to
+                // the chain's non-null element type).
+                if let Some((name, _)) = self
+                    .pattern
+                    .as_ref()
+                    .and_then(|p| p.pending_decls.last().copied())
+                    && let Some(Resolved::Local(child)) = self.resolve(name)
+                    && let Some(meta) = self.vars.get_mut(child as usize)
+                    && meta.ty == Ty::UNKNOWN
+                {
+                    meta.ty = non_null;
+                    meta.args = non_null_args;
                 }
             }
             Ev::DeclaredVarPattern {
@@ -934,6 +961,7 @@ impl Interp<'_> {
             },
             unmatched,
             scrutinee: None,
+            scrutinee_ty: None,
             guard: None,
             pre_guard: None,
             pending_decls: Vec::new(),
