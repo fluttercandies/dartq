@@ -31,7 +31,8 @@ impl Engine<'_> {
         ) {
             return ty;
         }
-        let Some((_, tys)) = self.call_type_args.iter().find(|(r, _)| *r == row) else {
+        let offset = self.rows.get(row).map_or(u32::MAX, |r| r.range.offset);
+        let Some((_, tys)) = self.call_type_args.iter().find(|(r, _)| *r == offset) else {
             return ty;
         };
         self.boundary.args.borrow_mut().named(name, nullable, tys)

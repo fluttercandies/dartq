@@ -2147,7 +2147,7 @@ pub(crate) struct Engine<'a> {
     /// Explicit type arguments of pending calls, keyed by the callee's row
     /// index (pushed at the group's close, consumed by the argument check
     /// or the tear-off/implicit-creation faces).
-    pub(crate) call_type_args: Vec<(usize, Box<[Ty]>)>,
+    pub(crate) call_type_args: Vec<(u32, Box<[Ty]>)>,
     /// The send-close upward inference's solved parameters, keyed by the
     /// callee row's range offset (stable while row indexes churn under the
     /// folds): a generic call's typed arguments unify against the callee's

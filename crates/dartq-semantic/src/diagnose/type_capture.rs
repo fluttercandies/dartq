@@ -1206,20 +1206,28 @@ impl<'a> Engine<'a> {
         let Some(capture) = self.call_args_capture.take() else {
             return;
         };
-        // An older pending head can never be a callee anymore: entries at
-        // or past this head row are stale by construction.
-        self.call_type_args.retain(|(row, _)| *row < head_row);
+        // The entry keys on the head row's OFFSET, never its index: rows
+        // pop and merge through every fold, and a reused index would
+        // re-ground a dead group on an unrelated later callee (json1's
+        // `_col('key')` inheriting a sibling declaration's `<int>` and
+        // reporting the wrong return instantiation).
+        let Some(head) = self.rows.get(head_row) else {
+            return;
+        };
+        let head_offset = head.range.offset;
+        self.call_type_args.retain(|(offset, _)| *offset < head_offset);
         self.call_type_args
-            .push((head_row, capture.members.into_boxed_slice()));
+            .push((head_offset, capture.members.into_boxed_slice()));
     }
 
     /// The explicit type arguments of the callee row, if a call-site
     /// group latched any.
     pub(crate) fn call_args_for(&mut self, callee: usize) -> Option<Box<[Ty]>> {
+        let offset = self.rows.get(callee)?.range.offset;
         let pos = self
             .call_type_args
             .iter()
-            .rposition(|(row, _)| *row == callee)?;
+            .rposition(|(at, _)| *at == offset)?;
         Some(self.call_type_args.remove(pos).1)
     }
 

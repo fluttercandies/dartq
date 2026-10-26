@@ -111,15 +111,19 @@ impl<'a> Engine<'a> {
             }
             // The merge removes every row at or above the member row's slot
             // (the member and receiver pops below replace the receiver's
-            // slot with the merged row), so index-keyed entries pointing
-            // there lose their rows — the F-H drain's same under-report
-            // discipline. A stale entry would otherwise re-ground on a
-            // LATER send's callee and check the dead group's count against
-            // an unrelated method (the `_isValidContext` misattribution).
+            // slot with the merged row), so entries anchored there lose
+            // their rows — the F-H drain's same under-report discipline. A
+            // stale entry would otherwise re-ground on a LATER send's
+            // callee and check the dead group's count against an unrelated
+            // method (the `_isValidContext` misattribution).
             let first_removed = self.rows.len();
+            let boundary = self
+                .rows
+                .get(first_removed)
+                .map_or(u32::MAX, |row| row.range.offset);
             self.deferred_args
                 .retain(|(row, _, _)| *row < first_removed);
-            self.call_type_args.retain(|(row, _)| *row < first_removed);
+            self.call_type_args.retain(|(offset, _)| *offset < boundary);
             self.deferred_miss_rows.append(&mut type_arg_rows);
         }
         // The `.{`/`?.{` operand recovery (`AstBuilder.doDotExpression`):
@@ -3163,10 +3167,14 @@ impl<'a> Engine<'a> {
         };
         // The creation is the outer call's first argument (an earlier
         // compound argument would leave the positional index unattributed).
+        let outer_offset = self.rows.get(outer).map(|row| row.range.offset);
         if self.init_mark != Some(outer)
             || callee != outer + 1
             || !outer_level.args.is_empty()
-            || self.call_type_args.iter().any(|(row, _)| *row == outer)
+            || self
+                .call_type_args
+                .iter()
+                .any(|(at, _)| Some(*at) == outer_offset)
         {
             return;
         }

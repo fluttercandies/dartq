@@ -3538,10 +3538,14 @@ impl ParserListener for DiagnoseListener<'_> {
                                 // callee row. The bare head would stage a
                                 // `C` write and demote the target's
                                 // promoted `C<int>`.
+                                let rhs_offset = engine
+                                    .rows
+                                    .get(rhs_index)
+                                    .map(|r| r.range.offset);
                                 let explicit = engine
                                     .call_type_args
                                     .iter()
-                                    .find(|(row, _)| *row == rhs_index)
+                                    .find(|(row, _)| Some(*row) == rhs_offset)
                                     .map(|(_, tys)| tys.clone());
                                 match explicit {
                                     Some(tys) => engine

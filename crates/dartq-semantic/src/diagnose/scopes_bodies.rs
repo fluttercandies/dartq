@@ -1409,10 +1409,11 @@ impl<'a> Engine<'a> {
         // the declaration's parameter order, which the foreign-declaration
         // recovery cannot vouch for, so those solutions stay open.
         if let (Some(own), Some(callee_row)) = (ordered, callee_row)
+            && let Some(callee_offset) = self.rows.get(callee_row).map(|r| r.range.offset)
             && let Some((_, explicit)) = self
                 .call_type_args
                 .iter()
-                .find(|(row, _)| *row == callee_row)
+                .find(|(row, _)| *row == callee_offset)
             && explicit.len() == own
         {
             for ((slot, fixed), ty) in solutions.iter_mut().zip(fixed.iter_mut()).zip(explicit) {
