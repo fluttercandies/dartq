@@ -2234,7 +2234,7 @@ impl<'a> Engine<'a> {
     /// receiver resolves the member face; a bare callee reads the
     /// top-level declaration; a constructor selector reads the resolved
     /// container's `ctor_formals` table).
-    fn callee_formals(&self, recv: &Receiver, name: StringId) -> Option<Formals> {
+    fn callee_formals(&mut self, recv: &Receiver, name: StringId) -> Option<Formals> {
         match recv {
             // A bare class-name callee's constructor schema stays closed:
             // the class's own type parameters bind only through the
@@ -2252,8 +2252,100 @@ impl<'a> Engine<'a> {
                 .member_formals_full(recv, name)
                 .map(|f| f.into_owned())
                 .or_else(|| self.ctor_schema_formals(*class, name)),
-            _ => self.member_formals_full(recv, name).map(|f| f.into_owned()),
+            _ => self
+                .member_formals_full(recv, name)
+                .map(|f| f.into_owned())
+                .or_else(|| self.extension_member_formals(recv, name)),
         }
+    }
+
+    /// An applied extension member's formal table, the extension's own
+    /// type parameters instantiated from the receiver's written arguments
+    /// through the `on` clause (`extension M<K, V> on Map<K, V>`'s
+    /// `mapValue<R>(R Function(V) f)` types the literal's `v` as the
+    /// receiver's `V`): the container walk in
+    /// [`Self::member_formals_full`] never reaches these — the member
+    /// lives on the extension, not on the `on`-type's container, and the
+    /// unindexed SDK receiver (`Map`) answers no member table of its own.
+    /// The positional zip of the projected `on` type's arguments with the
+    /// receiver's written arguments is the substitution (an `on` head
+    /// without written arguments instantiates nothing); a receiver
+    /// without written arguments leaves the formals as written.
+    fn extension_member_formals(&mut self, recv: &Receiver, name: StringId) -> Option<Formals> {
+        let Receiver::Typed { ty, .. } = *recv else {
+            return None;
+        };
+        let Ty::Named {
+            name: head, args, ..
+        } = ty
+        else {
+            return None;
+        };
+        let pairs: Vec<(&'a ExtensionFace, FileId)> =
+            self.accessible_extension_faces().to_vec();
+        for (face, file) in pairs {
+            if face.on_type != Some(head) {
+                continue;
+            }
+            let Some(entry) = face.members.get(&name) else {
+                continue;
+            };
+            if entry.kind != MemberKind::Method {
+                continue;
+            }
+            let Some(formals) = entry.formals.as_deref() else {
+                continue;
+            };
+            let mut formals = formals.clone();
+            self.project_formals(file, &mut formals);
+            // The instantiation gate: an extension whose `on` clause spells
+            // its own type parameters instantiates ONLY from the
+            // receiver's written arguments — a receiver that carries none
+            // (an unsolved generic send's result) leaves the formal's
+            // parameters spelling the extension's unsolved names, and the
+            // schema machinery's `Object?` unresolvable fallback would
+            // REFUSE arguments the oracle infers fine (the callback's
+            // params are the oracle's solved types, which the name-level
+            // model cannot derive). No honest instantiation keeps the
+            // whole face off (the under-report direction). A
+            // parameter-less extension's formals spell no extension
+            // names and answer as written.
+            if !face.type_param_names.is_empty() {
+                let on_ty = self.boundary.ty(file, face.on_ty);
+                let Ty::Named {
+                    args: on_args, ..
+                } = on_ty
+                else {
+                    continue;
+                };
+                let written = self.boundary.pool().get(args).to_vec();
+                let on_params = self.boundary.pool().get(on_args).to_vec();
+                if on_params.len() != written.len() {
+                    continue;
+                }
+                let keys: FxHashMap<StringId, Ty> = on_params
+                    .iter()
+                    .zip(written.iter().copied())
+                    .filter_map(|(param, written)| match param {
+                        Ty::Named { name, .. } => Some((*name, written)),
+                        _ => None,
+                    })
+                    .collect();
+                if keys.len() != face.type_param_names.len() {
+                    continue;
+                }
+                let all = formals
+                    .positional
+                    .iter_mut()
+                    .map(|f| &mut f.ty)
+                    .chain(formals.named.iter_mut().map(|f| &mut f.ty));
+                for formal_ty in all {
+                    *formal_ty = self.substitute_ty(*formal_ty, &keys);
+                }
+            }
+            return Some(formals);
+        }
+        None
     }
 
     /// A constructor invocation's formal table as a closure-context
