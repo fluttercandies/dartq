@@ -4239,6 +4239,24 @@ impl<'a> Engine<'a> {
         map
     }
 
+    /// The written type arguments of `container`'s clause naming
+    /// `super_name` (`PathMap<V> extends MapView<String?, V>` answers
+    /// `[String?, V]` for `MapView`) — the subclass's written
+    /// instantiation for the direct superclass, the substitution source
+    /// the element model's name-only clause face cannot carry.
+    pub(super) fn clause_instantiation(
+        &self,
+        container: StringId,
+        super_name: StringId,
+    ) -> Option<Vec<Ty>> {
+        self.scan_header_clauses()
+            .get(&container)?
+            .supers
+            .iter()
+            .find(|(name, _)| *name == super_name)
+            .map(|(_, args)| args.clone())
+    }
+
     /// The prefixed supertype-clause faces of this file's container headers:
     /// `(writer container, face local name)` → the written prefix head. The
     /// element model keeps only the clause continuation (`implements idl.X`

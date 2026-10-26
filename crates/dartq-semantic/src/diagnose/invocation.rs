@@ -3897,6 +3897,45 @@ impl<'a> Engine<'a> {
                         let mut formals = formals;
                         self.project_formals(super_owner, &mut formals);
                         self.patch_super_formals(superclass, &mut formals);
+                        // The subclass's written instantiation substitutes
+                        // the superclass's own parameters in the formals
+                        // (`PathMap<V> extends MapView<String?, V>` pairs
+                        // `MapView(Map<K, V>?)`'s `K := String?`) — the
+                        // element model's clause face carries names only,
+                        // so the written argument group is the only source.
+                        if let Some(args) = self.clause_instantiation(container, superclass)
+                            && !super_container.type_param_names.is_empty()
+                        {
+                            // The clause scan records one `Ty` per clause
+                            // entry — a single instantiated head carries its
+                            // own written arguments, so the positional
+                            // pairing reads them out of the pool first.
+                            let written: Vec<Ty> = match args.as_slice() {
+                                [Ty::Named {
+                                    args: arg_list, ..
+                                }] if *arg_list != crate::model::ArgListId::EMPTY => {
+                                    self.boundary.args.borrow().get(*arg_list).to_vec()
+                                }
+                                many => many.to_vec(),
+                            };
+                            if written.len() == super_container.type_param_names.len() {
+                                let map: Vec<(StringId, Ty)> = super_container
+                                    .type_param_names
+                                    .iter()
+                                    .copied()
+                                    .zip(written.iter().copied())
+                                    .collect();
+                                for formal in formals
+                                    .positional
+                                    .iter_mut()
+                                    .chain(formals.named.iter_mut())
+                                {
+                                    if let Some(ty) = self.subst_params(formal.ty, &map) {
+                                        formal.ty = ty;
+                                    }
+                                }
+                            }
+                        }
                         (
                             formals,
                             Some((super_container, super_owner)),
@@ -5474,6 +5513,20 @@ impl<'a> Engine<'a> {
                     })
                     .collect(),
             );
+        }
+        // The bounds capture registers at the container's close, so a
+        // creation whose callee is declared LATER in the file (the
+        // extension method above its own return type's class,
+        // `optional()` before `OptionalParser`) reads no capture
+        // mid-parse. The element model's `type_param_names` — complete
+        // before the parse runs — stand in unbounded: explicit type
+        // arguments still solve every slot, and an unsolved slot keeps
+        // the raw spelling.
+        if exec_params.is_none()
+            && let Some(container) = creation_container
+            && let Some(names) = self.foreign_container_params(container)
+        {
+            exec_params = Some(names.into_iter().map(|name| (name, None)).collect());
         }
         // The function-typed variable's written signature (the captured
         // `T Function<T>(T)` annotation): its declared type parameters
