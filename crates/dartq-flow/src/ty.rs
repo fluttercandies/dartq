@@ -194,6 +194,14 @@ pub(crate) struct ClosedNames {
 /// The client-supplied type operations seam (official
 /// `FlowAnalysisTypeOperations`, cut to the questions the engine asks).
 pub trait TypeOps {
+    /// Whether this back-end is the resolved (element-indexed) layer —
+    /// `false` for the name-level default the unit tests run under. An
+    /// `Unknown` face under the resolved seam is the layer's own
+    /// resolution gap (the stager dropped an unresolvable head), never a
+    /// lattice spelling the name level chose.
+    fn is_resolved_seam(&self) -> bool {
+        false
+    }
     /// Whether `left` is a subtype of `right`.
     fn is_subtype(&self, left: Ty, right: Ty) -> bool;
     /// The "remainder" of `from` when `what` is removed by an instance

@@ -851,6 +851,7 @@ impl<'t> Flow<'t> {
         // `FutureOr<T>` recurses into `T`.
         self.closed.bool_name = Some(self.intern_lexeme("bool"));
         self.closed.future_or = Some(self.intern_lexeme("FutureOr"));
+        self.intern_lexeme("Future");
         let fallback = NameTypeOps;
         let ops = self.ops.unwrap_or(&fallback);
         let mut interp = Interp::new(ops, &self.type_args, &self.boundaries);

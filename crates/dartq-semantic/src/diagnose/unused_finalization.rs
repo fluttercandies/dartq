@@ -28,8 +28,9 @@ impl<'a> Engine<'a> {
     /// unresolvable entry stays with the clause ledger's own faces.
     pub(crate) fn finalize_mixin_uses(&mut self) {
         for span in std::mem::take(&mut self.pending_mixin_uses) {
-            let start = span.offset as usize;
-            let end = (start + span.length as usize).min(self.source.len());
+            // The span is UTF-16; the slice reads source bytes (#2594).
+            let start = self.byte_of(span.offset);
+            let end = self.byte_of(span.end()).min(self.source.len());
             if start >= end {
                 continue;
             }
@@ -256,6 +257,20 @@ impl<'a> Engine<'a> {
                 } => {
                     self.member_found(container, read.name, false)
                         || self.ctor_found(container, read.name)
+                        // A head that resolves to no type in this scope (a
+                        // foreign class's unsubstituted parameter —
+                        // `WeakReference<C>.target` read as `T?`) names no
+                        // container the walk can probe; the oracle's
+                        // substituted receiver resolves the member, so the
+                        // access stays resolved like an `Unknown` receiver.
+                        || {
+                            let foreign = !self.is_scope_param(container)
+                                && self.type_resolution(container).0 == TypeResolution::Missing;
+                            if foreign {
+                                
+                            }
+                            foreign
+                        }
                 }
                 Receiver::Super { container, .. } => self.member_found(container, read.name, true),
                 // The prefix-resolved container (`io.Directory.gone`): the
@@ -371,6 +386,54 @@ impl<'a> Engine<'a> {
     /// resolution the oracle reached; a second declarer would be the
     /// ambiguous application that credits nothing and leaves every
     /// candidate reporting.
+    /// The plain identifier a `.`-selection's receiver ends with (`x.m`
+    /// at `m`'s offset answers `x`'s span; `a.b.m` answers `b`'s):
+    /// `None` when the receiver is not a bare identifier link (a call or
+    /// index result closes with `)`/`]`, not the `.` the backscan
+    /// requires). Offsets are UTF-16 like every token range; the
+    /// identifier charset is ASCII, so the unit arithmetic is exact.
+    fn ident_span_before_dot(&self, offset: u32) -> Option<(u32, u32)> {
+        let ident_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        let mut at = offset;
+        while at > 0 && matches!(self.byte_at(at - 1), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            at -= 1;
+        }
+        if at == 0 || self.byte_at(at - 1) != Some(b'.') {
+            return None;
+        }
+        at -= 1;
+        let end = at;
+        while at > 0 && self.byte_at(at - 1).is_some_and(ident_char) {
+            at -= 1;
+        }
+        (at != end).then_some((at, end))
+    }
+
+    /// Whether the bytes after a declarator's name spell `= <…>(…` — the
+    /// local's initializer is a CALL expression (a plain `= ident;` or a
+    /// literal initializer never matches). The untyped-call-local premise
+    /// keys on it: only a send's return can be inferred by the oracle
+    /// where the walk's tables cannot.
+    fn decl_initializer_is_call(&self, name_end: u32) -> bool {
+        let mut at = name_end;
+        while matches!(self.byte_at(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
+        if self.byte_at(at) != Some(b'=') || self.byte_at(at + 1) == Some(b'=') {
+            return false;
+        }
+        at += 1;
+        let limit = at + 300;
+        while at < limit {
+            match self.byte_at(at) {
+                Some(b'(') => return true,
+                Some(b';') | Some(b'\n') => return false,
+                _ => at += 1,
+            }
+        }
+        false
+    }
+
     fn credit_derived_extension_uses(&mut self) {
         let Some(elements) = self.index.get(self.file) else {
             return;
@@ -399,7 +462,217 @@ impl<'a> Engine<'a> {
                 self.note_extension_self_use(&face_keys, &mut derived, container, read.name);
             }
         }
+        // The IMPLICIT-THIS / TYPE-PARAMETER-RECEIVER arm: a bare
+        // reference the scope walk answered through the extension pool
+        // (`RefTarget::Opaque` — `_kind(1)` inside a subclass of the
+        // face's `on` type) and a member read whose receiver is a type
+        // parameter (`e.eff` over `E extends EI` — the bound's extension
+        // face resolves it) both resolve in the oracle, which records the
+        // use on the member element. A spelling declared by exactly one
+        // same-file face is that resolution; a second declarer is the
+        // ambiguity the oracle leaves unresolved.
+        let type_param_heads: FxHashSet<StringId> = elements
+            .containers()
+            .flat_map(|(_, c)| c.type_param_names.iter().copied())
+            .chain(faces.iter().flat_map(|f| f.type_param_names.iter().copied()))
+            .chain(
+                self.exec_bounds
+                    .values()
+                    .chain(self.method_exec_bounds.values())
+                    .flat_map(|w| w.iter().map(|(p, _)| *p)),
+            )
+            .collect();
+        let unique_face = |name: StringId| -> Option<u32> {
+            let mut hit = None;
+            for (index, face) in faces.iter().enumerate() {
+                if face.members.contains_key(&name) {
+                    if hit.is_some() {
+                        return None;
+                    }
+                    hit = u32::try_from(index).ok();
+                }
+            }
+            hit
+        };
+        // The enclosing top-level declaration's keyword, read backward from
+        // the reference: an implicit-`this` read inside an EXTENSION body
+        // looks up on that extension's own `on` type, never a sibling
+        // face — only class/mixin/enum bodies (a subclass of the face's
+        // `on` type) carry the pool resolution.
+        // The enclosing top-level extension's `on` head, read backward from
+        // the reference: an implicit-`this` read inside an EXTENSION body
+        // looks up on that extension's own `on` type, so only a face on the
+        // same head resolves it (a sibling face on another type never
+        // does). `None` = not inside an extension body (a class/mixin/enum
+        // body — a subclass of the face's `on` type — or top level).
+        let enclosing_extension_on = |offset: u32| -> Option<&str> {
+            let bytes = self.source.as_bytes();
+            let mut end = self.byte_of(offset).min(bytes.len());
+            loop {
+                let start = bytes[..end].iter().rposition(|b| *b == b'\n').map_or(0, |p| p + 1);
+                let line = &self.source[start..end];
+                // A top-level declaration header starts in column 0.
+                if !line.is_empty() && !line.starts_with([' ', '\t', '}', '/', '*', ')']) {
+                    let words: Vec<&str> = line.split_whitespace().collect();
+                    if words.contains(&"extension") {
+                        let head = words
+                            .iter()
+                            .position(|w| *w == "on")
+                            .and_then(|at| words.get(at + 1))
+                            .map(|w| w.trim_end_matches(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$')))
+                            .map(|w| w.split(['<', '?']).next().unwrap_or(w));
+                        return Some(head.unwrap_or(""));
+                    }
+                    if words.iter().any(|w| matches!(*w, "class" | "mixin" | "enum")) {
+                        return None;
+                    }
+                }
+                if start == 0 {
+                    return None;
+                }
+                end = start - 1;
+            }
+        };
+        let in_extension_body = |offset: u32, index: u32| -> bool {
+            let Some(head) = enclosing_extension_on(offset) else {
+                return false;
+            };
+            let face_head = faces
+                .get(index as usize)
+                .and_then(|face| face.on_type)
+                .map(|on| self.strings.resolve(on));
+            // The enclosing `on` type must be the face's own head or a
+            // subtype of it (`ClassElement` reaching an `InterfaceElement`
+            // face); an unresolvable head keeps the pool credit.
+            let foreign = match face_head {
+                Some(face_head) if face_head != head => {
+                    let sub = Ty::named(self.intern(head));
+                    let sup = Ty::named(self.intern(face_head));
+                    self.type_resolution(self.intern(head)).0 != TypeResolution::Missing
+                        && !self.name_subtype(sub, sup)
+                }
+                _ => false,
+            };
+            
+            foreign
+        };
+        for unit_ref in &self.refs {
+            if matches!(unit_ref.target, RefTarget::Opaque)
+                && let Some(index) = unique_face(unit_ref.name)
+                && !in_extension_body(unit_ref.range.offset, index)
+            {
+                
+                derived.insert((self.file, index, unit_ref.name));
+            }
+        }
+        for read in &self.member_reads {
+            if let Receiver::Typed { type_name, .. } = read.recv
+                && type_param_heads.contains(&type_name)
+                && let Some(index) = unique_face(read.name)
+            {
+                
+                derived.insert((self.file, index, read.name));
+            }
+        }
         self.extension_member_used.extend(derived);
+        // The CLOSURE-FORMAL-CHAIN arm: a member row whose receiver chain
+        // roots at a link the walk could not type — a closure formal the
+        // callee inference never solved (`((x ?? const []).map((sub) =>
+        // sub.source.meta))` leaves `.map` unresolvable) or a var-inferred
+        // local from an untyped call (`final sub = ext._addListener(…)`).
+        // The oracle instantiates the real callback/send return and
+        // resolves the whole chain, so each link's spelling is a resolved
+        // use — the same premise the inference-bound receiver gate rides.
+        // The chain walks backward by bytes: the receiver's last
+        // identifier is either SPELLED like a recorded closure formal
+        // (`sub`), names an untyped-call local, or is itself a member row
+        // this pass just credited (`source`), so one in-order sweep
+        // carries the premise outward (`meta`).
+        if !self.closure_formal_names.is_empty() {
+            let mut premise_ends: FxHashSet<u32> = FxHashSet::default();
+            let mut chain_credits: Vec<StringId> = Vec::new();
+            // Pass A: the merged-read record (`member_reads`) — the reads
+            // whose receiver rows folded away at merge time. Pass B: the
+            // still-standing member rows with `Unknown` receivers (the
+            // `sub.impl` chains the merge never recorded). One shared
+            // premise set carries both.
+            let mut reads: Vec<(u32, StringId)> = self
+                .member_reads
+                .iter()
+                .filter(|read| matches!(read.recv, Receiver::Unknown))
+                .map(|read| (read.offset, read.name))
+                .collect();
+            let mut extra: Vec<(u32, StringId)> = self
+                .unresolved_member_rows
+                .iter()
+                .copied()
+                .filter(|&(offset, _)| {
+                    !self
+                        .member_reads
+                        .binary_search_by(|read| read.offset.cmp(&offset))
+                        .is_ok()
+                })
+                .collect();
+            reads.append(&mut extra);
+            reads.sort_unstable();
+            reads.dedup_by(|a, b| a.0 == b.0);
+            reads.sort_unstable();
+            reads.dedup_by(|a, b| a.0 == b.0);
+            for (read_offset, read_name) in reads {
+                
+                let Some((start, end)) = self.ident_span_before_dot(read_offset) else {
+                    continue;
+                };
+                let span_bytes =
+                    &self.source.as_bytes()[self.byte_of(start)..self.byte_of(end)];
+                let rooted_at_formal = self
+                    .closure_formal_names
+                    .iter()
+                    .any(|formal| self.strings.resolve(*formal).as_bytes() == span_bytes);
+                // A var-inferred local whose initializer is a CALL the walk
+                // could not type (`final sub = listenable._addListener(…)`
+                // — the extension method's return stays outside the
+                // element tables) roots the same premise: the oracle
+                // infers the send's return and every member chain beyond
+                // the local resolves (`sub.impl._listenedElement`).
+                let rooted_at_untyped_call_local = !rooted_at_formal
+                    && self.locals.iter().any(|decl| {
+                        self.strings.resolve(decl.name).as_bytes() == span_bytes
+                            && matches!(
+                                self.frames
+                                    .iter()
+                                    .rev()
+                                    .find_map(|frame| frame.var_types.get(&decl.name).copied()),
+                                None | Some(Ty::Unknown)
+                            )
+                            && self.decl_initializer_is_call(decl.range.end())
+                    });
+                if !rooted_at_formal
+                    && !rooted_at_untyped_call_local
+                    && !premise_ends.contains(&end)
+                {
+                    continue;
+                }
+                chain_credits.push(read_name);
+                let name_len = self.strings.resolve(read_name).len() as u32;
+                premise_ends.insert(read_offset + name_len);
+            }
+            for name in &chain_credits {
+                self.inferred_recv_used_members.insert(*name);
+                if let Some(elements) = self.index.get(self.file) {
+                    let credits: Vec<u32> = elements
+                        .extension_faces()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, face)| face.members.contains_key(name))
+                        .filter_map(|(index, _)| u32::try_from(index).ok())
+                        .collect();
+                    for index in credits {
+                        self.extension_member_used.insert((self.file, index, *name));
+                    }
+                }
+            }
+        }
         // Universal-`on`-type arm: the re-adjudicated accesses. The
         // declarer count rides the whole accessible pool (own units +
         // imports — the resolve-side ambiguity set), so the guard keeps the
@@ -601,6 +874,7 @@ impl<'a> Engine<'a> {
                         } else {
                             site.range
                         };
+                        
                         self.stage_usage(SemanticCode::UnusedElement, range, &name_text);
                     }
                 }
@@ -612,6 +886,7 @@ impl<'a> Engine<'a> {
                         && (self.is_private_name(site.name) || self.is_nameless(site.name))
                         && !element_used.contains(&bare)
                     {
+                        
                         self.stage_usage(SemanticCode::UnusedElement, site.range, &name_text);
                     }
                 }
@@ -744,6 +1019,7 @@ impl<'a> Engine<'a> {
                         || member_used
                         || matches!(self.walk_super(container, site.name), Walk::Found(_));
                     if !spared {
+                        
                         self.stage_usage(SemanticCode::UnusedElement, site.range, &name_text);
                     }
                 }
@@ -1400,12 +1676,17 @@ impl<'a> Engine<'a> {
                     self.used_names.contains(&prefix) || self.import_used.contains(&prefix)
                 }
                 None => {
-                    used.iter().any(|&n| {
+                    let hit = used.iter().find(|&&n| {
                         edge.combinators.allows(n) && self.graph.exported(target, n).is_some()
-                    }) || self.import_credits_extension_member(edge, target, &used)
+                    });
+                    if let Some(n) = hit {
+                        
+                    }
+                    hit.is_some() || self.import_credits_extension_member(edge, target, &used)
                 }
             };
             if !is_used {
+                
                 self.stage_usage(SemanticCode::UnusedImport, uri_range, &uri_text);
                 continue;
             }
@@ -1587,6 +1868,20 @@ impl<'a> Engine<'a> {
                 if face.name != Some(export_name) {
                     continue;
                 }
+                // The oracle's credit requires an APPLICABLE extension: the
+                // `on` type's head must resolve in the DECLARING file's
+                // scope (the spelling need not be visible to the importer —
+                // `on XmlNode` applies in files that never import node.dart;
+                // an extension over a type unresolvable in its own scope —
+                // `on YamlMap` under the missing package:yaml — never
+                // applies, so its member names lend the import no credit;
+                // imports_verifier.dart counts extension elements the
+                // resolver actually applied).
+                if let Some(on) = face.on_type
+                    && !self.named_type_is_type_in(entry.file, on)
+                {
+                    continue;
+                }
                 if face.members.keys().any(|member| used.contains(member)) {
                     return true;
                 }
@@ -1675,11 +1970,12 @@ impl<'a> Engine<'a> {
             }
         }
         let asserts = std::mem::take(&mut self.null_assert_staged);
-        for (read, bang) in asserts {
-            if promotions
-                .promoted(read)
-                .is_some_and(Ty::is_strictly_non_nullable)
-            {
+        for (read, bang, nullable_params) in asserts {
+            let promoted = promotions.promoted(read).filter(|ty| {
+                !matches!(ty, Ty::Named { name, .. } if nullable_params.contains(name))
+            });
+            
+            if promoted.is_some_and(Ty::is_strictly_non_nullable) {
                 self.stage_usage(SemanticCode::UnnecessaryNonNullAssertion, bang, "");
             }
         }
@@ -1914,8 +2210,10 @@ impl<'a> Engine<'a> {
     /// under-reporting.
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     pub(crate) fn note_metadata_args(&mut self, begin: Token, end: Token) {
-        let start = begin.range.offset as usize;
-        let stop = (end.range.offset + end.range.length) as usize;
+        // Token ranges are UTF-16; the walk reads source bytes — convert so a
+        // wide char upstream cannot desync (or cut mid-character, #2594).
+        let start = self.byte_of(begin.range.offset);
+        let stop = self.byte_of(end.range.end());
         let Some(open) = self.pending_annotations.last_mut() else {
             return;
         };

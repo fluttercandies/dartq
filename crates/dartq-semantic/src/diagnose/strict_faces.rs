@@ -35,7 +35,7 @@ impl<'a> Engine<'a> {
             .iter()
             .enumerate()
             .filter_map(|(index, &name)| {
-                let id = ops.param_id(name)?;
+                let id = ops.param_id(name, face_file)?;
                 let bound = match face.type_param_bounds.get(index).copied() {
                     None | Some(Ty::Dynamic) => None,
                     Some(bound) => Some(self.boundary.ty(face_file, bound)),

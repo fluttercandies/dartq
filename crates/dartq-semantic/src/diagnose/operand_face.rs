@@ -79,6 +79,18 @@ impl<'a> Engine<'a> {
                     OperandFace::Invalid
                 }
             }
+            // A flow-blind local whose initializer typed InvalidType (the
+            // pass-2 pre-pass's `invalid_init_locals`): the local's
+            // inferred type is the initializer's, so the read is invalid.
+            RowShape::Bare(BareInfo::Plain { .. })
+                if self
+                    .local_decl_at_read
+                    .get(&row.range.offset)
+                    .is_some_and(|decl| self.invalid_init_locals.borrow().contains(decl)) =>
+            {
+                
+                OperandFace::Invalid
+            }
             _ => OperandFace::Gap,
         }
     }

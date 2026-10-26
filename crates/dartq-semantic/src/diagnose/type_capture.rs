@@ -796,7 +796,23 @@ impl<'a> Engine<'a> {
             return;
         }
         match self.fn_type_capture.last_mut() {
-            Some(open) => open.poisoned = true,
+            // A NESTED function type (`Future<I> Function(void
+            // Function(Object), Object)` — the outer signature's formal
+            // carries an inner signature) pushes its OWN capture frame:
+            // the inner close pops the inner and hands its interned
+            // `Ty::Function` to this (still-open) outer capture through
+            // `fn_capture_type`, exactly like any other formal type, and
+            // the outer's own close then stashes the FULL signature. The
+            // old blanket poison made every nested-signature parameter
+            // degrade to a 0-formal stash, so the call-site arity read
+            // "0 expected". Only an inner close that never landed any
+            // formal (recovery) poisons the parent — the unclaimed flag
+            // carries that verdict from the inner close.
+            Some(open) => {
+                let unclaimed = std::mem::take(&mut self.fn_nested_unclaimed);
+                open.poisoned |= unclaimed;
+                self.fn_type_capture.push(FnTypeCapture::default());
+            }
             None => {
                 self.fn_type_capture.push(FnTypeCapture::default());
             }
@@ -862,6 +878,12 @@ impl<'a> Engine<'a> {
         );
         self.armed_ty = Some(fn_ty);
         self.armed_ty_unresolved = false;
+        // An inner capture that never landed a pending formal nor a
+        // return (a stray `Function(` the formals never claimed): the
+        // enclosing capture treats it as recovery poison; a clean close
+        // leaves the outer signature intact.
+        self.fn_nested_unclaimed =
+            capture.in_params && capture.pending_formal.is_none() && capture.positional.is_empty() && capture.named.is_empty();
         self.fn_capture_type(fn_ty, StringId::NONE, 0);
         // A body-position capture (#2359) arms its shape for the
         // annotation/test faces but claims no variable-signature stash: the
@@ -938,6 +960,31 @@ impl<'a> Engine<'a> {
         };
         match capture.section {
             FnFormalSection::Named => capture.named.push((name, ty, required)),
+            FnFormalSection::Required => {
+                capture.required_positional += 1;
+                capture.positional.push(ty);
+            }
+            FnFormalSection::OptionalPositional => capture.positional.push(ty),
+        }
+    }
+
+    /// `end_formal_parameter` inside an open capture: an UNNAMED formal
+    /// (`Future<I> Function(void Function(Object), Object)`'s positional
+    /// columns) fires no identifier event, so the pending formal its type
+    /// armed claims here — a named formal's identifier event already took
+    /// the slot, making this a no-op.
+    pub(crate) fn fn_capture_formal_unnamed(&mut self) {
+        let Some(capture) = self.fn_type_capture.last_mut() else {
+            return;
+        };
+        if !capture.in_params {
+            return;
+        }
+        let Some(ty) = capture.pending_formal.take() else {
+            return;
+        };
+        match capture.section {
+            FnFormalSection::Named => capture.poisoned = true,
             FnFormalSection::Required => {
                 capture.required_positional += 1;
                 capture.positional.push(ty);

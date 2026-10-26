@@ -757,6 +757,7 @@ impl ParserListener for DiagnoseListener<'_> {
         // head event precedes the return parse).
         if kind == dartq_parser::MemberKind::GeneralizedFunctionType {
             self.engine.bounds.alias_formals_region_open();
+            self.engine.fn_type_formal_lists += 1;
         }
 
         let engine = &mut self.engine;
@@ -812,6 +813,9 @@ impl ParserListener for DiagnoseListener<'_> {
         }
         // The body may drive the `noSuchMethod` shape only after the
         // method's own formals close (defaults-window closures predate it).
+        if kind == dartq_parser::MemberKind::GeneralizedFunctionType {
+            engine.fn_type_formal_lists = engine.fn_type_formal_lists.saturating_sub(1);
+        }
         engine.arm_no_such_method();
         // The `==` question adjudicates at the outermost list's close.
         engine.equals_parameters_closed(count);
@@ -913,6 +917,7 @@ impl ParserListener for DiagnoseListener<'_> {
         name: Token,
         enclosing_declaration_name: Option<&str>,
     ) {
+        self.engine.this_formal_names.clear();
         self.flow().begin_method(
             kind,
             augment_kw,
@@ -1757,9 +1762,12 @@ impl ParserListener for DiagnoseListener<'_> {
                                 && matches!(engine.rows[mark + 1].shape, RowShape::Value)
                                 && engine.rows[mark + 1].ty != Ty::UNKNOWN
                                 && !Engine::is_nullable_ty(engine.rows[mark + 1].ty)
-                                && engine.byte_at(engine.rows[mark + 1].range.end())
-                                    == Some(b'!') =>
+                                && (engine.byte_at(engine.rows[mark + 1].range.end())
+                                    == Some(b'!')
+                                    || (engine.strictly_non_nullable(engine.rows[mark + 1].ty)
+                                        && !engine.index_receiver_latched(&engine.rows[mark]))) =>
                         {
+                            
                             Some((mark + 1, None))
                         }
                         _ => None,
@@ -1895,9 +1903,23 @@ impl ParserListener for DiagnoseListener<'_> {
                 // lattice cannot spell), so the local's type derivation
                 // defers to the `resolve_rows` pre-pass — the same single-
                 // row discipline the bind window holds.
+                let row_offset = engine.rows[mark].range.offset;
                 engine
                     .local_init_rows
-                    .insert(decl_range.offset, (engine.rows[mark].range.offset, false));
+                    .insert(decl_range.offset, (row_offset, false));
+                // The invalid face is decidable now (the receiver chain's
+                // written heads are staged), and the later binary folds
+                // that read the local run at parse time.
+                let invalid = matches!(engine.rows[mark].shape, RowShape::Member { .. })
+                    && engine
+                        .member_reads
+                        .iter()
+                        .find(|read| read.offset == row_offset)
+                        .is_some_and(|read| engine.member_read_invalid(read));
+                
+                if invalid {
+                    engine.invalid_init_locals.borrow_mut().insert(decl_range.offset);
+                }
             }
             staged
         };
@@ -2234,8 +2256,16 @@ impl ParserListener for DiagnoseListener<'_> {
                             }
                         }
                     }
-                    engine.note_parameter(name, token.range);
-                    engine.bind_parameter_type(name);
+                    let type_level = engine.fn_type_formal_lists > 0 || engine.formal_list_depth > 1;
+                    
+                    if type_level {
+                        // The inner formal's written type is consumed but
+                        // binds nothing in the enclosing body's scope.
+                        engine.armed_ty = None;
+                    } else {
+                        engine.note_parameter(name, token.range);
+                        engine.bind_parameter_type(name);
+                    }
                 }
             }
             C::CatchParameter => {
@@ -3586,6 +3616,18 @@ impl ParserListener for DiagnoseListener<'_> {
             } else {
                 from_ty
             };
+            // `x = await e` writes the flattened operand type: the send
+            // face answers `Future<T>`, the assignment's value is `T`.
+            let from_ty = if from_ty != Ty::UNKNOWN
+                && engine.await_operand_extents.iter().any(|&(start, end)| {
+                    rhs_row.range.offset >= start
+                        && rhs_row.range.end() <= end
+                        && start > engine.rows[target].range.end()
+                }) {
+                engine.flatten(from_ty)
+            } else {
+                from_ty
+            };
             if let Ty::Named {
                 name,
                 nullable,
@@ -4119,7 +4161,18 @@ impl ParserListener for DiagnoseListener<'_> {
         // expression form is `visitAsExpression`'s `_isUnnecessaryCast`
         // (best_practices_verifier.dart:170-183, 1708-1741).
         if engine.switch.pattern_depth == 0 {
-            let operand = engine.operand_row().map_or(Ty::Unknown, |row| row.ty);
+            // A `?.`-shorted chain (`a?.b as S`) reads nullable: the
+            // whole null-shorting node's static type is the selector's
+            // type made nullable, never the bare member face.
+            let operand = engine.operand_row().map_or(Ty::Unknown, |row| {
+                let shorted = engine.null_aware_members.contains(&row.range.offset);
+                
+                if shorted && row.ty != Ty::UNKNOWN {
+                    Engine::nullable_form(row.ty)
+                } else {
+                    row.ty
+                }
+            });
             // The simple-local face the nullable-cast join keys on (the
             // row's span and name), snapshotted before the mutable calls.
             let simple_local = engine.operand_row().and_then(|row| {
@@ -4790,9 +4843,10 @@ impl ParserListener for DiagnoseListener<'_> {
         // the sections on this span (the flow's promotion of the target
         // read answers each section's receiver verdict).
         if let Some(target) = engine.rows.last() {
-            engine.cascade_target_spans.push(target.range);
+            let span = engine.cascade_continuation_target(operator.range.offset, target.range);
+            engine.cascade_target_spans.push(span);
+            engine.cascade_open.push((operator.range.offset, span));
         }
-        let _ = operator;
     }
 
     fn end_cascade(&mut self) {
@@ -4800,6 +4854,7 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let engine = &mut self.engine;
         engine.cascade_target_spans.pop();
+        engine.cascade_last = engine.cascade_open.pop();
         engine.nsm_poison();
         // The sections are not uses (the official `CascadeExpression` arm
         // spares only the target).
@@ -4942,6 +4997,15 @@ impl ParserListener for DiagnoseListener<'_> {
                 engine.deferred_miss_rows.push(row);
             }
             engine.rows[pos].intent = Intent::Operator(index_op, bracket);
+            // A `?.`-shorted receiver (`a?.l[i]`) shorts the index result
+            // too: the whole chain node reads nullable, and the chain
+            // continuation (`a?.l[i].t`) joins through the value row.
+            let shorted = !engine.in_cascade
+                && engine.null_aware_members.contains(&engine.rows[pos].range.offset);
+            
+            if shorted {
+                engine.null_aware_members.insert(close.range.offset);
+            }
             engine.push_value_row(close);
             if result_ty != Ty::UNKNOWN
                 && let Some(result) = engine.rows.last_mut()
@@ -4976,7 +5040,15 @@ impl ParserListener for DiagnoseListener<'_> {
             // stale clause anchor must not join the if-case's candidates
             // either (the switch-expression case's posture).
             if engine.switch.pattern_stack.is_empty() && !engine.switch.case_sink_open {
-                let scrutinee = engine.rows.last().map_or(Ty::Unknown, |row| row.ty);
+                // An unfolded index (`m[k]?[n]`, a value-row receiver
+                // keeps its operand rows) leaves the KEY as the top row:
+                // the matched value is the `[]` read, never the key.
+                let scrutinee = engine
+                    .rows
+                    .last()
+                    .filter(|row| !engine.is_index_key_row(row))
+                    .map_or(Ty::Unknown, |row| row.ty);
+
                 engine.switch.open_if_case(scrutinee, token.range);
                 engine.clause_anchor = None;
             }
@@ -5955,6 +6027,7 @@ impl ParserListener for DiagnoseListener<'_> {
         let engine = &mut self.engine;
         engine.nsm_poison();
         engine.switch.switch_kw_latch = Some(token.range);
+        engine.switch_expr_marks.push(engine.rows.len());
     }
 
     /// The expression-case header's pattern window opens before its
@@ -6032,6 +6105,51 @@ impl ParserListener for DiagnoseListener<'_> {
         // fold over zero arms is InvalidType).
         if count == 0 {
             self.engine.push_value_row(begin);
+        }
+        // A selector after the closed expression (`switch (x) {…}[i]`,
+        // `.m`) reads the arm fold's static type, which this pass does not
+        // compute: the window above the scrutinee folds to one opaque
+        // value row so the selector's receiver stays unresolved (never an
+        // arm's own row, e.g. a `throw`'s `AssertionError` operand).
+        let engine = &mut self.engine;
+        let mark = engine.switch_expr_marks.pop();
+        
+        if count > 0
+            && let Some(mark) = mark
+            && {
+                // `end` is the closing `}` (or, in some recovery paths, the
+                // token after it): the selector is the first non-space byte
+                // past the brace.
+                let mut at = if engine.byte_at(end.range.offset) == Some(b'}') {
+                    end.range.end()
+                } else {
+                    end.range.offset
+                };
+                while matches!(engine.byte_at(at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                    at += 1;
+                }
+                matches!(engine.byte_at(at), Some(b'[' | b'.' | b'?'))
+            }
+        {
+            let scrutinee_end = mark + 1;
+            
+            if engine.rows.len() > scrutinee_end {
+                for row in engine.rows.drain(mark..) {
+                    engine.deferred_miss_rows.push(row);
+                }
+                engine.push_row(Row {
+                    name: engine.intern(""),
+                    range: SourceRange {
+                        offset: begin.range.offset,
+                        length: end.range.end().saturating_sub(begin.range.offset),
+                    },
+                    qualified: false,
+                    shape: RowShape::Value,
+                    intent: Intent::Read,
+                    write_op: None,
+                    ty: Ty::UNKNOWN,
+                });
+            }
         }
     }
 
@@ -7225,6 +7343,25 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn begin_block_function_body(&mut self, token: Token) {
         self.flow().begin_block_function_body(token);
+        // The constructor body leaves the initializing-formal scope: a
+        // `this.x` name reads the field from here on.
+        let this_formals = std::mem::take(&mut self.engine.this_formal_names);
+        if !this_formals.is_empty()
+            && let Some(frame) = self.engine.frames.last_mut()
+            && matches!(frame.kind, FrameKind::Executable { .. })
+        {
+            for (name, serial) in this_formals {
+                // Only the constructor that declared the formal: a
+                // body-less constructor's leftovers never touch the next
+                // executable's own parameters.
+                if serial != frame.serial {
+                    continue;
+                }
+                
+                frame.locals.remove(&name);
+                frame.var_types.remove(&name);
+            }
+        }
         // A function body's statement list owns a duplicate scope, same as
         // any block (`visitBlock` walks the body's `Block` node).
         self.engine.dup_scopes.push(FxHashMap::default());
@@ -7800,6 +7937,12 @@ impl ParserListener for DiagnoseListener<'_> {
             && let Some(name_id) = self.engine.name_of(name)
         {
             self.engine.note_parameter(name_id, name.range);
+            if this_keyword.is_some()
+                && self.engine.formal_list_depth == 1
+                && let Some(serial) = self.engine.frames.last().map(|frame| frame.serial)
+            {
+                self.engine.this_formal_names.push((name_id, serial));
+            }
             // The parameter's declared type: the written annotation when one
             // armed (`String this.p`), else the bound field's own type
             // (`C(this.p)` binds `p` at the field's `String?` — the upstream
@@ -8492,7 +8635,7 @@ impl ParserListener for DiagnoseListener<'_> {
 // untouched.
 
 fn ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
 fn trim_ws(bytes: &[u8], mut start: usize, end: usize) -> usize {

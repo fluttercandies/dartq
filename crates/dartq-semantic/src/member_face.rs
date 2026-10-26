@@ -80,6 +80,10 @@ pub(crate) enum CoreRet {
     /// cannot spell. Every entry of this shape is a getter, which the
     /// accessor-read face relies on.
     RecvArg(&'static str, u8),
+    /// The receiver's Nth written argument VERBATIM — `Iterable<E>.first`
+    /// answers `E` itself (iterable.dart: `E get first`), a spelling no
+    /// re-heading can express. Getters only, like `RecvArg`.
+    ElemArg(u8),
 }
 
 /// The core members whose official signatures are unambiguous at this
@@ -212,6 +216,18 @@ pub(crate) const CORE_MEMBER_RETURNS: &[(&str, &str, CoreRet)] = &[
     ("Map", "containsValue", CoreRet::Fixed("bool")),
     ("Map", "keys", CoreRet::RecvArg("Iterable", 0)),
     ("Map", "values", CoreRet::RecvArg("Iterable", 1)),
+    // iterable.dart: `E get first` / `E get last` / `E get single` — the
+    // element itself, inherited by List/Set alike but tabled per head (the
+    // lookup keys the receiver's exact spelling).
+    ("Iterable", "first", CoreRet::ElemArg(0)),
+    ("Iterable", "last", CoreRet::ElemArg(0)),
+    ("Iterable", "single", CoreRet::ElemArg(0)),
+    ("List", "first", CoreRet::ElemArg(0)),
+    ("List", "last", CoreRet::ElemArg(0)),
+    ("List", "single", CoreRet::ElemArg(0)),
+    ("Set", "first", CoreRet::ElemArg(0)),
+    ("Set", "last", CoreRet::ElemArg(0)),
+    ("Set", "single", CoreRet::ElemArg(0)),
     ("Map", "toString", CoreRet::Fixed("String")),
 ];
 
@@ -227,6 +243,7 @@ fn core_ret_head_ids(strings: &StringTable) -> FxHashMap<&'static str, StringId>
         let ret_head = match ret {
             CoreRet::Fixed(h) | CoreRet::RecvHead(h) | CoreRet::BareHead(h) => *h,
             CoreRet::RecvArg(h, _) => *h,
+            CoreRet::ElemArg(_) => *h,
         };
         [*h, ret_head]
     }) {

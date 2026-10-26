@@ -125,6 +125,9 @@ impl<'a> Engine<'a> {
             formal_written: None,
             formal_written_saved: None,
             formal_list_depth: 0,
+            fn_type_formal_lists: 0,
+            this_formal_names: Vec::new(),
+            switch_expr_marks: Vec::new(),
             pending_super_formals: Vec::new(),
             super_formal_positional_index: 0,
             primary_ctor_site: None,
@@ -236,8 +239,10 @@ impl<'a> Engine<'a> {
             frame_local_marks: Vec::new(),
             local_hits: FxHashMap::default(),
             local_decl_at_read: FxHashMap::default(),
+            shadowed_bare_rows: FxHashSet::default(),
             local_init_rows: FxHashMap::default(),
             init_derived_types: std::cell::RefCell::default(),
+            invalid_init_locals: std::cell::RefCell::default(),
             local_decl_at_member: FxHashMap::default(),
             deferred_closure_formals: Vec::new(),
             pattern_group_open: None,
@@ -264,6 +269,8 @@ impl<'a> Engine<'a> {
             null_aware_members: FxHashSet::default(),
             record_short_fields: FxHashMap::default(),
             cascade_target_spans: Vec::new(),
+            cascade_last: None,
+            cascade_open: Vec::new(),
             cascade_null_aware_op: None,
             used_names: FxHashSet::default(),
             import_used: FxHashSet::default(),
@@ -816,6 +823,30 @@ impl<'a> Engine<'a> {
                         .unwrap_or(check.from),
                 }
             };
+            // The promotion-latched initializer's re-bind (#2539's argument
+            // face): an argument read whose local's initializer member row
+            // re-derived under a promoted receiver (`var e = t.element` past
+            // `t is Sub` — the base getter's `Element?` at parse time, the
+            // promoted container's own declaration after the pass-2
+            // re-decision) carries the corrected face only in the re-bind
+            // map, so the parse-time capture spelled the base face and the
+            // standing rejection is a false positive. The flush reads the
+            // same corrected static type the operator verdict
+            // (row_resolution.rs's `Intent::Operator` arm) and every
+            // receiver face read — `rebound_read_face` outranks the parse
+            // bind; a standing promotion, a promotable-field substitution,
+            // or a cast at the read outranks the re-bind (decided above).
+            // The re-bind is narrowing-gated at insert, so this can only
+            // clean a staged rejection, never create one.
+            if matches!(check.kind, StagedKind::Argument | StagedKind::Assignment)
+                && cast_ty.is_none()
+                && staged_promotion.is_none()
+                && let Some(face) = self
+                    .rebound_read_face(check.range)
+                    .filter(|ty| *ty != Ty::Unknown)
+            {
+                from = face;
+            }
             // A record-literal operand keeps its per-ELEMENT promotions: the
             // whole-record span stages no promotion of its own (the record is
             // not a variable read), but each element's read inside the span
@@ -913,6 +944,26 @@ impl<'a> Engine<'a> {
                         code.correction_message(""),
                     ));
                 }
+                continue;
+            }
+            // The invalid-poison face (A6): a staged argument whose
+            // operand — or formal — carries a written head this scope
+            // resolves to no type is the oracle's `InvalidType` operand
+            // (`Source` under the unresolvable `_fe_analyzer_shared`
+            // export chain): the argument check is vacuous and stays
+            // silent, whatever the name-level pair spells. The compiler-
+            // known core heads are exempt — they are never invalid in a
+            // mounted run, and a synthetic unit test (no SDK) still
+            // decides real pairs over them.
+            let invalid_poison = |engine: &Self, ty: Ty| match ty {
+                Ty::Named { name, .. } => {
+                    !engine.core_head(name) && engine.written_ty_invalid(ty)
+                }
+                _ => false,
+            };
+            if matches!(check.kind, StagedKind::Argument)
+                && (invalid_poison(self, from) || invalid_poison(self, check.to))
+            {
                 continue;
             }
             let verdict = match check.kind {
@@ -2454,6 +2505,17 @@ impl<'a> Engine<'a> {
         (!matches!(face, Ty::Named { nullable: true, .. })).then_some(face)
     }
 
+    /// Whether a named head is a compiler-known core container the
+    /// invalid-poison face never applies to (a mounted run resolves them
+    /// always; a synthetic unit test without the SDK decides real
+    /// argument pairs over them regardless).
+    fn core_head(&self, name: StringId) -> bool {
+        matches!(
+            self.strings.resolve(name),
+            "List" | "Map" | "Set" | "Iterable" | "Object" | "Future" | "Stream" | "Function"
+        )
+    }
+
     /// The tear-off function type of a member row resolving to a declared
     /// method: `M Function<M>(M)` for `m`'s `M m<M>(M)` — the member's own
     /// type-parameter count, written return type, and formal table
@@ -2674,7 +2736,21 @@ impl<'a> Engine<'a> {
             // `!` verdict is its declared nullability; the field-promotion
             // re-decision rides the property table elsewhere, never this
             // one.
-            self.null_assert_staged.push((read_span, at));
+            let nullable_params: Box<[StringId]> = self
+                .type_params
+                .iter()
+                .chain(&self.pending_type_params)
+                .copied()
+                .filter(|&name| {
+                    !self.strictly_non_nullable(Ty::Named {
+                        name,
+                        nullable: false,
+                        args: ArgListId::EMPTY,
+                    })
+                })
+                .collect();
+            self.null_assert_staged
+                .push((read_span, at, nullable_params));
         }
         if let Some(row) = self.rows.last_mut() {
             row.ty = Self::non_null_form(ty);
@@ -4158,6 +4234,53 @@ impl<'a> Engine<'a> {
 
     /// Byte offset of a UTF-16 offset (row ranges are UTF-16; `source`
     /// slices by byte). Identity on ASCII sources.
+    /// Whether `row` is an unfolded index's KEY (`f()[k]`, `m[k]?[n]` —
+    /// a receiver that keeps its operand rows): the next source byte
+    /// after the row closes the brackets, so the enclosing operand is
+    /// the `[]` read, never the key's own face.
+    /// Whether an index fold's receiver (`node.ps` in `node.ps[i]`) may
+    /// read a flow-promoted face the pass-1 index result cannot see: its
+    /// root identifier is type-tested (`node is FI` / `node as FI`)
+    /// somewhere in the unit. The pass-1 result reads the unpromoted
+    /// container's `[]` (`List<P>` where the promoted `FI.ps` answers
+    /// `List<PI>`), so binding it as an initializer's inferred type would
+    /// type later reads on the wrong face; the gate keeps the unbound
+    /// (under-report) posture for exactly those receivers.
+    pub(crate) fn index_receiver_latched(&self, row: &Row) -> bool {
+        let bytes = self.source.as_bytes();
+        let chain_start = self
+            .property_access_span(row.range)
+            .map_or(row.range.offset, |span| span.offset);
+        let start = self.byte_of(chain_start).min(bytes.len());
+        let len = bytes[start..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_' || **b == b'$')
+            .count();
+        let root = &self.source[start..start + len];
+        let latched = !root.is_empty()
+            && root != "this"
+            && [" is ", " as "].iter().any(|op| {
+                let needle = format!("{root}{op}");
+                self.source.match_indices(&needle).any(|(at, _)| {
+                    at == 0
+                        || !bytes[at - 1].is_ascii_alphanumeric()
+                            && bytes[at - 1] != b'_'
+                            && bytes[at - 1] != b'$'
+                            && bytes[at - 1] != b'.'
+                })
+            });
+        
+        latched
+    }
+
+    pub(crate) fn is_index_key_row(&self, row: &Row) -> bool {
+        let end = self.byte_of(row.range.end()).min(self.source.len());
+        self.source.as_bytes()[end..]
+            .iter()
+            .find(|b| !b.is_ascii_whitespace())
+            == Some(&b']')
+    }
+
     pub(crate) fn byte_of(&self, utf16: u32) -> usize {
         let knots = self.wide_knots();
         let at = knots.partition_point(|&(end, _)| end <= utf16);
@@ -4202,12 +4325,13 @@ impl<'a> Engine<'a> {
         let text = &self.source[start..end];
         let mut chars = text.bytes();
         let head = chars.next()?;
-        if !(head.is_ascii_alphabetic() || head == b'_') {
+        if !(head.is_ascii_alphabetic() || head == b'_' || head == b'$') {
             return None;
         }
-        if !chars.all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        if !chars.all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$') {
             return None;
         }
+        
         Some(self.intern(text))
     }
 
@@ -4223,7 +4347,7 @@ impl<'a> Engine<'a> {
         }
         let bytes = self.source.as_bytes();
         let mut start = open;
-        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+        while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_' || bytes[start - 1] == b'$') {
             start -= 1;
         }
         if start == open {
@@ -4273,6 +4397,41 @@ impl<'a> Engine<'a> {
     /// callee abuts its argument group across them (`f /*c*/ (x)` still
     /// checks the argument), so the callee link must see through comments
     /// where [`Self::ws_between`] would break it.
+    /// The target span a cascade opening at `operator` re-reads: the
+    /// previous cascade's target when this one continues it (the target
+    /// row sits after that cascade's operator, and the source between the
+    /// two operators stays inside one expression — no `;`, no block brace,
+    /// no bracket closing past its own opener), else the popped `target`.
+    pub(crate) fn cascade_continuation_target(&self, operator: u32, target: SourceRange) -> SourceRange {
+        let Some((prev_op, prev_target)) = self.cascade_last else {
+            return target;
+        };
+        if !(prev_op < target.offset && target.offset < operator) {
+            return target;
+        }
+        let bytes = self.source.as_bytes();
+        let (start, end) = (self.byte_of(prev_op), self.byte_of(operator));
+        let mut depth = 0i32;
+        for &b in &bytes[start..end] {
+            match b {
+                b';' | b'{' | b'}' => return target,
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return target;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return target;
+        }
+        
+        prev_target
+    }
+
     pub(crate) fn trivia_between(&self, start: u32, end: u32) -> bool {
         if start > end {
             return false;

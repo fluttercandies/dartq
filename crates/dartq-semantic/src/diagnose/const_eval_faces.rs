@@ -1093,7 +1093,7 @@ impl<'a> Engine<'a> {
             return false;
         }
         let before = bytes[i - 2];
-        before.is_ascii_alphanumeric() || before == b'_'
+        before.is_ascii_alphanumeric() || before == b'_' || before == b'$'
     }
 
     /// Whether the span's last character is `)` — the invocation shape
@@ -1182,7 +1182,7 @@ impl<'a> Engine<'a> {
         // The declaration keyword, behind any written class modifiers.
         for _ in 0..4 {
             let mut end = i;
-            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'$') {
                 end += 1;
             }
             match &bytes[i..end] {

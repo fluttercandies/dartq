@@ -2105,11 +2105,11 @@ fn ignored_elements(rest: &str) -> Vec<Entry> {
         let word_start = o;
         // A word starts with a letter or underscore and continues with
         // letters, digits, underscores (upstream `readWord`).
-        if !(bytes[o].is_ascii_alphabetic() || bytes[o] == b'_') {
+        if !(bytes[o].is_ascii_alphabetic() || bytes[o] == b'_' || bytes[o] == b'$') {
             return entries;
         }
         o += 1;
-        while o < n && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_') {
+        while o < n && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_' || bytes[o] == b'$') {
             o += 1;
         }
         let word = &rest[word_start..o];
@@ -2126,12 +2126,12 @@ fn ignored_elements(rest: &str) -> Vec<Entry> {
             while o < n && is_space(bytes[o]) {
                 o += 1;
             }
-            if o == n || !(bytes[o].is_ascii_alphabetic() || bytes[o] == b'_') {
+            if o == n || !(bytes[o].is_ascii_alphabetic() || bytes[o] == b'_' || bytes[o] == b'$') {
                 return entries;
             }
             let family_start = o;
             o += 1;
-            while o < n && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_') {
+            while o < n && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_' || bytes[o] == b'$') {
                 o += 1;
             }
             if o < n && !is_space(bytes[o]) && bytes[o] != b',' {
@@ -2148,11 +2148,11 @@ fn ignored_elements(rest: &str) -> Vec<Entry> {
                 // `plugin/name` (ignore_info.dart:398-423): the citation
                 // binds to the named plugin's diagnostics only.
                 o += 1;
-                if o == n || !(bytes[o].is_ascii_alphabetic() || bytes[o] == b'_') {
+                if o == n || !(bytes[o].is_ascii_alphabetic() || bytes[o] == b'_' || bytes[o] == b'$') {
                     return entries;
                 }
                 o += 1;
-                while o < n && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_') {
+                while o < n && (bytes[o].is_ascii_alphanumeric() || bytes[o] == b'_' || bytes[o] == b'$') {
                     o += 1;
                 }
             }

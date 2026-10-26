@@ -214,6 +214,18 @@ pub(crate) enum Frame {
         /// The head `?..` opened a short (it sits at `null_shorts_base - 1`
         /// and joins at `CascadeEnd`).
         own_short: bool,
+        /// The cascade TARGET's expression entry, captured at begin (the
+        /// entry at `exprs_base - 1`). A section's write pops it as the
+        /// write's target (`..f = v`'s target read is the cascade target
+        /// itself) and pushes the assignment's value in its place, so the
+        /// stack at `CascadeEnd` holds the LAST section's value, not the
+        /// target. The close restores the captured entry: the cascade's
+        /// value is the target (`CascadeExpression`'s static type is its
+        /// target's — a `C()..f = v` expression reads `C`, never `v`'s
+        /// type), and the last section's RHS — a nullable spelling — was
+        /// adopted whole by the inferred-local slot, firing
+        /// `unchecked_use_of_nullable_value` rows the oracle never reports.
+        target: Option<Box<Expr>>,
     },
     /// A loop: break/continue target (`collection` selects a
     /// collection-`for` element).
@@ -425,6 +437,7 @@ pub(crate) struct CondVarEntry {
     pub if_false: State,
 }
 
+#[derive(Clone)]
 pub(crate) struct Expr {
     /// Type of the expression (name-level).
     pub ty: Ty,
@@ -854,6 +867,15 @@ pub(crate) struct Interp<'o> {
     /// when the fold's own RHS read is the unknown face. Read-only for the
     /// replay.
     pub(crate) staged_rhs: &'o FxHashMap<u32, (crate::ty::Ty, u32)>,
+    /// Locals written at least once with an `Unknown` right-hand face (our
+    /// resolution gap — the oracle sees the real send return): a nullable
+    /// declared face plus this mark keeps every later read's promotion
+    /// opaque (`FlowFact::PromotedRead` with `Ty::UNKNOWN`, the #2174
+    /// channel the staged-argument flush converts to the non-null form) —
+    /// the write-promotion our tables could not decide is not evidence
+    /// against the operand (`qname.dart`'s `prefix = paramQName.substring(
+    /// …)` over an untyped `paramQName`).
+    pub(crate) unresolved_writes: FxHashSet<u32>,
     /// `this`-read types keyed on the `this` token's offset: the semantic
     /// layer resolves a `this` read its event stream leaves unknown — an
     /// extension or extension-type instance member's extended type — and
@@ -1165,6 +1187,7 @@ impl<'o> Interp<'o> {
             top_level: &NO_TOP_LEVEL,
             inferred_locals: &NO_INFERRED_LOCALS,
             staged_rhs: &NO_STAGED_RHS,
+            unresolved_writes: FxHashSet::default(),
             staged_this: &NO_STAGED_THIS,
             staged_calls: &NO_STAGED_CALLS,
             names: &NO_NAMES,
@@ -1376,6 +1399,29 @@ impl<'o> Interp<'o> {
             }
         }
         self.top_level.get(&name_id).copied().map(Resolved::Top)
+    }
+
+    /// TEMPORARY R53 probe helper: a flow [`Ty`] as readable text (the
+    /// interned head resolved through the body's name table), so probe
+    /// lines carry type names instead of opaque `Name(id)` debug.
+    pub(crate) fn probe_ty(&self, ty: Ty) -> String {
+        let head = match ty.base {
+            crate::ty::Base::Name(id) => self
+                .names
+                .get(id as usize)
+                .map_or_else(|| "?".to_string(), |n| n.to_string()),
+            crate::ty::Base::Dynamic => "dynamic".to_string(),
+            crate::ty::Base::Void => "void".to_string(),
+            crate::ty::Base::Never => "Never".to_string(),
+            crate::ty::Base::Null => "Null".to_string(),
+            crate::ty::Base::Function => "Function".to_string(),
+            crate::ty::Base::Unknown => "%unknown".to_string(),
+        };
+        if ty.nullable {
+            format!("{head}?")
+        } else {
+            head
+        }
     }
 
     /// Records a write (real or collect mode) and updates the flow state.

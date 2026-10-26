@@ -556,6 +556,12 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// Declares a top-level name, logging a duplicate when taken.
     fn declare_top(&mut self, name: StringId, range: SourceRange, decl: TopDecl) {
         match self.decls.entry(name) {
+            // A type parameter's placeholder (declaration-scoped in truth)
+            // never collides with a top-level declaration: the real
+            // declaration takes the slot.
+            Entry::Occupied(existing) if existing.kind == MicroKind::TypeParam => {
+                self.decls.insert(name, decl);
+            }
             Entry::Occupied(_) => self.record_duplicate(name, range),
             Entry::Vacant(slot) => {
                 slot.insert(decl);

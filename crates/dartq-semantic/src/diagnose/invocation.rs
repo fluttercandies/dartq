@@ -37,6 +37,7 @@ impl<'a> Engine<'a> {
         // `deferred_miss_rows` re-entry, resolved rows stay (the known
         // under-report boundary). Geometric matches take the original path
         // untouched; the latch is single-shot.
+        
         if let Some((index, send_end)) = self.last_send_callee.take() {
             let displaced = self.rows.get(index).is_some_and(|row| {
                 matches!(row.shape, RowShape::Member { .. })
@@ -700,6 +701,42 @@ impl<'a> Engine<'a> {
                     // (a top-level function/variable) resolves to `None`
                     // and keeps the Unknown dispatch — its own resolution
                     // already reported.
+                    // An INVOKED prefixed head (`io.File(p).existsSync()`)
+                    // is an instance-creation result: the next selector
+                    // reads the instance face, never the static one.
+                    RowShape::Member {
+                        recv: Receiver::Prefix { name: prefix },
+                    } if popped.intent == Intent::Invoke
+                        && let Some((resolved, _)) = prefixed_container(
+                            self.graph,
+                            self.namespaces,
+                            self.index,
+                            self.lib,
+                            *prefix,
+                            popped.name,
+                        )
+                        && matches!(resolved.kind, ContainerKind::Class)
+                        // The bare spelling must name the SAME declaration
+                        // (or nothing) in this scope: the typed receiver
+                        // carries no owner, so a same-named local class
+                        // (`Link` of the file-system API beside `io.Link`)
+                        // would answer the walk instead.
+                        && resolve_container(
+                            self.graph,
+                            self.namespaces,
+                            self.index,
+                            self.lib,
+                            self.file,
+                            popped.name,
+                        )
+                        .is_none_or(|(local, _)| std::ptr::eq(local, resolved)) =>
+                    {
+                        
+                        Receiver::Typed {
+                            type_name: popped.name,
+                            ty: Ty::named(popped.name),
+                        }
+                    }
                     RowShape::Member {
                         recv: Receiver::Prefix { name: prefix },
                     } => match prefixed_container(
@@ -758,6 +795,15 @@ impl<'a> Engine<'a> {
         // merge already recorded `member_reads` for this section; only the
         // classification feeds the override.
         let recv = cascade_recv.unwrap_or(recv);
+        // A later section's popped row is the previous section's RHS
+        // leftover: the receiver span the pass-2 flow re-derivation reads
+        // is the cascade target's own read, never that leftover's.
+        if cascade_recv.is_some()
+            && let Some(target_span) = self.cascade_target_spans.last().copied()
+        {
+            
+            recv_span = target_span;
+        }
         if is_null_aware {
             // The receiver's expression static type decides the face
             // (`_checkForUnnecessaryNullAware` reads the flow-aware static
@@ -1733,14 +1779,14 @@ impl<'a> Engine<'a> {
     fn named_selector_head_before(&self, open: u32) -> Option<(StringId, SourceRange)> {
         let bytes = self.source.as_bytes();
         let mut end = self.byte_of(open);
-        while end > 0 && (bytes[end - 1].is_ascii_alphanumeric() || bytes[end - 1] == b'_') {
+        while end > 0 && (bytes[end - 1].is_ascii_alphanumeric() || bytes[end - 1] == b'_' || bytes[end - 1] == b'$') {
             end -= 1;
         }
         let start = end;
         if start == self.byte_of(open)
             || start == 0
             || bytes[start - 1] != b'.'
-            || !(bytes[start].is_ascii_alphabetic() || bytes[start] == b'_')
+            || !(bytes[start].is_ascii_alphabetic() || bytes[start] == b'_' || bytes[start] == b'$')
         {
             return None;
         }
@@ -1796,7 +1842,7 @@ impl<'a> Engine<'a> {
             }
         }
         let end = cursor;
-        while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_')
+        while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_' || bytes[cursor - 1] == b'$')
         {
             cursor -= 1;
         }
@@ -1828,7 +1874,7 @@ impl<'a> Engine<'a> {
                 continue;
             }
             // Whole word: no identifier character directly before.
-            if start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_')
+            if start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_' || bytes[start - 1] == b'$')
             {
                 return true;
             }
@@ -1888,7 +1934,7 @@ impl<'a> Engine<'a> {
             cursor -= 1;
         }
         let end = cursor;
-        while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_')
+        while cursor > 0 && (bytes[cursor - 1].is_ascii_alphanumeric() || bytes[cursor - 1] == b'_' || bytes[cursor - 1] == b'$')
         {
             cursor -= 1;
         }
@@ -1912,7 +1958,7 @@ impl<'a> Engine<'a> {
         let name = if cursor > 0
             && bytes[cursor - 1] == b'.'
             && !(cursor >= 2 && (bytes[cursor - 2] == b'?' || bytes[cursor - 2] == b'.'))
-            && (bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_')
+            && (bytes[cursor].is_ascii_alphabetic() || bytes[cursor] == b'_' || bytes[cursor] == b'$')
         {
             self.intern(&self.source[cursor..end])
         } else {
@@ -2633,7 +2679,9 @@ impl<'a> Engine<'a> {
         // own value, never the function's tear-off — the row carries no
         // resolved-target signal (both faces push a `Plain` shape), so the
         // shadow check is the gate.
-        if self.frames.iter().any(|f| f.locals.contains(&row.name)) {
+        if self.frames.iter().any(|f| f.locals.contains(&row.name))
+            || self.shadowed_bare_rows.contains(&row.range.offset)
+        {
             return None;
         }
         // A missing bare row (no in-file declaration at all) still reads
@@ -4501,7 +4549,7 @@ impl<'a> Engine<'a> {
             at -= 1;
         }
         let end = at;
-        while at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
+        while at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_' || bytes[at - 1] == b'$') {
             at -= 1;
         }
         end - at == 5 && &bytes[at..end] == b"const"
@@ -4524,7 +4572,7 @@ impl<'a> Engine<'a> {
             at -= 1;
         }
         let end = at;
-        while at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
+        while at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_' || bytes[at - 1] == b'$') {
             at -= 1;
         }
         if at == end {
@@ -4557,7 +4605,7 @@ impl<'a> Engine<'a> {
             at += 1;
         }
         let start = at;
-        while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_') {
+        while at < bytes.len() && (bytes[at].is_ascii_alphanumeric() || bytes[at] == b'_' || bytes[at] == b'$') {
             at += 1;
         }
         if at == start {
@@ -6137,7 +6185,16 @@ impl<'a> Engine<'a> {
                         "",
                         range.offset,
                     );
-                } else if row.ty != Ty::UNKNOWN {
+                } else if row.ty != Ty::UNKNOWN
+                    // An index-result callee (`handlers[i](x)`) reads the
+                    // element argument's written face, where a function-type
+                    // argument (`List<F Function(String)>`) collapses to its
+                    // return head — the callable shape is lost, so the face
+                    // keeps silent; a `Function` head is callable outright.
+                    && self.source.as_bytes().get(self.byte_of(range.offset)) != Some(&b']')
+                    && !matches!(row.ty, Ty::Named { name, .. } if self.strings.resolve(name) == "Function")
+                {
+                    
                     self.emit(
                         SemanticCode::InvocationOfNonFunctionExpression,
                         range,

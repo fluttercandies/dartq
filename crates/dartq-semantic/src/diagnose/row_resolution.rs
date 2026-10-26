@@ -58,6 +58,30 @@ pub(crate) const SDK_FACES_EXTRA: &[(&str, &[&str])] = &[(
     // MEMBERS rows follow; `SDK_SUPER_FACES` joins the Stream row).
     ("ReceivePort", &["close", "listen", "sendPort"]),
     ("SendPort", &["send"]),
+    // dart:io's `Link` (sdk/lib/io/link.dart:9 — `abstract interface class
+    // Link implements FileSystemEntity`): the whole instance face the
+    // unindexed dart:io container cannot walk; the FileSystemEntity row's
+    // members the `implements` edge would add stay the under-report
+    // direction (the same shape the ReceivePort row carries).
+    (
+        "Link",
+        &[
+            "create",
+            "createSync",
+            "delete",
+            "deleteSync",
+            "exists",
+            "existsSync",
+            "rename",
+            "renameSync",
+            "resolveSymbolicLinks",
+            "resolveSymbolicLinksSync",
+            "target",
+            "targetSync",
+            "update",
+            "updateSync",
+        ],
+    ),
 ];
 
 /// The unindexed `implements` edges between SDK faces the frozen verdict
@@ -339,6 +363,7 @@ impl<'a> Engine<'a> {
         head: StringId,
         getter: StringId,
     ) -> Option<Ty> {
+        
         match self.walk_members(head, getter) {
             Walk::Found(entry)
                 if matches!(entry.kind, MemberKind::Getter | MemberKind::Field)
@@ -528,6 +553,26 @@ impl<'a> Engine<'a> {
                 self.rebound_locals.insert(decl_offset, (parse_ty, corrected));
             }
         }
+        // The implicit-call re-binds: the callee's promoted read (a pass-2
+        // flow face) resolves the `call` member, and its return narrows
+        // the initializer's parse-time face — `switch (x) case
+        // XPathExpression():` arm's `var f = x(context)` binds
+        // `XPathSequence`, never the declared `Object` arm's callee face.
+        let deferred_calls = std::mem::take(&mut self.deferred_call_rebinds);
+        for (decl_offset, callee_span, parse_ty) in deferred_calls {
+            let Some(read) = self.read_type_at(callee_span) else {
+                continue;
+            };
+            let Some((_, call_ret, _)) = self.implicit_call_face(read) else {
+                continue;
+            };
+            if call_ret != Ty::UNKNOWN
+                && call_ret != parse_ty
+                && self.promotion_narrows(call_ret, parse_ty)
+            {
+                self.rebound_locals.insert(decl_offset, (parse_ty, call_ret));
+            }
+        }
         // The deferred closure formals: the context schema recomputes over
         // the re-derived receiver face (a promotion-latched link below the
         // callee — `rebound.fragments.where((f) => f.isComplete)` — freezes
@@ -676,7 +721,23 @@ impl<'a> Engine<'a> {
                         _ => continue,
                     };
                 }
+                // The await operand's extent flattens the derived face, the
+                // same re-application the parse-time bind makes (#2506).
+                if !for_in
+                    && ty != Ty::UNKNOWN
+                    && self.await_operand_extents.iter().any(|&(start, end)| {
+                        row.range.offset >= start && row.range.end() <= end
+                    })
+                {
+                    
+                    ty = self.flatten(ty);
+                }
                 if ty == Ty::UNKNOWN {
+                    let invalid = !for_in && record.is_some_and(|read| self.member_read_invalid(read));
+                    
+                    if invalid {
+                        self.invalid_init_locals.borrow_mut().insert(decl);
+                    }
                     continue;
                 }
                 self.init_derived_types.borrow_mut().insert(decl, ty);
@@ -1271,12 +1332,11 @@ impl<'a> Engine<'a> {
                 // The discarded-value face (`_check` + `checkNameExpression`,
                 // use_result_verifier.dart): an invocation or bare read of a
                 // UseResult-carrying top-level declaration, not sealed used.
-                // A local shadowing the name resolves to the local here —
-                // the model carries no local annotations, so the face
-                // lookup answers from the outer declaration and may
-                // over-report that shadow (documented divergence).
+                // A local, parameter, or member shadowing the name owns the
+                // reference — the top-level face never applies there.
                 if matches!(row.intent, Intent::Invoke | Intent::Read)
                     && !self.self_scope_rows.contains(&row.range.offset)
+                    && !self.shadowed_bare_rows.contains(&row.range.offset)
                 {
                     self.check_top_level_unused_result(row);
                 }
@@ -1675,6 +1735,42 @@ impl<'a> Engine<'a> {
                 self.record_miss(row.name, row.range, false, NameUse::Type);
             }
             TypeVerdict::Missing => {
+                // A GFT's own type-parameter spellings (`Function<T>(T x)`,
+                // `… Function<T>(void Function(T), T)`): the names declare
+                // function-type parameters bound across the signature —
+                // inside the `<…>` group itself or in any formal type — so
+                // they are never undefined classes (the parser's GFT scan
+                // emits no type-variable events; this gate owns the
+                // verdict by harvesting the enclosing group's names).
+                if let Some((lo, hi)) = self.gft_param_group_covering(row.range.offset) {
+                    let name_bytes = self.strings.resolve(row.name).as_bytes();
+                    let mut window = (lo..hi).filter_map(|at| self.byte_at(at));
+                    let mut word: Vec<u8> = Vec::new();
+                    let mut declared = false;
+                    while let Some(b) = window.next() {
+                        match b {
+                            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'$' => {
+                                word.push(b)
+                            }
+                            _ => {
+                                if !word.is_empty() {
+                                    if word.as_slice() == name_bytes {
+                                        declared = true;
+                                        break;
+                                    }
+                                    word.clear();
+                                }
+                            }
+                        }
+                    }
+                    if !declared && !word.is_empty() && word.as_slice() == name_bytes {
+                        declared = true;
+                    }
+                    if declared {
+                        self.record_miss(row.name, row.range, false, NameUse::Type);
+                        return;
+                    }
+                }
                 if !suppressed && !self.guard.ignore(None, row.name) {
                     // A declaration parse keeps `await` in the type position:
                     // the unresolved simple name carries the await code, not
@@ -1976,7 +2072,18 @@ impl<'a> Engine<'a> {
         // its member token's end and descends through each record's
         // `recv_span`. Offsets are UTF-16 units, so the token end is the
         // name's UTF-16 length past its offset.
-        let end = read_span.offset + read_span.length;
+        let prev = self.chain_node_read(read_span, false)?;
+        self.chained_read_static_ty(prev)
+    }
+
+    /// The staged member-read record whose member token ENDS the span — the
+    /// chain node `read_span` names (`skip_bang`: past a trailing `!`).
+    fn chain_node_read(&self, read_span: SourceRange, skip_bang: bool) -> Option<&MemberRead> {
+        let mut end = read_span.offset + read_span.length;
+        let src = self.source.as_bytes();
+        while skip_bang && end > read_span.offset && src.get(end as usize - 1) == Some(&b'!') {
+            end -= 1;
+        }
         let token_end = |read: &MemberRead| {
             let name = self.strings.resolve(read.name);
             let units: usize = if name.is_ascii() {
@@ -1986,12 +2093,36 @@ impl<'a> Engine<'a> {
             };
             read.offset as usize + units == end as usize
         };
-        let prev = self
-            .member_reads
+        self.member_reads
             .iter()
             .rev()
-            .find(|read| read.offset >= read_span.offset && token_end(read))?;
-        self.chained_read_static_ty(prev)
+            .find(|read| read.offset >= read_span.offset && token_end(read))
+    }
+
+    /// Whether a member read types as the oracle's `InvalidType`: its
+    /// receiver's face is a head that resolves to no declaration, or the
+    /// receiver is itself an invalid chain node or an invalid-initialized
+    /// local (`type_property_resolver`'s invalid-bounded short-circuit
+    /// types every read on an invalid receiver invalid). Each hop descends
+    /// to a strictly earlier record, so the walk terminates.
+    pub(crate) fn member_read_invalid(&self, read: &MemberRead) -> bool {
+        if let Some(&decl) = self.local_decl_at_read.get(&read.recv_span.offset)
+            && self.invalid_init_locals.borrow().contains(&decl)
+        {
+            return true;
+        }
+        let recv_ty = self.recv_expression_ty(read.recv_span).or(match &read.recv {
+            Receiver::Typed { ty, .. } => Some(*ty),
+            _ => None,
+        });
+        match recv_ty {
+            Some(Ty::Dynamic) => false,
+            Some(ty @ Ty::Named { .. }) => self.is_invalid_ty(ty),
+            _ => match self.chain_node_read(read.recv_span, true) {
+                Some(prev) if prev.offset < read.offset => self.member_read_invalid(prev),
+                _ => false,
+            },
+        }
     }
 
     /// The re-derived static type of one chained member node, keyed by its
@@ -2042,7 +2173,13 @@ impl<'a> Engine<'a> {
             write_op: None,
             ty: Ty::UNKNOWN,
         };
-        let ty = self.receiver_static_ty(&row);
+        let mut ty = self.receiver_static_ty(&row);
+        if ty == Ty::UNKNOWN
+            && let Some(ext) = self.extension_accessor_ty(recv_ty, read.name)
+        {
+            
+            ty = ext;
+        }
         // An invoked callee's chain node is the SEND, not the read: a
         // member token followed by `(` (the same byte probe the
         // redirect-edge face takes) makes the node's value the
@@ -2145,6 +2282,9 @@ impl<'a> Engine<'a> {
         if receivers.contains(&decl) {
             return true;
         }
+        let alias_hop = |name: StringId, file: FileId, lib: LibraryId| {
+            self.alias_clause_hop(name, file, lib)
+        };
         let hierarchy = FoldHierarchy {
             graph: self.graph,
             namespaces: self.namespaces,
@@ -2153,6 +2293,7 @@ impl<'a> Engine<'a> {
             lib: self.lib,
             memo: RefCell::default(),
             in_progress: RefCell::default(),
+            alias_head: Some(&alias_hop),
         };
         receivers
             .iter()
@@ -2165,6 +2306,12 @@ impl<'a> Engine<'a> {
         row: &Row,
         recv: Receiver,
     ) {
+        
+        if matches!(recv, Receiver::Unknown)
+            && matches!(row.intent, Intent::Read | Intent::ReadWrite)
+        {
+            self.unresolved_member_rows.push((row.range.offset, row.name));
+        }
         // Any member access uses the accessed name (the official `members`
         // set; unresolved reads land in `unresolvedReadMembers`, which the
         // field rule credits the same). Read-shaped accesses also join the
@@ -2193,6 +2340,37 @@ impl<'a> Engine<'a> {
         // skips the synthetic token, so no member face reports for it and
         // the miss only lands in the byproduct table.
         if Self::synthetic_reference(row.range) {
+            self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
+            return;
+        }
+        // The invalid-type container (scanner.dart's `scanner
+        // .configuration` over a `fasta.Scanner` the failed
+        // package:_fe_analyzer_shared import left): the oracle's
+        // `InvalidType` receiver makes every member ask vacuous — the
+        // walk's undefined trio never reports, only the type-position miss
+        // beside it does. A container whose spelling resolves nowhere in
+        // this scope (and is no compiler-known head) is exactly that
+        // face.
+        let container_face = match &recv {
+            Receiver::Typed { type_name, .. } => Some(*type_name),
+            Receiver::Container { name, .. } => Some(*name),
+            Receiver::This { container, .. } => Some(*container),
+            _ => None,
+        };
+        if let Some(container) = container_face
+            && !self.is_scope_param(container)
+            && self.param_bound(container).is_none()
+            && !matches!(
+                self.strings.resolve(container),
+                "Symbol" | "Version" | "VersionConstraint"
+            )
+            && !crate::member_face::CORE_TYPE_MEMBERS
+                .iter()
+                .chain(crate::member_face::CORE_INTERFACE_MEMBERS.iter())
+                .any(|(head, _)| *head == self.strings.resolve(container))
+            && self.is_invalid_ty(Ty::named(container))
+        {
+            
             self.record_miss(row.name, row.range, true, use_kind_of(&row.intent));
             return;
         }
@@ -2456,6 +2634,21 @@ impl<'a> Engine<'a> {
         kind: ContainerKind,
     ) {
         let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
+        
+        // A named-CONSTRUCTOR reference on the class head (`$Result.error`
+        // — the implicit creation `C.ctor(...)`, a redirecting factory
+        // included) is not a static member access: the constructor-
+        // reference dispatch owns the verdict, and the getter/method trio
+        // never fires (the use credits the constructor's name the same
+        // `check_enum_constructor_selector` credit carries).
+        if !write
+            && matches!(resolved.kind, ContainerKind::Class | ContainerKind::ExtensionType)
+            && resolved.constructors.contains(&row.name)
+        {
+            self.used_names.insert(row.name);
+            self.record_miss(row.name, row.range, true, NameUse::Read);
+            return;
+        }
         // Write intent resolves through the SETTER spelling plus a
         // non-final field's implicit setter — a getter under the base
         // name never satisfies a write (`Ext(item).g = x` on a
@@ -2810,6 +3003,31 @@ impl<'a> Engine<'a> {
                 // a decidable miss reports the getter read — or the shared
                 // unchecked-access code on a merely-nullable receiver — and
                 // a genuinely unindexed declaration keeps the under-report.
+                _ if {
+                    // An applicable extension accessor resolves the
+                    // operator-merged read too (`ports.toDart[0]` through
+                    // `JSArrayToList.toDart`): its result types the operator.
+                    let receiver_ty = match recv {
+                        Receiver::Typed { ty, .. } => ty,
+                        Receiver::This { container, kind } => self.this_static_ty(container, kind),
+                        _ => Ty::UNKNOWN,
+                    };
+                    let applied = !matches!(
+                        self.extension_application(
+                            container,
+                            receiver_ty,
+                            row.name,
+                            false,
+                            receiver_nullable
+                        ),
+                        ExtensionApp::None
+                    );
+                    
+                    applied
+                } =>
+                {
+                    return;
+                }
                 Walk::ChainBroken => {
                     match self.frozen_member_verdict(report_on, row.name) {
                         FrozenFace::Absent => {
@@ -3514,6 +3732,13 @@ impl<'a> Engine<'a> {
         {
             return None;
         }
+        // A name the diagnosing library pulls through a broken import's
+        // `show` list is the same InvalidType face (`import 'missing.dart'
+        // show Response;` — the use sites never record a miss, the guard
+        // suppresses them).
+        if scope_lib == self.lib && self.guard.ignore(None, name) {
+            return None;
+        }
         let libs = self.graph.declaring_libraries(name);
         if libs.len() != 1 || libs[0] == scope_lib {
             return None;
@@ -4064,9 +4289,18 @@ impl<'a> Engine<'a> {
         // arguments cannot match (a different concrete element) never
         // applies; disagreement among the viable faces stays the
         // under-report (`None`).
+        self.extension_accessor_ty(receiver_ty, row.name)
+    }
+
+    /// The declared accessor face an accessible extension gives `member`
+    /// on `receiver_ty`, over the already-filled extension pool (`None`
+    /// before the fill): every viable declarer must instantiate to the
+    /// same answer.
+    pub(crate) fn extension_accessor_ty(&self, receiver_ty: Ty, member: StringId) -> Option<Ty> {
+        let faces = self.accessible_extensions.as_deref()?;
         let mut answer: Option<Ty> = None;
-        for (face, face_file) in declarers {
-            let Some(entry) = face.members.get(&row.name) else {
+        for &(face, face_file) in faces {
+            let Some(entry) = face.members.get(&member) else {
                 continue;
             };
             let declared = match entry.kind {
@@ -4288,6 +4522,7 @@ impl<'a> Engine<'a> {
         receiver_nullable: bool,
     ) -> bool {
         let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
+        
         // The write target resolves the SETTER side
         // (`assignment_expression_resolver.dart` `_resolveSimpleAssignment`:
         // `writeElement` is the `name=` lookup): a setter or a field
@@ -4768,7 +5003,7 @@ impl<'a> Engine<'a> {
                             if param_args != ArgListId::EMPTY {
                                 return None;
                             }
-                            let param = ops.param_id(param_name)?;
+                            let param = ops.param_id(param_name, face_file)?;
                             let bound_arg =
                                 bind_through_nullable(on_nullable, receiver_arg);
                             Some((param, ops.map_ty_strict(bound_arg, &pool)?))
@@ -5109,6 +5344,18 @@ impl<'a> Engine<'a> {
                 applicable.push((face, on_ty, face_file));
             }
         }
+        
+        for (i, (face, on_ty, face_file)) in applicable.iter().enumerate() {
+            let on_desc = match on_ty {
+                Ty::Named { name, nullable, .. } => format!(
+                    "{}{}",
+                    self.strings.resolve(*name),
+                    if *nullable { "?" } else { "" }
+                ),
+                other => format!("{:?}", other),
+            };
+            
+        }
         // `_isMoreSpecific` steps 3-4 at the name level: a face whose
         // instantiated `on` type is a strict subtype of another applicable
         // face's dominates it (`extension_member_resolver.dart:467-491`).
@@ -5363,6 +5610,22 @@ impl<'a> Engine<'a> {
                     return false;
                 }
                 let (other_face, other_on_ty, other_file) = applicable[other];
+                // A face whose `on` type is non-nullable is inapplicable to
+                // a nullable receiver (`applicableTo` rejects it: `C?` is
+                // not assignable to the non-null `on` type), so it never
+                // gets a domination vote against a nullable-`on` twin —
+                // the vote would kill the ONLY applicable face and flip the
+                // access to the unsafe arm (`element.supertype
+                // .isAbiSpecificInteger` over the `on DartType?`/`on
+                // DartType` twins, ffi_verifier.dart:2644). The oracle's
+                // `_getApplicable` drops the non-null face before
+                // `_isMoreSpecific` ever runs.
+                if receiver_nullable
+                    && !other_face.on_type_nullable
+                    && face.on_type_nullable
+                {
+                    return false;
+                }
                 // Steps 1-2: the SDK-precedence order decides before the
                 // subtype steps; same-origin pairs fall through to them.
                 if sdk_origin[other] != sdk_origin[index] {
@@ -5438,6 +5701,8 @@ impl<'a> Engine<'a> {
         }
         // On a nullable receiver a nullable `on` face is the safe match;
         // only when none applies does the unsafe non-nullable set answer.
+        let specific_n = specific.len();
+        let nullable_n = nullable.len();
         let (candidates, unsafe_match) = if receiver_nullable {
             if nullable.is_empty() {
                 (specific, true)
@@ -5494,6 +5759,7 @@ impl<'a> Engine<'a> {
             }
             self.credit_extension_import(face, face_file);
         }
+        
         match candidates.len() {
             0 => ExtensionApp::None,
             1 if unsafe_match => ExtensionApp::UnsafeSingle,

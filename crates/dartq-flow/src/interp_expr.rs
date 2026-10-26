@@ -104,6 +104,20 @@ impl Interp<'_> {
                                     ty,
                                     args,
                                 });
+                            } else if self.unresolved_writes.contains(&var)
+                                && declared.nullable
+                                && matches!(declared.base, crate::ty::Base::Name(_))
+                            {
+                                // A write our tables could not type: the
+                                // oracle's write-promotion stands beyond our
+                                // sight — the opaque promotion row lets the
+                                // staged consumers take the non-null form
+                                // (the #2174 channel).
+                                self.emit(FlowFact::PromotedRead {
+                                    span: *token,
+                                    ty: Ty::UNKNOWN,
+                                    args: crate::ty::EMPTY_ARGS,
+                                });
                             }
                             // The read-type row (the semantic query face's
                             // family-a): every read carries its flow type —
@@ -1161,6 +1175,28 @@ impl Interp<'_> {
                     None
                 };
                 let (rhs_ty, rhs_ty_args) = staged.unwrap_or((rhs.ty, rhs_args));
+                // The opaque write mark: under a MOUNTED resolved seam
+                // (any staged entry proves the stager ran), a nullable-
+                // declared local whose right-hand face the lattice still
+                // spells `Unknown` — the stager drops a head it cannot
+                // resolve, so the absence is the attempted-and-unresolved
+                // gap, never a literal — keeps its reads' promotion
+                // under-report-safe (see [`Interp::unresolved_writes`]).
+                if (*plain || *if_null)
+                    && self.ops.is_resolved_seam()
+                    && !rhs_literal
+                    && (rhs_ty == crate::ty::Ty::UNKNOWN
+                        || (rhs_ty == crate::ty::Ty::UNKNOWN_NULLABLE
+                            && rhs.prop.is_some()
+                            && staged.is_none()))
+                    && let Some(var) = target.reference
+                    && self
+                        .vars
+                        .get(var as usize)
+                        .is_some_and(|meta| meta.ty.nullable)
+                {
+                    self.unresolved_writes.insert(var);
+                }
                 // A plain assignment's target identifier is the write, not
                 // a read: retract its facts. Both read facts can coexist at
                 // this span — the target read may run under an active
@@ -1985,6 +2021,12 @@ impl Interp<'_> {
                         .unwrap_or((None, Ty::UNKNOWN, crate::ty::EMPTY_ARGS));
                     self.null_short_begin(receiver);
                 }
+                let target = self
+                    .exprs
+                    .last()
+                    .filter(|_| !self.exprs.is_empty())
+                    .cloned()
+                    .map(Box::new);
                 self.stack.push(Frame::Cascade {
                     exprs_base: self.exprs.len(),
                     // Count AFTER the `?..` push: section-end flushes keep
@@ -1993,6 +2035,7 @@ impl Interp<'_> {
                     // it via `own_short`.
                     null_shorts_base: self.null_shorts.len(),
                     own_short: *null_aware,
+                    target,
                 });
             }
             Ev::CascadeAccess { .. } => {
@@ -2021,7 +2064,9 @@ impl Interp<'_> {
                     _ => (self.null_shorts.len(), false),
                 };
                 match self.stack.pop() {
-                    Some(Frame::Cascade { exprs_base, .. }) => {
+                    Some(Frame::Cascade {
+                        exprs_base, target, ..
+                    }) => {
                         // The head `?..` context's skip path rejoins here —
                         // official `nullAwareAccess_end` after the last
                         // section (type_analyzer.dart:2358-2360), so a
@@ -2033,6 +2078,15 @@ impl Interp<'_> {
                         }
                         // Keep the cascade target as the value.
                         self.exprs.truncate(exprs_base);
+                        // A section's write consumed the target entry and
+                        // left its assignment value at the base — the
+                        // captured target restores the true value face.
+                        if let Some(target) = target
+                            && self.exprs.len() == exprs_base
+                            && exprs_base > 0
+                        {
+                            self.exprs[exprs_base - 1] = *target;
+                        }
                     }
                     other => {
                         // A frame-less close (unbalanced recovery buffer) is
@@ -2422,6 +2476,42 @@ impl Interp<'_> {
         tested_args: u32,
         promoted: Option<Ty>,
     ) -> (State, State) {
+        // An is-test whose tested head resolves NOWHERE (a failed-import
+        // name — `uriSource is InSummarySource` over the missing
+        // package:front_end) is the official's InvalidType operand:
+        // subtype.dart's vacuous arm makes the test always-succeed, the
+        // failing branch dies, and the operand promotes TO THE TESTED
+        // SPELLING (an invalid-typed read whose downstream assignability
+        // asks stay vacuous — the oracle's silent argument row). The
+        // semantic side's staged filter recognizes the invalid head and
+        // skips; here the promotion carries the tested name non-null.
+        if let crate::ty::Ty {
+            base: crate::ty::Base::Name(name),
+            nullable: false,
+        } = tested
+        {
+            let unresolved = self
+                .ops
+                .call_head_unresolved(name, self.names);
+            if unresolved {
+                // Promotion only: the oracle's flow keeps BOTH arms live
+                // over an invalid tested type (no dead_code rows — the
+                // R53 regressions over `e is InvalidName` elses), while
+                // the static type of the matched read still carries the
+                // tested spelling (the argument rows' vacuous checks).
+                let matched = self.current.clone().finish_type_test(
+                    self.ops,
+                    &mut self.lists,
+                    var,
+                    Some((tested, tested_args)),
+                    Some((tested, tested_args)),
+                    self.args,
+                    self.names,
+                );
+                let unmatched = self.current.clone();
+                return (matched, unmatched);
+            }
+        }
         let (previous, previous_args) = {
             let model = self.current.model(var);
             (

@@ -613,12 +613,14 @@ pub(crate) fn supertype_has_instance_members(
 /// unindexed name (an unanalyzed dependency, an SDK type absent from the
 /// table) leaves the question open. The table carries no negative facts:
 /// an unindexed name never answers `false`, only the open direction.
-const CORE_INTERFACE_IMPLS: [(&str, &str); 12] = [
+const CORE_INTERFACE_IMPLS: [(&str, &str); 14] = [
     ("Iterable", "Iterable"),
     ("List", "Iterable"),
     ("Set", "Iterable"),
     ("IterableMixin", "Iterable"),
     ("IterableBase", "Iterable"),
+    ("ListMixin", "List"),
+    ("ListBase", "List"),
     ("SetMixin", "Set"),
     ("SetBase", "Set"),
     ("MapMixin", "Map"),

@@ -79,8 +79,8 @@ use dartq_language::Feature;
 use dartq_parser::ParserFeatures;
 use dartq_resolution::LibraryClassModifiers;
 use dartq_semantic::{
-    ElementIndex, ExportUseFace, ImportUseFace, LibraryUsages, LibraryUseSet, StrictModes,
-    UnitUseFace,
+    ElementIndex, ExportUseFace, ImportUseFace, LibraryUsages, LibraryUseSet, MicroKind,
+    StrictModes, UnitUseFace,
 };
 use dartq_source::{ContentId, FileId, LineIndex, SourceRange, StringId, StringTable};
 use rayon::prelude::*;
@@ -311,6 +311,48 @@ fn release_unused_imports(
     }
 }
 
+/// Whether the extension-credit face's `on` head resolves as a type in the
+/// DECLARING file's scope — the engine-side twin of the per-file pass's
+/// on-type gate: the extension's applicability resolves its own `on` clause
+/// where it was written (`on XmlNode` in ancestors.dart, which imports
+/// node.dart — the spelling need not be visible to the importing file). An
+/// extension over a type unresolvable in its own scope (`on YamlMap` under
+/// a missing package:yaml) never applies, so its member names lend the
+/// import no credit at the library close either.
+fn on_type_is_type(library: &LibraryView<'_>, declaring: FileId, on: StringId) -> bool {
+    use dartq_resolution::{Lookup, NamespaceEntry};
+    let is_type_kind = |kind: MicroKind| {
+        matches!(
+            kind,
+            MicroKind::Class
+                | MicroKind::Enum
+                | MicroKind::Mixin
+                | MicroKind::Extension
+                | MicroKind::TypeAlias
+                | MicroKind::TypeParam
+        )
+    };
+    if let Some(facts) = library.facts.get(&declaring) {
+        if facts.elements.container(on).is_some() {
+            return true;
+        }
+        if let Some(decl) = facts.elements.decl(on) {
+            return is_type_kind(decl.kind);
+        }
+    }
+    match library
+        .namespaces
+        .lookup(library.graph, library.graph_library, on)
+    {
+        Lookup::Found(NamespaceEntry::Decl(owner)) => library
+            .facts
+            .get(&owner)
+            .and_then(|facts| facts.elements.decl(on))
+            .map_or(true, |decl| is_type_kind(decl.kind)),
+        _ => false,
+    }
+}
+
 /// Whether `edge`'s target exports an extension whose member the library
 /// used — the `notifyExtensionUsed` leg of the import-use verdict
 /// (scope.dart:204-321). The oracle credits the contributing import when
@@ -337,6 +379,14 @@ fn extension_member_credit(
         };
         for face in elements.extension_faces() {
             if face.name != Some(export_name) {
+                continue;
+            }
+            // The on-type gate (see [`on_type_is_type`]): an extension that
+            // can never apply lends the import no credit at the close —
+            // the same rule the per-file staging pass applies.
+            if let Some(on) = face.on_type
+                && !on_type_is_type(library, entry.file, on)
+            {
                 continue;
             }
             if face.members.keys().any(|member| consumed.used(*member)) {
@@ -915,9 +965,9 @@ impl SemanticDiagnoser for Diagnoser {
             // carries the library's `LibraryTypes` snapshot, every type
             // question this member's flow replay asks answers through it;
             // the `None` path keeps the name-level `NameTypeOps` default.
-            let ops = library.types.map(|types| {
-                dartq_semantic::ResolvedTypeOps::new(types, library.strings)
-            });
+            let ops = library
+                .types
+                .map(|types| dartq_semantic::ResolvedTypeOps::new(types, library.strings, file));
             let (report, face) = dartq_semantic::diagnose_unit_with_ops(
                 text,
                 tokens,

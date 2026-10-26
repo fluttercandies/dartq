@@ -333,8 +333,31 @@ impl<'a> Engine<'a> {
                     return Walk::ChainBroken;
                 }
                 let mixin_lib = owner_lib;
-                if let Some((mixin_container, mixin_owner)) =
-                    self.resolve_clause_face(name, found_owner, mixin_lib, *mixin)
+                let mixin_resolved =
+                    self.resolve_clause_face(name, found_owner, mixin_lib, *mixin);
+                if let Some((mixin_container, mixin_owner)) = &mixin_resolved
+                    && mixin_container.members.get(&member).is_none()
+                {
+                    // The application's interface keeps the mixin's own
+                    // faces: a resolved mixin whose members miss the lookup
+                    // still contributes its `on` constraint heads and
+                    // `implements` faces to the chain's interface climb
+                    // (`with ListMixin<E>` — SDK 3.47's ListBase `implements
+                    // List<E>` is where `[]`/`length` live; skipping them
+                    // left a fully-decidable chain answering Missing, which
+                    // flagged legal overrides as non-overriding once the
+                    // alias fold made the hop resolvable).
+                    let level: Vec<(StringId, FileId, StringId)> = mixin_container
+                        .on_clause
+                        .iter()
+                        .chain(mixin_container.implements_clause.iter())
+                        .map(|face| (*face, *mixin_owner, *mixin))
+                        .collect();
+                    if !level.is_empty() {
+                        pending_faces.push(level);
+                    }
+                }
+                if let Some((mixin_container, mixin_owner)) = mixin_resolved
                     && let Some(entry) = mixin_container.members.get(&member)
                 {
                     // The application-site substitution face: the member
@@ -1287,6 +1310,16 @@ impl<'a> Engine<'a> {
             {
                 return true;
             }
+            // A resolved hop whose indexed members miss the spelling still
+            // answers by its frozen face: the SDK units index only
+            // concrete-bodied members (dart:core `List`'s abstract
+            // `E operator [](int)`, `int get length` carry no entry), so a
+            // RESOLVED core container decides by the same frozen table an
+            // unresolvable one does — the name-keyed tables keep this to
+            // the core heads.
+            if frozen_hit(self.strings.resolve(name)) {
+                return true;
+            }
             let owner_lib = self
                 .owner_library_of(found_owner, name)
                 .unwrap_or(scope_lib);
@@ -1303,6 +1336,13 @@ impl<'a> Engine<'a> {
                             .is_some_and(|entry| !entry.is_static) =>
                     {
                         return true;
+                    }
+                    // A resolved mixin hop's frozen face answers the same
+                    // way (`with ListMixin<E>` — the alias folds to the
+                    // indexed ListBase, whose abstract-only members miss,
+                    // but List's frozen face owns them).
+                    Some(_) if frozen_hit(self.strings.resolve(*mixin)) => {
+                        mixin_hit = true;
                     }
                     None if frozen_hit(self.strings.resolve(*mixin)) => {
                         mixin_hit = true;
@@ -2191,6 +2231,9 @@ impl<'a> Engine<'a> {
         let (graph, namespaces, index, strings) =
             (self.graph, self.namespaces, self.index, self.strings);
         let element = (self.file, container);
+        let alias_hop = |name: StringId, file: FileId, lib: LibraryId| {
+            self.alias_clause_hop(name, file, lib)
+        };
         let hierarchy = FoldHierarchy {
             graph,
             namespaces,
@@ -2199,29 +2242,38 @@ impl<'a> Engine<'a> {
             lib: self.lib,
             memo: RefCell::default(),
             in_progress: RefCell::default(),
+            alias_head: Some(&alias_hop),
         };
         // The constraint face is the DIRECT `on` list (the official
         // `superclassConstraints.contains`, :1195-1196): the same sealed
         // supertype reached through any other path reports the regular
-        // subtype face, and only mixins carry `on` constraints.
-        let direct_ons: FxHashSet<(FileId, StringId)> =
-            hierarchy.face_handles(element).3.into_iter().collect();
-        for handle in hierarchy.closure(element) {
-            let Some(decl) = index
-                .get(handle.0)
-                .and_then(|elements| elements.container(handle.1))
-            else {
-                continue;
-            };
-            let owner_lib = hierarchy.library_of(handle);
-            let is_sealed = decl
-                .annotations
-                .iter()
-                .any(|annotation| is_meta_getter(annotation, "sealed", strings, graph, owner_lib));
-            if !is_sealed || same_workspace_package(graph, owner_lib, self.lib) {
-                continue;
-            }
-            let code = if direct_ons.contains(&handle) {
+        // subtype face, and only mixins carry `on` constraints. The
+        // hierarchy phase (immutable borrows, alias fold included) ends
+        // before the report writes below.
+        let sealed_hits: Vec<((FileId, StringId), bool)> = {
+            let direct_ons: FxHashSet<(FileId, StringId)> =
+                hierarchy.face_handles(element).3.into_iter().collect();
+            hierarchy
+                .closure(element)
+                .into_iter()
+                .filter_map(|handle| {
+                    let Some(decl) = index
+                        .get(handle.0)
+                        .and_then(|elements| elements.container(handle.1))
+                    else {
+                        return None;
+                    };
+                    let owner_lib = hierarchy.library_of(handle);
+                    let is_sealed = decl.annotations.iter().any(|annotation| {
+                        is_meta_getter(annotation, "sealed", strings, graph, owner_lib)
+                    });
+                    (is_sealed && !same_workspace_package(graph, owner_lib, self.lib))
+                        .then_some((handle, direct_ons.contains(&handle)))
+                })
+                .collect()
+        };
+        for (handle, direct_on) in sealed_hits {
+            let code = if direct_on {
                 SemanticCode::MixinOnSealedClass
             } else {
                 SemanticCode::SubtypeOfSealedClass
@@ -2302,6 +2354,9 @@ impl<'a> Engine<'a> {
         let display = |name: StringId| self.strings.resolve(name).to_owned();
         let element = (self.file, container);
         let use_facts = self.library_facts(self.lib);
+        let alias_hop = |name: StringId, file: FileId, lib: LibraryId| {
+            self.alias_clause_hop(name, file, lib)
+        };
         let hierarchy = FoldHierarchy {
             graph: self.graph,
             namespaces: self.namespaces,
@@ -2310,6 +2365,7 @@ impl<'a> Engine<'a> {
             lib: self.lib,
             memo: RefCell::default(),
             in_progress: RefCell::default(),
+            alias_head: Some(&alias_hop),
         };
         // The resolved faces, written order within a clause, each with its
         // written entry's span. The extends head exists on class-family
@@ -4318,6 +4374,42 @@ impl<'a> Engine<'a> {
             file,
             face,
         );
+        let bare = match bare {
+            Some(hit) => Some(hit),
+            // A clause face that names a TYPE ALIAS binds the alias's
+            // right-hand container (`with ListMixin<E>` — SDK 3.47 spells
+            // `typedef ListMixin<E> = ListBase<E>`; the mixin application's
+            // real face is `ListBase`, whose members the oracle walks — the
+            // alias's own name resolves to no container). The RHS parameter
+            // leaves ride bare — the application's written clause arguments
+            // substitute at the member sites — so only the HEAD resolves
+            // here; chains and cycles bound by the loop depth.
+            None => {
+                let mut head = face;
+                let mut hit = None;
+                for _ in 0..8 {
+                    let Some(Ty::Named { name: next, .. }) = self.alias_rhs_any(head) else {
+                        break;
+                    };
+                    if next == head {
+                        break;
+                    }
+                    head = next;
+                    if let Some(found) = resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        scope_lib,
+                        file,
+                        head,
+                    ) {
+                        hit = Some(found);
+                        break;
+                    }
+                }
+                hit
+            }
+        };
         if bare.is_some() || file == self.file {
             return bare;
         }
@@ -4659,6 +4751,30 @@ impl<'a> Engine<'a> {
         inherited: &MemberEntry,
         inherited_owner: (FileId, StringId),
     ) -> bool {
+        // A generic-method override unifies the two signatures' method type
+        // parameters by POSITION — the official subtype question runs over
+        // fresh variables, so `QueueList<T> cast<T>()` overrides
+        // `List<R> cast<R>()` (both spell "the method's first parameter";
+        // `QueueList<X> <: List<X>` through the with-application). The raw
+        // spellings are unrelated names (`QueueList<T>` vs `List<R>`), so
+        // the declared entry renames onto the inherited spellings before
+        // any face comparison.
+        let unified;
+        let declared = if declared.type_params > 0
+            && declared.type_params == inherited.type_params
+            && declared.type_param_names != inherited.type_param_names
+        {
+            let env: FxHashMap<StringId, Ty> = declared
+                .type_param_names
+                .iter()
+                .zip(inherited.type_param_names.iter())
+                .map(|(from, to)| (*from, Ty::named(*to)))
+                .collect();
+            unified = self.substitute_entry(declared, &env);
+            &unified
+        } else {
+            declared
+        };
         let world = self.name_world();
         // The single type-decision point for every face below: the M1
         // assignability first, the name lattice on its `None`. No consumer

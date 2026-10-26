@@ -458,6 +458,64 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The clause-face hop with the alias fold (the name-level twin of
+    /// [`crate::diagnose::Engine::resolve_clause_face`]'s fallback): a
+    /// clause face spelling a TYPE ALIAS binds the alias's right-hand
+    /// container. Answers the resolved (owner, head) pair the
+    /// [`crate::diagnose::types::FoldHierarchy`] walk crosses.
+    pub(crate) fn alias_clause_hop(
+        &self,
+        name: StringId,
+        file: FileId,
+        lib: LibraryId,
+    ) -> Option<(FileId, StringId)> {
+        let mut head = name;
+        for _ in 0..8 {
+            let Some(Ty::Named { name: next, .. }) = self.alias_rhs_any(head) else {
+                return None;
+            };
+            if next == head {
+                return None;
+            }
+            head = next;
+            if let Some((_, owner)) =
+                resolve_container(self.graph, self.namespaces, self.index, lib, file, head)
+            {
+                return Some((owner, head));
+            }
+        }
+        None
+    }
+
+    /// [`Self::alias_rhs`] without the non-parameterized gate: the
+    /// clause-face fold (a `with ListMixin<E>` application over SDK 3.47's
+    /// `typedef ListMixin<E> = ListBase<E>`) needs the right-hand HEAD of a
+    /// parameterized class alias too — the parameter leaves ride bare and
+    /// the application's own clause arguments substitute at the member
+    /// sites, so only the head name matters there.
+    pub(crate) fn alias_rhs_any(&self, name: StringId) -> Option<Ty> {
+        let (owner, decl) = match lookup_scoped(
+            self.graph,
+            self.namespaces,
+            self.index,
+            self.lib,
+            self.file,
+            name,
+        ) {
+            ScopedHit::Local(decl) => (self.file, decl),
+            ScopedHit::Found(NamespaceEntry::Decl(file)) => {
+                (file, self.index.get(file).and_then(|f| f.decl(name))?)
+            }
+            _ => return None,
+        };
+        match decl.kind {
+            MicroKind::TypeAlias if decl.var_ty != Ty::UNKNOWN => {
+                Some(self.boundary.ty(owner, decl.var_ty))
+            }
+            _ => None,
+        }
+    }
+
     /// The callable signature a parameterized function-type alias spells
     /// (`typedef Predicate<T> = bool Function(T)`): the element model keeps
     /// no RHS for a parameterized alias (its substitution face is
@@ -1544,6 +1602,7 @@ impl<'a> Engine<'a> {
     /// member face (own-file container chain), the extension pool, enum
     /// synthesized members, then the scoped library lookup.
     pub(crate) fn resolve_bare(&self, name: StringId) -> (BareInfo, RefTarget) {
+        
         if self.frames.iter().rev().any(|f| f.locals.contains(&name)) {
             return (
                 BareInfo::Plain {
@@ -1551,6 +1610,25 @@ impl<'a> Engine<'a> {
                 },
                 RefTarget::Local,
             );
+        }
+        // A pattern binder's var_types slot (the shorthand `:final x` and
+        // the binder arms bind through `bind_var_type`, never the tracked
+        // locals set — the R53 scoped-locals attempt leaked the flat set
+        // past the clause scope and regressed outer reads): consulting the
+        // frame chain's typed slots answers the binder's reads with its
+        // bound face and leaves the set untouched, so the scope's restore
+        // keeps its exact contract. A slot spelling `Unknown` (the
+        // unresolvable-getter fallback) still resolves — the oracle's
+        // binder is a local however weakly typed (`$Result.error(error,
+        // stackTrace)` reads the bound `stackTrace`, never the implicit
+        // this getter).
+        if let Some(ty) = self
+            .frames
+            .iter()
+            .rev()
+            .find_map(|f| f.var_types.get(&name).copied())
+        {
+            return (BareInfo::Plain { ty }, RefTarget::Local);
         }
         // The frameless initializer world: a pattern variable of a switch /
         // if-case expression in a top-level variable's initializer binds
@@ -2393,6 +2471,12 @@ impl<'a> Engine<'a> {
     #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
     pub(crate) fn push_bare(&mut self, name: StringId, range: SourceRange) {
         let (info, target) = self.resolve_bare(name);
+        if matches!(
+            target,
+            RefTarget::Local | RefTarget::TypeParam | RefTarget::Member { .. }
+        ) {
+            self.shadowed_bare_rows.insert(range.offset);
+        }
         // The query face's publication (#1056): the push-time decision
         // ships as-is — the resolution is final even where a later fold
         // retracts the row (a creation fold's truncated callee resolved

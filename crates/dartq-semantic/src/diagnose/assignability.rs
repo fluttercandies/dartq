@@ -404,7 +404,7 @@ impl<'a> Engine<'a> {
         let name_text = self.strings.resolve(name);
         let needle = format!("extension {name_text}");
         let bytes = self.source.as_bytes();
-        let ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
         let mut search = 0usize;
         loop {
             let at = self.source[search..].find(&needle)? + search;
@@ -515,7 +515,7 @@ impl<'a> Engine<'a> {
     /// `extension <name><...> on` header; no header (or no type-parameter
     /// group) answers `false`.
     pub(crate) fn extension_on_is_generic(&self, name: StringId) -> bool {
-        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
         let needle = format!("extension {}", self.strings.resolve(name));
         let mut search = 0usize;
         while let Some(found) = self.source[search..].find(&needle) {
@@ -1029,7 +1029,14 @@ impl<'a> Engine<'a> {
         });
         let params = match own_params.or_else(|| core_params.flatten()) {
             Some(params) if !params.is_empty() => params,
-            _ => return declared,
+            _ => {
+                let raw = self.raw_receiver_env(recv);
+                return if raw.is_empty() {
+                    declared
+                } else {
+                    self.subst_params(declared, &raw).unwrap_or(Ty::UNKNOWN)
+                };
+            }
         };
         let receiver_ty = match recv {
             Receiver::Typed { ty, .. } => *ty,
@@ -1042,6 +1049,12 @@ impl<'a> Engine<'a> {
             return Ty::UNKNOWN;
         };
         let recv_args = self.boundary.pool().get(args).to_vec();
+        if recv_args.is_empty() {
+            let raw = self.raw_receiver_env(recv);
+            if !raw.is_empty() {
+                return self.subst_params(declared, &raw).unwrap_or(Ty::UNKNOWN);
+            }
+        }
         if recv_args.len() != params.len() {
             return Ty::UNKNOWN;
         }
@@ -2366,6 +2379,30 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// [`Self::named_type_is_type`] resolved in a FOREIGN file's scope: the
+    /// extension-credit gate asks whether an extension's `on` head resolves
+    /// where the extension was DECLARED (the spelling need not be visible to
+    /// the importing file — `on XmlNode` in ancestors.dart applies in files
+    /// that never import node.dart). The current container's member-shadow
+    /// check is the diagnosing scope's own; a foreign asking scope keeps the
+    /// declaration-table and namespace probes alone.
+    pub(crate) fn named_type_is_type_in(&self, file: FileId, name: StringId) -> bool {
+        if self.members.primitive_ids.contains(&name) {
+            return true;
+        }
+        let lib = self.graph.library_of_file(file).unwrap_or(self.lib);
+        match lookup_scoped(self.graph, self.namespaces, self.index, lib, file, name) {
+            ScopedHit::Local(decl) => Self::decl_is_type(decl.kind),
+            ScopedHit::Found(NamespaceEntry::Decl(owner)) => self
+                .index
+                .get(owner)
+                .and_then(|f| f.decl(name))
+                .map_or(true, |decl| Self::decl_is_type(decl.kind)),
+            ScopedHit::Found(NamespaceEntry::Prefix) | ScopedHit::Ambiguous(_) => false,
+            ScopedHit::NotFound => false,
+        }
+    }
+
     /// The declaration kinds a named type can name.
     pub(crate) fn decl_is_type(kind: MicroKind) -> bool {
         matches!(
@@ -2856,6 +2893,9 @@ impl<'a> Engine<'a> {
         if to_container.is_none() {
             return None;
         }
+        let alias_hop = |name: StringId, file: FileId, lib: LibraryId| {
+            self.alias_clause_hop(name, file, lib)
+        };
         let hierarchy = FoldHierarchy {
             graph: self.graph,
             namespaces: self.namespaces,
@@ -2864,6 +2904,7 @@ impl<'a> Engine<'a> {
             lib: self.lib,
             memo: RefCell::default(),
             in_progress: RefCell::default(),
+            alias_head: Some(&alias_hop),
         };
         let (_, from_file) = from_container.unwrap();
         let found = hierarchy
@@ -2971,7 +3012,12 @@ impl<'a> Engine<'a> {
     /// oracle's `InvalidType` gate), so the latch gap suppresses instead
     /// of mis-answering.
     pub(crate) fn open_switch(&mut self, is_expression: bool, kw: SourceRange) {
-        let scrutinee = self.rows.last().map_or(Ty::Unknown, |row| row.ty);
+        let scrutinee = self
+            .rows
+            .last()
+            .filter(|row| !self.is_index_key_row(row))
+            .map_or(Ty::Unknown, |row| row.ty);
+        
         self.switch.open_switch(scrutinee, is_expression, kw);
     }
 

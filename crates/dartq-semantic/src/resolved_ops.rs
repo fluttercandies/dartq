@@ -187,6 +187,16 @@ pub struct LibraryTypes {
     /// the id — reflexive `T <: T` answers `true` either way, the only
     /// question identity changes.
     type_params: FxHashMap<StringId, TypeParamId>,
+    /// The `(file, spelling)` pairs of every registered type parameter —
+    /// the scope face of [`Self::type_params`]. Type parameters are never
+    /// visible across files: a body sees only the parameters of the
+    /// declarations that enclose it, all in its own file. The name-keyed
+    /// map above stays global for the build-time filters (every spelling
+    /// registered anywhere), but every query-time resolution — the
+    /// adapter's `map_name` face — requires the pair here, so an SDK
+    /// type-parameter spelling (`List<E>`'s `E`) can never capture a
+    /// same-named user class in another file (#2510).
+    type_param_scope: FxHashSet<(FileId, StringId)>,
     /// Every member name of every registered container — the
     /// bare-head-invocation over-approximation
     /// ([`TypeOps::call_head_unresolved`]): a spelling here may resolve as
@@ -465,6 +475,7 @@ impl LibraryTypes {
             typedef_shapes: FxHashMap::default(),
             aliases: Vec::new(),
             type_params,
+            type_param_scope: FxHashSet::default(),
             param_names,
             invokable_members: FxHashSet::default(),
             property_ty_heads: Vec::new(),
@@ -706,6 +717,7 @@ impl LibraryTypes {
             typedef_targets,
             typedef_shapes,
             type_params,
+            type_param_scope,
             param_names,
             invokable_members,
             property_ty_heads,
@@ -889,7 +901,9 @@ impl LibraryTypes {
         // sentinels, so the error arm is unreachable by construction and
         // only the bare core answers it.
         let hierarchy = match builder.build_lenient(&table) {
-            Ok((hierarchy, _dropped)) => hierarchy,
+            Ok((hierarchy, _dropped)) => {
+                hierarchy
+            }
             Err(_) => TypeHierarchy::builder(CoreDecls {
                 object,
                 future,
@@ -915,6 +929,7 @@ impl LibraryTypes {
             typedef_shapes,
             param_names,
             type_params,
+            type_param_scope,
             invokable_members,
             invalid_property_tys,
         }
@@ -991,6 +1006,8 @@ struct Registry {
     /// `TypeKind::TypeParameter` map the adapter answers instead of
     /// `Invalid` for a `T`-shaped name (#2186 S4-C).
     type_params: FxHashMap<StringId, TypeParamId>,
+    /// See [`LibraryTypes::type_param_scope`].
+    type_param_scope: FxHashSet<(FileId, StringId)>,
     /// See [`LibraryTypes::param_names`].
     param_names: FxHashMap<TypeParamId, StringId>,
     /// See [`LibraryTypes::invokable_members`].
@@ -1116,6 +1133,9 @@ impl Registry {
                     self.facts.set(param, ParamFacts::LEGACY);
                     self.type_params.insert(name, param);
                 }
+                // The scope face keys on the declaring file: a spelling is
+                // a type parameter only inside the file that declares it.
+                self.type_param_scope.insert((file, name));
                 continue;
             }
             let container_like = matches!(
@@ -1695,6 +1715,12 @@ fn instantiate_to_bounds(
 pub struct ResolvedTypeOps<'a> {
     snapshot: &'a LibraryTypes,
     strings: &'a StringTable,
+    /// The unit file the replayed member lives in — the scope face of the
+    /// snapshot's type parameters ([`LibraryTypes::type_param_scope`]): a
+    /// type-parameter spelling resolves only inside the file that declares
+    /// it, so an SDK `List<E>`'s `E` never captures a same-named class of
+    /// this unit's file (#2510).
+    file: FileId,
     system: TypeSystem<'a>,
     /// `name_id → (non-null TypeId, nullable TypeId)`, lazily extended:
     /// `is_always_exhaustive` is the only op carrying the recorder's
@@ -1745,11 +1771,12 @@ impl<'a> ResolvedTypeOps<'a> {
     /// Mounts the adapter over `snapshot`: `strings` is the shared name
     /// table the recorder's lexemes intern into (the same one the
     /// snapshot's registry keyed its `StringId`s on).
-    pub fn new(snapshot: &'a LibraryTypes, strings: &'a StringTable) -> Self {
+    pub fn new(snapshot: &'a LibraryTypes, strings: &'a StringTable, file: FileId) -> Self {
         let table = &snapshot.table;
         Self {
             snapshot,
             strings,
+            file,
             system: TypeSystem::new(&snapshot.table, &snapshot.hierarchy),
             name_ty: RefCell::new(Vec::new()),
             overload_ids: RefCell::new(FxHashSet::default()),
@@ -1816,7 +1843,7 @@ impl<'a> ResolvedTypeOps<'a> {
                 self.overload_ids.borrow_mut().insert((start + offset) as u32);
             }
             let name = self.strings.intern(lexeme);
-            let pair = if let Some(&param) = self.snapshot.type_params.get(&name) {
+            let pair = if let Some(param) = self.scoped_param(name) {
                 (
                     self.snapshot.table.intern(
                         UninternedType::TypeParameter { parameter: param },
@@ -1862,6 +1889,23 @@ impl<'a> ResolvedTypeOps<'a> {
                     })
                     .map_or_else(
                         || {
+                            // The foreign member-signature parameter leaf —
+                            // see the same arm in [`Self::map_name`]: after
+                            // this unit's scope and the visible registry
+                            // both miss, the parameter face is the
+                            // conservative under-report posture (#2510's
+                            // precedence flip).
+                            if let Some(&param) = self.snapshot.type_params.get(&name) {
+                                let non_null = self.snapshot.table.intern(
+                                    UninternedType::TypeParameter { parameter: param },
+                                    false,
+                                );
+                                let nullable = self.snapshot.table.intern(
+                                    UninternedType::TypeParameter { parameter: param },
+                                    true,
+                                );
+                                return (non_null, nullable);
+                            }
                             self.builtin_spelling(lexeme, false).map_or_else(
                                 || self.observed_opaque_pair(name),
                                 |non_null| {
@@ -2080,7 +2124,7 @@ impl<'a> ResolvedTypeOps<'a> {
         nullable: bool,
     ) -> TypeId {
         let name = self.strings.intern(lexeme);
-        if let Some(&param) = self.snapshot.type_params.get(&name) {
+        if let Some(param) = self.scoped_param(name) {
             return self
                 .snapshot
                 .table
@@ -2094,6 +2138,22 @@ impl<'a> ResolvedTypeOps<'a> {
             .registry
             .get(&name)
             .filter(|_| !self.snapshot.non_containers.contains(&name));
+        if registered.is_none() && let Some(&param) = self.snapshot.type_params.get(&name) {
+            // A spelling no container registers but SOME file declares as a
+            // type parameter — the member-signature leaf of a foreign
+            // generic (`Iterable<E>`'s `E` reaching the flow layer through
+            // a member type the receiver instantiation never substituted).
+            // It resolves nowhere in this unit's scope, so the parameter
+            // face — conservative in every subtype question — is the
+            // under-report posture that keeps the oracle's `is`-arms live.
+            // The registry arm below runs FIRST precisely so a same-spelled
+            // visible class wins over a foreign parameter (dart:core's
+            // `List<E>` must not capture a user class named `E`, #2510).
+            return self
+                .snapshot
+                .table
+                .intern(UninternedType::TypeParameter { parameter: param }, nullable);
+        }
         if let Some(&decl) = registered {
             let Some(mapped_args) = self.map_args(args, arena, names, decl) else {
                 // The arity veto recovers instead of erasing: the official
@@ -2283,7 +2343,7 @@ impl<'a> ResolvedTypeOps<'a> {
         args: crate::model::ArgListId,
         pool: &crate::model::ArgPool,
     ) -> Option<TypeId> {
-        if let Some(&param) = self.snapshot.type_params.get(&name) {
+        if let Some(param) = self.scoped_param(name) {
             return Some(
                 self.snapshot
                     .table
@@ -2306,12 +2366,23 @@ impl<'a> ResolvedTypeOps<'a> {
                     .intern(UninternedType::FutureOr { base }, nullable),
             );
         }
-        if let Some(&decl) = self
+        let registered = self
             .snapshot
             .registry
             .get(&name)
-            .filter(|_| !self.snapshot.non_containers.contains(&name))
-        {
+            .filter(|_| !self.snapshot.non_containers.contains(&name));
+        if registered.is_none() && let Some(&param) = self.snapshot.type_params.get(&name) {
+            // The foreign member-signature parameter leaf — see the same
+            // arm in [`Self::map_name`]: after this unit's scope and the
+            // visible registry both miss, the parameter face is the
+            // conservative under-report posture (#2510's precedence flip).
+            return Some(
+                self.snapshot
+                    .table
+                    .intern(UninternedType::TypeParameter { parameter: param }, nullable),
+            );
+        }
+        if let Some(&decl) = registered {
             let params = self
                 .snapshot
                 .decl_params
@@ -2420,11 +2491,22 @@ impl<'a> ResolvedTypeOps<'a> {
     }
 
     /// The `TypeParamId` a written parameter name lands on in this
-    /// snapshot (`type_params` is name-keyed across the library — the
-    /// flow layer's own declaration-scope convention). `None` for a name
-    /// no declaration registers.
-    pub(crate) fn param_id(&self, name: StringId) -> Option<TypeParamId> {
-        self.snapshot.type_params.get(&name).copied()
+    /// snapshot, scoped to `file` — the file that declares the parameter
+    /// (`type_params` is name-keyed across the library, but a spelling is
+    /// a parameter only inside its declaring file, #2510). `None` for a
+    /// name no declaration of `file` registers.
+    pub(crate) fn param_id(&self, name: StringId, file: FileId) -> Option<TypeParamId> {
+        self.snapshot
+            .type_params
+            .get(&name)
+            .filter(|_| self.snapshot.type_param_scope.contains(&(file, name)))
+            .copied()
+    }
+
+    /// [`Self::param_id`] against the replayed unit's own file — the
+    /// scope every bare spelling the flow layer interns resolves in.
+    fn scoped_param(&self, name: StringId) -> Option<TypeParamId> {
+        self.param_id(name, self.file)
     }
 
     /// Step-5's instantiate-to-bounds projection
@@ -2996,7 +3078,7 @@ impl<'a> ResolvedTypeOps<'a> {
             return false;
         }
         let name = self.strings.intern(lexeme);
-        if self.snapshot.type_params.contains_key(&name)
+        if self.scoped_param(name).is_some()
             || self.snapshot.non_containers.contains(&name)
         {
             return false;
@@ -3006,6 +3088,10 @@ impl<'a> ResolvedTypeOps<'a> {
 }
 
 impl TypeOps for ResolvedTypeOps<'_> {
+    fn is_resolved_seam(&self) -> bool {
+        true
+    }
+
     /// `is_subtype` over the resolved world where both sides map; either
     /// side unmapped answers through [`NameTypeOps`] — today's name-level
     /// logic — so a `var`-inferred or unresolvable spelling keeps its
@@ -3312,6 +3398,38 @@ impl TypeOps for ResolvedTypeOps<'_> {
             return self
                 .factor_typed(from.non_null(), from_args, what, what_args, arena, names)
                 .make_nullable();
+        }
+        // Rule 3 of factorType (factor_type.dart:33-41): `FutureOr<R>`
+        // factors as `Future<R>` when `R <: what`, and as `R` when
+        // `Future<R> <: what`. The `Future<R>` remainder reuses the
+        // FutureOr node's own argument list, which is exactly `[R]`.
+        if let Base::Name(id) = from.base
+            && names.get(id as usize).is_some_and(|n| &**n == "FutureOr")
+            && let Some(&arg) = arena.get(from_args as usize).and_then(|a| a.first())
+        {
+            let inner = FlowTy {
+                base: arg.base,
+                nullable: arg.nullable,
+            };
+            let r = self.map_scrutinee(inner, arg.args, arena, names);
+            let future = names.iter().position(|n| &**n == "Future");
+            if self.system.is_subtype(r, w)
+                && let Some(future) = future
+            {
+                return FlowTy {
+                    base: Base::Name(future as u32),
+                    nullable: false,
+                };
+            }
+            if let Some(future) = future {
+                let future_ty = FlowTy {
+                    base: Base::Name(future as u32),
+                    nullable: false,
+                };
+                if self.system.is_subtype(self.map_scrutinee(future_ty, from_args, arena, names), w) {
+                    return inner;
+                }
+            }
         }
         from
     }
@@ -3637,7 +3755,7 @@ mod tests {
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
         let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
-        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let ops = ResolvedTypeOps::new(&library_types, &strings, file);
         let fold = fold_unit_with_ops(
             source,
             &scanned.tokens,
@@ -3711,7 +3829,7 @@ mod tests {
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
         let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib_main);
-        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let ops = ResolvedTypeOps::new(&library_types, &strings, main_file);
         let fold = fold_unit_with_ops(
             source,
             &scanned.tokens,
@@ -3920,7 +4038,7 @@ mod tests {
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
         let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib_main);
-        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let ops = ResolvedTypeOps::new(&library_types, &strings, main_file);
         let fold = fold_unit_with_ops(
             main_source,
             &scanned.tokens,
@@ -4005,7 +4123,7 @@ mod tests {
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
         let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib_main);
-        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let ops = ResolvedTypeOps::new(&library_types, &strings, main_file);
         let fold = fold_unit_with_ops(
             main_source,
             &scanned.tokens,
@@ -4150,7 +4268,7 @@ mod tests {
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
         let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
-        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let ops = ResolvedTypeOps::new(&library_types, &strings, file);
 
         // `names` is the recorder's table — ids index into it.
         let names: Vec<Box<str>> =
@@ -4267,7 +4385,7 @@ mod tests {
         let namespaces = Namespaces::build(&graph);
         let library_types =
             LibraryTypes::build(&graph, &namespaces, &index, &strings, lib_main);
-        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let ops = ResolvedTypeOps::new(&library_types, &strings, main_file);
         let fold = fold_unit_with_ops(
             main_source,
             &scanned.tokens,
@@ -4327,7 +4445,7 @@ mod tests {
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
         let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
-        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let ops = ResolvedTypeOps::new(&library_types, &strings, file);
 
         // `names` is the recorder's table — ids index into it.
         let names: Vec<Box<str>> = vec![
@@ -4550,7 +4668,7 @@ mod tests {
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
         let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
-        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let ops = ResolvedTypeOps::new(&library_types, &strings, file);
 
         // `names` is the recorder's table — ids index into it.
         let names: Vec<Box<str>> = vec!["List".into(), "int".into(), "num".into()];
@@ -4671,7 +4789,7 @@ mod tests {
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
         let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
-        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let ops = ResolvedTypeOps::new(&library_types, &strings, file);
 
         let names: Vec<Box<str>> = vec!["B".into(), "D".into()];
         let sup = Ty {
@@ -5231,7 +5349,7 @@ mod tests {
             lib,
             &clauses,
         );
-        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let ops = ResolvedTypeOps::new(&library_types, &strings, file);
 
         // `names` is the recorder's table — ids index into it.
         let names: Vec<Box<str>> = vec![
@@ -5326,7 +5444,7 @@ mod tests {
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
         let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
-        let ops = ResolvedTypeOps::new(&library_types, &strings);
+        let ops = ResolvedTypeOps::new(&library_types, &strings, file);
 
         let names: Vec<Box<str>> = vec!["A".into(), "S".into(), "num".into(), "int".into()];
         let arena: Vec<Vec<ArgTy>> = vec![

@@ -12,11 +12,16 @@ impl Engine<'_> {
     /// A pattern variable is about to bind `name`: remember the frame's
     /// current type for the spelling (the shadowed declaration, if any).
     pub(crate) fn note_pattern_shadow(&mut self, name: StringId) {
-        let prev = self
+        let (prev, was_local) = self
             .frames
             .last()
-            .and_then(|frame| frame.var_types.get(&name).copied());
-        self.pattern_shadows.push((name, prev));
+            .map_or((None, false), |frame| {
+                (
+                    frame.var_types.get(&name).copied(),
+                    frame.locals.contains(&name),
+                )
+            });
+        self.pattern_shadows.push((name, prev, was_local));
         // An open switch member records the same pair in its own scope:
         // the binder shadows only inside its member. A member whose head
         // never fired (`default:` bodies, switch-expression arms) opens
@@ -35,8 +40,8 @@ impl Engine<'_> {
             });
         }
         if let Some(top) = self.switch_arm_scopes.last_mut() {
-            if !top.shadows.iter().any(|(n, _)| *n == name) {
-                top.shadows.push((name, prev));
+            if !top.shadows.iter().any(|(n, _, _)| *n == name) {
+                top.shadows.push((name, prev, was_local));
             }
         }
     }
@@ -112,11 +117,11 @@ impl Engine<'_> {
         }
     }
 
-    fn restore_var_types(&mut self, shadows: &[(StringId, Option<Ty>)]) {
+    fn restore_var_types(&mut self, shadows: &[(StringId, Option<Ty>, bool)]) {
         let Some(frame) = self.frames.last_mut() else {
             return;
         };
-        for (name, prev) in shadows.iter().rev() {
+        for (name, prev, was_local) in shadows.iter().rev() {
             match prev {
                 Some(ty) => {
                     frame.var_types.insert(*name, *ty);
@@ -125,6 +130,14 @@ impl Engine<'_> {
                     frame.var_types.remove(name);
                 }
             }
+            // The flat locals set is untouched: `add_tracked_local` fires
+            // AFTER the shadow record (was_local=false), so a remove here
+            // would kill the binder's own legitimate entry — the R53
+            // undefined-identifier regressions. The recorded membership is
+            // kept for the scoped-locals follow-up (the F4 completion
+            // needs a locals push/pop paired with this restore, gated on
+            // evidence).
+            let _ = was_local;
         }
     }
 }

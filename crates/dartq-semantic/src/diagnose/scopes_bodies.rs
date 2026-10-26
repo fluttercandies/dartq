@@ -500,7 +500,12 @@ impl<'a> Engine<'a> {
                 // type-parameter posture keeps a generic key send
                 // (`m[keyOf(e)] ?? d`) from anchoring.
                 .filter(|lhs| !matches!(lhs.intent, Intent::Operator(..)))
+                // An unfolded index (`f()[k] ?? d`, a call-result receiver
+                // keeps its operand rows) leaves the KEY as the top row:
+                // the left operand is the `[]` read, never the key.
+                .filter(|lhs| !self.is_index_key_row(lhs))
                 .is_some_and(|lhs| self.coalesce_operand_never_null(lhs));
+        
         if !non_null {
             return;
         }
@@ -708,14 +713,18 @@ impl<'a> Engine<'a> {
     /// collection — their variables linger into the next declaration's
     /// window, where the count mismatch suppresses the bind (the
     /// under-report direction either way).
-    pub(crate) fn destructure_record(&mut self, init_start: u32, semi: u32) {
+    pub(crate) fn destructure_record(
+        &mut self,
+        init_start: u32,
+        semi: u32,
+    ) -> Vec<(StringId, SourceRange, Ty)> {
         let vars = std::mem::take(&mut self.pattern_bind_vars);
         let records = self.pattern_bind_records;
         let dirty = self.pattern_bind_dirty;
         self.pattern_bind_records = 0;
         self.pattern_bind_dirty = false;
         if dirty || records != 1 || vars.is_empty() {
-            return;
+            return Vec::new();
         }
         let mut inits = self
             .rows
@@ -727,23 +736,27 @@ impl<'a> Engine<'a> {
             })
             .cloned();
         let (Some(row), None) = (inits.next(), inits.next()) else {
-            return;
+            return Vec::new();
         };
         let Some(ty) = self.initializer_static_ty(&row) else {
-            return;
+            return Vec::new();
         };
         let Ty::Record { shape, .. } = ty else {
-            return;
+            return Vec::new();
         };
         let fields = self.boundary.pool().record_shape(shape).positional.to_vec();
         if fields.len() != vars.len() {
-            return;
+            return Vec::new();
         }
         if let Some(frame) = self.frames.last_mut() {
-            for (name, ty) in vars.iter().zip(fields) {
+            let mut staged: Vec<(StringId, SourceRange, Ty)> = Vec::new();
+            for ((name, span), ty) in vars.iter().zip(fields) {
                 frame.var_types.insert(*name, ty);
+                staged.push((*name, *span, ty));
             }
+            return staged;
         }
+        Vec::new()
     }
 
     /// Classifies a constant pattern whose events left no literal: a
@@ -826,6 +839,7 @@ impl<'a> Engine<'a> {
     /// official clause scope only under-reports undefined-name, the flat
     /// frame's documented direction.
     pub(crate) fn add_local(&mut self, name: StringId) {
+        
         if let Some(frame) = self.frames.last_mut() {
             frame.locals.insert(name);
         } else {
@@ -1004,6 +1018,15 @@ impl<'a> Engine<'a> {
             || capture.list_depth != self.formal_list_depth
         {
             return None;
+        }
+        // The formal's ident end joins the closure-formal index: a formal
+        // the callee inference never solves (the literal's callee receiver
+        // is itself unresolvable — `(x ?? const []).map((sub) => …)`)
+        // keeps every member chain rooted at it silent, and the
+        // extension-use re-attribution keys the end to re-credit the
+        // chain's reads (`sub.source.meta`'s `meta`).
+        if let Some(decl) = self.locals.last().filter(|decl| decl.name == name) {
+            self.closure_formal_names.insert(decl.name);
         }
         // The formal's schema entry: a positional formal pairs by
         // declaration order (the formals already bound in this frame ARE
@@ -2586,6 +2609,14 @@ impl<'a> Engine<'a> {
             && body_brace.is_none()
         {
             *body_brace = Some(brace);
+            // The ctor's OWN body brace ends the initializer window: only
+            // the ctor frame latches it (a closure above would swallow the
+            // note for its own brace — `frames.len()` equality rejects
+            // that, and a closure brace inside an initializer never opens
+            // the window early).
+            if self.ctor_pending.is_some() && self.frames.len() == self.ctor_frame_len {
+                self.ctor_body_open = true;
+            }
         }
     }
 
@@ -2700,6 +2731,7 @@ impl<'a> Engine<'a> {
         } else {
             *declared
         };
+        
         let code = match ret {
             // (b)'s top faces: each is its own `FutureOr` base.
             Ty::Unknown | Ty::Null | Ty::Dynamic | Ty::Void => return None,

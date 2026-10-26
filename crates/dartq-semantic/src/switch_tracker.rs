@@ -187,6 +187,15 @@ impl SwitchTracker {
             self.pattern_leaf(Restriction::Unknown);
             return;
         };
+        // A `dynamic(...)` object pattern's head is the nullable top: the
+        // pattern is the total catch-all (its space covers everything —
+        // `dynamic(:var runtimeType) => ...` closing interpreter.dart's
+        // `switch (value)` over `Object?`, the oracle's matched-by-everything
+        // arm). The head spelling decides; no member column is consulted.
+        if world.strings.resolve(ty) == "dynamic" {
+            self.pattern_leaf(Restriction::Named(world.object_id, true));
+            return;
+        }
         let covered = fields.iter().all(|field| match field.leaves.as_slice() {
             // A type-free sub-pattern (`var x`, `_`, the `:x` shorthand)
             // covers the whole column.

@@ -193,7 +193,7 @@ fn report_ops_with(source: &str, imports: &[RigImport<'_>]) -> FileReport {
         lib,
         &clauses,
     );
-    let ops = ResolvedTypeOps::new(&types, &strings);
+    let ops = ResolvedTypeOps::new(&types, &strings, file);
     let fold = fold_unit_with_ops(
         source,
         &scanned.tokens,

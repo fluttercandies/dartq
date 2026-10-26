@@ -1383,7 +1383,7 @@ pub(crate) struct PendingInitVariable {
 pub(crate) struct SwitchArmScope {
     pub(crate) depth: usize,
     pub(crate) head_done: bool,
-    pub(crate) shadows: Vec<(StringId, Option<Ty>)>,
+    pub(crate) shadows: Vec<(StringId, Option<Ty>, bool)>,
 }
 
 /// F-C: a folded `super.`-selector candidate in the open
@@ -1923,6 +1923,16 @@ pub(crate) struct Engine<'a> {
     /// Formal-parameter lists open around the current one (1 = the
     /// executable's own list; 2+ = a function-typed formal's nested list).
     pub(crate) formal_list_depth: u32,
+    /// Open `Function(...)` type formal lists: their parameter names are
+    /// type-level spellings, never locals of the enclosing body.
+    pub(crate) fn_type_formal_lists: u32,
+    /// The open constructor's `this.x` formal names: in scope through the
+    /// initializer list only — the body block reads the FIELD (the
+    /// initializing-formal scope ends at the body).
+    pub(crate) this_formal_names: Vec<(StringId, usize)>,
+    /// Row-stack marks of the open switch EXPRESSIONS (LIFO): the closed
+    /// expression folds its window into one opaque value row.
+    pub(crate) switch_expr_marks: Vec<usize>,
     /// The open constructor's `super.x` formals awaiting the
     /// initializer-list's super-invocation target — association is a
     /// resolution product (upstream Dart SDK source,
@@ -2093,6 +2103,13 @@ pub(crate) struct Engine<'a> {
     /// element model cannot see (a variable's function-type annotation
     /// poisons the declared-type slot).
     pub(crate) fn_var_sigs: FxHashMap<StringId, Box<FnVarSig>>,
+    /// The fn_var_sigs subset claimed at FORMAL declarations only (a
+    /// parameter whose written annotation is a function type): the arity
+    /// gate reads this table to count a shadowed local's call against its
+    /// own written signature without opening the stale-stash attribution
+    /// the general table carries (a local function's same-spelled entry
+    /// must never lend formals).
+    pub(crate) fn_param_sigs: FxHashMap<StringId, Box<FnVarSig>>,
     /// The written generic-function-type signatures of formals, keyed by
     /// declaring executable spelling (`void useNum(void Function(num) f)`
     /// → `useNum`). The argument check reads them for the
@@ -2120,6 +2137,10 @@ pub(crate) struct Engine<'a> {
     pub(crate) fn_formal_named_section: bool,
     /// The open written function-type captures (nested annotations stack).
     pub(crate) fn_type_capture: Vec<FnTypeCapture>,
+    /// The last inner function-type close left the enclosing capture
+    /// unclaimed (recovery poison face, read once by the next
+    /// `fn_capture_begin` over an open capture).
+    pub(crate) fn_nested_unclaimed: bool,
     /// The last completed written signature, claimed by the next variable
     /// group's names and dropped at every declaration boundary in between.
     pub(crate) fn_type_stash: Option<Box<FnVarSig>>,
@@ -2195,10 +2216,10 @@ pub(crate) struct Engine<'a> {
     /// The frame types the current `if` condition's pattern variables
     /// shadowed (name, previous type) — the statement's case scope
     /// ([`super::pattern_scope`]).
-    pub(crate) pattern_shadows: Vec<(StringId, Option<Ty>)>,
+    pub(crate) pattern_shadows: Vec<(StringId, Option<Ty>, bool)>,
     /// The open `if` statements' case scopes, innermost last; restored
     /// when the then statement ends.
-    pub(crate) if_case_scopes: Vec<Vec<(StringId, Option<Ty>)>>,
+    pub(crate) if_case_scopes: Vec<Vec<(StringId, Option<Ty>, bool)>>,
     /// The open switch members' case scopes, innermost last (the arm
     /// counterpart of [`Self::if_case_scopes`]): a `case Sub x:` binder
     /// shadows only inside its own member — later members' reads of the
@@ -2467,6 +2488,11 @@ pub(crate) struct Engine<'a> {
     /// `invocation_of_non_function` row defers and re-decides on the
     /// flow face there.
     pub(crate) deferred_invocation_faces: Vec<(SourceRange, StringId)>,
+    /// Implicit-call initializers (`var f = promotedLocal(args)`): the
+    /// callee's promoted read re-decides the send's result in pass 2 —
+    /// the entry keys the declaring local's name-token offset, the
+    /// callee's own row span, and the parse-time face.
+    pub(crate) deferred_call_rebinds: Vec<(u32, SourceRange, Ty)>,
     /// The names a deferred re-bind actually retyped (#2539): the
     /// receiver re-decision consults the frame's var-types for these
     /// names when the flow read face carries no promotion — the local's
@@ -2501,6 +2527,11 @@ pub(crate) struct Engine<'a> {
     /// row's offset too (the merge's hit move), so identity questions key
     /// on the receiver read's own span here and on the member row there.
     pub(crate) local_decl_at_read: FxHashMap<u32, u32>,
+    /// Bare reads whose push-time scope lookup landed on a local, a type
+    /// parameter, or a member of the enclosing container: a same-spelled
+    /// top-level declaration is shadowed there, so its faces (the
+    /// `@useResult` discard check, the tear-off signature) never apply.
+    pub(crate) shadowed_bare_rows: FxHashSet<u32>,
     /// The flow-blind locals' initializer rows: each UNANNOTATED local
     /// declaration's name-token offset to its initializer expression's row
     /// offset (`for_in` marks a loop variable whose type is the
@@ -2516,6 +2547,12 @@ pub(crate) struct Engine<'a> {
     /// the same table the receiver faces read), so the immutable
     /// expression walk and the staging interleave.
     pub(crate) init_derived_types: std::cell::RefCell<FxHashMap<u32, Ty>>,
+    /// The flow-blind locals whose initializer types as the oracle's
+    /// `InvalidType` — a member chain rooted in a receiver whose head
+    /// resolves to no declaration (`var at = node.operator.offset` with
+    /// `operator`'s type undefined). Keyed like [`Self::init_derived_types`];
+    /// the numeric refinement reads such a local as an invalid operand.
+    pub(crate) invalid_init_locals: std::cell::RefCell<FxHashSet<u32>>,
     /// The fold's twin of [`Engine::local_decl_at_read`]: each member
     /// row's offset to the receiver read's local declaration offset. The
     /// receiver re-bind fallback keys it (the receiver read's own span is
@@ -2542,7 +2579,7 @@ pub(crate) struct Engine<'a> {
     /// the whole pattern is one flat record. A variable already carrying a
     /// written type (`final (int a, b)`) never enters the list — its own
     /// bind runs at declaration.
-    pub(crate) pattern_bind_vars: Vec<StringId>,
+    pub(crate) pattern_bind_vars: Vec<(StringId, SourceRange)>,
     /// The record-pattern closes observed inside the in-flight pattern
     /// declaration (a flat `(a, b)` closes exactly once; nesting closes
     /// more). Any other shape marks the window non-record.
@@ -2562,6 +2599,21 @@ pub(crate) struct Engine<'a> {
     /// The latch carries the wrapped variable's name so a stale latch from
     /// another sub-pattern never projects an unrelated field's binder.
     pub(crate) pending_pattern_null_check: Option<StringId>,
+    /// The most recent object-pattern head inside a case/if-case pattern
+    /// window (`AsyncData()`): the head types a type-free binder on the
+    /// RIGHT operand of a logical-and (`AsyncData() && final transformer`
+    /// binds `transformer` to `AsyncData` — the oracle's matched-type
+    /// binding for the and-pattern's variable). Latched at the object
+    /// pattern's close, consumed by the first type-free declared-variable
+    /// pattern in a binary-and frame.
+    pub(crate) last_case_object_head: Option<StringId>,
+    /// Type-free variable binders a null-check pattern wrapped
+    /// (`case final transformer?` over a member-chain scrutinee): their
+    /// face is the matched type's non-null projection — the scrutinee's
+    /// own static type — applied at the root pattern's close unless the
+    /// object-pattern field path claims the binder first (`:final x?`
+    /// binds from the property face, never the scrutinee).
+    pub(crate) null_check_binder_candidates: Vec<(StringId, SourceRange)>,
     /// Object-pattern field reads awaiting the file-tail verdict
     /// (`resolveObjectPatternPropertyGet`, type_analyzer.dart:1669-1715):
     /// `(head type, getter, anchor)`.
@@ -2639,6 +2691,15 @@ pub(crate) struct Engine<'a> {
     /// re-decision latch keys every section on it — the flow's promotion
     /// of the target read answers the receiver verdict.
     pub(crate) cascade_target_spans: Vec<SourceRange>,
+    /// The parser reopens a cascade for each `..` section after the
+    /// first one's assignment (`t..a = x..b = y` parses `..b` as a fresh
+    /// cascade whose "target" row is `x`). The last closed cascade's
+    /// `(operator offset, target span)` lets a directly following section
+    /// inherit the real target span instead.
+    pub(crate) cascade_last: Option<(u32, SourceRange)>,
+    /// The open cascades' `(operator offset, target span)` pairs, moved to
+    /// [`Self::cascade_last`] at their close.
+    pub(crate) cascade_open: Vec<(u32, SourceRange)>,
     /// A null-aware RECORD-field read (`result?.read` on
     /// `({M read, …})?`): the record arm bakes the shorted `?` into the
     /// row's stored face (its consumers read the written nullable), so
@@ -2856,8 +2917,12 @@ pub(crate) struct Engine<'a> {
     /// operand is the declared nullable/dynamic shape): `(read span, bang
     /// span)` re-decided at teardown against the flow's promoted type —
     /// the promoted-Never read after an earlier assertion makes the `!`
-    /// dead (`unnecessary_non_null_assertion`).
-    pub(crate) null_assert_staged: Vec<(SourceRange, SourceRange)>,
+    /// dead (`unnecessary_non_null_assertion`). The third slot snapshots
+    /// the in-scope type parameters that are potentially nullable at the
+    /// `!` (no bound, or a nullable bound): a read promoted to such a
+    /// parameter type (`E? item` reassigned from an `E` call) keeps the
+    /// assertion live, and the scope is torn down by the flush.
+    pub(crate) null_assert_staged: Vec<(SourceRange, SourceRange, Box<[StringId]>)>,
     /// Null-aware access/index over a local's read whose walk-time type is
     /// nullable: `(read span, operator span, kind)` re-decided at teardown
     /// against the promoted receiver type (`_checkForUnnecessaryNullAware`'s
@@ -2907,6 +2972,20 @@ pub(crate) struct Engine<'a> {
     /// `unused_element` (manifest_item.dart's extension `write` family,
     /// whose only uses ride inferred formals).
     pub(crate) inferred_recv_used_members: FxHashSet<StringId>,
+    /// The spellings of closure-formal parameters
+    /// ([`Engine::closure_param_context_ty`] records each): a formal the
+    /// callee inference never solved still roots an oracle-resolved member
+    /// chain, and the extension-use re-attribution walks `sub.source.meta`
+    /// chains off a receiver identifier spelled like one of these to
+    /// re-credit the reads the silent walk never attributed
+    /// (`devtool.dart`'s `map((sub) => sub.source.meta)`).
+    pub(crate) closure_formal_names: FxHashSet<StringId>,
+    /// Member rows that resolved with an `Unknown` receiver, recorded at
+    /// resolution time (the rows table is emptied before finalization):
+    /// `(name-ident offset, name)`. The extension-use re-attribution's
+    /// closure-formal-chain arm reads them — the chains the merged-read
+    /// record never captured (`sub.impl` after an untyped-call local).
+    pub(crate) unresolved_member_rows: Vec<(u32, StringId)>,
     /// Member rows that resolved through a nullable-applicable extension
     /// face on a nullable receiver ([`Engine::member_defined`]'s safe
     /// `Single` verdict): the access needs no null check and the member's
@@ -3038,6 +3117,15 @@ pub(crate) struct Engine<'a> {
     /// provisional (their optional parameters stay out of the
     /// `unused_element_parameter` face).
     pub(crate) ctor_pending: Option<(StringId, Option<usize>)>,
+    /// The constructor's own executable-frame depth (`frames.len()` right
+    /// after `push_executable_frame`) plus whether that frame's body brace
+    /// has been noted. `this`/`super` legality asks "lexically between the
+    /// initializer `:` and the body `{`" — a braceless closure opened in
+    /// the body has no `body_brace` of its own, so the ctor's own latch,
+    /// not the innermost frame's, answers (the R53 ctor-body `this` face:
+    /// `_state = AsyncResult.guard(() => initState(this))`).
+    pub(crate) ctor_body_open: bool,
+    pub(crate) ctor_frame_len: usize,
     /// The top-level function declaration site awaiting its setter
     /// spelling fix-up at `end_top_level_method`.
     pub(crate) open_toplevel_site: Option<usize>,
@@ -4249,6 +4337,15 @@ pub(crate) struct FoldHierarchy<'a> {
     pub(crate) lib: LibraryId,
     pub(crate) memo: RefCell<FxHashMap<(FileId, StringId), ClassModifiers>>,
     pub(crate) in_progress: RefCell<FxHashSet<(FileId, StringId)>>,
+    /// The clause-face alias fold (`with ListMixin<E>` — SDK 3.47 spells
+    /// `typedef ListMixin<E> = ListBase<E>`; the application's real face is
+    /// ListBase): supplied by the engine-backed constructors so the
+    /// supertype walk crosses alias-written clause faces exactly like
+    /// [`crate::diagnose::Engine::resolve_clause_face`] does. `None` keeps
+    /// the bare-world rigs on the direct resolution alone.
+    #[expect(clippy::type_complexity)]
+    pub(crate) alias_head:
+        Option<&'a dyn Fn(StringId, FileId, LibraryId) -> Option<(FileId, StringId)>>,
 }
 
 /// One resolved super handle: the declaring file with the container name.
@@ -4346,6 +4443,10 @@ impl FoldHierarchy<'_> {
                 name,
             )
             .map(|(_, owner)| (owner, name))
+            .or_else(|| {
+                self.alias_head
+                    .and_then(|fold| fold(name, owner_file, scope_lib))
+            })
         };
         (
             container.superclass.and_then(&hop),

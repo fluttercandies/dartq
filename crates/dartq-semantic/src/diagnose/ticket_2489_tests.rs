@@ -75,7 +75,7 @@ fn report_ops(source: &str) -> FileReport {
     let graph = builder.finish();
     let namespaces = Namespaces::build(&graph);
     let types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
-    let ops = ResolvedTypeOps::new(&types, &strings);
+    let ops = ResolvedTypeOps::new(&types, &strings, file);
     let fold = fold_unit_with_ops(
         source,
         &scanned.tokens,
