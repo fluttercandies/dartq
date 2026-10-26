@@ -154,7 +154,12 @@ pub struct RefHit<'a> {
 }
 
 /// Answers a by-name symbol query over the maintained index state (module
-/// docs for the freshness and cost contracts).
+/// docs for the freshness and cost contracts). The declaration surface
+/// spans two tiers — the resident workspace captures and the dependency
+/// interface units' captures ([`crate::deps`]) — with residency winning a
+/// file both hold; reference rows resolve against the union, so a use in
+/// the workspace whose declaration sits in a lazily indexed dependency
+/// keeps its target (the rename face's cross-package refusal contract).
 pub(crate) fn symbols<'a>(state: &'a EngineState, name: &str) -> SymbolAnswer<'a> {
     // The queried name interns once; every lookup below runs on the id.
     let id = state.strings.intern(name);
@@ -162,8 +167,11 @@ pub(crate) fn symbols<'a>(state: &'a EngineState, name: &str) -> SymbolAnswer<'a
     // Declaration rows through the decl directory: one hash probe names the
     // declaring files (ascending — the arena slot order the scan served),
     // and each file's equal-name run comes off its own capture,
-    // offset-ascending.
-    let decls: Vec<DeclHit<'a>> = state
+    // offset-ascending. Both tiers join — the resident captures first,
+    // then the dependency units' captures through the dep tier's own
+    // postings — and the merged list re-sorts by file so the ascending
+    // order holds across tiers.
+    let mut decls: Vec<DeclHit<'a>> = state
         .decl_postings
         .units(id)
         .iter()
@@ -185,6 +193,31 @@ pub(crate) fn symbols<'a>(state: &'a EngineState, name: &str) -> SymbolAnswer<'a
         })
         .flatten()
         .collect();
+    decls.extend(
+        state
+            .deps
+            .decl_postings
+            .units(id)
+            .iter()
+            .copied()
+            .filter_map(|file| {
+                let capture = &state.deps.units.get(&file)?.capture;
+                let rows = capture.index.by_name(id)?;
+                Some(rows.iter().map(move |decl| DeclHit {
+                    file,
+                    kind: decl.kind,
+                    name: state.strings.resolve(decl.name),
+                    container: (decl.container != DeclRow::NONE).then(|| {
+                        state
+                            .strings
+                            .resolve(capture.index.row(decl.container).name)
+                    }),
+                    range: decl.range,
+                }))
+            })
+            .flatten(),
+    );
+    decls.sort_by_key(|hit| hit.file);
 
     // Reference rows through the ref directory, the name-keyed face of
     // each library's surface, and the exact-target filter: the directory
@@ -199,7 +232,12 @@ pub(crate) fn symbols<'a>(state: &'a EngineState, name: &str) -> SymbolAnswer<'a
     // stable target sort restores the contract order — target-major,
     // then library, then (use file, offset) — byte-identical to the
     // nested loop this join retired.
-    let declaring: FxHashSet<FileId> = state.decl_postings.units(id).iter().copied().collect();
+    let mut declaring: FxHashSet<FileId> = state.decl_postings.units(id).iter().copied().collect();
+    // The dependency declarations join the declaring set: a workspace use
+    // whose target sits in the interface tier keeps its run (the filter
+    // below would otherwise drop the very rows the cross-package faces —
+    // rename's refusal, goto-def — resolve through).
+    declaring.extend(state.deps.decl_postings.units(id).iter().copied());
     let mut refs: Vec<RefHit<'a>> = state
         .ref_postings
         .units(id)
@@ -420,7 +458,12 @@ fn subtype_closure(
 /// answer before the deterministic `(file, offset)` sort.
 pub(crate) fn callers<'a>(state: &'a EngineState, name: &str) -> Vec<DeclHit<'a>> {
     let id = state.strings.intern(name);
-    let declaring: FxHashSet<FileId> = state.decl_postings.units(id).iter().copied().collect();
+    let mut declaring: FxHashSet<FileId> = state.decl_postings.units(id).iter().copied().collect();
+    // The dependency declarations join the declaring set: a workspace use
+    // whose target sits in the interface tier keeps its run (the filter
+    // below would otherwise drop the very rows the cross-package faces —
+    // rename's refusal, goto-def — resolve through).
+    declaring.extend(state.deps.decl_postings.units(id).iter().copied());
 
     // The invocation sites resolving to the queried name and targeting one
     // of its declarations, file-major (a file belongs to one library, so
@@ -880,10 +923,16 @@ pub(crate) fn resolve_at(
     // The target's declaration row: a resolved target is always a library
     // face of the target file (the namespace declarer and the local hop
     // both admit library faces only), so the name run's first face row is
-    // the resolution's target — the span the cursor faces jump to. A phase
-    // disagreement (the resolution outran the target's capture or its
-    // declaring rows) answers `None` — not found, never a panic.
-    let target = state.capture(row.target_file)?;
+    // the resolution's target — the span the cursor faces jump to. The
+    // capture reads residency first, then the dependency interface tier
+    // (a use whose declaration sits in a lazily indexed dep file names its
+    // target exactly like a same-package one — the cross-package rename
+    // face's substrate). A phase disagreement (the resolution outran the
+    // target's capture or its declaring rows) answers `None` — not found,
+    // never a panic.
+    let target = state
+        .capture(row.target_file)
+        .or_else(|| state.deps.units.get(&row.target_file).map(|unit| &unit.capture))?;
     let decl = target
         .index
         .by_name(row.target_name)

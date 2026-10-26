@@ -112,7 +112,7 @@ fn load_sdk_file(state: &mut EngineState, file: FileId) -> Option<Arc<UnitFacts>
     let text = SourceText::canonical(&bytes);
     let content = state.store.put_text(&text);
     let version = state.sdk.language_metadata;
-    let (facts, _capture, scanned) = l1::compute_unit(
+    let (facts, capture, scanned) = l1::compute_unit(
         file,
         content,
         text.as_str(),
@@ -130,10 +130,11 @@ fn load_sdk_file(state: &mut EngineState, file: FileId) -> Option<Arc<UnitFacts>
         })
         .collect();
     let facts = Arc::new(facts);
-    state.deps.units.insert(
+    state.deps.insert(
         file,
         DepUnit {
             facts: Arc::clone(&facts),
+            capture: Arc::new(capture.without_sites()),
             version: scanned.version,
             targets: targets.into_boxed_slice(),
         },

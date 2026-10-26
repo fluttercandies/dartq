@@ -1522,14 +1522,16 @@ impl Engine {
     }
 
     /// Exact byte footprint of the two postings directories (name →
-    /// declaring files, name → libraries with resolved uses) — the S2
-    /// extension the RSS decomposition probe pins: hash slots at capacity
-    /// plus the unit lists' reserved bytes
-    /// ([`dartq_index::Postings::bytes`]).
+    /// declaring files, name → libraries with resolved uses) plus the
+    /// dependency tier's declaration directory — the S2 extension the RSS
+    /// decomposition probe pins: hash slots at capacity plus each live
+    /// row's reserved bytes ([`dartq_index::Postings::bytes`]).
     #[doc(hidden)]
     #[must_use]
     pub fn postings_bytes(&self) -> u64 {
-        (self.state.decl_postings.bytes() + self.state.ref_postings.bytes()) as u64
+        (self.state.decl_postings.bytes()
+            + self.state.ref_postings.bytes()
+            + self.state.deps.decl_postings.bytes()) as u64
     }
 
     /// The library owning `file` (defining or part), if resident.

@@ -599,6 +599,84 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The cross-package refusal substrate (#2597): a use in the workspace
+    /// whose declaration sits in an out-of-tree path dependency still
+    /// resolves — the dependency tier's declaration surface backs the
+    /// target — so the plan carries the dependency's declaration edit
+    /// beside the workspace use, and [`outside_workspace`] names the
+    /// dependency file (the `--write` refusal contract: find the use,
+    /// refuse the write, name the reason).
+    #[test]
+    fn rename_finds_a_cross_package_declaration_outside_the_bound() {
+        let root = workspace("rename_cross_pkg", &[("lib/main.dart", "import 'package:dep/extra.dart';\n\nint main() => extra();\n")]);
+        // The out-of-tree path dependency: a sibling package the config
+        // lists (the fvm/flutter and pub-cache shape), outside the
+        // workspace bound discovery walks.
+        let dep = root.parent().expect("temp parent").join(format!(
+            "dq_cmd_rename_cross_pkg_dep_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dep);
+        std::fs::create_dir_all(dep.join("lib")).expect("dep lib");
+        std::fs::write(dep.join("pubspec.yaml"), "name: dep\n").expect("dep pubspec");
+        std::fs::write(dep.join("lib/extra.dart"), "int extra() => 1;\n").expect("dep file");
+        // Canonicalize before the config names it (the engine's spelling
+        // universe — macOS `/var` vs `/private/var`).
+        let dep = dep.canonicalize().expect("dep root resolves");
+        std::fs::write(
+            root.join(".dart_tool/package_config.json"),
+            format!(
+                concat!(
+                    r#"{{"configVersion": 2, "packages": [{{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}}, "#,
+                    r#"{{"name": "dep", "rootUri": "{}", "packageUri": "lib/", "languageVersion": "3.5"}}], "generator": "pub"}}"#
+                ),
+                dep.to_string_lossy().replace('\\', "\\\\").replace('\"', "\\\"")
+            ),
+        )
+        .expect("config");
+
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let main = canonical(&root, "lib/main.dart");
+        let extra = dep.join("lib/extra.dart");
+        // The gate's workspace spelling is canonical (the engine's file
+        // table interns canonical paths; the fixture helper returns the
+        // raw temp spelling).
+        let bound = root.canonicalize().expect("canonical root");
+
+        let run = rename(
+            &mut engine,
+            &main,
+            Anchor::LineCol { line: 3, column: 15 },
+            "zulu",
+        )
+        .expect("rename");
+        let target = run
+            .target
+            .as_ref()
+            .expect("the use resolves through the dependency tier");
+        assert_eq!(target.name, "extra");
+        assert_eq!(run.layout.file_path(target.file), extra);
+        // The edit set: the workspace use and the dependency's declaration
+        // row, path-major (this layout's root sorts before its sibling).
+        assert_eq!(
+            edit_files(&run),
+            vec![main.to_string_lossy(), extra.to_string_lossy()]
+        );
+        // The write gate names the dependency file — the refusal's reason.
+        assert_eq!(
+            outside_workspace(
+                run.edits
+                    .iter()
+                    .map(|edit| run.layout.file_path(edit.file)),
+                &bound
+            ),
+            Some(extra.as_path())
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&dep).ok();
+    }
+
     /// The new-name gate: legal identifiers pass, and reserved words fail
     /// while built-in and pseudo keywords stay legal — the scanner's own
     /// classification, pinned at its rename consumption point; the gate

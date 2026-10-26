@@ -47,6 +47,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use dartq_index::{FileCapture, Postings, distinct_decl_names};
 use dartq_language::LanguageVersion;
 use dartq_resolution::{DirectiveKind as UriDirectiveKind, ResolvedTarget, UriResolver};
 use dartq_source::{FileId, SourceText};
@@ -56,21 +57,27 @@ use crate::l1;
 use crate::state::{DirectiveKind, EngineState, UnitFacts};
 
 /// The total dependency-file cap per engine. Each cached unit is one dep
-/// file's interface face (element model + directives + resolved targets +
-/// line index) plus its bytes in the content store — the closure of a
-/// real application (a Flutter widget tree's interface closure runs to
-/// a couple of thousand files) fits with headroom while the cap keeps the
-/// layer a bounded slice of memory however wide the import graph is.
+/// file's interface face (element model + declaration surface + directives +
+/// resolved targets + line index) plus its bytes in the content store — the
+/// closure of a real application (a Flutter widget tree's interface closure
+/// runs to a couple of thousand files) fits with headroom while the cap
+/// keeps the layer a bounded slice of memory however wide the import graph
+/// is.
 pub(crate) const DEP_FILE_CAP: usize = 4096;
 
 /// One indexed dependency file: the interface facts (its diagnostics are
-/// dead weight — the file is never an engine library and never folds),
-/// the settled language version (the clause-tree capture's re-scan key),
-/// and the resolved target per directive (index-aligned with
-/// [`UnitFacts::directives`]) the graph build maps onto
-/// SDK/dep/workspace nodes.
+/// dead weight — the file is never an engine library and never folds), the
+/// sites-shed declaration capture (the [`FileCapture::without_sites`]
+/// twin: the name/kind/span rows the query joins resolve cross-package
+/// targets against — `rename` on a use whose declaration sits in the
+/// dependency must find the declaration to name its edit, and a
+/// `query symbol` must list it), the settled language version (the
+/// clause-tree capture's re-scan key), and the resolved target per
+/// directive (index-aligned with [`UnitFacts::directives`]) the graph
+/// build maps onto SDK/dep/workspace nodes.
 pub(crate) struct DepUnit {
     pub facts: Arc<UnitFacts>,
+    pub capture: Arc<FileCapture>,
     pub version: LanguageVersion,
     pub targets: Box<[ResolvedTarget]>,
 }
@@ -82,6 +89,11 @@ pub(crate) struct DepUnit {
 pub(crate) struct DepIndex {
     /// The indexed units by interned canonical path.
     pub units: FxHashMap<FileId, DepUnit>,
+    /// The declaration-name directory over the units' captures — the dep
+    /// tier's twin of the resident `decl_postings`, keyed and consulted the
+    /// same way (name → declaring files). Entries unlist when a unit leaves
+    /// the index (the residency-wins retain), so the map stays exact.
+    pub decl_postings: Postings<FileId>,
     /// Debug counter: unreadable or missing dep files.
     pub load_failures: u64,
     /// The one-shot stderr note's tripwire for cap overflows.
@@ -92,6 +104,28 @@ pub(crate) struct DepIndex {
     pub sdk_libraries: FxHashMap<String, Vec<FileId>>,
     /// How many of `units` are SDK files — exempt from [`DEP_FILE_CAP`].
     pub sdk_file_count: usize,
+}
+
+impl DepIndex {
+    /// Registers a loaded unit: the unit under its file, the declaration
+    /// names into the postings. The single insert seam both loaders share
+    /// (the pub-cache closure and the SDK sources).
+    pub(crate) fn insert(&mut self, file: FileId, unit: DepUnit) {
+        for name in distinct_decl_names(&unit.capture.index) {
+            self.decl_postings.list(name, file);
+        }
+        self.units.insert(file, unit);
+    }
+
+    /// Removes a unit that residency superseded (a file the caller later
+    /// fed as content), unlisting its declaration names with it.
+    fn remove(&mut self, file: FileId) -> Option<DepUnit> {
+        let unit = self.units.remove(&file)?;
+        for name in distinct_decl_names(&unit.capture.index) {
+            self.decl_postings.unlist(name, file);
+        }
+        Some(unit)
+    }
 }
 
 /// Seeds and drains the dependency closure for the current live libraries.
@@ -106,11 +140,18 @@ pub(crate) fn load_dep_closure(state: &mut EngineState) {
     }
     // Residency wins: a dep file the caller later fed as content (a daemon
     // opening a pub-cache path) left the dep face — its stale cached unit
-    // would double-register the file's graph node.
-    state
+    // would double-register the file's graph node. The eviction unlists the
+    // declaration names with the unit, keeping the postings exact.
+    let evicted: Vec<FileId> = state
         .deps
         .units
-        .retain(|file, _| !state.residency.contains_key(file));
+        .keys()
+        .filter(|file| state.residency.contains_key(file))
+        .copied()
+        .collect();
+    for file in evicted {
+        state.deps.remove(file);
+    }
     crate::sdk_units::load_sdk_units(state);
     let mut queue: Vec<FileId> = Vec::new();
     for library in state.libraries.live() {
@@ -203,7 +244,7 @@ fn load_dep_unit(state: &mut EngineState, file: FileId) -> Vec<FileId> {
     let text = SourceText::canonical(&bytes);
     let content = state.store.put_text(&text);
     let version = l1::language_version_for(&state.packages, &state.files, file);
-    let (facts, _capture, scanned) = l1::compute_unit(
+    let (facts, capture, scanned) = l1::compute_unit(
         file,
         content,
         text.as_str(),
@@ -252,10 +293,11 @@ fn load_dep_unit(state: &mut EngineState, file: FileId) -> Vec<FileId> {
         }
         next.push(dependency);
     }
-    state.deps.units.insert(
+    state.deps.insert(
         file,
         DepUnit {
             facts,
+            capture: Arc::new(capture.without_sites()),
             version: scanned.version,
             targets: targets.into_boxed_slice(),
         },
