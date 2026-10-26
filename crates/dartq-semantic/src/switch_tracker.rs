@@ -196,30 +196,71 @@ impl SwitchTracker {
             self.pattern_leaf(Restriction::Named(world.object_id, true));
             return;
         }
-        let covered = fields.iter().all(|field| match field.leaves.as_slice() {
-            // A type-free sub-pattern (`var x`, `_`, the `:x` shorthand)
-            // covers the whole column.
-            [] => true,
-            // A conjunctive residual is not one name-level row.
-            [leaf] => match field.name {
-                Some(name) => {
-                    let Restriction::Named(lt, ln) = leaf else {
-                        return false;
+        // The per-field constraints the name level can express: a leaf that
+        // covers its whole column (or the type-free `var x`/`_`) contributes
+        // nothing, a `null` leaf or a refining type-test leaf rides the
+        // single's property sub-space, and anything else (a conjunctive
+        // residual, a positional field's constraining leaf — the member
+        // table keeps no declaration order) degrades the pattern to the
+        // unknown space, the pre-existing under-report posture.
+        let mut carried: Vec<(StringId, Restriction)> = Vec::new();
+        let mut expressible = true;
+        for field in fields {
+            match field.leaves.as_slice() {
+                // A type-free sub-pattern (`var x`, `_`, the `:x` shorthand)
+                // covers the whole column.
+                [] => {}
+                [leaf] => {
+                    let Some(name) = field.name else {
+                        expressible = false;
+                        break;
                     };
-                    world.member_column(ty, name).is_some_and(|column| {
-                        world.is_subtype_of(&column, &NameTy::Named(*lt, *ln))
-                    })
+                    let Some(column) = world.member_column(ty, name) else {
+                        expressible = false;
+                        break;
+                    };
+                    match leaf {
+                        Restriction::Null => carried.push((name, Restriction::Null)),
+                        Restriction::Named(lt, ln) if field.binder_non_null => {
+                            // The null-check binder's leaf names the
+                            // SCRUTINEE (the root face the `?` handler
+                            // builds from the switch context); the field's
+                            // constraint is its OWN column's non-null
+                            // projection (`createNullCheckSpace` over the
+                            // property's static type).
+                            match column {
+                                NameTy::Named(column_name, _) => {
+                                    carried.push((name, Restriction::Named(column_name, false)));
+                                }
+                                _ => {
+                                    expressible = false;
+                                    break;
+                                }
+                            }
+                        }
+                        Restriction::Named(lt, ln) => {
+                            if !world.is_subtype_of(&column, &NameTy::Named(*lt, *ln)) {
+                                carried.push((name, leaf.clone()));
+                            }
+                        }
+                        _ => {
+                            expressible = false;
+                            break;
+                        }
+                    }
                 }
-                // Positional fields: the member table keeps no declaration
-                // order, so a constraining leaf is unattributable.
-                None => false,
-            },
-            _ => false,
-        });
-        let leaf = if covered {
+                _ => {
+                    expressible = false;
+                    break;
+                }
+            }
+        }
+        let leaf = if !expressible {
+            Restriction::Unknown
+        } else if carried.is_empty() {
             Restriction::Named(ty, false)
         } else {
-            Restriction::Unknown
+            Restriction::Object(ty, carried)
         };
         self.pattern_leaf(leaf);
     }
@@ -282,6 +323,11 @@ pub(crate) fn restriction_disjoint_from(
         // the engine under-reports instead of mis-answering.
         Restriction::Unknown | Restriction::NamedContext => false,
         Restriction::Null => !world.can_be_subtype_of(&NameTy::Null, &matched),
+        // The object pattern's head test decides the overlap; the property
+        // refinements only narrow the case's own space.
+        Restriction::Object(name, _) => {
+            !world.can_be_subtype_of(&NameTy::Named(*name, false), &matched)
+        }
         Restriction::Named(name, nullable) => {
             !world.can_be_subtype_of(&NameTy::Named(*name, *nullable), &matched)
         }
@@ -494,6 +540,15 @@ pub(crate) enum Restriction {
     /// The type-free coverage (`var x`, `_`): substituted with the
     /// scrutinee's context type when the case closes.
     NamedContext,
+    /// An object pattern's head with its per-field REFINING sub-restrictions
+    /// (`A(d: null)`, `A(:final e?)`): each carried field lowers into the
+    /// single's property sub-space, so a null-split pair of cases over one
+    /// head covers it exactly (the official `convertObjectPattern`'s field
+    /// columns, space_builder.dart:146-176). A field whose leaf covers its
+    /// whole column contributes nothing; a constraint the name level cannot
+    /// express degrades the whole pattern to [`Restriction::Unknown`] at
+    /// the close.
+    Object(StringId, Vec<(StringId, Restriction)>),
     /// The unknown space: relational patterns, list/map patterns, and
     /// constants the name level cannot represent. Never must-matches, so
     /// the engine under-reports instead of mis-answering.
@@ -559,6 +614,18 @@ fn collect_singles(
         }
         // Substituted before the case is recorded; unreachable here.
         Restriction::NamedContext => out.push(Single::full(context)),
+        Restriction::Object(name, fields) => {
+            let head = NameTy::Named(*name, false);
+            let mut props = Vec::with_capacity(fields.len());
+            for (field, rest) in fields {
+                let mut singles = Vec::new();
+                collect_singles(world, rest, world.unknown(), &mut singles);
+                let key = Key::Name(world.strings.resolve(*field).to_string());
+                let space = Space::from_singles(world, Vec::new(), singles);
+                props.push((key, space));
+            }
+            out.push(Single::with_props(head, props));
+        }
     }
 }
 

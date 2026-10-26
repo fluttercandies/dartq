@@ -3257,9 +3257,16 @@ impl<'a> Engine<'a> {
                 // (`if (n == null) return;` strips the null witness the
                 // parse-time row reports), and that fact drains only at
                 // the teardown join — stage the row for the re-decision
-                // there instead of reporting now. A non-nullable or
-                // clause-less switch keeps today's immediate face.
-                if Self::is_nullable_ty(ctx.scrutinee)
+                // there instead of reporting now. A NAMED scrutinee defers
+                // for the same reason: an enclosing `is`-guard promotes a
+                // bare read past its parse-time face (`if (e is Literal)
+                // switch (e) {…}` — the subclass cases cover the promoted
+                // `Literal`, never the unrefined `Object`), and the
+                // teardown keeps the unrefined verdict verbatim when no
+                // refinement stands. Anything else (a clause-less switch,
+                // an unnameable scrutinee) keeps today's immediate face.
+                if (Self::is_nullable_ty(ctx.scrutinee)
+                    || matches!(ctx.scrutinee, Ty::Named { .. }))
                     && let Some(first) = ctx.cases.first()
                 {
                     self.pending_switch_coverings.push(PendingSwitchCovering {
