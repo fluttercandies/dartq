@@ -5128,13 +5128,18 @@ impl ParserListener for DiagnoseListener<'_> {
                 // An unfolded index (`m[k]?[n]`, a value-row receiver
                 // keeps its operand rows) leaves the KEY as the top row:
                 // the matched value is the `[]` read, never the key.
-                let scrutinee = engine
+                let scrutinee_row = engine
                     .rows
                     .last()
-                    .filter(|row| !engine.is_index_key_row(row))
-                    .map_or(Ty::Unknown, |row| row.ty);
+                    .filter(|row| !engine.is_index_key_row(row));
+                let scrutinee = scrutinee_row.map_or(Ty::Unknown, |row| row.ty);
+                let member_scrutinee = scrutinee_row.and_then(|row| {
+                    matches!(row.shape, RowShape::Member { .. }).then_some(row.range)
+                });
 
-                engine.switch.open_if_case(scrutinee, token.range);
+                engine
+                    .switch
+                    .open_if_case(scrutinee, token.range, member_scrutinee);
                 engine.clause_anchor = None;
             }
         }
@@ -5167,22 +5172,48 @@ impl ParserListener for DiagnoseListener<'_> {
             // context's scrutinee face, read before an if-case window
             // closes with it (`if (expr?.f case final x?)` binds `x` to
             // the chain's non-null element face).
+            // The candidates are ROOT null-checks only (the queue's own
+            // depth gate) — record/object sub-pattern binders never queue,
+            // their faces belong to the destructure/field paths.
             let candidates = std::mem::take(&mut engine.null_check_binder_candidates);
-            // A record-slot binder (`case (final x?, _)` — the destructure
-            // path owns its face) never takes the scrutinee's: drop the
-            // names queued for the record bind.
-            let is_record_slot = |name: StringId| {
-                engine
-                    .pattern_bind_vars
-                    .iter()
-                    .any(|(queued, _)| *queued == name)
-            };
-            let candidates: Vec<(StringId, SourceRange)> = candidates
-                .into_iter()
-                .filter(|(name, _)| !is_record_slot(*name))
-                .collect();
-            if let (false, Some(mut scrutinee)) =
-                (candidates.is_empty(), engine.switch.switches.last().map(|c| c.scrutinee))
+            let mut scrutinee = engine
+                .switch
+                .switches
+                .last()
+                .map_or(Ty::Unknown, |c| c.scrutinee);
+            // A MEMBER scrutinee's chain (`transformer?.value case final
+            // t?`) carries its face in the accessor walk, not the merged
+            // row's own ty (the merge's declared-type write answers fields
+            // only): re-derive this gate's face from the member read
+            // recorded at exactly the chain head's span, the `?.` short's
+            // nullability joined. ONLY the member-row shape re-derives —
+            // a bare-variable scrutinee's nearest-earlier member read
+            // would be a stale, unrelated face. The raw latch stays the
+            // answer for every other scrutinee consumer (the null-check
+            // pattern's own verdicts among them: widening them
+            // over-fires on degraded receivers the oracle types nullable).
+            if !matches!(scrutinee, Ty::Named { .. })
+                && let Some(span) = engine
+                    .switch
+                    .switches
+                    .last()
+                    .and_then(|c| c.if_case_member_scrutinee)
+                && let Some(read) = engine
+                    .member_reads
+                    .binary_search_by(|read| read.offset.cmp(&span.offset))
+                    .ok()
+                    .map(|index| &engine.member_reads[index])
+            {
+                let face = engine.accessor_face_for(&read.recv, read.name);
+                if matches!(face, Ty::Named { .. }) {
+                    scrutinee = if engine.null_aware_members.contains(&span.offset) {
+                        Engine::nullable_form(face)
+                    } else {
+                        face
+                    };
+                }
+            }
+            if let (false, mut scrutinee) = (candidates.is_empty(), scrutinee)
                 && let Ty::Named { nullable, .. } = &mut scrutinee
             {
                 *nullable = false;
@@ -5308,8 +5339,14 @@ impl ParserListener for DiagnoseListener<'_> {
         // scrutinee): its face is the matched type's non-null projection,
         // applied at the root pattern's close — the object-pattern
         // shorthand path (`:final x?`) claims its binder at the field
-        // boundary first and the claim retracts the candidate.
-        if let Some(pair) = self.engine.last_pattern_variable {
+        // boundary first and the claim retracts the candidate. Only a
+        // ROOT null-check queues: a null-check nested inside a record or
+        // object sub-pattern (`case (final x?, _)`'s slot, `Foo(:final
+        // x?)`'s field) fires at pattern_depth > 1 and its binder's face
+        // belongs to the destructure/field path, never the scrutinee's.
+        if self.engine.switch.pattern_depth == 1
+            && let Some(pair) = self.engine.last_pattern_variable
+        {
             self.engine.null_check_binder_candidates.push(pair);
         }
         // `p?` = the subpattern space ∩ nonNull (official

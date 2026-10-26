@@ -819,6 +819,51 @@ impl<'a> Engine<'a> {
     /// merged member row resolves through the receiver it names. Every
     /// other shape (a broken climb, executables, unknown receivers) keeps
     /// the unknown face.
+    /// The accessor (getter/field) face of `name` read on `recv`, keyed by
+    /// the recorded member-read facts rather than a live row — the face the
+    /// if-case null-check binder gate re-derives for a MEMBER scrutinee
+    /// (`transformer?.value case final t?`), whose merged row's own ty
+    /// stays empty (the merge's declared-type write answers fields only,
+    /// the documented under-report posture for getters). The container
+    /// walk plus instantiation mirror [`Self::accessor_read_ty`]'s Member
+    /// arm; the SDK static fallbacks stay out (they read row-relative
+    /// facts this face has no row for) — a miss keeps `Unknown`.
+    pub(crate) fn accessor_face_for(&self, recv: &Receiver, name: StringId) -> Ty {
+        let container = match recv {
+            Receiver::This { container, .. }
+            | Receiver::Super { container, .. }
+            | Receiver::Container {
+                name: container, ..
+            }
+            | Receiver::Created {
+                name: container, ..
+            }
+            | Receiver::Typed {
+                type_name: container,
+                ..
+            } => Some(*container),
+            _ => None,
+        };
+        let Some(container) = container else {
+            return Ty::UNKNOWN;
+        };
+        let found = if matches!(recv, Receiver::Super { .. }) {
+            self.walk_from(container, name, true)
+        } else {
+            self.walk_members(container, name)
+        };
+        match found {
+            Walk::Found(entry) if matches!(entry.kind, MemberKind::Getter | MemberKind::Field) => {
+                let answer = match entry.kind {
+                    MemberKind::Field => self.fold_alias_ty(entry.var_ty),
+                    _ => self.fold_alias_ty(entry.return_ty),
+                };
+                self.instantiate_accessor_static(container, recv, answer)
+            }
+            _ => Ty::UNKNOWN,
+        }
+    }
+
     fn accessor_read_ty(&self, row: &Row) -> Ty {
         let answer = |entry: &MemberEntry| match entry.kind {
             MemberKind::Field => self.fold_alias_ty(entry.var_ty),

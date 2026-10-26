@@ -110,7 +110,12 @@ impl SwitchTracker {
     /// checks read a context of their own — the same sink a case header
     /// opens. `kw` is never read (an if-case reports nothing at the
     /// keyword); it fills the context's anchor slot.
-    pub(crate) fn open_if_case(&mut self, scrutinee: Ty, kw: SourceRange) {
+    pub(crate) fn open_if_case(
+        &mut self,
+        scrutinee: Ty,
+        kw: SourceRange,
+        member_scrutinee: Option<SourceRange>,
+    ) {
         self.switches.push(SwitchCtx {
             is_expression: false,
             switch_kw: kw,
@@ -119,6 +124,7 @@ impl SwitchTracker {
             default_kw: None,
             default_pos: None,
             pending_root: None,
+            if_case_member_scrutinee: member_scrutinee,
         });
         self.case_sink_open = true;
         self.if_case_window = true;
@@ -166,6 +172,7 @@ impl SwitchTracker {
             default_kw: None,
             default_pos: None,
             pending_root: None,
+            if_case_member_scrutinee: None,
         });
     }
 
@@ -464,6 +471,14 @@ pub(crate) struct SwitchCtx {
     /// the case's end). Statement cases capture in one step and leave this
     /// `None`.
     pub(crate) pending_root: Option<Restriction>,
+    /// An if-case's MEMBER scrutinee row (`transformer?.value case …`):
+    /// the chain-head row's span, set only when the scrutinee row is a
+    /// member access. The null-check binder gate re-derives the chain's
+    /// accessor face from the recorded member read at exactly this span;
+    /// a bare-variable scrutinee (whatever its latched type) never
+    /// re-derives — the nearest-earlier member read would be a stale,
+    /// unrelated face.
+    pub(crate) if_case_member_scrutinee: Option<SourceRange>,
 }
 
 /// One open `begin_pattern`..`end_pattern` bracket: the leaf restrictions
