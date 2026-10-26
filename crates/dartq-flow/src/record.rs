@@ -1306,8 +1306,18 @@ impl ParserListener for Flow<'_> {
         _initializer_start: Option<Token>,
         _initializer_end: Option<Token>,
         _kind: FormalParameterKind,
-        _member_kind: MemberKind,
+        member_kind: MemberKind,
     ) {
+        // A formal inside a function-TYPE annotation (`int Function(String
+        // s)` — GeneralizedFunctionType formals) declares no variable in
+        // the enclosing scope: the oracle scopes the names to the type
+        // alone, and recording them would redeclare a same-named local
+        // with the annotation's written type (the method's
+        // `LibraryElementImpl library` clobbered by a named fn-type
+        // formal's `String library`, the dead_code_verifier census shape).
+        if member_kind == MemberKind::GeneralizedFunctionType {
+            return;
+        }
         let name = self.name(name_token);
         self.record(Ev::Formal {
             name,
