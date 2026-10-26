@@ -17,15 +17,12 @@ Core contract:
 - `dartq packages` inventories the enclosing monorepo (every package root
   and pruned boundary) — run it before touching an unfamiliar tree.
 
-Skill files (load the matching one before the task):
+Skill file (one skill, reference docs per face — load the matching one
+before the task):
 
-- `using-dartq` — index: the verb surface and the skill picker
-- `dartq-getting-started` — install, first run, orientation
-- `dartq-test-driving` — dartq test vs dart test, the cache, --impacted
-- `dartq-analysis-loop` — analyze/query/explain/impact/rename/fix workflow
-- `dartq-sessions-and-monorepos` — sessions, worktrees, boundaries
-- `dartq-debugging` — launch/attach, breakpoints, hot reload (MCP-native)
-- `dartq-mcp` — wiring `dartq mcp` (stdio MCP server) into agent hosts
+- `dartq` — the skill: contract, verb surface, and a router into
+  `references/` (getting-started, analysis-loop, test-driving,
+  sessions-and-monorepos, debugging, mcp)
 
 To expose dartq as MCP tools, register the stdio server in
 `.kiro/settings/mcp.json` (workspace) or `~/.kiro/settings/mcp.json`

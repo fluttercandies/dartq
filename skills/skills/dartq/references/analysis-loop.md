@@ -1,9 +1,4 @@
----
-name: dartq-analysis-loop
-description: Use when diagnosing analyzer errors or lint findings, understanding a symbol before changing it, scoping a change's blast radius, renaming across a workspace, or applying fixes — the analyze/query/explain/impact/rename/fix workflow
----
-
-# dartq: The Analysis Loop
+# The Analysis Loop
 
 The loop for every code change in an analyzed workspace:
 
@@ -105,4 +100,4 @@ write it only if clean.
 ## Depth
 
 Formats, tiers, and machine schemas per verb:
-[references/formats-and-tiers.md](references/formats-and-tiers.md).
+[formats-and-tiers.md](formats-and-tiers.md).

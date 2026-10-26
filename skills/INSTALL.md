@@ -1,10 +1,10 @@
 # Installing the dartq skill package
 
-What you get: seven agent skills covering the dartq toolchain (AI-first
-Dart/Flutter analysis, test driving, monorepo sessions, debugging, MCP),
-plus the `dartq mcp` stdio server registration for hosts that support MCP.
-One package, every harness — install it separately per harness if you use
-more than one.
+What you get: one agent skill (`dartq`) covering the dartq toolchain
+(AI-first Dart/Flutter analysis, test driving, monorepo sessions, debugging,
+MCP) with per-face reference docs for depth, plus the `dartq mcp` stdio
+server registration for hosts that support MCP. One package, every harness —
+install it separately per harness if you use more than one.
 
 Prerequisites for every path below:
 
@@ -68,7 +68,7 @@ MCP:
 claude mcp add dartq -- dartq mcp
 ```
 
-Verify: ask "list your dartq skills" — a working install names `using-dartq`.
+Verify: ask "list your dartq skills" — a working install names `dartq`.
 
 ## Codex
 
@@ -106,7 +106,7 @@ MCP (`.cursor/mcp.json` or `~/.cursor/mcp.json`):
 ## Gemini CLI
 
 Extension manifest: `adapters/gemini/gemini-extension.json` with context
-file `GEMINI.md` (it @-imports the `using-dartq` index skill). Install:
+file `GEMINI.md` (it @-imports the `dartq` skill). Install:
 
 ```bash
 gemini extensions install <this-package>/adapters/gemini
@@ -121,7 +121,7 @@ gemini mcp add dartq -- dartq mcp
 ## Kimi Code
 
 Manifest: `adapters/kimi/plugin.json` — it points at the shared skills and
-sets the session-start skill to `using-dartq`. Install through Kimi Code's
+sets the session-start skill to `dartq`. Install through Kimi Code's
 plugin manager (`/plugins`) from this package (or a hosted git URL), or
 copy the skills directory into your Kimi skills location.
 
@@ -196,8 +196,8 @@ pi -e <this-package>
 ```
 
 pi lists each skill's name, description, and path in the system prompt;
-invoke one with `/skill:using-dartq` or let the model load the matching
-skill for the task. MCP: register `dartq mcp` per pi's MCP configuration
+invoke it with `/skill:dartq` or let the model load the skill for the task.
+MCP: register `dartq mcp` per pi's MCP configuration
 (stdio: command `dartq`, args `["mcp"]`).
 
 ## oh-my-pi (omp)
@@ -214,7 +214,7 @@ Installs from a local path are linked, so edits flow through — start a
 new session to pick them up. Verify offline (no session needed):
 
 ```bash
-omp skill list   # the dartq skills should be listed
+omp skill list   # the dartq skill should be listed
 ```
 
 MCP: in an omp session run `/mcp add dartq -- dartq mcp`.
@@ -260,7 +260,7 @@ Configs hot-reload on save.
 
 - **Verify the binary before anything else:** `dartq version`.
 - **Verify skills landed:** ask the agent "list your dartq skills" — the
-  `using-dartq` index should be named. On omp you can verify offline with
+  single `dartq` skill should be named. On omp you can verify offline with
   `omp skill list`.
 - **Relative skills paths** (`../../skills` in the claude/codex/cursor/
   kimi manifests): the flat-dir assembly steps exist because some host

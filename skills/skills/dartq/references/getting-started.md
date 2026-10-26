@@ -1,9 +1,4 @@
----
-name: dartq-getting-started
-description: Use when installing or first running dartq in a repo, orienting in an unfamiliar Dart/Flutter codebase, or checking that a dartq setup works (version, first analyze, machine vs human output)
----
-
-# dartq: Getting Started
+# Getting Started
 
 ## When dartq Is the Right Tool
 
@@ -13,8 +8,8 @@ description: Use when installing or first running dartq in a repo, orienting in 
 - The repo is large and `dart analyze` per-command latency is the bottleneck.
 - You need machine output by default, not prose to strip.
 
-If dartq is absent, `dart analyze` / `flutter analyze` still work — but every
-skill in this set assumes dartq from here on.
+If dartq is absent, `dart analyze` / `flutter analyze` still work — but the
+rest of this skill assumes dartq from here on.
 
 ## Install
 
@@ -41,7 +36,8 @@ dartq analyze --fast               # parser-only sweep: no engine, pure syntax
 ```
 
 The first command also elects the worktree's resident session (see
-`dartq-sessions-and-monorepos`). It is automatic — no daemon to babysit.
+[sessions-and-monorepos.md](sessions-and-monorepos.md)). It is automatic — no
+daemon to babysit.
 
 ## Orientation Pass (unfamiliar repo)
 
@@ -96,6 +92,6 @@ inside the package directory it named. If the SDK is wrong, set `$DART_SDK`.
 
 ## Next Stops
 
-- Editing code: `dartq-analysis-loop` (diagnose → understand → scope → verify)
-- Running tests: `dartq-test-driving`
-- Agent host integration: `dartq-mcp`
+- Editing code: [analysis-loop.md](analysis-loop.md) (diagnose → understand → scope → verify)
+- Running tests: [test-driving.md](test-driving.md)
+- Agent host integration: [mcp.md](mcp.md)

@@ -54,4 +54,4 @@ dartq version
 ```
 
 Then ask OpenCode: "List your dartq skills." A working install answers
-with the `using-dartq` index and the topic skills.
+with the single `dartq` skill.

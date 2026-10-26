@@ -31,15 +31,16 @@ agents that read the AGENTS.md convention pick it up automatically.
 
 ## Skill files
 
-The full skill set lives beside this adapter under `skills/`:
+One skill (`dartq`) carries the whole surface; its reference docs hold the
+per-face depth, under `skills/dartq/`:
 
-- `using-dartq` — the index: verb surface, contract, skill picker
-- `dartq-getting-started` — install, first run, orientation
-- `dartq-test-driving` — the result cache, markers, `--impacted`, `--stats`
-- `dartq-analysis-loop` — analyze → query/explain → impact → rename/fix → verify
-- `dartq-sessions-and-monorepos` — session model, multi-worktree, boundaries
-- `dartq-debugging` — launch/attach, paused-on-start takeover, hot reload
-- `dartq-mcp` — the 28-tool stdio MCP server and CLI-vs-MCP guidance
+- `skills/dartq/SKILL.md` — the entry: contract, verb surface, face router
+- `references/getting-started.md` — install, first run, orientation
+- `references/test-driving.md` — the result cache, markers, `--impacted`, `--stats`
+- `references/analysis-loop.md` — analyze → query/explain → impact → rename/fix → verify
+- `references/sessions-and-monorepos.md` — session model, multi-worktree, boundaries
+- `references/debugging.md` — launch/attach, paused-on-start takeover, hot reload
+- `references/mcp.md` — the 28-tool stdio MCP server and CLI-vs-MCP guidance
 
 ## MCP
 

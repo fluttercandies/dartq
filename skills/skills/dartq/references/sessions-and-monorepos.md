@@ -1,13 +1,8 @@
----
-name: dartq-sessions-and-monorepos
-description: Use when dartq commands share (or should share) a resident engine, when working across nested worktrees or monster monorepos with dartq packages, when parallel checkouts each need an engine, or when a session looks stale, capped, or duplicated
----
-
-# dartq: Sessions and Monorepos
+# Sessions and Monorepos
 
 ## The Session Model in One Paragraph
 
-Every dartq command auto-att to the worktree's **resident session** — a
+Every dartq command auto-attaches to the worktree's **resident session** — a
 long-lived engine server keyed on a triple: **(resolution-root realpath, SDK
 identity, dartq binary hash)**. Two faces share one engine exactly when
 their triples agree; an FVM switch or a dartq upgrade is a different
@@ -18,7 +13,7 @@ manual warm-up — the first command in a cold worktree elects the server,
 later commands attach.
 
 Depth (election, idle reaper, cap, standalone degrade):
-[references/session-model.md](references/session-model.md).
+[session-model.md](session-model.md).
 
 ## Managing Sessions
 

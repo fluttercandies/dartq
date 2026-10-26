@@ -1,14 +1,9 @@
----
-name: dartq-debugging
-description: Use when launching or attaching to a running Dart/Flutter app, setting breakpoints, inspecting paused state, evaluating expressions in a frame, or doing hot reload/restart from an agent session — no IDE in the loop
----
-
-# dartq: Debugging
+# Debugging
 
 **Where debugging lives:** the debug surface is **daemon/MCP-native**. There
 is no `dartq debug` CLI verb. Debug operations are `dartq/debug/*` methods
 served by the worktree's resident session and exposed as MCP tools — use
-them through `dartq mcp` (see `dartq-mcp`) or any MCP client. The commands
+them through `dartq mcp` (see [mcp.md](mcp.md)) or any MCP client. The commands
 below are tool calls, not shell commands.
 
 dartq speaks the Dart VM Service Protocol directly and layers an AI-first

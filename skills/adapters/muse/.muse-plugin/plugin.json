@@ -11,32 +11,8 @@
   "capabilities": {
     "skills": [
       {
-        "id": "using-dartq",
-        "path": "../../skills/using-dartq/SKILL.md"
-      },
-      {
-        "id": "dartq-getting-started",
-        "path": "../../skills/dartq-getting-started/SKILL.md"
-      },
-      {
-        "id": "dartq-test-driving",
-        "path": "../../skills/dartq-test-driving/SKILL.md"
-      },
-      {
-        "id": "dartq-analysis-loop",
-        "path": "../../skills/dartq-analysis-loop/SKILL.md"
-      },
-      {
-        "id": "dartq-sessions-and-monorepos",
-        "path": "../../skills/dartq-sessions-and-monorepos/SKILL.md"
-      },
-      {
-        "id": "dartq-debugging",
-        "path": "../../skills/dartq-debugging/SKILL.md"
-      },
-      {
-        "id": "dartq-mcp",
-        "path": "../../skills/dartq-mcp/SKILL.md"
+        "id": "dartq",
+        "path": "../../skills/dartq/SKILL.md"
       }
     ],
     "commands": [],

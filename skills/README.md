@@ -16,17 +16,24 @@ exposes the same engine as 28 MCP tools.
   convention); every adapter points at the shared skill set — no
   duplicated content
 
-## The skill set
+## The skill
 
-| Skill | Load when |
+One skill, `dartq`, is the single entry point: the core contract, the verb
+surface, and a router into per-face reference docs under
+`skills/dartq/references/` (hosts inject one description per turn — one
+product means one skill entry, depth lives in references):
+
+| Reference | Depth |
 | --- | --- |
-| `using-dartq` | working in any Dart/Flutter repo — the index and the core contract |
-| `dartq-getting-started` | installing, first run, orienting in an unfamiliar repo |
-| `dartq-test-driving` | running tests, cache questions, `--impacted` edit-test loops |
-| `dartq-analysis-loop` | diagnose → understand → scope → execute → verify on analyzed code |
-| `dartq-sessions-and-monorepos` | resident sessions, nested worktrees, monster monorepos |
-| `dartq-debugging` | launching/attaching, breakpoints, hot reload — no IDE |
-| `dartq-mcp` | wiring `dartq mcp` into an agent host, CLI vs MCP |
+| `references/getting-started.md` | install, first run, orienting in an unfamiliar repo |
+| `references/test-driving.md` | running tests, cache questions, `--impacted` edit-test loops |
+| `references/analysis-loop.md` | diagnose → understand → scope → execute → verify on analyzed code |
+| `references/sessions-and-monorepos.md` | resident sessions, nested worktrees, monster monorepos |
+| `references/debugging.md` | launching/attaching, breakpoints, hot reload — no IDE |
+| `references/mcp.md` | wiring `dartq mcp` into an agent host, CLI vs MCP |
+
+Four deeper references sit beside them: `cache-and-markers.md`,
+`formats-and-tiers.md`, `session-model.md`, and `tool-catalog.md`.
 
 ## Install
 

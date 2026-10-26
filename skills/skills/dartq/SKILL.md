@@ -1,9 +1,9 @@
 ---
-name: using-dartq
-description: Use when working in any Dart or Flutter codebase where dartq is (or could be) installed — before reaching for dart analyze, dart test, flutter test, or an IDE, pick the dartq skill that matches the task
+name: dartq
+description: Use when working in any Dart or Flutter codebase — before reaching for dart analyze, dart test, flutter test, or an IDE — for analyzing diagnostics, navigating or explaining symbols, scoping a change's blast radius, renaming or applying fixes, running or accelerating tests, debugging or hot-reloading a running app, managing resident sessions across worktrees and monorepos, wiring dartq as MCP tools for an agent host, or installing dartq and verifying a setup
 ---
 
-# Using dartq
+# dartq
 
 dartq is a drop-in Rust toolchain for Dart and Flutter analysis, testing, and
 debugging. AI agents are its first-class users: piped output is machine output,
@@ -42,16 +42,19 @@ CLI, events, and MCP clients alike.
 
 Run `dartq <verb> --help` for the full grammar of any face.
 
-## Pick the Skill
+## Where the Depth Lives
 
-| When the task is... | Load |
+This file is the whole skill's entry point; each face has a reference doc
+under `references/`. Load the one that matches the task:
+
+| When the task is... | Read |
 | --- | --- |
-| First contact: install, first run, orienting in a repo | `dartq-getting-started` |
-| Running tests, speeding up edit-test loops, cache questions | `dartq-test-driving` |
-| Diagnose → understand → scope → edit → verify on analyzed code | `dartq-analysis-loop` |
-| Nested worktrees, monster monorepos, multi-checkout parallel work | `dartq-sessions-and-monorepos` |
-| Launching, pausing, inspecting, hot-reloading a running app | `dartq-debugging` |
-| Wiring dartq into an agent host as MCP tools | `dartq-mcp` |
+| First contact: install, first run, orienting in a repo | [references/getting-started.md](references/getting-started.md) |
+| Running tests, speeding up edit-test loops, cache questions | [references/test-driving.md](references/test-driving.md) — depth: [references/cache-and-markers.md](references/cache-and-markers.md) |
+| Diagnose → understand → scope → edit → verify on analyzed code | [references/analysis-loop.md](references/analysis-loop.md) — depth: [references/formats-and-tiers.md](references/formats-and-tiers.md) |
+| Nested worktrees, monster monorepos, multi-checkout parallel work | [references/sessions-and-monorepos.md](references/sessions-and-monorepos.md) — depth: [references/session-model.md](references/session-model.md) |
+| Launching, pausing, inspecting, hot-reloading a running app | [references/debugging.md](references/debugging.md) |
+| Wiring dartq into an agent host as MCP tools | [references/mcp.md](references/mcp.md) — depth: [references/tool-catalog.md](references/tool-catalog.md) |
 
 ## Defaults That Surprise Newcomers
 
@@ -64,6 +67,8 @@ Run `dartq <verb> --help` for the full grammar of any face.
 - Engine faces need a resolved workspace: `pubspec.yaml` plus
   `.dart_tool/package_config.json` (run `dart pub get` first). `--fast` and
   `--sdk-path`/`$DART_SDK` control the rest.
+- Debugging is daemon/MCP-native — there is no `dartq debug` CLI verb; the
+  debug tools are MCP tools (`dartq mcp`), see the debugging reference.
 
 ## Not Sure dartq Is Installed?
 
@@ -71,4 +76,5 @@ Run `dartq <verb> --help` for the full grammar of any face.
 dartq version   # prints "dartq 0.1.0" or similar
 ```
 
-If it is not, see `dartq-getting-started` for install and first-run steps.
+If it is not, see [references/getting-started.md](references/getting-started.md)
+for install and first-run steps.

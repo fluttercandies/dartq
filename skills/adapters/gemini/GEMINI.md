@@ -1,1 +1,1 @@
-@../../skills/using-dartq/SKILL.md
+@../../skills/dartq/SKILL.md

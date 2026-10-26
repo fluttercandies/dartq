@@ -82,7 +82,7 @@ Arguments: `{handle: "session"|"progress", since, limit}`.
 | `dartq_debug_events` | `dartq/debug/events` | cursor-paged debugger events |
 | `dartq_debug_output` | `dartq/debug/output` | cursor-paged program output |
 
-Semantics and the launch loop: the `dartq-debugging` skill.
+Semantics and the launch loop: [debugging.md](debugging.md).
 
 ## Resource
 

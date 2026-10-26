@@ -1,9 +1,4 @@
----
-name: dartq-mcp
-description: Use when wiring dartq into an agent host (Claude Code, Codex, Cursor, Gemini CLI, ...) as an MCP server, choosing between the CLI and MCP faces for a task, or debugging a dartq MCP tool call
----
-
-# dartq: MCP Integration
+# MCP Integration
 
 ## One-Line Setup
 
@@ -63,10 +58,10 @@ cold-analysis progress (`handle`: `session` | `progress`; `since`, `limit`)
 Debugging (17 tools): `dartq_debug_launch`, `_attach`, `_detach`, `_stop`,
 `_status`, `_breakpoint_add`, `_breakpoint_remove`, `_exception_pause`,
 `_resume`, `_pause`, `_step`, `_snapshot`, `_reload`, `_restart`,
-`_evaluate`, `_events`, `_output`. Semantics: the `dartq-debugging` skill.
+`_evaluate`, `_events`, `_output`. Semantics: [debugging.md](debugging.md).
 
 The full per-tool descriptions (with use-for / not-for lines):
-[references/tool-catalog.md](references/tool-catalog.md).
+[tool-catalog.md](tool-catalog.md).
 
 ## Resource
 
@@ -84,4 +79,4 @@ Read it first in a fresh MCP session to confirm the binding.
 | Tools slow on first call | cold analysis — poll `dartq_events` (`progress`) |
 | `dartq_rename` much slower than others | expected: cold pass per call |
 | Wrong workspace answered | the server bound a different worktree — check `dartq://workspace-status`; restart `dartq mcp` inside the right tree |
-| Session degraded to standalone | unwritable or foreign worktree — printed, not an error; see `dartq-sessions-and-monorepos` |
+| Session degraded to standalone | unwritable or foreign worktree — printed, not an error; see [sessions-and-monorepos.md](sessions-and-monorepos.md) |

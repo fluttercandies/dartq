@@ -1,9 +1,4 @@
----
-name: dartq-test-driving
-description: Use when running Dart or Flutter tests, choosing between dartq test and dart/flutter test, diagnosing why a suite re-runs instead of replaying from cache, or selecting only impacted suites in an edit-test loop
----
-
-# dartq: Test Driving
+# Test Driving
 
 ## The Rule
 
@@ -44,7 +39,7 @@ dartq test: 42 suites — 30 replayed, 9 grouped, 3 stock (8.2s)
   outcome, or the suite observes how it was launched).
 
 High `stock` counts are the signal to investigate: read
-[references/cache-and-markers.md](references/cache-and-markers.md) for why a
+[cache-and-markers.md](cache-and-markers.md) for why a
 suite refuses replay and which marker opts it back in.
 
 ## When dartq Delegates to the Stock Runner
