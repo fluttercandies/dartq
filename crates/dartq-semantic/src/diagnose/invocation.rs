@@ -6573,10 +6573,14 @@ impl<'a> Engine<'a> {
         // alias or the raw function type) — never the whole function type
         // the declared row carries. A nullable callee keeps its face (the
         // unchecked-use verdict owns the value then).
-        if let Some(&Ty::Function {
+        let callee_ty = self
+            .rows
+            .get(callee)
+            .map(|row| self.fold_alias_ty(row.ty));
+        if let Some(Ty::Function {
             shape,
             nullable: false,
-        }) = self.rows.get(callee).map(|row| &row.ty)
+        }) = callee_ty
         {
             let ret = self.boundary.pool().function_shape(shape).return_ty;
             self.rows[callee].ty = ret;
