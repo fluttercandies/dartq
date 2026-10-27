@@ -76,6 +76,13 @@ const PIPE_READ_SIZE: usize = 8 * 1024;
 /// session; a full queue drops chunks rather than blocking the child.
 const PIPE_QUEUE_CAPACITY: usize = 4096;
 
+/// Budget covering the whole best-effort resume sweep that precedes a
+/// release (see [`DebugSession::detach`]): one deadline for every
+/// isolate, so a wedged transport delays the release by seconds, never
+/// `rpc_timeout` per isolate. A healthy transport answers each resume
+/// in milliseconds.
+const RELEASE_RESUME_BUDGET: Duration = Duration::from_secs(5);
+
 /// Bounds for lazy object-graph expansion.
 #[derive(Debug, Clone, Copy)]
 pub struct ExpandLimits {
@@ -1721,11 +1728,16 @@ impl DebugSession {
     }
 
     /// Closes the debugger connection and releases the launched
-    /// program: the app keeps running under its own steam. The child
-    /// is moved to a reaper thread so it never lingers as a zombie;
-    /// the session is inert afterwards and its [`Drop`] no longer
-    /// kills anything. Re-attach later through [`DebugSession::ws_uri`].
+    /// program: the app keeps running under its own steam. Every
+    /// isolate the session knows first gets a best-effort `resume`
+    /// (the DevTools detach courtesy): a pause outlives the connection
+    /// that requested it, so closing while paused would wedge the app
+    /// for every later client. The child is moved to a reaper thread
+    /// so it never lingers as a zombie; the session is inert afterwards
+    /// and its [`Drop`] no longer kills anything. Re-attach later
+    /// through [`DebugSession::ws_uri`].
     pub fn detach(&mut self) {
+        self.resume_before_release();
         self.client.close();
         if let Some(child) = self.process.take() {
             // A detached child must still be waited or it zombies; the
@@ -1733,6 +1745,33 @@ impl DebugSession {
             let _ = std::thread::Builder::new()
                 .name("dartq-debug-reaper".into())
                 .spawn(move || drop(child));
+        }
+    }
+
+    /// Best-effort `resume` for every known isolate before the
+    /// connection closes — [`DebugSession::detach`], and an attached
+    /// session's [`DebugSession::terminate`]. A pause outlives the
+    /// connection that requested it (DDS does not resume on
+    /// disconnect, so with no client left the pause stands), and
+    /// skipping this wedges the app for every later client. Errors are
+    /// swallowed on purpose: the VM answers `resume` on a running
+    /// isolate with a benign "isolate must be paused" error, an exited
+    /// isolate answers a sentinel, and a dead transport must not block
+    /// the release — none of these change what happens next, which is
+    /// the close. One deadline bounds the whole sweep
+    /// (see [`RELEASE_RESUME_BUDGET`]).
+    fn resume_before_release(&mut self) {
+        let deadline = Instant::now() + RELEASE_RESUME_BUDGET;
+        for isolate in resume_targets(&self.isolates, self.main_isolate.as_deref()) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let _ = self.client.call_unit(
+                "resume",
+                json!({ "isolateId": isolate }),
+                self.config.rpc_timeout.min(remaining),
+            );
         }
     }
 
@@ -1755,6 +1794,14 @@ impl DebugSession {
                 self.signal_child_group(libc::SIGTERM)?;
                 self.wait_child_grace(Duration::from_secs(10))?;
             }
+        }
+        // An attached session has no child to kill — closing is its
+        // whole release, so the paused-isolate resume courtesy applies
+        // here too (this is the daemon-shutdown path: sessions drop,
+        // `Drop` runs terminate). A launched session dies with its
+        // child below; resuming it first would be pointless.
+        if self.process.is_none() {
+            self.resume_before_release();
         }
         self.client.close();
         if let Some(mut child) = self.process.take() {
@@ -2307,6 +2354,32 @@ fn isolate_order(isolate: &IsolateRef) -> (u64, &str) {
     (number, isolate.id.as_str())
 }
 
+/// The isolates a releasing session must try to resume, in issue order:
+/// the main isolate first (the debug target is the likeliest held
+/// paused), then the rest by [`isolate_order`], so the sweep is
+/// deterministic. Every known isolate is included — running or not,
+/// system ones too: the VM answers `resume` on a running isolate with
+/// a benign "isolate must be paused" error, while an isolate the sweep
+/// skipped could stay wedged forever once the connection is gone (a
+/// pause survives the disconnect that requested it). Over-inclusion is
+/// one wasted round trip; under-inclusion is a stuck app.
+fn resume_targets<'a>(
+    isolates: &'a FxHashMap<String, IsolateRef>,
+    main_isolate: Option<&str>,
+) -> Vec<&'a str> {
+    fn rank<'a>(main_isolate: Option<&'a str>, isolate: &'a IsolateRef) -> (bool, (u64, &'a str)) {
+        (
+            main_isolate != Some(isolate.id.as_str()),
+            isolate_order(isolate),
+        )
+    }
+    let mut refs: Vec<&IsolateRef> = isolates.values().collect();
+    refs.sort_unstable_by(|a, b| rank(main_isolate, a).cmp(&rank(main_isolate, b)));
+    refs.into_iter()
+        .map(|isolate| isolate.id.as_str())
+        .collect()
+}
+
 /// Rejects a sentinel answer to an RPC that should return `Success`.
 fn check_success(value: &Value) -> Result<()> {
     if value.get("type").and_then(Value::as_str) == Some("Sentinel") {
@@ -2738,10 +2811,13 @@ mod tests {
     use std::io::Cursor;
     use std::time::{Duration, Instant};
 
+    use rustc_hash::FxHashMap;
+
     use super::{
         LaunchConfig, LaunchKind, PipeEvent, PipeKind, banner_in, dart_argv, flutter_argv,
-        flutter_target, service_uri_to_ws, spawn_pipe_reader,
+        flutter_target, resume_targets, service_uri_to_ws, spawn_pipe_reader,
     };
+    use crate::protocol::IsolateRef;
     use std::path::PathBuf;
 
     const BANNER: &str = "The Dart VM service is listening on http://127.0.0.1:8181/AbC=/\n";
@@ -2916,6 +2992,60 @@ http://127.0.0.1:9002/A=/\r"
         assert!(service_uri_to_ws("http://127.0.0.1/x/").is_err());
         assert!(service_uri_to_ws("127.0.0.1:8181/x/").is_err());
         assert!(service_uri_to_ws("http://127.0.0.1:notaport/x/").is_err());
+    }
+
+    /// The release sweep's target list is the testable half of the
+    /// detach courtesy; that `detach`/`terminate` actually send the
+    /// `resume` RPCs before closing is live-verified against a real VM
+    /// (pause, detach, then observe the app answering again).
+    fn tracked_isolate(id: &str, number: Option<&str>, system: bool) -> IsolateRef {
+        IsolateRef {
+            id: id.to_owned(),
+            number: number.map(str::to_owned),
+            name: None,
+            is_system_isolate: system,
+            isolate_group_id: None,
+        }
+    }
+
+    #[test]
+    fn resume_targets_cover_every_isolate_with_main_first() {
+        let mut isolates = FxHashMap::default();
+        isolates.insert(
+            "isolates/3".to_owned(),
+            tracked_isolate("isolates/3", Some("3"), false),
+        );
+        isolates.insert(
+            "isolates/1".to_owned(),
+            tracked_isolate("isolates/1", Some("1"), true),
+        );
+        isolates.insert(
+            "isolates/2".to_owned(),
+            tracked_isolate("isolates/2", Some("2"), false),
+        );
+        isolates.insert(
+            "isolates/late".to_owned(),
+            tracked_isolate("isolates/late", None, false),
+        );
+
+        // The main isolate leads even though its number is the highest
+        // (it is the likeliest held paused), the rest follow in
+        // isolate order, the unnumbered one sorts by id after the
+        // numbered ones, and the system isolate is not skipped: an
+        // over-inclusive resume is one wasted round trip, a skipped
+        // isolate could stay wedged after the connection is gone.
+        let targets = resume_targets(&isolates, Some("isolates/3"));
+        assert_eq!(
+            targets,
+            ["isolates/3", "isolates/1", "isolates/2", "isolates/late"]
+        );
+
+        // Nothing elected as main: plain isolate order.
+        let targets = resume_targets(&isolates, None);
+        assert_eq!(
+            targets,
+            ["isolates/1", "isolates/2", "isolates/3", "isolates/late"]
+        );
     }
 
     #[test]
