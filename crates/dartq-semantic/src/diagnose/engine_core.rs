@@ -873,17 +873,88 @@ impl<'a> Engine<'a> {
                 };
                 let element_count = positional.len() + named.len();
                 let mut inside: Vec<Ty> = Vec::with_capacity(element_count);
-                // The window opens 64 bytes before the staged span: a
-                // `return (a, b);` stages the RECORD's own span, and the
-                // first element's read sits a `return (` ahead of it — the
-                // exact-non-null-form guard below rejects any stray
-                // promotion the wider window lets in.
+                // The element window. The staged span's own -64 pre-window
+                // answers the short literal (`return (a, b);`'s elements),
+                // but a record-return check anchors at a degenerate tail
+                // byte PAST the closing `)` (the merged row's 1-byte
+                // range), so a long literal's first elements sit far
+                // before it. Recover the record's own extent — walk back
+                // over the statement close and paren-match the `)` — and
+                // take the wider of the two bounds; the exact-form and
+                // subtype gates below still refuse anything the window
+                // lets in that no element owns.
                 let window_start = check.range.offset.saturating_sub(64);
+                let elem_start = {
+                    let mut at = check.range.offset;
+                    let floor = check.range.offset.saturating_sub(2_048);
+                    let ws = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r');
+                    // The record's closer: the anchor byte itself (the
+                    // merged row's 1-byte range sits ON the `)`), or the
+                    // `)` behind it past the statement's `;`.
+                    let close = if self.byte_at(at) == Some(b')') {
+                        Some(at)
+                    } else {
+                        while at > floor && self.byte_at(at - 1).is_some_and(ws) {
+                            at -= 1;
+                        }
+                        if at > floor && self.byte_at(at - 1) == Some(b';') {
+                            at -= 1;
+                            while at > floor && self.byte_at(at - 1).is_some_and(ws) {
+                                at -= 1;
+                            }
+                        }
+                        (at > floor && self.byte_at(at - 1) == Some(b')')).then_some(at - 1)
+                    };
+                    match close {
+                        Some(close) => {
+                            let mut depth = 0u32;
+                            let mut p = close + 1;
+                            while p > floor {
+                                match self.byte_at(p - 1) {
+                                    Some(b')') => depth += 1,
+                                    Some(b'(') => {
+                                        depth = depth.saturating_sub(1);
+                                        if depth == 0 {
+                                            p -= 1;
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                p -= 1;
+                            }
+                            if depth == 0 {
+                                p
+                            } else {
+                                window_start
+                            }
+                        }
+                        None => window_start,
+                    }
+                };
+                let elem_start = elem_start.min(window_start);
                 for (range, ty) in &promotions.rows {
-                    if range.offset >= window_start
+                    if range.offset >= elem_start
                         && range.end() <= check.range.end()
                         && *ty != Ty::Unknown
                     {
+                        inside.push(*ty);
+                    }
+                }
+                // The flow read types (#1056's rows) in the window: an
+                // element's bare read carries its flow-aware static face —
+                // a write promotion the `promotions` staging cannot spell
+                // (`x ??= SubImpl` over `x: T?` types later reads non-null
+                // through the write, never a `PromotedRead` fact when the
+                // flow's declared face already matched).
+                let scan_start = self
+                    .read_types
+                    .partition_point(|(row, _)| row.offset < elem_start);
+                for (range, ty) in &self.read_types[scan_start..] {
+                    if range.offset > check.range.end() {
+                        break;
+                    }
+                    if range.end() <= check.range.end() && *ty != Ty::Unknown {
                         inside.push(*ty);
                     }
                 }
@@ -892,15 +963,26 @@ impl<'a> Engine<'a> {
                 // promotion row, so a strict count match would refuse the
                 // rebuild; each nullable element whose non-null form the
                 // window saw takes it (distinct-element records — the
-                // oracle's own per-element reads).
+                // oracle's own per-element reads). A row may instead carry
+                // a strict SUBTYPE head of the element (`x ??= SubImpl`
+                // over `x: T?` promotes to `SubImpl`): `LUB(elem,
+                // written)` is exactly the element's non-null form
+                // whenever the written type is assignable to it, so the
+                // substitution holds on that proof alone.
                 if !inside.is_empty() {
                     let mut positional = positional;
                     let mut named = named;
                     let mut changed = false;
+                    let covers = |seen: &[Ty], promoted: Ty| {
+                        seen.contains(&promoted)
+                            || seen.iter().any(|ty| {
+                                *ty != promoted && self.assignable(*ty, promoted, false) == Some(true)
+                            })
+                    };
                     for element in positional.iter_mut() {
                         if let Ty::Named { nullable: true, .. } = element {
                             let promoted = Self::non_null_form(*element);
-                            if &promoted != element && inside.contains(&promoted) {
+                            if &promoted != element && covers(&inside, promoted) {
                                 *element = promoted;
                                 changed = true;
                             }
@@ -909,7 +991,7 @@ impl<'a> Engine<'a> {
                     for (_, element) in named.iter_mut() {
                         if let Ty::Named { nullable: true, .. } = element {
                             let promoted = Self::non_null_form(*element);
-                            if &promoted != element && inside.contains(&promoted) {
+                            if &promoted != element && covers(&inside, promoted) {
                                 *element = promoted;
                                 changed = true;
                             }
@@ -2421,7 +2503,61 @@ impl<'a> Engine<'a> {
                     best = Some((question_at, index));
                 }
             }
-            best.map(|(_, index)| self.rows[mark + index].clone())?
+            let (question_at, lhs_index) = best?;
+            let lhs = self.rows[mark + lhs_index].clone();
+            // The located `??` must be the window's TOP-LEVEL operator. A
+            // `??` nested inside a larger initializer (`(g?.x.length ?? 0)
+            // > 1 || (s?.x.length ?? 0) > 1`) pairs its left `int` with
+            // the `||` result row — the same-head arms decline on the head
+            // mismatch, but the different-head nullability arm below
+            // would bind the operand's head onto the whole initializer's
+            // local (a `bool`-valued `||` chain typed `int`). The test is
+            // the operator's bracket depth from the window start: scan
+            // forward from the `??` tracking `()`/`[]`/`{}` — the right
+            // operand's own bytes stay at or above that depth; a closer
+            // dropping BELOW it ends the enclosing construct, and real
+            // content after that (a `>`, `||`, any operator) proves the
+            // `??` was nested, while `;`/`,` (or only closers up to one)
+            // prove the initializer ended with this operand.
+            let mut depth = 0i32;
+            let mut at = self.rows[mark].range.offset;
+            while at < question_at {
+                match self.byte_at(at) {
+                    Some(b'(' | b'[' | b'{') => depth += 1,
+                    Some(b')' | b']' | b'}') => depth -= 1,
+                    _ => {}
+                }
+                at += 1;
+            }
+            // `depth` is the operator's own bracket depth from the
+            // window start; the right operand lives AT that depth. A
+            // closer dropping below it ends the enclosing construct (an
+            // argument list, a parenthesized operand) — only `;`/`,` or
+            // further closers may follow before real content does.
+            let base = depth;
+            let mut at = question_at + 2;
+            let mut below = false;
+            loop {
+                match self.byte_at(at) {
+                    None => break,
+                    Some(b' ' | b'\t' | b'\n' | b'\r') => {}
+                    Some(b';' | b',') if depth <= base || below => break,
+                    Some(b')' | b']' | b'}') => {
+                        depth -= 1;
+                        if depth < base {
+                            below = true;
+                        }
+                    }
+                    Some(b'(' | b'[' | b'{') if !below => depth += 1,
+                    Some(_) if below => return None,
+                    Some(_) => {}
+                }
+                at += 1;
+                if at > question_at + 4_096 {
+                    return None;
+                }
+            }
+            lhs
         };
         // The fold answers only a TOP-LEVEL `??`: the bytes from the
         // window's first row to the left operand may spell nothing but
@@ -2503,6 +2639,30 @@ impl<'a> Engine<'a> {
                     args: ra,
                 }
             }
+            // Different heads: the join's HEAD needs the hierarchy (a
+            // supertype walk this name-level fold does not own), but its
+            // NULLABILITY is operand-decided — `T1 ?? T2` is nullable only
+            // when both sides are (`resolveIfNull` joins `NonNull(T1)`).
+            // The flow layer already widened the local's write to the left
+            // head (nullable), so re-binding the left head with the joined
+            // nullability changes nothing about member resolution and only
+            // corrects nullness: a non-null right operand makes every
+            // downstream dereference safe, and the oracle's LUB stays
+            // silent there (`constructorName ?? beginToken` reads `.end`
+            // clean). Both-nullable pairs keep the widened face via the
+            // final nullable gate's None.
+            (
+                Ty::Named {
+                    name: l,
+                    nullable: ln,
+                    args: la,
+                },
+                Ty::Named { nullable: rn, .. },
+            ) if !ln || !rn => Ty::Named {
+                name: l,
+                nullable: ln && rn,
+                args: la,
+            },
             _ => return None,
         };
         (!matches!(face, Ty::Named { nullable: true, .. })).then_some(face)

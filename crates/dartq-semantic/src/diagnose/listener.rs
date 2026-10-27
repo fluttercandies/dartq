@@ -3528,8 +3528,16 @@ impl ParserListener for DiagnoseListener<'_> {
                 .iter()
                 .enumerate()
                 .filter(|(_, row)| row.range.offset > limit)
-                .rev()
-                .find(|(_, row)| !matches!(row.shape, RowShape::Bare(_) | RowShape::Value))
+                .filter(|(_, row)| !matches!(row.shape, RowShape::Bare(_) | RowShape::Value))
+                // The result row is the OUTERMOST expression — the row
+                // with the largest END, not the last pushed: an
+                // argument-bearing send's callee row spans through the
+                // closing paren while an argument's own member row
+                // (`recoveryElement: a ?? r.m2 ?? b` inside the parens)
+                // trails it in push order with an earlier end. The
+                // largest end picks the send's own face; a bare chain's
+                // last member is both the largest end and the last push.
+                .max_by_key(|(index, row)| (row.range.end(), *index))
                 .or_else(|| {
                     engine.rows[target + 1..]
                         .iter()
