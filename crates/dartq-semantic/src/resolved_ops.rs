@@ -551,9 +551,32 @@ impl LibraryTypes {
             let (Some(target), Some(prefix)) = (edge.target, edge.prefix) else {
                 continue;
             };
-            for (name, _) in graph.export_scope(target) {
+            for (name, entry) in graph.export_scope(target) {
                 if !edge.combinators.allows(name) {
                     continue;
+                }
+                // A prefixed import never publishes its target's names
+                // bare, so the bare key exists only when another import
+                // (or the unit itself) already registered the container.
+                // A prefixed-only target still needs its declaration for
+                // the alias — register the declaring file's containers
+                // (the same probe the unprefixed pass runs: no model or
+                // no container under the name suppresses, never borrows a
+                // same-named decl), then alias the joined spelling.
+                if !registry.registry.contains_key(&name)
+                    && !registry.non_containers.contains(&name)
+                {
+                    match index.get(entry.file).map(|els| els.container(name)) {
+                        Some(Some(_)) => {
+                            registry.register_file(index, entry.file, target, &mut actions);
+                            for action in actions.drain(..) {
+                                builder = action.apply(builder, &table, core_enum);
+                            }
+                        }
+                        Some(None) | None => {
+                            registry.non_containers.insert(name);
+                        }
+                    }
                 }
                 let Some(&decl) = registry.registry.get(&name) else {
                     continue;
