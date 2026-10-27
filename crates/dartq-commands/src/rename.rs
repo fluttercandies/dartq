@@ -7,7 +7,9 @@
 //! rows (the same join the `query references` face serves) and projected
 //! onto a whole-identifier edit set: one edit per family declaration's
 //! name token and every resolved use whose static target is a family
-//! member, ordered by path then offset. The CLI's `dartq rename`
+//! member, each verified to spell the member's identifier (a
+//! member-surface row minted across names joins nothing), ordered by
+//! path then offset. The CLI's `dartq rename`
 //! prints the set as the machine document and, under `--write`, splices
 //! it into the on-disk files; the daemon shapes the same result into its
 //! RPC answer.
@@ -282,9 +284,12 @@ pub fn plan<'a>(
     // resolved use whose static target is a family member — the by-name
     // join's declaration and reference rows filtered to the family, the
     // Override rows (declaration sites the declaration pass already
-    // edits) excluded. A shadowing declaration outside the family targets
-    // its own declaration's scope and stays out.
+    // edits) excluded, each reference row verified to spell the member's
+    // identifier ([`spells`]: the splice's own law, applied at the join).
+    // A shadowing declaration outside the family targets its own
+    // declaration's scope and stays out.
     let joined = engine.query_symbols(lookup_name);
+    let old = lookup_name.strip_suffix('=').unwrap_or(lookup_name);
     let mut edits: Vec<RenameEdit> = joined
         .decls
         .iter()
@@ -300,6 +305,7 @@ pub fn plan<'a>(
             .iter()
             .filter(|hit| hit.kind != ReferenceKind::Override)
             .filter(|hit| family.contains(&(hit.target_file, hit.target_container)))
+            .filter(|hit| spells(engine, hit.file, hit.range, old))
             .map(|hit| RenameEdit {
                 file: hit.file,
                 range: hit.range,
@@ -439,6 +445,28 @@ pub fn patched_text(
         patched.replace_range(start..end, new_name);
     }
     Ok(patched)
+}
+
+/// The join's spelling law: whether the analyzed text at `range` in
+/// `file` spells `old`. Every edit splices the target's own identifier
+/// token — a reference row whose range covers another member's token (a
+/// member-surface row minted across names) is not an edit of this member
+/// however its target columns read, and a `--write` would refuse it at
+/// the splice check; the plan refuses it here, at the join, so the edit
+/// set stays the family's own rows whatever the resolution surfaces
+/// minted beside them. A file the analyzed snapshot holds no content or
+/// line index for answers false (the row's facts are gone with it — the
+/// same phase posture the completion face keeps).
+fn spells(engine: &Engine, file: FileId, range: SourceRange, old: &str) -> bool {
+    let (Some(bytes), Some(index)) = (engine.content(file), engine.line_index(file)) else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let start = index.utf16_to_byte(text, range.offset) as usize;
+    let end = index.utf16_to_byte(text, range.end()) as usize;
+    text.get(start..end) == Some(old)
 }
 
 /// The byte bounds of 1-based `line` in `text` (content plus its
@@ -605,6 +633,96 @@ mod tests {
             run.edits.iter().all(|edit| edit.file == m),
             "the whole family rides the one file"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The spelling law's repro (#2649 rework): a member-surface reference
+    /// row can be minted across names — its range covering another
+    /// member's token while its target columns name the renamed family
+    /// member (the live-package shape: sends of `fetchTags`/`createTag`
+    /// riding the `createTask` answer). Whatever its target columns read,
+    /// the join must refuse it: the token does not spell the member, and
+    /// a `--write` would refuse it at the splice check anyway. The law is
+    /// probed at row fidelity here — [`spells`] over the analyzed text.
+    #[test]
+    fn a_cross_name_row_joins_nothing() {
+        const REPO: &str = concat!(
+            "abstract interface class C {\n",
+            "  Future<void> createTask();\n",
+            "  Future<void> fetchTags();\n",
+            "}\n",
+            "class R implements C {\n",
+            "  Future<void> createTask() async {}\n",
+            "  Future<void> fetchTags() async {}\n",
+            "}\n"
+        );
+        const SVC: &str = concat!(
+            "import 'repo.dart';\n",
+            "\n",
+            "class S {\n",
+            "  final C _repository;\n",
+            "  S(this._repository);\n",
+            "  void work() {\n",
+            "    _repository.fetchTags();\n",
+            "    _repository.createTask();\n",
+            "  }\n",
+            "}\n"
+        );
+        let root = workspace(
+            "rename_cross_name",
+            &[("lib/repo.dart", REPO), ("lib/svc.dart", SVC)],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        prelude(&mut engine).expect("prelude");
+        let svc = canonical(&root, "lib/svc.dart");
+        let svc_id = engine.file_table().try_file_id(&svc).expect("svc interned");
+
+        let at = |marker: &str| {
+            let off = SVC.find(marker).expect(marker) as u32;
+            dartq_source::SourceRange {
+                offset: off,
+                length: marker.split('(').next().expect("name").len() as u32,
+            }
+        };
+        // The member's own token — the createTask send — spells the name.
+        assert!(spells(&engine, svc_id, at("createTask("), "createTask"));
+        // The cross-name shapes: another member's send, the type
+        // annotation, the receiver field — none spells the member, none is
+        // an edit of it.
+        assert!(!spells(&engine, svc_id, at("fetchTags("), "createTask"));
+        assert!(!spells(
+            &engine,
+            svc_id,
+            at("C _repository"),
+            "createTask"
+        ));
+        assert!(!spells(&engine, svc_id, at("S(this._repository)"), "createTask"));
+
+        // End to end: the plan over the interface declaration edits the
+        // two family declarations and the one real call — the sibling
+        // member's send never rides the set.
+        let run = rename(
+            &mut engine,
+            &canonical(&root, "lib/repo.dart"),
+            Anchor::LineCol { line: 2, column: 17 },
+            "n",
+        )
+        .expect("rename");
+        let offsets: Vec<usize> = run
+            .edits
+            .iter()
+            .map(|edit| edit.range.offset as usize)
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![
+                REPO.find("createTask();").expect("interface decl"),
+                REPO.rfind("createTask() async").expect("override decl"),
+                SVC.find("createTask(").expect("the call"),
+            ],
+            "two declarations and the one real call"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
