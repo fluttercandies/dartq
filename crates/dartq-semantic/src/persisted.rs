@@ -182,6 +182,11 @@ pub struct PersistedMemberEntry {
     pub is_final: bool,
     pub type_params: u16,
     pub type_param_names: Vec<u32>,
+    /// The own type parameters' declared bounds, parallel to
+    /// `type_param_names`. Additive after the format shipped: a pre-field
+    /// payload decodes empty (unbounded).
+    #[serde(default)]
+    pub type_param_bounds: Vec<PersistedTy>,
     pub var_ty: PersistedTy,
     pub return_ty: PersistedTy,
     pub formals: Option<Box<PersistedFormals>>,
@@ -526,6 +531,7 @@ impl<'a> Slice<'a> {
             is_final: entry.is_final,
             type_params: entry.type_params,
             type_param_names: self.ids(&entry.type_param_names),
+            type_param_bounds: entry.type_param_bounds.iter().map(|bound| self.ty(bound)).collect(),
             var_ty: self.ty(&entry.var_ty),
             return_ty: self.ty(&entry.return_ty),
             formals: entry
@@ -941,6 +947,11 @@ impl PersistedMemberEntry {
                 .iter()
                 .map(|&at| ids[at as usize])
                 .collect(),
+            type_param_bounds: self
+                .type_param_bounds
+                .into_iter()
+                .map(|bound| into_ty(bound, ids, pool))
+                .collect(),
             var_ty: into_ty(self.var_ty, ids, pool),
             return_ty: into_ty(self.return_ty, ids, pool),
             formals: self
@@ -1071,6 +1082,7 @@ mod tests {
             is_final: false,
             type_params: 1,
             type_param_names: Box::new([name(text)]),
+            type_param_bounds: Box::default(),
             var_ty: Ty::Unknown,
             return_ty: list_int,
             formals: Some(Box::new(Formals {
@@ -1265,6 +1277,7 @@ mod tests {
             is_final: false,
             type_params: 0,
             type_param_names: Box::new([]),
+            type_param_bounds: Box::default(),
             var_ty: Ty::Unknown,
             return_ty: Ty::Void,
             formals: Some(Box::new(Formals {

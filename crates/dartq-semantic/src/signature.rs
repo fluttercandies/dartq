@@ -91,8 +91,10 @@ use crate::model::{
 /// parallel to the names — a bound-only edit moves every dependent's
 /// raw-receiver instantiation (`instantiateToBounds`: `JSArray<T extends
 /// JSAny?>` reads a bare `JSArray` as `JSArray<JSAny?>`) and so the
-/// extension faces that apply to it.
-pub const SIGNATURE_VERSION: u32 = 11;
+/// extension faces that apply to it. v12: a member's own type-parameter
+/// bounds — a bound-only edit moves every dependent member send whose
+/// unconstrained parameter settles to it.
+pub const SIGNATURE_VERSION: u32 = 12;
 
 /// The 128-bit blake3 digest of a file's canonical element face — the same
 /// width family as [`dartq_source::ContentId`].
@@ -405,6 +407,14 @@ impl<'a> Face<'a> {
         self.uint(u64::from(entry.type_params));
         for param in &entry.type_param_names {
             self.name(*param);
+        }
+        // Written bounds only: a bound edit moves the dependents' settled
+        // member-send results; an unbounded list hashes as before.
+        for (index, bound) in entry.type_param_bounds.iter().enumerate() {
+            if *bound != Ty::Dynamic {
+                self.usize(index);
+                self.ty(*bound);
+            }
         }
         self.ty(entry.var_ty);
         self.ty(entry.return_ty);

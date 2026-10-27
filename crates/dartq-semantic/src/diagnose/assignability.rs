@@ -1132,6 +1132,49 @@ impl<'a> Engine<'a> {
             Some(params) if !params.is_empty() => params,
             _ => {
                 let raw = self.raw_receiver_env(recv);
+                if raw.is_empty()
+                    && let Receiver::Typed {
+                        ty: Ty::Named { args, .. },
+                        ..
+                    } = *recv
+                    && args != ArgListId::EMPTY
+                    && let Some(found) = resolve_container(
+                        self.graph,
+                        self.namespaces,
+                        self.index,
+                        self.lib,
+                        self.file,
+                        container,
+                    )
+                    .map(|(found, _)| found)
+                    .or_else(|| {
+                        // A head reached only through a foreign member
+                        // signature (not importable here): the member walk
+                        // that just resolved the accessor recorded its
+                        // declaring file.
+                        (self.member_faces.last_origin() == Some(container))
+                            .then(|| self.member_faces.last_found_file())
+                            .flatten()
+                            .and_then(|file| self.index.get(file)?.container(container))
+                    })
+                {
+                    // A foreign container's own spellings (its element
+                    // model's declaration order) pair the receiver's
+                    // written arguments: a `T?` face lifts, and a compound
+                    // face (`Res<V>? get result` over `Obs<N>`) substitutes
+                    // to the receiver's instantiation (`Res<N>?`).
+                    let written = self.boundary.pool().get(args).to_vec();
+                    if found.type_param_names.len() == written.len() {
+                        let map: Vec<(StringId, Ty)> =
+                            found.type_param_names.iter().copied().zip(written).collect();
+                        if let Some(lifted) = self.lift_nullable_param(declared, &map) {
+                            return lifted;
+                        }
+                        if let Some(out) = self.subst_params(declared, &map) {
+                            return out;
+                        }
+                    }
+                }
                 return if raw.is_empty() {
                     declared
                 } else {
@@ -1164,7 +1207,34 @@ impl<'a> Engine<'a> {
             .zip(recv_args.iter())
             .map(|((param, ..), arg)| (*param, *arg))
             .collect();
+        if let Some(lifted) = self.lift_nullable_param(declared, &map) {
+            return lifted;
+        }
         self.subst_params(declared, &map).unwrap_or(Ty::UNKNOWN)
+    }
+
+    /// A bare nullable parameter face (`T? get value`) read through a
+    /// receiver whose argument for `T` is a named type (`R<N>`, `R<C<int>>`)
+    /// reads that type made nullable — `N?`, `C<int>?` — the substitution
+    /// [`Self::subst_params`] declines for the `?` leaf (its formal/override
+    /// consumers keep that posture). A scope-parameter argument's
+    /// nullability classification rides the parameter's own bound (an
+    /// invalid bound makes `N?` null-or-equivalent, the oracle's dead
+    /// `!= null` arm). This is a member READ's static type only.
+    fn lift_nullable_param(&self, declared: Ty, map: &[(StringId, Ty)]) -> Option<Ty> {
+        let Ty::Named {
+            name,
+            nullable: true,
+            args: ArgListId::EMPTY,
+        } = declared
+        else {
+            return None;
+        };
+        let (_, arg) = map.iter().find(|(param, _)| *param == name)?;
+        match *arg {
+            Ty::Named { .. } => Some(Self::nullable_form(*arg)),
+            _ => None,
+        }
     }
 
     /// The `Object` getter face for a member READ the container walk
@@ -3670,6 +3740,49 @@ impl<'a> Engine<'a> {
     /// through the boundary pool ([`Engine::covariant_args`]). `None`
     /// suppresses (under-report).
     pub(crate) fn assignable(&self, from: Ty, to: Ty, from_literal: bool) -> Option<bool> {
+        // Left FutureOr (`subtype.dart:371-385`, ahead of Right FutureOr):
+        // `FutureOr<S0> <: T1` iff `S0 <: T1` and `Future<S0> <: T1`; a
+        // `FutureOr<S0>?` source is Left Nullable over it (`Null <: T1` as
+        // well). Without this arm a FutureOr source only ever met the
+        // same-head matrix, so `FutureOr<S<int>>` failed against itself.
+        if let Ty::Named {
+            name,
+            nullable,
+            args,
+        } = from
+            && name == self.intern("FutureOr")
+            && !matches!(to, Ty::Unknown)
+        {
+            let value_ty = self
+                .boundary
+                .pool()
+                .get(args)
+                .first()
+                .copied()
+                .unwrap_or(Ty::Dynamic);
+            if value_ty == Ty::Unknown {
+                return None;
+            }
+            let future_ty = Ty::Named {
+                name: self.intern("Future"),
+                nullable: false,
+                args,
+            };
+            let null_leg = if nullable {
+                self.assignable(Ty::Null, to, false)
+            } else {
+                Some(true)
+            };
+            return match (
+                self.assignable(value_ty, to, from_literal),
+                self.assignable(future_ty, to, from_literal),
+                null_leg,
+            ) {
+                (Some(true), Some(true), Some(true)) => Some(true),
+                (Some(false), _, _) | (_, Some(false), _) | (_, _, Some(false)) => Some(false),
+                _ => None,
+            };
+        }
         // The `FutureOr<T>` union rule (`subtype.dart`'s FutureOr case):
         // `S <: FutureOr<T>` iff `S <: Future<T>` or `S <: T` — a nominal
         // head question the matrix cannot ask (Future and FutureOr are

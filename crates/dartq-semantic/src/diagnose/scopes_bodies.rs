@@ -2625,6 +2625,17 @@ impl<'a> Engine<'a> {
                                 .map(|p| (self.intern(p), None, false))
                                 .collect::<Vec<_>>()
                         })
+                })
+                .or_else(|| {
+                    // A cross-file container (`StreamController<T>.stream`
+                    // read in a user unit): its declaring unit's parameter
+                    // spellings instantiate the getter's declared return.
+                    self.foreign_container_params(*type_name).map(|names| {
+                        names
+                            .into_iter()
+                            .map(|p| (p, None, false))
+                            .collect::<Vec<_>>()
+                    })
                 }) {
                 Some(params) if !params.is_empty() => {
                     let Ty::Named { args: recv_args, .. } = *ty else {

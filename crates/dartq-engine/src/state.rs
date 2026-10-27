@@ -145,7 +145,12 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// but a payload the old producer wrote would keep the bounded faces
 /// dropping on raw receivers, so the version moves. The same train raised
 /// `dartq_semantic::SIGNATURE_VERSION` to 11 (the bounds hash into the
-/// element face).
+/// element face). v18: member entries carry their own type-parameter
+/// bounds (`PersistedMemberEntry::type_param_bounds`) — an unconstrained
+/// member-send parameter settles to its bound — and an unannotated field
+/// whose initializer is an explicitly instantiated creation (`final o =
+/// Obs<N>();`) captures `Obs<N>`; both change the capture output an old
+/// payload holds, so the version moves (and `SIGNATURE_VERSION` to 12).
 ///
 /// # Bump contract (structural guard)
 ///
@@ -164,7 +169,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// version too.) The bump lane also forks on capture-behavior changes with
 /// no layout delta: a payload the old producer wrote must not be served to
 /// a producer whose capture output diverges from it.
-const FACTS_SHAPE_VERSION: u32 = 17;
+const FACTS_SHAPE_VERSION: u32 = 18;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component of
 /// `EngineSemanticVersion`): the engine facts shape folded with

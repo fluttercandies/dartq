@@ -3152,7 +3152,7 @@ impl<'a> Engine<'a> {
     /// a user unit): the unique declaring library's unit carries the
     /// declaration, and its `type_param_names` are the send-inference
     /// domain when this-file bounds hold no capture.
-    fn foreign_container_params(&self, name: StringId) -> Option<Vec<StringId>> {
+    pub(crate) fn foreign_container_params(&self, name: StringId) -> Option<Vec<StringId>> {
         let libs = self.graph.declaring_libraries(name);
         if libs.len() != 1 {
             return None;
@@ -3208,10 +3208,69 @@ impl<'a> Engine<'a> {
             container,
         )
         .is_some_and(|(c, _)| c.members.get(&member).is_some());
+        // The method's own bounds, read like a top-level function's
+        // `exec_bounds`: an unconstrained parameter settles to its bound
+        // (`popTypedList<T extends Object>(n)` reads `List<Object>?`, the
+        // inferrer's `_chooseTypeFromConstraints` falling back to the
+        // bound). An absent bound, or one naming the method's own
+        // parameters (`T extends Comparable<T>`), stays unbounded. The
+        // fallback only answers a parameter no formal mentions (no
+        // argument can constrain it — a closure argument's return the
+        // model cannot infer would otherwise settle `Item extends
+        // ManifestItem` to the bound) on a context-free send — the whole
+        // initializer of an unannotated declaration outside any argument
+        // list (the caller already popped the send's own level); a
+        // downward context (`take(pop(n)!)`, `List<Foo> x = pop(n)`) would
+        // solve the slot from the context, which this model leaves open.
+        let context_free = self.in_initializer
+            && self.pending_decl_ty.is_none()
+            && self.arg_levels.is_empty()
+            && self.init_frame_depth == self.frames.len();
+        let formal_mentions = |param: StringId| {
+            let Some(formals) = entry.formals.as_deref() else {
+                return false;
+            };
+            let pool = self.boundary.pool();
+            formals.positional.iter().chain(formals.named.iter()).any(|formal| {
+                // An unmodeled formal type (a function-typed formal) may
+                // spell the parameter anywhere.
+                if formal.ty == Ty::Unknown {
+                    return true;
+                }
+                let mut hit = false;
+                pool.visit_named(formal.ty, &mut |named| {
+                    if let Ty::Named { name, .. } = named
+                        && name == param
+                    {
+                        hit = true;
+                    }
+                });
+                hit
+            })
+        };
+        let own_bound = |index: usize| {
+            if !context_free || formal_mentions(entry.type_param_names[index]) {
+                return None;
+            }
+            let bound = entry.type_param_bounds.get(index).copied()?;
+            if bound == Ty::Dynamic {
+                return None;
+            }
+            let mut recursive = false;
+            self.boundary.pool().visit_named(bound, &mut |named| {
+                if let Ty::Named { name, .. } = named
+                    && entry.type_param_names.contains(&name)
+                {
+                    recursive = true;
+                }
+            });
+            (!recursive).then_some(bound)
+        };
         let mut params: Vec<(StringId, Option<Ty>)> = entry
             .type_param_names
             .iter()
-            .map(|name| (*name, None))
+            .enumerate()
+            .map(|(index, name)| (*name, own_bound(index)))
             .collect();
         // The declaring container's parameters join only for the
         // receiver's own member: an inherited member's formals spell the
@@ -5761,10 +5820,8 @@ impl<'a> Engine<'a> {
         // `type_param_names` — keyed by the member walk, so a same-spelled
         // member elsewhere never lends them — plus the declaring
         // container's captured parameters, which the receiver's written
-        // instantiation seeds (`Box<int>.get()` binds `T := int`). Member
-        // type-parameter bounds are not modeled on the element entry, so
-        // every parameter lands unbounded (the under-report direction the
-        // name-keyed model already carries).
+        // instantiation seeds (`Box<int>.get()` binds `T := int`). The
+        // method's own bounds ride the entry (see `member_send_params`).
         let mut receiver_seeds: Vec<(StringId, Ty)> = Vec::new();
         if exec_params.is_none()
             && let Some(recv) = send_recv

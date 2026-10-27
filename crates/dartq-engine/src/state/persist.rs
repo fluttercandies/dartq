@@ -1045,7 +1045,8 @@ mod tests {
         r#""containers":[[0,{"kind":"Class","is_abstract":false,"is_base":false,"is_final":false,"#,
         r#""is_interface":false,"is_mixin_class":false,"superclass":null,"members":[[1,{"kind":"Method","#,
         r#""is_static":false,"is_abstract":false,"is_external":false,"is_final":false,"type_params":0,"#,
-        r#""type_param_names":[],"var_ty":"Unknown","return_ty":"Void","formals":{"positional":[{"name":2,"#,
+        r#""type_param_names":[],"type_param_bounds":[],"var_ty":"Unknown","return_ty":"Void","#,
+        r#""formals":{"positional":[{"name":2,"#,
         r#""ty":{"Named":{"name":4,"nullable":false,"args":[]}},"required":true,"covariant":false,"#,
         r#""default_value":null}],"named":[{"name":3,"ty":{"Named":{"name":4,"nullable":false,"args":[]}},"#,
         r#""required":false,"covariant":true,"default_value":5}]},"annotations":[{"name":8,"offset":0,"#,
@@ -1058,7 +1059,8 @@ mod tests {
         r#""nullable":false,"args":[{"Named":{"name":12,"nullable":false,"args":[]}}]}},"#,
         r#""type_param_names":[12],"type_param_bounds":[{"Named":{"name":4,"nullable":false,"args":[]}}],"#,
         r#""members":[[14,{"kind":"Getter","is_static":false,"is_abstract":false,"is_external":false,"#,
-        r#""is_final":false,"type_params":0,"type_param_names":[],"var_ty":"Unknown","#,
+        r#""is_final":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"#,
+        r#""var_ty":"Unknown","#,
         r#""return_ty":{"Named":{"name":4,"nullable":false,"args":[]}},"formals":null,"annotations":[],"#,
         r#""name_range":null}]]}],"duplicates":[],"arity_violations":[]}"#,
     );
@@ -1156,6 +1158,7 @@ mod tests {
                             is_final: false,
                             type_params: 0,
                             type_param_names: Vec::new(),
+                            type_param_bounds: Vec::new(),
                             var_ty: PersistedTy::Unknown,
                             return_ty: PersistedTy::Void,
                             formals: Some(Box::new(PersistedFormals {
@@ -1242,6 +1245,7 @@ mod tests {
                         is_final: false,
                         type_params: 0,
                         type_param_names: Vec::new(),
+                        type_param_bounds: Vec::new(),
                         var_ty: PersistedTy::Unknown,
                         return_ty: PersistedTy::Named {
                             name: 4,

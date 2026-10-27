@@ -973,6 +973,9 @@ impl<'a> Boundary<'a> {
         let mut copy = entry.clone();
         copy.var_ty = self.ty(owner, copy.var_ty);
         copy.return_ty = self.ty(owner, copy.return_ty);
+        for bound in copy.type_param_bounds.iter_mut() {
+            *bound = self.ty(owner, *bound);
+        }
         if let Some(formals) = &mut copy.formals {
             for formal in formals
                 .positional

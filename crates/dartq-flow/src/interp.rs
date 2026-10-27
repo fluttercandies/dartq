@@ -3341,10 +3341,21 @@ impl Interp<'_> {
         // (upstream `_inferForEachVariable` reads the resolved element
         // type; the name-level face of `Iterable<E>`'s `E` is the
         // iterable's first written argument).
+        // An iterable typed as the invalid face iterates the invalid face:
+        // `asInstanceOf(Iterable)` on `InvalidType` answers null and the
+        // official `_computeForEachElementType` returns `InvalidType`
+        // (upstream Dart SDK source, pkg/analyzer/lib/src/dart/resolver/
+        // for_resolver.dart:134-155).
         let mut element_ty = self
             .exprs
             .pop()
             .and_then(|iterable| {
+                if self
+                    .ops
+                    .is_invalid_typed(iterable.ty, iterable.args, self.args, self.names)
+                {
+                    return Some((iterable.ty, iterable.args));
+                }
                 self.args
                     .get(iterable.args as usize)
                     .and_then(|args| args.first())

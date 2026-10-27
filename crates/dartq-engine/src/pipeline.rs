@@ -1679,7 +1679,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                     .collect();
                 if !face_only.is_empty() {
                     let file = state.files.intern(Path::new(&format!("<dart:{uri}>")));
-                    builder.unit(node, file);
+                    builder.face_unit(node, file);
                     for name in face_only {
                         builder.declare(node, name, file);
                     }
@@ -1692,7 +1692,7 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
                 // preference reads the declaring library's URI (a `dart:`
                 // name loses to a same-spelling package declaration,
                 // `element/scope.dart:811-832`).
-                builder.unit(node, file);
+                builder.face_unit(node, file);
                 for name in *names {
                     builder.declare(node, state.strings.intern(name), file);
                 }

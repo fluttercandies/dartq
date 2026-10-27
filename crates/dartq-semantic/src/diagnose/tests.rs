@@ -8758,6 +8758,7 @@ fn overridden_member_context_degrades_on_a_missing_span() {
         is_final: false,
         type_params: 0,
         type_param_names: Box::new([]),
+        type_param_bounds: Box::default(),
         var_ty: Ty::UNKNOWN,
         return_ty: Ty::UNKNOWN,
         formals: None,

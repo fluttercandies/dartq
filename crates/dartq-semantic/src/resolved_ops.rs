@@ -506,6 +506,7 @@ impl LibraryTypes {
         // `is File` promotion the oracle makes (the census's
         // blaze_watcher rows: first-writer-wins made the wrong `File`
         // answer `is_subtype(File, Resource)` false).
+        let mut face_only: Vec<StringId> = Vec::new();
         for edge in graph.import_edges(lib) {
             let Some(target) = edge.target else {
                 continue;
@@ -533,10 +534,23 @@ impl LibraryTypes {
                         // The name resolves but its declaring file
                         // carries no model, or the model holds no
                         // container under it — suppress, never
-                        // borrow a same-named decl.
-                        registry.non_containers.insert(name);
+                        // borrow a same-named decl. An SDK names-only
+                        // face entry is no verdict: it stands in for a
+                        // declaration another import may carry (the
+                        // namespace merge treats both as one element), so
+                        // it leaves the slot open until every edge ran.
+                        if graph.is_face_file(entry.file) {
+                            face_only.push(name);
+                        } else {
+                            registry.non_containers.insert(name);
+                        }
                     }
                 }
+            }
+        }
+        for name in face_only {
+            if !registry.registry.contains_key(&name) {
+                registry.non_containers.insert(name);
             }
         }
         // The prefixed spellings' joined heads (`io.File`): the diagnose

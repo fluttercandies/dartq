@@ -1411,6 +1411,12 @@ pub struct MemberEntry {
     /// The member's own type-parameter names, in declaration order (the
     /// `wrong_number_of_type_arguments_function` display renders them).
     pub type_param_names: Box<[StringId]>,
+    /// Each own type parameter's declared bound, parallel to
+    /// [`Self::type_param_names`]; [`Ty::Dynamic`] for an absent bound.
+    /// An unconstrained parameter of a member send settles to it
+    /// (`popTypedList<T extends Object>(n)` answers `List<Object>?`).
+    /// Empty when decoded from a pre-field payload (unbounded).
+    pub type_param_bounds: Box<[Ty]>,
     /// Declared type of a field (getters/setters/methods: [`Ty::Unknown`]).
     pub var_ty: Ty,
     /// Declared return type of a method/getter/setter (fields:
@@ -2188,6 +2194,7 @@ mod tests {
             is_final: false,
             type_params: 0,
             type_param_names: Box::new([]),
+            type_param_bounds: Box::default(),
             var_ty: Ty::UNKNOWN,
             return_ty: Ty::UNKNOWN,
             formals: Some(Box::new(formals_of(&fix.strings, &[], &[]))),

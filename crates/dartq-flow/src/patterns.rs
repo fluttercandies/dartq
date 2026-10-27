@@ -865,6 +865,18 @@ impl Interp<'_> {
         })
     }
 
+    /// Whether the open standalone context (if-case, declaration) matches a
+    /// non-reference value whose static type is the invalid face.
+    fn standalone_scrutinee_invalid(&self) -> bool {
+        self.pattern.as_ref().is_some_and(|p| {
+            matches!(p.kind, PatternKind::IfCase | PatternKind::Decl)
+                && p.scrutinee.is_none()
+                && p.scrutinee_ty.is_some_and(|(ty, args)| {
+                    self.ops.is_invalid_typed(ty, args, self.args, self.names)
+                })
+        })
+    }
+
     /// The official `_pushPattern` starts every case's working unmatched
     /// chain UNREACHABLE (flow_analysis.dart:9376-9380), and an
     /// alternative whose pattern provably covers leaves it that way —
@@ -901,6 +913,14 @@ impl Interp<'_> {
             && self.ops.is_invalid_typed(ty, args, self.args, self.names)
         {
             self.vacuous_cover_kills_chain();
+            return;
+        }
+        // A standalone context's (if-case) non-reference matched value —
+        // `this` in an extension on an unresolved type, `x.foo` off an
+        // invalid receiver: the same vacuous cover, and the context's
+        // chain is already seeded unreachable, so skipping the join below
+        // keeps the else arm dead.
+        if self.standalone_scrutinee_invalid() {
             return;
         }
         // A property scrutinee's type test is refutable like a variable's

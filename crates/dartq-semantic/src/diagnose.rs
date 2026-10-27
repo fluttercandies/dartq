@@ -4054,6 +4054,23 @@ fn switch_clause_absorber(
         ) {
             p += 1;
         }
+        // A parenthesized pattern (`(String s)`) is its inner pattern; a
+        // record pattern (a depth-1 `,` inside the group) is not stepped.
+        while slice
+            .get(p)
+            .is_some_and(|t| t.kind == dartq_scanner::TokenKind::OpenParen)
+            && let Some(close) = tokens.matching_end(p)
+            && close > p + 1
+            && {
+                let mut depth = 0i32;
+                !slice[p + 1..close].iter().any(|t| {
+                    depth += group_depth_step(t.kind);
+                    depth == 0 && t.kind == dartq_scanner::TokenKind::Comma
+                })
+            }
+        {
+            p += 1;
+        }
         if matches!(
             slice.get(p).map(|t| t.kind),
             Some(

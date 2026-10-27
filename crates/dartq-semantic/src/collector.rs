@@ -217,6 +217,8 @@ struct PendingMember {
     type_params: u16,
     /// The member's own type-parameter names, in declaration order.
     type_param_names: Vec<StringId>,
+    /// Their declared bounds, parallel to `type_param_names`.
+    type_param_bounds: Vec<Ty>,
     return_ty: Ty,
     formals: Option<Box<Formals>>,
     /// The member's own metadata star, claimed at `begin_method` (the star
@@ -848,13 +850,14 @@ impl<'src, 'tab> Builder<'src, 'tab> {
     /// The same byte-scan posture as [`Self::typed_literal_initializer_ty`]:
     /// a single capitalized identifier (optionally after `const`/`new`)
     /// directly followed by a balanced argument group that ends the
-    /// declarator (`;`/`,`). Named constructors and static calls
-    /// (`Foo.parse(…)` may return anything), written or inferred type
+    /// declarator (`;`/`,`). Explicit type arguments ride the head
+    /// (`final o = Obs<N>();` declares `Obs<N>`). Named constructors and
+    /// static calls (`Foo.parse(…)` may return anything), inferred type
     /// arguments, and every other shape keep the unknown face. A head the
     /// scope resolves to a non-class or a generic class is filtered at the
     /// use site ([`Engine::typed_local`]'s consumers treat an unprovable
     /// head as silent).
-    fn creation_initializer_ty(&self, name_end: u32) -> Option<Ty> {
+    fn creation_initializer_ty(&mut self, name_end: u32) -> Option<Ty> {
         let bytes = self.source.as_bytes();
         let mut i = name_end as usize;
         Self::skip_literal_ws(bytes, &mut i);
@@ -875,16 +878,26 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             }
         }
         let start = i;
-        if !bytes.get(start).is_some_and(u8::is_ascii_uppercase) {
+        // A class-like head: capitalized, optionally behind the `$`
+        // marker (`$Observable`).
+        let lead = usize::from(bytes.get(start) == Some(&b'$'));
+        if !bytes.get(start + lead).is_some_and(u8::is_ascii_uppercase) {
             return None;
         }
         while bytes
             .get(i)
-            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$')
         {
             i += 1;
         }
         let head = std::str::from_utf8(&bytes[start..i]).ok()?;
+        // Explicit type arguments (`Obs<N>()`) are the creation's own
+        // instantiation: the static type is `Obs<N>` verbatim.
+        let explicit = if bytes.get(i) == Some(&b'<') {
+            Some(Self::parse_literal_spellings(bytes, &mut i)?)
+        } else {
+            None
+        };
         if bytes.get(i) != Some(&b'(') {
             return None;
         }
@@ -918,7 +931,17 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         if !matches!(bytes.get(i), Some(b';' | b',')) {
             return None;
         }
-        Some(Ty::named(self.strings.intern(head)))
+        let head = self.strings.intern(head);
+        Some(match explicit {
+            Some(spellings) => {
+                let args: Vec<Ty> = spellings
+                    .into_iter()
+                    .map(|spelling| self.literal_spelling_ty(spelling))
+                    .collect();
+                self.type_args.named(head, false, &args)
+            }
+            None => Ty::named(head),
+        })
     }
 
     fn skip_literal_ws(bytes: &[u8], i: &mut usize) {
@@ -1616,9 +1639,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         if let Some(pending) = &mut self.pending_member {
             pending.type_params = count;
             pending.type_param_names = std::mem::take(&mut self.type_var_group);
-            // The member face keeps only the names; the bounds buffer
-            // leaves with the group it mirrors (no bound consumer here).
-            std::mem::take(&mut self.type_var_bounds);
+            pending.type_param_bounds = std::mem::take(&mut self.type_var_bounds);
         } else if let Some(pending) = &mut self.pending_top {
             pending.type_params = count;
             // A generic top-level function's spellings ride the declaration
@@ -2399,10 +2420,21 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     // `Map<String, Command<T>>`; every use site's member
                     // table then carries it).
                     if ty == Ty::UNKNOWN
-                        && let Some(inferred) = builder
-                            .numeric_initializer_ty(range.end())
-                            .or_else(|| builder.typed_literal_initializer_ty(range.end()))
-                            .or_else(|| builder.creation_initializer_ty(range.end()))
+                        && let Some(inferred) = {
+                            // The byte scanners read source bytes; the name
+                            // span is UTF-16 (a non-ASCII character earlier
+                            // in the unit shifts the two apart).
+                            let name_end = if builder.source.is_ascii() {
+                                range.end()
+                            } else {
+                                dartq_source::utf16_offset_to_byte(builder.source, range.end())
+                                    as u32
+                            };
+                            builder
+                                .numeric_initializer_ty(name_end)
+                                .or_else(|| builder.typed_literal_initializer_ty(name_end))
+                                .or_else(|| builder.creation_initializer_ty(name_end))
+                        }
                     {
                         ty = inferred;
                     }
@@ -2437,6 +2469,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                     is_final,
                                     type_params: 0,
                                     type_param_names: Box::default(),
+                                    type_param_bounds: Box::default(),
                                     var_ty: ty,
                                     return_ty: Ty::UNKNOWN,
                                     formals: None,
@@ -2479,6 +2512,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                                 is_final: false,
                                 type_params: 0,
                                 type_param_names: Box::default(),
+                                type_param_bounds: Box::default(),
                                 var_ty: Ty::UNKNOWN,
                                 return_ty: Ty::UNKNOWN,
                                 formals: None,
@@ -2730,6 +2764,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             has_body: false,
             type_params: 0,
             type_param_names: Vec::new(),
+            type_param_bounds: Vec::new(),
             return_ty: Ty::UNKNOWN,
             formals: None,
             annotations,
@@ -2781,6 +2816,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     is_final: false,
                     type_params: pending.type_params,
                     type_param_names: pending.type_param_names.into_boxed_slice(),
+                    type_param_bounds: pending.type_param_bounds.into_boxed_slice(),
                     var_ty: Ty::UNKNOWN,
                     return_ty: pending.return_ty,
                     formals: pending.formals,
@@ -3378,6 +3414,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 is_final: false,
                 type_params: 0,
                 type_param_names: Box::default(),
+                type_param_bounds: Box::default(),
                 var_ty: ty,
                 return_ty: Ty::UNKNOWN,
                 formals: None,
@@ -3468,6 +3505,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                 is_final: true,
                 type_params: 0,
                 type_param_names: Box::default(),
+                type_param_bounds: Box::default(),
                 var_ty: ty,
                 return_ty: Ty::UNKNOWN,
                 formals: None,

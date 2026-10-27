@@ -411,6 +411,21 @@ fn fold(graph: &LibraryGraph, hits: impl Iterator<Item = NamespaceEntry>) -> Loo
                     if !existing_sdk && hit_sdk {
                         continue;
                     }
+                    // Two SDK entries where one is a names-only face: the
+                    // face stands in for an SDK element re-exported from a
+                    // library the element model carries (`dart:core`'s
+                    // `Future` is `dart:async`'s class), so both are the one
+                    // element — the declaration-backed entry wins.
+                    if existing_sdk && hit_sdk {
+                        match (is_face(graph, &existing), is_face(graph, &hit)) {
+                            (true, false) => {
+                                first = Some(hit);
+                                continue;
+                            }
+                            (false, true) => continue,
+                            _ => {}
+                        }
+                    }
                 }
                 if !rest.contains(&hit) {
                     rest.push(hit);
@@ -441,6 +456,12 @@ fn is_sdk(graph: &LibraryGraph, entry: &NamespaceEntry) -> bool {
     graph
         .library_of_file(file)
         .is_some_and(|lib| graph.uri(lib).starts_with("dart:"))
+}
+
+/// Whether `entry` is declared on a synthetic SDK names-only face file
+/// ([`LibraryGraph::is_face_file`]).
+fn is_face(graph: &LibraryGraph, entry: &NamespaceEntry) -> bool {
+    matches!(*entry, NamespaceEntry::Decl(file) if graph.is_face_file(file))
 }
 
 #[cfg(test)]

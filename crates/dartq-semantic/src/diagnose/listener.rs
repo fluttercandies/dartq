@@ -1850,8 +1850,15 @@ impl ParserListener for DiagnoseListener<'_> {
                 // keys the declaring local's NAME-TOKEN offset — the
                 // scoped locals-stack index aliases across scopes once
                 // the frames close, and the re-bind map must stay
-                // per-declaration.
+                // per-declaration. A cast-typed initializer (`var t =
+                // p.first as T`) owes none: the cast decided the type, and
+                // an unresolvable target would let the accessor's face
+                // replace it.
                 if let Some(expr_row) = engine.rows.get(expr)
+                    && !engine.cast_rewrites.iter().any(|(span, _)| {
+                        span.offset <= expr_row.range.offset
+                            && span.end() >= expr_row.range.end()
+                    })
                     && engine
                         .promoted_recv_reads
                         .binary_search_by(|(member, _)| member.cmp(&expr_row.range.offset))
@@ -5304,6 +5311,15 @@ impl ParserListener for DiagnoseListener<'_> {
 
         let engine = &mut self.engine;
         engine.switch.pattern_depth += 1;
+        // A root pattern starts a fresh flat-destructure window: a case
+        // or if-case pattern never reaches `destructure_record`, so its
+        // marks (an object pattern's dirty bit, its binders) must not
+        // leak into the next declaration's bind.
+        if engine.switch.pattern_depth == 1 {
+            engine.pattern_bind_vars.clear();
+            engine.pattern_bind_records = 0;
+            engine.pattern_bind_dirty = false;
+        }
         // A pattern opening while a condition window is armed marks an
         // if-case: the checkpoint's plain-condition face is routed away
         // upstream (`analyzeIfCaseStatement`/`analyzeIfCaseElement` never

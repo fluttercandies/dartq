@@ -543,6 +543,8 @@ pub struct LibraryGraphBuilder<'t> {
     strings: &'t StringTable,
     nodes: Vec<NodeBuilder>,
     by_uri: FxHashMap<Box<str>, LibraryId>,
+    /// The synthetic SDK face files ([`Self::face_unit`]).
+    face_files: FxHashSet<FileId>,
 }
 
 struct NodeBuilder {
@@ -575,6 +577,7 @@ impl<'t> LibraryGraphBuilder<'t> {
             strings,
             nodes: Vec::new(),
             by_uri: FxHashMap::default(),
+            face_files: FxHashSet::default(),
         }
     }
 
@@ -612,6 +615,17 @@ impl<'t> LibraryGraphBuilder<'t> {
     /// [`LibraryGraph::unit_files`].
     pub fn unit(&mut self, lib: LibraryId, file: FileId) {
         self.nodes[lib.index() as usize].units.push(file);
+    }
+
+    /// [`Self::unit`] for an SDK library's synthetic names-only face file:
+    /// its declarations stand in for SDK elements the element model does
+    /// not carry under that library (`dart:core`'s `Future` is
+    /// `dart:async`'s class re-exported). The namespace merge treats a face
+    /// entry and a same-named SDK declaration as one element
+    /// ([`LibraryGraph::is_face_file`]).
+    pub fn face_unit(&mut self, lib: LibraryId, file: FileId) {
+        self.unit(lib, file);
+        self.face_files.insert(file);
     }
 
     /// Records `lib`'s declared `library <name>;` name — the oracle's
@@ -713,6 +727,7 @@ impl<'t> LibraryGraphBuilder<'t> {
     #[must_use]
     pub fn finish(self) -> LibraryGraph {
         let strings = self.strings;
+        let face_files = self.face_files;
         // The wildcard id: a prefix registered under `_` is gated out of the
         // bare-name prefix branch (`_shouldTryPrefixElement`,
         // `element/scope.dart:486-494`; `wildcard_variables` is default-on
@@ -865,6 +880,7 @@ impl<'t> LibraryGraphBuilder<'t> {
             nodes,
             declarations,
             file_lib,
+            face_files,
         }
     }
 }
@@ -993,6 +1009,8 @@ pub struct LibraryGraph {
     /// [`LibraryGraphBuilder::finish`]; dual registration resolves first-wins
     /// by registration order (the accessor doc pins the terms).
     file_lib: FxHashMap<FileId, LibraryId>,
+    /// The synthetic SDK face files ([`LibraryGraph::is_face_file`]).
+    face_files: FxHashSet<FileId>,
 }
 
 struct LibraryNode {
@@ -1095,6 +1113,13 @@ impl LibraryGraph {
     #[must_use]
     pub fn library_of_file(&self, file: FileId) -> Option<LibraryId> {
         self.file_lib.get(&file).copied()
+    }
+
+    /// Whether `file` is a synthetic SDK names-only face file
+    /// ([`LibraryGraphBuilder::face_unit`]).
+    #[must_use]
+    pub fn is_face_file(&self, file: FileId) -> bool {
+        self.face_files.contains(&file)
     }
 
     /// The resolved import edges of `lib`, in directive source order.
