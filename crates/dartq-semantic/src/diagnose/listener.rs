@@ -5877,8 +5877,19 @@ impl ParserListener for DiagnoseListener<'_> {
         // `PatternVariableDeclaration` group reports all-or-nothing.
         if let Some(name) = engine.name_of(variable) {
             engine.last_pattern_variable = Some((name, variable.range));
+            // A binder in an if-case condition that shadows an outer
+            // tracked local retires with its case scope: a read after the
+            // statement counts for the outer declaration
+            // (`T? e; if (x case C(:var e)) {...} print(e);`).
+            let shadows_local = engine.cond_mark.is_some()
+                && engine.cond_case
+                && engine.resolve_local(name).is_some();
             engine.note_pattern_shadow(name);
             engine.add_tracked_local(name, variable.range, LocalKind::PatternVariable);
+            if shadows_local {
+                let index = engine.locals.len() - 1;
+                engine.note_pattern_binder(index, variable.range.offset);
+            }
             // The DeclaredVariable kind of `checkPatternNeverMatchesValueType`
             // (type_analyzer.dart:723-756) reads the still-armed declared
             // type before the binding consumes it, anchored at

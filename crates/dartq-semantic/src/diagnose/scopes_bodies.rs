@@ -116,6 +116,7 @@ impl<'a> Engine<'a> {
                 kind: LocalKind::LocalFunction,
                 uses: 0,
                 group: None,
+                retired: false,
             });
         }
     }
@@ -588,6 +589,7 @@ impl<'a> Engine<'a> {
                     .iter()
                     .rposition(|d| {
                         d.name == name
+                            && !d.retired
                             && match d.group {
                                 Some(g) if g >= PATTERN_ARM_SCOPE_BASE => {
                                     let slot = (u32::MAX - g) as usize;
@@ -895,6 +897,7 @@ impl<'a> Engine<'a> {
             kind,
             uses: 0,
             group,
+            retired: false,
         });
     }
 

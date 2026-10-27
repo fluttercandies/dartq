@@ -99,10 +99,19 @@ impl Interp<'_> {
                             // reachability), and the region's own dead row
                             // stays the only reachability face.
                             if ty != declared {
+                                // A nullability-only promotion standing past a
+                                // write our tables could not type (`v = q.m()`
+                                // over a receiver only the flow promotes) may
+                                // be the oracle's demotion: the opaque row
+                                // keeps the non-null consumers silent without
+                                // certifying non-null to the null-aware faces.
+                                let opaque = self.unresolved_writes.contains(&var)
+                                    && declared.nullable
+                                    && ty == declared.non_null();
                                 self.emit(FlowFact::PromotedRead {
                                     span: *token,
-                                    ty,
-                                    args,
+                                    ty: if opaque { Ty::UNKNOWN } else { ty },
+                                    args: if opaque { crate::ty::EMPTY_ARGS } else { args },
                                 });
                             } else if self.unresolved_writes.contains(&var)
                                 && declared.nullable

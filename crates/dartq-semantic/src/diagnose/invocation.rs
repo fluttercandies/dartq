@@ -2754,8 +2754,10 @@ impl<'a> Engine<'a> {
             if !matches!(decl.kind, MicroKind::TopLevelFn) {
                 return None;
             }
-            // A zero-formal declaration (`int top() => 0;`) carries no
-            // captured formals: the empty shape is the signature.
+            // A top-level getter shares the tag but captures no formal
+            // group at all (a zero-parameter function captures an empty
+            // one): its bare read is the getter's value, never a tear-off.
+            decl.formals.as_ref()?;
             let formals = decl.formals.as_deref();
             let required = formals
                 .map(|formals| {
@@ -5222,6 +5224,13 @@ impl<'a> Engine<'a> {
                         self.fn_param_sigs
                             .get(&row.name)
                             .map(|sig| (sig.formals(self.intern("")), sig.clone()))
+                    } else if self.fn_param_sigs.contains_key(&row.name) {
+                        // A parameter-claimed spelling with no frame
+                        // binding it here is another executable's formal
+                        // (`rel(int Function() topF)` beside a call of the
+                        // top-level `topF`): the out-of-scope parameter
+                        // must not lend its signature.
+                        None
                     } else {
                         self.fn_var_sigs
                             .get(&row.name)

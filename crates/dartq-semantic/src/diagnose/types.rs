@@ -1266,6 +1266,9 @@ pub(crate) struct LocalDecl {
     pub(crate) uses: u32,
     /// The pattern-variable-declaration group (`None` = independent).
     pub(crate) group: Option<u32>,
+    /// An if-case binder whose case scope closed: later reads of the
+    /// spelling resolve past it to the outer declaration it shadowed.
+    pub(crate) retired: bool,
 }
 
 /// An unannotated collection literal's element face: the shape the return
@@ -2220,6 +2223,11 @@ pub(crate) struct Engine<'a> {
     /// The open `if` statements' case scopes, innermost last; restored
     /// when the then statement ends.
     pub(crate) if_case_scopes: Vec<Vec<(StringId, Option<Ty>, bool)>>,
+    /// The current `if` condition's shadowing binders (their `locals`
+    /// indices), and the open statements' twins: a binder that shadowed an
+    /// outer tracked local retires when its case scope closes.
+    pub(crate) pattern_shadow_binders: Vec<(usize, u32)>,
+    pub(crate) if_case_binders: Vec<Vec<(usize, u32)>>,
     /// The open switch members' case scopes, innermost last (the arm
     /// counterpart of [`Self::if_case_scopes`]): a `case Sub x:` binder
     /// shadows only inside its own member — later members' reads of the

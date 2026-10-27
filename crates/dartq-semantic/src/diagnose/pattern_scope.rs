@@ -93,6 +93,14 @@ impl Engine<'_> {
     /// statement's case scope.
     pub(crate) fn if_condition_begin(&mut self) {
         self.pattern_shadows.clear();
+        self.pattern_shadow_binders.clear();
+    }
+
+    /// A pattern binder just joined `locals` at `index` after
+    /// [`Self::note_pattern_shadow`] found its spelling already tracked:
+    /// the if-case scope retires it at close.
+    pub(crate) fn note_pattern_binder(&mut self, index: usize, anchor: u32) {
+        self.pattern_shadow_binders.push((index, anchor));
     }
 
     /// The then statement opens: the condition's pattern shadows become
@@ -100,6 +108,8 @@ impl Engine<'_> {
     pub(crate) fn if_then_begin(&mut self) {
         let shadows = std::mem::take(&mut self.pattern_shadows);
         self.if_case_scopes.push(shadows);
+        let binders = std::mem::take(&mut self.pattern_shadow_binders);
+        self.if_case_binders.push(binders);
     }
 
     /// The then statement ends (an else follows): the case scope closes.
@@ -108,12 +118,32 @@ impl Engine<'_> {
             let shadows = std::mem::take(top);
             self.restore_var_types(&shadows);
         }
+        if let Some(top) = self.if_case_binders.last_mut() {
+            let binders = std::mem::take(top);
+            self.retire_binders(&binders);
+        }
     }
 
     /// The whole statement ends: a still-open case scope (no else) closes.
     pub(crate) fn if_statement_end(&mut self) {
         if let Some(shadows) = self.if_case_scopes.pop() {
             self.restore_var_types(&shadows);
+        }
+        if let Some(binders) = self.if_case_binders.pop() {
+            self.retire_binders(&binders);
+        }
+    }
+
+    /// Retires closed-scope binders still standing in `locals` (a frame pop
+    /// may already have truncated them — the index then names a later
+    /// entry, so the spelling and anchor must still match).
+    fn retire_binders(&mut self, binders: &[(usize, u32)]) {
+        for &(index, anchor) in binders {
+            if let Some(decl) = self.locals.get_mut(index)
+                && decl.range.offset == anchor
+            {
+                decl.retired = true;
+            }
         }
     }
 

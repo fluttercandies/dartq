@@ -178,6 +178,8 @@ impl<'a> Engine<'a> {
             field_init_this_rows: FxHashSet::default(),
             pattern_shadows: Vec::new(),
             if_case_scopes: Vec::new(),
+            pattern_shadow_binders: Vec::new(),
+            if_case_binders: Vec::new(),
             switch_arm_scopes: Vec::new(),
             pending_init_super: Vec::new(),
             init_item_head: None,
