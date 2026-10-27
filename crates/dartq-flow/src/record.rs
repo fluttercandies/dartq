@@ -103,6 +103,13 @@ pub struct Flow<'t> {
     /// replay. Entries whose `this` never replays are inert (bounded by
     /// the unit's `this`-read count).
     staged_this: FxHashMap<u32, crate::ty::Ty>,
+    /// Implicit-this member reads' declared faces (the #2292 sibling):
+    /// a bare identifier the scope cannot answer resolves to an instance
+    /// field/getter of the enclosing container — the semantic layer
+    /// stages that member's declared type keyed on the read's offset, so
+    /// the flow's unknown-read arm answers on the real element (a switch
+    /// scrutinee over the bare read closes its exhaustiveness verdict).
+    staged_this_members: FxHashMap<u32, crate::ty::Ty>,
     /// The most recent label-reference identifier (a break/continue
     /// target's name, consumed by the next break/continue event).
     pending_label_ref: Option<u32>,
@@ -279,6 +286,7 @@ impl<'t> Flow<'t> {
             staged_rhs: FxHashMap::default(),
             staged_calls: FxHashMap::default(),
             staged_this: FxHashMap::default(),
+            staged_this_members: FxHashMap::default(),
             extension_on_head: None,
             in_extension_header: false,
             pending_label_ref: None,
@@ -771,6 +779,14 @@ impl<'t> Flow<'t> {
         self.staged_this.insert(token_offset, ty);
     }
 
+    /// Stages one implicit-this member read's declared face (the
+    /// [`Flow::stage_this_type`] sibling): adopted by the flow's
+    /// unresolved-bare-read arm at the same offset. Shapes the flow
+    /// lattice cannot spell never arrive (the stager drops them).
+    pub fn stage_this_member_type(&mut self, token_offset: u32, ty: crate::ty::Ty) {
+        self.staged_this_members.insert(token_offset, ty);
+    }
+
     /// Records the `handleExit` contract: a subexpression's static type is
     /// Never, so the flow state goes unreachable from the expression's end
     /// (official `FlowAnalysis.handleExit`, flow_analysis.dart:919-925).
@@ -870,6 +886,7 @@ impl<'t> Flow<'t> {
         // The staged `this` read types (#2292) — read-only here, adopted
         // at `Ev::This` when the fold's own answer is the unknown face.
         interp.staged_this = &self.staged_this;
+        interp.staged_this_members = &self.staged_this_members;
         // The staged invocation-result types (#2567 R18) — read-only
         // here, adopted at the send fold when its own callee read is an
         // unknown face.

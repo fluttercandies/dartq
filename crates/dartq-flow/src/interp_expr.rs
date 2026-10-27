@@ -218,6 +218,19 @@ impl Interp<'_> {
                             } else {
                                 Ty::UNKNOWN_NULLABLE
                             };
+                            // The implicit-this member's declared face
+                            // (the #2292 sibling): the semantic layer
+                            // staged the field/getter's type at this
+                            // offset — the bare read's own answer when no
+                            // property promotion stands (a promotion keeps
+                            // its non-null unknown face; the staged row is
+                            // the declared one).
+                            if !promoted
+                                && let Some(&staged) =
+                                    self.staged_this_members.get(&token.range.offset)
+                            {
+                                expr.ty = staged;
+                            }
                             // The implicit-`this` invalid face: inside an
                             // extension whose written `on` type resolves
                             // nowhere (the recorder staged it at this

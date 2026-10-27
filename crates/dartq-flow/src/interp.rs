@@ -891,6 +891,10 @@ pub(crate) struct Interp<'o> {
     /// real type. Entries whose `this` never folds are inert (bounded by
     /// the unit's `this`-read count).
     pub(crate) staged_this: &'o FxHashMap<u32, crate::ty::Ty>,
+    /// The staged implicit-this member faces (the #2292 sibling): the
+    /// unresolved bare read's declared element, adopted at `Ev::Ident`'s
+    /// unknown-read arm.
+    pub(crate) staged_this_members: &'o FxHashMap<u32, crate::ty::Ty>,
     /// The staged invocation-result types the semantic layer resolved for
     /// this unit (#2567 R18), beside their written-argument arena index,
     /// keyed on the callee identifier token's offset — adopted at
@@ -1203,6 +1207,7 @@ impl<'o> Interp<'o> {
             staged_rhs: &NO_STAGED_RHS,
             unresolved_writes: FxHashSet::default(),
             staged_this: &NO_STAGED_THIS,
+            staged_this_members: &NO_STAGED_THIS,
             staged_calls: &NO_STAGED_CALLS,
             names: &NO_NAMES,
             reach: ReachArena::new(),

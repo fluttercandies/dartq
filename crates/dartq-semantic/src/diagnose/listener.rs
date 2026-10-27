@@ -2098,6 +2098,47 @@ impl ParserListener for DiagnoseListener<'_> {
                 if let Some(name) = name {
                     engine.push_bare(name, token.range);
                     engine.const_capture.identifier(name, token.range);
+                    // The implicit-this member read's declared face (the
+                    // #2292 `this`-stage sibling): a bare identifier the
+                    // scope cannot answer may resolve to an instance
+                    // field/getter of the enclosing container — stage the
+                    // member's declared type keyed on the read's offset so
+                    // the flow's unknown-read arm answers on the real
+                    // element (a switch scrutinee over the bare read then
+                    // closes its exhaustiveness verdict). A same-named
+                    // local never reaches the staged row: the flow's own
+                    // scope resolution answers first. Only the spellable
+                    // named shapes ride (the same gate the `this` stage
+                    // applies); anything else keeps the unknown face.
+                    if let Some((container, kind)) = engine.container_context() {
+                        let face = engine.accessor_face_for(
+                            &Receiver::This { container, kind },
+                            name,
+                        );
+                        if let Ty::Named {
+                            args: ArgListId::EMPTY,
+                            ..
+                        } = face
+                        {
+                            if let Ty::Named {
+                                name: ty_name,
+                                nullable,
+                                ..
+                            } = engine.fold_alias_ty(face)
+                            {
+                                let lexeme =
+                                    engine.strings.resolve(ty_name).to_string();
+                                let base = self.flow().intern_name(&lexeme);
+                                self.flow().stage_this_member_type(
+                                    token.range.offset,
+                                    FlowTy {
+                                        base: FlowBase::Name(base),
+                                        nullable,
+                                    },
+                                );
+                            }
+                        }
+                    }
                 }
             }
             C::ExpressionContinuation => {
