@@ -818,19 +818,21 @@ fn minimal_check_rows_pass_and_negatives_are_named() {
 // Analyze answer (daemon `dartq/analyze`)
 // ---------------------------------------------------------------------------
 
-/// Transcript of the compact `analyze_answer` row
-/// (`crates/dartq-daemon/src/commands.rs`, the analyze section, over
-/// `wire::row`): the entry flattened onto the short vocabulary —
-/// `{code, sev, file, line, col, len, msg}` with `file` carrying the
-/// document URI and `line`/`col` 1-based.
+/// Transcript of the compact `analyze_answer` document
+/// (`crates/dartq-daemon/src/commands.rs`, the analyze section, over the
+/// shared `diags_document` builder): the diagnostic flattened onto the
+/// short vocabulary — `{code, sev, file, line, col, len, msg}` with
+/// `file` carrying the located spelling and `line`/`col` 1-based; the
+/// optional `root` key carries the envelope's analysis root (#2657).
 #[test]
 fn compact_analyze_answer_passes_validation() {
     let doc = serde_json::json!({
         "v": SCHEMA_VERSION_ANALYZE,
+        "root": "/w",
         "diags": [{
             "code": "undefined_identifier",
             "sev": "error",
-            "file": "file:///w/lib/a.dart",
+            "file": "lib/a.dart",
             "line": 3,
             "col": 7,
             "len": 2,
@@ -1237,10 +1239,7 @@ fn query_reserved_kind_arrays_are_exact_at_their_tier() {
         .as_object_mut()
         .expect("object")
         .remove("implementations");
-    minimal
-        .as_object_mut()
-        .expect("object")
-        .remove("deps");
+    minimal.as_object_mut().expect("object").remove("deps");
     minimal["decls"][0]
         .as_object_mut()
         .expect("object")

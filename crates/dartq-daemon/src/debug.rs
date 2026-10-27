@@ -149,6 +149,10 @@ pub(crate) enum DebugError {
     /// The request named no session and several are live (the payload
     /// lists every candidate: id, kind, script or ws URI).
     AmbiguousSession(String),
+    /// A frame-indexed `evaluate` named a frame the paused isolate
+    /// does not have (its stack is empty — an isolate interrupted
+    /// while idle).
+    NoFrame(u32),
     /// The underlying debug session call failed (transport, VM RPC,
     /// process, or timeout — dartq-debug's typed failure set). Resource
     /// exhaustion (process table, fds, memory) surfaces here as the OS's
@@ -180,6 +184,13 @@ impl DebugError {
                 format!(
                     "DARTQ/DEBUG/AMBIGUOUS_SESSION: several debug sessions are live \
                      ({candidates}) — name one (CLI `-s <ID>`, MCP `session_id`)"
+                ),
+            ),
+            Self::NoFrame(index) => (
+                codes::DEBUG_SESSION,
+                format!(
+                    "DARTQ/DEBUG/NO_FRAME: the paused isolate has no frame at index {index}; \
+                     pause at a breakpoint or evaluate in the root library"
                 ),
             ),
             Self::Vm(error) => (codes::DEBUG_SESSION, format!("DARTQ/DEBUG/VM: {error}")),
@@ -1017,6 +1028,16 @@ pub(crate) fn handle(
             }
             let id = select_session(manager, decoded.session_id)?;
             let managed = manager.get(id)?;
+            // A frame-indexed evaluation needs a frame to exist. A
+            // pause with no top frame (an isolate interrupted while
+            // idle) has an empty stack — the VM would wrap the miss in
+            // its generic compile-error text, so the session's tracked
+            // pause answers the real condition before any round trip.
+            if let Some(frame_index) = decoded.frame_index
+                && managed.session.paused_frame_exists(decoded.isolate.as_deref()) == Some(false)
+            {
+                return Err(DebugError::NoFrame(frame_index));
+            }
             let value = match decoded.frame_index {
                 Some(frame_index) => managed.session.evaluate_in_frame(
                     decoded.isolate.as_deref(),
@@ -1843,6 +1864,55 @@ mod tests {
                 .expect("shutdown answers");
         assert_eq!(answer, json!({"released": 0}));
         assert_eq!(live.load(Ordering::Relaxed), 0, "the counter stays in step");
+    }
+
+    /// #2661: `sessions_released` counts only sessions this daemon
+    /// actually detaches — an empty registry answers zero even with an
+    /// orphan manifest on disk (an earlier daemon's trail), and the
+    /// ladder never rewrites that trail: only a held session's own
+    /// manifest is marked released.
+    #[test]
+    fn shutdown_releases_zero_and_never_touches_orphan_manifests() {
+        let root = std::env::temp_dir().join(format!("dqd-shutdown-orphans-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = manifests_dir(&root);
+        write_manifest(
+            &dir,
+            4,
+            &SessionManifest {
+                ws_uri: "ws://left-behind".into(),
+                kind: "launch".into(),
+                since: 1_700_000_000,
+                pid: Some(111),
+                released: None,
+            },
+        );
+        let mut manager = DebugManager::sharing(Arc::new(AtomicUsize::new(0)));
+        let answer =
+            handle(&mut manager, DEBUG_SHUTDOWN, &json!({}), &root).expect("shutdown answers");
+        assert_eq!(answer, json!({"released": 0}), "no live session, nothing released");
+        let trail = load_manifests(&dir);
+        assert_eq!(trail.len(), 1, "the orphan trail stays");
+        assert_eq!(trail[0].1.released, None, "an untouched manifest is never marked released");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// #2661: a frame-indexed evaluate against a paused isolate with
+    /// an empty stack answers the machine-coded `NO_FRAME` condition —
+    /// not the VM's generic compile-error text — with the way out
+    /// named in the message.
+    #[test]
+    fn the_no_frame_miss_names_the_condition_and_the_way_out() {
+        let (code, message) = DebugError::NoFrame(0).wire();
+        assert_eq!(code, codes::DEBUG_SESSION);
+        assert!(
+            message.starts_with("DARTQ/DEBUG/NO_FRAME: the paused isolate has no frame at index 0;"),
+            "{message}"
+        );
+        assert!(
+            message.contains("pause at a breakpoint or evaluate in the root library"),
+            "the message names the way out: {message}"
+        );
     }
 
     /// #2622: the `reload` answer reports its own facts — the isolate

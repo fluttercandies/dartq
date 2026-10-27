@@ -39,8 +39,6 @@ use std::time::Duration;
 use clap::Args;
 use serde_json::{Value, json};
 
-use dartq_diagnostics::FileLayoutProvider;
-
 use dartq_session::{EventLog, Layout, Progress};
 
 use crate::exit;
@@ -57,42 +55,189 @@ pub struct McpArgs {
     pub sdk: Option<PathBuf>,
 }
 
+/// One tool parameter: its type face, whether it is required, and its
+/// description. The tool table below is the single source of every
+/// tool's parameters — `tools/list` renders it as the inputSchema and
+/// `tools/call` validates against it (#2657: the schema that advertises
+/// the contract is the same table that guards the dispatch).
+struct Param {
+    name: &'static str,
+    kind: ParamKind,
+    required: bool,
+    description: &'static str,
+}
+
+/// A parameter's JSON-Schema type face. `Path` renders as `string` (the
+/// description carries the resolution rule — relative paths resolve
+/// against the server's working directory, the workspace root as the
+/// fallback).
+#[derive(Clone, Copy)]
+enum ParamKind {
+    Str,
+    Path,
+    Num,
+    Bool,
+    /// A closed string vocabulary.
+    Enum(&'static [&'static str]),
+    /// An array of strings.
+    Strings,
+    /// An array of paths.
+    Paths,
+    /// A nested object with its own field table.
+    Object(&'static [Param]),
+}
+
+/// An optional parameter.
+const fn opt(name: &'static str, kind: ParamKind, description: &'static str) -> Param {
+    Param {
+        name,
+        kind,
+        required: false,
+        description,
+    }
+}
+
+/// A required parameter.
+const fn req(name: &'static str, kind: ParamKind, description: &'static str) -> Param {
+    Param {
+        name,
+        kind,
+        required: true,
+        description,
+    }
+}
+
+/// The shared vocabularies (the daemon faces' own closed sets).
+const VERBOSITY: ParamKind = ParamKind::Enum(&["minimal", "compact", "full"]);
+const QUERY_KINDS: ParamKind = ParamKind::Enum(&[
+    "symbol",
+    "references",
+    "callers",
+    "implementations",
+    "dependencies",
+]);
+const FIX_ROLES: ParamKind =
+    ParamKind::Enum(&["primary", "ignore_line", "ignore_file", "suppress"]);
+
+/// The breakpoint-location object (`dartq_debug_breakpoint_add`): a
+/// source line (`script` + `line`, optional `column`) or a function entry
+/// (`function_id`) — exactly one of the two forms.
+const BREAKPOINT_LOCATION: ParamKind = ParamKind::Object(&[
+    opt(
+        "script",
+        ParamKind::Str,
+        "The script URI or path of the line breakpoint.",
+    ),
+    opt(
+        "line",
+        ParamKind::Num,
+        "The 1-based line of the breakpoint.",
+    ),
+    opt("column", ParamKind::Num, "The optional 1-based column."),
+    opt(
+        "function_id",
+        ParamKind::Str,
+        "A function-entry breakpoint instead of a line (mutually exclusive with script/line).",
+    ),
+]);
+
 /// The one tool family the server serves.
 struct Tool {
     name: &'static str,
     description: &'static str,
     kind: ToolKind,
+    params: &'static [Param],
 }
 
 enum ToolKind {
     /// A daemon request over the session socket; the tool's arguments
-    /// are the request's parameters.
+    /// are the request's parameters, and the answer's canonical LON line
+    /// is the tool text.
     Daemon(&'static str),
+    /// The `dartq/fix` daemon face: the answer envelope's `files`
+    /// documents, one canonical LON line per file — the CLI face's own
+    /// stdout lines, joined by `\n` (#2657).
+    Fix,
     /// The rename face over a fresh in-process engine (a rare operation;
-    /// a cold pass per call).
+    /// a cold pass per call). The tool text is the CLI face's own
+    /// document (`rename::to_json`).
     Rename,
-    /// The session's event log / progress snapshot, read locally.
+    /// The session's event log / progress snapshot, read locally: one
+    /// canonical LON line per row — the CLI `events` verb's own stdout
+    /// lines, joined by `\n`.
     Events,
 }
 
 const TOOLS: &[Tool] = &[
     Tool {
         name: "dartq_analyze",
-        description: "Full-engine diagnostics for the workspace (scan, parse, resolution, \
-semantic/flow/lint). Use for: 'what is wrong with this code', pre-commit checks, whole-file \
-review context. Not for: symbol lookups (dartq_query), why a diagnostic fires (dartq_explain), \
-or blast-radius questions (dartq_impact). Arguments: the daemon analyze parameters \
-(verbosity, context, agent_id). Answers in canonical LON over the short field vocabulary.",
+        description: "Full-engine diagnostics (scan, parse, resolution, semantic/flow/lint) \
+for the target, rendered exactly like the CLI's `dartq analyze` lon document \
+(root key, root-relative files). Use for: 'what is wrong with this code', \
+pre-commit checks, whole-file review context. Not for: symbol lookups \
+(dartq_query), why a diagnostic fires (dartq_explain), or blast-radius \
+questions (dartq_impact).",
         kind: ToolKind::Daemon("dartq/analyze"),
+        params: &[
+            opt(
+                "target",
+                ParamKind::Path,
+                "The analysis aim: a directory or file. Relative paths resolve against the \
+                 server's working directory (the workspace root as the fallback); the default \
+                 is the server's working directory itself — the CLI's positional default.",
+            ),
+            opt(
+                "verbosity",
+                VERBOSITY,
+                "The answer tier; compact by default.",
+            ),
+            opt(
+                "agent_id",
+                ParamKind::Str,
+                "Analyze this agent's overlay view instead of the base view.",
+            ),
+            opt(
+                "context",
+                ParamKind::Str,
+                "A declared dartq.yaml context tag to analyze.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_query",
         description: "Symbol-index lookups: declarations and resolved references by name. Use \
 for: 'where is X declared/used', call sites, implementations, dependencies. Not for: \
 diagnostics (dartq_analyze) or one-cursor symbol resolution (no CLI mirror — the daemon \
-resolveAt). Arguments: {name, kind (symbol|references|callers|implementations|dependencies), \
-verbosity}.",
+resolveAt).",
         kind: ToolKind::Daemon("dartq/query"),
+        params: &[
+            req("name", ParamKind::Str, "The symbol name to look up."),
+            opt(
+                "kind",
+                QUERY_KINDS,
+                "The answered row kind; symbol by default.",
+            ),
+            opt(
+                "verbosity",
+                VERBOSITY,
+                "The answer tier; compact by default.",
+            ),
+            opt(
+                "agent_id",
+                ParamKind::Str,
+                "Analyze this agent's overlay view instead of the base view.",
+            ),
+            opt(
+                "context",
+                ParamKind::Str,
+                "A declared dartq.yaml context tag to analyze.",
+            ),
+            opt(
+                "since",
+                ParamKind::Num,
+                "The session's delta cursor: keep only rows whose file changed after it.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_explain",
@@ -100,31 +245,114 @@ verbosity}.",
 related diagnostics. Use for: 'tell me everything about this API'. Not for: raw reference \
 rows (dartq_query is cheaper) or diagnostics alone (dartq_analyze).",
         kind: ToolKind::Daemon("dartq/explain"),
+        params: &[
+            req(
+                "symbol",
+                ParamKind::Str,
+                "The symbol name the report is for.",
+            ),
+            opt(
+                "verbosity",
+                VERBOSITY,
+                "The answer tier; compact by default.",
+            ),
+            opt(
+                "since",
+                ParamKind::Num,
+                "The session's delta cursor: keep only rows whose file changed after it.",
+            ),
+            opt(
+                "sdk",
+                ParamKind::Path,
+                "The SDK root the report's engine assembles against; defaults to the \
+                 session's own SDK root.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_impact",
         description: "What a change to one file would affect: dependent files, signatures, \
-tests. Use before: edits whose blast radius is unclear. Not for: current diagnostics \
-(dartq_analyze) — this answers the counterfactual.",
+tests, environments. Use before: edits whose blast radius is unclear. Not for: current \
+diagnostics (dartq_analyze) — this answers the counterfactual. Answers exactly the CLI's \
+`dartq impact` report, environment verdicts included.",
         kind: ToolKind::Daemon("dartq/impact"),
+        params: &[
+            req(
+                "path",
+                ParamKind::Path,
+                "The changed .dart file to assess. Relative paths resolve against the \
+                 server's working directory (the workspace root as the fallback).",
+            ),
+            opt(
+                "verbosity",
+                VERBOSITY,
+                "Parses for grammar parity; the report is tier-invariant.",
+            ),
+            opt(
+                "agent_id",
+                ParamKind::Str,
+                "Analyze this agent's overlay view instead of the base view.",
+            ),
+            opt(
+                "context",
+                ParamKind::Str,
+                "A declared dartq.yaml context tag to analyze.",
+            ),
+            opt(
+                "since",
+                ParamKind::Num,
+                "The session's delta cursor: keep only rows whose file changed after it.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_fix",
-        description: "Anchored fix proposals/patches for the analyzed workspace. Use for: \
-applying lint/quick fixes. Not for: rename edits (dartq_rename) or plugin assists. Arguments: \
-the daemon fix parameters {paths, role} — role selects the candidate kind the answer serves: \
-primary (default, one code change per diagnostic), ignore_line, ignore_file, or suppress (the \
-ignore-comment spellings; never auto-applied unless named). Every returned row carries its \
-role key.",
-        kind: ToolKind::Daemon("dartq/fix"),
+        description: "Anchored fix proposals/patches. Use for: applying lint/quick fixes. \
+Not for: rename edits (dartq_rename) or plugin assists. The tool text is the CLI \
+`dartq fix --dry-run` stdout itself: one LON patch document per file, located paths.",
+        kind: ToolKind::Fix,
+        params: &[
+            req(
+                "paths",
+                ParamKind::Paths,
+                "The target directories/files. Relative paths resolve against the server's \
+                 working directory (the workspace root as the fallback); the CLI's own \
+                 spelling is kept, so the documents match the CLI run's bytes.",
+            ),
+            opt(
+                "role",
+                FIX_ROLES,
+                "The candidate kind the answer serves: primary (default, one code change \
+                 per diagnostic), ignore_line, ignore_file, or suppress.",
+            ),
+            opt(
+                "verbosity",
+                VERBOSITY,
+                "The answer tier; compact by default.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_rename",
         description: "Rename one symbol across the workspace; returns the machine edit set \
-(dry-run semantics — the caller applies edits). Use for: identifier renames. Not for: \
-fix-class rewrites (dartq_fix). Arguments: {target: 'PATH:LINE:COL', new_name}. Runs a cold \
-analysis pass — expect it slower than the session-resident tools.",
+(dry-run semantics — the caller applies edits) as the CLI's own rename document (v, \
+target, edit rows). Use for: identifier renames. Not for: fix-class rewrites \
+(dartq_fix). Runs a cold analysis pass — expect it slower than the session-resident \
+tools.",
         kind: ToolKind::Rename,
+        params: &[
+            req(
+                "target",
+                ParamKind::Str,
+                "The rename anchor: 'PATH:LINE:COL' (1-based; the column counts UTF-16 \
+                 code units) or 'PATH:OFFSET' (0-based byte offset).",
+            ),
+            req(
+                "new_name",
+                ParamKind::Str,
+                "The new identifier: a legal Dart identifier, not a reserved word.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_test",
@@ -132,42 +360,128 @@ analysis pass — expect it slower than the session-resident tools.",
 for: verifying a change. Not for: reading results of a run already made \
 (dartq_test_events) or diagnostics (dartq_analyze).",
         kind: ToolKind::Daemon("dartq/test/run"),
+        params: &[
+            opt(
+                "args",
+                ParamKind::Strings,
+                "The dart test arguments (test paths, --name filters, ...).",
+            ),
+            opt(
+                "cwd",
+                ParamKind::Path,
+                "The run's working directory; defaults to the session's workspace root.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_test_status",
         description: "The session's test runs: in-flight and finished. Use after dartq_test \
 to poll. Not for: starting a run.",
         kind: ToolKind::Daemon("dartq/test/status"),
+        params: &[opt(
+            "run_id",
+            ParamKind::Num,
+            "One run's status; absent lists every run.",
+        )],
     },
     Tool {
         name: "dartq_test_events",
         description: "Cursor-paged events of one test run. Use for: streaming a run's \
 results. Not for: live session/analysis progress (dartq_events).",
         kind: ToolKind::Daemon("dartq/test/events"),
+        params: &[
+            req("run_id", ParamKind::Num, "The run whose events are paged."),
+            opt(
+                "cursor",
+                ParamKind::Num,
+                "The event cursor to continue after; 0 by default.",
+            ),
+            opt(
+                "limit",
+                ParamKind::Num,
+                "The page width; the whole remainder by default.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_test_cancel",
         description: "Cancel one in-flight test run. Use for: aborting a dartq_test that \noutlived its value. Not for: reading results (dartq_test_events).",
         kind: ToolKind::Daemon("dartq/test/cancel"),
+        params: &[req("run_id", ParamKind::Num, "The run to cancel.")],
     },
     Tool {
         name: "dartq_events",
         description: "The session's unified event stream or its cold-analysis progress \
-(files scanned, current package). Use for: 'is it still working' during a long first \
-analysis, and lifecycle reads. Not for: test-run result events \
-(dartq_test_events). Arguments: {handle: 'session'|'progress', since (unix seconds, \
-a floor on row timestamps), limit} — the session handle lists newest first, default \
-100 rows.",
+(files scanned, current package) — one LON row per line, the CLI `dartq events` \
+stdout itself. Use for: 'is it still working' during a long first analysis, and \
+lifecycle reads. Not for: test-run result events (dartq_test_events).",
         kind: ToolKind::Events,
+        params: &[
+            opt(
+                "handle",
+                ParamKind::Enum(&["session", "progress"]),
+                "The stream to read; session by default.",
+            ),
+            opt(
+                "since",
+                ParamKind::Num,
+                "The session handle's timestamp floor in milliseconds — the same unit the \
+                 rows' ts field carries (default: no floor).",
+            ),
+            opt(
+                "limit",
+                ParamKind::Num,
+                "At most this many rows, keeping the newest; 100 by default.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_debug_launch",
         description: "Launch a debug session for a Dart script or a Flutter app (Flutter is \
-the primary target; kind: dart|flutter, plus device/flavor/dartDefines for flutter). Use for: \
-interactive debugging — launch pauses at start, so arm breakpoints via \
-dartq_debug_breakpoint_add, then dartq_debug_resume (the standard takeover loop). Not for: \
-analyzing code or running tests.",
+the primary target). Use for: interactive debugging — launch pauses at start, so arm \
+breakpoints via dartq_debug_breakpoint_add, then dartq_debug_resume (the standard \
+takeover loop). Not for: analyzing code or running tests.",
         kind: ToolKind::Daemon("dartq/debug/launch"),
+        params: &[
+            req(
+                "script",
+                ParamKind::Path,
+                "The entry script (bin/main.dart, or the Flutter app's main).",
+            ),
+            opt(
+                "kind",
+                ParamKind::Enum(&["dart", "flutter"]),
+                "The launch kind; dart by default.",
+            ),
+            opt(
+                "args",
+                ParamKind::Strings,
+                "Arguments passed to the program.",
+            ),
+            opt("vm_flags", ParamKind::Strings, "VM flags for the Dart VM."),
+            opt(
+                "pause_on_start",
+                ParamKind::Bool,
+                "Pause at start (the default) so breakpoints arm first.",
+            ),
+            opt("cwd", ParamKind::Path, "The program's working directory."),
+            opt(
+                "device",
+                ParamKind::Str,
+                "Flutter: the device id (`flutter run -d`).",
+            ),
+            opt("flavor", ParamKind::Str, "Flutter: the build flavor."),
+            opt(
+                "dart_defines",
+                ParamKind::Strings,
+                "Flutter: --dart-define entries, KEY=VALUE strings.",
+            ),
+            opt(
+                "flutter_args",
+                ParamKind::Strings,
+                "Flutter: extra flutter run arguments passed through.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_debug_attach",
@@ -176,13 +490,23 @@ owned by a live `flutter run` (dartq speaks only the service protocol; the tool'
 console keeps working). Use for: debugging an already-started program. Not for: starting \
 fresh (dartq_debug_launch).",
         kind: ToolKind::Daemon("dartq/debug/attach"),
+        params: &[req(
+            "ws_uri",
+            ParamKind::Str,
+            "The VM service web-socket URI to attach to.",
+        )],
     },
     Tool {
         name: "dartq_debug_detach",
         description: "Detach one debug session; the program keeps running and the answer \
-carries the ws URI for re-attaching later. Use for: ending debugging without stopping the \
-app. Not for: terminating it (dartq_debug_stop).",
+carries the ws URI for re-attaching later. Use for: ending debugging without stopping \
+the app. Not for: terminating it (dartq_debug_stop).",
         kind: ToolKind::Daemon("dartq/debug/detach"),
+        params: &[opt(
+            "session_id",
+            ParamKind::Num,
+            "The session to act on; the sole live session by default.",
+        )],
     },
     Tool {
         name: "dartq_debug_stop",
@@ -190,46 +514,161 @@ app. Not for: terminating it (dartq_debug_stop).",
 down through the tool's own cleanup ladder — no orphaned app). Use for: ending a launched \
 session for good. Not for: keeping it running (dartq_debug_detach).",
         kind: ToolKind::Daemon("dartq/debug/stop"),
+        params: &[opt(
+            "session_id",
+            ParamKind::Num,
+            "The session to act on; the sole live session by default.",
+        )],
     },
     Tool {
         name: "dartq_debug_status",
         description: "The session's debug sessions and their stopped states. Use for: \norientation after a stop event. Not for: frame detail (dartq_debug_snapshot).",
         kind: ToolKind::Daemon("dartq/debug/status"),
+        params: &[opt(
+            "session_id",
+            ParamKind::Num,
+            "One session's status; absent lists every session.",
+        )],
     },
     Tool {
         name: "dartq_debug_breakpoint_add",
-        description: "Add a line breakpoint to one debug session. Use for: stopping at a \nline. Not for: exception behavior (dartq_debug_exception_pause).",
+        description: "Add a breakpoint to one debug session. Use for: stopping at a \nline or function entry. Not for: exception behavior (dartq_debug_exception_pause).",
         kind: ToolKind::Daemon("dartq/debug/breakpointAdd"),
+        params: &[
+            opt(
+                "session_id",
+                ParamKind::Num,
+                "The session to act on; the sole live session by default.",
+            ),
+            opt(
+                "isolate",
+                ParamKind::Str,
+                "The isolate; the paused one by default.",
+            ),
+            req(
+                "location",
+                BREAKPOINT_LOCATION,
+                "The breakpoint target: a source line (script + line, optional column) or a function entry (function_id).",
+            ),
+            opt(
+                "condition",
+                ParamKind::Str,
+                "A condition expression; the breakpoint hits when true.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_debug_breakpoint_remove",
         description: "Remove one breakpoint. Use for: clearing a stop you set. Not for: \nresuming (dartq_debug_resume).",
         kind: ToolKind::Daemon("dartq/debug/breakpointRemove"),
+        params: &[
+            opt(
+                "session_id",
+                ParamKind::Num,
+                "The session to act on; the sole live session by default.",
+            ),
+            opt(
+                "isolate",
+                ParamKind::Str,
+                "The isolate; the paused one by default.",
+            ),
+            req(
+                "breakpoint_id",
+                ParamKind::Str,
+                "The breakpoint to remove (the id the add answer carried).",
+            ),
+        ],
     },
     Tool {
         name: "dartq_debug_exception_pause",
-        description: "Set a session's exception pause mode (never/uncaught/all). Use for: \nbreaking on throws. Not for: line stops (dartq_debug_breakpoint_add).",
+        description: "Set a session's exception pause mode (none/uncaught/all). Use for: \nbreaking on throws. Not for: line stops (dartq_debug_breakpoint_add).",
         kind: ToolKind::Daemon("dartq/debug/exceptionPause"),
+        params: &[
+            opt(
+                "session_id",
+                ParamKind::Num,
+                "The session to act on; the sole live session by default.",
+            ),
+            opt(
+                "isolate",
+                ParamKind::Str,
+                "The isolate; the paused one by default.",
+            ),
+            req(
+                "mode",
+                ParamKind::Enum(&["none", "uncaught", "all"]),
+                "The exception pause mode.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_debug_resume",
         description: "Resume a paused session. Use for: continuing after any stop. Not for: \nstepping (dartq_debug_step).",
         kind: ToolKind::Daemon("dartq/debug/resume"),
+        params: &[
+            opt(
+                "session_id",
+                ParamKind::Num,
+                "The session to act on; the sole live session by default.",
+            ),
+            opt(
+                "isolate",
+                ParamKind::Str,
+                "The isolate; the paused one by default.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_debug_pause",
         description: "Pause a running session. Use for: interrupting to inspect state. \nNot for: stepping (that rides dartq_debug_step after the pause).",
         kind: ToolKind::Daemon("dartq/debug/pause"),
+        params: &[
+            opt(
+                "session_id",
+                ParamKind::Num,
+                "The session to act on; the sole live session by default.",
+            ),
+            opt("isolate", ParamKind::Str, "The isolate to pause."),
+        ],
     },
     Tool {
         name: "dartq_debug_step",
         description: "Step (into/over/out) a paused session. Use for: advancing by one \nframe's worth. Not for: free-running (dartq_debug_resume).",
         kind: ToolKind::Daemon("dartq/debug/step"),
+        params: &[
+            opt(
+                "session_id",
+                ParamKind::Num,
+                "The session to act on; the sole live session by default.",
+            ),
+            opt(
+                "isolate",
+                ParamKind::Str,
+                "The isolate; the paused one by default.",
+            ),
+            req(
+                "option",
+                ParamKind::Enum(&["into", "over", "out"]),
+                "The step direction.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_debug_snapshot",
         description: "A stopped frame snapshot: variables, scopes. Use for: inspecting a \npaused program. Not for: its output stream (dartq_debug_output).",
         kind: ToolKind::Daemon("dartq/debug/snapshot"),
+        params: &[
+            opt(
+                "session_id",
+                ParamKind::Num,
+                "The session to act on; the sole live session by default.",
+            ),
+            req(
+                "isolate",
+                ParamKind::Str,
+                "The isolate whose stopped frame is snapshotted.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_debug_reload",
@@ -238,6 +677,23 @@ own orchestrated reload (source push + reassemble), so edits on disk take effect
 edit answers the compile error as data; the session stays usable. Use for: the edit-reload \
 half of the loop. Not for: state resets (dartq_debug_restart).",
         kind: ToolKind::Daemon("dartq/debug/reload"),
+        params: &[
+            opt(
+                "session_id",
+                ParamKind::Num,
+                "The session to act on; the sole live session by default.",
+            ),
+            opt(
+                "isolate",
+                ParamKind::Str,
+                "The isolate; the paused one by default.",
+            ),
+            opt(
+                "force",
+                ParamKind::Bool,
+                "Force the reload past a dirty-state refusal.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_debug_restart",
@@ -246,24 +702,86 @@ rebuilt, and the session re-arms its breakpoints on the new isolate (the answer 
 Use for: a clean slate after edits too large for reload. Not for: keeping state \
 (dartq_debug_reload).",
         kind: ToolKind::Daemon("dartq/debug/restart"),
+        params: &[opt(
+            "session_id",
+            ParamKind::Num,
+            "The session to act on; the sole live session by default.",
+        )],
     },
     Tool {
         name: "dartq_debug_evaluate",
-        description: "Evaluate one Dart expression in a paused frame (frameIndex) or the \
-isolate's root library (no frameIndex). Use for: inspecting state the snapshot only names, \
+        description: "Evaluate one Dart expression in a paused frame (frame_index) or the \
+isolate's root library (no frame_index). Use for: inspecting state the snapshot only names, \
 verifying a fix from inside the app. Not for: the one-call stopped bundle \
 (dartq_debug_snapshot).",
         kind: ToolKind::Daemon("dartq/debug/evaluate"),
+        params: &[
+            opt(
+                "session_id",
+                ParamKind::Num,
+                "The session to act on; the sole live session by default.",
+            ),
+            opt(
+                "isolate",
+                ParamKind::Str,
+                "The isolate; the paused one by default.",
+            ),
+            req(
+                "expression",
+                ParamKind::Str,
+                "The Dart expression to evaluate.",
+            ),
+            opt(
+                "frame_index",
+                ParamKind::Num,
+                "The paused frame to evaluate in; the root library without it.",
+            ),
+        ],
     },
     Tool {
         name: "dartq_debug_events",
         description: "Cursor-paged debugger events of one session. Use for: replaying \nwhat the debugger did. Not for: program stdout (dartq_debug_output).",
         kind: ToolKind::Daemon("dartq/debug/events"),
+        params: &[
+            opt(
+                "session_id",
+                ParamKind::Num,
+                "The session to act on; the sole live session by default.",
+            ),
+            opt(
+                "cursor",
+                ParamKind::Num,
+                "The event cursor to continue after; 0 by default.",
+            ),
+            opt("limit", ParamKind::Num, "The page width; 64 by default."),
+        ],
     },
     Tool {
         name: "dartq_debug_output",
         description: "Cursor-paged program output of one session. Use for: reading what \nthe program printed. Not for: debugger lifecycle (dartq_debug_events).",
         kind: ToolKind::Daemon("dartq/debug/output"),
+        params: &[
+            opt(
+                "session_id",
+                ParamKind::Num,
+                "The session to act on; the sole live session by default.",
+            ),
+            req(
+                "stream",
+                ParamKind::Enum(&["stdout", "stderr"]),
+                "The output stream to read.",
+            ),
+            opt(
+                "cursor",
+                ParamKind::Num,
+                "The byte cursor to continue after; 0 by default.",
+            ),
+            opt(
+                "max_bytes",
+                ParamKind::Num,
+                "The page's byte budget; 4096 by default.",
+            ),
+        ],
     },
 ];
 
@@ -293,7 +811,11 @@ impl Mcp {
             }
             Err(error) => Err(error),
         };
-        Self { layout: Layout::new(&root), root, session }
+        Self {
+            layout: Layout::new(&root),
+            root,
+            session,
+        }
     }
 }
 
@@ -370,14 +892,137 @@ fn serve<R: Read, W: Write>(input: R, mut output: W, mcp: &Mcp) -> io::Result<u8
     }
 }
 
-/// The MCP tool shape: the permissive object schema (the daemon owns the
-/// parameter contracts; each description documents them).
+/// The MCP tool shape: the real input schema, generated from the same
+/// parameter table the dispatch validates against (#2657) — a closed
+/// object (`additionalProperties: false`) whose `properties` carry each
+/// parameter's type/enum/description and whose `required` names the
+/// mandatory ones.
 fn tool_shape(tool: &Tool) -> Value {
+    let properties: serde_json::Map<String, Value> = tool
+        .params
+        .iter()
+        .map(|param| (param.name.to_owned(), param_schema(param)))
+        .collect();
+    let required: Vec<Value> = tool
+        .params
+        .iter()
+        .filter(|param| param.required)
+        .map(|param| Value::String(param.name.to_owned()))
+        .collect();
     json!({
         "name": tool.name,
         "description": tool.description,
-        "inputSchema": {"type": "object", "additionalProperties": true, "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": properties,
+            "required": required,
+        },
     })
+}
+
+/// One parameter's schema fragment.
+fn param_schema(param: &Param) -> Value {
+    let mut schema = match &param.kind {
+        ParamKind::Str | ParamKind::Path => json!({"type": "string"}),
+        ParamKind::Num => json!({"type": "integer"}),
+        ParamKind::Bool => json!({"type": "boolean"}),
+        ParamKind::Enum(values) => json!({"type": "string", "enum": values}),
+        ParamKind::Strings => json!({"type": "array", "items": {"type": "string"}}),
+        ParamKind::Paths => json!({"type": "array", "items": {"type": "string"}}),
+        ParamKind::Object(fields) => tool_shape(&Tool {
+            name: "",
+            description: "",
+            kind: ToolKind::Daemon(""),
+            params: fields,
+        })["inputSchema"]
+            .clone(),
+    };
+    schema["description"] = Value::String(param.description.to_owned());
+    schema
+}
+
+/// Validates one call's arguments against the tool's table: every key
+/// known, every required key present, every value of its advertised type
+/// — `Err` is the INVALID_PARAMS message, naming the parameter.
+fn validate_arguments(tool: &Tool, args: &Value) -> Result<(), String> {
+    let Some(object) = args.as_object() else {
+        return Err("arguments must be an object".to_owned());
+    };
+    for key in object.keys() {
+        if !tool.params.iter().any(|param| param.name == key) {
+            return Err(format!("unknown parameter `{key}` for {}", tool.name));
+        }
+    }
+    for param in tool.params {
+        let Some(value) = object.get(param.name) else {
+            if param.required {
+                return Err(format!(
+                    "missing required parameter `{}` for {}",
+                    param.name, tool.name
+                ));
+            }
+            continue;
+        };
+        check_value(param, value)
+            .map_err(|reason| format!("parameter `{}` {reason}", param.name))?;
+    }
+    Ok(())
+}
+
+/// One value against its parameter's type face.
+fn check_value(param: &Param, value: &Value) -> Result<(), String> {
+    match &param.kind {
+        ParamKind::Str | ParamKind::Path => value
+            .as_str()
+            .map_or_else(|| Err("must be a string".into()), |_| Ok(())),
+        ParamKind::Num => {
+            let integer = value
+                .as_number()
+                .is_some_and(|number| number.is_u64() || number.is_i64());
+            integer
+                .then_some(())
+                .ok_or_else(|| "must be an integer".to_owned())
+        }
+        ParamKind::Bool => value
+            .as_bool()
+            .map_or_else(|| Err("must be a boolean".into()), |_| Ok(())),
+        ParamKind::Enum(values) => match value.as_str() {
+            Some(text) if values.contains(&text) => Ok(()),
+            Some(text) => Err(format!(
+                "must be one of {} (got `{text}`)",
+                values.join(", ")
+            )),
+            None => Err("must be a string".into()),
+        },
+        ParamKind::Strings | ParamKind::Paths => value.as_array().map_or_else(
+            || Err("must be an array".into()),
+            |items| {
+                items
+                    .iter()
+                    .all(|item| item.is_string())
+                    .then_some(())
+                    .ok_or_else(|| "must be an array of strings".to_owned())
+            },
+        ),
+        ParamKind::Object(fields) => {
+            let Some(object) = value.as_object() else {
+                return Err("must be an object".to_owned());
+            };
+            for key in object.keys() {
+                if !fields.iter().any(|field| field.name == key) {
+                    return Err(format!("must not carry the unknown key `{key}`"));
+                }
+            }
+            for field in fields.iter() {
+                if let Some(inner) = object.get(field.name) {
+                    check_value(field, inner)
+                        .map_err(|reason| format!("key `{}` {reason}", field.name))?;
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn call_tool(params: &Value, mcp: &Mcp, output: &mut impl Write) -> Result<Value, Value> {
@@ -385,7 +1030,13 @@ fn call_tool(params: &Value, mcp: &Mcp, output: &mut impl Write) -> Result<Value
     let Some(tool) = TOOLS.iter().find(|tool| tool.name == name) else {
         return Err(json!({"code": -32602, "message": format!("unknown tool: {name}")}));
     };
-    let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let Err(message) = validate_arguments(tool, &arguments) {
+        return Err(json!({"code": -32602, "message": message}));
+    }
     // Progress bookends for the long faces, when the caller sent a token.
     let token = params["_meta"]["progressToken"].clone();
     fn notify(output: &mut impl Write, token: &Value, progress: u64) {
@@ -399,8 +1050,15 @@ fn call_tool(params: &Value, mcp: &Mcp, output: &mut impl Write) -> Result<Value
         let _ = output.flush();
     }
     notify(output, &token, 0);
+    // The content text is the face's CLI stdout itself (#2657): the
+    // canonical LON line of the answer's value — or, for the
+    // multi-document faces (fix, events), the same lines the CLI prints,
+    // joined by `\n`.
     let outcome = match tool.kind {
-        ToolKind::Daemon(method) => daemon_call(method, &arguments, mcp),
+        ToolKind::Daemon(method) => {
+            daemon_call(method, &arguments, mcp).map(|value| crate::output::lon_line(&value))
+        }
+        ToolKind::Fix => daemon_call("dartq/fix", &arguments, mcp).map(fix_text),
         ToolKind::Rename => rename_call(&arguments, mcp).map_err(ProxyError::Transport),
         ToolKind::Events => events_call(&arguments, mcp).map_err(ProxyError::Transport),
     }
@@ -410,13 +1068,9 @@ fn call_tool(params: &Value, mcp: &Mcp, output: &mut impl Write) -> Result<Value
         ProxyError::Transport(reason) => reason,
     });
     notify(output, &token, 1);
-    // The content payload is the answer's canonical LON encoding — the
-    // compact AI-first face, the same word list the daemon's own answers
-    // carry. The MCP wrapper itself stays
-    // JSON (the protocol's wire); only the content text re-encodes.
     Ok(match outcome {
-        Ok(value) => json!({
-            "content": [{"type": "text", "text": crate::output::lon_line(&value)}],
+        Ok(text) => json!({
+            "content": [{"type": "text", "text": text}],
             "isError": false,
         }),
         Err(reason) => json!({
@@ -424,6 +1078,22 @@ fn call_tool(params: &Value, mcp: &Mcp, output: &mut impl Write) -> Result<Value
             "isError": true,
         }),
     })
+}
+
+/// The fix face's tool text: the answer envelope's `files` documents,
+/// each its own canonical LON line — the CLI `dartq fix --dry-run`
+/// stdout (the plugin-error rows the CLI prints on stderr stay off the
+/// data face here too).
+fn fix_text(answer: Value) -> String {
+    answer["files"]
+        .as_array()
+        .map_or_else(Vec::new, |files| {
+            files
+                .iter()
+                .map(|document| crate::output::lon_line(document))
+                .collect()
+        })
+        .join("\n")
 }
 
 /// How long one proxied daemon request may run before the caller hears
@@ -464,8 +1134,8 @@ pub(crate) fn daemon_call_bounded(
              start it with `dartq session start` in a writable checkout"
         )));
     }
-    let mut stream =
-        UnixStream::connect(&mcp.layout.socket).map_err(|error| ProxyError::Transport(error.to_string()))?;
+    let mut stream = UnixStream::connect(&mcp.layout.socket)
+        .map_err(|error| ProxyError::Transport(error.to_string()))?;
     // The bound covers the whole round trip: a wedged engine (or a
     // wedged serve between clients) answers the timeout error, never a
     // hang.
@@ -481,7 +1151,9 @@ pub(crate) fn daemon_call_bounded(
     .map_err(|error| ProxyError::Transport(error.to_string()))?;
     write!(stream, "Content-Length: {}\r\n\r\n{body}", body.len())
         .map_err(|error| ProxyError::Transport(error.to_string()))?;
-    stream.flush().map_err(|error| ProxyError::Transport(error.to_string()))?;
+    stream
+        .flush()
+        .map_err(|error| ProxyError::Transport(error.to_string()))?;
     // The daemon streams publishes and progress notifications ahead of
     // the answer on the same connection (#2596: a resident that picked up
     // an out-of-band edit emits its diagnostics pushes first) — the proxy
@@ -563,83 +1235,110 @@ fn read_frame(stream: &mut UnixStream) -> Result<Value, ReadError> {
     let header = String::from_utf8_lossy(&header);
     let length: usize = header
         .lines()
-        .find_map(|line| line.split_once(':').and_then(|(name, value)| {
-            (name.trim().eq_ignore_ascii_case("content-length"))
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
-        }))
+        .find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                (name.trim().eq_ignore_ascii_case("content-length"))
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+        })
         .ok_or_else(|| ReadError::Malformed("missing Content-Length".to_owned()))?;
     let mut body = vec![0u8; length];
     read(&mut body)?;
-    serde_json::from_slice(&body)
-        .map_err(|error| ReadError::Malformed(error.to_string()))
+    serde_json::from_slice(&body).map_err(|error| ReadError::Malformed(error.to_string()))
 }
 
 /// The rename face over a cold in-process engine (the rare tool). The
-/// answer is the vocabulary shape: `new_name` plus one `{file off len}`
-/// edit row per site.
-fn rename_call(params: &Value, _mcp: &Mcp) -> Result<Value, String> {
-    let target = params["target"].as_str().ok_or("arguments: {target: 'PATH:LINE:COL', new_name}")?;
-    let new_name = params["new_name"].as_str().ok_or("arguments: {target: 'PATH:LINE:COL', new_name}")?;
-    let (path, line, column) = parse_target(target)?;
+/// tool text is the CLI face's own document — [`dartq_commands::rename::to_json`],
+/// the one producer both faces print (#2657): `v`, the new name, the
+/// resolved target, and the edit rows (canonical file spellings,
+/// path-then-offset order). The anchor's path resolves against the
+/// server's working directory and canonicalizes, the CLI face's own
+/// steps.
+fn rename_call(params: &Value, mcp: &Mcp) -> Result<String, String> {
+    let target = params["target"]
+        .as_str()
+        .ok_or("arguments: {target: 'PATH:LINE:COL or PATH:OFFSET', new_name}")?;
+    let new_name = params["new_name"]
+        .as_str()
+        .ok_or("arguments: {target: 'PATH:LINE:COL or PATH:OFFSET', new_name}")?;
+    let (path, anchor) = parse_target(target)?;
+    // Relative anchor paths resolve against the server's working
+    // directory (the CLI's positional base), then canonicalize — the
+    // engine interns canonical spellings.
+    let path = if path.is_absolute() {
+        path
+    } else {
+        mcp.root.join(path)
+    };
+    let path = path
+        .canonicalize()
+        .map_err(|_| format!("Directory or file doesn't exist: {target}"))?;
     let (mut engine, _dir) = dartq_commands::workspace::open_engine(
-        path.parent().unwrap_or(Path::new(".")),
+        &mcp.root,
         std::env::var_os("DART_SDK").map(PathBuf::from).as_deref(),
     )
     .map_err(|error| error.to_string())?;
-    let run = dartq_commands::rename::rename(
-        &mut engine,
-        &path,
-        dartq_commands::rename::Anchor::LineCol { line, column },
-        new_name,
-    )
-    .map_err(|error| error.to_string())?;
-    let layout = &run.layout;
-    let edits: Vec<Value> = run
-        .edits
-        .iter()
-        .map(|edit| {
-            json!({
-                "file": layout.file_path(edit.file),
-                "off": edit.range.offset,
-                "len": edit.range.length,
-            })
-        })
-        .collect();
-    Ok(json!({"new_name": new_name, "edits": edits}))
+    let run = dartq_commands::rename::rename(&mut engine, &path, anchor, new_name)
+        .map_err(|error| error.to_string())?;
+    Ok(crate::output::lon_line(&dartq_commands::rename::to_json(
+        &run, new_name,
+    )))
 }
 
-fn parse_target(spec: &str) -> Result<(PathBuf, u32, u32), String> {
-    let mut parts = spec.rsplitn(3, ':');
-    let column = parts.next().and_then(|c| c.parse().ok()).ok_or("target PATH:LINE:COL")?;
-    let line = parts.next().and_then(|l| l.parse().ok()).ok_or("target PATH:LINE:COL")?;
-    let path = parts.next().filter(|p| !p.is_empty()).ok_or("target PATH:LINE:COL")?;
-    Ok((PathBuf::from(path), line, column))
+/// The rename anchor spec: the CLI face's grammar — a trailing
+/// `:LINE:COL` pair (1-based; UTF-16 code units), a single trailing
+/// `:OFFSET` (0-based bytes), anything else malformed. Split from the
+/// right so a Windows-style drive path keeps its colon.
+fn parse_target(spec: &str) -> Result<(PathBuf, dartq_commands::rename::Anchor), String> {
+    let malformed = || format!("expected PATH:LINE:COL or PATH:OFFSET, got `{spec}`");
+    let Some((path, last)) = spec.rsplit_once(':') else {
+        return Err(malformed());
+    };
+    if let Some((head, column_text)) = path.rsplit_once(':')
+        && !head.is_empty()
+        && let (Ok(line), Ok(column)) = (column_text.parse::<u32>(), last.parse::<u32>())
+    {
+        return Ok((
+            PathBuf::from(head),
+            dartq_commands::rename::Anchor::LineCol { line, column },
+        ));
+    }
+    if let Ok(offset) = last.parse::<u64>() {
+        if path.is_empty() {
+            return Err(malformed());
+        }
+        return Ok((
+            PathBuf::from(path),
+            dartq_commands::rename::Anchor::ByteOffset(offset),
+        ));
+    }
+    Err(malformed())
 }
 
-/// The events read, local to the worktree. The session handle lists
-/// newest first (#2622) with `since` as a UNIX-seconds floor and
-/// `limit` keeping the newest rows — the same contract as the CLI verb.
-fn events_call(params: &Value, mcp: &Mcp) -> Result<Value, String> {
+/// The events read, local to the worktree. The tool text is the CLI
+/// verb's own stdout (#2657): the session handle answers one canonical
+/// LON line per row — newest first (#2622), `since` a millisecond floor
+/// on the rows' own `ts` unit, `limit` keeping the newest rows — and the
+/// progress handle the CLI's own progress row document.
+fn events_call(params: &Value, mcp: &Mcp) -> Result<String, String> {
     match params["handle"].as_str().unwrap_or("session") {
         "session" => {
             let log = EventLog::new(&mcp.layout);
-            let since_ms =
-                params["since"].as_u64().map_or(0, |secs| u128::from(secs) * 1000);
+            let since_ms = params["since"].as_u64().map_or(0, u128::from);
             let limit = params["limit"].as_u64().unwrap_or(100).min(1000) as usize;
-            Ok(json!({"events": log.read_newest(None, since_ms, limit)
+            Ok(log
+                .read_newest(None, since_ms, limit)
                 .into_iter()
-                .map(|(_, value)| value)
-                .collect::<Vec<_>>()}))
+                .map(|(_, value)| crate::output::lon_line(&value))
+                .collect::<Vec<_>>()
+                .join("\n"))
         }
         "progress" => {
             let progress = Progress::from_trace(&mcp.layout.dir.join("trace.jsonl"));
-            Ok(json!({
-                "files_scanned": progress.files_scanned,
-                "from_cache": progress.from_cache,
-                "current": progress.current,
-                "current_package": progress.current_package,
-            }))
+            Ok(crate::output::lon_line(&crate::events::progress_row(
+                &progress,
+            )))
         }
         other => Err(format!("unknown handle `{other}` (session | progress)")),
     }
@@ -720,8 +1419,9 @@ mod tests {
         // In-process serve loop: collateral of the session module's real
         // signal test (its SIGTERM is process-wide and would tear this
         // serve down mid-drive) — same serialization lock.
-        let _serial =
-            crate::session::tests::SIGNAL_SERIALIZATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = crate::session::tests::SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = fixture();
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
@@ -731,10 +1431,17 @@ mod tests {
         let layout = Layout::new(&root);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while !dartq_session::socket_open(&layout) {
-            assert!(std::time::Instant::now() < deadline, "the serve loop never listened");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the serve loop never listened"
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let mcp = Mcp { root: root.clone(), layout: layout.clone(), session: Ok(()) };
+        let mcp = Mcp {
+            root: root.clone(),
+            layout: layout.clone(),
+            session: Ok(()),
+        };
         let answers = drive(
             &mcp,
             &[
@@ -760,7 +1467,10 @@ mod tests {
         };
         assert_eq!(answer(1)["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(answer(1)["result"]["serverInfo"]["name"], "dartq");
-        let tools = answer(2)["result"]["tools"].as_array().cloned().expect("tools");
+        let tools = answer(2)["result"]["tools"]
+            .as_array()
+            .cloned()
+            .expect("tools");
         assert!(tools.len() >= 20, "{} tools", tools.len());
         assert!(
             tools.iter().all(|tool| {
@@ -773,20 +1483,34 @@ mod tests {
         let analyze = answer(3)["result"].clone();
         assert!(analyze["isError"].as_bool() == Some(false), "{analyze}");
         assert!(
-            analyze["content"][0]["text"].as_str().unwrap_or_default().contains("diags"),
+            analyze["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("diags"),
             "the daemon answer rides the MCP content in canonical LON (diagnostics → diags)"
         );
         let progress = answer(4)["result"]["content"][0]["text"].to_string();
         assert!(progress.contains("files_scanned"), "{progress}");
+        assert!(
+            progress.contains("type:progress"),
+            "the CLI verb's own row: {progress}"
+        );
         let status = answer(5)["result"]["contents"][0]["text"].to_string();
-        assert!(status.contains("fx"), "the workspace status names the package: {status}");
+        assert!(
+            status.contains("fx"),
+            "the workspace status names the package: {status}"
+        );
         assert!(status.contains("packages"), "{status}");
         assert!(answer(6)["error"]["code"].as_i64() == Some(-32602));
         assert!(answer(7)["result"].as_object().is_some(), "ping answers");
 
         // A degraded tree (no session): the engine tools answer isError
         // with the reason; the local faces keep working.
-        let degraded = Mcp { root: root.clone(), layout, session: Err("read-only checkout".into()) };
+        let degraded = Mcp {
+            root: root.clone(),
+            layout,
+            session: Err("read-only checkout".into()),
+        };
         let answers = drive(
             &degraded,
             &[
@@ -797,8 +1521,16 @@ mod tests {
             ],
         );
         assert!(answers[0]["result"]["isError"].as_bool() == Some(true));
-        assert!(answers[0]["result"]["content"][0]["text"].as_str().unwrap_or_default().contains("no resident session"));
-        assert!(answers[1]["result"]["isError"].as_bool() == Some(false), "local faces survive");
+        assert!(
+            answers[0]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no resident session")
+        );
+        assert!(
+            answers[1]["result"]["isError"].as_bool() == Some(false),
+            "local faces survive"
+        );
 
         // Drain the server thread.
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -808,7 +1540,8 @@ mod tests {
 
     /// The tool table behind `tools/list`: names are unique, every daemon
     /// tool maps to a `dartq/*` method, and the served shape carries the
-    /// permissive object schema (the daemon owns the parameter contracts).
+    /// real closed schema generated from the same table the dispatch
+    /// validates against (#2657).
     #[test]
     fn tool_table_is_well_formed() {
         let mut names: Vec<&str> = TOOLS.iter().map(|tool| tool.name).collect();
@@ -816,17 +1549,195 @@ mod tests {
         let before = names.len();
         names.dedup();
         assert_eq!(names.len(), before, "tool names are unique");
-        assert!(TOOLS.len() >= 20, "{} tools", TOOLS.len());
+        assert_eq!(TOOLS.len(), 28, "the tool family is exactly 28");
         for tool in TOOLS {
             if let ToolKind::Daemon(method) = tool.kind {
-                assert!(method.starts_with("dartq/"), "{} maps to a daemon method", tool.name);
+                assert!(
+                    method.starts_with("dartq/"),
+                    "{} maps to a daemon method",
+                    tool.name
+                );
             }
             let shape = tool_shape(tool);
             assert_eq!(shape["name"], tool.name);
             assert_eq!(shape["description"], tool.description);
             assert_eq!(shape["inputSchema"]["type"], "object");
-            assert_eq!(shape["inputSchema"]["additionalProperties"], true);
+            assert_eq!(
+                shape["inputSchema"]["additionalProperties"], false,
+                "{}: the schema is closed",
+                tool.name
+            );
+            // Every advertised property renders, and `required` names
+            // exactly the required ones.
+            let properties = shape["inputSchema"]["properties"]
+                .as_object()
+                .expect("properties");
+            assert_eq!(
+                properties.len(),
+                tool.params.len(),
+                "{}: every parameter renders",
+                tool.name
+            );
+            let mut required: Vec<&str> = tool
+                .params
+                .iter()
+                .filter(|param| param.required)
+                .map(|param| param.name)
+                .collect();
+            required.sort_unstable();
+            let mut served: Vec<&str> = shape["inputSchema"]["required"]
+                .as_array()
+                .expect("required")
+                .iter()
+                .map(|value| value.as_str().expect("name"))
+                .collect();
+            served.sort_unstable();
+            assert_eq!(required, served, "{}: required names match", tool.name);
+            for param in tool.params {
+                assert!(
+                    param.description.len() > 8,
+                    "{}.{}: the description says what it is",
+                    tool.name,
+                    param.name
+                );
+            }
         }
+        // The ruling's flagship schemas: the closed vocabularies.
+        let query = tool_shape(
+            TOOLS
+                .iter()
+                .find(|tool| tool.name == "dartq_query")
+                .expect("query"),
+        );
+        assert_eq!(
+            query["inputSchema"]["properties"]["kind"]["enum"],
+            json!([
+                "symbol",
+                "references",
+                "callers",
+                "implementations",
+                "dependencies"
+            ])
+        );
+        let fix = tool_shape(
+            TOOLS
+                .iter()
+                .find(|tool| tool.name == "dartq_fix")
+                .expect("fix"),
+        );
+        assert_eq!(
+            fix["inputSchema"]["properties"]["role"]["enum"],
+            json!(["primary", "ignore_line", "ignore_file", "suppress"])
+        );
+        assert_eq!(
+            fix["inputSchema"]["required"],
+            json!(["paths"]),
+            "fix requires its paths"
+        );
+        let evaluate = tool_shape(
+            TOOLS
+                .iter()
+                .find(|tool| tool.name == "dartq_debug_evaluate")
+                .expect("evaluate"),
+        );
+        assert!(
+            evaluate["inputSchema"]["properties"]
+                .as_object()
+                .expect("properties")
+                .contains_key("frame_index"),
+            "the evaluate schema spells frame_index"
+        );
+    }
+
+    /// `tools/call` validates against the table: an unknown parameter,
+    /// a missing required one, and a wrong type each answer INVALID_PARAMS
+    /// naming the parameter — and a legal call still passes through.
+    #[test]
+    fn unknown_and_malformed_parameters_answer_invalid_params() {
+        let root = std::env::temp_dir().join(format!("dqs-mcp-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("dir");
+        let mcp = Mcp {
+            layout: Layout::new(&root),
+            root: root.clone(),
+            session: Err("standalone".into()),
+        };
+        let mut output = Vec::new();
+        let call = |output: &mut Vec<u8>, name: &str, arguments: Value| {
+            serve(
+                Cursor::new(
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                           "params": {"name": name, "arguments": arguments}})
+                    .to_string()
+                    .into_bytes(),
+                ),
+                &mut *output,
+                &mcp,
+            )
+            .expect("serve");
+            let lines: Vec<Value> = String::from_utf8(std::mem::take(output))
+                .expect("utf-8")
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            lines[0].clone()
+        };
+        let unknown = call(&mut output, "dartq_analyze", json!({"bogus": 1}));
+        assert_eq!(unknown["error"]["code"], -32602, "{unknown}");
+        assert!(
+            unknown["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("`bogus`"),
+            "the message names the parameter: {unknown}"
+        );
+        let missing = call(&mut output, "dartq_query", json!({}));
+        assert_eq!(missing["error"]["code"], -32602);
+        assert!(
+            missing["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("`name`"),
+            "the message names the missing parameter: {missing}"
+        );
+        let typed = call(&mut output, "dartq_query", json!({"name": 7}));
+        assert_eq!(typed["error"]["code"], -32602);
+        assert!(
+            typed["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("`name`"),
+            "the message names the mistyped parameter: {typed}"
+        );
+        let spelled = call(
+            &mut output,
+            "dartq_fix",
+            json!({"paths": ["lib"], "role": "nope"}),
+        );
+        assert_eq!(spelled["error"]["code"], -32602);
+        assert!(
+            spelled["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("`role`"),
+            "the message names the enum parameter: {spelled}"
+        );
+        // A legal call reaches the transport tier (no session here — the
+        // degradation answer, not a usage error).
+        let legal = call(
+            &mut output,
+            "dartq_query",
+            json!({"name": "foo", "kind": "callers"}),
+        );
+        assert!(
+            legal["result"].is_object(),
+            "the validated call proceeds: {legal}"
+        );
+        assert!(
+            legal["result"]["isError"].as_bool() == Some(true),
+            "no session: {legal}"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The wire's noise discipline: a line that is not JSON and a
@@ -836,7 +1747,11 @@ mod tests {
     fn malformed_lines_and_notifications_answer_nothing() {
         let root = std::env::temp_dir().join(format!("dqs-mcp-noise-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("dir");
-        let mcp = Mcp { layout: Layout::new(&root), root: root.clone(), session: Err("standalone".into()) };
+        let mcp = Mcp {
+            layout: Layout::new(&root),
+            root: root.clone(),
+            session: Err("standalone".into()),
+        };
         let input = concat!(
             "this line is not json\n",
             "\n",
@@ -863,7 +1778,11 @@ mod tests {
     fn unknown_method_and_resource_answer_protocol_errors() {
         let root = std::env::temp_dir().join(format!("dqs-mcp-unknown-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("dir");
-        let mcp = Mcp { layout: Layout::new(&root), root: root.clone(), session: Err("standalone".into()) };
+        let mcp = Mcp {
+            layout: Layout::new(&root),
+            root: root.clone(),
+            session: Err("standalone".into()),
+        };
         let answers = drive(
             &mcp,
             &[
@@ -882,11 +1801,21 @@ mod tests {
         };
         assert_eq!(answer(1)["error"]["code"], -32601);
         assert!(
-            answer(1)["error"]["message"].as_str().unwrap_or_default().contains("workspace/symbol"),
+            answer(1)["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspace/symbol"),
             "the message names the method"
         );
-        assert_eq!(answer(2)["error"]["code"], -32602, "an unknown resource is a usage error");
-        let resources = answer(3)["result"]["resources"].as_array().cloned().expect("resources");
+        assert_eq!(
+            answer(2)["error"]["code"],
+            -32602,
+            "an unknown resource is a usage error"
+        );
+        let resources = answer(3)["result"]["resources"]
+            .as_array()
+            .cloned()
+            .expect("resources");
         assert_eq!(resources[0]["uri"], STATUS_URI);
         std::fs::remove_dir_all(&root).ok();
     }
@@ -899,19 +1828,23 @@ mod tests {
     fn progress_token_brackets_a_tool_call() {
         let root = std::env::temp_dir().join(format!("dqs-mcp-progress-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("dir");
-        let mcp = Mcp { layout: Layout::new(&root), root: root.clone(), session: Err("read-only checkout".into()) };
+        let mcp = Mcp {
+            layout: Layout::new(&root),
+            root: root.clone(),
+            session: Err("read-only checkout".into()),
+        };
         let mut input = String::new();
         input.push_str(
             &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                     "params": {"name": "dartq_analyze", "arguments": {},
                                "_meta": {"progressToken": "tok-7"}}})
-                .to_string(),
+            .to_string(),
         );
         input.push('\n');
         input.push_str(
             &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                     "params": {"name": "dartq_events", "arguments": {"handle": "progress"}}})
-                .to_string(),
+            .to_string(),
         );
         input.push('\n');
         let mut output = Vec::new();
@@ -925,10 +1858,17 @@ mod tests {
             .iter()
             .filter(|value| value["method"].as_str() == Some("notifications/progress"))
             .collect();
-        assert_eq!(progress.len(), 2, "exactly the token-carrying call brackets: {lines:?}");
+        assert_eq!(
+            progress.len(),
+            2,
+            "exactly the token-carrying call brackets: {lines:?}"
+        );
         for (index, value) in progress.iter().enumerate() {
             assert_eq!(value["params"]["progressToken"], "tok-7");
-            assert_eq!(value["params"]["progress"], index as u64, "0 then 1, in order");
+            assert_eq!(
+                value["params"]["progress"], index as u64,
+                "0 then 1, in order"
+            );
             assert_eq!(value["params"]["total"], 1);
         }
         // The notifications precede their call's answer.
@@ -937,7 +1877,9 @@ mod tests {
             .position(|value| value["id"].as_u64() == Some(1))
             .expect("answer 1");
         assert!(
-            lines[..answer_position].iter().any(|value| value["method"].as_str() == Some("notifications/progress")),
+            lines[..answer_position]
+                .iter()
+                .any(|value| value["method"].as_str() == Some("notifications/progress")),
             "the bracket opens before the answer rides the stream"
         );
         std::fs::remove_dir_all(&root).ok();
@@ -951,8 +1893,13 @@ mod tests {
     fn read_frame_parses_headers_and_rejects_missing_length() {
         let (mut mine, mut theirs) = UnixStream::pair().expect("socketpair");
         let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
-        write!(mine, "Content-Type: application/json\r\ncontent-length: {}\r\n\r\n{}", body.len(), body)
-            .expect("write frame");
+        write!(
+            mine,
+            "Content-Type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write frame");
         mine.flush().expect("flush");
         let answer = read_frame(&mut theirs).expect("frame");
         assert_eq!(answer["result"]["ok"], true);
@@ -990,7 +1937,11 @@ mod tests {
                 std::mem::forget(stream);
             }
         });
-        let mcp = Mcp { layout, root: root.clone(), session: Ok(()) };
+        let mcp = Mcp {
+            layout,
+            root: root.clone(),
+            session: Ok(()),
+        };
         let started = std::time::Instant::now();
         let error = match daemon_call_bounded(
             "dartq/test/status",
@@ -1003,7 +1954,10 @@ mod tests {
             ProxyError::Transport(reason) => reason,
             other => panic!("the wedge is a transport failure: {other:?}"),
         };
-        assert!(started.elapsed() < Duration::from_secs(5), "bounded: {error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bounded: {error}"
+        );
         assert!(
             error.contains("did not answer dartq/test/status"),
             "the error names the method: {error}"
@@ -1012,23 +1966,63 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The rename target grammar splits from the right, so a Windows-style
-    /// drive path keeps its colon; every other shape is the usage error.
+    /// The rename target grammar — the CLI face's own: a trailing
+    /// `:LINE:COL` pair, a single trailing `:OFFSET`, a Windows-style
+    /// drive path keeping its colon (split from the right); every other
+    /// shape is the usage error.
     #[test]
     fn parse_target_splits_from_the_right() {
+        use dartq_commands::rename::Anchor;
         let ok = |spec: &str| parse_target(spec).expect("target");
-        assert_eq!(ok("lib/a.dart:3:7"), (PathBuf::from("lib/a.dart"), 3, 7));
-        assert_eq!(ok("/w/a.dart:1:2"), (PathBuf::from("/w/a.dart"), 1, 2));
-        assert_eq!(ok("C:\\a.dart:1:2"), (PathBuf::from("C:\\a.dart"), 1, 2));
-        for bad in ["a.dart", "a.dart:1", "a.dart:x:2", ":1:2", ""] {
+        assert_eq!(
+            ok("lib/a.dart:3:7"),
+            (
+                PathBuf::from("lib/a.dart"),
+                Anchor::LineCol { line: 3, column: 7 }
+            )
+        );
+        assert_eq!(
+            ok("lib/a.dart:58"),
+            (PathBuf::from("lib/a.dart"), Anchor::ByteOffset(58))
+        );
+        assert_eq!(
+            ok("/w/a.dart:1:2"),
+            (
+                PathBuf::from("/w/a.dart"),
+                Anchor::LineCol { line: 1, column: 2 }
+            )
+        );
+        assert_eq!(
+            ok("C:\\a.dart:1:2"),
+            (
+                PathBuf::from("C:\\a.dart"),
+                Anchor::LineCol { line: 1, column: 2 }
+            )
+        );
+        // The offset form: a single trailing number is a 0-based byte
+        // offset (the CLI face's own grammar).
+        assert_eq!(
+            ok("a.dart:58"),
+            (PathBuf::from("a.dart"), Anchor::ByteOffset(58))
+        );
+        for bad in ["a.dart", "a.dart:x", ":58", ""] {
             assert!(parse_target(bad).is_err(), "`{bad}` must be refused");
         }
+        // `we:ird/a.dart:2` is the offset form over a colon-bearing path —
+        // accepted, exactly like the CLI face's grammar.
+        assert_eq!(
+            ok("we:ird/a.dart:2"),
+            (PathBuf::from("we:ird/a.dart"), Anchor::ByteOffset(2))
+        );
     }
 
     /// The events tool is a local face: without a session it still reads
-    /// the event log (newest first, UNIX-seconds floor, limit keeping
-    /// the newest rows) and the progress snapshot, and an unknown handle
-    /// is the usage error.
+    /// the event log (newest first, millisecond floor on the rows' own
+    /// `ts` unit, limit keeping the newest rows) and the progress
+    /// snapshot, and an unknown handle is the usage error. The session
+    /// handle's text is the CLI verb's own stdout: one canonical LON
+    /// line per row, joined by `\n` — never a wrapper array, so no row
+    /// count can flip the encoding (#2657).
     #[test]
     fn events_tool_reads_local_faces_without_a_session() {
         let root = std::env::temp_dir().join(format!("dqs-mcp-events-{}", std::process::id()));
@@ -1037,32 +2031,103 @@ mod tests {
         let layout = Layout::new(&root);
         let log = EventLog::new(&layout);
         log.append("session", "serving", json!({})).expect("append");
-        log.append("session", "client_attached", json!({})).expect("append");
-        let mcp = Mcp { layout, root: root.clone(), session: Err("read-only checkout".into()) };
-        let now_s =
-            u64::try_from(dartq_session::SessionState::now_ms() / 1000).expect("unix seconds");
+        log.append("session", "client_attached", json!({"pid": 7}))
+            .expect("append");
+        let mcp = Mcp {
+            layout,
+            root: root.clone(),
+            session: Err("read-only checkout".into()),
+        };
+        let now_ms = u64::try_from(dartq_session::SessionState::now_ms()).expect("unix ms");
 
         let events = events_call(&json!({}), &mcp).expect("default handle is session");
-        let rows = events["events"].as_array().expect("events");
-        assert_eq!(rows.len(), 2);
+        let lines: Vec<&str> = events.split('\n').collect();
+        assert_eq!(lines.len(), 2, "one line per row: {events}");
+        assert!(
+            lines.iter().all(|line| line.starts_with('{')),
+            "every row is its own object document, no wrapper array: {events}"
+        );
+        let first: Value = lon::from_str(lines[0]).expect("lon row");
         assert_eq!(
-            rows[0]["event"], "client_attached",
+            first["event"], "client_attached",
             "newest first: the last append leads the page"
         );
-        let floored = events_call(&json!({"since": now_s - 60}), &mcp).expect("floor read");
-        assert_eq!(floored["events"].as_array().expect("events").len(), 2);
-        let future = events_call(&json!({"since": now_s + 60}), &mcp).expect("future floor");
-        assert!(future["events"].as_array().expect("events").is_empty());
+        let second: Value = lon::from_str(lines[1]).expect("lon row");
+        assert_eq!(second["event"], "serving");
+
+        // The millisecond floor (#2657): the same unit the rows' ts carry.
+        let floored = events_call(&json!({"since": now_ms - 60_000}), &mcp).expect("floor read");
+        assert_eq!(floored.split('\n').count(), 2);
+        let future = events_call(&json!({"since": now_ms + 60_000}), &mcp).expect("future floor");
+        assert!(future.is_empty(), "a future floor reads nothing: {future}");
+        // A seconds-scale floor would read nothing under the old contract
+        // — the rows' ts (≈1.7e12) sit far above it — so this also pins
+        // that the parameter is milliseconds, not seconds.
+        assert!(
+            !events_call(&json!({"since": now_ms / 1000}), &mcp)
+                .expect("seconds-scale floor")
+                .is_empty(),
+            "since is milliseconds: a seconds-scale number floors nothing"
+        );
         let limited = events_call(&json!({"limit": 1}), &mcp).expect("limit read");
-        let page = limited["events"].as_array().expect("events");
+        let page: Vec<&str> = limited.split('\n').collect();
         assert_eq!(page.len(), 1);
-        assert_eq!(page[0]["event"], "client_attached", "the limit keeps the newest row");
+        let newest: Value = lon::from_str(page[0]).expect("lon row");
+        assert_eq!(
+            newest["event"], "client_attached",
+            "the limit keeps the newest row"
+        );
 
         let progress = events_call(&json!({"handle": "progress"}), &mcp).expect("progress");
-        assert_eq!(progress["files_scanned"], 0, "no trace in this tree");
+        assert_eq!(
+            progress,
+            "{type:progress files_scanned:0 from_cache:0 current:null current_package:null cursor:0}",
+            "no trace in this tree — the CLI verb's own row document"
+        );
 
         let error = events_call(&json!({"handle": "bogus"}), &mcp).expect_err("unknown handle");
         assert!(error.contains("unknown handle"), "{error}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The events page's shape is a function of the data alone (#2657):
+    /// a 40-row page — well past the 31/32 boundary a wrapper array once
+    /// flipped at — answers 40 standalone row documents, heterogeneous
+    /// `data` shapes included; no row count can change the encoding.
+    #[test]
+    fn a_40_row_events_page_keeps_one_document_per_row() {
+        let root = std::env::temp_dir().join(format!("dqs-mcp-events-40-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("dir");
+        let layout = Layout::new(&root);
+        let log = EventLog::new(&layout);
+        for index in 0..40 {
+            // Heterogeneous data shapes on purpose: a uniform table is
+            // what a wrapper array would need, and mixed shapes are what
+            // flipped it before.
+            let data = if index % 2 == 0 {
+                json!({"pid": index})
+            } else {
+                json!({"run": index, "label": format!("run-{index}")})
+            };
+            log.append("session", "test_event", data).expect("append");
+        }
+        let mcp = Mcp {
+            layout,
+            root: root.clone(),
+            session: Err("standalone".into()),
+        };
+        let text = events_call(&json!({"limit": 40}), &mcp).expect("page");
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert_eq!(lines.len(), 40, "every row answers: {text}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.starts_with('{') && line.ends_with('}')),
+            "40 object documents, no record table, no wrapper: {text}"
+        );
+        let newest: Value = lon::from_str(lines[0]).expect("lon row");
+        assert_eq!(newest["seq"], 40, "newest first: {newest}");
         std::fs::remove_dir_all(&root).ok();
     }
 }

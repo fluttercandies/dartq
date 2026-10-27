@@ -195,7 +195,6 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use dartq_commands::Verbosity;
 use dartq_commands::discover::DiscoverError;
 use dartq_commands::fix::{self, PluginHosts};
-use dartq_commands::layout::{path_key, severity_rank};
 use dartq_commands::workspace::{WorkspaceAdvisory, engine_config_with_advisory};
 use dartq_diagnostics::{DARTQ_SOURCE_REJECTED, Diagnostic, FileId};
 use dartq_engine::{
@@ -781,7 +780,11 @@ fn config_input_stamps(root: &Path) -> [Option<(SystemTime, u64)>; 3] {
         let meta = std::fs::metadata(root.join(rel)).ok()?;
         Some((meta.modified().ok()?, meta.len()))
     };
-    [stamp("pubspec.yaml"), stamp(".dart_tool/package_config.json"), stamp("analysis_options.yaml")]
+    [
+        stamp("pubspec.yaml"),
+        stamp(".dart_tool/package_config.json"),
+        stamp("analysis_options.yaml"),
+    ]
 }
 
 /// The wire form of a request id (the progress notice carries it, so a
@@ -873,12 +876,12 @@ pub struct Session {
     /// exactly the files the verdict reads, so a mid-session `dart pub get`
     /// heals (or re-arms) it, while source edits cannot move it — the
     /// config is not an engine file (no cycle reconciles it away) and its
-    /// inputs are not source bytes. Every `dartq/analyze` pull leads with
-    /// the current verdict — the full-recompute faces report the on-disk
-    /// state on every run, and the pull face must agree — while the publish
-    /// channel pushes at session start exactly once (`advisory_pushed`)
-    /// plus one replacement push per healed verdict change
-    /// (`advisory_republish`), never part of the per-file diff baseline.
+    /// inputs are not source bytes. The advisory rides the publish channel
+    /// alone (#2657): the push at session start exactly once
+    /// (`advisory_pushed`) plus one replacement push per healed verdict
+    /// change (`advisory_republish`), never part of the per-file diff
+    /// baseline, and never a row of the `dartq/analyze` machine pull (the
+    /// CLI prints it on the human stream; the pull is the CLI's document).
     workspace_advisory: Option<WorkspaceAdvisory>,
     /// The session-start advisory push's exactly-once guard (#741): set
     /// when the first drain has led its publishes with the advisory.
@@ -1086,10 +1089,10 @@ impl Session {
     /// means no persistence (accelerator semantics), never a failed session.
     /// `workspace_advisory` is the assembly's one stale-config advisory (#741);
     /// when present, the session's first drain leads its publishes with the
-    /// advisory push, and every `dartq/analyze` pull leads with the advisory
-    /// row. The verdict is stable across source edits; the config-input
-    /// watch sweep is the only mid-session re-evaluation
-    /// ([`Self::refresh_workspace_advisory`]).
+    /// advisory push; the `dartq/analyze` pull never carries the row (#2657
+    /// — the CLI's own document answers the pull). The verdict is stable
+    /// across source edits; the config-input watch sweep is the only
+    /// mid-session re-evaluation ([`Self::refresh_workspace_advisory`]).
     ///
     /// # Errors
     ///
@@ -1321,9 +1324,10 @@ impl Session {
         // The assembly's workspace advisory (#741: the stale-config row, or
         // its #759 missing-config sibling) moves in as-is: the publish
         // channel renders it once at session start (the push site in
-        // [`Self::service`]) and the `dartq/analyze` pull leads with its row
-        // on every answer. The verdict is stable across source edits; the
-        // config-input watch sweep is the only mid-session re-evaluation
+        // [`Self::service`]); the `dartq/analyze` pull never carries it
+        // (#2657 — the pull answers the CLI's own document). The verdict is
+        // stable across source edits; the config-input watch sweep is the
+        // only mid-session re-evaluation
         // ([`Self::refresh_workspace_advisory`]).
         // The plugin set spawns eagerly at assembly:
         // the handshake completes before the first turn. An empty discovery
@@ -1452,14 +1456,20 @@ impl Session {
         if !self.discovered {
             self.discovered = true;
             for index in 0..self.context_ids.len() {
-                if let Err(error) = self.engine_mut(self.context_ids[index]).discover_workspace() {
+                if let Err(error) = self
+                    .engine_mut(self.context_ids[index])
+                    .discover_workspace()
+                {
                     eprintln!("dartq-daemon: workspace discovery failed: {error}");
                 }
             }
         } else {
             let cap = self.live_path_cap;
             for index in 0..self.context_ids.len() {
-                match self.engine_mut(self.context_ids[index]).refresh_workspace(cap) {
+                match self
+                    .engine_mut(self.context_ids[index])
+                    .refresh_workspace(cap)
+                {
                     Ok(stats) if stats.skipped > 0 && !self.refresh_skip_reported => {
                         self.refresh_skip_reported = true;
                         eprintln!(
@@ -1806,9 +1816,7 @@ impl Session {
         });
         for (path, file) in &staged {
             if let Some(prev) = existing.and_then(|overlay| overlay.files.get(path)) {
-                total = total
-                    .saturating_sub(prev.len())
-                    .saturating_add(file.len());
+                total = total.saturating_sub(prev.len()).saturating_add(file.len());
             } else {
                 count += 1;
                 total = total.saturating_add(file.len());
@@ -2037,7 +2045,8 @@ impl Session {
             Err(crossbeam_channel::TryRecvError::Empty) => None,
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 self.debug_dispatch = None;
-                self.debug_live.store(0, std::sync::atomic::Ordering::Relaxed);
+                self.debug_live
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
                 None
             }
         }
@@ -3038,55 +3047,15 @@ impl Session {
         if is_base {
             self.publish_plan(&diagnostics, &converted, turn);
         }
-        // dartq/analyze answers keep the CLI analyze face's printed order
-        // (severity-first before writing; the shared key lives in
-        // dartq-commands' layout module): severity, path bytes, offset,
-        // message — not the engine's canonical (file, offset) order the
-        // other faces mirror. The entries pair with their engine
-        // diagnostics for the sort key, then strip.
-        let mut paired: Vec<(&Diagnostic, &Path, wire::AnalyzeEntry)> = diagnostics
-            .iter()
-            .zip(converted)
-            .filter_map(|(diagnostic, converted)| {
-                let converted = converted?;
-                let path = self.engine(context).file_table().path(diagnostic.file)?;
-                Some((
-                    diagnostic,
-                    path,
-                    wire::AnalyzeEntry {
-                        uri: uri::from_path(path),
-                        diagnostic: converted,
-                        len: diagnostic.range.length,
-                    },
-                ))
-            })
-            .collect();
-        paired.sort_by(|(a, a_path, _), (b, b_path, _)| {
-            severity_rank(a.severity)
-                .cmp(&severity_rank(b.severity))
-                .then_with(|| path_key(a_path).cmp(path_key(b_path)))
-                .then_with(|| a.range.offset.cmp(&b.range.offset))
-                .then_with(|| a.message.cmp(&b.message))
-        });
-        let mut entries: Vec<wire::AnalyzeEntry> =
-            paired.into_iter().map(|(_, _, entry)| entry).collect();
-        // The workspace advisory leads the pull answer (#741): the CLI
-        // analyze face renders the advisory ahead of the rows. The verdict
-        // is stable across source edits and tracks the watched config
-        // inputs ([`Self::refresh_workspace_advisory`]), so every pull
-        // carries the on-disk state's verdict — keeping the incremental
-        // face byte-equal with the full-recompute faces (the
-        // incremental-consistency gate compares the two).
-        if let Some(advisory) = &self.workspace_advisory {
-            entries.insert(
-                0,
-                wire::AnalyzeEntry {
-                    uri: uri::from_path(advisory.config_path()),
-                    diagnostic: advisory_row(advisory),
-                    len: 0,
-                },
-            );
-        }
+        // `dartq/analyze` answers render at the drain through the shared
+        // CLI document builder (`commands::analyze_answer`), which imposes
+        // the CLI's severity-first order itself over the raw set — no
+        // pre-shaped pull entries ride the drain anymore (#2657); the
+        // conversion above feeds the publish face alone. The workspace
+        // advisory (#741) keeps its channels: the session-start push and
+        // the config-input sweep's republish — its row no longer leads
+        // the machine pull, matching the CLI face (the advisory prints on
+        // the human stream there, never in the lon document).
         let agent_changed: Option<Vec<(PathBuf, u64)>> = agent.map(|agent| {
             self.agents[agent]
                 .files
@@ -3108,7 +3077,6 @@ impl Session {
             root: &self.workspace_root,
             sdk_root: &self.sdk_root,
             diagnostics: &diagnostics,
-            entries: &entries,
             changes: &changes,
             cursor: self.cursor,
             overlay_paths: &overlay_paths,
@@ -4265,6 +4233,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(1),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4370,16 +4339,15 @@ mod tests {
         );
     }
 
-    /// The pull face carries the stale-config advisory: every `dartq/analyze`
-    /// answer leads with the advisory row — the same anchor, severity, code,
-    /// and message the session-start push serves — and it stays present
-    /// across later turns (a source-only edit cannot change the freshness
-    /// verdict), which is what keeps an incremental replay byte-equal with
-    /// the full-recompute faces (the incremental-consistency gate compares
-    /// the two). The push stays exactly-once across those same turns; a
-    /// fresh assembly's pull carries no config row.
+    /// The pull face after #2657: `dartq/analyze` answers the CLI's own
+    /// document (the shared `diags_document` builder — `root` key, located
+    /// files, the CLI's row order), and the stale-config advisory rides
+    /// its push channel alone, never the machine pull — the CLI prints the
+    /// advisory on its human stream, and the machine faces now match it
+    /// byte for byte. The push stays exactly-once across the same turns;
+    /// the advisory never appears as a pull row, stale or fresh.
     #[test]
-    fn analyze_pull_leads_with_the_stale_config_advisory() {
+    fn analyze_pull_is_the_cli_document_and_keeps_the_advisory_off() {
         let workspace = Workspace::new(BROKEN_MAIN);
         let config_path = workspace.path(".dart_tool/package_config.json");
         let config_uri = uri::from_path(&config_path);
@@ -4397,43 +4365,46 @@ mod tests {
 
         session.sweep().expect("sweep");
         let start = session.service();
-        let push_row = &start.publishes[0].diagnostics[0];
+        assert!(
+            start.publishes.iter().any(|push| push.uri == config_uri),
+            "the session-start push carries the advisory"
+        );
 
-        // First pull: the advisory row leads the answer, byte-equal to the
-        // push row (severity, range, code, source, message) at the config URI.
+        // First pull: the CLI document — the workspace root rides once,
+        // the rows locate against it, and no advisory row rides the
+        // machine face.
         session.queue_command(
             RequestId::Num(1),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
             },
         );
         let turn = session.service();
-        let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diags"]
-            .as_array()
-            .expect("diagnostics rows");
-        assert!(!rows.is_empty(), "the pull is not empty");
-        let lead = &rows[0];
-        assert_eq!(lead["file"], config_uri.as_str(), "the advisory leads");
+        let answer = turn.answers[0].1.as_ref().expect("the pull answers");
         assert_eq!(
-            lead["sev"],
-            wire::severity_word(push_row.severity),
-            "same severity"
+            answer["root"],
+            workspace.root.display().to_string(),
+            "the CLI document's root key: {answer}"
         );
-        assert_eq!(lead["code"], push_row.code, "same code");
-        assert_eq!(lead["msg"], push_row.message, "same message");
-        assert_eq!(lead["line"], 1, "the row names a file, not a span");
-        assert_eq!(lead["col"], 1, "the row names a file, not a span");
-        assert_eq!(lead["len"], 0, "the row names a file, not a span");
+        let rows = answer["diags"].as_array().expect("diagnostics rows");
+        assert!(!rows.is_empty(), "the pull is not empty");
+        assert_eq!(rows[0]["file"], "lib/main.dart", "the located spelling");
+        assert!(
+            rows.iter()
+                .all(|row| row["file"] != config_uri.as_str()
+                    && row["code"] != "dartq/package_config_out_of_date"),
+            "the advisory never rides the machine pull: {answer}"
+        );
         assert!(
             !turn.publishes.iter().any(|push| push.uri == config_uri),
             "the push stays exactly-once across pulls"
         );
 
-        // A source-only edit turn (the gate's comment splice shape): the
-        // verdict cannot change, so the advisory still leads and the push
-        // never repeats.
+        // A source-only edit turn: the verdict cannot change, and the pull
+        // still carries no config row while the push never repeats.
         let main = workspace.path("lib/main.dart");
         std::fs::write(&main, CLEAN_MAIN).expect("rewrite on disk");
         session
@@ -4442,24 +4413,23 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
             },
         );
         let turn = session.service();
-        let rows = turn.answers[0]
+        let answer = turn.answers[0]
             .1
             .as_ref()
-            .expect("the post-edit pull answers")["diags"]
-            .as_array()
-            .expect("diagnostics rows");
-        assert_eq!(
-            rows[0]["file"],
-            config_uri.as_str(),
-            "the advisory still leads after a source-only edit"
+            .expect("the post-edit pull answers");
+        let rows = answer["diags"].as_array().expect("diagnostics rows");
+        assert!(
+            rows.iter()
+                .all(|row| row["file"] != config_uri.as_str()),
+            "the advisory stays off the pull after a source-only edit: {answer}"
         );
-        assert_eq!(rows[0]["code"], "dartq/package_config_out_of_date");
         assert!(
             !turn.publishes.iter().any(|push| push.uri == config_uri),
             "the push never republishes after an edit"
@@ -4479,6 +4449,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4497,13 +4468,13 @@ mod tests {
 
     /// The config-input watch sweep's advisory heal: a re-evaluation over a
     /// resolution that went stale behind the session re-arms the verdict
-    /// (the fresh row republishes exactly once and leads the next pull), a
-    /// re-evaluation over a healed resolution clears it (the retraction is
-    /// one empty set at the previous anchor), and a re-evaluation over an
-    /// unchanged resolution stages nothing — the once-per-session push
-    /// economics hold. Source edits never reach the re-evaluation (only the
-    /// watched config inputs route to it), so the pull face's source-edit
-    /// stability is unchanged.
+    /// (the fresh row republishes exactly once, riding the push channel
+    /// alone), a re-evaluation over a healed resolution clears it (the
+    /// retraction is one empty set at the previous anchor), and a
+    /// re-evaluation over an unchanged resolution stages nothing — the
+    /// once-per-session push economics hold. Source edits never reach the
+    /// re-evaluation (only the watched config inputs route to it), and the
+    /// pull face never carries the advisory in any state (#2657).
     #[test]
     fn config_input_sweep_heals_the_workspace_advisory() {
         let workspace = Workspace::new(BROKEN_MAIN);
@@ -4536,6 +4507,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(1),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4553,20 +4525,19 @@ mod tests {
             pushes[0].diagnostics[0].code,
             "dartq/package_config_out_of_date"
         );
+        assert!(
+            pushes[0].diagnostics[0]
+                .message
+                .contains("generated by Dart 3.9.0"),
+            "the pushed row names the fresh verdict: {:?}",
+            pushes[0].diagnostics[0].message
+        );
         let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diags"]
             .as_array()
             .expect("diagnostics rows");
-        assert_eq!(
-            rows[0]["file"],
-            config_uri.as_str(),
-            "the healed verdict leads the pull"
-        );
         assert!(
-            rows[0]["msg"]
-                .as_str()
-                .is_some_and(|message| message.contains("generated by Dart 3.9.0")),
-            "the row names the fresh verdict: {}",
-            rows[0]["msg"]
+            rows.iter().all(|row| row["file"] != config_uri.as_str()),
+            "the healed verdict rides the push, never the machine pull: {rows:?}"
         );
 
         // The heal: the resolution catches up (`dart pub get` rewrote the
@@ -4581,6 +4552,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4619,7 +4591,7 @@ mod tests {
     /// `refresh_workspace_advisory` calls in the pushed state — an unchanged
     /// standing verdict, and the both-verdicts-clear neighborhood the
     /// degrade arm covers — never panic and never stage a republish; the
-    /// pull keeps leading with the standing verdict and the retract stays
+    /// pull stays the advisory-free CLI document and the retract stays
     /// exactly-once.
     #[test]
     fn stale_advisory_refresh_degrades_without_unreachable() {
@@ -4662,12 +4634,14 @@ mod tests {
 
         // Watch-event interleaving shape: repeated refreshes over the
         // unchanged standing verdict in the pushed state stage nothing, and
-        // the pull still leads with the row.
+        // the machine pull never carries the row (#2657 — the push face
+        // owns the advisory alone).
         session.refresh_workspace_advisory();
         session.refresh_workspace_advisory();
         session.queue_command(
             RequestId::Num(1),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4681,10 +4655,9 @@ mod tests {
         let rows = turn.answers[0].1.as_ref().expect("the pull answers")["diags"]
             .as_array()
             .expect("diagnostics rows");
-        assert_eq!(
-            rows[0]["file"],
-            config_uri.as_str(),
-            "the standing verdict still leads the pull"
+        assert!(
+            rows.iter().all(|row| row["file"] != config_uri.as_str()),
+            "the pull stays the CLI document, advisory-free: {rows:?}"
         );
 
         // The heal retracts exactly once; further refreshes over the
@@ -4737,6 +4710,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4749,6 +4723,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4777,7 +4752,14 @@ mod tests {
     /// queued position (the serial partition), preamble attached.
     #[test]
     fn coalesced_requests_answer_in_order_across_the_fan_out() {
-        let (_workspace, mut session) = fixture_with("fanout-order-unit", SYNTAX_BROKEN);
+        // The broken file lives at a long located path: the short-id
+        // economics must pay (rows long enough to beat the preamble cost —
+        // the located spellings the #2657 document carries are far shorter
+        // than the retired URI spellings).
+        let (workspace, mut session) = fixture_with("fanout-order-unit", CLEAN_MAIN);
+        let long = workspace.path("lib/src/a_suitably_long_directory_name/compile_unit.dart");
+        std::fs::create_dir_all(long.parent().expect("parent")).expect("dir");
+        std::fs::write(&long, SYNTAX_BROKEN).expect("write the broken unit");
 
         session.sweep().expect("sweep");
         let _ = session.service();
@@ -4789,6 +4771,7 @@ mod tests {
             session.queue_command(
                 RequestId::Num(id),
                 Request::Analyze {
+                    target: None,
                     verbosity: Verbosity::Compact,
                     agent: None,
                     context: None,
@@ -4798,6 +4781,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(8),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Full,
                 agent: None,
                 context: None,
@@ -4865,6 +4849,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4898,6 +4883,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4953,6 +4939,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -4982,6 +4969,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(1),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5032,6 +5020,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5074,6 +5063,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5128,10 +5118,7 @@ mod tests {
         };
         assert_eq!(*id, RequestId::Num(2));
         let answer = answer.as_ref().expect("the fix answers");
-        assert_eq!(
-            answer["v"],
-            serde_json::json!(commands::SCHEMA_VERSION)
-        );
+        assert_eq!(answer["v"], serde_json::json!(commands::SCHEMA_VERSION));
         assert!(answer["files"].is_array(), "the patch document: {answer}");
         assert!(session.fix_running.is_none(), "the mail freed the slot");
         assert!(session.fix_hosts.is_some(), "the host set came home");
@@ -5218,6 +5205,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5271,6 +5259,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5398,6 +5387,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5615,6 +5605,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5678,6 +5669,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5686,6 +5678,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5734,6 +5727,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5755,6 +5749,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5822,6 +5817,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5880,6 +5876,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -5904,6 +5901,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6023,6 +6021,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6110,6 +6109,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6137,7 +6137,13 @@ mod tests {
         // while the agent's view keeps its own
         // content — disk traffic never leaks into it.
         session
-            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
+            .set_overlay(
+                "A",
+                vec![(
+                    main.clone(),
+                    StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()),
+                )],
+            )
             .expect("stage A");
         fs::write(&main, SYNTAX_BROKEN).expect("another disk rewrite");
         session
@@ -6148,6 +6154,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(4),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6194,6 +6201,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6226,6 +6234,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6427,10 +6436,19 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
+            .set_overlay(
+                "A",
+                vec![(
+                    main.clone(),
+                    StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()),
+                )],
+            )
             .expect("stage A");
         session
-            .set_overlay("B", vec![(main, StagedFile::Bytes(AGENT_B_MAIN.as_bytes().to_vec()))])
+            .set_overlay(
+                "B",
+                vec![(main, StagedFile::Bytes(AGENT_B_MAIN.as_bytes().to_vec()))],
+            )
             .expect("stage B");
 
         let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
@@ -6442,6 +6460,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(5),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6516,7 +6535,10 @@ mod tests {
             )
             .expect("stage A");
         session
-            .set_overlay("B", vec![(main.clone(), StagedFile::Bytes(b"var b = 3;".to_vec()))])
+            .set_overlay(
+                "B",
+                vec![(main.clone(), StagedFile::Bytes(b"var b = 3;".to_vec()))],
+            )
             .expect("stage B");
 
         let overlays = session.plugin_overlays();
@@ -6550,7 +6572,13 @@ mod tests {
         let main = workspace.path("lib/main.dart");
         session.inject_plugins(PluginSet::with_dead_plugin("dead", "spawn failed"));
         session
-            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
+            .set_overlay(
+                "A",
+                vec![(
+                    main.clone(),
+                    StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()),
+                )],
+            )
             .expect("stage");
 
         session.sweep().expect("sweep");
@@ -6574,12 +6602,16 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main, StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
+            .set_overlay(
+                "A",
+                vec![(main, StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))],
+            )
             .expect("stage");
 
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: Some("A".into()),
                 context: None,
@@ -6592,6 +6624,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: Some("A".into()),
                 context: None,
@@ -6610,6 +6643,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(4),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6639,7 +6673,13 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(SYNTAX_BROKEN.as_bytes().to_vec()))])
+            .set_overlay(
+                "A",
+                vec![(
+                    main.clone(),
+                    StagedFile::Bytes(SYNTAX_BROKEN.as_bytes().to_vec()),
+                )],
+            )
             .expect("stage");
         // The base moves AFTER staging: the agent's capture must happen at
         // wear time, so A keeps seeing its own text and the base moves on.
@@ -6667,6 +6707,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6773,9 +6814,7 @@ mod tests {
                 .1
         };
         let syms = |answer: &Result<serde_json::Value, SessionError>| {
-            answer
-                .as_ref()
-                .expect("the impact answer is ok")["sym"]
+            answer.as_ref().expect("the impact answer is ok")["sym"]
                 .as_array()
                 .expect("the changed-symbol rows")
                 .to_vec()
@@ -6791,7 +6830,8 @@ mod tests {
             "the edited in-root row survives the delta filter: {all_syms:?}"
         );
         assert_eq!(
-            by_id(2).as_ref().expect("ok")["since"], 1,
+            by_id(2).as_ref().expect("ok")["since"],
+            1,
             "the delta answer echoes the session's current cursor"
         );
         // since=1 (the current cursor): nothing is newer — the same row
@@ -6817,7 +6857,13 @@ mod tests {
         // the file. If the publish leaked A's view, the push would carry
         // `expected_token` instead of the base clear.
         session
-            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(AGENT_B_MAIN.as_bytes().to_vec()))])
+            .set_overlay(
+                "A",
+                vec![(
+                    main.clone(),
+                    StagedFile::Bytes(AGENT_B_MAIN.as_bytes().to_vec()),
+                )],
+            )
             .expect("stage");
         let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
         session.queue_command(id_a, a);
@@ -6863,6 +6909,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6886,6 +6933,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -6932,6 +6980,7 @@ mod tests {
             session.queue_command(
                 RequestId::Num(id),
                 Request::Analyze {
+                    target: None,
                     verbosity: Verbosity::Compact,
                     agent: None,
                     context: None,
@@ -6978,6 +7027,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(20),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7093,6 +7143,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7241,6 +7292,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7314,13 +7366,17 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main, StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
+            .set_overlay(
+                "A",
+                vec![(main, StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))],
+            )
             .expect("stage A");
         let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
         session.queue_command(id_a, a);
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7354,6 +7410,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(4),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7378,7 +7435,13 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(AGENT_B_MAIN.as_bytes().to_vec()))])
+            .set_overlay(
+                "A",
+                vec![(
+                    main.clone(),
+                    StagedFile::Bytes(AGENT_B_MAIN.as_bytes().to_vec()),
+                )],
+            )
             .expect("stage A");
         let (id_a, a) = check_request(2, &[workspace.path("lib")], Some("A"), None);
         session.queue_command(id_a, a);
@@ -7386,6 +7449,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7637,6 +7701,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7676,6 +7741,7 @@ mod tests {
             session.queue_command(
                 RequestId::Num(i64::try_from(index).expect("index fits i64") + 2),
                 Request::Analyze {
+                    target: None,
                     verbosity: Verbosity::Compact,
                     agent: Some(agent),
                     context: None,
@@ -7700,6 +7766,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(10_000),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: Some(format!("agent-{}", count - 1)),
                 context: None,
@@ -7745,6 +7812,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -7934,7 +8002,10 @@ mod tests {
             session
                 .set_overlay(
                     &format!("agent-{index}"),
-                    vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))],
+                    vec![(
+                        main.clone(),
+                        StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()),
+                    )],
                 )
                 .expect("under the cap");
         }
@@ -7942,14 +8013,20 @@ mod tests {
             session
                 .set_overlay(
                     "overflow",
-                    vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))]
+                    vec![(
+                        main.clone(),
+                        StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec())
+                    )]
                 )
                 .is_err(),
             "the cap rejects a new agent"
         );
         session.clear_overlay("agent-0");
         session
-            .set_overlay("overflow", vec![(main, StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
+            .set_overlay(
+                "overflow",
+                vec![(main, StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))],
+            )
             .expect("a cleared slot frees room");
     }
 
@@ -7975,7 +8052,10 @@ mod tests {
         let error = session
             .set_overlay(
                 "A",
-                vec![(workspace.path("lib/extra.dart"), StagedFile::Bytes(b"var y = 2;\n".to_vec()))],
+                vec![(
+                    workspace.path("lib/extra.dart"),
+                    StagedFile::Bytes(b"var y = 2;\n".to_vec()),
+                )],
             )
             .expect_err("the cap rejects growth");
         assert!(
@@ -7992,7 +8072,10 @@ mod tests {
         session
             .set_overlay(
                 "A",
-                vec![(workspace.path("lib/f0.dart"), StagedFile::Bytes(b"var z = 3;\n".to_vec()))],
+                vec![(
+                    workspace.path("lib/f0.dart"),
+                    StagedFile::Bytes(b"var z = 3;\n".to_vec()),
+                )],
             )
             .expect("an overwrite stays at the cap");
         assert_eq!(session.agents["A"].files.len(), MAX_OVERLAY_FILES);
@@ -8006,11 +8089,20 @@ mod tests {
         let (workspace, mut session) = fixture("agent-bytes-cap-unit");
         let full = vec![0u8; MAX_OVERLAY_BYTES];
         session
-            .set_overlay("A", vec![(workspace.path("lib/big.dart"), StagedFile::Bytes(full))])
+            .set_overlay(
+                "A",
+                vec![(workspace.path("lib/big.dart"), StagedFile::Bytes(full))],
+            )
             .expect("exactly the byte cap fits");
 
         let error = session
-            .set_overlay("A", vec![(workspace.path("lib/one.dart"), StagedFile::Bytes(b"x".to_vec()))])
+            .set_overlay(
+                "A",
+                vec![(
+                    workspace.path("lib/one.dart"),
+                    StagedFile::Bytes(b"x".to_vec()),
+                )],
+            )
             .expect_err("one byte past the cap rejects");
         assert!(
             matches!(error, SessionError::InvalidParams(ref message) if message.contains("byte cap")),
@@ -8032,13 +8124,22 @@ mod tests {
             let agent = format!("A{index}");
             let full = vec![0u8; MAX_OVERLAY_BYTES];
             session
-                .set_overlay(&agent, vec![(workspace.path("lib/big.dart"), StagedFile::Bytes(full))])
+                .set_overlay(
+                    &agent,
+                    vec![(workspace.path("lib/big.dart"), StagedFile::Bytes(full))],
+                )
                 .expect("each agent holds its own cap within the session total");
         }
 
         // One byte past the session total rejects the staging agent only.
         let error = session
-            .set_overlay("E", vec![(workspace.path("lib/one.dart"), StagedFile::Bytes(b"x".to_vec()))])
+            .set_overlay(
+                "E",
+                vec![(
+                    workspace.path("lib/one.dart"),
+                    StagedFile::Bytes(b"x".to_vec()),
+                )],
+            )
             .expect_err("the session total rejects growth");
         assert!(
             matches!(error, SessionError::InvalidParams(ref message) if message.contains("total cap")),
@@ -8053,7 +8154,13 @@ mod tests {
         // Clearing an agent frees its budget for the next stager.
         session.clear_overlay("A0");
         session
-            .set_overlay("E", vec![(workspace.path("lib/one.dart"), StagedFile::Bytes(b"x".to_vec()))])
+            .set_overlay(
+                "E",
+                vec![(
+                    workspace.path("lib/one.dart"),
+                    StagedFile::Bytes(b"x".to_vec()),
+                )],
+            )
             .expect("a cleared agent frees session budget");
     }
 
@@ -8074,7 +8181,10 @@ mod tests {
         let error = session
             .set_overlay(
                 "A",
-                vec![(PathBuf::from("/etc/dartq-escape"), StagedFile::Bytes(b"x".to_vec()))],
+                vec![(
+                    PathBuf::from("/etc/dartq-escape"),
+                    StagedFile::Bytes(b"x".to_vec()),
+                )],
             )
             .expect_err("an absolute path outside the root rejects");
         assert!(
@@ -8084,7 +8194,10 @@ mod tests {
         // Relative `..` escape.
         let outside = session.set_overlay(
             "A",
-            vec![(workspace.path("../../outside.dart"), StagedFile::Bytes(b"x".to_vec()))],
+            vec![(
+                workspace.path("../../outside.dart"),
+                StagedFile::Bytes(b"x".to_vec()),
+            )],
         );
         assert!(
             matches!(outside, Err(SessionError::InvalidParams(ref message)) if message.contains("escapes")),
@@ -8137,7 +8250,10 @@ mod tests {
         session
             .set_overlay(
                 "A",
-                vec![(link.join("x.dart"), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))],
+                vec![(
+                    link.join("x.dart"),
+                    StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()),
+                )],
             )
             .expect("staging is lexical: the symlink is not followed yet");
 
@@ -8278,6 +8394,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -8286,6 +8403,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("t".into()),
@@ -8340,6 +8458,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("t".into()),
@@ -8400,6 +8519,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("a".into()),
@@ -8465,6 +8585,7 @@ mod tests {
         warm.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -8473,6 +8594,7 @@ mod tests {
         warm.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("t".into()),
@@ -8612,6 +8734,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: Some("t".into()),
@@ -8798,6 +8921,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -8829,6 +8953,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -8877,6 +9002,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -8912,6 +9038,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -8956,6 +9083,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -8978,6 +9106,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -8999,6 +9128,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(4),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -9033,6 +9163,7 @@ mod tests {
             session.queue_command(
                 RequestId::Num(i64::from(strike) + 2),
                 Request::Analyze {
+                    target: None,
                     verbosity: Verbosity::Compact,
                     agent: None,
                     context: None,
@@ -9056,6 +9187,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(5),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -9067,6 +9199,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(6),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -9089,7 +9222,13 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
+            .set_overlay(
+                "A",
+                vec![(
+                    main.clone(),
+                    StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()),
+                )],
+            )
             .expect("stage");
 
         let before = session.cursor;
@@ -9125,6 +9264,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: Some("A".into()),
                 context: None,
@@ -9157,7 +9297,13 @@ mod tests {
         session.sweep().expect("sweep");
         let _ = session.service();
         session
-            .set_overlay("A", vec![(main.clone(), StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()))])
+            .set_overlay(
+                "A",
+                vec![(
+                    main.clone(),
+                    StagedFile::Bytes(CLEAN_MAIN.as_bytes().to_vec()),
+                )],
+            )
             .expect("stage");
         assert_eq!(session.commit_overlay("A").expect("first commit"), 1);
         let _ = session.service();
@@ -9296,6 +9442,7 @@ mod tests {
         session.queue_command(
             RequestId::Num(2),
             Request::Analyze {
+                target: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -9308,13 +9455,13 @@ mod tests {
         assert_eq!(entries.len(), 2, "the warning plus the error: {entries:?}");
         assert_eq!(
             entries[0]["file"],
-            uri::from_path(&workspace.path("lib/b.dart")),
-            "the error sorts first despite b.dart sorting second: {entries:?}"
+            "lib/b.dart",
+            "the error sorts first despite b.dart sorting second (the CLI's severity-first order, the located spelling): {entries:?}"
         );
         assert_eq!(entries[0]["sev"], "error", "error first");
         assert_eq!(
             entries[1]["file"],
-            uri::from_path(&workspace.path("lib/a.dart")),
+            "lib/a.dart",
             "the warning follows: {entries:?}"
         );
         assert_eq!(entries[1]["sev"], "warning", "warning second");

@@ -923,3 +923,76 @@ fn event_payload_keeps_typed_shape_and_drops_raw_for_modeled_kinds() {
         Some(0)
     );
 }
+
+/// #2661: the tracked pause answers whether a frame exists — the
+/// precondition of a frame-indexed evaluation — from session state
+/// alone, no VM round trip. A pause with no top frame (an isolate
+/// interrupted while idle) means an empty stack; a breakpoint pause
+/// carries frame 0; a running isolate is no local verdict, and a
+/// resume clears it back to none.
+#[test]
+fn paused_frame_exists_tracks_the_pause_shape() {
+    let vm = MockVm::start(|request| match request.method.as_str() {
+        "pause" => Reply::Prefixed {
+            prelude: vec![pause_event("Debug", interrupt_event())],
+            result: json!({ "type": "Success" }),
+        },
+        _ => default_reply(request),
+    });
+    let mut session = DebugSession::attach_with(&vm.ws_uri, fast_config()).expect("attach");
+    assert_eq!(
+        session.paused_frame_exists(None),
+        None,
+        "a running isolate carries no local verdict"
+    );
+    session.pause(None).expect("pause");
+    // The pushed event rides the socket; a bounded poll loop waits out
+    // the delivery instead of racing it (the pattern the blocking
+    // faces' internal loops use).
+    let pause_by = std::time::Instant::now() + Duration::from_secs(5);
+    while session.paused_frame_exists(None) != Some(false) {
+        assert!(
+            std::time::Instant::now() < pause_by,
+            "the interrupt pause never landed"
+        );
+        session.poll_events().expect("poll");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    vm.control()
+        .send(pause_event(
+            "Debug",
+            pause_breakpoint_event("isolates/1", &["breakpoints/1"]),
+        ))
+        .expect("push breakpoint pause");
+    let frame_by = std::time::Instant::now() + Duration::from_secs(5);
+    while session.paused_frame_exists(None) != Some(true) {
+        assert!(
+            std::time::Instant::now() < frame_by,
+            "the breakpoint pause never landed"
+        );
+        session.poll_events().expect("poll");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    vm.control()
+        .send(pause_event(
+            "Debug",
+            json!({
+                "type": "Event",
+                "kind": "Resume",
+                "isolate": { "type": "@Isolate", "id": "isolates/1", "number": "1", "name": "main" },
+                "timestamp": 2_i64,
+            }),
+        ))
+        .expect("push resume");
+    let gone_by = std::time::Instant::now() + Duration::from_secs(5);
+    while session.paused_frame_exists(None).is_some() {
+        assert!(
+            std::time::Instant::now() < gone_by,
+            "the resume never landed"
+        );
+        session.poll_events().expect("poll");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}

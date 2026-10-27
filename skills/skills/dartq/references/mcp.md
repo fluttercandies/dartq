@@ -41,14 +41,38 @@ pass its path as the `DIR` argument) so tools bind the right session.
 
 ## Tool Schemas Are Self-Describing
 
-The server's `tools/list` carries every tool's parameter schema and a
-when-to-use / not-for description — including the full debug family
-(`dartq_debug_*`, the `dartq debug` verbs' mirror). Tool arguments are
-snake_case (`new_name`, `session_id` where a tool names one) and every
-`tools/call` answer rides `content[0].text` as **canonical LON** over the
-short field vocabulary — the same encoding the CLI's `--format lon`
-default prints. Ask the host to list tools instead of loading a catalog
-here; the live answer is always current, a copied one only drifts.
+The server's `tools/list` carries every tool's parameter schema — real,
+closed schemas (`additionalProperties: false`, typed properties, the
+closed vocabularies like `kind`/`role`/`verbosity`, required keys) —
+generated from the same table the dispatch validates against: an
+unknown or mistyped parameter answers `INVALID_PARAMS` naming the
+parameter. Every tool also carries a when-to-use / not-for description,
+including the full debug family (`dartq_debug_*`, the `dartq debug`
+verbs' mirror). Tool arguments are snake_case (`new_name`,
+`frame_index`, `session_id` where a tool names one).
+
+Relative path arguments (`target` on `dartq_analyze`, `path` on
+`dartq_impact`, `paths` on `dartq_fix`, the rename anchor) resolve
+against the server's working directory — the directory the client runs
+in — falling back to the workspace root only when that spelling does
+not exist.
+
+## Every Tool Answers the CLI's Own Bytes
+
+Every `tools/call` answer rides `content[0].text` as **canonical LON** —
+the same encoding the CLI's `--format lon` default prints, and the same
+*value*: each tool's text is exactly the equivalent CLI command's stdout
+(#2657). One LON line per document; the multi-document faces (`dartq_fix`'s
+per-file patch documents, `dartq_events`' per-row stream) answer the same
+lines the CLI prints, joined by `\n`. `dartq_analyze` answers the CLI's
+`dartq analyze` document itself (the `root` key, root-relative files, the
+CLI's row order); `dartq_impact` answers the CLI's report, environment
+verdicts included; `dartq_rename` answers the CLI's rename document. The
+one unit caveat: `dartq_events`' `since` floors in **milliseconds**, the
+unit the rows' own `ts` field carries.
+
+Ask the host to list tools instead of loading a catalog here; the live
+answer is always current, a copied one only drifts.
 
 ## Resource
 

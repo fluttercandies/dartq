@@ -136,10 +136,13 @@ fn dartq_check_matches_the_cli_machine_face() {
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
-/// dartq/analyze vs the CLI machine face: one RPC entry per machine line,
-/// its URI the encoded file path and its diagnostic fields identical.
+/// dartq/analyze vs the CLI lon face (#2657): the RPC answer IS the CLI's
+/// own analyze document — the shared `diags_document` builder over the
+/// same engine pass, root key and located files included — and a `target`
+/// narrows the answer to the covered files exactly like the CLI's
+/// positional; a missing target is the CLI's own usage wording.
 #[test]
-fn dartq_analyze_matches_the_cli_machine_face() {
+fn dartq_analyze_answers_the_cli_document() {
     let _guard = workspace_lock();
     let workspace = Workspace::new(BROKEN_MAIN);
     let mut h = spawn(&workspace, &store_root("rpc-analyze"));
@@ -147,29 +150,205 @@ fn dartq_analyze_matches_the_cli_machine_face() {
     h.step(&request(2, "dartq/analyze", json!({})), 1);
     let result = answer_result(&h, 2);
     assert_eq!(result["v"], 1);
-    let entries = result["diags"].as_array().expect("entries");
-    assert!(!entries.is_empty(), "the broken fixture has diagnostics");
 
-    // The CLI face: a fresh engine over the same workspace.
+    // The CLI face: a fresh engine over the same workspace, the same lint
+    // roots the session uses, merged exactly like the CLI's runner — then
+    // the one shared document builder both faces render through.
     let mut engine = dartq_engine::Engine::new(workspace.engine_config()).expect("engine");
-    // The lint stage roots at the workspace root, exactly like the daemon
-    // session does, so both faces produce the same rows.
     let run = dartq_commands::analyze::run(&mut engine, std::slice::from_ref(&workspace.root))
         .expect("analyze core");
-    let expected = machine_face_rows(&run.diagnostics, &run.layout);
-    assert_eq!(entries.len(), expected.len(), "one entry per machine row");
-    for (entry, row) in entries.iter().zip(&expected) {
-        let path = std::path::Path::new(row["file"].as_str().expect("file"));
-        assert_eq!(entry["file"], dartq_daemon::uri::from_path(path));
-        assert_eq!(entry["code"], row["code"]);
-        assert_eq!(entry["msg"], row["msg"]);
-        assert_eq!(entry["line"], row["line"], "rows are 1-based");
-        assert_eq!(entry["col"], row["col"], "rows are 1-based");
-        assert_eq!(entry["sev"], "error", "the fixture row is an error");
-    }
+    let merged = dartq_commands::analyze::merge_runs(vec![run]);
+    let expected = dartq_commands::analyze::diags_document(&dartq_diagnostics::AnalysisOutput {
+        diagnostics: &merged.diagnostics,
+        files: &merged,
+    });
+    assert!(
+        !expected["diags"].as_array().expect("rows").is_empty(),
+        "the broken fixture has diagnostics"
+    );
+    assert_eq!(
+        result, expected,
+        "the RPC answer is the CLI's own document, field for field"
+    );
+    assert_eq!(
+        result["root"],
+        workspace.root.display().to_string(),
+        "the envelope carries the analysis root once"
+    );
+    assert_eq!(
+        result["diags"][0]["file"], "lib/main.dart",
+        "inside the root: the located spelling"
+    );
+
+    // A target narrows the answer: the file target keeps exactly that
+    // file's rows, the same coverage the CLI positional applies.
+    h.step(
+        &request(
+            3,
+            "dartq/analyze",
+            json!({ "target": workspace.path("lib/main.dart").display().to_string() }),
+        ),
+        1,
+    );
+    let narrowed = answer_result(&h, 3);
+    assert_eq!(
+        narrowed["diags"].as_array().expect("rows").len(),
+        expected["diags"].as_array().expect("rows").len(),
+        "the fixture's rows all live in main.dart"
+    );
+
+    // A relative target rides the read faces' resolution rule: the
+    // cwd-relative miss falls back to the workspace root.
+    h.step(
+        &request(4, "dartq/analyze", json!({ "target": "lib/main.dart" })),
+        1,
+    );
+    assert_eq!(answer_result(&h, 4), narrowed, "the relative target resolves");
+
+    // A missing target is the CLI's own usage wording.
+    h.step(
+        &request(
+            5,
+            "dartq/analyze",
+            json!({ "target": workspace.path("lib/nope.dart").display().to_string() }),
+        ),
+        1,
+    );
+    let error = answer_error(&h, 5);
+    assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Directory or file doesn't exist"),
+        "the CLI face's wording: {error}"
+    );
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+}
+
+/// The package-inside-a-workspace shape the MCP server serves (#2657): the
+/// session's engine analyzes the whole two-package workspace, and a
+/// `target` naming one package's directory answers exactly that package's
+/// rows — the CLI run in the package directory's own answer — with every
+/// file located against the workspace root.
+#[test]
+fn dartq_analyze_target_narrows_to_the_client_package() {
+    let _guard = workspace_lock();
+    let workspace = two_package_workspace();
+    let mut h = spawn(&workspace, &store_root("rpc-analyze-package"));
+
+    // The whole-workspace answer: both packages' rows.
+    h.step(&request(2, "dartq/analyze", json!({})), 1);
+    let whole = answer_result(&h, 2);
+    let files: Vec<&str> = whole["diags"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["file"].as_str().expect("file"))
+        .collect();
+    assert_eq!(
+        files.len(),
+        2,
+        "one broken row per package: {files:?} in {whole}"
+    );
+    assert!(
+        files.contains(&"packages/a/lib/main.dart")
+            && files.contains(&"packages/b/lib/main.dart"),
+        "both packages' rows, located against the workspace root: {files:?}"
+    );
+    assert_eq!(whole["root"], workspace.root.display().to_string());
+
+    // The package target: the client package's rows alone — the CLI's
+    // answer for `dartq analyze` run inside that directory.
+    h.step(
+        &request(
+            3,
+            "dartq/analyze",
+            json!({ "target": workspace.path("packages/a").display().to_string() }),
+        ),
+        1,
+    );
+    let package = answer_result(&h, 3);
+    let files: Vec<&str> = package["diags"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["file"].as_str().expect("file"))
+        .collect();
+    assert_eq!(files, vec!["packages/a/lib/main.dart"], "{package}");
+
+    let (code, _) = h.join_ended();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+}
+
+/// A pub-workspace fixture: one root declaring two member packages, each
+/// with one broken lib file — assembled through the same pub/package/sdk
+/// faces the single-package fixture uses, at the workspace root.
+fn two_package_workspace() -> Workspace {
+    let workspace = Workspace::new("void main() {}\n");
+    let root = &workspace.root;
+    fs::write(
+        root.join("pubspec.yaml"),
+        "name: fixture\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\nworkspace:\n  - packages/a\n  - packages/b\n",
+    )
+    .expect("root pubspec");
+    for member in ["a", "b"] {
+        let dir = root.join("packages").join(member);
+        fs::create_dir_all(dir.join("lib")).expect("member dir");
+        fs::write(
+            dir.join("pubspec.yaml"),
+            format!(
+                "name: {member}\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\nresolution: workspace\n"
+            ),
+        )
+        .expect("member pubspec");
+        fs::write(dir.join("lib/main.dart"), BROKEN_MAIN).expect("member lib");
+    }
+    // The root's config lists both members plus the root package; the
+    // engine assembles the whole workspace through it.
+    let config = serde_json::json!({
+        "configVersion": 2,
+        "packages": [
+            {"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"},
+            {"name": "a", "rootUri": "../packages/a", "packageUri": "lib/", "languageVersion": "3.5"},
+            {"name": "b", "rootUri": "../packages/b", "packageUri": "lib/", "languageVersion": "3.5"},
+        ],
+        "generator": "pub",
+    });
+    fs::write(
+        root.join(".dart_tool/package_config.json"),
+        config.to_string(),
+    )
+    .expect("config");
+    // Rebuild the session-facing faces over the workspace-wide config.
+    let config = std::sync::Arc::new(
+        dartq_pub::PackageConfig::parse(&config.to_string()).expect("config parses"),
+    );
+    let lock =
+        dartq_pub::LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n").expect("lock");
+    let pubspec = dartq_pub::Pubspec::parse(
+        &fs::read_to_string(root.join("pubspec.yaml")).expect("pubspec"),
+    )
+    .expect("pubspec parses");
+    let graph = dartq_pub::build_graph(
+        &config,
+        &lock,
+        &pubspec,
+        &std::collections::BTreeMap::new(),
+        None,
+        &root.join(".dart_tool"),
+    )
+    .expect("graph");
+    let packages = dartq_package::PackageTable::build(&config, &graph, &root.join(".dart_tool"))
+        .expect("table");
+    Workspace {
+        root: root.clone(),
+        config,
+        config_dir: root.join(".dart_tool"),
+        packages,
+    }
 }
 
 /// dartq/query vs the CLI JSON face: the compact answer IS the shared
@@ -591,6 +770,50 @@ fn dartq_impact_matches_the_cli_report() {
         result["envs"],
         json!([{ "label": "default", "compatible": true }]),
     );
+
+    let (code, _) = h.join_ended();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+}
+
+/// The environment axis parity (#2657): the daemon's `dartq/impact`
+/// computes its `envs` verdict through the same shared function the CLI
+/// face does, over the analyzed view's diagnostics — on a workspace whose
+/// affected set carries an ERROR (the broken fixture's unresolved import),
+/// both faces answer the honest `compatible: false` where the daemon once
+/// answered a vacuous affirmative. Byte-identical rows, both faces.
+#[test]
+fn dartq_impact_environments_match_the_cli_face() {
+    let _guard = workspace_lock();
+    let workspace = Workspace::new(BROKEN_MAIN);
+    let main = workspace.path("lib/main.dart");
+    let mut h = spawn(&workspace, &store_root("rpc-impact-envs"));
+
+    h.step(
+        &request(2, "dartq/impact", json!({ "path": main.display().to_string() })),
+        1,
+    );
+    let result = answer_result(&h, 2);
+    assert_eq!(
+        result["envs"],
+        json!([{ "label": "default", "compatible": false }]),
+        "the broken affected set is incompatible on the daemon face"
+    );
+
+    // The CLI face over its own fresh engine: the same rows, the same
+    // verdict, through the one shared environments function.
+    let mut engine = dartq_engine::Engine::new(workspace.engine_config()).expect("engine");
+    let report =
+        dartq_commands::impact::impact(&mut engine, &main, &[]).expect("the CLI impact face");
+    assert_eq!(
+        serde_json::to_value(&report.affected_environments).expect("serializes"),
+        result["envs"],
+        "both faces answer the same environment rows"
+    );
+
+    // The relative path rides the read faces' resolution rule.
+    h.step(&request(3, "dartq/impact", json!({ "path": "lib/main.dart" })), 1);
+    let relative = answer_result(&h, 3);
+    assert_eq!(relative["envs"], result["envs"], "the relative path resolves");
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);

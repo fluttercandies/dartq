@@ -222,26 +222,29 @@ fn json_context_message<'a>(
 ///
 /// * analyzer codes — `errors.dart`'s `url` getter: `null` unless the
 ///   registry marks the code `hasPublishedDocs: true`, then
-///   `https://dart.dev/diagnostics/<name>`; `dartq/`-namespace codes are
-///   never published (pinned by the registry tests in `code.rs`), so the
-///   flag alone decides;
-/// * lint codes — the linter's `LinterLintCode.url` (upstream Dart SDK
-///   source, `pkg/linter/lib/src/lint_codes.dart`): every first-party
-///   lint code carries a URL — the diagnostics page for published codes,
-///   the `https://dart.dev/lints/<name>` page otherwise. The published
-///   bit is read by code name from the captured first-party table
-///   ([`crate::lint_docs`]), never from the row's `has_published_docs`
-///   flag: that flag is persisted per row (the content store's
-///   `code_published`) and would serve stale URLs from pre-capture
-///   stores; the name-keyed table is stable across warm and cold rows.
-///   A lint-typed code the table does not carry is a plugin code — the
-///   analyzer-side `LintCode.url` is null, so no URL.
+///   `https://dart.dev/diagnostics/<name>`. The published bit is read
+///   by code name from the captured registry table
+///   ([`crate::analyzer_docs`]), never from the row's
+///   `has_published_docs` flag: that flag is persisted per row (the
+///   content store's `code_published`) and would serve stale URLs
+///   from pre-capture stores, and emitters build `CodeInfo` rows
+///   independently of this crate — the name-keyed table is stable
+///   across warm and cold rows (same posture as the lint arm).
+///   `dartq/`-namespace codes never spell a table name, so they take
+///   no URL by construction;
+/// * lint codes — the linter's `LinterLintCode.url` (upstream Dart
+///   SDK source, `pkg/linter/lib/src/lint_codes.dart`): every
+///   first-party lint code carries a URL — the diagnostics page for
+///   published codes, the `https://dart.dev/lints/<name>` page
+///   otherwise. A lint-typed code the first-party table does not
+///   carry is a plugin code — the analyzer-side `LintCode.url` is
+///   null, so no URL.
 ///
 /// The URL is built in the caller's reused buffer and returned borrowed.
 fn documentation_url(code: CodeInfo, buf: &mut String) -> Option<&str> {
     let prefix = match code.dtype {
         DiagnosticType::Lint => crate::lint_docs::lint_doc_prefix(code.name)?,
-        _ if code.has_published_docs => "https://dart.dev/diagnostics/",
+        _ if crate::analyzer_docs::published(code.name) => "https://dart.dev/diagnostics/",
         _ => return None,
     };
     buf.clear();
@@ -282,10 +285,16 @@ mod tests {
     use std::path::Path;
 
     /// The JSON face's `documentation` decisions (the oracle's
-    /// `documentation: ?url` face): a first-party published lint takes the
-    /// diagnostics page, an unpublished first-party lint takes the lint
-    /// page, a plugin lint code and an unpublished analyzer code omit the
-    /// key, and a published analyzer code keeps the diagnostics page.
+    /// `documentation: ?url` face): a first-party published lint takes
+    /// the diagnostics page, an unpublished first-party lint takes the
+    /// lint page, a plugin lint code and an unpublished analyzer code
+    /// omit the key, and a published analyzer code keeps the
+    /// diagnostics page — decided by name from the captured registry
+    /// table, not the row's `has_published_docs` flag (the ticket's
+    /// regression: `built_in_identifier_in_declaration` rows carried
+    /// no URL because their per-row flag was unset; the
+    /// `uri_does_not_exist` pair pins the flag independence both
+    /// ways).
     #[test]
     fn json_documentation_decides_by_code_family() {
         struct OneFile;
@@ -339,6 +348,12 @@ mod tests {
                 false,
             )),
             row(CodeInfo::new(
+                "built_in_identifier_in_declaration",
+                "BUILT_IN_IDENTIFIER_IN_DECLARATION",
+                DiagnosticType::CompileTimeError,
+                false,
+            )),
+            row(CodeInfo::new(
                 "uri_does_not_exist",
                 "URI_DOES_NOT_EXIST",
                 DiagnosticType::CompileTimeError,
@@ -362,8 +377,13 @@ mod tests {
         assert!(rows[2].get("documentation").is_none(), "plugin lint: no URL");
         assert!(rows[3].get("documentation").is_none(), "unpublished analyzer code");
         assert_eq!(
-            rows[4]["documentation"], "https://dart.dev/diagnostics/uri_does_not_exist",
-            "published analyzer code: the flag alone decides"
+            rows[4]["documentation"],
+            "https://dart.dev/diagnostics/built_in_identifier_in_declaration",
+            "published by upstream registry: the name decides, not the flag"
+        );
+        assert_eq!(
+            rows[5]["documentation"], "https://dart.dev/diagnostics/uri_does_not_exist",
+            "published analyzer code"
         );
     }
 }

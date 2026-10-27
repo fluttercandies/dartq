@@ -140,8 +140,32 @@ pub fn impact(
         .map_err(ImpactError::from)?
         .diagnostics;
     let mut report = impact_after_analysis_with_symbols(engine, target, symbols)?;
-    report.affected_environments = environments_section(engine, target, &report, &diagnostics)?;
+    report.affected_environments =
+        environments_after_analysis(engine, target, &report, &diagnostics)?;
     Ok(report)
+}
+
+/// The environment section over an already-analyzed engine — the one
+/// implementation both faces answer through (#2657): the CLI's
+/// [`impact`] computes it over its own pass's rows, the daemon's
+/// `dartq/impact` over the session's analyzed-view rows. One row per
+/// declared `dartq.yaml` context, each judged by the compat verdict rule
+/// over the affected set; a workspace with no `dartq.yaml` — or one
+/// without contexts — answers the single `default` row, derived from
+/// `diagnostics`, never an unevaluated affirmative.
+///
+/// # Errors
+///
+/// [`ImpactError::Usage`] on a malformed config, an unresolvable locator,
+/// or an unusable axis workspace/engine; [`ImpactError::Internal`] on a
+/// failed axis discovery or analysis.
+pub fn environments_after_analysis(
+    engine: &Engine,
+    target: &Path,
+    report: &query::ImpactReport,
+    diagnostics: &[Diagnostic],
+) -> Result<Vec<query::EnvironmentImpact>, ImpactError> {
+    environments_section(engine, target, report, diagnostics)
 }
 
 /// The environment section: one honest row per declared `dartq.yaml`
@@ -411,18 +435,21 @@ pub fn impact_after_analysis_with_symbols(
 /// assembly is possible (and testable).
 ///
 /// [`open_engine`]: crate::workspace::open_engine
-pub fn impacted_tests(
-    root: &Path,
-    sdk: Option<&Path>,
-    base: &str,
-) -> Result<Vec<String>, String> {
+pub fn impacted_tests(root: &Path, sdk: Option<&Path>, base: &str) -> Result<Vec<String>, String> {
     let changed = changed_since(root, base)
         .ok_or_else(|| format!("cannot diff against {base} (no git repository?)"))?;
     let mut selected: BTreeSet<PathBuf> = BTreeSet::new();
     let mut sources = Vec::new();
     for relative in &changed {
-        let path = if relative.is_absolute() { relative.clone() } else { root.join(relative) };
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let path = if relative.is_absolute() {
+            relative.clone()
+        } else {
+            root.join(relative)
+        };
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
         if matches!(
             name,
             "pubspec.yaml"
@@ -458,13 +485,19 @@ pub fn impacted_tests(
             let analysis_root = engine.packages().workspace_root().to_path_buf();
             let mut tests = Vec::new();
             for seed in &sources {
-                let report = impact_after_analysis(&engine, seed)
-                    .map_err(|error| {
-                        format!("{} is outside the analyzed workspace: {error}", seed.display())
-                    })?;
+                let report = impact_after_analysis(&engine, seed).map_err(|error| {
+                    format!(
+                        "{} is outside the analyzed workspace: {error}",
+                        seed.display()
+                    )
+                })?;
                 tests.extend(report.affected_tests.into_iter().map(|test| {
                     let path = PathBuf::from(test.path);
-                    if path.is_absolute() { path } else { analysis_root.join(path) }
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        analysis_root.join(path)
+                    }
                 }));
             }
             Ok(tests)
@@ -476,7 +509,11 @@ pub fn impacted_tests(
     }
     Ok(selected
         .into_iter()
-        .filter_map(|path| path.strip_prefix(root).ok().map(|rel| rel.to_string_lossy().replace('\\', "/")))
+        .filter_map(|path| {
+            path.strip_prefix(root)
+                .ok()
+                .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        })
         .filter(|rel| rel.ends_with("_test.dart"))
         .collect())
 }
@@ -660,16 +697,13 @@ pub fn impact_after_analysis_with_persisted_facts(
         .filter_map(|(library, files)| files.first().map(|&f| (library.index(), f)))
         .collect();
     let reference_lines_of = |library: u32| -> Vec<u32> {
-        let (Some(surface), Some(&defining)) =
-            (surfaces.get(&library), defining_of.get(&library))
+        let (Some(surface), Some(&defining)) = (surfaces.get(&library), defining_of.get(&library))
         else {
             return Vec::new();
         };
         let mut lines = Vec::new();
         for row in surface.refs() {
-            if row.file != defining
-                || !propagation.contains(&(row.target_file, row.target_name))
-            {
+            if row.file != defining || !propagation.contains(&(row.target_file, row.target_name)) {
                 continue;
             }
             let (Some(index), Some(content)) =
@@ -725,9 +759,7 @@ fn resolve_symbol_spelling(
     symbol: &str,
     seed: &Path,
 ) -> Result<Vec<StringId>, ImpactError> {
-    let usage = || {
-        ImpactError::Usage(format!("no such symbol in {}: {symbol}", seed.display()))
-    };
+    let usage = || ImpactError::Usage(format!("no such symbol in {}: {symbol}", seed.display()));
     let candidates = if let Some((path, line)) = file_line_of(symbol) {
         declaration_at(engine, members, path, line, seed)
     } else if let Some((container, member)) = symbol.split_once('.') {
@@ -1201,7 +1233,11 @@ mod tests {
             "the sym label half is the located path: {:?}",
             report.changed
         );
-        let paths: Vec<&str> = report.affected.iter().map(|row| row.path.as_str()).collect();
+        let paths: Vec<&str> = report
+            .affected
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
         assert_eq!(paths, vec!["lib/b.dart"], "the affected row is located");
         let tests: Vec<&str> = report
             .affected_tests
@@ -1479,9 +1515,12 @@ mod tests {
             persisted.insert(text.clone(), persisted_facts(&text, file, &strings));
         }
 
-        let loaded = impact_after_analysis_with_persisted_facts(&engine, &target, &|text: &str| {
-            persisted.get(text).cloned()
-        }, &[])
+        let loaded = impact_after_analysis_with_persisted_facts(
+            &engine,
+            &target,
+            &|text: &str| persisted.get(text).cloned(),
+            &[],
+        )
         .expect("loaded impact");
 
         // The seed members (main.dart and its part) both hit; the report
@@ -1565,9 +1604,12 @@ mod tests {
             let file = engine.file_table().try_file_id(&path).expect("discovered");
             persisted.insert(text.clone(), persisted_facts(&text, file, &strings));
         }
-        let loaded = impact_after_analysis_with_persisted_facts(&engine, &target, &|text: &str| {
-            persisted.get(text).cloned()
-        }, &[])
+        let loaded = impact_after_analysis_with_persisted_facts(
+            &engine,
+            &target,
+            &|text: &str| persisted.get(text).cloned(),
+            &[],
+        )
         .expect("partially loaded impact");
         assert_eq!(
             serde_json::to_string(&loaded).expect("serialize"),
@@ -2060,13 +2102,19 @@ mod tests {
             impact(&mut engine, &target, &["createTask".to_owned()]).expect("bare member name");
         let names = faces(&report);
         assert_eq!(names.len(), 2, "both declaring containers seed: {names:?}");
-        assert!(names.iter().all(|row| {
-            row.ends_with("|TodoRepository") || row.ends_with("|Other")
-        }));
+        assert!(
+            names
+                .iter()
+                .all(|row| { row.ends_with("|TodoRepository") || row.ends_with("|Other") })
+        );
 
         // `Container.name`: the named container's face alone.
-        let report = impact(&mut engine, &target, &["TodoRepository.createTask".to_owned()])
-            .expect("container-qualified spelling");
+        let report = impact(
+            &mut engine,
+            &target,
+            &["TodoRepository.createTask".to_owned()],
+        )
+        .expect("container-qualified spelling");
         let names = faces(&report);
         assert_eq!(names.len(), 1);
         assert!(names[0].ends_with("|TodoRepository"), "{names:?}");
@@ -2080,7 +2128,11 @@ mod tests {
 
         // `file:line`: the container header (line 1), the member (line 2,
         // resolving to its container), and the second container (line 4).
-        for (line, face) in [(1u32, "|TodoRepository"), (2, "|TodoRepository"), (4, "|Other")] {
+        for (line, face) in [
+            (1u32, "|TodoRepository"),
+            (2, "|TodoRepository"),
+            (4, "|Other"),
+        ] {
             let spelling = format!("{}:{line}", target.display());
             let report = impact(&mut engine, &target, &[spelling]).expect("file:line seed");
             let names = faces(&report);
@@ -2162,10 +2214,7 @@ mod tests {
     /// a silent file-level fallback.
     #[test]
     fn an_unresolvable_symbol_is_the_usage_tier() {
-        let root = workspace(
-            "impact_symbol_miss",
-            &[("lib/a.dart", "class A {}\n")],
-        );
+        let root = workspace("impact_symbol_miss", &[("lib/a.dart", "class A {}\n")]);
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
         let target = root.join("lib/a.dart");
         let error = impact(&mut engine, &target, &["Missing".to_owned()])
@@ -2199,11 +2248,7 @@ mod tests {
             .iter()
             .map(|row| row.symbol.as_str())
             .collect();
-        assert_eq!(
-            names.len(),
-            2,
-            "the whole face seeds: {names:?}"
-        );
+        assert_eq!(names.len(), 2, "the whole face seeds: {names:?}");
         fs::remove_dir_all(&root).ok();
     }
 
@@ -2216,7 +2261,10 @@ mod tests {
             "impact_symbol_determinism",
             &[
                 ("lib/a.dart", "class A {}\nclass B {}\n"),
-                ("lib/b.dart", "import 'a.dart';\nA a() => A();\nB b() => B();\n"),
+                (
+                    "lib/b.dart",
+                    "import 'a.dart';\nA a() => A();\nB b() => B();\n",
+                ),
             ],
         );
         let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
@@ -2276,8 +2324,7 @@ mod tests {
             "library dart.core;",
         )
         .expect("embedder core");
-        fs::write(root.join("sky_engine/lib/ui/ui.dart"), "library dart.ui;")
-            .expect("embedder ui");
+        fs::write(root.join("sky_engine/lib/ui/ui.dart"), "library dart.ui;").expect("embedder ui");
     }
 
     /// The fixture's package config plus one `sky_engine` entry

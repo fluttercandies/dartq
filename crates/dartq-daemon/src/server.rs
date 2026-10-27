@@ -280,8 +280,7 @@ where
             let selected = match deadline {
                 None => select.select(),
                 Some(deadline) => {
-                    match select
-                        .select_timeout(deadline.saturating_duration_since(Instant::now()))
+                    match select.select_timeout(deadline.saturating_duration_since(Instant::now()))
                     {
                         Ok(selected) => selected,
                         // The loop top re-checks both deadlines: the save or
@@ -782,7 +781,9 @@ fn handle_watch(session: &mut Session, touched: Vec<PathBuf>) {
     }
 }
 
-/// Relative request paths resolve against the session workspace root.
+/// Relative request paths resolve against the session workspace root —
+/// the write-face base (`dartq/sync` names paths inside the workspace;
+/// the read faces use [`commands::resolve`]'s cwd-first rule instead).
 fn resolve_path(root: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
         path
@@ -791,10 +792,13 @@ fn resolve_path(root: &Path, path: PathBuf) -> PathBuf {
     }
 }
 
-/// The `dartq/fix` intake: parameters decode and paths resolve against the
-/// session workspace root here (bad parameters answer `INVALID_PARAMS`
-/// immediately); the job stages onto the session's scheduler and the
-/// completion answers.
+/// The `dartq/fix` intake: parameters decode and paths resolve through
+/// the read faces' shared rule — the server's working directory first
+/// (the client's own; the relative spelling is preserved so the answer's
+/// patch documents carry the CLI face's own path spellings), the session
+/// workspace root as the fallback — here (bad parameters answer
+/// `INVALID_PARAMS` immediately); the job stages onto the session's
+/// scheduler and the completion answers.
 fn fix_stage(session: &mut Session, params: &Value, id: jsonrpc::RequestId) -> Option<Response> {
     #[derive(Deserialize)]
     struct FixParams {
@@ -825,7 +829,7 @@ fn fix_stage(session: &mut Session, params: &Value, id: jsonrpc::RequestId) -> O
     let paths: Vec<PathBuf> = decoded
         .paths
         .into_iter()
-        .map(|path| resolve_path(&root, path))
+        .map(|path| commands::resolve(&root, path))
         .collect();
     session.queue_fix(
         id,
@@ -839,8 +843,9 @@ fn fix_stage(session: &mut Session, params: &Value, id: jsonrpc::RequestId) -> O
 }
 
 /// The `dartq/assists` intake: the same staging posture as `dartq/fix` —
-/// parameters decode and the path resolves at intake; the plugin hosts'
-/// location-directed proposals answer with the completion.
+/// parameters decode and the path resolves through the read faces' shared
+/// cwd-first rule at intake; the plugin hosts' location-directed
+/// proposals answer with the completion.
 fn assists_stage(
     session: &mut Session,
     params: &Value,
@@ -864,7 +869,7 @@ fn assists_stage(
     let root = session.workspace_root().to_path_buf();
     let decoded = match serde_json::from_value::<AssistsParams>(params.clone()) {
         Ok(mut decoded) => {
-            decoded.path = resolve_path(&root, decoded.path);
+            decoded.path = commands::resolve(&root, decoded.path);
             decoded
         }
         Err(error) => return Some(invalid(error.to_string())),
@@ -1000,45 +1005,44 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-/// #2632: the exit-signal close-out answers every queued request with
-/// exactly one structured error (silence is not a well-formed close)
-/// and answers nothing else — notifications take no answer, and the
-/// stream-end marker is not a message.
-#[test]
-fn the_signal_close_out_answers_queued_requests_only() {
-    let (sender, receiver) = crossbeam_channel::unbounded();
-    sender
-        .send(vec![
-            Incoming::Message(Message::Request(Request {
-                id: jsonrpc::RequestId::Num(7),
-                method: "dartq/analyze".into(),
-                params: None,
-            })),
-            Incoming::Message(Message::Notification(Notification::new(
-                "dartq/sync",
-                json!({}),
-            ))),
-        ])
-        .expect("batch");
-    sender.send(vec![Incoming::Eof]).expect("end");
-    let mut output = Vec::new();
-    answer_queued(&mut output, &receiver).expect("the close-out writes");
-    let frames = test_fixtures::frames(&output);
-    assert_eq!(frames.len(), 1, "one answer, nothing else: {frames:?}");
-    assert_eq!(frames[0]["id"], json!(7), "the queued request's id");
-    assert_eq!(
-        frames[0]["error"]["code"],
-        json!(codes::REQUEST_CANCELLED),
-        "the structured drop verdict: {frames:?}"
-    );
-    assert!(receiver.try_recv().is_err(), "the queue drained");
-}
+    /// #2632: the exit-signal close-out answers every queued request with
+    /// exactly one structured error (silence is not a well-formed close)
+    /// and answers nothing else — notifications take no answer, and the
+    /// stream-end marker is not a message.
+    #[test]
+    fn the_signal_close_out_answers_queued_requests_only() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        sender
+            .send(vec![
+                Incoming::Message(Message::Request(Request {
+                    id: jsonrpc::RequestId::Num(7),
+                    method: "dartq/analyze".into(),
+                    params: None,
+                })),
+                Incoming::Message(Message::Notification(Notification::new(
+                    "dartq/sync",
+                    json!({}),
+                ))),
+            ])
+            .expect("batch");
+        sender.send(vec![Incoming::Eof]).expect("end");
+        let mut output = Vec::new();
+        answer_queued(&mut output, &receiver).expect("the close-out writes");
+        let frames = test_fixtures::frames(&output);
+        assert_eq!(frames.len(), 1, "one answer, nothing else: {frames:?}");
+        assert_eq!(frames[0]["id"], json!(7), "the queued request's id");
+        assert_eq!(
+            frames[0]["error"]["code"],
+            json!(codes::REQUEST_CANCELLED),
+            "the structured drop verdict: {frames:?}"
+        );
+        assert!(receiver.try_recv().is_err(), "the queue drained");
+    }
 
-/// One turn stages at most [`MAX_TURN_INTAKE`] messages (#947 F2) and
-/// drops none: the surplus stays queued for the next turn.
-#[test]
-fn turn_intake_is_capped_and_never_drops() {
-
+    /// One turn stages at most [`MAX_TURN_INTAKE`] messages (#947 F2) and
+    /// drops none: the surplus stays queued for the next turn.
+    #[test]
+    fn turn_intake_is_capped_and_never_drops() {
         let (sender, receiver) = crossbeam_channel::unbounded();
         let total = MAX_TURN_INTAKE + 10;
         for _ in 0..total {
@@ -1267,8 +1271,7 @@ fn turn_intake_is_capped_and_never_drops() {
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
         })
         .expect("store opens on a temp root");
-        let session =
-            Session::with_store(workspace.engine_config(), store, None).expect("session");
+        let session = Session::with_store(workspace.engine_config(), store, None).expect("session");
         let (client, receiver) = mpsc::channel::<Vec<u8>>();
         let output = TestOutput::default();
         let server_output = output.clone();
@@ -1363,8 +1366,7 @@ fn turn_intake_is_capped_and_never_drops() {
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
         })
         .expect("store opens on a temp root");
-        let session =
-            Session::with_store(workspace.engine_config(), store, None).expect("session");
+        let session = Session::with_store(workspace.engine_config(), store, None).expect("session");
         let (client, receiver) = mpsc::channel::<Vec<u8>>();
         let output = TestOutput::default();
         let server_output = output.clone();
@@ -1430,8 +1432,9 @@ fn turn_intake_is_capped_and_never_drops() {
             || {
                 transcript_of(&output)
                     .iter()
-                    .find(|frame| frame["method"] == "dartq/diagnostics"
-                        && frame["params"]["uri"] == uri)
+                    .find(|frame| {
+                        frame["method"] == "dartq/diagnostics" && frame["params"]["uri"] == uri
+                    })
                     .cloned()
             },
             "the first publish diff never rode the analyze drain",
@@ -1455,7 +1458,6 @@ fn turn_intake_is_capped_and_never_drops() {
             .expect("server thread does not panic")
             .expect("transport does not fail on memory pipes");
     }
-
 
     /// #2587's core pin: a debug op stuck on its (bounded) attach must
     /// never wedge the serve loop — a request on another face riding
@@ -1483,8 +1485,7 @@ fn turn_intake_is_capped_and_never_drops() {
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
         })
         .expect("store opens on a temp root");
-        let session =
-            Session::with_store(workspace.engine_config(), store, None).expect("session");
+        let session = Session::with_store(workspace.engine_config(), store, None).expect("session");
         let (client, receiver) = mpsc::channel::<Vec<u8>>();
         let output = TestOutput::default();
         let server_output = output.clone();
@@ -1590,7 +1591,8 @@ fn turn_intake_is_capped_and_never_drops() {
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
         })
         .expect("store opens on a temp root");
-        let mut session = Session::with_store(workspace.engine_config(), store, None).expect("session");
+        let mut session =
+            Session::with_store(workspace.engine_config(), store, None).expect("session");
         let (client, receiver) = mpsc::channel::<Vec<u8>>();
         let output = TestOutput::default();
         let server_output = output.clone();
@@ -1688,7 +1690,8 @@ fn turn_intake_is_capped_and_never_drops() {
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
         })
         .expect("store opens on a temp root");
-        let mut session = Session::with_store(workspace.engine_config(), store, None).expect("session");
+        let mut session =
+            Session::with_store(workspace.engine_config(), store, None).expect("session");
         let (client, receiver) = mpsc::channel::<Vec<u8>>();
         let output = TestOutput::default();
         let server_output = output.clone();

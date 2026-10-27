@@ -9,7 +9,6 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use serde_json::json;
 
 use dartq_session::{EventLog, Layout, Progress};
 
@@ -29,9 +28,9 @@ pub struct EventsArgs {
     #[arg(default_value = ".")]
     pub dir: PathBuf,
     /// The session handle's timestamp floor: only rows at or after
-    /// this UNIX-seconds instant (default: no floor — every row,
-    /// newest first); `progress` treats it as the last-seen file
-    /// count.
+    /// this instant, in milliseconds — the same unit the rows' own
+    /// `ts` field carries (#2657: one unit across the flag and the
+    /// data); `progress` treats it as the last-seen file count.
     #[arg(long)]
     pub since: Option<u64>,
     /// At most this many events per read, keeping the newest rows
@@ -60,9 +59,9 @@ pub fn run_entry(args: &EventsArgs) -> u8 {
             let log = EventLog::new(&layout);
             // #2622: newest first — an oldest-first page never reached
             // the newest rows, which is the read an agent tailing the
-            // session wants. `--since` is a UNIX-seconds floor on the
-            // rows' own timestamps.
-            let since_ms = args.since.map_or(0, |secs| u128::from(secs) * 1000);
+            // session wants. `--since` is a millisecond floor on the
+            // rows' own `ts` unit (#2657).
+            let since_ms = args.since.map_or(0, u128::from);
             for (_, event) in log.read_newest(None, since_ms, args.limit) {
                 match args.format {
                     OutputFormat::Lon => println!("{}", lon_line(&event)),
@@ -83,21 +82,18 @@ pub fn run_entry(args: &EventsArgs) -> u8 {
             if progress.files_scanned <= args.since.unwrap_or_default() {
                 return exit::CLEAN;
             }
-            let row = json!({
-                "type": "progress",
-                "files_scanned": progress.files_scanned,
-                "from_cache": progress.from_cache,
-                "current": progress.current,
-                "current_package": progress.current_package,
-                "cursor": progress.files_scanned,
-            });
+            let row = progress_row(&progress);
             match args.format {
                 OutputFormat::Lon => println!("{}", lon_line(&row)),
                 OutputFormat::Json => println!("{row}"),
                 OutputFormat::Text => println!(
                     "progress: {} files scanned ({})",
                     progress.files_scanned,
-                    progress.current.as_deref().or(progress.current_package.as_deref()).unwrap_or("analyzing"),
+                    progress
+                        .current
+                        .as_deref()
+                        .or(progress.current_package.as_deref())
+                        .unwrap_or("analyzing"),
                 ),
             }
             exit::CLEAN
@@ -110,6 +106,20 @@ pub fn run_entry(args: &EventsArgs) -> u8 {
             exit::USAGE
         }
     }
+}
+
+/// The progress handle's row document — the one builder the CLI verb
+/// prints and the MCP events tool answers (#2657: the two faces' bytes
+/// come from the same shape).
+pub(crate) fn progress_row(progress: &Progress) -> serde_json::Value {
+    serde_json::json!({
+        "type": "progress",
+        "files_scanned": progress.files_scanned,
+        "from_cache": progress.from_cache,
+        "current": progress.current,
+        "current_package": progress.current_package,
+        "cursor": progress.files_scanned,
+    })
 }
 
 #[cfg(all(test, unix))]
@@ -133,9 +143,9 @@ mod tests {
     }
 
     /// The grammar: the handle defaults to `session`, the dir to the cwd,
-    /// `--since` is an optional UNIX-seconds floor (session handle),
-    /// `--limit` defaults to 100, and `lon` is the constant format
-    /// default.
+    /// `--since` is an optional millisecond floor (session handle — the
+    /// rows' own `ts` unit), `--limit` defaults to 100, and `lon` is the
+    /// constant format default.
     #[test]
     fn events_args_parse() {
         let args = parse(&[]).expect("parse");
@@ -162,7 +172,8 @@ mod tests {
         let layout = Layout::new(&root);
         let log = EventLog::new(&layout);
         for _ in 0..3 {
-            log.append("session", "serving", serde_json::json!({})).expect("append");
+            log.append("session", "serving", serde_json::json!({}))
+                .expect("append");
         }
         let read = |handle: &str, since: Option<u64>, limit: usize| {
             run_entry(&EventsArgs {
@@ -174,13 +185,27 @@ mod tests {
             })
         };
         assert_eq!(read("session", None, 100), exit::CLEAN);
-        assert_eq!(read("session", Some(2), 100), exit::CLEAN, "a far-past floor keeps every row");
+        assert_eq!(
+            read("session", Some(2), 100),
+            exit::CLEAN,
+            "a far-past floor keeps every row"
+        );
         assert_eq!(
             read("session", Some(u64::MAX), 100),
             exit::CLEAN,
             "a future floor reads nothing, still clean"
         );
-        assert_eq!(read("session", None, 0), exit::CLEAN, "a zero limit reads nothing");
+        assert_eq!(
+            read("session", None, 0),
+            exit::CLEAN,
+            "a zero limit reads nothing"
+        );
+        // `--since` floors on the rows' own millisecond unit (#2657): a
+        // 60 s-old floor keeps the fresh rows, a 60 s-future one drops
+        // them — the same numbers a client chains from a row's `ts`.
+        let now_ms = u64::try_from(dartq_session::SessionState::now_ms()).expect("unix ms");
+        assert_eq!(read("session", Some(now_ms - 60_000), 100), exit::CLEAN);
+        assert_eq!(read("session", Some(now_ms + 60_000), 100), exit::CLEAN);
         // The progress handle: no trace is zero progress; a trace past the
         // cursor prints, at-or-below prints nothing — both clean.
         assert_eq!(read("progress", None, 100), exit::CLEAN);

@@ -119,8 +119,10 @@ Both answer one page per call; feed the last line's `nextCursor` back as
   isolate is resumed first, a `session`/`shutdown` event
   `{reason: idle|signal|accept_failed, sessions_released}` is written,
   and each held session leaves a re-attach manifest under
-  `.dart_tool/dartq/debug/<id>.json` — a later `dartq debug status` lists
-  them as `orphans`, and a successful `debug attach` to the same ws_uri
+  `.dart_tool/dartq/debug/<id>.json` of the served checkout root (the
+  session layout root, beside `session.sock` — not the package
+  directory the daemon was started in) — a later `dartq debug status`
+  lists them as `orphans`, and a successful `debug attach` to the same ws_uri
   consumes one. The election reap's grace is 8 s + 5 s per held session
   (the daemon advertises the count in its heartbeat), so the resume
   ladder fits inside the window.

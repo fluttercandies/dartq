@@ -193,7 +193,9 @@ fn start_session(args: &StartArgs) -> u8 {
         }
     };
     // Lifecycle upkeep rides the start: upgrade orphans die, the cap
-    // holds, then the election runs.
+    // holds, dead-daemon socket files go (#2661 — a SIGKILLed reap
+    // leaves them behind and nothing else ever claims them), then the
+    // election runs.
     let registry = Registry::open();
     let triple_probe = SessionTriple::compute(&root, &sdk_root);
     for swept in registry.sweep_upgrades(&triple_probe.binary_hash) {
@@ -204,6 +206,7 @@ fn start_session(args: &StartArgs) -> u8 {
             Some(format!("swept stale session at {}", swept.display())),
         );
     }
+    let _ = registry.sweep_dead_sockets();
     for evicted in registry.evict_past_cap() {
         let row = json!({"type": "evicted", "root": evicted.display().to_string()});
         print_row(
@@ -815,6 +818,16 @@ pub(crate) mod tests {
         // parallel signal test would rewrite it (see SIGNAL_SERIALIZATION).
         let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_fixture("loop");
+        // #2661: an earlier daemon's orphan manifest sits in the trail
+        // — this daemon holds nothing, so its shutdown must release
+        // zero and leave the trail untouched.
+        let orphan_dir = Layout::new(&root).dir.join("debug");
+        std::fs::create_dir_all(&orphan_dir).expect("orphan dir");
+        std::fs::write(
+            orphan_dir.join("9.json"),
+            r#"{"ws_uri":"ws://earlier","kind":"attach","since":1700000000}"#,
+        )
+        .expect("orphan manifest");
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
         let server = std::thread::spawn(move || {
@@ -851,6 +864,14 @@ pub(crate) mod tests {
             .expect("the shutdown event landed");
         assert_eq!(shutdown["data"]["reason"], "idle");
         assert_eq!(shutdown["data"]["sessions_released"], 0);
+        // The orphan trail survived the release-zero shutdown verbatim:
+        // sessions_released counts only this daemon's own detachments,
+        // and a daemon holding nothing rewrites no manifest.
+        let manifest = std::fs::read_to_string(orphan_dir.join("9.json")).expect("manifest");
+        assert!(
+            !manifest.contains("released"),
+            "an unheld orphan manifest is never rewritten: {manifest}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1294,6 +1315,37 @@ pub(crate) mod tests {
         assert!(registry.list().is_empty(), "the registry entry dropped");
         // A dead pid answers gone immediately.
         assert!(wait_gone(u32::MAX - 1));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #2661: every serve-loop exit path funnels through `cleanup` —
+    /// idle, signal, and accept_failed alike — so its unlink is the
+    /// one fact that keeps a daemon from leaving its socket behind.
+    #[test]
+    fn cleanup_unlinks_the_socket_state_and_pointer() {
+        let home = std::env::temp_dir().join(format!("dqs-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("w");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        std::fs::write(&layout.socket, b"").expect("socket file");
+        std::fs::write(layout.dir.join("session.sock.point"), b"/relocated").expect("pointer");
+        SessionState {
+            pid: std::process::id(),
+            heartbeat_ms: SessionState::now_ms(),
+            triple: SessionTriple::compute(&root, &root),
+            debug_sessions: 0,
+        }
+        .write(&layout)
+        .expect("state");
+        assert!(layout.socket.exists() && layout.state.exists());
+        cleanup(&layout, &root);
+        assert!(!layout.socket.exists(), "the socket was unlinked");
+        assert!(!layout.state.exists(), "the state was removed");
+        assert!(
+            !layout.dir.join("session.sock.point").exists(),
+            "the relocation pointer was removed"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 }

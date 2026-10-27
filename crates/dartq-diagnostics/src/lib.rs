@@ -24,6 +24,7 @@
 //! single source of truth for file identity and the UTF-16 position
 //! convention.
 
+mod analyzer_docs;
 mod code;
 mod lint_docs;
 mod model;

@@ -136,23 +136,18 @@ fn assert_schema_valid(result: &Value, domain: dartq_schema::Domain) {
 /// the engine, never through the session's write path — the `since: 0`
 /// echo pins assert a fresh session sits at 0), the overlay.set = 1, the
 /// commit merge = 2, the sync's drain = 3. File references in the query /
-/// explain / impact answers carry the package-form label (`lib/` members
-/// spell `package:fixture/<tail>`; `test/` has no `package:` URI, so it
-/// keeps the canonical path) — the publish channel's URIs stay
-/// `file://` + canonical path.
+/// explain / impact answers carry the unified locator's root-relative
+/// spelling (every in-root file — `lib/` and `test/` alike) — the publish
+/// channel's URIs stay `file://` + canonical path.
 #[test]
 fn agent_script_over_the_daemon_rpc_surface() {
     let _guard = workspace_lock();
     let workspace = scenario_workspace();
     let b = workspace.path("lib/b.dart");
     let main = workspace.path("lib/main.dart");
-    let a_test = workspace.path("test/a_test.dart");
-    // The package-form labels the report rows carry.
-    let (a_label, b_label, main_label) = (
-        "package:fixture/a.dart",
-        "package:fixture/b.dart",
-        "package:fixture/main.dart",
-    );
+    // The unified locator's root-relative labels the report rows carry.
+    let (a_label, b_label, main_label) = ("lib/a.dart", "lib/b.dart", "lib/main.dart");
+    let a_test_label = "test/a_test.dart";
     let main_uri = format!("file://{}", main.display());
     let mut h = spawn(&workspace, &store_root("rpc-scenario"));
 
@@ -196,8 +191,8 @@ fn agent_script_over_the_daemon_rpc_surface() {
                 let mut expected: Vec<(String, &str, i64)> = vec![
                     (b_label.to_owned(), "reference", 33),
                     (b_label.to_owned(), "invoked", 42),
-                    (a_test.display().to_string(), "reference", 49),
-                    (a_test.display().to_string(), "invoked", 58),
+                    (a_test_label.to_owned(), "reference", 49),
+                    (a_test_label.to_owned(), "invoked", 58),
                 ];
                 expected.sort();
                 assert_eq!(
@@ -275,8 +270,8 @@ fn agent_script_over_the_daemon_rpc_surface() {
                     (b_label.to_owned(), "invoked", 42),
                     (b_label.to_owned(), "reference", 63),
                     (b_label.to_owned(), "invoked", 72),
-                    (a_test.display().to_string(), "reference", 49),
-                    (a_test.display().to_string(), "invoked", 58),
+                    (a_test_label.to_owned(), "reference", 49),
+                    (a_test_label.to_owned(), "invoked", 58),
                 ];
                 expected.sort();
                 assert_eq!(uses, expected, "the overlay pair lands at 63/72");
@@ -374,7 +369,7 @@ fn agent_script_over_the_daemon_rpc_surface() {
                     [
                         b_label.to_owned(),
                         main_label.to_owned(),
-                        a_test.display().to_string(),
+                        a_test_label.to_owned(),
                     ],
                     "every declaration, canonical path order"
                 );
@@ -439,10 +434,10 @@ fn agent_script_over_the_daemon_rpc_surface() {
         ),
         // -- explain at the full tier: the session short-ids are assigned on
         // first payable use — the repeat paths become s1/s2 in first-seen
-        // order across the label-sorted row arrays (the test file's
-        // canonical path sorts ahead of b.dart's `package:` label, so the
-        // test file takes s1), announced by the symbols table, and every
-        // path-valued row back-references them --
+        // order across the row arrays (the located spellings' byte order
+        // puts b.dart's `lib/` label ahead of the test file's `test/`
+        // label, so b.dart takes s1), announced by the symbols table, and
+        // every path-valued row back-references them --
         step(
             request(
                 11,
@@ -461,11 +456,10 @@ fn agent_script_over_the_daemon_rpc_surface() {
                 let symbols = result["symbols"].as_object().expect("symbols preamble");
                 assert_eq!(symbols.len(), 2, "both repeat paths announced: {symbols:?}");
                 assert_eq!(
-                    symbols["s1"],
-                    a_test.display().to_string(),
-                    "first-seen path (the label-sorted test file) maps to s1"
+                    symbols["s1"], b_label,
+                    "first-seen path (the located spelling's byte order: lib < test) maps to s1"
                 );
-                assert_eq!(symbols["s2"], b_label);
+                assert_eq!(symbols["s2"], a_test_label);
                 let refs = result["refs"].as_array().expect("refs");
                 assert_eq!(
                     refs.len(),

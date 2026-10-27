@@ -854,6 +854,56 @@ impl Registry {
         }
         evicted
     }
+
+    /// Removes socket files in the per-user sockets directory whose
+    /// daemon is dead — a SIGKILLed reap or a crash leaves the file
+    /// behind (no shutdown ladder ran to unlink it), and nothing else
+    /// ever claims it. A socket survives the sweep when a live record
+    /// claims it (its root's layout names the path) or when its bind
+    /// is young enough to be a bring-up's (the start window plus one
+    /// stale-heartbeat of slack: a daemon that bound longer ago has
+    /// either registered or died). Returns the swept paths;
+    /// best-effort — unreadable entries are left alone.
+    #[must_use]
+    pub fn sweep_dead_sockets(&self) -> Vec<PathBuf> {
+        let live: Vec<PathBuf> = self
+            .list()
+            .iter()
+            .map(|record| Layout::new(&record.state.triple.root).socket)
+            .collect();
+        sweep_sockets(&self.dir.join("sockets"), &live)
+    }
+}
+
+/// One sockets-directory sweep: every `.sock` file that no `live` path
+/// claims and whose bind is older than the bring-up grace goes; the
+/// young and the claimed stay; anything else in the directory is not a
+/// socket file and stays too.
+fn sweep_sockets(dir: &Path, live: &[PathBuf]) -> Vec<PathBuf> {
+    let grace = START_TIMEOUT + STALE_HEARTBEAT;
+    let young_bind = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .map(|bound| bound.elapsed().map(|age| age < grace).unwrap_or(true))
+            .unwrap_or(true)
+    };
+    let mut swept = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return swept;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension() != Some("sock".as_ref())
+            || live.contains(&path)
+            || young_bind(&path)
+        {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            swept.push(path);
+        }
+    }
+    swept
 }
 
 // ---------------------------------------------------------------------------
@@ -1270,6 +1320,41 @@ mod tests {
         let _ = std::fs::remove_file(&layout.socket);
         let _ = std::fs::remove_dir_all(&long);
         let _ = std::fs::remove_dir_all(&short);
+    }
+
+    /// #2661: the dead-socket sweep — a `.sock` file past the bring-up
+    /// grace with no live claim goes; a claimed one, a young bind, and
+    /// non-socket files stay.
+    #[test]
+    fn the_socket_sweep_removes_only_dead_sockets() {
+        let home = temp("socksweep");
+        let dir = home.join("sockets");
+        std::fs::create_dir_all(&dir).expect("sockets dir");
+        let dead = dir.join("dead.sock");
+        write(&dead, "");
+        let young = dir.join("young.sock");
+        write(&young, "");
+        let claimed = dir.join("claimed.sock");
+        write(&claimed, "");
+        write(&dir.join("notes.txt"), "not a socket");
+        // The dead bind is older than the bring-up grace; the others
+        // bind "now".
+        let past =
+            std::time::SystemTime::now() - (START_TIMEOUT + STALE_HEARTBEAT).saturating_mul(2);
+        std::fs::File::options()
+            .write(true)
+            .open(&dead)
+            .expect("open")
+            .set_modified(past)
+            .expect("backdate");
+
+        let swept = sweep_sockets(&dir, &[claimed.clone()]);
+        assert_eq!(swept, [dead.clone()], "only the old unclaimed socket goes");
+        assert!(!dead.exists(), "the dead socket was removed");
+        assert!(young.exists(), "a fresh bind sits inside the bring-up grace");
+        assert!(claimed.exists(), "a live record's socket is claimed");
+        assert!(dir.join("notes.txt").exists(), "non-socket files stay");
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

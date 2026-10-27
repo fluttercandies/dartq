@@ -1,14 +1,16 @@
 //! The daemon's `dartq/analyze` answer — the pull face behind the RPC `v`
-//! stamp. Each row is the entry flattened onto the short vocabulary
-//! (`wire::row`, `crates/dartq-daemon/src/wire.rs`):
-//! `{code, sev, file, line, col, len, msg}` — `file` carrying the entry's
-//! document URI, `line`/`col` 1-based (the push face's zero-based LSP
-//! positions plus one), `len` the span's UTF-16 length; the minimal tier
-//! builds the reduced row at the call site (`analyze_answer`): `code` +
-//! the locator. The envelope carries the full-tier short-id table
-//! (`symbols` — its values are the entry URIs substituted out of the
-//! rows); no writer emits `since` on this face (the pull face has no
-//! delta parameter), so none is declared.
+//! stamp. The answer is the CLI analyze face's own lon document
+//! (`dartq_commands::analyze::diags_document`, #2657 — one builder, both
+//! faces): each row is the diagnostic flattened onto the short vocabulary
+//! `{code, sev, file, line, col, len, msg}` — `file` carrying the located
+//! spelling (relative to the envelope's `root` when the file lies inside
+//! it, absolute otherwise), `line`/`col` 1-based, `len` the span's UTF-16
+//! length; the minimal tier is the reduced row (`code` + the locator).
+//! The optional tier-independent `root` key carries the analysis root
+//! exactly once, only when rows exist; the full tier adds the short-id
+//! table (`symbols` — its values are the located spellings substituted
+//! out of the rows); no writer emits `since` on this face (the pull face
+//! has no delta parameter), so none is declared.
 
 use std::sync::LazyLock;
 
@@ -40,37 +42,45 @@ static ANALYZE_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "title": "dartq analyze answer (v 1)",
         "type": "object",
         "additionalProperties": false,
-        "required": ["v", "diags"],
-        "properties": {
-            "v": { "const": SCHEMA_VERSION_ANALYZE },
-            "diags": { "type": "array", "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["code", "file", "line", "col", "len"],
+                "required": ["v", "diags"],
                 "properties": {
-                    "code": { "type": "string" },
-                    // The entry's document URI.
-                    "file": { "type": "string" },
-                    "line": { "type": "integer", "minimum": 1 },
-                    "col": { "type": "integer", "minimum": 1 },
-                    "len": { "type": "integer", "minimum": 0 },
-                    "sev": { "enum": SEVERITY_WORDS },
-                    "msg": { "type": "string" },
+                    "v": { "const": SCHEMA_VERSION_ANALYZE },
+                    // The envelope's analysis root: the one base the rows'
+                    // located spellings resolve against. Rides only when
+                    // rows exist (#2657 — the CLI document's own key).
+                    "root": { "type": "string" },
+                    "diags": { "type": "array", "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["code", "file", "line", "col", "len"],
+                        "properties": {
+                            "code": { "type": "string" },
+                            // The located spelling: relative to the
+                            // envelope's root inside it, absolute outside.
+                            "file": { "type": "string" },
+                            "line": { "type": "integer", "minimum": 1 },
+                            "col": { "type": "integer", "minimum": 1 },
+                            "len": { "type": "integer", "minimum": 0 },
+                            "sev": { "enum": SEVERITY_WORDS },
+                            "msg": { "type": "string" },
+                        },
+                    }},
+                    // Session token economics (crate docs, "Token
+                    // economics"): the full-tier short-id table over the
+                    // located spellings. `since` is not declared — this
+                    // face has no delta parameter, so no writer emits the
+                    // cursor.
+                    "symbols": { "type": "object",
+                        "additionalProperties": { "type": "string" } },
                 },
-            }},
-            // Session token economics (crate docs, "Token
-            // economics"): the full-tier short-id table over the entry
-            // URIs. `since` is not declared — this face has no delta
-            // parameter, so no writer emits the cursor.
-            "symbols": { "type": "object",
-                "additionalProperties": { "type": "string" } },
-        },
     })
 });
 
 const ANALYZE_TOP: &[&str] = &["v", "diags"];
-// Tier-independent (crate docs, "Token economics").
-const ANALYZE_SESSION: &[&str] = &["symbols"];
+// Tier-independent (crate docs, "Token economics"): the full-tier
+// short-id table, and the envelope's optional analysis root (#2657 — the
+// CLI document's own key, riding only when rows exist).
+const ANALYZE_SESSION: &[&str] = &["symbols", "root"];
 // The red line: the code plus the locator; the severity word and message
 // are the compact tier's contribution (analyze_answer — full equals
 // compact plus the short-id table).
@@ -82,6 +92,9 @@ pub(crate) fn validate_analyze(value: &Value) -> Result<(), SchemaViolation> {
     exact_fields(root, ANALYZE_TOP, ANALYZE_SESSION, "")?;
     pinned_version(root, "v", SCHEMA_VERSION_ANALYZE)?;
     path_session_fields(root)?;
+    if let Some(analysis_root) = root.get("root") {
+        string(analysis_root, "root")?;
+    }
     for (i, row) in rows(root, "diags")? {
         let p = format!("diags[{i}]");
         let obj = object(row, &p)?;
@@ -169,18 +182,12 @@ mod tests {
             .collect();
         row_fields.sort_unstable();
         assert_eq!(schema_keys(row), row_fields);
-        assert_eq!(
-            row["properties"]["sev"]["enum"],
-            json!(SEVERITY_WORDS)
-        );
-        assert_eq!(
-            schema_keys(row),
-            {
-                let mut names = const_names(&["code", "file", "line", "col", "len", "sev", "msg"]);
-                names.sort_unstable();
-                names
-            }
-        );
+        assert_eq!(row["properties"]["sev"]["enum"], json!(SEVERITY_WORDS));
+        assert_eq!(schema_keys(row), {
+            let mut names = const_names(&["code", "file", "line", "col", "len", "sev", "msg"]);
+            names.sort_unstable();
+            names
+        });
     }
 
     /// Tier exactness: a minimal row carries the red line only; the

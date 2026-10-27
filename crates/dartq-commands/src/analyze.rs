@@ -12,7 +12,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, FileLayoutProvider as _};
+use dartq_diagnostics::{
+    AnalysisOutput, CodeInfo, Diagnostic, DiagnosticType, FileLayoutProvider as _, Severity,
+};
 use dartq_engine::analysis_options;
 use dartq_engine::{CancellationToken, Cancelled, Engine, EngineEvent};
 use dartq_source::{FileId, FileTable, SourceRange};
@@ -236,9 +238,8 @@ pub fn run_overlaid<'a>(
                 notices.push(notice);
             }
         }
-        let conflict_rows = plugin_conflict_rows(&loaded, &|path| {
-            engine.file_table().try_file_id(path)
-        });
+        let conflict_rows =
+            plugin_conflict_rows(&loaded, &|path| engine.file_table().try_file_id(path));
         if !conflict_rows.is_empty() {
             diagnostics.extend(engine.apply_severity_options(conflict_rows));
         }
@@ -253,9 +254,12 @@ pub fn run_overlaid<'a>(
     // The layout snapshot covers every location the writers resolve — a
     // context message may anchor in a file that carries no row of its own
     // (#2164: its id joins the output set or the merged lookups panic).
-    let layout = EngineLayout::over(engine, diagnostics.iter().flat_map(|d| {
-        std::iter::once(d.file).chain(d.context.iter().flatten().map(|m| m.file))
-    }));
+    let layout = EngineLayout::over(
+        engine,
+        diagnostics.iter().flat_map(|d| {
+            std::iter::once(d.file).chain(d.context.iter().flatten().map(|m| m.file))
+        }),
+    );
     // Stable like `sort_by` (rayon's merge sort), so ties keep their
     // arrival order and the output is byte-identical; the comparator walks
     // path bytes per pair, so 10⁵-row runs split across workers.
@@ -279,7 +283,7 @@ pub fn run_overlaid<'a>(
 /// directory yields a directory target, an existing file a file target.
 /// Paths are canonicalized by the caller, so they live in the same spelling
 /// universe the engine's discovery interns.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Target {
     /// A directory target: the run emits every diagnostic whose file lies
     /// under it (the oracle's directory context root).
@@ -294,8 +298,11 @@ pub enum Target {
 /// target or identical to a `.dart` file target. The emitted diagnostic set
 /// is exactly the covered rows (the oracle pushes diagnostics only for
 /// files inside the targets' context roots — and a file target's root only
-/// ever analyzes `.dart` files, `file_paths.dart:75-78` `isDart`).
-fn covered(path: &Path, targets: &[Target]) -> bool {
+/// ever analyzes `.dart` files, `file_paths.dart:75-78` `isDart`). Public:
+/// the daemon's `dartq/analyze` filters its analyzed view through the same
+/// coverage rule its CLI twin's target set applies.
+#[must_use]
+pub fn covered(path: &Path, targets: &[Target]) -> bool {
     targets.iter().any(|target| match target {
         Target::Dir(dir) => path.starts_with(dir),
         Target::File(file) => path == file && file.extension().is_some_and(|ext| ext == "dart"),
@@ -384,9 +391,8 @@ pub fn run_targets<'a>(
                 notices.push(notice);
             }
         }
-        let conflict_rows = plugin_conflict_rows(&loaded, &|path| {
-            engine.file_table().try_file_id(path)
-        });
+        let conflict_rows =
+            plugin_conflict_rows(&loaded, &|path| engine.file_table().try_file_id(path));
         if !conflict_rows.is_empty() {
             diagnostics.extend(engine.apply_severity_options(conflict_rows));
         }
@@ -458,11 +464,16 @@ pub fn run_targets<'a>(
             query_server: Some(&|query| crate::plugins::serve_query(engine, query)),
         };
         let cycle = plugin_set.cycle(&diagnostics, files, anchor, &context);
-        let mut findings = crate::plugins::resolve_findings(&cycle.findings, files, |file| {
-            let index = engine.line_index(file)?;
-            let text = engine.content(file)?;
-            Some((index, std::str::from_utf8(text).ok()?))
-        }, &loaded);
+        let mut findings = crate::plugins::resolve_findings(
+            &cycle.findings,
+            files,
+            |file| {
+                let index = engine.line_index(file)?;
+                let text = engine.content(file)?;
+                Some((index, std::str::from_utf8(text).ok()?))
+            },
+            &loaded,
+        );
         // The covered emit filter applies to plugin rows identically: the
         // context analyzes the whole root, but the oracle emits rows only
         // inside the targets — a finding on a non-covered file never
@@ -486,9 +497,12 @@ pub fn run_targets<'a>(
     // The layout snapshot covers every location the writers resolve — a
     // context message may anchor in a file that carries no row of its own
     // (#2164: its id joins the output set or the merged lookups panic).
-    let layout = EngineLayout::over(engine, diagnostics.iter().flat_map(|d| {
-        std::iter::once(d.file).chain(d.context.iter().flatten().map(|m| m.file))
-    }));
+    let layout = EngineLayout::over(
+        engine,
+        diagnostics.iter().flat_map(|d| {
+            std::iter::once(d.file).chain(d.context.iter().flatten().map(|m| m.file))
+        }),
+    );
     // Stable like `sort_by` (rayon's merge sort), so ties keep their
     // arrival order and the output is byte-identical; the comparator walks
     // path bytes per pair, so 10⁵-row runs split across workers.
@@ -580,7 +594,13 @@ pub fn merge_runs<'a>(runs: Vec<AnalyzeRun<'a>>) -> MergedRun<'a> {
             .iter()
             .flat_map(|(run_index, diagnostic)| {
                 std::iter::once(diagnostic.file)
-                    .chain(diagnostic.context.iter().flatten().map(|message| message.file))
+                    .chain(
+                        diagnostic
+                            .context
+                            .iter()
+                            .flatten()
+                            .map(|message| message.file),
+                    )
                     .map(move |file| (*run_index, file))
             })
             .collect();
@@ -1056,13 +1076,10 @@ fn plugin_conflict_rows(
 /// the oracle emits no machine row for a malformed options file (the pinned
 /// 2026-10-18 probe), so the failure rides the faces' stderr channel.
 fn options_failure_notice(options: &analysis_options::AnalysisOptions) -> Option<String> {
-    options.parse_failure.as_ref().map(|issue| {
-        format!(
-            "note: {}: {}",
-            options.file_path.display(),
-            issue.message
-        )
-    })
+    options
+        .parse_failure
+        .as_ref()
+        .map(|issue| format!("note: {}: {}", options.file_path.display(), issue.message))
 }
 /// + `reportIncompatibleWithIncluded`, upstream Dart SDK source,
 /// `pkg/analyzer/lib/src/analysis_options/linter_rule_options_validator.dart`
@@ -1472,6 +1489,113 @@ fn oracle_cmp(a: &Diagnostic, b: &Diagnostic, layout: &EngineLayout<'_>) -> Orde
         .then_with(|| a.message.cmp(&b.message))
 }
 
+/// The oracle display order over an analyzed engine — the one comparator
+/// the CLI's analyze document and the daemon's `dartq/analyze` answer sort
+/// their rows through (severity, path bytes, offset, message), public so
+/// the daemon face keeps the same printed order as its CLI twin.
+pub fn oracle_order<'a, I>(diagnostics: I, layout: &EngineLayout<'_>) -> Vec<&'a Diagnostic>
+where
+    I: IntoIterator<Item = &'a Diagnostic>,
+{
+    let mut rows: Vec<&Diagnostic> = diagnostics.into_iter().collect();
+    rows.sort_by(|a, b| oracle_cmp(a, b, layout));
+    rows
+}
+
+// ---------------------------------------------------------------------------
+// The lon diagnostics document — the one builder every analyze face renders
+// through (the CLI's `--format lon` default and the daemon's `dartq/analyze`
+// answer; #2657: no second encoder exists)
+// ---------------------------------------------------------------------------
+
+/// The analyze/check faces' `lon` document: one flat `diags` row per
+/// diagnostic — `{v root? diags:[{code sev file line col len msg}]}` —
+/// the short-vocabulary spelling of the diagnostics set (the json face's
+/// oracle envelope is a different, frozen dialect and stays untouched:
+/// absolute paths, no root key, `documentation` per the oracle's url
+/// rules).
+///
+/// The `file` column spells through the one file locator
+/// (`dartq_commands::locate`): relative to the run's analysis root when
+/// the file lies inside it, absolute otherwise. The envelope carries that
+/// root exactly once (`root:<absolute path>`) so the relative spellings
+/// are unambiguous — a mixed set (a workspace row beside a pub-cache row)
+/// reads `root:/w/pkg` + `file:lib/a.dart` + `file:/Users/…/x.dart`. The
+/// key rides only when rows exist and the run has one root (the empty
+/// set is still `{v:1 diags:[]}`; a multi-root merge or a degenerate
+/// root keeps absolute spellings and no key). The `doc` URL is off on
+/// this face: `code` is the lookup key and `explain` returns the URL —
+/// the oracle machine format carries none either.
+///
+/// # Row shape at small N
+///
+/// The lon crate's encoder already amortizes for row count: arrays below
+/// two elements never form a record table (`lon` 0.1
+/// `write_record_table`: `values.len() < 2` → the ordinary form), and the
+/// two-row/two-field edge compares structural bytes before factoring.
+/// One diagnostic therefore renders the object form
+/// `diags:[{code:… sev:… …}]` — no table header. Measured on the m0
+/// single-error row (located `file:main.dart`): the object form is 108
+/// bytes, a forced single-row table (`[code sev file line col len
+/// msg;…]`) 106 — a ±2-byte class delta that flips sign with value
+/// lengths, not a lever. This function does no shape selection of its
+/// own: the encoder's gate decides, deterministically for every N.
+#[must_use]
+pub fn diags_document(output: &AnalysisOutput<'_>) -> serde_json::Value {
+    // One provider read for the whole document: the root decides every
+    // row's spelling.
+    let root = output.files.analysis_root();
+    let rows = output
+        .diagnostics
+        .iter()
+        .map(|diag| diag_row(diag, output, root))
+        .collect::<Vec<_>>();
+    match (root, rows.is_empty()) {
+        (Some(root), false) => serde_json::json!({
+            "v": 1,
+            "root": root.display().to_string(),
+            "diags": rows,
+        }),
+        _ => serde_json::json!({"v": 1, "diags": rows}),
+    }
+}
+
+/// One `diags` row: the locator-spelled `file`, no `doc` (see
+/// [`diags_document`]).
+fn diag_row(
+    diag: &Diagnostic,
+    output: &AnalysisOutput<'_>,
+    root: Option<&Path>,
+) -> serde_json::Value {
+    let (line, col) = output.files.line_col(diag.file, diag.range.offset);
+    let path = output.files.file_path(diag.file);
+    let file = match root {
+        Some(root) => crate::locate(root, path),
+        None => path.display().to_string(),
+    };
+    serde_json::json!({
+        "code": diag.code.name,
+        "sev": severity_word(diag.severity),
+        "file": file,
+        "line": line,
+        "col": col,
+        "len": diag.range.length,
+        "msg": diag.message.to_string(),
+    })
+}
+
+/// The `sev` value spelling: lowercase, the compact rows' own — the one
+/// severity spelling the lon faces print (the json face's oracle envelope
+/// keeps the analyzer's uppercase, in dartq-diagnostics).
+#[must_use]
+pub fn severity_word(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Error => "error",
+        Severity::Warning => "warning",
+        Severity::Info => "info",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use dartq_diagnostics::{
@@ -1483,6 +1607,158 @@ mod tests {
 
     use super::*;
     use crate::workspace::{engine_config, test_fixture::workspace};
+
+    /// A layout over the interned paths, optionally carrying an analysis
+    /// root — the provider face the document locator tests project through.
+    struct TableLayout {
+        table: dartq_source::FileTable,
+        root: Option<std::path::PathBuf>,
+    }
+
+    impl dartq_diagnostics::FileLayoutProvider for TableLayout {
+        fn file_path(&self, file: FileId) -> &Path {
+            self.table.path(file).expect("interned FileId")
+        }
+
+        fn analysis_root(&self) -> Option<&Path> {
+            self.root.as_deref()
+        }
+
+        fn line_col(&self, _file: FileId, _offset: u32) -> (u32, u32) {
+            (1, 27)
+        }
+    }
+
+    fn published_diag(table: &mut dartq_source::FileTable, path: &Path) -> Diagnostic {
+        let file = table.intern(path);
+        Diagnostic::new(
+            Severity::Error,
+            dartq_diagnostics::UNDEFINED_IDENTIFIER,
+            "Expected an identifier.",
+            file,
+            SourceRange {
+                offset: 26,
+                length: 1,
+            },
+            None,
+        )
+    }
+
+    /// The locator policy on the document face: the envelope carries the
+    /// root once, rows inside the root spell relative (no `package:`
+    /// form, no leading `./`), rows outside keep the absolute spelling,
+    /// and `doc` is off — even for a published code.
+    #[test]
+    fn diags_document_locates_files_and_carries_the_root() {
+        let mut table = dartq_source::FileTable::new();
+        let inside = table.intern(Path::new("/w/pkg/lib/a.dart"));
+        let outside = table.intern(Path::new("/Users/x/.pub-cache/x/lib/b.dart"));
+        let row = |file: FileId| {
+            Diagnostic::new(
+                Severity::Error,
+                dartq_diagnostics::UNDEFINED_IDENTIFIER,
+                "Expected an identifier.",
+                file,
+                SourceRange {
+                    offset: 26,
+                    length: 1,
+                },
+                None,
+            )
+        };
+        let diagnostics = [row(inside), row(outside)];
+        let files = TableLayout {
+            table,
+            root: Some(std::path::PathBuf::from("/w/pkg")),
+        };
+        let output = AnalysisOutput {
+            diagnostics: &diagnostics,
+            files: &files,
+        };
+        let document = diags_document(&output);
+        assert_eq!(document["root"], "/w/pkg", "the root rides exactly once");
+        let diags = document["diags"].as_array().expect("rows");
+        assert_eq!(diags[0]["file"], "lib/a.dart", "inside the root: relative");
+        assert_eq!(
+            diags[1]["file"], "/Users/x/.pub-cache/x/lib/b.dart",
+            "outside the root: absolute"
+        );
+        assert!(
+            diags.iter().all(|row| row.get("doc").is_none()),
+            "the doc URL is off on this face: {}",
+            document
+        );
+    }
+
+    /// The no-root and empty-set faces: a provider without one root keeps
+    /// absolute spellings and no `root` key, and the clean run is still
+    /// the bare `{v:1 diags:[]}` document.
+    #[test]
+    fn diags_document_without_a_root_or_rows() {
+        let mut table = dartq_source::FileTable::new();
+        let diagnostics = [published_diag(&mut table, Path::new("/w/pkg/lib/a.dart"))];
+        let files = TableLayout { table, root: None };
+        let output = AnalysisOutput {
+            diagnostics: &diagnostics,
+            files: &files,
+        };
+        let document = diags_document(&output);
+        assert!(document.get("root").is_none(), "no root to carry");
+        assert_eq!(
+            document["diags"][0]["file"], "/w/pkg/lib/a.dart",
+            "absolute spelling stands"
+        );
+
+        let empty: [Diagnostic; 0] = [];
+        let output = AnalysisOutput {
+            diagnostics: &empty,
+            files: &files,
+        };
+        assert_eq!(
+            diags_document(&output),
+            serde_json::json!({"v": 1, "diags": []}),
+            "the empty set carries no root"
+        );
+    }
+
+    /// The small-N row shape gate (pinned so a codec change is a visible
+    /// contract change): the row vocabulary is exactly the seven compact
+    /// keys, in the builder's own order — the lon byte shapes themselves
+    /// are pinned by the CLI face's tests over this same builder.
+    #[test]
+    fn diags_document_row_vocabulary() {
+        let mut table = dartq_source::FileTable::new();
+        let mut files = TableLayout {
+            table,
+            root: Some(std::path::PathBuf::from("/w/pkg")),
+        };
+        let one = [published_diag(
+            &mut files.table,
+            Path::new("/w/pkg/lib/a.dart"),
+        )];
+        let output = AnalysisOutput {
+            diagnostics: &one,
+            files: &files,
+        };
+        let document = diags_document(&output);
+        assert_eq!(
+            document,
+            serde_json::json!({
+                "v": 1,
+                "root": "/w/pkg",
+                "diags": [{
+                    "code": "undefined_identifier",
+                    "sev": "error",
+                    "file": "lib/a.dart",
+                    "line": 1,
+                    "col": 27,
+                    "len": 1,
+                    "msg": "Expected an identifier.",
+                }],
+            }),
+            "the whole document, as the value the lon face encodes"
+        );
+    }
 
     /// A hand-built diagnostic, identified by its message in the
     /// assertions; the engine never analyzes it.

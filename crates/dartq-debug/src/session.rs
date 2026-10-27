@@ -1360,6 +1360,22 @@ impl DebugSession {
         Ok(list.scripts)
     }
 
+    /// Whether the isolate's tracked pause carries a stack frame — the
+    /// precondition of a frame-indexed evaluation, answered from tracked
+    /// state with no VM round trip. `None`: the isolate is not paused
+    /// as far as the session knows (no local verdict — the VM speaks).
+    /// `Some(false)`: it is paused with no top frame (interrupted while
+    /// idle at the event loop) — the stack is empty, no frame index
+    /// exists. `Some(true)`: paused with a top frame — frame 0 exists;
+    /// deeper indexes are the VM's to judge.
+    #[must_use]
+    pub fn paused_frame_exists(&self, isolate: Option<&str>) -> Option<bool> {
+        let isolate = self.resolve_isolate(isolate).ok()?;
+        self.pause_events
+            .get(&isolate)
+            .map(|(_, event)| event.top_frame.is_some())
+    }
+
     /// Evaluates `expression` in a stack frame (`frame_index` 0 is the
     /// top frame).
     ///

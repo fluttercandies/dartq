@@ -115,7 +115,7 @@ fn default_missing_kind_is_the_symbol_answer() {
     assert_eq!(absent["sym"], "Foo");
     let decls = absent["decls"].as_array().expect("decls");
     assert_eq!(decls.len(), 1);
-    assert_eq!(decls[0]["file"], "package:fixture/a.dart");
+    assert_eq!(decls[0]["file"], "lib/a.dart", "the unified locator's root-relative spelling");
     assert_eq!(decls[0]["kind"], "class");
     assert_eq!(decls[0]["name"], "Foo");
     assert_eq!(decls[0]["line"], 1);
@@ -158,10 +158,10 @@ fn minimal_tier_keeps_the_package_form_labels() {
     let result = answer_result(&h, 2);
     let decls = result["decls"].as_array().expect("decls");
     assert_eq!(decls.len(), 1);
-    assert_eq!(decls[0]["file"], "package:fixture/a.dart");
+    assert_eq!(decls[0]["file"], "lib/a.dart", "the unified locator's root-relative spelling");
     let refs = result["refs"].as_array().expect("refs");
     assert_eq!(refs.len(), 2);
-    assert_eq!(refs[0]["target"], "package:fixture/a.dart");
+    assert_eq!(refs[0]["target"], "lib/a.dart", "the unified locator's root-relative spelling");
     assert!(
         refs[0].get("file").is_none(),
         "the minimal red line keeps the target locator only: {row}",
@@ -400,8 +400,8 @@ fn implementation_and_dependency_kinds_end_to_end() {
     assert_eq!(implementations[0]["name"], "breathe");
     assert_eq!(implementations[0]["container"], "Dog");
     assert_eq!(
-        implementations[0]["file"], "package:fixture/b.dart",
-        "the stable package-form label (the shared shaper's projection)"
+        implementations[0]["file"], "lib/b.dart",
+        "the unified locator's root-relative spelling (the shared shaper's projection)"
     );
 
     // `dependencies` is the forward face: the declaring library's own

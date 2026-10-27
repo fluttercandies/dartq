@@ -47,8 +47,9 @@ for line in open('$(out_file ev-full)'):
   assert_contains "$names" "client_detached" "a client detach was recorded"
 
   # Newest-first paging: limit 1 gives the newest record (the default
-  # order leads with it); --since (UNIX seconds) floors the read at a
-  # timestamp — a far-past floor returns every event, a future one none.
+  # order leads with it); --since (milliseconds, the rows' own ts unit,
+  # #2657) floors the read at a timestamp — a far-past floor returns
+  # every event, a future one none.
   run_dartq_in ev-page1 "$base/ev" events session "$base/ev" --limit 1 --format json
   assert_eq "$(jsonl_count "$(out_file ev-page1)")" 1 "limit 1 reads one event"
   total="$(jsonl_count "$(out_file ev-full)")"
@@ -58,7 +59,7 @@ for line in open('$(out_file ev-full)'):
   assert_eq "$DQ_RC" 0 "a floor at the unix epoch reads clean"
   assert_eq "$(jsonl_count "$(out_file ev-past)")" "$total" \
     "--since 0 returns every event"
-  local future=$(( $(date +%s) + 60 ))
+  local future=$(( $(date +%s) * 1000 + 60000 ))
   run_dartq_in ev-future "$base/ev" events session "$base/ev" --since "$future" --limit 100 --format json
   assert_eq "$DQ_RC" 0 "a future floor reads clean"
   assert_eq "$(jsonl_count "$(out_file ev-future)")" 0 \

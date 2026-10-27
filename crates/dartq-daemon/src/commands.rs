@@ -88,8 +88,8 @@
 //!   session selectors (`agent_id`/`context`) and `since` apply to the whole
 //!   batch, exactly as they do to the single face.
 //! * **Short-id symbol table** — full-tier `dartq/check` and `dartq/analyze`
-//!   answers substitute path-valued row fields (`file`, the analyze rows'
-//!   document URIs included) with
+//!   answers substitute path-valued row fields (`file`, the analyze
+//!   document's located spellings included) with
 //!   session-stable short ids (`s1`, `s2`, …) and carry a `symbols` preamble
 //!   (id → path) for ids the client has not seen yet, only when the
 //!   substitution saves bytes. Compact answers stay byte-identical to the
@@ -110,9 +110,13 @@
 //! `compat`) shape through the CLI faces' own implementations — the query
 //! rows' file references are the shared shaper's stable package-form
 //! labels (`dartq_commands::pkg_label`, tier-agnostic), the `analyze`
-//! face keeps document URIs. Relative request paths resolve
-//! against the session's workspace root (the CLI resolves them against the
-//! process cwd). The CLI's `$DART_SDK` fallback has no daemon equivalent:
+//! face renders through the shared `diags_document` builder (the CLI's
+//! own lon document). Relative request paths resolve against the
+//! server's working directory first (the client's own cwd — a package
+//! inside a pub-workspace monorepo spells paths against its package
+//! directory, not the workspace root), falling back to the session's
+//! workspace root when the cwd-relative spelling does not exist. The
+//! CLI's `$DART_SDK` fallback has no daemon equivalent:
 //! `dartq/compat` requires explicit `sdk_roots`, and `dartq/explain` takes
 //! an optional `sdk` root per query — absent resolves to the session's own
 //! SDK root (the SDK the analyzed view was assembled against); the
@@ -134,7 +138,7 @@ use dartq_commands::query::{BatchQuery, QueryKind};
 use dartq_commands::resolve as resolve_core;
 use dartq_commands::resolve::ResolveError;
 use dartq_commands::{Verbosity, check, compat as compat_core, fix, impact as impact_core, query};
-use dartq_diagnostics::{Diagnostic, FileLayoutProvider};
+use dartq_diagnostics::{AnalysisOutput, Diagnostic, FileLayoutProvider};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -189,7 +193,16 @@ pub(crate) enum Request {
         agent: Option<String>,
         context: Option<String>,
     },
+    /// The diagnostics-pull face. `target` honors the request's aim — a
+    /// directory or file, the CLI positional's mirror, resolved and
+    /// classified at intake — and the answer renders through the shared
+    /// `diags_document` builder (the CLI's own lon document: root key,
+    /// located paths, oracle display order). `None` is the CLI's
+    /// positional default, resolved at answer time (the server's working
+    /// directory when it lies inside the workspace, the workspace root
+    /// itself otherwise).
     Analyze {
+        target: Option<dartq_commands::analyze::Target>,
         verbosity: Verbosity,
         agent: Option<String>,
         context: Option<String>,
@@ -348,6 +361,16 @@ struct VerbosityParams {
     verbosity: Verbosity,
 }
 
+/// The `dartq/analyze` payload: the optional aim (a directory or file —
+/// the CLI positional's mirror) beside the tier.
+#[derive(Deserialize)]
+struct AnalyzeParams {
+    #[serde(default)]
+    target: Option<PathBuf>,
+    #[serde(default)]
+    verbosity: Verbosity,
+}
+
 #[derive(Deserialize)]
 struct CheckParams {
     paths: Vec<PathBuf>,
@@ -467,8 +490,13 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
             let (agent, _) = session_fields(params)?;
             let context = context_field(params)?;
             let decoded =
-                serde_json::from_value::<VerbosityParams>(params.clone()).map_err(invalid)?;
+                serde_json::from_value::<AnalyzeParams>(params.clone()).map_err(invalid)?;
+            let target = match decoded.target.as_deref() {
+                None => None,
+                Some(target) => Some(classify_target(&resolve(root, target.to_path_buf()))?),
+            };
             Ok(Request::Analyze {
+                target,
                 verbosity: decoded.verbosity,
                 agent,
                 context,
@@ -802,7 +830,17 @@ pub(crate) fn parse_overlay_commit(params: &Value) -> Result<String, String> {
     overlay_agent(params, "commit")
 }
 
-/// Relative request paths resolve against the session workspace root.
+/// Relative request paths resolve against the server's working directory
+/// first — the client's own directory (a package inside a pub-workspace
+/// monorepo spells `lib/a.dart` against its package directory, not the
+/// workspace root; the daemon serve process inherits the starter's cwd,
+/// which is that directory) — falling back to the session's workspace
+/// root when the cwd-relative spelling does not exist. Absolute paths
+/// pass through.
+///
+/// The relative spelling is preserved when the cwd resolves it: the
+/// downstream document spellings then match the CLI run's own bytes for
+/// the same arguments in that directory (#2657).
 ///
 /// Path trust is deliberately split by face (#947 F4; the read-side
 /// adjudication is #947 F9). The READ faces — `dartq/check` (`paths`),
@@ -813,18 +851,69 @@ pub(crate) fn parse_overlay_commit(params: &Value) -> Result<String, String> {
 /// workspace trust domain (one same-user client over stdio), and these
 /// faces only read; the fix faces are additionally dry by contract (they
 /// report patch documents, never write). The remaining command faces
-/// (`dartq/index`, `dartq/analyze`, `dartq/query`, `dartq/queryBatch`)
-/// resolve no client paths at all — they answer from the analyzed view — so
-/// the split has no say there. The WRITE faces are confined to the
-/// workspace root — `Session::set_overlay` rejects any staged path whose
-/// normalized form escapes it, and `Session::commit_overlay` re-checks a
-/// canonical (symlink-following) prefix before a byte lands on disk.
-fn resolve(root: &Path, path: PathBuf) -> PathBuf {
+/// (`dartq/index`, `dartq/query`, `dartq/queryBatch`) resolve no client
+/// paths at all — they answer from the analyzed view — so the split has
+/// no say there. The WRITE faces are confined to the workspace root —
+/// `Session::set_overlay` rejects any staged path whose normalized form
+/// escapes it, and `Session::commit_overlay` re-checks a canonical
+/// (symlink-following) prefix before a byte lands on disk; they resolve
+/// against the workspace root only (the write trust base), never the
+/// cwd.
+pub(crate) fn resolve(root: &Path, path: PathBuf) -> PathBuf {
+    resolve_in(std::env::current_dir().ok().as_deref(), root, path)
+}
+
+/// [`resolve`] with the working directory injected — the test seam for the
+/// two-leg rule (a process-wide cwd cannot be moved under parallel
+/// tests).
+fn resolve_in(cwd: Option<&Path>, root: &Path, path: PathBuf) -> PathBuf {
     if path.is_absolute() {
-        path
-    } else {
-        root.join(path)
+        return path;
     }
+    match cwd {
+        Some(cwd) if cwd.join(&path).exists() => path,
+        _ => root.join(path),
+    }
+}
+
+/// One `dartq/analyze` target's classification — the CLI positional's own
+/// step (metadata kind + canonical spelling, the emitted set's coverage
+/// universe).
+///
+/// # Errors
+///
+/// A target that does not exist names itself in the CLI face's own
+/// usage wording.
+fn classify_target(path: &Path) -> Result<dartq_commands::analyze::Target, String> {
+    let meta = std::fs::metadata(path)
+        .map_err(|_| format!("Directory or file doesn't exist: {}", path.display()))?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| format!("Directory or file doesn't exist: {}", path.display()))?;
+    Ok(if meta.is_file() {
+        dartq_commands::analyze::Target::File(canonical)
+    } else {
+        dartq_commands::analyze::Target::Dir(canonical)
+    })
+}
+
+/// The `dartq/analyze` default target: the server's working directory —
+/// the CLI positional `.`'s mirror, the client's own package — when it
+/// lies inside the analyzed workspace, and the workspace root itself
+/// otherwise (an in-process session whose cwd has no say keeps the
+/// whole-workspace answer). A degenerate root (deleted mid-session)
+/// still classifies: an empty answer, never a failed request.
+fn default_target(root: &Path) -> dartq_commands::analyze::Target {
+    default_target_in(std::env::current_dir().ok().as_deref(), root)
+}
+
+/// [`default_target`] with the working directory injected — the test seam.
+fn default_target_in(cwd: Option<&Path>, root: &Path) -> dartq_commands::analyze::Target {
+    let base = match cwd {
+        Some(cwd) if cwd.starts_with(root) => cwd.to_path_buf(),
+        _ => root.to_path_buf(),
+    };
+    classify_target(&base).unwrap_or(dartq_commands::analyze::Target::Dir(root.to_path_buf()))
 }
 
 /// The analyzed view's changed-file cursors, for `since` delta filtering.
@@ -1051,11 +1140,10 @@ pub(crate) struct Drain<'a> {
     /// request omits `sdk` (the session analyzes against this SDK, so the
     /// report must come from the same one).
     pub sdk_root: &'a Path,
-    /// The analyzed view's raw diagnostic set (engine-canonical order).
+    /// The analyzed view's raw diagnostic set (engine-canonical order) —
+    /// the analyze document's rows, the impact environment verdicts'
+    /// input, and the delta filters' substrate.
     pub diagnostics: &'a [dartq_diagnostics::Diagnostic],
-    /// The shared analyze entries (uri + converted wire diagnostic per
-    /// diagnostic of this view), consumed by `dartq/analyze` answers.
-    pub entries: &'a [wire::AnalyzeEntry],
     /// The analyzed view's changed-file table for `since` filtering.
     pub changes: &'a Changes<'a>,
     /// The session's current delta cursor, echoed by delta answers.
@@ -1074,7 +1162,9 @@ pub(crate) struct Drain<'a> {
 pub(crate) fn answer(drain: &Drain<'_>, request: &Request) -> Result<Value, SessionError> {
     match request {
         Request::Index { verbosity, .. } => Ok(index_answer(drain, *verbosity)),
-        Request::Analyze { verbosity, .. } => Ok(analyze_answer(drain, *verbosity)),
+        Request::Analyze {
+            target, verbosity, ..
+        } => Ok(analyze_answer(drain, *verbosity, target.as_ref())),
         Request::Check {
             paths,
             verbosity,
@@ -1221,38 +1311,73 @@ fn index_answer(drain: &Drain<'_>, _verbosity: Verbosity) -> Value {
 // dartq/analyze — the diagnostics pull face
 // ---------------------------------------------------------------------------
 
-/// The merged diagnostic set of the analyzed view. Compact/full keep the
-/// flattened row (`code`/`sev`/`file`/`line`/`col`/`len`/`msg` — the wire
-/// module's row builder, `file` carrying the document URI); minimal keeps
-/// the red line (code + locator, the same shape minus `sev`/`msg`); full
-/// equals compact plus the short-id economics over row `file` values. The
-/// envelope comes from the wire-shape module (`crate::wire`) — the frozen
-/// pull-face shape — plus the session economics here.
-/// Rows keep the CLI analyze face's severity-first printed order (the
-/// entries are sorted where the read task builds them); the other faces
-/// mirror the engine's canonical (file, offset) order.
-pub(crate) fn analyze_answer(drain: &Drain<'_>, verbosity: Verbosity) -> Value {
-    let rows: Vec<Value> = drain
-        .entries
-        .iter()
-        .map(|entry| match verbosity {
-            Verbosity::Minimal => json!({
-                "code": entry.diagnostic.code,
-                "file": entry.uri,
-                "line": entry.diagnostic.range.start.line + 1,
-                "col": entry.diagnostic.range.start.character + 1,
-                "len": entry.len,
-            }),
-            Verbosity::Compact | Verbosity::Full => crate::wire::row(entry),
-        })
-        .collect();
-    session_answer(
-        crate::wire::envelope(&rows),
-        verbosity,
-        None,
-        drain,
-        &[("diags", "file")],
-    )
+/// The merged diagnostic set of the analyzed view, rendered through the
+/// shared `diags_document` builder — byte-identical to the CLI analyze
+/// face's own lon stdout for the same target (#2657): the `root` key with
+/// located `file` spellings, rows in the CLI's severity-first printed
+/// order (the oracle display order), the seven-key compact row. Minimal
+/// keeps the red line (the document's rows minus `sev`/`msg`); full
+/// equals compact plus the short-id economics over row `file` values.
+pub(crate) fn analyze_answer(
+    drain: &Drain<'_>,
+    verbosity: Verbosity,
+    target: Option<&dartq_commands::analyze::Target>,
+) -> Value {
+    let target = target
+        .cloned()
+        .unwrap_or_else(|| default_target(drain.root));
+    let layout = EngineLayout::over(drain.engine, drain.diagnostics.iter().map(|d| d.file));
+    let targets = [target];
+    let covered: Vec<Diagnostic> =
+        dartq_commands::analyze::oracle_order(drain.diagnostics, &layout)
+            .into_iter()
+            .filter(|diagnostic| {
+                dartq_commands::analyze::covered(layout.file_path(diagnostic.file), &targets)
+            })
+            .cloned()
+            .collect();
+    let document = DocumentLayout {
+        inner: &layout,
+        root: drain.engine.packages().workspace_root(),
+    };
+    let mut answer = dartq_commands::analyze::diags_document(&AnalysisOutput {
+        diagnostics: &covered,
+        files: &document,
+    });
+    if verbosity == Verbosity::Minimal
+        && let Some(rows) = answer["diags"].as_array_mut()
+    {
+        for row in rows {
+            if let Some(row) = row.as_object_mut() {
+                row.remove("sev");
+                row.remove("msg");
+            }
+        }
+    }
+    session_answer(answer, verbosity, None, drain, &[("diags", "file")])
+}
+
+/// The analyze document's layout face: the engine's paths and positions
+/// with the workspace root as the locator's analysis root — the same
+/// projection the CLI's run carries (its provider answers the engine's
+/// own workspace root).
+struct DocumentLayout<'a> {
+    inner: &'a EngineLayout<'a>,
+    root: &'a Path,
+}
+
+impl FileLayoutProvider for DocumentLayout<'_> {
+    fn file_path(&self, file: dartq_diagnostics::FileId) -> &Path {
+        self.inner.file_path(file)
+    }
+
+    fn analysis_root(&self) -> Option<&Path> {
+        Some(self.root)
+    }
+
+    fn line_col(&self, file: dartq_diagnostics::FileId, utf16_offset: u32) -> (u32, u32) {
+        self.inner.line_col(file, utf16_offset)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1548,6 +1673,27 @@ fn impact_answer(
     // implementation for the CLI and the daemon, schema-validated at
     // birth. Its library labels stay unsubstituted: each row names a
     // distinct library, so short ids save nothing.
+    //
+    // The environment section re-answers through the same shared
+    // function the CLI face computes its rows with (#2657): the session's
+    // analyzed-view diagnostics feed the verdict rule, so both faces
+    // compute the same compatible/incompatible answer over the same
+    // affected set instead of the vacuous affirmative the bare
+    // after-analysis report carries.
+    report.affected_environments =
+        impact_core::environments_after_analysis(drain.engine, target, &report, drain.diagnostics)
+            .map_err(|error| match error {
+                impact_core::ImpactError::Usage(message) => SessionError::InvalidParams(message),
+                impact_core::ImpactError::Internal(message) => SessionError::Internal(message),
+                // The target already resolved through the analyzed engine above;
+                // the section cannot see a missing/unanalyzed target.
+                impact_core::ImpactError::Missing(path)
+                | impact_core::ImpactError::NotAnalyzed(path) => SessionError::Internal(format!(
+                    "the impact target left the analyzed view: {}",
+                    path.display()
+                )),
+                impact_core::ImpactError::Step(step) => step.into(),
+            })?;
     let mut value = impact_core::to_json(&report);
     if since.is_some() {
         value["since"] = json!(drain.cursor);
@@ -1817,5 +1963,84 @@ mod tests {
         assert!(table.shorten(&mut answer, ROWS));
         assert_eq!(answer["diags"][0]["file"], "s2");
         assert_eq!(answer["symbols"]["s2"], "/workspace/open/b_other.dart");
+    }
+
+    /// The read faces' path rule (#2657): a relative path resolves against
+    /// the server's working directory first — keeping its spelling, so the
+    /// answer's documents carry the CLI run's own bytes — and falls back to
+    /// the workspace root when the cwd-relative spelling does not exist;
+    /// absolute paths pass through.
+    #[test]
+    fn relative_paths_resolve_cwd_first_then_the_workspace_root() {
+        let root = std::env::temp_dir().join(format!("dqs-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cwd = root.join("pkg");
+        std::fs::create_dir_all(cwd.join("lib")).expect("dirs");
+        std::fs::write(cwd.join("lib/a.dart"), "void a() {}\n").expect("file");
+        std::fs::create_dir_all(root.join("shared")).expect("shared dir");
+
+        // The cwd hit: the relative spelling survives (the CLI-equivalent
+        // document bytes ride the answer).
+        assert_eq!(
+            resolve_in(Some(&cwd), &root, PathBuf::from("lib/a.dart")),
+            PathBuf::from("lib/a.dart"),
+            "a cwd-relative hit keeps the spelling"
+        );
+        // The cwd miss: the workspace root joins (the legacy base).
+        assert_eq!(
+            resolve_in(Some(&cwd), &root, PathBuf::from("shared/x.dart")),
+            root.join("shared/x.dart"),
+            "a cwd-relative miss falls back to the workspace root"
+        );
+        // No cwd at all: the workspace root is the only base.
+        assert_eq!(
+            resolve_in(None, &root, PathBuf::from("lib/a.dart")),
+            root.join("lib/a.dart"),
+            "without a cwd the workspace root resolves"
+        );
+        // Absolute paths never rebase.
+        assert_eq!(
+            resolve_in(Some(&cwd), &root, PathBuf::from("/elsewhere/a.dart")),
+            PathBuf::from("/elsewhere/a.dart"),
+            "absolute paths pass through"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The analyze default target (#2657): the server's working directory
+    /// — the CLI positional `.`'s mirror, the client's own package — when
+    /// it lies inside the analyzed workspace; the workspace root itself
+    /// otherwise.
+    #[test]
+    fn the_analyze_default_targets_the_cwd_inside_the_workspace() {
+        // macOS temp paths canonicalize (/var → /private/var), and the
+        // classification answers canonical spellings — build the fixture,
+        // then compare in its canonical form.
+        let raw = std::env::temp_dir().join(format!("dqs-target-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&raw);
+        std::fs::create_dir_all(raw.join("packages/a")).expect("dirs");
+        let root = raw.canonicalize().expect("root canonicalizes");
+        let pkg = root.join("packages/a");
+        let outside_raw =
+            std::env::temp_dir().join(format!("dqs-target-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside_raw);
+        std::fs::create_dir_all(&outside_raw).expect("outside dir");
+        let outside = outside_raw.canonicalize().expect("outside canonicalizes");
+
+        use dartq_commands::analyze::Target;
+        match default_target_in(Some(&pkg), &root) {
+            Target::Dir(dir) => assert_eq!(dir, pkg, "the client's package is the default"),
+            other => panic!("a directory default, got {other:?}"),
+        }
+        match default_target_in(Some(&outside), &root) {
+            Target::Dir(dir) => assert_eq!(dir, root, "an unrelated cwd falls back to the root"),
+            other => panic!("a directory default, got {other:?}"),
+        }
+        match default_target_in(None, &root) {
+            Target::Dir(dir) => assert_eq!(dir, root, "without a cwd the root answers"),
+            other => panic!("a directory default, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 }
