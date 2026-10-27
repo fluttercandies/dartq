@@ -2,6 +2,12 @@
 //! shapes are tier-invariant (crate docs, "Verbosity tiers"): every field is
 //! a locator or a verdict, so `minimal` cannot shrink a row. The session
 //! fields (`symbols`/`since`) are the face's token levers.
+//!
+//! The path columns spell through the one file locator (root-relative
+//! inside the analysis root, absolute outside it — the `sym` label half
+//! included), and the envelope's optional `root` (the absolute analysis
+//! root) rides exactly when a file-bearing row does (`sym`/`files`/
+//! `tests`).
 
 use std::sync::LazyLock;
 
@@ -40,6 +46,10 @@ static IMPACT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "required": ["v", "sym", "files", "tests", "envs"],
         "properties": {
             "v": { "const": SCHEMA_VERSION_IMPACT },
+            // The analysis root the path columns locate against
+            // (absolute): rides exactly when a file-bearing row does
+            // (`sym`/`files`/`tests`), omitted on the all-empty report.
+            "root": { "type": "string" },
             "sym": { "type": "array", "items": {
                 "type": "object",
                 "additionalProperties": false,
@@ -96,6 +106,9 @@ const IMPACT_TOP: &[&str] = &[
     "tests",
     "envs",
 ];
+/// The locator envelope's key — the analysis root the path columns locate
+/// against, riding exactly when a file-bearing row does.
+const IMPACT_LOCATOR: &[&str] = &["root"];
 const IMPACT_SESSION: &[&str] = &["symbols", "since"];
 const CHANGED_SYMBOL: &[&str] = &["sym", "sig_changed"];
 const AFFECTED_TARGET: &[&str] = &["path", "impact", "lines"];
@@ -105,8 +118,18 @@ const IMPACT_LEVELS: &[&str] = &["content-only", "semantic"];
 
 pub(crate) fn validate_impact(value: &Value) -> Result<(), SchemaViolation> {
     let root = object(value, "")?;
-    exact_fields(root, IMPACT_TOP, IMPACT_SESSION, "")?;
+    // The locator envelope and the session fields share the optional slot:
+    // declared, absent-tolerant, unknown-key rejection intact.
+    let optional: Vec<&str> = IMPACT_LOCATOR
+        .iter()
+        .chain(IMPACT_SESSION.iter())
+        .copied()
+        .collect();
+    exact_fields(root, IMPACT_TOP, &optional, "")?;
     pinned_version(root, "v", SCHEMA_VERSION_IMPACT)?;
+    if let Some(locator_root) = root.get("root") {
+        string(locator_root, "root")?;
+    }
     session_fields(root)?;
     for (i, row) in rows(root, "sym")? {
         let p = format!("sym[{i}]");
@@ -180,6 +203,7 @@ mod tests {
     fn report() -> serde_json::Value {
         json!({
             "v": SCHEMA_VERSION_IMPACT,
+            "root": "/w",
             "sym": [{"sym": "a.dart|fb", "sig_changed": true}],
             "files": [{"path": "b.dart", "impact": "semantic", "lines": [3, 7]}],
             "tests": [],
@@ -194,10 +218,11 @@ mod tests {
         let impact = impact_schema();
         let mut top: Vec<String> = IMPACT_TOP
             .iter()
+            .chain(IMPACT_LOCATOR.iter())
             .chain(IMPACT_SESSION.iter())
             .map(|s| (*s).to_owned())
             .collect();
-        top.sort_unstable();
+        top.sort();
         assert_eq!(schema_keys(impact), top);
         assert_eq!(
             schema_keys(&impact["properties"]["sym"]["items"]),
@@ -237,5 +262,23 @@ mod tests {
         let violation = validate_impact(&payload).expect_err("missing section must violate");
         assert_eq!(violation.path, "tests");
         assert_eq!(violation.found, "missing");
+    }
+
+    /// The locator envelope: `root` rides absent-tolerant (the all-empty
+    /// report carries no file field), and a non-string is named.
+    #[test]
+    fn the_locator_root_validates_and_a_non_string_is_named() {
+        let mut payload = report();
+        payload
+            .as_object_mut()
+            .expect("object")
+            .remove("root");
+        assert!(validate_impact(&payload).is_ok());
+
+        let mut payload = report();
+        payload["root"] = json!(true);
+        let violation = validate_impact(&payload).expect_err("non-string root");
+        assert_eq!(violation.path, "root");
+        assert_eq!(violation.expected, "a string");
     }
 }

@@ -41,6 +41,12 @@ pub fn ignore_line_fix(
         source: BUILTIN_IGNORE_SOURCE,
         edit: anchored_edit(text, lines, offset, 0, &insertion),
         target: None,
+        role: FixRole::IgnoreLine,
+        diag: Some(SourceRange {
+            offset: range.start,
+            length: range.end - range.start,
+        }),
+        group: 0,
     })
 }
 
@@ -146,6 +152,10 @@ pub fn ignore_file_fix(code: &'static str, text: &str, lines: &LineIndex) -> Opt
         source: BUILTIN_IGNORE_SOURCE,
         edit: anchored_edit(text, lines, offset, 0, &insertion),
         target: None,
+        role: FixRole::IgnoreFile,
+        // File-level: one row per code, no single diagnostic to serve.
+        diag: None,
+        group: 0,
     })
 }
 

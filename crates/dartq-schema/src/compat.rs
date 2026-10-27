@@ -1,6 +1,11 @@
 //! The compatibility report — `dartq compat`, the per-SDK-context
 //! verdict matrix produced by `dartq-ai::compatibility::CompatReport` and
-//! serialized by the CLI (`crates/dartq-cli/src/compat.rs:151-159`).
+//! serialized by the CLI (`crates/dartq-cli/src/compat.rs:151-159`). The
+//! `file` and failure columns spell through the one file locator
+//! (root-relative inside the analysis root, absolute outside it), and the
+//! envelope's optional `root` (the absolute analysis root) makes the
+//! relative tails unambiguous — the subject always rides, so the root
+//! always does on the produced face.
 
 use std::sync::LazyLock;
 
@@ -46,6 +51,11 @@ static COMPAT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "required": ["schema_version", "file", "matrix"],
         "properties": {
             "schema_version": { "const": SCHEMA_VERSION_COMPAT },
+            // The analysis root the file columns locate against
+            // (absolute). The subject `file` always rides, so the produced
+            // face always carries the root; absent-tolerant for other
+            // producers.
+            "root": { "type": "string" },
             "file": { "type": "string" },
             "matrix": { "type": "array", "items": {
                 "type": "object",
@@ -79,6 +89,9 @@ static COMPAT_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 pub const ERROR_KINDS: &[&str] = &["sdk_unavailable"];
 
 const COMPAT_TOP: &[&str] = &["schema_version", "file", "matrix"];
+/// The locator envelope's key — the analysis root the file columns locate
+/// against; absent-tolerant for producers that spell absolute paths only.
+const COMPAT_LOCATOR: &[&str] = &["root"];
 const AXIS: &[&str] = &["sdk", "compatible"];
 const AXIS_OPTIONAL: &[&str] = &["first_failure", "error"];
 const FAILURE: &[&str] = &["code", "file", "line", "col", "message"];
@@ -86,8 +99,11 @@ const AXIS_ERROR: &[&str] = &["kind", "message"];
 
 pub(crate) fn validate_compat(value: &Value) -> Result<(), SchemaViolation> {
     let root = object(value, "")?;
-    exact_fields(root, COMPAT_TOP, &[], "")?;
+    exact_fields(root, COMPAT_TOP, COMPAT_LOCATOR, "")?;
     pinned_version(root, "schema_version", SCHEMA_VERSION_COMPAT)?;
+    if let Some(locator_root) = root.get("root") {
+        string(locator_root, "root")?;
+    }
     string(field(root, "file", "")?, "file")?;
     for (i, row) in rows(root, "matrix")? {
         let p = format!("matrix[{i}]");
@@ -150,10 +166,13 @@ mod tests {
     #[test]
     fn document_and_validator_name_the_same_fields() {
         let compat = compat_schema();
-        assert_eq!(
-            crate::support::schema_keys(compat),
-            crate::support::const_names(COMPAT_TOP)
-        );
+        let mut top: Vec<String> = COMPAT_TOP
+            .iter()
+            .chain(COMPAT_LOCATOR.iter())
+            .map(|s| (*s).to_owned())
+            .collect();
+        top.sort();
+        assert_eq!(crate::support::schema_keys(compat), top);
         let axis = &compat["properties"]["matrix"]["items"];
         let mut axis_fields: Vec<String> = AXIS
             .iter()
@@ -178,13 +197,14 @@ mod tests {
     fn minimal_tier_rejects_evidence_columns() {
         let doc = serde_json::json!({
             "schema_version": SCHEMA_VERSION_COMPAT,
-            "file": "/w/lib/a.dart",
+            "root": "/w",
+            "file": "lib/a.dart",
             "matrix": [{
                 "sdk": "3.5.0",
                 "compatible": false,
                 "first_failure": {
                     "code": "uri_does_not_exist",
-                    "file": "/w/lib/a.dart",
+                    "file": "lib/a.dart",
                     "line": 1,
                     "col": 8,
                     "message": "Target of URI doesn't exist: dart:async",
@@ -197,5 +217,21 @@ mod tests {
         assert_eq!(violation.expected, "omitted at the minimal tier");
         assert!(validate_compat_at_tier(&doc, Verbosity::Compact).is_ok());
         assert!(validate_compat_at_tier(&doc, Verbosity::Full).is_ok());
+    }
+
+    /// The locator envelope rides absent-tolerant; a non-string `root` is
+    /// named.
+    #[test]
+    fn the_locator_root_validates_and_a_non_string_is_named() {
+        let mut doc = serde_json::json!({
+            "schema_version": SCHEMA_VERSION_COMPAT,
+            "file": "lib/a.dart",
+            "matrix": [],
+        });
+        assert!(validate_compat(&doc).is_ok());
+        doc["root"] = serde_json::json!(1);
+        let violation = validate_compat(&doc).expect_err("non-string root");
+        assert_eq!(violation.path, "root");
+        assert_eq!(violation.expected, "a string");
     }
 }

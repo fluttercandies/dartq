@@ -2,9 +2,11 @@
 //! AI's one-stop symbol report. The sections map onto the substrate
 //! the assembler can reach; `inheritance` carries the `extends` supertype
 //! edges while `interfaces` carries the `with`/`on`/`implements` ones
-//! (each row naming its clause), and `constructors` carries the element
+//! (each row naming its clause), `constructors` carries the element
 //! face's constructor rows (no source span exists for them — the name
-//! and the rendered parameter face are the facts).
+//! and the rendered parameter face are the facts), and `others` carries
+//! the remaining same-named declarations the primary was picked over
+//! (locator rows: file, kind, container, 1-based line).
 //!
 //! # Verbosity tiers (crate docs, "Verbosity tiers")
 //!
@@ -21,12 +23,18 @@
 //! | `symbol`                  | ●       | ●       | ●    |
 //! | `declaration`             | ●       | ●       | ●    |
 //! | `declaration.container`   |         | ●       | ●    |
-//! | section arrays (7)        | counts  | ●       | ●    |
+//! | section arrays (8)        | counts  | ●       | ●    |
 //! | `references[].qualified`  | (count) | ●       | ●    |
+//! | `others[].container`      | (count) | ●       | ●    |
 //! | `counts`                  | ●       |         |      |
 //!
 //! Ranges are the `[startOffset, endOffset)` pair form (this face
-//! is new — no legacy spelling to keep). The session fields
+//! is new — no legacy spelling to keep). The file columns spell through
+//! the one file locator (root-relative inside the analysis root, absolute
+//! outside it, never a `package:` URI); the envelope's optional `root`
+//! (the absolute analysis root) rides exactly when the answer carries a
+//! file field — the declaration is present, since every file-bearing
+//! section hangs off it. The session fields
 //! (`symbols`/`since`) are declared absent-tolerant like every daemon face;
 //! the face's `symbols` table is the id → FILE path spelling — the
 //! economics over this face's own path-valued rows — not query/impact's
@@ -41,7 +49,7 @@ use crate::Verbosity;
 use crate::query::{DECL_KINDS, REF_KINDS};
 use crate::support::{
     absent, array, boolean, enum_spelling, exact_fields, field, join, non_negative, object,
-    path_session_fields, pinned_version, string,
+    one_based, path_session_fields, pinned_version, string,
 };
 
 /// The explain report's output contract version. Mirrors the
@@ -65,6 +73,11 @@ static EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "required": ["v", "sym"],
         "properties": {
             "v": { "const": SCHEMA_VERSION_EXPLAIN },
+            // The analysis root the file columns locate against (absolute)
+            // — rides exactly when the answer carries a file field (the
+            // declaration present; every file-bearing section hangs off
+            // it), omitted on the unknown-symbol floor.
+            "root": { "type": "string" },
             "sym": { "type": "string" },
             "declaration": { "type": "object",
                 "additionalProperties": false,
@@ -102,8 +115,22 @@ static EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             }},
             "deps": path_rows(),
             "tests": path_rows(),
+            // The remaining same-named candidates the primary was picked
+            // over: locator rows for disambiguation and re-querying.
+            "others": { "type": "array", "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["file", "kind", "line"],
+                "properties": {
+                    "file": { "type": "string" },
+                    "kind": { "enum": DECL_KINDS },
+                    // Absent for a top-level candidate.
+                    "container": { "type": "string" },
+                    "line": { "type": "integer", "minimum": 1 },
+                },
+            }},
             // The `minimal`-tier replacement for the arrays: one entry per
-            // section, all seven always present.
+            // section, all eight always present.
             "counts": { "type": "object",
                 "additionalProperties": false,
                 "required": EXPLAIN_SECTIONS,
@@ -115,6 +142,7 @@ static EXPLAIN_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                     "refs": { "type": "integer", "minimum": 0 },
                     "deps": { "type": "integer", "minimum": 0 },
                     "tests": { "type": "integer", "minimum": 0 },
+                    "others": { "type": "integer", "minimum": 0 },
                 },
             },
             // Session token economics (crate docs, "Token economics").
@@ -213,13 +241,16 @@ pub const EXPLAIN_SECTIONS: &[&str] = &[
     "refs",
     "deps",
     "tests",
+    "others",
 ];
 
 const EXPLAIN_TOP: &[&str] = &["v", "sym"];
-/// Everything beyond the red line is optional: the section arrays drop at
-/// `minimal`, `counts` exists only there, and the session fields
-/// (`symbols`/`since`) ride absent-tolerant.
+/// Everything beyond the red line is optional: the locator envelope
+/// (`root`, riding exactly when a file field does), the section arrays
+/// (dropped at `minimal`), `counts` (existing only there), and the
+/// session fields (`symbols`/`since`, riding absent-tolerant).
 const EXPLAIN_OPTIONAL: &[&str] = &[
+    "root",
     "declaration",
     "bases",
     "ifaces",
@@ -228,12 +259,15 @@ const EXPLAIN_OPTIONAL: &[&str] = &[
     "refs",
     "deps",
     "tests",
+    "others",
     "counts",
     "symbols",
     "since",
 ];
 const DECLARATION_ROW: &[&str] = &["file", "name", "kind", "off", "len"];
 const DECLARATION_ROW_OPTIONAL: &[&str] = &["container"];
+const OTHER_ROW: &[&str] = &["file", "kind", "line"];
+const OTHER_ROW_OPTIONAL: &[&str] = &["container"];
 const SUPERTYPE_ROW: &[&str] = &["name"];
 const SUPERTYPE_ROW_OPTIONAL: &[&str] = &["file", "clause"];
 const MEMBER_ROW: &[&str] = &["name", "kind", "off", "len"];
@@ -255,6 +289,9 @@ pub(crate) fn validate_explain(value: &Value) -> Result<(), SchemaViolation> {
     exact_fields(root, EXPLAIN_TOP, EXPLAIN_OPTIONAL, "")?;
     pinned_version(root, "v", SCHEMA_VERSION_EXPLAIN)?;
     string(field(root, "sym", "")?, "sym")?;
+    if let Some(locator_root) = root.get("root") {
+        string(locator_root, "root")?;
+    }
     path_session_fields(root)?;
     if let Some(declaration) = root.get("declaration") {
         let p = "declaration";
@@ -335,6 +372,19 @@ pub(crate) fn validate_explain(value: &Value) -> Result<(), SchemaViolation> {
             string(field(obj, "path", &p)?, &join(&p, "path"))?;
         }
     }
+    if let Some(list) = root.get("others") {
+        for (i, row) in array(list, "others")?.iter().enumerate() {
+            let p = format!("others[{i}]");
+            let obj = object(row, &p)?;
+            exact_fields(obj, OTHER_ROW, OTHER_ROW_OPTIONAL, &p)?;
+            string(field(obj, "file", &p)?, &join(&p, "file"))?;
+            enum_spelling(field(obj, "kind", &p)?, &join(&p, "kind"), DECL_KINDS)?;
+            one_based(field(obj, "line", &p)?, &join(&p, "line"))?;
+            if let Some(container) = obj.get("container") {
+                string(container, &join(&p, "container"))?;
+            }
+        }
+    }
     if let Some(counts) = root.get("counts") {
         let obj = object(counts, "counts")?;
         exact_fields(obj, EXPLAIN_SECTIONS, &[], "counts")?;
@@ -387,6 +437,7 @@ mod tests {
     fn full_report() -> Value {
         json!({
             "v": SCHEMA_VERSION_EXPLAIN,
+            "root": "/w/pkg",
             "sym": "Foo",
             "declaration": {
                 "file": "a.dart",
@@ -407,8 +458,11 @@ mod tests {
             "refs": [
                 {"file": "b.dart", "kind": "reference", "off": 10, "len": 3, "qualified": false},
             ],
-            "deps": [{"path": "package:t/b.dart"}],
-            "tests": [{"path": "package:t/a_test.dart"}],
+            "deps": [{"path": "lib/b.dart"}],
+            "tests": [{"path": "test/a_test.dart"}],
+            "others": [
+                {"file": "c.dart", "kind": "class", "container": "_Fake", "line": 4},
+            ],
         })
     }
 
@@ -416,6 +470,7 @@ mod tests {
     fn minimal_report() -> Value {
         json!({
             "v": SCHEMA_VERSION_EXPLAIN,
+            "root": "/w/pkg",
             "sym": "Foo",
             "declaration": {
                 "file": "a.dart",
@@ -432,6 +487,7 @@ mod tests {
                 "refs": 1,
                 "deps": 1,
                 "tests": 1,
+                "others": 1,
             },
         })
     }
@@ -484,6 +540,14 @@ mod tests {
         assert_eq!(schema_keys(reference), ref_fields);
         let path_row = &explain["properties"]["deps"]["items"];
         assert_eq!(schema_keys(path_row), const_names(PATH_ROW));
+        let other = &explain["properties"]["others"]["items"];
+        let mut other_fields: Vec<String> = OTHER_ROW
+            .iter()
+            .chain(OTHER_ROW_OPTIONAL.iter())
+            .map(|s| (*s).to_owned())
+            .collect();
+        other_fields.sort_unstable();
+        assert_eq!(schema_keys(other), other_fields);
         let counts = &explain["properties"]["counts"];
         assert_eq!(schema_keys(counts), const_names(EXPLAIN_SECTIONS));
     }
@@ -523,6 +587,10 @@ mod tests {
         assert_eq!(
             spelling(&explain["properties"]["refs"]["items"]["properties"]["kind"]),
             REF_KINDS
+        );
+        assert_eq!(
+            spelling(&explain["properties"]["others"]["items"]["properties"]["kind"]),
+            DECL_KINDS
         );
     }
 
@@ -586,6 +654,7 @@ mod tests {
             "refs": [],
             "deps": [],
             "tests": [],
+            "others": [],
         });
         assert!(validate_explain(&empty).is_ok());
     }
@@ -593,12 +662,24 @@ mod tests {
     #[test]
     fn minimal_report_validates() {
         assert!(validate_explain(&minimal_report()).is_ok());
-        // The unknown-symbol floor: symbol and version only.
+        // The unknown-symbol floor: symbol and version only — no file
+        // field, so no locator root either.
         let floor = json!({
             "v": SCHEMA_VERSION_EXPLAIN,
             "sym": "Nope",
         });
         assert!(validate_explain(&floor).is_ok());
+    }
+
+    /// The locator envelope rides absent-tolerant; a non-string `root` is
+    /// named like any other type defect.
+    #[test]
+    fn a_non_string_locator_root_is_named() {
+        let mut payload = full_report();
+        payload["root"] = json!(3);
+        let violation = validate_explain(&payload).expect_err("non-string root");
+        assert_eq!(violation.path, "root");
+        assert_eq!(violation.expected, "a string");
     }
 
     #[test]
@@ -660,10 +741,20 @@ mod tests {
         payload["deps"][0]["file"] = json!("b.dart");
         let violation = validate_explain(&payload).expect_err("undeclared row field");
         assert_eq!(violation.path, "deps[0].file");
+
+        let mut payload = full_report();
+        payload["others"][0]["line"] = json!(0);
+        let violation = validate_explain(&payload).expect_err("zero-based line");
+        assert_eq!(violation.path, "others[0].line");
+
+        let mut payload = full_report();
+        payload["others"][0]["off"] = json!(4);
+        let violation = validate_explain(&payload).expect_err("others rows are line-located");
+        assert_eq!(violation.path, "others[0].off");
     }
 
     /// A counts object missing one section is a violation: the minimal
-    /// tier always answers the full seven-entry map.
+    /// tier always answers the full eight-entry map.
     #[test]
     fn partial_counts_are_rejected() {
         let mut payload = minimal_report();

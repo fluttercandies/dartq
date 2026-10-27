@@ -126,6 +126,11 @@ pub struct AnalyzeRun<'a> {
     /// Wall-clock of the discovery and analysis passes (metrics facts).
     pub discovery: Duration,
     pub analysis: Duration,
+    /// Wall-clock of the lint stage — the `analyze_lints` pass plus the
+    /// options registry/conflict/removed rows that ride it — captured
+    /// around the lint block, after the engine pass (never interleaved
+    /// with `analysis`, so the two never double-count).
+    pub lints: Duration,
     /// Discovered file count and total LOC ([`dartq_engine::DiscoveryStats`]).
     pub file_count: usize,
     pub loc: u64,
@@ -203,6 +208,7 @@ pub fn run_overlaid<'a>(
     let (mut diagnostics, analysis, libraries_analyzed, libraries_from_cache, mut event_notices) =
         analyze_pass(engine)?;
     notices.append(&mut event_notices);
+    let lints_at = std::time::Instant::now();
     if !roots.is_empty() {
         // The lint rows ride the same severity face as the engine rows
         // (`analyzer.errors` re-levels and filters them identically — the
@@ -242,6 +248,7 @@ pub fn run_overlaid<'a>(
             diagnostics.extend(engine.apply_severity_options(removed_rows));
         }
     }
+    let lints = lints_at.elapsed();
     report_memory(engine);
     // The layout snapshot covers every location the writers resolve — a
     // context message may anchor in a file that carries no row of its own
@@ -257,6 +264,7 @@ pub fn run_overlaid<'a>(
         diagnostics,
         discovery,
         analysis,
+        lints,
         file_count: stats.file_count,
         loc: stats.loc_total,
         libraries_analyzed,
@@ -362,6 +370,7 @@ pub fn run_targets<'a>(
     // The loaded options set lives past the roots block: the plugin weave's
     // per-directory gate consumes the same governing directories.
     let loaded = loaded_options(engine, roots);
+    let lints_at = std::time::Instant::now();
     if !roots.is_empty() {
         let lint_rows =
             crate::lints::analyze_lints(engine, roots, &mut crate::lints::LintMemo::default());
@@ -386,6 +395,7 @@ pub fn run_targets<'a>(
             diagnostics.extend(engine.apply_severity_options(removed_rows));
         }
     }
+    let lints = lints_at.elapsed();
     // The oracle emits rows for covered files only; the filter is a retain
     // on the interned (canonical) spelling, so it precedes the layout build.
     let files = engine.file_table();
@@ -487,6 +497,7 @@ pub fn run_targets<'a>(
         diagnostics,
         discovery,
         analysis,
+        lints,
         file_count: stats.file_count,
         loc: stats.loc_total,
         libraries_analyzed,
@@ -512,6 +523,7 @@ pub struct MergedRun<'a> {
     /// engine runs; counters summed.
     pub discovery: Duration,
     pub analysis: Duration,
+    pub lints: Duration,
     pub file_count: usize,
     pub loc: u64,
     pub libraries_analyzed: usize,
@@ -634,6 +646,7 @@ pub fn merge_runs<'a>(runs: Vec<AnalyzeRun<'a>>) -> MergedRun<'a> {
         diagnostics,
         discovery: Duration::ZERO,
         analysis: Duration::ZERO,
+        lints: Duration::ZERO,
         file_count: 0,
         loc: 0,
         libraries_analyzed: 0,
@@ -646,6 +659,7 @@ pub fn merge_runs<'a>(runs: Vec<AnalyzeRun<'a>>) -> MergedRun<'a> {
     for run in &merged.runs {
         merged.discovery += run.discovery;
         merged.analysis += run.analysis;
+        merged.lints += run.lints;
         merged.file_count += run.file_count;
         merged.loc += run.loc;
         merged.libraries_analyzed += run.libraries_analyzed;
@@ -660,6 +674,20 @@ pub fn merge_runs<'a>(runs: Vec<AnalyzeRun<'a>>) -> MergedRun<'a> {
 impl dartq_diagnostics::FileLayoutProvider for MergedRun<'_> {
     fn file_path(&self, file: FileId) -> &Path {
         self.files.path(file).expect("merged FileId")
+    }
+
+    /// The analyze face's analysis root: the engine's context root (the
+    /// package table's workspace root — the configured workspace's root,
+    /// or the analyzed directory on the no-config floors), shared by every
+    /// merged run. Divergent roots (a multi-workspace merge) have no one
+    /// root to project against: the no-root face, absolute spellings.
+    fn analysis_root(&self) -> Option<&Path> {
+        let mut roots = self
+            .runs
+            .iter()
+            .map(|run| run.layout.engine().packages().workspace_root());
+        let first = roots.next()?;
+        roots.all(|root| root == first).then_some(first)
     }
 
     fn line_col(&self, file: FileId, utf16_offset: u32) -> (u32, u32) {

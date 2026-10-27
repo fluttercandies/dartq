@@ -80,8 +80,11 @@ const PIPE_QUEUE_CAPACITY: usize = 4096;
 /// release (see [`DebugSession::detach`]): one deadline for every
 /// isolate, so a wedged transport delays the release by seconds, never
 /// `rpc_timeout` per isolate. A healthy transport answers each resume
-/// in milliseconds.
-const RELEASE_RESUME_BUDGET: Duration = Duration::from_secs(5);
+/// in milliseconds. Public because the shutdown ladders built on
+/// `detach` size their wait windows from it (#2619: the session
+/// election's reap grace must exceed one detach budget — asserted at
+/// compile time in dartq-daemon).
+pub const RELEASE_RESUME_BUDGET: Duration = Duration::from_secs(5);
 
 /// Bounds for lazy object-graph expansion.
 #[derive(Debug, Clone, Copy)]
@@ -793,6 +796,14 @@ impl DebugSession {
     #[must_use]
     pub fn ws_uri(&self) -> &str {
         &self.ws_uri
+    }
+
+    /// The launched program's pid, when this session launched one (an
+    /// attached session owns no process) — the recovery trail a
+    /// daemon-side shutdown manifest records (#2619).
+    #[must_use]
+    pub fn child_pid(&self) -> Option<u32> {
+        self.process.as_ref().map(std::process::Child::id)
     }
 
     /// Whether a `flutter run`-style tool is behind this service

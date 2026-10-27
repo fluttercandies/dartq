@@ -159,6 +159,13 @@ pub struct ImpactReport {
     /// The output contract version ([`IMPACT_SCHEMA_VERSION`]).
     #[serde(rename = "v")]
     pub schema_version: u32,
+    /// The analysis root the path columns locate against (absolute), set by
+    /// the caller that owns the engine — the pure query never sees one, so
+    /// it ships `None` and the commands face fills it exactly when the
+    /// report carries a file-bearing row (`sym`/`files`/`tests`). Wire:
+    /// `root`, omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
     /// The changed symbols of the target libraries (wire: `sym`).
     #[serde(rename = "sym")]
     pub changed: Vec<ChangedSymbol>,
@@ -504,12 +511,15 @@ pub fn impact<'a>(
 
     ImpactReport {
         schema_version: IMPACT_SCHEMA_VERSION,
+        // Two caller-answered sections: the environment verdicts need the
+        // analysis' diagnostics and the locator root needs the engine's
+        // workspace root — this pure query sees neither, so the commands
+        // face fills them (the honest default row or the context matrix;
+        // the root, exactly when a file-bearing row rides).
+        root: None,
         changed: changed_rows,
         affected: affected_rows,
         affected_tests: test_rows,
-        // The caller's section: an environment verdict needs the analysis'
-        // diagnostics, which this pure query never sees — the commands
-        // face fills it (the honest default row, or the context matrix).
         affected_environments: Vec::new(),
     }
 }
@@ -1198,6 +1208,7 @@ mod tests {
             report,
             ImpactReport {
                 schema_version: IMPACT_SCHEMA_VERSION,
+                root: None,
                 changed: vec![ChangedSymbol {
                     symbol: "a.dart|fb".to_string(),
                     signature_changed: true,

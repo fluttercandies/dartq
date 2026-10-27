@@ -144,10 +144,23 @@ try:
 except (FileNotFoundError, ValueError):
     print('gone')
 ")"
-  if [ "$evicted_pid" != "gone" ] && kill -0 "$evicted_pid" 2>/dev/null; then
-    bad "the evicted server process is dead" "pid $evicted_pid still alive"
+  # The eviction SIGTERM takes the graceful-shutdown ladder: the serve
+  # loop polls the signal flag on its 250 ms tick, so death lands
+  # asynchronously — poll the pid out to the idle reap bound (8 s grace,
+  # no debug sessions held) instead of sampling it once.
+  local evicted_dead=1
+  if [ "$evicted_pid" = "gone" ]; then
+    evicted_dead=0
   else
+    for _ in $(seq 1 100); do
+      kill -0 "$evicted_pid" 2>/dev/null || { evicted_dead=0; break; }
+      sleep 0.1
+    done
+  fi
+  if [ "$evicted_dead" -eq 0 ]; then
     ok "the evicted server process is dead"
+  else
+    bad "the evicted server process is dead" "pid $evicted_pid still alive after 10 s"
   fi
   # Cold recovery: the evicted root starts again from scratch.
   run_dartq_in sess-lru-recover "$evicted_root" session start "$evicted_root" --sdk "$base/sdk" --format json

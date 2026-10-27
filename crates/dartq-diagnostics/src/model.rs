@@ -354,6 +354,16 @@ pub trait FileLayoutProvider {
     /// only pass IDs that participate in the analysis.
     fn file_path(&self, file: FileId) -> &Path;
 
+    /// The analysis root the compact faces' file locator projects against
+    /// (the workspace/context root the run analyzed within): files inside
+    /// it are spelled relative to it, files outside it keep the absolute
+    /// spelling. `None` (the default) is the no-root face — every file
+    /// keeps its absolute spelling and the document carries no `root` key
+    /// (multi-root merges, providers with no single root).
+    fn analysis_root(&self) -> Option<&Path> {
+        None
+    }
+
     /// 1-based `(line, column)` of a UTF-16 code-unit offset.
     ///
     /// # Panics

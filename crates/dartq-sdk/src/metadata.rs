@@ -70,6 +70,11 @@ pub static DEPRECATED_SDK_LIBRARIES: &[(&str, &str)] = &[
 /// root it was loaded from.
 ///
 /// Constructed only by [`SdkSnapshot::load`](crate::SdkSnapshot::load).
+/// When loaded with an embedder directory, the snapshot additionally
+/// carries the [`EmbedderLibraries`] full-replacement table — the dart-sdk
+/// faces below stay loaded (version, revision, experiments) exactly as the
+/// analyzer's embedder construction keeps the folder SDK's language
+/// version, while `dart:` URI resolution answers from the embedder map.
 #[derive(Debug)]
 pub struct SdkSnapshot {
     /// Canonical content name of the parsed metadata: stable across loads of
@@ -88,6 +93,10 @@ pub struct SdkSnapshot {
     /// Language version derived from the `version` file: `major.minor` with
     /// the patch always zero.
     pub language_metadata: LanguageVersion,
+    /// The embedder full-replacement table, when an embedder directory
+    /// backed the load. Every query face consults it first
+    /// ([`SdkSnapshot::target`](crate::SdkSnapshot::target)).
+    pub(crate) embedder: Option<EmbedderLibraries>,
     pub(crate) dart_sdk_root: PathBuf,
 }
 
@@ -140,6 +149,28 @@ impl SdkLibraries {
 pub struct TargetLibraries {
     /// Library name (leading `_` internal names preserved) → metadata.
     pub libraries: BTreeMap<String, SdkLibrary>,
+}
+
+/// The `_embedder.yaml` library table of an embedder SDK — the analyzer's
+/// `EmbedderSdk` (`pkg/analyzer/lib/src/dart/sdk/sdk.dart`): the
+/// `embedded_libs` mapping, each key's leading `dart:` stripped, each
+/// `uri` relative to the yaml's directory.
+///
+/// Embedder semantics are **full-table replacement**, never an overlay:
+/// while present, every `dart:` URI — `dart:core` included — resolves
+/// through this table and its base directory, whatever the plain
+/// `libraries.json` segment tables say. In a Flutter project both
+/// `dart:core` and `dart:ui` come from the `sky_engine` package; a name
+/// the embedder does not map does not exist, even when the dart SDK
+/// tabulates it.
+#[derive(Debug, Serialize)]
+pub struct EmbedderLibraries {
+    /// The directory holding `_embedder.yaml` (`<sky_engine>/lib`) — the
+    /// base every mapped path resolves against.
+    pub(crate) base_dir: PathBuf,
+    /// The full replacement table, consumed exactly like a target
+    /// segment's.
+    pub(crate) table: TargetLibraries,
 }
 
 /// One `dart:` library within one target segment.

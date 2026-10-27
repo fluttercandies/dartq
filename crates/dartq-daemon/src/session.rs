@@ -608,10 +608,12 @@ struct PendingRead {
 #[derive(Debug)]
 pub(crate) enum FixJob {
     /// The patch documents over the requested paths (the built-in
-    /// lint rows, the semantic pass's rows, and the hosts' proposals).
+    /// lint rows, the semantic pass's rows, and the hosts' proposals),
+    /// selected to the request's candidate role.
     Fix {
         paths: Vec<PathBuf>,
         verbosity: Verbosity,
+        role: dartq_commands::fix::FixRole,
     },
     /// The hosts' location-directed proposals for one file.
     Assists {
@@ -724,7 +726,11 @@ fn run_fix_job(
     match job {
         #[cfg(test)]
         FixJob::Panics => panic!("test-armed fix panic"),
-        FixJob::Fix { paths, verbosity } => commands::fix_answer(&paths, verbosity, hosts, sdk),
+        FixJob::Fix {
+            paths,
+            verbosity,
+            role,
+        } => commands::fix_answer(&paths, verbosity, role, hosts, sdk),
         FixJob::Assists {
             path,
             offset,
@@ -1038,6 +1044,11 @@ pub struct Session {
     /// the first debug request and this field stays empty afterwards;
     /// dropped sessions tear themselves down on the worker.
     debug: crate::debug::DebugManager,
+    /// The debug registry's live-session counter — the other handle of
+    /// the arc the [`Self::debug`] manager keeps in sync, wherever the
+    /// manager currently lives (#2619: the serve loop's idle probe and
+    /// the shutdown wait window size).
+    debug_live: Arc<std::sync::atomic::AtomicUsize>,
     /// The debug worker's dispatch handles once the worker exists: the
     /// request sender (dies with the session, ending the worker) and
     /// the completion channel the main loop selects on (#2587 — a
@@ -1322,6 +1333,9 @@ impl Session {
         // advisory's own evaluation moment — so only a later disk move of
         // pubspec / package config / analysis options re-evaluates it.
         let config_stamps = config_input_stamps(&workspace_root);
+        // #2619: the debug registry's live counter, shared with the
+        // manager wherever it lives (here or on the debug worker).
+        let debug_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Ok(Self {
             runtime,
             contexts,
@@ -1368,7 +1382,8 @@ impl Session {
             fix_running: None,
             fix_done: bounded(MAX_QUEUED_FIX_MAILS),
             fix_budget: FIX_TIME_BUDGET,
-            debug: crate::debug::DebugManager::default(),
+            debug: crate::debug::DebugManager::sharing(Arc::clone(&debug_live)),
+            debug_live,
             debug_dispatch: None,
             test: crate::test::TestManager::default(),
             mapped_pool,
@@ -1994,9 +2009,13 @@ impl Session {
         params: serde_json::Value,
     ) -> Option<Response> {
         let root = self.workspace_root.to_path_buf();
+        // The handover leaves a fresh, still-sharing manager in place so
+        // a later worker respawn (the dead-dispatch retirement below)
+        // re-hands over the same live counter.
+        let fresh = crate::debug::DebugManager::sharing(Arc::clone(&self.debug_live));
         let dispatch = self
             .debug_dispatch
-            .get_or_insert_with(|| DebugDispatch::spawn(std::mem::take(&mut self.debug)));
+            .get_or_insert_with(|| DebugDispatch::spawn(std::mem::replace(&mut self.debug, fresh)));
         dispatch.send(DebugJob {
             id,
             method: method.to_owned(),
@@ -2008,7 +2027,9 @@ impl Session {
     /// Pops one completed debug answer if any is ready. A worker that
     /// died (its completion channel disconnected) is retired here: the
     /// dispatch is dropped so the main loop stops selecting on the dead
-    /// channel, and the next debug request spawns a fresh worker.
+    /// channel, the live counter resets (the dead worker's sessions
+    /// dropped with it — #2619's containment), and the next debug
+    /// request spawns a fresh worker.
     pub(crate) fn complete_debug(&mut self) -> Option<Response> {
         let dispatch = self.debug_dispatch.as_ref()?;
         match dispatch.completions().try_recv() {
@@ -2016,7 +2037,81 @@ impl Session {
             Err(crossbeam_channel::TryRecvError::Empty) => None,
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 self.debug_dispatch = None;
+                self.debug_live.store(0, std::sync::atomic::Ordering::Relaxed);
                 None
+            }
+        }
+    }
+
+    /// How many debug sessions are live right now — the serve loop's
+    /// idle probe (#2619: an attached debug session means the daemon is
+    /// not idle). Cheap: one relaxed atomic load, valid whichever side
+    /// of the worker handover the registry lives on.
+    #[must_use]
+    pub fn debug_sessions_len(&self) -> usize {
+        self.debug_live.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The live counter's shareable handle — the same count as
+    /// [`Self::debug_sessions_len`], for threads that cannot borrow the
+    /// session (#2632: the heartbeat thread advertises the held-session
+    /// count in the state record, and the reaper's SIGTERM grace scales
+    /// by it). Relaxed like every read of it; whichever side of the
+    /// worker handover the registry lives on keeps it in step.
+    #[must_use]
+    pub fn debug_sessions_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        std::sync::Arc::clone(&self.debug_live)
+    }
+
+    /// The graceful-shutdown leg (#2619): detach (resume) every live
+    /// debug session through the worker, each bounded by dartq-debug's
+    /// release budget, and mark each orphan manifest released. The wait
+    /// window covers the full sequential ladder (one budget per held
+    /// session, plus one); a straggler answer from a disconnected
+    /// client sitting ahead of the shutdown answer in the completion
+    /// channel is skipped. `None` means nothing was confirmed released
+    /// (no worker, nothing held, queue full, or the window expired) —
+    /// the caller proceeds with shutdown either way: the reaper's
+    /// SIGKILL escalation, not this window, is the hard bound.
+    pub fn debug_shutdown(&mut self) -> Option<usize> {
+        let dispatch = self.debug_dispatch.as_ref()?;
+        let held = self.debug_live.load(std::sync::atomic::Ordering::Relaxed);
+        if held == 0 {
+            return Some(0);
+        }
+        let job = DebugJob {
+            id: RequestId::Str(crate::debug::SHUTDOWN_JOB_ID.into()),
+            method: crate::debug::DEBUG_SHUTDOWN.to_owned(),
+            params: serde_json::Value::Null,
+            root: self.workspace_root.to_path_buf(),
+        };
+        if dispatch.send(job).is_some() {
+            return None; // queue full or worker gone — nothing to wait for
+        }
+        let ladder = dartq_debug::RELEASE_RESUME_BUDGET
+            .saturating_mul(u32::try_from(held).unwrap_or(u32::MAX).saturating_add(1));
+        let deadline = Instant::now() + ladder;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match dispatch.completions().recv_timeout(remaining) {
+                Ok(response)
+                    if matches!(&response.id, Some(RequestId::Str(id))
+                        if id == crate::debug::SHUTDOWN_JOB_ID) =>
+                {
+                    let released = response
+                        .result
+                        .as_ref()
+                        .and_then(|result| result["released"].as_u64())
+                        .unwrap_or_default();
+                    return Some(usize::try_from(released).unwrap_or_default());
+                }
+                // A straggler answer from a disconnected client — not
+                // ours; keep waiting inside the window.
+                Ok(_) => {}
+                Err(_) => return None, // window spent or worker gone
             }
         }
     }
@@ -5009,6 +5104,7 @@ mod tests {
             FixJob::Fix {
                 paths: vec![main],
                 verbosity: Verbosity::Compact,
+                role: dartq_commands::fix::FixRole::Primary,
             },
         );
         let turn = session.service();
@@ -5088,6 +5184,7 @@ mod tests {
             FixJob::Fix {
                 paths: vec![main],
                 verbosity: Verbosity::Compact,
+                role: dartq_commands::fix::FixRole::Primary,
             },
         );
         let _ = session.service();
@@ -5115,6 +5212,7 @@ mod tests {
             FixJob::Fix {
                 paths: vec![workspace.path("lib/main.dart")],
                 verbosity: Verbosity::Compact,
+                role: dartq_commands::fix::FixRole::Primary,
             },
         );
         session.queue_command(
@@ -5167,6 +5265,7 @@ mod tests {
             FixJob::Fix {
                 paths: vec![main],
                 verbosity: Verbosity::Compact,
+                role: dartq_commands::fix::FixRole::Primary,
             },
         );
         session.queue_command(
@@ -5230,6 +5329,7 @@ mod tests {
             FixJob::Fix {
                 paths: vec![workspace.path("lib/main.dart")],
                 verbosity: Verbosity::Compact,
+                role: dartq_commands::fix::FixRole::Primary,
             },
         );
         let turn = session.service();
@@ -5285,6 +5385,7 @@ mod tests {
             FixJob::Fix {
                 paths: vec![main],
                 verbosity: Verbosity::Compact,
+                role: dartq_commands::fix::FixRole::Primary,
             },
         );
         let turn = session.service();
@@ -5354,6 +5455,7 @@ mod tests {
             FixJob::Fix {
                 paths: vec![main.clone()],
                 verbosity: Verbosity::Compact,
+                role: dartq_commands::fix::FixRole::Primary,
             },
         );
         let turn = session.service();
@@ -5366,6 +5468,7 @@ mod tests {
             FixJob::Fix {
                 paths: vec![main],
                 verbosity: Verbosity::Compact,
+                role: dartq_commands::fix::FixRole::Primary,
             },
         );
         let turn = session.service();
@@ -5478,6 +5581,7 @@ mod tests {
             FixJob::Fix {
                 paths: vec![workspace.path("lib/main.dart")],
                 verbosity: Verbosity::Compact,
+                role: dartq_commands::fix::FixRole::Primary,
             },
         );
         let turn = session.service();
@@ -5540,6 +5644,7 @@ mod tests {
             FixJob::Fix {
                 paths: vec![workspace.path("lib/main.dart")],
                 verbosity: Verbosity::Compact,
+                role: dartq_commands::fix::FixRole::Primary,
             },
         );
         let turn = session.service();
@@ -6293,6 +6398,24 @@ mod tests {
         )
     }
 
+    /// A `dartq/impact` request over `target` (the file-level report).
+    fn impact_request(
+        id: i64,
+        target: std::path::PathBuf,
+        since: Option<u64>,
+    ) -> (RequestId, Request) {
+        (
+            RequestId::Num(id),
+            Request::Impact {
+                target,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+                since,
+            },
+        )
+    }
+
     /// The acceptance posture, at session level: two concurrent agent
     /// overlays over one base produce isolated diagnostics, and the base
     /// view is untouched by both.
@@ -6612,6 +6735,71 @@ mod tests {
         assert!(
             by_id(4).as_ref().expect("ok").get("since").is_none(),
             "a full answer carries no cursor"
+        );
+    }
+
+    /// The report-carrying delta filters vs the locator (#2613): the
+    /// impact report's rows spell their file references root-relative
+    /// inside the analysis root (`sym`'s `label|name` labels likewise),
+    /// while the changed table keys on the session's absolute paths — the
+    /// lookup key re-joins a relative tail against the workspace root
+    /// (commands::delta_key). The bare relative spelling missed the table
+    /// and silently dropped every in-root row from the delta answer.
+    #[test]
+    fn the_delta_filters_rejoin_located_rows_against_the_workspace_root() {
+        let (workspace, mut session) = fixture("delta-located-unit");
+        let main = workspace.path("lib/main.dart");
+
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        // The edit moves the cursor to 1; main.dart is the delta's file.
+        // (The fixture imports nothing and nothing imports it, so the
+        // report's affected closure is empty — the changed-symbol section
+        // is the row set this pins.)
+        sync_text(&mut session, &main, CLEAN_MAIN);
+
+        let (id_all, all) = impact_request(2, main.clone(), Some(0));
+        session.queue_command(id_all, all);
+        let (id_current, current) = impact_request(3, main, Some(1));
+        session.queue_command(id_current, current);
+        let turn = session.service();
+
+        let by_id = |wanted: i64| {
+            &turn
+                .answers
+                .iter()
+                .find(|(id, _)| *id == RequestId::Num(wanted))
+                .expect("answer present")
+                .1
+        };
+        let syms = |answer: &Result<serde_json::Value, SessionError>| {
+            answer
+                .as_ref()
+                .expect("the impact answer is ok")["sym"]
+                .as_array()
+                .expect("the changed-symbol rows")
+                .to_vec()
+        };
+        // since=0: the edited file's changed-symbol row survives the
+        // filter, its label the located spelling — the re-join resolved
+        // it back to the changed table's absolute key.
+        let all_syms = syms(by_id(2));
+        assert!(
+            all_syms.iter().any(|row| row["sym"]
+                .as_str()
+                .is_some_and(|symbol| symbol.starts_with("lib/main.dart|"))),
+            "the edited in-root row survives the delta filter: {all_syms:?}"
+        );
+        assert_eq!(
+            by_id(2).as_ref().expect("ok")["since"], 1,
+            "the delta answer echoes the session's current cursor"
+        );
+        // since=1 (the current cursor): nothing is newer — the same row
+        // drops, so the re-join is a lookup key, not a keep-all.
+        assert!(
+            syms(by_id(3)).is_empty(),
+            "nothing is newer than the current cursor: {:?}",
+            by_id(3)
         );
     }
 
@@ -9011,6 +9199,68 @@ mod tests {
         )
         .expect_err("explain rejects context");
         assert!(error.contains("agent_id/context"), "{error}");
+    }
+
+    /// The `role` param's wire contract at the parse edge: absent defaults
+    /// to `primary`, the four exact spellings parse, and an alias is the
+    /// usage tier naming the field.
+    #[test]
+    fn fix_role_param_defaults_to_primary_and_rejects_aliases() {
+        let request = crate::commands::parse(
+            "dartq/fix",
+            &serde_json::json!({"paths": ["lib"]}),
+            Path::new("/"),
+        )
+        .expect("absent role defaults");
+        let crate::commands::Request::Fix { role, .. } = request else {
+            panic!("the fix request");
+        };
+        assert_eq!(role, dartq_commands::fix::FixRole::Primary);
+
+        for spelling in ["primary", "ignore_line", "ignore_file", "suppress"] {
+            let request = crate::commands::parse(
+                "dartq/fix",
+                &serde_json::json!({"paths": ["lib"], "role": spelling}),
+                Path::new("/"),
+            )
+            .unwrap_or_else(|error| panic!("`{spelling}` parses: {error}"));
+            let crate::commands::Request::Fix { role, .. } = request else {
+                panic!("the fix request");
+            };
+            assert_eq!(
+                role,
+                dartq_commands::fix::FixRole::parse(spelling).expect("spelling"),
+                "`{spelling}`"
+            );
+        }
+
+        // A bad spelling answers the shaped usage message — the parameter
+        // named and the accepted spellings, so a consumer can self-correct
+        // (both intakes share the shape: this parse and the live
+        // `fix_stage` the MCP tool rides).
+        let error = crate::commands::parse(
+            "dartq/fix",
+            &serde_json::json!({"paths": ["lib"], "role": "ignore"}),
+            Path::new("/"),
+        )
+        .expect_err("aliases are the usage tier");
+        assert_eq!(
+            error,
+            "invalid role `ignore`; expected one of primary, ignore_line, ignore_file, suppress",
+            "the message names the parameter and the spellings"
+        );
+
+        // A non-string value takes the same shape without the spelling.
+        let error = crate::commands::parse(
+            "dartq/fix",
+            &serde_json::json!({"paths": ["lib"], "role": 7}),
+            Path::new("/"),
+        )
+        .expect_err("a non-string role is the usage tier too");
+        assert_eq!(
+            error,
+            "invalid role; expected one of primary, ignore_line, ignore_file, suppress"
+        );
     }
 
     /// dartq/analyze answers follow the CLI's severity-first printed order

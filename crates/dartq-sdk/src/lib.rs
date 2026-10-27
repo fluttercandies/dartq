@@ -13,9 +13,10 @@
 //!
 //! - [`SdkSnapshot::load`] reads `version`, `revision`, `libraries.json`
 //!   (with per-target `include` expansion), and
-//!   `lib/_internal/allowed_experiments.json`. A flutter root is accepted
-//!   for signature stability but rejected until embedder support lands
-//!   (M2); `None` is fully self-sufficient.
+//!   `lib/_internal/allowed_experiments.json`. An embedder directory (a
+//!   `sky_engine` package's `lib/`, carrying `_embedder.yaml`) additionally
+//!   installs the analyzer `EmbedderSdk` full-replacement table;
+//!   `None` is fully self-sufficient.
 //! - [`SdkSnapshot::id`] is the blake3 content hash of the *parsed*
 //!   metadata in canonical form, so two SDKs whose metadata parses the same
 //!   share one id regardless of JSON layout; raw-file hashes live only in
@@ -53,7 +54,8 @@ pub use extension_faces::EXTENSION_FACE_SOURCES;
 pub use flat_libraries::FLAT_LIBRARIES;
 pub use loader::SdkError;
 pub use metadata::{
-    AllowedExperiments, DEPRECATED_SDK_LIBRARIES, IMPLICITLY_IMPORTED_LIBRARIES, Importability,
-    SdkIdentity, SdkLibraries, SdkLibrary, SdkSnapshot, TargetLibraries, UnknownExperiments,
+    AllowedExperiments, DEPRECATED_SDK_LIBRARIES, EmbedderLibraries, IMPLICITLY_IMPORTED_LIBRARIES,
+    Importability, SdkIdentity, SdkLibraries, SdkLibrary, SdkSnapshot, TargetLibraries,
+    UnknownExperiments,
 };
 pub use query::{SdkUriError, deprecated_library_message};

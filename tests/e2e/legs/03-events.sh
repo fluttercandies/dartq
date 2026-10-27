@@ -1,5 +1,5 @@
 # legs/03-events.sh — the unified event faces: `dartq events session`
-# cursor pagination over a really-served session (serving, client
+# newest-first paging over a really-served session (serving, client
 # attach/detach records), `dartq events progress` on a bigger tree (the
 # cold-analysis snapshot), and — with a real Dart SDK — a test run's
 # handle driven through the MCP tools (run → status → events cursor).
@@ -46,19 +46,23 @@ for line in open('$(out_file ev-full)'):
   assert_contains "$names" "client_attached" "a client attach was recorded"
   assert_contains "$names" "client_detached" "a client detach was recorded"
 
-  # Pagination: limit 1 gives exactly the first record and its seq; the
-  # --since read returns exactly the remainder, all past the cursor.
+  # Newest-first paging: limit 1 gives the newest record (the default
+  # order leads with it); --since (UNIX seconds) floors the read at a
+  # timestamp — a far-past floor returns every event, a future one none.
   run_dartq_in ev-page1 "$base/ev" events session "$base/ev" --limit 1 --format json
   assert_eq "$(jsonl_count "$(out_file ev-page1)")" 1 "limit 1 reads one event"
   total="$(jsonl_count "$(out_file ev-full)")"
-  first_seq="$(python3 -c "
-import json
-print(json.loads(open('$(out_file ev-page1)').read())['seq'])
-")"
-  run_dartq_in ev-rest "$base/ev" events session "$base/ev" --since "$first_seq" --limit 100 --format json
-  assert_eq "$(jsonl_count "$(out_file ev-rest)")" "$((total - 1))" \
-    "--since <seq> returns exactly the remaining events"
-  jsonl_check "$(out_file ev-rest)" "j['seq']>$first_seq" "every paged event's seq is past the cursor"
+  assert_eq "$(head -n 1 "$(out_file ev-page1)")" "$(head -n 1 "$(out_file ev-full)")" \
+    "the default order is newest first (the newest row leads the page)"
+  run_dartq_in ev-past "$base/ev" events session "$base/ev" --since 0 --limit 100 --format json
+  assert_eq "$DQ_RC" 0 "a floor at the unix epoch reads clean"
+  assert_eq "$(jsonl_count "$(out_file ev-past)")" "$total" \
+    "--since 0 returns every event"
+  local future=$(( $(date +%s) + 60 ))
+  run_dartq_in ev-future "$base/ev" events session "$base/ev" --since "$future" --limit 100 --format json
+  assert_eq "$DQ_RC" 0 "a future floor reads clean"
+  assert_eq "$(jsonl_count "$(out_file ev-future)")" 0 \
+    "--since past every timestamp returns nothing"
   run_dartq_in ev-stop "$base/ev" session stop "$base/ev"
   assert_eq "$DQ_RC" 0 "events teardown"
 
@@ -134,7 +138,7 @@ SCRIPT
   assert_eq "$?" 0 "the MCP test-run conversation held (run → finished status → events)"
   assert_contains "$(cat "$EVIDENCE/tf-mcp.log")" '"pass": true' \
     "every scripted expectation passed"
-  # The same log reads through the CLI face, cursor-paginated.
+  # The same log reads through the CLI face, newest-first.
   run_dartq_in tf-cli-events "$tf" events session "$tf" --limit 3 --format json
   assert_eq "$DQ_RC" 0 "the CLI events face reads the same log"
   run_dartq_in tf-stop "$tf" session stop "$tf"

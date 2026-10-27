@@ -25,6 +25,12 @@ Engine faces resolve the SDK through `$DART_SDK` (or the per-command
 `--sdk-path` / `--sdk` spelling); FVM worktrees are picked up through the
 session identity, so `.fvmrc` switches are respected per worktree.
 
+Flutter packages need no new flags: when the package graph contains
+`sky_engine`, its `lib/_embedder.yaml` replaces the SDK's `dart:` library
+table (analyzer `EmbedderSdk` semantics), so `dart:ui` and the embedder
+libraries resolve automatically — `--sdk-path`/`$DART_SDK` still name the
+Dart SDK.
+
 ## First Run in a Repo
 
 ```bash
@@ -49,7 +55,7 @@ dartq packages                      # {v root pkgs bounds}: every package root,
                                     #   kind, resolved state, pruned boundary
 dartq packages --format json        # same facts, one JSON object per line
 dartq query symbol main             # where is main declared, who references it
-dartq explain MyAppService          # one-stop report: shape, refs, related diagnostics
+dartq explain MyAppService          # symbol report: declaration, supertypes, ctors, members, refs, importers, tests
 ```
 
 `packages` is the navigation face for multi-package trees: run it before

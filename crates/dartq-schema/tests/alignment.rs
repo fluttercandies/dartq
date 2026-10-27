@@ -8,7 +8,7 @@
 use dartq_ai::compatibility::{COMPAT_SCHEMA_VERSION, CompatReport};
 use dartq_ai::explain::{
     ConstructorRow, DeclarationRow, DependencyRow, EXPLAIN_SCHEMA_VERSION, ExplainReport,
-    MemberRow, ReferenceRow, SectionCounts, SuperTypeRow,
+    MemberRow, OtherDeclRow, ReferenceRow, SectionCounts, SuperTypeRow,
 };
 use dartq_ai::impact::{
     AffectedTarget, AffectedTest, ChangedSymbol, EnvironmentImpact, IMPACT_SCHEMA_VERSION,
@@ -35,6 +35,7 @@ fn compat_version_constant_matches_dartq_ai() {
 fn fixture_report() -> ImpactReport {
     ImpactReport {
         schema_version: IMPACT_SCHEMA_VERSION,
+        root: Some("/w".to_owned()),
         changed: vec![ChangedSymbol {
             symbol: "a.dart|fb".to_owned(),
             signature_changed: true,
@@ -84,6 +85,9 @@ fn impact_report_is_tier_invariant() {
 fn empty_impact_report_passes_validation() {
     let report = ImpactReport {
         schema_version: IMPACT_SCHEMA_VERSION,
+        // No file-bearing row rides, so the locator root stays omitted —
+        // the schema's optional-when-no-files rule.
+        root: None,
         changed: Vec::new(),
         affected: Vec::new(),
         affected_tests: Vec::new(),
@@ -189,7 +193,8 @@ fn non_json_payload_names_the_syntax_error() {
 fn real_compat_report_passes_validation() {
     let report = CompatReport {
         schema_version: COMPAT_SCHEMA_VERSION,
-        file: "/w/lib/a.dart".to_owned(),
+        root: Some("/w".to_owned()),
+        file: "lib/a.dart".to_owned(),
         matrix: vec![
             dartq_ai::compatibility::AxisCompat {
                 sdk: "3.5.0".to_owned(),
@@ -202,7 +207,7 @@ fn real_compat_report_passes_validation() {
                 compatible: false,
                 first_failure: Some(dartq_ai::compatibility::Failure {
                     code: "uri_does_not_exist".to_owned(),
-                    file: "/w/lib/a.dart".to_owned(),
+                    file: "lib/a.dart".to_owned(),
                     line: 1,
                     col: 8,
                     message: "Target of URI doesn't exist: dart:async".to_owned(),
@@ -395,6 +400,12 @@ fn compact_explain_report() -> ExplainReport {
         affected_tests: Some(vec![AffectedTest {
             path: "package:t/a_test.dart".to_owned(),
         }]),
+        others: Some(vec![OtherDeclRow {
+            file: "c.dart".to_owned(),
+            kind: "class".to_owned(),
+            container: Some("_Fake".to_owned()),
+            line: 4,
+        }]),
         counts: None,
     }
 }
@@ -428,6 +439,7 @@ fn minimal_explain_report_passes_validation() {
         references: None,
         dependencies: None,
         affected_tests: None,
+        others: None,
         counts: Some(SectionCounts {
             inheritance: 1,
             interfaces: 0,
@@ -436,6 +448,7 @@ fn minimal_explain_report_passes_validation() {
             references: 1,
             dependencies: 1,
             affected_tests: 1,
+            others: 1,
         }),
     };
     let payload = serde_json::to_string(&report).expect("serialize");
@@ -469,6 +482,7 @@ fn explain_reports_are_exact_at_their_tier() {
         references: None,
         dependencies: None,
         affected_tests: None,
+        others: None,
         counts: Some(SectionCounts {
             inheritance: 1,
             interfaces: 0,
@@ -477,6 +491,7 @@ fn explain_reports_are_exact_at_their_tier() {
             references: 1,
             dependencies: 1,
             affected_tests: 1,
+            others: 0,
         }),
     };
     let payload = serde_json::to_string(&minimal).expect("serialize");
@@ -505,6 +520,7 @@ fn misspelled_explain_member_kind_is_named() {
         references: Some(Vec::new()),
         dependencies: Some(Vec::new()),
         affected_tests: Some(Vec::new()),
+        others: Some(Vec::new()),
         counts: None,
     })
     .expect("value");

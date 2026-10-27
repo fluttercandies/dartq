@@ -11,7 +11,9 @@ use std::io::{self, Write};
 use serde::Serialize;
 
 use crate::code::CodeInfo;
-use crate::model::{AnalysisOutput, ContextMessage, Diagnostic, FileId, SourceRange};
+use crate::model::{
+    AnalysisOutput, ContextMessage, Diagnostic, DiagnosticType, FileId, SourceRange,
+};
 
 /// Writes diagnostics in the oracle machine format, one line per diagnostic:
 ///
@@ -62,14 +64,17 @@ pub fn write_machine(out: &mut impl Write, output: &AnalysisOutput<'_>) -> io::R
 ///
 /// Single line, compact, key order and casing identical to the oracle
 /// (`code` lowercase, `severity`/`type` uppercase). `correctionMessage` is
-/// emitted only when present; `documentation` is emitted only for official
+/// emitted only when present; `documentation` is emitted for every
+/// first-party lint code (the published rules' diagnostics page, the rest
+/// the `https://dart.dev/lints/<rule>` page) and for official analyzer
 /// codes with a published docs page (`hasPublishedDocs: true` in the
-/// analyzer registry — `errors.dart` `url` getter), as
-/// `https://dart.dev/diagnostics/<code>`; unpublished codes (e.g.
-/// `expected_token`) and `dartq/`-namespace codes omit the key. The
-/// envelope is always emitted, even with no diagnostics, and the output
-/// always ends with a newline — the oracle routes every format through
-/// `writeln` (measured: empty set → exactly `{"version":1,"diagnostics":[]}\n`).
+/// analyzer registry — `errors.dart` `url` getter) as
+/// `https://dart.dev/diagnostics/<code>`; unpublished analyzer codes
+/// (e.g. `expected_token`), plugin lint codes, and `dartq/`-namespace
+/// codes omit the key. The envelope is always emitted, even with no
+/// diagnostics, and the output always ends with a newline — the oracle
+/// routes every format through `writeln` (measured: empty set → exactly
+/// `{"version":1,"diagnostics":[]}\n`).
 ///
 /// Serialization goes through `JsonDiagnostic` so `serde_json` owns the
 /// string escaping; its escape table is byte-identical to Dart's
@@ -212,21 +217,37 @@ fn json_context_message<'a>(
     }
 }
 
-/// The oracle emits `documentation` only for codes its registry marks
-/// `hasPublishedDocs: true` (`errors.dart` `url` getter: published →
-/// `https://dart.dev/diagnostics/<name>`, else `null`); `dartq/`-namespace
-/// codes are never published (pinned by the registry tests in `code.rs`), so
-/// the flag alone decides. The URL is built in the caller's reused buffer and
-/// returned borrowed.
+/// The oracle emits `documentation` straight from the code's URL
+/// (`analyze.dart` `emitJsonFormat`: `'documentation': ?url`):
+///
+/// * analyzer codes — `errors.dart`'s `url` getter: `null` unless the
+///   registry marks the code `hasPublishedDocs: true`, then
+///   `https://dart.dev/diagnostics/<name>`; `dartq/`-namespace codes are
+///   never published (pinned by the registry tests in `code.rs`), so the
+///   flag alone decides;
+/// * lint codes — the linter's `LinterLintCode.url` (upstream Dart SDK
+///   source, `pkg/linter/lib/src/lint_codes.dart`): every first-party
+///   lint code carries a URL — the diagnostics page for published codes,
+///   the `https://dart.dev/lints/<name>` page otherwise. The published
+///   bit is read by code name from the captured first-party table
+///   ([`crate::lint_docs`]), never from the row's `has_published_docs`
+///   flag: that flag is persisted per row (the content store's
+///   `code_published`) and would serve stale URLs from pre-capture
+///   stores; the name-keyed table is stable across warm and cold rows.
+///   A lint-typed code the table does not carry is a plugin code — the
+///   analyzer-side `LintCode.url` is null, so no URL.
+///
+/// The URL is built in the caller's reused buffer and returned borrowed.
 fn documentation_url(code: CodeInfo, buf: &mut String) -> Option<&str> {
-    if code.has_published_docs {
-        buf.clear();
-        buf.push_str("https://dart.dev/diagnostics/");
-        buf.push_str(code.name);
-        Some(buf.as_str())
-    } else {
-        None
-    }
+    let prefix = match code.dtype {
+        DiagnosticType::Lint => crate::lint_docs::lint_doc_prefix(code.name)?,
+        _ if code.has_published_docs => "https://dart.dev/diagnostics/",
+        _ => return None,
+    };
+    buf.clear();
+    buf.push_str(prefix);
+    buf.push_str(code.name);
+    Some(buf.as_str())
 }
 
 /// Machine-format field escaping, equivalent to the oracle's
@@ -252,4 +273,97 @@ fn escape_into(text: &str, out: &mut String) {
         copied = i + 1;
     }
     out.push_str(&text[copied..]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::FileLayoutProvider;
+    use std::path::Path;
+
+    /// The JSON face's `documentation` decisions (the oracle's
+    /// `documentation: ?url` face): a first-party published lint takes the
+    /// diagnostics page, an unpublished first-party lint takes the lint
+    /// page, a plugin lint code and an unpublished analyzer code omit the
+    /// key, and a published analyzer code keeps the diagnostics page.
+    #[test]
+    fn json_documentation_decides_by_code_family() {
+        struct OneFile;
+        impl FileLayoutProvider for OneFile {
+            fn file_path(&self, _file: FileId) -> &Path {
+                Path::new("/w/lib/a.dart")
+            }
+            fn line_col(&self, _file: FileId, _offset: u32) -> (u32, u32) {
+                (1, 1)
+            }
+        }
+        let files = OneFile;
+        let mut table = dartq_source::FileTable::new();
+        let id = table.intern(Path::new("/w/lib/a.dart"));
+        let row = |code: CodeInfo| {
+            Diagnostic::new(
+                code.dtype.severity(),
+                code,
+                "m",
+                id,
+                SourceRange {
+                    offset: 0,
+                    length: 1,
+                },
+                None,
+            )
+        };
+        let diagnostics = [
+            row(CodeInfo::new(
+                "avoid_empty_else",
+                "AVOID_EMPTY_ELSE",
+                DiagnosticType::Lint,
+                false,
+            )),
+            row(CodeInfo::new(
+                "always_require_non_null_named_parameters",
+                "ALWAYS_REQUIRE_NON_NULL_NAMED_PARAMETERS",
+                DiagnosticType::Lint,
+                false,
+            )),
+            row(CodeInfo::new(
+                "plug_lint",
+                "PLUG_LINT",
+                DiagnosticType::Lint,
+                false,
+            )),
+            row(CodeInfo::new(
+                "expected_token",
+                "EXPECTED_TOKEN",
+                DiagnosticType::SyntacticError,
+                false,
+            )),
+            row(CodeInfo::new(
+                "uri_does_not_exist",
+                "URI_DOES_NOT_EXIST",
+                DiagnosticType::CompileTimeError,
+                true,
+            )),
+        ];
+        let output = AnalysisOutput {
+            diagnostics: &diagnostics,
+            files: &files,
+        };
+        let mut out = Vec::new();
+        write_json(&mut out, &output).expect("write");
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&out).expect("one JSON object");
+        let rows = envelope["diagnostics"].as_array().expect("rows");
+        assert_eq!(rows[0]["documentation"], "https://dart.dev/diagnostics/avoid_empty_else");
+        assert_eq!(
+            rows[1]["documentation"],
+            "https://dart.dev/lints/always_require_non_null_named_parameters"
+        );
+        assert!(rows[2].get("documentation").is_none(), "plugin lint: no URL");
+        assert!(rows[3].get("documentation").is_none(), "unpublished analyzer code");
+        assert_eq!(
+            rows[4]["documentation"], "https://dart.dev/diagnostics/uri_does_not_exist",
+            "published analyzer code: the flag alone decides"
+        );
+    }
 }

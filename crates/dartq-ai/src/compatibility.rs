@@ -107,6 +107,13 @@ impl AxisError {
 pub struct CompatReport {
     /// The output contract version ([`COMPAT_SCHEMA_VERSION`]).
     pub schema_version: u32,
+    /// The analysis root the `file` and failure columns locate against
+    /// (absolute), set by the caller that owns the resolution — this pure
+    /// query never sees one, so it ships `None` and the commands face fills
+    /// it (the subject always rides, so the root always does). Wire:
+    /// `root`, omitted when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
     /// The queried file — the subject of the query, as given by the caller.
     pub file: String,
     /// One row per axis, in the caller's axis order.
@@ -142,6 +149,7 @@ pub fn compatibility(file: &str, axes: &[AxisInput]) -> CompatReport {
         .collect();
     CompatReport {
         schema_version: COMPAT_SCHEMA_VERSION,
+        root: None,
         file: file.to_owned(),
         matrix,
     }

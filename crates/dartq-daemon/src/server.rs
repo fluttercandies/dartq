@@ -19,8 +19,9 @@
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::SelectTimeoutError;
 use serde::Deserialize;
@@ -59,6 +60,14 @@ const MAX_QUEUED_BATCHES: usize = 64;
 /// so latency is unaffected; the staged fixes/requests vectors just stay
 /// bounded within any single turn.
 const MAX_TURN_INTAKE: usize = 64;
+
+/// #2632: while an exit-signal flag is armed, the main loop's quiet wait
+/// is bounded by this tick, so the flag is observed within it. A held
+/// long-lived client — the MCP stdio proxy keeps one connection open —
+/// must not delay the serve loop's shutdown ladder past the reaper's
+/// grace: without the bound, a signal landing between requests would sit
+/// unobserved until the client itself disconnected.
+const SIGNAL_POLL: Duration = Duration::from_millis(250);
 
 /// What the reader thread hands to the main loop — plus the watch thread's
 /// debounced batches, which ride the same channel (one receiver, no select).
@@ -115,18 +124,47 @@ fn install_panic_hook() {
 
 /// Runs one RPC session to its end and returns the process exit code.
 ///
-/// Spawns the reader thread and runs the main loop on the current thread.
-/// There is no handshake gate: the session is ready from the start, and
-/// the loop answers the first frame immediately — the workspace walk and
-/// first analysis run lazily, on the first drain that stages engine work
-/// (#2591; see `Session::service`), so a cold engine still answers every
-/// face that never touches the analysis engines. With `watch` set it also
-/// spawns the one watch thread, whose debounced batches ride the same
-/// channel; dropping the watcher at session end stops and joins it.
-/// Returns when the input stream ends — a client close is the session's
-/// only end signal — (possibly leaving the reader blocked on the next
-/// read — under a real process the caller exits immediately, which reaps
-/// it; the reader is joined only when it is known to have finished).
+/// The plain entry: the caller's process owns the signal disposition
+/// (the stdio serve — a SIGTERM is a death, by default disposition).
+/// Sessions that must close out gracefully on an exit signal pass one
+/// through [`run_with_signal`].
+///
+/// # Errors
+///
+/// Writing to the client failed (peer vanished mid-answer).
+pub fn run<R, W>(
+    input: R,
+    output: W,
+    session: &mut Session,
+    watch: Option<WatchOptions>,
+) -> io::Result<u8>
+where
+    R: Read + Send + 'static,
+    W: Write + 'static,
+{
+    run_with_signal(input, output, session, watch, None)
+}
+
+/// [`run`] with an exit-signal flag (#2632): the serve loop's own
+/// SIGTERM/SIGINT landing place, polled by this loop while the client
+/// is held. The flag turns a blocked session into a graceful close-out
+/// — the in-flight turn completes (a client mid-request is answered or
+/// cleanly closed, never cut mid-frame), every request queued behind
+/// the last completed turn answers a structured error instead of
+/// silence, and the session returns so the caller can run its
+/// shutdown ladder (detaching every held debug session before death).
+///
+/// All other behavior is [`run`]'s: spawns the reader thread and runs
+/// the main loop on the current thread; no handshake gate — the session
+/// is ready from the start, and the loop answers the first frame
+/// immediately (the workspace walk and first analysis run lazily, on
+/// the first drain that stages engine work, #2591); with `watch` set it
+/// also spawns the one watch thread, whose debounced batches ride the
+/// same channel; dropping the watcher at session end stops and joins
+/// it. Returns when the input stream ends or the flag fires — possibly
+/// leaving the reader blocked on the next read: under a real process
+/// the caller exits immediately after its shutdown ladder, which reaps
+/// it; the reader is joined only when it is known to have finished.
 /// Input buffering is the shell's policy: the reader thread wraps the
 /// stream so batch boundaries follow read granularity.
 ///
@@ -139,11 +177,12 @@ fn install_panic_hook() {
 /// Only if the session's fix mailbox is disconnected while the session
 /// lives — the session owns the mailbox's sender end, so a disconnect is an
 /// internal invariant breach, not a reachable peer-induced state.
-pub fn run<R, W>(
+pub fn run_with_signal<R, W>(
     input: R,
     output: W,
     mut session: &mut Session,
     watch: Option<WatchOptions>,
+    signal: Option<&AtomicBool>,
 ) -> io::Result<u8>
 where
     R: Read + Send + 'static,
@@ -174,8 +213,20 @@ where
     // request pays the cold cost in its own drain. The startup advisory
     // and the first publish diff ride that first drain instead.
 
-    // Ends when the reader thread disconnects or a notification breaks out.
+    // Ends when the reader thread disconnects, a notification breaks
+    // out, or the exit-signal flag fires (#2632).
     loop {
+        // #2632: the exit signal, observed between turns — never
+        // mid-turn, so every frame this session wrote stays whole and
+        // every request the last turn staged is already answered. What
+        // the close-out adds is an answer for each request queued
+        // behind the turn (silence is not a well-formed close); the
+        // caller then runs its shutdown ladder.
+        if signal.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            answer_queued(&mut output, &receiver)?;
+            break;
+        }
+
         // Turn start: the snapshot debounce window elapses across the
         // receive below — blocking or deadline-bounded — so the flush check
         // happens before intake. (Only tests read the attempt outcome.)
@@ -215,6 +266,9 @@ where
             .into_iter()
             .chain(session.flush_deadline())
             .chain(session.publish_retry_deadline())
+            // #2632: the signal tick bounds the quiet wait while a flag
+            // is armed — the loop-top check above is what observes it.
+            .chain(signal.map(|_| Instant::now() + SIGNAL_POLL))
             .min();
         let wake = {
             let mut select = crossbeam_channel::Select::new();
@@ -417,6 +471,34 @@ fn assemble_batch(
         batch.extend(queued);
     }
     batch
+}
+
+/// The exit-signal close-out (#2632): every request queued behind the
+/// last completed turn answers one structured error — the flag's break
+/// comes strictly between turns, so these are the only unanswered
+/// messages left. Notifications need no answer, and the reader may
+/// still be mid-frame on the next request; that one gets a clean close
+/// (whole frames only), never a partial answer. Bounded by the intake
+/// channel's own capacity.
+fn answer_queued(
+    output: &mut impl Write,
+    receiver: &crossbeam_channel::Receiver<Vec<Incoming>>,
+) -> io::Result<()> {
+    while let Ok(batch) = receiver.try_recv() {
+        for incoming in batch {
+            if let Incoming::Message(Message::Request(request)) = incoming {
+                write_message(
+                    output,
+                    &Message::Response(Response::error(
+                        Some(request.id),
+                        codes::REQUEST_CANCELLED,
+                        "session serve shutting down on exit signal",
+                    )),
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Decodes one well-framed body into what the main loop consumes.
@@ -729,6 +811,13 @@ fn fix_stage(session: &mut Session, params: &Value, id: jsonrpc::RequestId) -> O
         Ok(decoded) => decoded,
         Err(error) => return Some(invalid(error.to_string())),
     };
+    // The role decodes through the shared face — a bad spelling answers
+    // `INVALID_PARAMS` with the parameter named and the accepted
+    // spellings (the MCP tool's arguments ride this intake verbatim).
+    let role = match commands::fix_role(params) {
+        Ok(role) => role,
+        Err(message) => return Some(invalid(message)),
+    };
     if decoded.paths.is_empty() {
         return Some(invalid("paths must be a non-empty array".into()));
     }
@@ -743,6 +832,7 @@ fn fix_stage(session: &mut Session, params: &Value, id: jsonrpc::RequestId) -> O
         FixJob::Fix {
             paths,
             verbosity: decoded.verbosity,
+            role,
         },
     );
     None
@@ -910,10 +1000,45 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    /// One turn stages at most [`MAX_TURN_INTAKE`] messages (#947 F2) and
-    /// drops none: the surplus stays queued for the next turn.
-    #[test]
-    fn turn_intake_is_capped_and_never_drops() {
+/// #2632: the exit-signal close-out answers every queued request with
+/// exactly one structured error (silence is not a well-formed close)
+/// and answers nothing else — notifications take no answer, and the
+/// stream-end marker is not a message.
+#[test]
+fn the_signal_close_out_answers_queued_requests_only() {
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    sender
+        .send(vec![
+            Incoming::Message(Message::Request(Request {
+                id: jsonrpc::RequestId::Num(7),
+                method: "dartq/analyze".into(),
+                params: None,
+            })),
+            Incoming::Message(Message::Notification(Notification::new(
+                "dartq/sync",
+                json!({}),
+            ))),
+        ])
+        .expect("batch");
+    sender.send(vec![Incoming::Eof]).expect("end");
+    let mut output = Vec::new();
+    answer_queued(&mut output, &receiver).expect("the close-out writes");
+    let frames = test_fixtures::frames(&output);
+    assert_eq!(frames.len(), 1, "one answer, nothing else: {frames:?}");
+    assert_eq!(frames[0]["id"], json!(7), "the queued request's id");
+    assert_eq!(
+        frames[0]["error"]["code"],
+        json!(codes::REQUEST_CANCELLED),
+        "the structured drop verdict: {frames:?}"
+    );
+    assert!(receiver.try_recv().is_err(), "the queue drained");
+}
+
+/// One turn stages at most [`MAX_TURN_INTAKE`] messages (#947 F2) and
+/// drops none: the surplus stays queued for the next turn.
+#[test]
+fn turn_intake_is_capped_and_never_drops() {
+
         let (sender, receiver) = crossbeam_channel::unbounded();
         let total = MAX_TURN_INTAKE + 10;
         for _ in 0..total {

@@ -158,6 +158,11 @@ def norm(p):
         p = p[len(strip):]
     return p
 
+def joined(p, root):
+    # dartq file fields spell root-relative inside the analysis root —
+    # rejoin before the shared normalization (absolute spellings pass).
+    return f"{root}/{p}" if root and not p.startswith("/") else p
+
 rows = set()
 if side == "dart":
     # dart default face: `  sev - file:l:c - message - code`, long rows wrap
@@ -192,20 +197,27 @@ if side == "dart":
                 cur[3] = tail_code
     if cur: flush()
 else:
-    # dartq default face: the canonical LON document `{v:1 diags:[…]}` —
-    # uniform rows collapse to the record table (`[code sev file …;v v v …]`,
-    # positional after the header), non-uniform rows stay object-form
-    # (`{code:X sev:error file:F …}`). File paths carry no spaces in the
-    # corpus, so each row's first three whitespace tokens are safe.
+    # dartq default face: the canonical LON document `{v:1 root:<abs>
+    # diags:[…]}` — the document names its analysis root once and file
+    # fields spell root-relative inside it (absolute outside), so each
+    # file is joined back onto its root before the shared repo-relative
+    # normalization. Uniform rows collapse to the record table
+    # (`[code sev file …;v v v …]`, positional after the header),
+    # non-uniform rows stay object-form (`{code:X sev:error file:F …}`).
+    # File paths carry no spaces in the corpus, so each row's first three
+    # whitespace tokens are safe.
     for line in open(path_file):
+        line = line.rstrip("\n")
+        root = re.match(r"\{v:\d+ root:(\S+) ", line)
+        root = root.group(1) if root else None
         m = re.search(r"diags:\[([a-z_ ]+);", line)
         if m and m.group(1).split()[:3] == ["code", "sev", "file"]:
             for row in line[m.end():].rstrip("]}").split(";"):
                 toks = row.split()
                 if len(toks) >= 3:
-                    rows.add(f"{toks[1]}|{toks[0]}|{norm(toks[2])}")
+                    rows.add(f"{toks[1]}|{toks[0]}|{norm(joined(toks[2], root))}")
         for m in re.finditer(r"(?:^|[{;\s])code:([^ ;]+)\s+sev:(error|warning|info)\s+file:([^ ;]+)", line):
-            rows.add(f"{m.group(2)}|{m.group(1)}|{norm(m.group(3))}")
+            rows.add(f"{m.group(2)}|{m.group(1)}|{norm(joined(m.group(3), root))}")
 for r in sorted(rows):
     print(r)
 PYEOF

@@ -1232,8 +1232,9 @@
         );
         for (edit, expected_source) in edits.iter().zip(["builtin-lint", "live"]) {
             let keys: Vec<_> = edit.as_object().expect("edit object").keys().collect();
-            assert_eq!(keys, ["anchor", "len", "off", "src", "text"]);
+            assert_eq!(keys, ["anchor", "len", "off", "role", "src", "text"]);
             assert_eq!(edit["src"], expected_source);
+            assert_eq!(edit["role"], "primary", "plugin rows are primary by nature");
         }
         assert_eq!(edits[0]["off"], 19);
         assert_eq!(edits[0]["len"], 4);
@@ -1260,7 +1261,7 @@
             .expect("edit object")
             .keys()
             .collect();
-        assert_eq!(keys, ["len", "off", "src", "text"]);
+        assert_eq!(keys, ["len", "off", "role", "src", "text"]);
         dartq_schema::validate_at_tier(
             &minimal.to_string(),
             dartq_schema::Domain::FixPatch,
@@ -1276,7 +1277,7 @@
             .collect();
         assert_eq!(
             builtin,
-            ["anchor", "len", "msg", "off", "rule", "src", "text"]
+            ["anchor", "len", "msg", "off", "role", "rule", "src", "text"]
         );
         assert_eq!(full["edits"][0]["rule"], "unnecessary_new");
         let plugin_row: Vec<_> = full["edits"][1]
@@ -1286,7 +1287,7 @@
             .collect();
         assert_eq!(
             plugin_row,
-            ["anchor", "len", "msg", "off", "priority", "src", "text"]
+            ["anchor", "len", "msg", "off", "priority", "role", "src", "text"]
         );
         assert_eq!(full["edits"][1]["msg"], "insert const");
         assert_eq!(full["edits"][1]["priority"], 1);
@@ -1304,13 +1305,16 @@
         let doc = patch_json(
             &FileFixSet {
                 path: "t.dart".to_owned(),
-                fixes: vec![RuleFix {
-                    rule: "unnecessary_new",
-                    message: String::new(),
-                    source: BUILTIN_SOURCE,
-                    edit: anchored_edit(text, &lines, 0, 3, "out"),
-                    target: None,
-                }],
+            fixes: vec![RuleFix {
+                rule: "unnecessary_new",
+                message: String::new(),
+                source: BUILTIN_SOURCE,
+                edit: anchored_edit(text, &lines, 0, 3, "out"),
+                target: None,
+                role: FixRole::Primary,
+                diag: None,
+                group: 0,
+            }],
                 plugin: Vec::new(),
             },
             Verbosity::Compact,
@@ -1360,7 +1364,7 @@
             let keys: Vec<_> = row.as_object().expect("edit object").keys().collect();
             assert_eq!(
                 keys,
-                ["anchor", "len", "off", "outcome", "src", "text"]
+                ["anchor", "len", "off", "outcome", "role", "src", "text"]
             );
             assert_eq!(row["outcome"], outcome.1);
             assert_eq!(row["src"], outcome.0);
@@ -8887,6 +8891,132 @@
         let kept = select_by_codes(sets.clone(), &[]);
         assert_eq!(kept.len(), sets.len());
         assert_eq!(kept[0].plugin.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // The candidate roles: producer tagging + the `--role` selection
+    // -----------------------------------------------------------------------
+
+    /// A primary row born of the semantic producer over `source`.
+    fn primary_row(source: &str, rule: &'static str, machine: &'static str, offset: u32, length: u32) -> RuleFix {
+        one_sem_fix(source, sem_row(rule, machine, offset, length))
+    }
+
+    /// The producers tag their rows at the mint: the mechanical rewrite is
+    /// `primary` and carries its diagnostic's span, the line comment is
+    /// `ignore_line` with the same span, and the file comment is
+    /// `ignore_file` with no single diagnostic to serve.
+    #[test]
+    fn producers_tag_their_candidates() {
+        let source = "import 'a.dart';\nvar x = 1;\n";
+        let fix = primary_row(source, "unused_import", "UNUSED_IMPORT", 7, 8);
+        assert_eq!(fix.role, FixRole::Primary);
+        assert_eq!(
+            fix.diag,
+            Some(SourceRange {
+                offset: 7,
+                length: 8
+            })
+        );
+
+        let fix =
+            ignore_line_fix("unused_import", 7..15, source, &LineIndex::new(source)).expect("line");
+        assert_eq!(fix.role, FixRole::IgnoreLine);
+        assert_eq!(
+            fix.diag,
+            Some(SourceRange {
+                offset: 7,
+                length: 8
+            })
+        );
+
+        let fix = ignore_file_fix("unused_import", source, &LineIndex::new(source)).expect("file");
+        assert_eq!(fix.role, FixRole::IgnoreFile);
+        assert_eq!(fix.diag, None);
+    }
+
+    /// One row of `group` serving `diag` under `rule` — the selection's
+    /// synthetic input (the producer tagging is pinned above).
+    fn role_row(rule: &'static str, diag: Option<SourceRange>, group: u32, role: FixRole) -> RuleFix {
+        let source = "var x = 1;\n";
+        RuleFix {
+            rule,
+            message: String::new(),
+            source: BUILTIN_SOURCE,
+            edit: anchored_edit(source, &LineIndex::new(source), 0, 0, ""),
+            target: None,
+            role,
+            diag,
+            group,
+        }
+    }
+
+    /// The primary selection keeps one candidate per `(rule, diagnostic)`
+    /// — the producer's first group whole, so a multi-edit candidate never
+    /// loses an edit — and later groups for the same pair drop (the import
+    /// synthesis shape: one candidate library applies, the first in the
+    /// producer's order). A different diagnostic under the same rule keeps
+    /// its own candidate; plugin rows ride along (primary by nature).
+    #[test]
+    fn role_selection_keeps_the_first_primary_candidate_whole() {
+        let diag_a = SourceRange {
+            offset: 0,
+            length: 4,
+        };
+        let diag_b = SourceRange {
+            offset: 10,
+            length: 4,
+        };
+        let plugin = PluginFix {
+            plugin: "sample".to_owned(),
+            message: "proposed".to_owned(),
+            priority: 0,
+            edits: Vec::new(),
+        };
+        let sets = vec![FileFixSet {
+            path: "a.dart".to_owned(),
+            fixes: vec![
+                role_row("r", Some(diag_a), 0, FixRole::Primary), // multi-edit candidate, row 1
+                role_row("r", Some(diag_a), 0, FixRole::Primary), // row 2 of the same group
+                role_row("r", Some(diag_a), 1, FixRole::Primary), // a second candidate — drops
+                role_row("r", Some(diag_b), 2, FixRole::Primary), // its own diagnostic — keeps
+                role_row("r", None, 3, FixRole::Primary),         // no anchor — never deduped
+                // The ignore trio mints group 0 for each of its rows — a
+                // role-blind group keep would ride it into the primary
+                // selection with the kept group-0 candidate above.
+                role_row("r", Some(diag_a), 0, FixRole::IgnoreLine),
+            ],
+            plugin: vec![plugin],
+        }];
+
+        let primary = select_by_role(sets.clone(), FixRole::Primary);
+        assert_eq!(primary.len(), 1);
+        let groups: Vec<u32> = primary[0].fixes.iter().map(|fix| fix.group).collect();
+        assert_eq!(groups, [0, 0, 2, 3], "groups 1 and 4 dropped whole: {groups:?}");
+        assert_eq!(primary[0].plugin.len(), 1, "plugin rows are primary");
+
+        // A suppression role answers exactly its rows; the plugin rows
+        // drop with them.
+        let line_only = select_by_role(sets, FixRole::IgnoreLine);
+        assert_eq!(line_only.len(), 1);
+        assert_eq!(line_only[0].fixes.len(), 1);
+        assert_eq!(line_only[0].fixes[0].role, FixRole::IgnoreLine);
+        assert!(line_only[0].plugin.is_empty());
+
+        // A role nothing carries answers the empty set — the options-file
+        // suppressions live in their own file set (the CLI quartet test
+        // pins that face end to end).
+        assert!(select_by_role(vec![FileFixSet {
+            path: "a.dart".to_owned(),
+            fixes: vec![role_row("r", Some(diag_a), 0, FixRole::Primary)],
+            plugin: vec![PluginFix {
+                plugin: "sample".to_owned(),
+                message: "m".to_owned(),
+                priority: 0,
+                edits: Vec::new(),
+            }],
+        }], FixRole::Suppress)
+        .is_empty());
     }
 
     // -----------------------------------------------------------------------

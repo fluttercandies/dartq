@@ -78,10 +78,24 @@ pub const SESSION_CAP: usize = 5;
 /// thread is independent of client service, #2591): the next election
 /// reaps the server rather than attaching it.
 pub const STALE_HEARTBEAT: Duration = Duration::from_secs(3 * HEARTBEAT.as_secs());
-/// The SIGTERM grace before the SIGKILL escalation in a reap. The serve
-/// loop installs no SIGTERM handler, so an ordinary death lands in
-/// milliseconds; the grace only covers a loaded host.
-const REAP_GRACE: Duration = Duration::from_secs(2);
+/// The SIGTERM grace before the SIGKILL escalation in a reap, for a
+/// daemon holding nothing. The serve loop's SIGTERM handler first walks
+/// its graceful-shutdown ladder — detaching (resuming) every held debug
+/// session, each bounded by dartq-debug's release budget — so the grace
+/// must exceed one detach budget or the escalation would cut a resume
+/// mid-flight (#2619; the tie is asserted at compile time in
+/// dartq-daemon, which sees both constants). A daemon holding debug
+/// sessions scales the window by [`reap_grace`] (#2632): the ladder is
+/// sequential, one budget per held session. An ordinary death with
+/// nothing held lands in milliseconds; the grace only covers the ladder
+/// and a loaded host.
+pub const REAP_GRACE: Duration = Duration::from_secs(8);
+/// One detach budget per held debug session — the share [`reap_grace`]
+/// adds for each session the daemon advertises (#2632). The value
+/// mirrors dartq-debug's `RELEASE_RESUME_BUDGET` (the shutdown ladder's
+/// per-session bound); the equality is asserted at compile time in
+/// dartq-daemon, which sees both constants, so the mirror cannot drift.
+pub const REAP_GRACE_PER_HELD: Duration = Duration::from_secs(5);
 /// The post-SIGKILL confirmation wait: after the escalation the process
 /// is dead by kernel decree (an unreaped zombie still answers
 /// `kill(pid, 0)` — waiting longer would be waiting for its parent).
@@ -314,6 +328,14 @@ pub struct SessionState {
     /// The last heartbeat, UNIX milliseconds.
     pub heartbeat_ms: u128,
     pub triple: SessionTriple,
+    /// The debug sessions the daemon held at that heartbeat (#2632):
+    /// the shutdown ladder detaches each one — a paused isolate set
+    /// resumed, one release budget apiece — so the reaper's SIGTERM
+    /// grace scales by this count ([`reap_grace`]) instead of
+    /// SIGKILLing a daemon mid-resume. Refreshed every heartbeat;
+    /// defaults to 0 for older state files and daemons holding none.
+    #[serde(default)]
+    pub debug_sessions: usize,
 }
 
 impl SessionState {
@@ -508,9 +530,11 @@ fn under_election(
             // The stale generation may still be RUNNING (a foreign
             // binary, a wedged heartbeat, a dead socket under a live
             // pid): reap it first — an un-reaped daemon heartbeats its
-            // state back over the replacement's forever (#2601).
+            // state back over the replacement's forever (#2601). The
+            // grace scales with the held debug sessions the state
+            // advertises (#2632): the ladder resumes each one.
             if pid_alive(state.pid) {
-                reap(state.pid);
+                reap(state.pid, reap_grace(state.debug_sessions));
             }
         }
     }
@@ -527,6 +551,7 @@ fn under_election(
         pid: 0,
         heartbeat_ms: SessionState::now_ms(),
         triple: triple.clone(),
+        debug_sessions: 0,
     }
     .write(layout);
     match spawn(layout, triple) {
@@ -563,18 +588,32 @@ fn placeholder_age(state: &SessionState) -> Duration {
     )
 }
 
+/// The SIGTERM grace for a daemon advertising `held` live debug
+/// sessions (#2632): the base window plus one detach budget per held
+/// session — the sequential shutdown ladder's worst case. The count
+/// refreshes every heartbeat, so it can lag one [`HEARTBEAT`] behind a
+/// fresh attach; the base's slack ([`REAP_GRACE`] minus one budget)
+/// absorbs exactly that one-session staleness.
+#[must_use]
+pub fn reap_grace(held: usize) -> Duration {
+    REAP_GRACE + REAP_GRACE_PER_HELD.saturating_mul(u32::try_from(held).unwrap_or(u32::MAX))
+}
+
 /// Terminates a stale daemon and waits for the death: SIGTERM, a
-/// bounded grace, a SIGKILL escalation, a short confirmation. Returns
-/// once the pid is gone or the budget is spent — a straggler past
-/// SIGKILL (an unreaped zombie, an uninterruptible sleep) is treated as
-/// dead and the takeover proceeds: its socket inode is unreachable
-/// through the path, so it cannot steal the bind back.
-fn reap(pid: u32) {
+/// bounded grace, a SIGKILL escalation, a short confirmation. The
+/// grace comes from the daemon's own advertisement ([`reap_grace`] over
+/// its state record) — a daemon mid-detach of held debug sessions
+/// legitimately outruns the base window. Returns once the pid is gone
+/// or the budget is spent — a straggler past SIGKILL (an unreaped
+/// zombie, an uninterruptible sleep) is treated as dead and the
+/// takeover proceeds: its socket inode is unreachable through the path,
+/// so it cannot steal the bind back.
+fn reap(pid: u32, grace: Duration) {
     if !reapable_pid(pid) {
         return;
     }
     terminate(pid);
-    if gone(pid, REAP_GRACE) {
+    if gone(pid, grace) {
         return;
     }
     #[cfg(unix)]
@@ -611,7 +650,7 @@ fn reap_rivals(registry: &Registry, root: &Path, keep: u32) {
     for record in registry.list() {
         let pid = record.state.pid;
         if record.state.triple.root == root && pid != keep && reapable_pid(pid) && pid_alive(pid) {
-            reap(pid);
+            reap(pid, reap_grace(record.state.debug_sessions));
             registry.remove_id(&record.id);
         }
     }
@@ -896,6 +935,40 @@ impl EventLog {
             .collect()
     }
 
+    /// Reads events newest first (#2622): only rows with `ts >= since_ms`
+    /// (the log's own millisecond unit — callers convert their
+    /// UNIX-seconds flags), at most `limit`, keeping the *newest* rows
+    /// when the page caps. Deterministic: file order reversed, so rows
+    /// sharing a `ts` keep the later-appended one ahead. This is the
+    /// `dartq events` default — an oldest-first page never reaches the
+    /// newest rows, which is the read an agent actually wants.
+    #[must_use]
+    pub fn read_newest(
+        &self,
+        handle: Option<&str>,
+        since_ms: u128,
+        limit: usize,
+    ) -> Vec<(u64, serde_json::Value)> {
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return Vec::new();
+        };
+        let mut rows: Vec<(u64, serde_json::Value)> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| {
+                value["ts"].as_u64().is_some_and(|ts| u128::from(ts) >= since_ms)
+            })
+            .filter(|value| handle.is_none_or(|wanted| value["handle"].as_str() == Some(wanted)))
+            .map(|value| (value["seq"].as_u64().unwrap_or_default(), value))
+            .collect();
+        if rows.len() > limit {
+            let oldest = rows.len() - limit;
+            rows.drain(..oldest);
+        }
+        rows.reverse();
+        rows
+    }
+
     /// The highest sequence written (0 on an absent log).
     #[must_use]
     pub fn head_seq(&self) -> u64 {
@@ -1041,6 +1114,7 @@ mod tests {
             pid: std::process::id(),
             heartbeat_ms: SessionState::now_ms(),
             triple: triple.clone(),
+            debug_sessions: 0,
         }
         .write(layout)
         .expect("state");
@@ -1068,6 +1142,7 @@ mod tests {
             pid,
             heartbeat_ms: SessionState::now_ms(),
             triple: triple.clone(),
+            debug_sessions: 0,
         }
         .write(layout)
         .expect("state");
@@ -1273,9 +1348,23 @@ mod tests {
             pid: std::process::id(),
             heartbeat_ms: 123_456,
             triple: SessionTriple::compute(&root, &root),
+            debug_sessions: 2,
         };
         state.write(&layout).expect("write");
         assert_eq!(SessionState::read(&layout).as_ref(), Some(&state));
+        // #2632: a state file from before the field reads back with zero
+        // held sessions (the daemon advertised nothing to scale by).
+        write(
+            &layout.state,
+            &serde_json::to_string(&serde_json::json!({
+                "pid": 7,
+                "heartbeat_ms": 1,
+                "triple": state.triple,
+            }))
+            .expect("serialize"),
+        );
+        let legacy = SessionState::read(&layout).expect("legacy state");
+        assert_eq!(legacy.debug_sessions, 0, "absent advertises nothing held");
         // No temp file residue from the atomic write.
         assert!(!layout.dir.join(".state.json.tmp").exists());
         write(&layout.state, "{ not json");
@@ -1323,6 +1412,7 @@ mod tests {
             pid: u32::MAX - 1,
             heartbeat_ms: 0,
             triple: triple.clone(),
+            debug_sessions: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1415,6 +1505,7 @@ mod tests {
             pid: std::process::id(),
             heartbeat_ms: 0,
             triple: foreign,
+            debug_sessions: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1438,6 +1529,7 @@ mod tests {
             pid: std::process::id(),
             heartbeat_ms: 0,
             triple: triple.clone(),
+            debug_sessions: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1480,6 +1572,7 @@ mod tests {
             pid: child.lock().expect("child").id(),
             heartbeat_ms: SessionState::now_ms(),
             triple: stale,
+            debug_sessions: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1544,6 +1637,7 @@ mod tests {
                         pid,
                         heartbeat_ms: SessionState::now_ms(),
                         triple,
+                        debug_sessions: 0,
                     },
                 })
                 .expect("upsert");
@@ -1622,6 +1716,7 @@ mod tests {
             pid: 0,
             heartbeat_ms: SessionState::now_ms(),
             triple: triple.clone(),
+            debug_sessions: 0,
         }
         .write(&layout)
         .expect("placeholder");
@@ -1661,6 +1756,7 @@ mod tests {
             pid: 0,
             heartbeat_ms: spent_heartbeat,
             triple: current.clone(),
+            debug_sessions: 0,
         }
         .write(&layout)
         .expect("placeholder");
@@ -1692,6 +1788,7 @@ mod tests {
             pid: 0,
             heartbeat_ms: SessionState::now_ms(),
             triple: foreign,
+            debug_sessions: 0,
         }
         .write(&layout)
         .expect("placeholder");
@@ -1727,6 +1824,7 @@ mod tests {
             pid: std::process::id(),
             heartbeat_ms: SessionState::now_ms().saturating_sub(10 * STALE_HEARTBEAT.as_millis()),
             triple: triple.clone(),
+            debug_sessions: 0,
         }
         .write(&layout)
         .expect("state");
@@ -1756,6 +1854,29 @@ mod tests {
         terminate(0);
         terminate(u32::MAX);
         assert!(pid_alive(std::process::id()), "the caller lived");
+    }
+
+    /// #2632: the reap grace scales with the daemon's advertised held
+    /// sessions — the base window plus one detach budget apiece, the
+    /// sequential shutdown ladder's worst case. A daemon holding
+    /// nothing gets exactly the base; a daemon holding two outruns the
+    /// base window by two budgets, which is precisely what the old flat
+    /// grace SIGKilled mid-resume.
+    #[test]
+    fn reap_grace_scales_with_the_advertised_held_sessions() {
+        assert_eq!(reap_grace(0), REAP_GRACE, "nothing held: the base window");
+        assert_eq!(reap_grace(1), REAP_GRACE + REAP_GRACE_PER_HELD);
+        assert_eq!(
+            reap_grace(2),
+            REAP_GRACE + 2 * REAP_GRACE_PER_HELD,
+            "N held: N detach budgets on top (sequential ladder)"
+        );
+        assert_eq!(reap_grace(4), Duration::from_secs(8 + 4 * 5));
+        assert_eq!(
+            reap_grace(usize::MAX),
+            reap_grace(u32::MAX as usize),
+            "an absurd count saturates its multiplier instead of panicking"
+        );
     }
 
     /// A spawn that never listens degrades to standalone with the reason
@@ -1848,6 +1969,61 @@ mod tests {
         assert_eq!(of("debug:1"), [(4, "launched".to_owned())]);
         // An exact-string filter: no prefix or substring accidents.
         assert!(of("test:").is_empty() && of("debug").is_empty());
+    }
+
+    /// #2622: the newest-first read — newest rows first, the `ts` floor
+    /// inclusive, `limit` keeping the newest page, and rows sharing a
+    /// `ts` keeping the later-appended one ahead (file order reversed).
+    #[test]
+    fn read_newest_orders_filters_and_limits() {
+        let root = temp("newest");
+        let layout = Layout::new(&root);
+        layout.create().expect("layout");
+        let log = EventLog::new(&layout);
+        // A hand-written log: the timestamps and their ties are the
+        // fixture, which `append` (always "now") cannot produce.
+        let line = |seq: u64, ts: u64, handle: &str| {
+            serde_json::json!({"seq": seq, "ts": ts, "handle": handle, "event": "e", "data": {}})
+                .to_string()
+        };
+        std::fs::write(
+            &log.path,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                line(1, 1_000, "session"),
+                line(2, 2_000, "session"),
+                line(3, 2_000, "session"),
+                line(4, 2_000, "debug:1"),
+            ),
+        )
+        .expect("log");
+
+        let seqs = |rows: Vec<(u64, serde_json::Value)>| {
+            rows.into_iter().map(|(seq, _)| seq).collect::<Vec<_>>()
+        };
+        // Newest first; the equal-`ts` pair keeps the later-appended row
+        // (seq 3) ahead of its earlier twin (seq 2).
+        assert_eq!(seqs(log.read_newest(None, 0, usize::MAX)), [4, 3, 2, 1]);
+        // The handle filter rides the same order.
+        assert_eq!(seqs(log.read_newest(Some("session"), 0, usize::MAX)), [3, 2, 1]);
+        // The `ts` floor is inclusive and measured in the log's ms.
+        assert_eq!(seqs(log.read_newest(Some("session"), 2_000, usize::MAX)), [3, 2]);
+        assert_eq!(
+            seqs(log.read_newest(Some("session"), 2_001, usize::MAX)),
+            Vec::<u64>::new(),
+            "nothing past the floor"
+        );
+        // The limit keeps the NEWEST rows — an oldest-first page was the
+        // bug this read replaces.
+        assert_eq!(seqs(log.read_newest(None, 0, 2)), [4, 3]);
+        assert_eq!(seqs(log.read_newest(None, 0, 0)), Vec::<u64>::new());
+        // An absent log reads empty, never errors.
+        assert!(
+            EventLog::new(&Layout::new(&root.join("gone")))
+                .read_newest(None, 0, 10)
+                .is_empty()
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Past [`EVENT_LOG_MAX_BYTES`] the log rewrites keeping the newest
@@ -2007,6 +2183,7 @@ mod tests {
                     pid,
                     heartbeat_ms: heartbeat,
                     triple,
+                    debug_sessions: 0,
                 },
             }
         };
@@ -2036,6 +2213,7 @@ mod tests {
                     fvmrc: None,
                     binary_hash: "bin1".to_owned(),
                 },
+                debug_sessions: 0,
             },
         };
         registry.upsert(&dead).expect("upsert");
@@ -2095,6 +2273,7 @@ mod tests {
                     pid,
                     heartbeat_ms: heartbeat,
                     triple,
+                    debug_sessions: 0,
                 },
             }
         };

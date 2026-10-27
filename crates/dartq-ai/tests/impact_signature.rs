@@ -1,10 +1,10 @@
 //! The impact report's signature-evidence face (#338 → #1561): since v2
-//! the `changed` section's per-symbol verdict compares the member-level
+//! the `sym` section's per-symbol verdict compares the member-level
 //! signature digests — a stable name whose canonical face moved ships its
 //! row, the v1 name-presence proxy's documented under-report. These pins
-//! date the contract: the row carries exactly `symbol` and
-//! `signature_changed` (the digest pair stays internal), and the verdict
-//! keys on the digest comparison.
+//! date the contract: the row carries exactly the wire keys `sym` and
+//! `sig_changed` (the digest pair stays internal), and the verdict keys on
+//! the digest comparison.
 
 use dartq_ai::impact::{
     self as query, FileSnapshot, IMPACT_SCHEMA_VERSION, ImpactLevel, LibraryChange,
@@ -54,8 +54,8 @@ fn signature_digest(tag: u8) -> [u8; 16] {
 }
 
 /// An API-level change (a face name added) ships the verdict row with
-/// `signature_changed: true` — and the row carries exactly the `symbol`
-/// and `signature_changed` keys: the digest pair behind the verdict stays
+/// `sig_changed: true` — and the row carries exactly the `sym` and
+/// `sig_changed` wire keys: the digest pair behind the verdict stays
 /// internal to the query.
 #[test]
 fn signature_change_ships_the_verdict_without_evidence() {
@@ -86,12 +86,12 @@ fn signature_change_ships_the_verdict_without_evidence() {
     );
 
     let value = serde_json::to_value(&report).expect("serialize");
-    let row = value["changed"][0].as_object().expect("row object");
+    let row = value["sym"][0].as_object().expect("row object");
     let mut keys: Vec<&str> = row.keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["signature_changed", "symbol"],
+        ["sig_changed", "sym"],
         "the row shape — the digest pair stays internal"
     );
 }

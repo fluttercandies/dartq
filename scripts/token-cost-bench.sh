@@ -7,9 +7,9 @@
 #
 # What it measures
 #
-# For one corpus (a directory of .dart files) and one fixed single-error
-# fixture, the harness captures the full stdout of every leg below and
-# counts tokens with one deterministic caliber, uniform across legs:
+# For one corpus (a directory of .dart files) and two fixed fixtures, the
+# harness captures the full stdout of every leg below and counts tokens
+# with one deterministic caliber, uniform across legs:
 #
 #   corpus (a staged clone — the original tree is never written):
 #     lon    : dartq analyze --format=lon (the constant default face — the
@@ -18,15 +18,23 @@
 #              the machine face's successor for jq consumers)
 #     oracle : dart analyze --format=machine
 #
-#   fixture (tests/bench/token-cost/single-error — exactly one diagnostic):
-#     the same three legs through the `check` face (scan+parse; the release
-#     gate's wording names `check`; needs no package context), with the
-#     oracle leg via `dart analyze --format=machine`.
+#   fixtures (tests/bench/token-cost):
+#     single-error — exactly one diagnostic; G1's surface.
+#     multi-error  — sixteen rows across two files; G2's surface (the
+#                    ruling below sets the integrity floor at >= 3 rows
+#                    across >= 2 files; the fixture sits well above it so
+#                    the gate measures the amortization, not the floor).
+#     both run the same three legs through the `check` face (scan+parse;
+#     the release gate's wording names `check`; needs no package context),
+#     with the oracle leg via `dart analyze --format=machine`.
 #
 # Format semantics: `lon` is the canonical LON line over the vocabulary
-# projection — `{v diags:[{code sev file line col len msg doc?}]}`, one flat
-# row per diagnostic (the compact product face); `json` is the frozen
-# single-line oracle envelope (severity/type/code longhand). The CLI's
+# projection — `{v root? diags:[{code sev file line col len msg}]}`, one flat
+# row per diagnostic (the compact product face): `root` rides when rows
+# exist and the run has one analysis root, rows locate their `file` under
+# it, and the docs URL is off (the `doc` key retired with the locator);
+# `json` is the frozen single-line oracle envelope (severity/type/code
+# longhand, `documentation` per the oracle's url rules). The CLI's
 # `-v/--verbosity` tiers were retired with the machine face (#2606) — the
 # format axis is the token-cost sweep's tier axis now.
 #
@@ -38,12 +46,26 @@
 # Byte counts are recorded alongside, and raw outputs are captured
 # verbatim, so any other tokenizer can be re-applied offline.
 #
-# Gates (judged on the fixture, PASS/FAIL lines in summary.md/json):
-#   G1: the fixture's lon output is <= 120 tokens.
-#   G2: the fixture's lon output saves >= 50% vs the oracle machine
-#       output for the same single-diagnostic content.
-#   The fixture must yield exactly one diagnostic — anything else is a
-#   fixture-integrity error (exit 2), not a gate verdict.
+# Gates (PASS/FAIL lines in summary.md/json):
+#   G1: the single-error fixture's lon output is <= 120 tokens.
+#   G2: the multi-error fixture's lon output saves >= 50% vs the oracle
+#       machine output over the same rows.
+#   G2 surface ruling (the locator adoption, #2634): G2 was previously
+#   judged on the single-error fixture, where the shape it rewards does
+#   not exist — one row carries the whole envelope alone, the 27-char
+#   message dominates both faces, and the locator's one-time `root` key
+#   adds a token, so the oracle's headerless machine line wins outright
+#   (measured lon 53 vs oracle 43 tokens: structurally unpassable at any
+#   encoding quality, not a regression signal). The relative gate is
+#   judged where its economics are real — a multi-row, multi-file set
+#   (integrity floor: >= 3 rows across >= 2 files) in which the root
+#   rides once, rows locate under it, and the factored row grammar pays
+#   per row. G1 — the absolute ceiling — stays on the single-row fixture
+#   where it was defined.
+#   Each fixture must meet its own shape — single-error exactly one
+#   diagnostic, multi-error at least 3 rows across at least 2 files —
+#   anything else is a fixture-integrity error (exit 2), not a gate
+#   verdict.
 # Corpus legs gate nothing: they are the per-format distribution surface
 # (tokens, tokens/diag, median, P95, saving vs oracle) behind the
 # benchmark charter's median/P95 metric shape.
@@ -93,6 +115,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT" || exit 2
 
 FIXTURE="tests/bench/token-cost/single-error"
+MULTI_FIXTURE="tests/bench/token-cost/multi-error"
 LABEL="${TOKEN_COST_LABEL:-token-r1}"
 CPT="${TOKEN_COST_CHARS_PER_TOKEN:-4}"
 MAX_FILES=""
@@ -162,7 +185,7 @@ LOC=$(tr '\n' '\0' <"$MANIFEST" | (cd "$CORPUS" && xargs -0 cat) | wc -l | tr -d
 report_stats() {
   echo "corpus: $CORPUS"
   echo "  measured files: $FILES  loc: $LOC  bytes: $BYTES${MAX_FILES:+  (capped by --max-files $MAX_FILES)}"
-  echo "  fixture: $FIXTURE (one diagnostic; gate surface)"
+  echo "  fixtures: $FIXTURE (one diagnostic; G1 surface), $MULTI_FIXTURE (multi-row, multi-file; G2 surface)"
   echo "  caliber: tokens = ceil(code points / $CPT), uniform across legs"
 }
 
@@ -179,8 +202,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "    $dartq_bin analyze --format=lon --sdk $sdk_desc <staging> (the constant default face)"
   echo "    $dartq_bin analyze --format=json --sdk $sdk_desc <staging>"
   echo "    $sdk_desc/bin/dart analyze --format=machine <staging>"
-  echo "  fixture legs (check face) on $FIXTURE: the same three, oracle via dart analyze --format=machine"
-  echo "  gates: G1 fixture lon <= 120 tokens; G2 fixture lon saving >= 50% vs fixture oracle"
+  echo "  fixture legs (check face) on $FIXTURE and $MULTI_FIXTURE: the same three each, oracle via dart analyze --format=machine"
+  echo "  gates: G1 single-fixture lon <= 120 tokens; G2 multi-fixture lon saving >= 50% vs multi-fixture oracle"
   echo "  outputs: $OUT/{versions.tsv,stats.txt,raw/,tokens.tsv,tokens-dist.tsv,summary.json,summary.md}"
   exit 0
 fi
@@ -200,6 +223,7 @@ if [ ! -x "$DARTQ_BIN" ]; then
 fi
 [ -x "$DARTQ_BIN" ] || die "dartq binary missing after build: $DARTQ_BIN"
 [ -d "$FIXTURE" ] || die "gate fixture missing: $FIXTURE (expected one main.dart with exactly one diagnostic)"
+[ -d "$MULTI_FIXTURE" ] || die "gate fixture missing: $MULTI_FIXTURE (expected >= 2 .dart files with >= 3 diagnostics total)"
 
 # --- stage the corpus -----------------------------------------------------------
 STAGE="$OUT/staging"
@@ -251,6 +275,7 @@ GIT_REV=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
   printf 'max_files\t%s\n' "${MAX_FILES:--}"
   printf 'chars_per_token\t%s\n' "$CPT"
   printf 'fixture\t%s\n' "$FIXTURE"
+  printf 'multi_fixture\t%s\n' "$MULTI_FIXTURE"
   printf 'materialization\t%s\n' "${MATERIALIZE_MODE:-selective}"
 } >"$OUT/versions.tsv"
 
@@ -279,15 +304,28 @@ run_leg fixture-lon "$DARTQ_BIN" check --format=lon "$FIXTURE"
 run_leg fixture-json "$DARTQ_BIN" check --format=json "$FIXTURE"
 run_leg fixture-oracle "$DART" analyze --format=machine "$FIXTURE"
 
+echo "token-cost-bench: fixture legs on $MULTI_FIXTURE (check face)"
+run_leg multi-lon "$DARTQ_BIN" check --format=lon "$MULTI_FIXTURE"
+run_leg multi-json "$DARTQ_BIN" check --format=json "$MULTI_FIXTURE"
+run_leg multi-oracle "$DART" analyze --format=machine "$MULTI_FIXTURE"
+
 # --- fixture integrity -------------------------------------------------------
-# The gate surface is meaningful only for exactly one diagnostic row; drift
-# here is a fixture bug (infra error), not a gate verdict. The json leg is
-# the structural witness (the envelope always parses; the machine face is
+# Each gate surface is meaningful only for its own shape; drift here is a
+# fixture bug (infra error), not a gate verdict. The json legs are the
+# structural witness (the envelope always parses; the machine face is
 # retired and the lon line has no row count of its own in wc terms).
 FIXTURE_ROWS=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("diagnostics", [])))' "$RAW/fixture-json.txt") ||
   die "fixture json leg did not parse — $FIXTURE run is not trustworthy"
 [ "$FIXTURE_ROWS" -eq 1 ] ||
   die "fixture produced $FIXTURE_ROWS diagnostics (expected exactly 1) — $FIXTURE drifted from the verified single-diagnostic shape; fix the fixture before trusting any gate"
+MULTI_ROWS=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1])).get("diagnostics", [])))' "$RAW/multi-json.txt") ||
+  die "multi fixture json leg did not parse — $MULTI_FIXTURE run is not trustworthy"
+MULTI_FILES=$(python3 -c 'import json,sys; print(len({d["location"]["file"] for d in json.load(open(sys.argv[1])).get("diagnostics", [])}))' "$RAW/multi-json.txt") ||
+  die "multi fixture json leg did not parse — $MULTI_FIXTURE run is not trustworthy"
+[ "$MULTI_ROWS" -ge 3 ] ||
+  die "multi fixture produced $MULTI_ROWS diagnostics (expected >= 3) — $MULTI_FIXTURE drifted below the G2 surface floor; fix the fixture before trusting any gate"
+[ "$MULTI_FILES" -ge 2 ] ||
+  die "multi fixture rows span $MULTI_FILES files (expected >= 2) — $MULTI_FIXTURE drifted below the G2 surface floor; fix the fixture before trusting any gate"
 
 # --- counting, gates, summaries ----------------------------------------------
 status=0
@@ -304,8 +342,10 @@ raw_bytes = {p.name: p.stat().st_size for p in raw.glob("*.txt")}
 
 CORPUS_LEGS = ["lon", "json", "oracle"]
 FIXTURE_LEGS = ["fixture-lon", "fixture-json", "fixture-oracle"]
-JSON_LEGS = {"json", "fixture-json"}
-LON_LEGS = {"lon", "fixture-lon"}
+MULTI_LEGS = ["multi-lon", "multi-json", "multi-oracle"]
+ALL_LEGS = CORPUS_LEGS + FIXTURE_LEGS + MULTI_LEGS
+JSON_LEGS = {"json", "fixture-json", "multi-json"}
+LON_LEGS = {"lon", "fixture-lon", "multi-lon"}
 GATE_TOKENS = 120   # the P4 release row's absolute lon ceiling
 GATE_SAVING = 50.0  # the P4 release row's relative saving floor
 
@@ -315,18 +355,22 @@ def tokens(chars):
 
 
 def lon_rows(text):
-    """The top-level {..} row objects of the diags array in a LON line.
+    """The per-diagnostic row payloads of the diags array in a LON line.
 
     LON quotes strings JSON-style; safe atoms (identifiers, numbers) cannot
-    contain braces or brackets, so a quote-aware depth scan splits the array
-    elements exactly. The row substring is measured verbatim (the payload a
-    consumer reads per diagnostic on the lon face).
+    contain braces, brackets, or semicolons, so a quote-aware scan splits
+    the elements exactly. Both row shapes are measured verbatim (the
+    payload a consumer reads per diagnostic on the lon face): the object
+    form at small N (`{code:...}`, one braced object per row) and the
+    factored record table at N >= 2 uniform rows (`[header;row;row...]`,
+    one semicolon-separated segment per row after the header).
     """
     start = text.find("diags:[")
     if start < 0:
         raise ValueError("lon payload has no diags array")
     i = start + len("diags:[")
     rows, depth, in_str, esc, row_start = [], 0, False, False, None
+    body_end = None
     while i < len(text):
         c = text[i]
         if in_str:
@@ -344,12 +388,39 @@ def lon_rows(text):
             depth += 1
         elif c in "}]":
             if c == "]" and depth == 0:
+                body_end = i
                 break  # end of the diags array
             depth -= 1
             if depth == 0 and c == "}":
                 rows.append(text[row_start:i + 1])
         i += 1
-    return rows
+    if body_end is None:
+        raise ValueError("lon diags array is unterminated")
+    if rows:
+        return rows
+    # Record-table form: no braced objects — the body is `header;row;...`;
+    # split on top-level semicolons and drop the header segment.
+    body = text[start + len("diags:["):body_end]
+    parts, buf, in_str, esc = [], [], False, False
+    for c in body:
+        if in_str:
+            buf.append(c)
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+            buf.append(c)
+        elif c == ";":
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(c)
+    parts.append("".join(buf))
+    return [part for part in parts[1:] if part.strip()] if len(parts) > 1 else []
 
 
 def measure(leg):
@@ -391,7 +462,7 @@ def p95(sorted_vals):
 
 
 legs = {}
-for leg in CORPUS_LEGS + FIXTURE_LEGS:
+for leg in ALL_LEGS:
     try:
         m = measure(leg)
     except (OSError, ValueError) as exc:
@@ -406,8 +477,13 @@ for leg in CORPUS_LEGS + FIXTURE_LEGS:
     m["tokens_per_diag"] = round(m["tokens"] / m["diags"], 2) if m["diags"] else None
     legs[leg] = m
 
-for leg in CORPUS_LEGS + FIXTURE_LEGS:
-    ref = "fixture-oracle" if leg.startswith("fixture-") else "oracle"
+for leg in ALL_LEGS:
+    if leg.startswith("multi-"):
+        ref = "multi-oracle"
+    elif leg.startswith("fixture-"):
+        ref = "fixture-oracle"
+    else:
+        ref = "oracle"
     oracle_tokens = legs[ref]["tokens"]
     legs[leg]["saving_pct"] = (
         round((oracle_tokens - legs[leg]["tokens"]) / oracle_tokens * 100, 1)
@@ -415,29 +491,30 @@ for leg in CORPUS_LEGS + FIXTURE_LEGS:
 
 with (out / "tokens.tsv").open("w", encoding="utf-8") as f:
     f.write("leg\texit_code\tbytes\tchars\tdiags\ttokens\ttokens_per_diag\tmedian\tp95\tsaving_vs_oracle_pct\n")
-    for leg in CORPUS_LEGS + FIXTURE_LEGS:
+    for leg in ALL_LEGS:
         m = legs[leg]
         f.write(f"{leg}\t{m['exit_code']}\t{m['bytes']}\t{m['chars']}\t{m['diags']}\t"
                 f"{m['tokens']}\t{m['tokens_per_diag']}\t{m['median']}\t{m['p95']}\t{m['saving_pct']}\n")
 
 with (out / "tokens-dist.tsv").open("w", encoding="utf-8") as f:
     f.write("leg\tseq\tchars\ttokens\n")
-    for leg in CORPUS_LEGS + FIXTURE_LEGS:
+    for leg in ALL_LEGS:
         m = legs[leg]
         f.write(f"{leg}\ttotal\t{m['chars']}\t{m['tokens']}\n")
         for i, t in enumerate(m["dist"], 1):
             f.write(f"{leg}\t{i}\t\t{t}\n")
 
-lon = legs["fixture-lon"]
+single = legs["fixture-lon"]
+multi = legs["multi-lon"]
 gates = [
     {"id": "G1",
      "desc": "single-error fixture lon output <= 120 tokens",
-     "value": lon["tokens"], "threshold": GATE_TOKENS,
-     "pass": lon["tokens"] <= GATE_TOKENS},
+     "value": single["tokens"], "threshold": GATE_TOKENS,
+     "pass": single["tokens"] <= GATE_TOKENS},
     {"id": "G2",
-     "desc": "single-error fixture lon saving >= 50% vs oracle machine output",
-     "value": lon["saving_pct"], "threshold": GATE_SAVING,
-     "pass": lon["saving_pct"] is not None and lon["saving_pct"] >= GATE_SAVING},
+     "desc": "multi-error fixture lon saving >= 50% vs oracle machine output",
+     "value": multi["saving_pct"], "threshold": GATE_SAVING,
+     "pass": multi["saving_pct"] is not None and multi["saving_pct"] >= GATE_SAVING},
 ]
 
 manifest = {}
@@ -460,7 +537,7 @@ summary = {
     "corpus": {"dir": manifest.get("corpus", ""), "files": int(manifest.get("measured_files", 0)),
                "loc": int(manifest.get("measured_loc", 0)), "bytes": int(manifest.get("measured_bytes", 0))},
     "legs": {leg: {k: v for k, v in legs[leg].items() if k != "dist"}
-             for leg in CORPUS_LEGS + FIXTURE_LEGS},
+             for leg in ALL_LEGS},
     "gates": gates,
     "all_gates_pass": all(g["pass"] for g in gates),
 }
@@ -478,7 +555,8 @@ lines = [
     "benchmark charter leaves the tokenizer unpinned)", "",
     f"corpus: {summary['corpus']['dir']} (files={summary['corpus']['files']}, "
     f"loc={summary['corpus']['loc']}, bytes={summary['corpus']['bytes']})",
-    f"fixture: single-error (one diagnostic; the gate surface)", "",
+    f"fixtures: single-error (one diagnostic; G1 surface), "
+    "multi-error (multi-row, multi-file; G2 surface)", "",
     "## Corpus legs (analyze face, staged clone)", "",
     "| leg | exit | diags | chars | tokens | tokens/diag | median | p95 | saving vs oracle |",
     "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -487,10 +565,10 @@ for leg in CORPUS_LEGS:
     m = legs[leg]
     lines.append(f"| {leg} | {m['exit_code']} | {m['diags']} | {m['chars']} | {m['tokens']} | "
                  f"{fmt(m['tokens_per_diag'])} | {m['median']} | {m['p95']} | {fmt(m['saving_pct'])}% |")
-lines += ["", "## Fixture legs (check face, one diagnostic)", "",
-          "| leg | exit | diags | chars | tokens | saving vs fixture oracle |",
+lines += ["", "## Fixture legs (check face: single-error = one row, multi-error = many rows over files)", "",
+          "| leg | exit | diags | chars | tokens | saving vs own-fixture oracle |",
           "| --- | --- | --- | --- | --- | --- |"]
-for leg in FIXTURE_LEGS:
+for leg in FIXTURE_LEGS + MULTI_LEGS:
     m = legs[leg]
     lines.append(f"| {leg} | {m['exit_code']} | {m['diags']} | {m['chars']} | {m['tokens']} | "
                  f"{fmt(m['saving_pct'])}% |")

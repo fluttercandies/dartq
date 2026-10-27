@@ -54,7 +54,10 @@ enum DebugCommand {
     Stop(SessionArgs),
     /// The worktree's debug sessions and their stopped states —
     /// orientation after a stop event. With `-s/--session`, one
-    /// session's detail including its breakpoints.
+    /// session's detail including its breakpoints. The answer is always
+    /// a document — `v`, `sessions`, `orphans` (the re-attach trail of
+    /// sessions a daemon released on its way out, #2619) — even when
+    /// both arrays are empty: a machine face never prints nothing.
     Status(StatusArgs),
     /// A stopped frame snapshot of one isolate: why it stopped, where,
     /// the stack summary, and the top frame's variables with

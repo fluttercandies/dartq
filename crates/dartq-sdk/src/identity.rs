@@ -14,7 +14,7 @@ use serde::Serialize;
 use dartq_language::LanguageVersion;
 use dartq_source::{ContentId, content_hash};
 
-use crate::metadata::{AllowedExperiments, SdkIdentity, SdkLibraries};
+use crate::metadata::{AllowedExperiments, SdkIdentity, SdkLibraries, TargetLibraries};
 
 /// Computes the snapshot id over the parsed metadata parts.
 pub(crate) fn snapshot_id(
@@ -22,6 +22,7 @@ pub(crate) fn snapshot_id(
     language: LanguageVersion,
     sdk_libraries: &SdkLibraries,
     platform_metadata: &AllowedExperiments,
+    embedder: Option<&TargetLibraries>,
 ) -> ContentId {
     let fingerprint = SnapshotFingerprint {
         dart_version: &dart.version,
@@ -30,6 +31,7 @@ pub(crate) fn snapshot_id(
         language_minor: language.minor,
         targets: &sdk_libraries.targets,
         allowed_experiments: platform_metadata,
+        embedder,
     };
     let bytes = serde_json::to_vec(&fingerprint)
         .expect("canonical fingerprint holds only maps and strings; serialization cannot fail");
@@ -39,13 +41,18 @@ pub(crate) fn snapshot_id(
 /// The canonical metadata view the id hashes. Serde emits struct fields in
 /// declaration order and `BTreeMap` keys sorted, so the byte form is
 /// deterministic; raw-file hashes are deliberately excluded (they live in
-/// [`SdkIdentity`] for change detection only).
+/// [`SdkIdentity`] for change detection only). The embedder table is
+/// serialized only while present, so plain snapshots keep the exact
+/// pre-embedder fingerprint bytes (no id churn for non-Flutter workspaces)
+/// and an embedder-backed load forks the id through its parsed table.
 #[derive(Serialize)]
 struct SnapshotFingerprint<'a> {
     dart_version: &'a str,
     dart_revision: Option<&'a str>,
     language_major: u32,
     language_minor: u32,
-    targets: &'a std::collections::BTreeMap<String, crate::metadata::TargetLibraries>,
+    targets: &'a std::collections::BTreeMap<String, TargetLibraries>,
     allowed_experiments: &'a AllowedExperiments,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedder: Option<&'a TargetLibraries>,
 }

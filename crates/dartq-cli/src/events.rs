@@ -1,5 +1,5 @@
-//! The `dartq events` shell: the unified event read — cursor-paginated
-//! JSONL over the session's event log (`session` handle) and the
+//! The `dartq events` shell: the unified event read — newest-first
+//! paged JSONL over the session's event log (`session` handle) and the
 //! cold-analysis progress snapshot (`progress` handle, derived from the
 //! engine trace: files scanned, current package — the anti-hung signal
 //! for a monster monorepo's first pass). Test-run and debug-session
@@ -28,11 +28,16 @@ pub struct EventsArgs {
     /// The worktree; defaults to the current directory.
     #[arg(default_value = ".")]
     pub dir: PathBuf,
-    /// The cursor: events after this sequence (the last read line's
-    /// `seq`); `progress` treats it as the last-seen file count.
+    /// The session handle's timestamp floor: only rows at or after
+    /// this UNIX-seconds instant (default: no floor — every row,
+    /// newest first); `progress` treats it as the last-seen file
+    /// count.
     #[arg(long)]
     pub since: Option<u64>,
-    /// At most this many events per read (session handle).
+    /// At most this many events per read, keeping the newest rows
+    /// (session handle). 100 is the standing default: one page a
+    /// screen-sized agent read wants, and low enough that a monster
+    /// session's log never floods a context.
     #[arg(long, default_value_t = 100)]
     pub limit: usize,
     /// Output format: `lon` (the default, one canonical line per row),
@@ -53,7 +58,12 @@ pub fn run_entry(args: &EventsArgs) -> u8 {
     match args.handle.as_str() {
         "session" => {
             let log = EventLog::new(&layout);
-            for (_, event) in log.read(None, args.since.unwrap_or_default(), args.limit) {
+            // #2622: newest first — an oldest-first page never reached
+            // the newest rows, which is the read an agent tailing the
+            // session wants. `--since` is a UNIX-seconds floor on the
+            // rows' own timestamps.
+            let since_ms = args.since.map_or(0, |secs| u128::from(secs) * 1000);
+            for (_, event) in log.read_newest(None, since_ms, args.limit) {
                 match args.format {
                     OutputFormat::Lon => println!("{}", lon_line(&event)),
                     OutputFormat::Json => println!("{event}"),
@@ -123,8 +133,9 @@ mod tests {
     }
 
     /// The grammar: the handle defaults to `session`, the dir to the cwd,
-    /// `--since` is optional, `--limit` defaults to 100, and `lon` is the
-    /// constant format default.
+    /// `--since` is an optional UNIX-seconds floor (session handle),
+    /// `--limit` defaults to 100, and `lon` is the constant format
+    /// default.
     #[test]
     fn events_args_parse() {
         let args = parse(&[]).expect("parse");
@@ -163,7 +174,12 @@ mod tests {
             })
         };
         assert_eq!(read("session", None, 100), exit::CLEAN);
-        assert_eq!(read("session", Some(2), 100), exit::CLEAN, "cursor pagination");
+        assert_eq!(read("session", Some(2), 100), exit::CLEAN, "a far-past floor keeps every row");
+        assert_eq!(
+            read("session", Some(u64::MAX), 100),
+            exit::CLEAN,
+            "a future floor reads nothing, still clean"
+        );
         assert_eq!(read("session", None, 0), exit::CLEAN, "a zero limit reads nothing");
         // The progress handle: no trace is zero progress; a trace past the
         // cursor prints, at-or-below prints nothing — both clean.

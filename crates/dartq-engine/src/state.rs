@@ -581,7 +581,10 @@ pub(crate) enum GrantOwner {
 ///   each `dart:` library's directory (`<root>/lib/<dirname(uri)>`) from the
 ///   flat existence table maps to its name, so a file attributed by its disk
 ///   path — the engine keeps no `dart:` URIs — recovers the owning library
-///   exactly when the path was produced by a `dart:` resolution.
+///   exactly when the path was produced by a `dart:` resolution. While an
+///   embedder backs the snapshot the reverse table (and the root it hangs
+///   under) derives from the embedder's own replacement table instead —
+///   full replacement, the resolution face's own rule.
 /// - `memo` is the `(owner, version) -> FeatureSet` cache the per-file
 ///   lanes share: one derivation per distinct pair per engine, O(1) lookups
 ///   after first touch. `Mutex`-guarded because the lanes read `&state` on
@@ -657,7 +660,7 @@ impl FeatureGrants {
         options: &FxHashMap<PathBuf, Arc<crate::analysis_options::AnalysisOptions>>,
         experiments: &[String],
     ) -> Self {
-        let lib_root: Box<Path> = Box::from(sdk.dart_sdk_root().join("lib"));
+        let lib_root: Box<Path>;
         let mut sdk_library_dirs = FxHashMap::default();
         let mut any = false;
         if let Some(segment) = sdk.target(target) {
@@ -667,19 +670,42 @@ impl FeatureGrants {
                 }
             }
         }
-        // Library directories come from the flat existence face — the same
-        // table `dart:` URI resolution answers from — so a path produced by
-        // a resolution attributes to its library whatever segment (or
+        // The dart: attribution face derives from the snapshot's own
+        // tables: while an embedder backs it, every `dart:` URI resolves
+        // under the yaml's directory and only the embedder's table exists
+        // (full replacement), so the root gate and the reverse directory
+        // table both come from [`SdkSnapshot::embedder`] — never a
+        // hardcoded embedder path. The plain load keeps the dart-sdk
+        // `lib/` root and the flat existence table — the same table
+        // `dart:` URI resolution answers from, so a path produced by a
+        // resolution attributes to its library whatever segment (or
         // platform variant) its source lives in. The library's directory:
-        // `<lib>/<dirname(uri)>` — the join always has a parent (`uri` is
-        // non-empty and relative).
-        for (name, uri) in dartq_sdk::FLAT_LIBRARIES.iter().copied() {
-            let dir = lib_root
-                .join(uri)
-                .parent()
-                .expect("library path under lib/ always has a directory")
-                .to_path_buf();
-            sdk_library_dirs.insert(Box::from(dir), Box::from(name));
+        // `<base>/<dirname(uri)>` — the join always has a parent (`uri`
+        // is non-empty and relative).
+        match sdk.embedder() {
+            Some((base, table)) => {
+                for (name, library) in &table.libraries {
+                    let dir = base
+                        .join(&library.uri)
+                        .parent()
+                        .expect("library path under the yaml dir always has a directory")
+                        .to_path_buf();
+                    sdk_library_dirs.insert(Box::from(dir), Box::from(name.as_str()));
+                }
+                lib_root = Box::from(base);
+            }
+            None => {
+                let dart_lib_root: Box<Path> = sdk.dart_sdk_root().join("lib").into_boxed_path();
+                for (name, uri) in dartq_sdk::FLAT_LIBRARIES.iter().copied() {
+                    let dir = dart_lib_root
+                        .join(uri)
+                        .parent()
+                        .expect("library path under lib/ always has a directory")
+                        .to_path_buf();
+                    sdk_library_dirs.insert(Box::from(dir), Box::from(name));
+                }
+                lib_root = dart_lib_root;
+            }
         }
         any |= packages.iter().any(|package| {
             sdk.platform_metadata
@@ -907,9 +933,11 @@ impl FeatureGrants {
     }
 
     /// The grant owner of `file`: an SDK library when the path lies under
-    /// the SDK's `lib/` (walked up to the nearest library directory — the
-    /// exact inverse of `SdkSnapshot::flat_library_to_path`, so parts
-    /// attribute to their `dart:` library), else the containing package. The SDK branch
+    /// the attribution root — the SDK's `lib/`, or the embedder yaml's
+    /// directory while an embedder backs the snapshot — (walked up to the
+    /// nearest library directory — the exact inverse of
+    /// `SdkSnapshot::flat_library_to_path`, so parts attribute to their
+    /// `dart:` library), else the containing package. The SDK branch
     /// runs first because the oracle attributes `dart:`-URI files before
     /// any package lookup (`feature_set_provider.dart:58-69`); an SDK tree
     /// nested under a package root is still dart:-owned.
@@ -2718,5 +2746,140 @@ mod tests {
         assert!(a2 == a || a2 == c, "interns draw from the freelist");
         assert_eq!(table.ids_by_uri.get("package:a/a.dart"), Some(&a2));
         assert_eq!(table.arena_len(), 3);
+    }
+
+    /// The synthetic SDK + `sky_engine`-shaped embedder tree of the
+    /// grant-attribution tests (the dartq-sdk load fixture's shape,
+    /// compact): the three metadata files plus an `_embedder.yaml` mapping
+    /// `dart:core` and `dart:ui` under the embedder's lib directory.
+    /// Removed on drop.
+    struct GrantTree {
+        root: PathBuf,
+    }
+
+    impl GrantTree {
+        fn new(tag: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("dq_engine_grants_{tag}_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let write = |relative: &str, content: &str| {
+                let path = root.join(relative);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+                std::fs::write(path, content).expect("file");
+            };
+            write("dart-sdk/version", "3.13.1\n");
+            write(
+                "dart-sdk/lib/libraries.json",
+                r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+            );
+            write(
+                "dart-sdk/lib/_internal/allowed_experiments.json",
+                r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+            );
+            write("dart-sdk/lib/core/core.dart", "library dart.core;");
+            write(
+                "sky_engine/lib/_embedder.yaml",
+                "embedded_libs:\n  \"dart:core\": \"embedder_core.dart\"\n  \"dart:ui\": \"ui/ui.dart\"\n",
+            );
+            write("sky_engine/lib/embedder_core.dart", "library dart.core;");
+            write("sky_engine/lib/ui/ui.dart", "library dart.ui;");
+            // Canonicalized so the table's realpath-normalized file paths
+            // and the snapshot's literal base-dir spellings agree (macOS
+            // `/var` → `/private/var`) — the same universe the engine's
+            // path-universe invariant builds over.
+            let root = root.canonicalize().expect("fixture root resolves");
+            Self { root }
+        }
+
+        /// The snapshot over the tree, embedder-backed or plain.
+        fn sdk(&self, embedder: bool) -> SdkSnapshot {
+            let embedder_dir = embedder.then(|| self.root.join("sky_engine").join("lib"));
+            SdkSnapshot::load(&self.root.join("dart-sdk"), embedder_dir.as_deref())
+                .expect("synthetic SDK loads")
+        }
+
+        /// The grants over the tree's snapshot, with an empty package table
+        /// (the SDK attribution branch runs before any package lookup).
+        fn grants(&self, embedder: bool) -> (FeatureGrants, IdentityTable) {
+            let packages = IdentityTable::basic(&self.root, None).expect("empty table");
+            let grants = FeatureGrants::new(
+                &self.sdk(embedder),
+                "vm",
+                &packages,
+                &FxHashMap::default(),
+                &[],
+            );
+            (grants, packages)
+        }
+    }
+
+    impl Drop for GrantTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// An embedder-backed snapshot attributes files under the embedder
+    /// directory to their `dart:` library (#2633): the reverse directory
+    /// table derives from the embedder's own replacement mapping, so the
+    /// `for_sdk_library` grant face reaches embedder-resolved files — and
+    /// the dart-sdk `lib/` tree the table replaced attributes nothing
+    /// (full replacement, the resolution face's own rule).
+    #[test]
+    fn embedder_files_attribute_to_their_dart_library() {
+        let tree = GrantTree::new("embedder");
+        let (grants, packages) = tree.grants(true);
+        let mut files = FileTable::new();
+        let mut owner = |path: PathBuf| {
+            let file = files.intern(path.as_path());
+            grants.owner_for(&packages, &files, file)
+        };
+
+        assert_eq!(
+            owner(tree.root.join("sky_engine").join("lib").join("ui").join("ui.dart")),
+            Some(GrantOwner::SdkLibrary("ui".into())),
+            "a mapped library file attributes to its dart: name"
+        );
+        assert_eq!(
+            owner(tree.root.join("sky_engine").join("lib").join("ui").join("painting.dart")),
+            Some(GrantOwner::SdkLibrary("ui".into())),
+            "a part under the library's directory attributes the same"
+        );
+        assert_eq!(
+            owner(tree.root.join("sky_engine").join("lib").join("embedder_core.dart")),
+            Some(GrantOwner::SdkLibrary("core".into())),
+            "a mapped library directly in the yaml's directory attributes"
+        );
+        assert_eq!(
+            owner(tree.root.join("dart-sdk").join("lib").join("core").join("core.dart")),
+            None,
+            "the replaced dart-sdk tree attributes nothing while the embedder backs the table"
+        );
+    }
+
+    /// The plain snapshot's attribution is untouched by the embedder
+    /// branch: the dart-sdk `lib/` reverse table stands (the flat existence
+    /// table's directories), and files under an embedder directory are
+    /// nobody's SDK library.
+    #[test]
+    fn plain_snapshot_attribution_stands_without_an_embedder() {
+        let tree = GrantTree::new("plain");
+        let (grants, packages) = tree.grants(false);
+        let mut files = FileTable::new();
+        let mut owner = |path: PathBuf| {
+            let file = files.intern(path.as_path());
+            grants.owner_for(&packages, &files, file)
+        };
+
+        assert_eq!(
+            owner(tree.root.join("dart-sdk").join("lib").join("core").join("bool.dart")),
+            Some(GrantOwner::SdkLibrary("core".into())),
+            "the flat table's core directory still attributes its parts"
+        );
+        assert_eq!(
+            owner(tree.root.join("sky_engine").join("lib").join("ui").join("ui.dart")),
+            None,
+            "an embedder directory outside the dart-sdk tree is no SDK library"
+        );
     }
 }

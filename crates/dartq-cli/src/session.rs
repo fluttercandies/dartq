@@ -364,13 +364,26 @@ fn print_state(format: OutputFormat, state: &SessionState, attached: bool) {
 // The serve loop
 // ---------------------------------------------------------------------------
 
+/// The serve loop's wake granularity: the accept tick, the beater's
+/// sleep slices, and the signal poll all ride it. The beater must not
+/// sleep a whole [`HEARTBEAT`] blind — the shutdown ladder joins it,
+/// and an idle daemon's exit has to land in milliseconds
+/// ([`dartq_session::REAP_GRACE`] covers only the debug-detach ladder).
+const TICK: Duration = Duration::from_millis(250);
+
 /// The resident loop: bind the session socket, announce the state, and
 /// serve daemon-protocol clients one at a time — the engine (the
 /// session) persists across clients; each connection is a full
 /// `dartq-daemon` serve until the client disconnects. Between
 /// connections the loop wakes on a 250 ms tick to heartbeat the state
-/// and to reap itself after [`IDLE_TIMEOUT`] with no client (no
-/// self-pipe: the tick replaces it — the Windows posture, unix-native).
+/// and to reap itself after [`IDLE_TIMEOUT`] with no client and no
+/// held debug session (#2619: an attached debug session freezes the
+/// idle clock; SIGTERM/SIGINT and every exit path take the
+/// graceful-shutdown ladder that detaches — resumes — every held
+/// session first; no self-pipe: the tick replaces it — the Windows
+/// posture, unix-native). A signal landing while a client is held is
+/// polled at the same granularity inside the client loop (#2632), so
+/// the ladder runs without waiting for that client to disconnect.
 fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     let root = match std::fs::canonicalize(&args.dir) {
         Ok(root) => root,
@@ -437,7 +450,11 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
         return exit::SOFTWARE;
     }
     let registry = Registry::open();
-    heartbeat(&layout, &registry, &triple);
+    // #2632: the heartbeat advertises the held debug-session count (the
+    // reaper's SIGTERM grace scales by it); the counter's shareable
+    // handle feeds the beat thread, which cannot borrow the session.
+    let held_sessions = session.debug_sessions_counter();
+    heartbeat(&layout, &registry, &triple, held_sessions.load(std::sync::atomic::Ordering::Relaxed));
 
     // #2591: the heartbeat owns its own thread. Beating between accepts
     // tied liveness to client service — a long client connection (a
@@ -451,57 +468,167 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     let beat_triple = triple.clone();
     let beat_registry = Registry::open();
     let beat_flag = std::sync::Arc::clone(&beating);
+    let beat_held = std::sync::Arc::clone(&held_sessions);
     let beater = std::thread::Builder::new()
         .name("dartq-heartbeat".into())
         .spawn(move || {
             while beat_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(HEARTBEAT);
+                // The beat window in TICK slices, not one HEARTBEAT
+                // sleep: the ladder's join must not wait out a full
+                // window — exit latency stays at the tick granularity.
+                let wake_at = Instant::now() + HEARTBEAT;
+                while Instant::now() < wake_at
+                    && beat_flag.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    std::thread::sleep(TICK);
+                }
                 if beat_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    heartbeat(&beat_layout, &beat_registry, &beat_triple);
+                    heartbeat(
+                        &beat_layout,
+                        &beat_registry,
+                        &beat_triple,
+                        beat_held.load(std::sync::atomic::Ordering::Relaxed),
+                    );
                 }
             }
         })
         .expect("the heartbeat thread spawns");
 
     let mut last_client = Instant::now();
+    // #2619: the exit signals land in a flag this loop's tick polls —
+    // SIGTERM (the election reap's grace window, `session stop`) and
+    // SIGINT both take the graceful ladder below instead of killing a
+    // daemon that holds paused debug sessions. Registration failure
+    // degrades to the default disposition (an immediate death, the
+    // pre-#2619 behavior), never a failed serve.
+    let signalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signals_ready = {
+        use signal_hook::consts::{SIGINT, SIGTERM};
+        signal_hook::flag::register(SIGTERM, std::sync::Arc::clone(&signalled))
+            .and_then(|_| signal_hook::flag::register(SIGINT, std::sync::Arc::clone(&signalled)))
+            .is_ok()
+    };
+    if !signals_ready {
+        eprintln!("dartq: session serve: signal handling unavailable; exit signals kill in place");
+    }
     loop {
+        if signalled.load(std::sync::atomic::Ordering::Relaxed) {
+            return serve_shutdown(
+                &mut session,
+                &events,
+                &layout,
+                &root,
+                &beating,
+                beater,
+                "signal",
+                exit::CLEAN,
+            );
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 last_client = Instant::now();
                 let _ = stream.set_nonblocking(false);
                 let _ = events.append("session", "client_attached", serde_json::json!({}));
-                serve_client(stream, &mut session);
+                serve_client(stream, &mut session, &signalled);
                 let _ = events.append("session", "client_detached", serde_json::json!({}));
-                heartbeat(&layout, &registry, &triple);
+                heartbeat(
+                    &layout,
+                    &registry,
+                    &triple,
+                    held_sessions.load(std::sync::atomic::Ordering::Relaxed),
+                );
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => {
                 eprintln!("dartq: session serve: accept failed: {error}");
-                beating.store(false, std::sync::atomic::Ordering::Relaxed);
-                let _ = beater.join();
-                cleanup(&layout, &root);
-                return exit::SOFTWARE;
+                return serve_shutdown(
+                    &mut session,
+                    &events,
+                    &layout,
+                    &root,
+                    &beating,
+                    beater,
+                    "accept_failed",
+                    exit::SOFTWARE,
+                );
             }
         }
-        if Instant::now().duration_since(last_client) > idle_timeout {
-            let _ = events.append("session", "reaped", serde_json::json!({"idle_s": idle_timeout.as_secs()}));
-            beating.store(false, std::sync::atomic::Ordering::Relaxed);
-            let _ = beater.join();
-            cleanup(&layout, &root);
-            return exit::CLEAN;
+        if idle_elapsed(last_client, Instant::now(), session.debug_sessions_len()) > idle_timeout {
+            return serve_shutdown(
+                &mut session,
+                &events,
+                &layout,
+                &root,
+                &beating,
+                beater,
+                "idle",
+                exit::CLEAN,
+            );
         }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(TICK);
     }
 }
 
-/// One client connection: the daemon protocol until the peer closes.
-fn serve_client(stream: UnixStream, session: &mut dartq_daemon::Session) {
+/// The idle clock (#2619): client silence, frozen at zero while any
+/// debug session is attached — a held debug session is never idle (a
+/// paused app must not outlive its daemon by reaper fiat), and on
+/// detach a full fresh idle window runs.
+fn idle_elapsed(last_client: Instant, now: Instant, debug_sessions: usize) -> Duration {
+    if debug_sessions > 0 {
+        Duration::ZERO
+    } else {
+        now.saturating_duration_since(last_client)
+    }
+}
+
+/// Every serve-loop exit path takes this ladder (#2619): first detach
+/// (resume) every held debug session through the worker — bounded per
+/// session by dartq-debug's release budget, inside the election reap's
+/// grace — then append the `shutdown` event naming what was released,
+/// stop the beat, clean the layout, and exit. A daemon must never die
+/// leaving a paused app frozen behind it.
+fn serve_shutdown(
+    session: &mut dartq_daemon::Session,
+    events: &EventLog,
+    layout: &Layout,
+    root: &Path,
+    beating: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    beater: std::thread::JoinHandle<()>,
+    reason: &str,
+    code: u8,
+) -> u8 {
+    let released = session.debug_shutdown().unwrap_or(0);
+    let _ = events.append(
+        "session",
+        "shutdown",
+        serde_json::json!({"reason": reason, "sessions_released": released}),
+    );
+    beating.store(false, std::sync::atomic::Ordering::Relaxed);
+    let _ = beater.join();
+    cleanup(layout, root);
+    code
+}
+
+/// One client connection: the daemon protocol until the peer closes —
+/// or until the exit signal fires under it (#2632: the client loop
+/// polls the same flag the accept tick does, at the same 250 ms
+/// granularity, so a signal landing while a long-lived client — the
+/// MCP stdio proxy — is held finishes the in-flight turn, answers or
+/// cleanly closes, and hands the loop back for the shutdown ladder;
+/// without this the reaper's SIGKILL would land first and every held
+/// debug session died un-resumed).
+fn serve_client(
+    stream: UnixStream,
+    session: &mut dartq_daemon::Session,
+    signalled: &std::sync::atomic::AtomicBool,
+) {
     let Ok(read) = stream.try_clone() else {
         return;
     };
     // The read half is the clone; the original stream stays the write
-    // half. run owns both and returns at the client's disconnect.
-    let _ = dartq_daemon::run(read, stream, session, None);
+    // half. run owns both and returns at the client's disconnect or the
+    // exit signal.
+    let _ = dartq_daemon::run_with_signal(read, stream, session, None, Some(signalled));
 }
 
 /// Binds the socket, unlinking a leftover file once (a crashed server's
@@ -513,12 +640,16 @@ fn bind_takeover(layout: &Layout) -> io::Result<UnixListener> {
     })
 }
 
-/// The liveness rewrite: state.json plus the registry record.
-fn heartbeat(layout: &Layout, registry: &Registry, triple: &SessionTriple) {
+/// The liveness rewrite: state.json plus the registry record. `held`
+/// is the live debug-session count (#2632) — the reaper reading either
+/// copy scales its SIGTERM grace by it instead of SIGKILLing a daemon
+/// mid-detach.
+fn heartbeat(layout: &Layout, registry: &Registry, triple: &SessionTriple, held: usize) {
     let state = SessionState {
         pid: std::process::id(),
         heartbeat_ms: SessionState::now_ms(),
         triple: triple.clone(),
+        debug_sessions: held,
     };
     if state.write(layout).is_ok() {
         let _ = registry.upsert(&Record { id: triple.identity(), state });
@@ -546,6 +677,15 @@ pub(crate) fn serve_loop_for_tests(dir: &Path, sdk: &Path) -> u8 {
 pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    /// Serializes every test that runs a serve loop in-process: #2632's
+    /// pin fires a real SIGTERM, which is process-wide — it sets the
+    /// flag of every registered serve loop, not just its own, so any
+    /// concurrently running serve test dies as collateral (its loop
+    /// takes the shutdown ladder and cleanup strips the state/socket
+    /// out from under its assertions). Shared with the mcp module's
+    /// serve test via `serve_loop_for_tests`.
+    pub(crate) static SIGNAL_SERIALIZATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A short-rooted fixture (unix sockets cap at ~104 path bytes): a
     /// package with a stub SDK — the shape the daemon session assembles
@@ -619,6 +759,10 @@ pub(crate) mod tests {
     /// reads the engine trace the serve loop armed.
     #[test]
     fn events_faces_read_the_served_session() {
+        // In-process serve loop: collateral of the real signal test (see
+        // SIGNAL_SERIALIZATION) — a stray SIGTERM would tear the socket
+        // and state down mid-roundtrip.
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_fixture("events");
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
@@ -667,6 +811,9 @@ pub(crate) mod tests {
     /// exits cleanly once the last client is gone.
     #[test]
     fn serve_loop_serves_a_client_then_reaps_itself() {
+        // This pin asserts the shutdown's reason; a stray signal from the
+        // parallel signal test would rewrite it (see SIGNAL_SERIALIZATION).
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_fixture("loop");
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
@@ -694,6 +841,109 @@ pub(crate) mod tests {
         assert_eq!(code, exit::CLEAN);
         assert!(!layout.socket.exists(), "the socket was removed at reap");
         assert!(!layout.state.exists(), "the state was removed at reap");
+        // #2619: the reap took the graceful ladder — the shutdown event
+        // names the reason and what it released (nothing held here).
+        let shutdown = EventLog::new(&layout)
+            .read(Some("session"), 0, usize::MAX)
+            .into_iter()
+            .find(|(_, value)| value["event"].as_str() == Some("shutdown"))
+            .map(|(_, value)| value)
+            .expect("the shutdown event landed");
+        assert_eq!(shutdown["data"]["reason"], "idle");
+        assert_eq!(shutdown["data"]["sessions_released"], 0);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// #2619: the idle clock — client silence, frozen at zero while any
+    /// debug session is attached. A held session is never idle however
+    /// long the silence, and on detach a full fresh idle window runs.
+    #[test]
+    fn the_idle_clock_freezes_while_debug_sessions_are_attached() {
+        let start = Instant::now();
+        let silent_for = |secs: u64, sessions: usize| {
+            idle_elapsed(start, start + Duration::from_secs(secs), sessions)
+        };
+        assert_eq!(silent_for(0, 0), Duration::ZERO);
+        assert_eq!(
+            silent_for(16 * 60, 0),
+            Duration::from_secs(16 * 60),
+            "no session: plain silence counts"
+        );
+        assert_eq!(
+            silent_for(16 * 60, 1),
+            Duration::ZERO,
+            "one held session freezes the clock past the timeout"
+        );
+        assert_eq!(
+            silent_for(16 * 60, 4),
+            Duration::ZERO,
+            "several held sessions are never idle either"
+        );
+    }
+
+    /// #2632: the exit signal under a held client. A quiet long-lived
+    /// connection (the MCP stdio proxy's shape) used to pin the loop
+    /// inside `serve_client` until the client disconnected — a SIGTERM
+    /// landed unobserved, the reaper's SIGKILL escalation arrived first,
+    /// and every held debug session died un-resumed. With the client
+    /// loop polling the flag, the signal finishes the turn, the client
+    /// sees a clean end, and the serve loop takes its shutdown ladder
+    /// naming the signal.
+    #[test]
+    fn the_exit_signal_unblocks_a_held_client_into_the_shutdown_ladder() {
+        // The real SIGTERM this pin delivers sets every registered
+        // serve-loop flag in the process; the serial lock keeps the other
+        // reason-asserting serve pins out of its window.
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = test_fixture("signal-held");
+        let serve_dir = root.clone();
+        let serve_sdk = root.join("sdk");
+        let server = std::thread::spawn(move || {
+            serve_loop(&ServeArgs { dir: serve_dir, sdk: serve_sdk }, Duration::from_secs(1))
+        });
+        let layout = Layout::new(&root);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !dartq_session::socket_open(&layout) {
+            assert!(Instant::now() < deadline, "the serve loop never listened");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Hold a client open, quiet — the exact shape that used to pin
+        // the loop. The idle timeout (1 s here) must NOT fire while it
+        // is held; only the signal may end the serve. The hold stays
+        // short so the post-signal return to the loop top (≤ one 250 ms
+        // tick + one 250 ms sleep) still beats the idle window.
+        let held = UnixStream::connect(&layout.socket).expect("client connects");
+        std::thread::sleep(Duration::from_millis(100));
+        // The exit signal lands while the client is held. In-process,
+        // the serve loop's own flag registration turns the real SIGTERM
+        // into the flag set — no test hook needed.
+        // SAFETY: SIGTERM to this test process reaches only the serve
+        // loop's registered flag (its disposition replaced the default
+        // when the loop started); nothing else in the harness arms one.
+        unsafe {
+            libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM);
+        }
+        let joined = Instant::now() + Duration::from_secs(10);
+        while !server.is_finished() && Instant::now() < joined {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            server.is_finished(),
+            "the signal ended the held-client serve without waiting for the client"
+        );
+        drop(held);
+        let code = server.join().expect("server thread");
+        assert_eq!(code, exit::CLEAN);
+        // The ladder ran for the signal's reason, not the idle reaper's.
+        let shutdown = EventLog::new(&layout)
+            .read(Some("session"), 0, usize::MAX)
+            .into_iter()
+            .find(|(_, value)| value["event"].as_str() == Some("shutdown"))
+            .map(|(_, value)| value)
+            .expect("the shutdown event landed");
+        assert_eq!(shutdown["data"]["reason"], "signal");
+        assert_eq!(shutdown["data"]["sessions_released"], 0);
+        assert!(!layout.socket.exists(), "the socket was removed at shutdown");
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -704,6 +954,11 @@ pub(crate) mod tests {
     /// accept loop, so the state stays fresh under a held client.
     #[test]
     fn the_heartbeat_stays_fresh_while_a_client_is_held_open() {
+        // In-process serve loop: collateral of the real signal test (see
+        // SIGNAL_SERIALIZATION) — a stray SIGTERM would run this loop's
+        // shutdown ladder and strip the state file mid-hold (the observed
+        // full-suite failure: "state while held").
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_fixture("beat-held");
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
@@ -716,16 +971,36 @@ pub(crate) mod tests {
             assert!(Instant::now() < deadline, "the serve loop never listened");
             std::thread::sleep(Duration::from_millis(50));
         }
-        // Hold a client open past one-and-a-half heartbeat windows.
+        // Hold a client open and pin the beat under it, deterministically:
+        // first learn the heartbeat current at hold entry (the serve
+        // thread's initial write lands between bind and the first accept,
+        // so it may postdate the connect), then wait — bounded, polling
+        // the observable state write rather than sleeping a fixed window
+        // a loaded host can stretch — for a strictly newer beat while the
+        // client stays held. That newer beat can only come from the beat
+        // thread, which must therefore be independent of client service.
         let held = UnixStream::connect(&layout.socket).expect("client connects");
-        let held_start = SessionState::now_ms();
-        std::thread::sleep(HEARTBEAT + HEARTBEAT / 2);
-        let state = SessionState::read(&layout).expect("state while held");
-        let age_ms = SessionState::now_ms().saturating_sub(state.heartbeat_ms);
-        assert!(
-            age_ms < held_start.saturating_sub(state.heartbeat_ms) + u128::try_from(HEARTBEAT.as_millis()).expect("ms"),
-            "the beat stayed fresh under a held client: age {age_ms} ms"
-        );
+        let entry_hb = loop {
+            match SessionState::read(&layout) {
+                Some(state) => break state.heartbeat_ms,
+                None => {
+                    assert!(Instant::now() < deadline, "the initial heartbeat never landed");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        };
+        let beat_by = Instant::now() + 2 * HEARTBEAT;
+        loop {
+            let beat = SessionState::read(&layout).map(|state| state.heartbeat_ms);
+            if beat.is_some_and(|heartbeat_ms| heartbeat_ms > entry_hb) {
+                break;
+            }
+            assert!(
+                Instant::now() < beat_by,
+                "no heartbeat newer than hold entry landed while the client was held: {beat:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
         drop(held);
         let _ = server.join();
         std::fs::remove_dir_all(&root).ok();
@@ -737,6 +1012,9 @@ pub(crate) mod tests {
     /// the session dir), and the protocol round-trips over it.
     #[test]
     fn a_long_checkout_path_still_listens_on_the_relocated_socket() {
+        // In-process serve loop: collateral of the real signal test (see
+        // SIGNAL_SERIALIZATION).
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // A root deep enough that `<root>/.dart_tool/dartq/session.sock`
         // blows the 104-byte sun_path: one long directory name under /tmp.
         let segment = "w".repeat(72);
@@ -989,7 +1267,12 @@ pub(crate) mod tests {
             }
         });
         let child = std::process::Command::new("sleep").arg("30").spawn().expect("sleep child");
-        let state = SessionState { pid: child.id(), heartbeat_ms: SessionState::now_ms(), triple: triple.clone() };
+        let state = SessionState {
+            pid: child.id(),
+            heartbeat_ms: SessionState::now_ms(),
+            triple: triple.clone(),
+            debug_sessions: 0,
+        };
         state.write(&layout).expect("state");
         let record = Record { id: triple.identity(), state };
         registry.upsert(&record).expect("upsert");

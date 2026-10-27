@@ -50,7 +50,7 @@ use thiserror::Error;
 
 use crate::Verbosity;
 use crate::layout::EngineLayout;
-use crate::workspace::package_assembly_strict;
+use crate::workspace::{embedder_lib_dir, package_assembly_strict};
 
 /// Why a compat run aborts without a matrix: workspace problems are the
 /// CLI's usage tier, engine failures the internal tier (each carries its
@@ -118,6 +118,15 @@ pub fn compat(
     // nested self-resolved roots, and the config-required refusals.
     let (config, graph, config_dir, advisory) = package_assembly_strict(&canonical_dir)
         .map_err(|error| CompatError::Usage(error.to_string()))?;
+    // The analysis root the file columns locate against, derived through
+    // the same table build every axis's engine uses (one extra build per
+    // run — beside the N engines it is noise, and it stays provably the
+    // same root the axes' label projections strip against, whatever the
+    // table's derivation rule becomes).
+    let analysis_root = PackageTable::build(&config, &graph, &config_dir)
+        .map_err(|error| CompatError::Usage(error.to_string()))?
+        .workspace_root()
+        .to_path_buf();
     // The assembly's one advisory rides the human stream ahead of the axis
     // notices; it is not an engine row, so it cannot enter the matrix.
     let mut notices: Vec<String> = Vec::new();
@@ -126,15 +135,18 @@ pub fn compat(
     }
     let mut matrix: Vec<AxisInput> = Vec::with_capacity(sdk_roots.len());
     for root in sdk_roots {
-        let (axis, axis_notices) = analyze_axis(root, &config, &graph, &config_dir)?;
+        let (axis, axis_notices) = analyze_axis(root, &config, &graph, &config_dir, &analysis_root)?;
         matrix.push(axis);
         notices.extend(axis_notices);
     }
 
-    Ok((
-        query::compatibility(&canonical_target.display().to_string(), &matrix),
-        notices,
-    ))
+    let mut report = query::compatibility(
+        &crate::pkg_label::locate(&analysis_root, &canonical_target),
+        &matrix,
+    );
+    // The subject file always rides, so its locator root always does.
+    report.root = Some(analysis_root.display().to_string());
+    Ok((report, notices))
 }
 
 /// Shapes the report at the requested verbosity tier — the canonical compat
@@ -181,19 +193,33 @@ pub fn to_json(report: &query::CompatReport) -> serde_json::Value {
 /// One matrix axis: assemble the engine under `root`'s snapshot over the
 /// shared package resolution, run the other faces' discover + analyze
 /// passes, and collect the axis's ERROR-severity diagnostics plus the
-/// axis's version-skew degrade notices (#1311). An SDK root that fails to
-/// load is an `sdk_unavailable` axis, never an abort (axis failure
-/// isolation). The engine drops at function end — one semantic graph alive
-/// at a time (bounded-memory doctrine).
+/// axis's version-skew degrade notices (#1311). `analysis_root` is the
+/// locator root the failure rows' `file` columns spell against (the same
+/// root every axis derives — the shared resolution's workspace root). An
+/// SDK root that fails to load is an `sdk_unavailable` axis, never an
+/// abort (axis failure isolation). The engine drops at function end — one
+/// semantic graph alive at a time (bounded-memory doctrine).
 fn analyze_axis(
     root: &Path,
     config: &Arc<PackageConfig>,
     graph: &ResolvedPackageGraph,
     config_dir: &Path,
+    analysis_root: &Path,
 ) -> Result<(AxisInput, Vec<String>), CompatError> {
+    // The axis snapshot rides the resolution's embedder table when the
+    // shared config carries a `sky_engine` package (the default context's
+    // posture — a Flutter package compares all axes with `dart:ui`
+    // resolved); an unusable embedder yaml degrades to the plain dart-sdk
+    // table, the analyzer's never-refuse rule.
+    let loaded = match embedder_lib_dir(config, config_dir) {
+        Some(lib_dir) => {
+            SdkSnapshot::load(root, Some(&lib_dir)).or_else(|_| SdkSnapshot::load(root, None))
+        }
+        None => SdkSnapshot::load(root, None),
+    };
     // A failed load has no version to label itself with: the axis keeps the
     // root it was given.
-    let snapshot = match SdkSnapshot::load(root, None) {
+    let snapshot = match loaded {
         Ok(snapshot) => snapshot,
         Err(error) => {
             return Ok((
@@ -264,9 +290,9 @@ fn analyze_axis(
             let (line, col) = layout.line_col(diag.file, diag.range.offset);
             Failure {
                 code: diag.code.name.to_owned(),
-                // The same package-form label projection the other AI faces
-                // emit, not the raw path.
-                file: crate::pkg_label::pkg_label(engine.packages(), layout.file_path(diag.file)),
+                // The one file locator's spelling, the same projection
+                // the other AI faces' file columns keep.
+                file: crate::pkg_label::locate(analysis_root, layout.file_path(diag.file)),
                 line,
                 col,
                 message: diag.message.clone().into_owned(),
@@ -293,14 +319,15 @@ mod tests {
     fn at_verbosity_drops_evidence_rows_at_minimal() {
         let report = query::CompatReport {
             schema_version: query::COMPAT_SCHEMA_VERSION,
-            file: "/w/lib/a.dart".to_owned(),
+            root: Some("/w".to_owned()),
+            file: "lib/a.dart".to_owned(),
             matrix: vec![
                 query::AxisCompat {
                     sdk: "3.5.0".to_owned(),
                     compatible: false,
                     first_failure: Some(query::Failure {
                         code: "uri_does_not_exist".to_owned(),
-                        file: "/w/lib/a.dart".to_owned(),
+                        file: "lib/a.dart".to_owned(),
                         line: 1,
                         col: 8,
                         message: "Target of URI doesn't exist".to_owned(),
@@ -347,7 +374,8 @@ mod tests {
     fn golden_report() -> query::CompatReport {
         query::CompatReport {
             schema_version: query::COMPAT_SCHEMA_VERSION,
-            file: "/w/lib/a.dart".to_owned(),
+            root: Some("/w".to_owned()),
+            file: "lib/a.dart".to_owned(),
             matrix: vec![
                 query::AxisCompat {
                     sdk: "3.13.1".to_owned(),
@@ -360,7 +388,7 @@ mod tests {
                     compatible: false,
                     first_failure: Some(query::Failure {
                         code: "uri_does_not_exist".to_owned(),
-                        file: "/w/lib/a.dart".to_owned(),
+                        file: "lib/a.dart".to_owned(),
                         line: 1,
                         col: 8,
                         message: "Target of URI doesn't exist: 'dart:async'".to_owned(),
@@ -513,12 +541,13 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The `Failure.file` label is the package-form projection (a `package:`
-    /// URI for `lib/` files), not the raw canonical path: a `lib/` file of
-    /// package `fixture` answers
-    /// `package:fixture/a.dart`, matching the other AI faces' references.
+    /// The `Failure.file` label is the located spelling (root-relative
+    /// inside the analysis root, absolute outside), not the raw canonical
+    /// path or a `package:` URI: a `lib/` file inside the workspace root
+    /// answers `lib/a.dart`, matching the other AI faces' file columns,
+    /// and the envelope carries the root once.
     #[test]
-    fn first_failure_file_is_the_package_label() {
+    fn first_failure_file_is_located_with_the_root() {
         let root = fixture("pkglabel");
         // A missing file target lands `uri_does_not_exist` on every stub SDK
         // (the file-existence face is axis-independent; the `dart:` table is
@@ -530,6 +559,7 @@ mod tests {
         .expect("lib file");
         let target = root.join("lib/a.dart");
         let (report, _notices) = compat(&root, &target, &[root.join("sdks/clean")]).expect("run");
+        let canonical = root.canonicalize().expect("root");
         assert_eq!(report.matrix.len(), 1);
         let failure = report.matrix[0]
             .first_failure
@@ -537,8 +567,17 @@ mod tests {
             .expect("the uri_does_not_exist row");
         assert_eq!(failure.code, "uri_does_not_exist");
         assert_eq!(
-            failure.file, "package:fixture/a.dart",
-            "the file reference projects to the package form"
+            failure.file, "lib/a.dart",
+            "the file column spells through the locator"
+        );
+        assert_eq!(
+            report.file, "lib/a.dart",
+            "the subject label spells through the same locator"
+        );
+        assert_eq!(
+            report.root.as_deref(),
+            Some(canonical.display().to_string().as_str()),
+            "the envelope carries the analysis root once"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -665,5 +704,71 @@ mod tests {
             "{notices:?}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Writes the `sky_engine`-shaped package: `lib/_embedder.yaml` mapping
+    /// `dart:core` and `dart:ui` inside the package, plus the mapped files.
+    fn write_sky_engine(root: &Path) {
+        std::fs::create_dir_all(root.join("sky_engine/lib/ui")).expect("package dirs");
+        std::fs::write(
+            root.join("sky_engine/lib/_embedder.yaml"),
+            "embedded_libs:\n  \"dart:core\": \"embedder_core.dart\"\n  \"dart:ui\": \"ui/ui.dart\"\n",
+        )
+        .expect("embedder yaml");
+        std::fs::write(
+            root.join("sky_engine/lib/embedder_core.dart"),
+            "library dart.core;",
+        )
+        .expect("embedder core");
+        std::fs::write(root.join("sky_engine/lib/ui/ui.dart"), "library dart.ui;")
+            .expect("embedder ui");
+    }
+
+    /// The fixture's package config plus one `sky_engine` entry
+    /// (config-relative `rootUri`, the pub-writer spelling).
+    fn rewrite_config_with_sky_engine(root: &Path) {
+        std::fs::write(
+            root.join(".dart_tool/package_config.json"),
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}, {"name": "sky_engine", "rootUri": "../sky_engine", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub"}"#,
+        )
+        .expect("config");
+    }
+
+    /// The axis snapshot rides the resolution's embedder table (#2633): a
+    /// `sky_engine` entry in the package config turns every axis's
+    /// `dart:` table into the embedder's replacement, so an
+    /// `import 'dart:ui'` target analyzes compatible; without the entry
+    /// the same target keeps the plain dart-sdk table and the axis fails
+    /// on `uri_does_not_exist`.
+    #[test]
+    fn axis_snapshot_rides_the_resolution_embedder_table() {
+        // The embedder-backed resolution: the axis is compatible.
+        let root = fixture("embedder");
+        write_sky_engine(&root);
+        rewrite_config_with_sky_engine(&root);
+        std::fs::write(root.join("lib/a.dart"), "import 'dart:ui';\nclass Foo {}\n")
+            .expect("lib file");
+        let (report, _) = compat(&root, &root.join("lib/a.dart"), &[root.join("sdks/clean")])
+            .expect("the embedder axis answers");
+        assert_eq!(report.matrix.len(), 1);
+        assert!(report.matrix[0].compatible, "dart:ui resolves: {report:?}");
+        assert!(report.matrix[0].first_failure.is_none());
+        std::fs::remove_dir_all(&root).ok();
+
+        // The plain resolution: the same target's missing `dart:ui` is the
+        // one ERROR, and it flips the axis.
+        let plain = fixture("embedder_plain");
+        std::fs::write(plain.join("lib/a.dart"), "import 'dart:ui';\nclass Foo {}\n")
+            .expect("lib file");
+        let (report, _) = compat(&plain, &plain.join("lib/a.dart"), &[plain.join("sdks/clean")])
+            .expect("the plain axis answers");
+        assert!(!report.matrix[0].compatible, "dart:ui does not exist");
+        let failure = report.matrix[0]
+            .first_failure
+            .as_ref()
+            .expect("the uri_does_not_exist row");
+        assert_eq!(failure.code, "uri_does_not_exist");
+        assert_eq!(failure.file, "lib/a.dart");
+        std::fs::remove_dir_all(&plain).ok();
     }
 }

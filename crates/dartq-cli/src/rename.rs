@@ -145,7 +145,7 @@ fn run(args: &RenameArgs, out: &mut impl Write) -> u8 {
     };
 
     if args.write {
-        if let Err(code) = apply(&plan, &args.new_name, &dir) {
+        if let Err(code) = apply(&plan, &args.new_name, &dir, args.format) {
             return code;
         }
     }
@@ -164,24 +164,65 @@ fn run(args: &RenameArgs, out: &mut impl Write) -> u8 {
     exit::CLEAN
 }
 
+/// The lon/json refusal document (#2618): `error`, the workspace bound,
+/// and EVERY out-of-boundary file under one `files` key — the atomic
+/// rule's full-list answer, never a first-reason only.
+fn refusal_document(workspace: &std::path::Path, outside: &[&std::path::Path]) -> serde_json::Value {
+    serde_json::json!({
+        "error": "outside_workspace",
+        "workspace": workspace.display().to_string(),
+        "files": outside
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// The `--write` stages: the workspace boundary gate first (only the
 /// analyzed workspace's own files are writable — an edit row outside it,
 /// such as a resolution into the SDK, refuses the run before anything is
-/// read), then collect-then-write (every patched buffer computed before
-/// any file changes; a write failing midway names the files already
-/// mutated).
-fn apply(plan: &RenameRun<'_>, new_name: &str, workspace: &std::path::Path) -> Result<(), u8> {
-    if let Some(path) = rename::outside_workspace(
+/// read; the atomic rule (#2618) — ANY out-of-boundary site refuses the
+/// whole write, and the refusal names EVERY refusing file: a
+/// `files:[...]`-keyed error document on stderr under the lon/json
+/// formats, one line per file under text), then collect-then-write (every
+/// patched buffer computed before any file changes; a write failing
+/// midway names the files already mutated).
+fn apply(
+    plan: &RenameRun<'_>,
+    new_name: &str,
+    workspace: &std::path::Path,
+    format: crate::OutputFormat,
+) -> Result<(), u8> {
+    let outside = rename::outside_workspace_all(
         plan.edits
             .iter()
             .map(|edit| plan.layout.file_path(edit.file)),
         workspace,
-    ) {
-        eprintln!(
-            "error: refusing to write outside the workspace {}: {}",
-            workspace.display(),
-            path.display()
-        );
+    );
+    if !outside.is_empty() {
+        match format {
+            crate::OutputFormat::Text => {
+                eprintln!(
+                    "error: refusing to write outside the workspace {}",
+                    workspace.display()
+                );
+                for path in &outside {
+                    eprintln!("  {}", path.display());
+                }
+            }
+            crate::OutputFormat::Json => {
+                let document = refusal_document(workspace, &outside);
+                if let Err(error) = writeln!(io::stderr(), "{document}") {
+                    eprintln!("dartq: internal error: writing the refusal failed: {error}");
+                }
+            }
+            crate::OutputFormat::Lon => {
+                let document = refusal_document(workspace, &outside);
+                if let Err(error) = crate::output::write_lon(&mut io::stderr(), &document) {
+                    eprintln!("dartq: internal error: writing the refusal failed: {error}");
+                }
+            }
+        }
         return Err(exit::USAGE);
     }
     let mut staged: Vec<(PathBuf, String)> = Vec::new();
@@ -417,5 +458,89 @@ mod tests {
         fs::remove_file(&stranger).ok();
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// The atomic boundary refusal (#2618): a `--write` whose edit set
+    /// reaches outside the workspace writes NOTHING and answers the FULL
+    /// list of out-of-boundary files — the `files:[...]` key of the
+    /// lon/json refusal document (pinned on the pure builder; stderr is
+    /// the process's own stream, unasserted here), usage exit, stdout
+    /// kept empty.
+    #[test]
+    fn rename_cli_write_refusal_answers_every_out_of_boundary_file() {
+        // The refusal document carries every refusing file under one key.
+        let root = std::path::Path::new("/w/fixture");
+        let a = std::path::Path::new("/w/deps/a/lib/x.dart");
+        let b = std::path::Path::new("/w/deps/b/lib/y.dart");
+        let document = refusal_document(root, &[a, b]);
+        assert_eq!(document["error"], "outside_workspace");
+        assert_eq!(
+            document["files"],
+            serde_json::json!([
+                a.display().to_string(),
+                b.display().to_string()
+            ]),
+            "every out-of-boundary file, in row order"
+        );
+
+        // End to end: a path dependency outside the workspace root feeds
+        // the edit set (the use plus the dependency's declaration), the
+        // write refuses, nothing lands on stdout, the exit is usage.
+        let root = workspace(
+            "boundary_refusal",
+            &[(
+                "lib/main.dart",
+                "import 'package:dep/extra.dart';\n\nint main() => extra();\n",
+            )],
+        );
+        let dep = root.parent().expect("temp parent").join(format!(
+            "dq_cli_rename_boundary_dep_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dep);
+        fs::create_dir_all(dep.join("lib")).expect("dep lib");
+        fs::write(dep.join("pubspec.yaml"), "name: dep\n").expect("dep pubspec");
+        fs::write(dep.join("lib/extra.dart"), "int extra() => 1;\n").expect("dep file");
+        let dep = dep.canonicalize().expect("dep root resolves");
+        fs::write(
+            root.join(".dart_tool/package_config.json"),
+            format!(
+                concat!(
+                    r#"{{"configVersion": 2, "packages": [{{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}}, "#,
+                    r#"{{"name": "dep", "rootUri": "{}", "packageUri": "lib/", "languageVersion": "3.5"}}], "generator": "pub"}}"#
+                ),
+                dep.to_string_lossy().replace('\\', "\\\\").replace('\"', "\\\"")
+            ),
+        )
+        .expect("config");
+
+        let root = root.canonicalize().expect("canonical root");
+        let main = root.join("lib/main.dart");
+        let source = fs::read_to_string(&main).expect("main text");
+        let at = source.find("=> extra()").expect("call") + 3;
+        let target = format!("{}:{}", main.display(), at);
+        let sdk = root.join("sdk").display().to_string();
+        for format in ["json", "text"] {
+            let args = args_of(
+                &root,
+                &[&target, "--new-name", "zulu", "--sdk", &sdk, "--write", "--format", format],
+            );
+            let mut out = Vec::new();
+            assert_eq!(run(&args, &mut out), exit::USAGE, "the write refuses");
+            assert!(out.is_empty(), "stdout stays empty on the refusal");
+        }
+        assert!(
+            fs::read_to_string(&main).expect("main unchanged").contains("extra()"),
+            "the workspace file was not written"
+        );
+        assert!(
+            fs::read_to_string(dep.join("lib/extra.dart"))
+                .expect("dep unchanged")
+                .contains("extra()"),
+            "the dependency file was not written"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&dep);
     }
 }

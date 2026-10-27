@@ -132,6 +132,12 @@ pub struct DeclHit<'a> {
 pub struct RefHit<'a> {
     /// The referenced declaration's file.
     pub target_file: FileId,
+    /// The referenced declaration's enclosing container for member targets
+    /// (#2618) — `(file, name)` alone cannot name a member (two classes in
+    /// one file may declare the same member name); [`None`] for top-level
+    /// targets. The override-closure rows carry the queried member's own
+    /// container (their target is that member's hierarchy).
+    pub target_container: Option<&'a str>,
     /// The use site's file — the library member whose capture recorded the
     /// row: a library spans its defining unit plus parts, so the target
     /// pair alone cannot locate the use (dartq-index `RefRow::file`).
@@ -249,6 +255,8 @@ pub(crate) fn symbols<'a>(state: &'a EngineState, name: &str) -> SymbolAnswer<'a
         .flatten()
         .map(|row: &RefRow| RefHit {
             target_file: row.target_file,
+            target_container: (row.target_container != StringId::NONE)
+                .then(|| state.strings.resolve(row.target_container)),
             file: row.file,
             kind: ReferenceKind::from(row.kind),
             explicit: row.qualified(),
@@ -278,16 +286,7 @@ pub(crate) fn symbols<'a>(state: &'a EngineState, name: &str) -> SymbolAnswer<'a
             let rows = capture.index.by_name(id)?;
             Some(
                 rows.iter()
-                    .filter(|row| {
-                        row.container != DeclRow::NONE
-                            && matches!(
-                                row.kind,
-                                DeclKind::Method
-                                    | DeclKind::Getter
-                                    | DeclKind::Setter
-                                    | DeclKind::Field
-                            )
-                    })
+                    .filter(|row| row.container != DeclRow::NONE && is_member_kind(row.kind))
                     .map(|row| (file, capture.index.row(row.container).name))
                     .collect::<Vec<_>>(),
             )
@@ -330,19 +329,18 @@ pub(crate) fn symbols<'a>(state: &'a EngineState, name: &str) -> SymbolAnswer<'a
                 for row in rows {
                     if row.container == DeclRow::NONE
                         || sub_capture.index.row(row.container).name != sub.1
-                        || !matches!(
-                            row.kind,
-                            DeclKind::Method
-                                | DeclKind::Getter
-                                | DeclKind::Setter
-                                | DeclKind::Field
-                        )
+                        || !is_member_kind(row.kind)
                         || !seen.insert((root.0, sub.0, row.range.offset))
                     {
                         continue;
                     }
                     overrides.push(RefHit {
                         target_file: root.0,
+                        // The row's target is the queried member's own
+                        // hierarchy: its container names the anchor's
+                        // declaring class, so the member-scoped consumers
+                        // (rename's target filter) keep the closure whole.
+                        target_container: Some(state.strings.resolve(root.1)),
                         file: sub.0,
                         kind: ReferenceKind::Override,
                         explicit: false,
@@ -417,6 +415,137 @@ fn subtype_closure(
         }
     }
     visited.into_iter()
+}
+
+/// The member kinds the override relation spans: a method, getter, setter,
+/// or field declaration of a class-like container — the predicate the
+/// override-row mint and the family face ([`override_family`]) share.
+fn is_member_kind(kind: DeclKind) -> bool {
+    matches!(
+        kind,
+        DeclKind::Method | DeclKind::Getter | DeclKind::Setter | DeclKind::Field
+    )
+}
+
+/// Whether `container` declares a member named `name` — an
+/// [`is_member_kind`] row of the name whose container anchor names
+/// `container` — the family membership predicate. A container whose file
+/// the resident captures do not hold answers false.
+fn declares_member(
+    state: &EngineState,
+    container: (FileId, StringId),
+    name: StringId,
+) -> bool {
+    let Some(capture) = state.capture(container.0) else {
+        return false;
+    };
+    capture.index.by_name(name).is_some_and(|rows| {
+        rows.iter().any(|row| {
+            row.container != DeclRow::NONE
+                && capture.index.row(row.container).name == container.1
+                && is_member_kind(row.kind)
+        })
+    })
+}
+
+/// The transitive supertypes of `container` over the surfaces' resolved
+/// edges — the upward twin of [`subtype_closure`]: one worklist walk over
+/// `supertypes_of`, workspace declarations only (a bare-name target outside
+/// the analyzed set carries no member rows to rename), the visited set the
+/// termination proof whatever the edge fan-out or the cycles recovery
+/// recorded.
+fn supertype_closure(
+    state: &EngineState,
+    container: (FileId, StringId),
+) -> FxHashSet<(FileId, StringId)> {
+    let mut visited: FxHashSet<(FileId, StringId)> = FxHashSet::default();
+    let mut worklist = vec![container];
+    while let Some(node) = worklist.pop() {
+        let Some(&library) = state.library_of_file.get(&node.0) else {
+            continue;
+        };
+        let Some(surface) = state.surface(library) else {
+            continue;
+        };
+        for edge in surface.supertypes_of(node.0, node.1).into_iter().flatten() {
+            if let TargetRef::Decl(file, name) = edge.supertype {
+                if visited.insert((file, name)) {
+                    worklist.push((file, name));
+                }
+            }
+        }
+    }
+    visited
+}
+
+/// The override family of one member declaration: every container that
+/// declares `name` connected to `container` through the inheritance
+/// closure — the whole hierarchy a member rename edits (the analyzer's
+/// rename of a method renames every declaration of the member in the
+/// family: supertype and subtype declarers, implementers, mixins — plus
+/// every reference whose static target is any of them, the caller's
+/// join).
+///
+/// The derivation is the one the override-row mint above walks —
+/// [`reverse_supertypes`] + [`subtype_closure`] down, [`supertype_closure`]
+/// up — run as a fixpoint: each newly-joined member contributes the
+/// declaring relatives of BOTH directions, so a subtype reached downward
+/// that joins a second branch (a mixin, a base class, a second interface)
+/// pulls that branch and its own implementers in too — a one-pass up/down
+/// walk would stop at the first branch and split the family by anchor.
+/// The fixpoint makes the family an equivalence class: anchoring at ANY
+/// member — interface, concrete override, or a use resolving to one —
+/// answers the identical set. A class reached through the closure that
+/// does not declare the member is walked through, never answered (it has
+/// no declaration to rename).
+///
+/// # Freshness contract
+///
+/// [`Engine::query_symbols`]'s, verbatim: a pure read of the latest
+/// [`crate::Engine::analyze`]'s maintained state — the only side effect is
+/// the caller-side interning of the queried spellings (the
+/// [`crate::Engine::override_family`] wrapper).
+///
+/// # Cost shape
+///
+/// One reverse adjacency build (O(units + containers + edges),
+/// [`reverse_supertypes`]) plus one up- and one down-closure walk per
+/// family member, each member processed exactly once (the family set
+/// doubles as the worklist's visited set) — the same cost class one
+/// `query symbols` answer pays at hierarchy scale. The answer sorts by
+/// `(file, container id)` and borrows the interned spellings — no
+/// allocation beyond the result Vec and the walk's transient sets.
+pub(crate) fn override_family<'a>(
+    state: &'a EngineState,
+    container: (FileId, StringId),
+    name: StringId,
+) -> Vec<(FileId, &'a str)> {
+    let subtypes = reverse_supertypes(state);
+    // The fixpoint worklist: a member joins exactly once, when first
+    // discovered, and is then processed once — contributing every
+    // declaring transitive supertype and subtype, whose own processing
+    // continues the alternation. Monotone growth over the finite container
+    // universe is the termination proof.
+    let mut family: FxHashSet<(FileId, StringId)> = FxHashSet::default();
+    family.insert(container);
+    let mut worklist = vec![container];
+    while let Some(member) = worklist.pop() {
+        for supertype in supertype_closure(state, member) {
+            if declares_member(state, supertype, name) && family.insert(supertype) {
+                worklist.push(supertype);
+            }
+        }
+        for sub in subtype_closure(&subtypes, member) {
+            if declares_member(state, sub, name) && family.insert(sub) {
+                worklist.push(sub);
+            }
+        }
+    }
+    let mut rows: Vec<(FileId, StringId)> = family.into_iter().collect();
+    rows.sort_unstable();
+    rows.into_iter()
+        .map(|(file, container)| (file, state.strings.resolve(container)))
+        .collect()
 }
 
 /// The `query callers` answer: every declaration whose body invokes the
@@ -920,23 +1049,31 @@ pub(crate) fn resolve_at(
     }
     let row = &refs[row as usize];
 
-    // The target's declaration row: a resolved target is always a library
+    // The target's declaration row: a parser-level target is a library
     // face of the target file (the namespace declarer and the local hop
     // both admit library faces only), so the name run's first face row is
-    // the resolution's target — the span the cursor faces jump to. The
-    // capture reads residency first, then the dependency interface tier
-    // (a use whose declaration sits in a lazily indexed dep file names its
-    // target exactly like a same-package one — the cross-package rename
-    // face's substrate). A phase disagreement (the resolution outran the
-    // target's capture or its declaring rows) answers `None` — not found,
-    // never a panic.
+    // the resolution's target; a member target (#2618) names its declaring
+    // CONTAINER — `(file, name)` alone cannot pick between two classes in
+    // one file declaring the same member name — the span the cursor faces
+    // jump to. The capture reads residency first, then the dependency
+    // interface tier (a use whose declaration sits in a lazily indexed dep
+    // file names its target exactly like a same-package one — the
+    // cross-package rename face's substrate). A phase disagreement (the
+    // resolution outran the target's capture or its declaring rows)
+    // answers `None` — not found, never a panic.
     let target = state
         .capture(row.target_file)
         .or_else(|| state.deps.units.get(&row.target_file).map(|unit| &unit.capture))?;
-    let decl = target
-        .index
-        .by_name(row.target_name)
-        .and_then(|run| run.iter().find(|decl| decl.is_library_face()))?;
+    let decl = target.index.by_name(row.target_name).and_then(|run| {
+        if row.target_container == StringId::NONE {
+            run.iter().find(|decl| decl.is_library_face())
+        } else {
+            run.iter().find(|decl| {
+                decl.container != DeclRow::NONE
+                    && target.index.row(decl.container).name == row.target_container
+            })
+        }
+    })?;
     Some(PositionAnswer::Use(UseHit {
         file,
         range: row.range,
@@ -1203,8 +1340,19 @@ mod tests {
         root
     }
 
-    /// A fresh engine over the fixture workspace.
+    /// A fresh engine over the fixture workspace (no semantic diagnoser —
+    /// the parser-level fixtures' posture).
     fn engine_over(root: &std::path::Path) -> Engine {
+        engine_over_with(root, None)
+    }
+
+    /// [`engine_over`] with an explicit semantic diagnoser — the
+    /// member-ref surface (#2618) rides the default fold, so its pins
+    /// configure it where the other fixtures keep `None`.
+    fn engine_over_with(
+        root: &std::path::Path,
+        semdiag: Option<Arc<dyn crate::SemanticDiagnoser>>,
+    ) -> Engine {
         let config_dir = root.join(".dart_tool");
         let config = Arc::new(
             PackageConfig::parse(
@@ -1231,12 +1379,79 @@ mod tests {
             packages: PackageTable::build(&config, &graph, &config_dir).expect("table"),
             pub_config: Arc::clone(&config),
             config_dir,
-            semdiag: None,
+            semdiag,
             target: DEFAULT_TARGET.to_owned(),
             declared_variables: rustc_hash::FxHashMap::default(),
             experiments: Vec::new(),
         })
         .expect("engine")
+    }
+
+    /// The #2618 pin: a member send on an interface-typed receiver reaches
+    /// the query surface — one `Invoked` reference row targeting the
+    /// INTERFACE declaration (the statically resolved one), with the
+    /// override closure appending the implementing declaration's
+    /// `Override` row beside it.
+    #[test]
+    fn member_sends_reach_the_reference_surface() {
+        let source = concat!(
+            "abstract class R {\n",
+            "  Future<void> createTask();\n",
+            "}\n",
+            "class Impl implements R {\n",
+            "  Future<void> createTask() async {}\n",
+            "}\n",
+            "void f(R r) {\n",
+            "  r.createTask();\n",
+            "}\n"
+        );
+        let root = workspace("member-refs", &[("lib/m.dart", source)]);
+        let mut engine = engine_over_with(&root, Some(crate::semdiag::diagnoser()));
+        engine.discover_workspace().expect("discovery");
+        engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+
+        // The declaration surface: the interface's declaration and the
+        // override, both named `createTask`.
+        let decls = decl_hits(&engine, "createTask");
+        assert_eq!(decls.len(), 2, "the interface declaration and the override");
+        let (interface, impl_offset) = (
+            source.find("createTask();").expect("interface decl"),
+            source.rfind("createTask() async").expect("override decl"),
+        );
+
+        // The reference surface: exactly one Invoked row at the call site
+        // targeting the interface's declaration, plus the override row at
+        // the implementing declaration — the closure's widening.
+        let m = engine
+            .file_table()
+            .try_file_id(&root.join("lib/m.dart"))
+            .expect("interned");
+        assert_eq!(
+            ref_hits(&engine, "createTask"),
+            vec![
+                (
+                    m,
+                    m,
+                    ReferenceKind::Invoked,
+                    (source.find("r.createTask()").expect("call") + 2) as u32,
+                    10
+                ),
+                (m, m, ReferenceKind::Override, impl_offset as u32, 10),
+            ],
+            "the call site's Invoked row, then the override's row (uses before overrides)"
+        );
+        assert_eq!(
+            decls
+                .iter()
+                .filter(|d| d.0 == m && d.2 == interface as u32)
+                .count(),
+            1,
+            "the interface declaration is in the decl set"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The qualified-name plumbing end to end: the armed-prefix hit
@@ -2192,6 +2407,106 @@ mod tests {
                 .all(|r| !r.explicit && r.qualified_name.is_none()),
             "override rows are bare declaration sites"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The override-family face: anchoring at any declaration of the member
+    /// — the interface, the implementing override, the extending override —
+    /// answers the identical container set (the whole hierarchy declaring
+    /// the member, upward walk included), while an unrelated same-name
+    /// member outside the hierarchy answers its own singleton family.
+    #[test]
+    fn override_family_answers_the_whole_hierarchy_from_any_member() {
+        let source = concat!(
+            "abstract class R {\n",
+            "  void m();\n",
+            "}\n",
+            "class A implements R {\n",
+            "  void m() {}\n",
+            "}\n",
+            "class B extends A {\n",
+            "  void m() {}\n",
+            "}\n",
+            "class S {\n",
+            "  void m() {}\n",
+            "}\n"
+        );
+        let root = workspace("override-family", &[("lib/m.dart", source)]);
+        let mut engine = engine_over(&root);
+        engine.discover_workspace().expect("discovery");
+        engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        let m = engine
+            .file_table()
+            .try_file_id(&root.join("lib/m.dart"))
+            .expect("interned");
+
+        // The raw answers are identical (same set, same deterministic
+        // order) from every anchor; spelling-sorted, the family is the
+        // whole R/A/B hierarchy.
+        let family = |container: &str| engine.override_family(m, container, "m");
+        for container in ["A", "B"] {
+            assert_eq!(
+                family(container),
+                family("R"),
+                "anchored at {container}.m, the same family as at R.m"
+            );
+        }
+        let mut spellings: Vec<&str> = family("R").iter().map(|(_, c)| *c).collect();
+        spellings.sort_unstable();
+        assert_eq!(spellings, vec!["A", "B", "R"]);
+        // The sibling's own family: itself, none of the hierarchy's.
+        assert_eq!(family("S"), vec![(m, "S")]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The diamond pin: a subtype that joins a second branch (`A extends
+    /// Base implements R`) must pull that branch into the family — a
+    /// one-pass up/down walk anchored at `R` would stop at R's subtypes
+    /// and never climb A's other supertype, splitting the family by
+    /// anchor. The fixpoint answers the identical {Base, R, A, C} from
+    /// every member of the diamond.
+    #[test]
+    fn override_family_closes_the_diamond_through_every_branch() {
+        let source = concat!(
+            "class Base {\n",
+            "  void m() {}\n",
+            "}\n",
+            "abstract class R {\n",
+            "  void m();\n",
+            "}\n",
+            "class A extends Base implements R {\n",
+            "  void m() {}\n",
+            "}\n",
+            "class C implements R {\n",
+            "  void m() {}\n",
+            "}\n"
+        );
+        let root = workspace("override-diamond", &[("lib/m.dart", source)]);
+        let mut engine = engine_over(&root);
+        engine.discover_workspace().expect("discovery");
+        engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        let m = engine
+            .file_table()
+            .try_file_id(&root.join("lib/m.dart"))
+            .expect("interned");
+
+        let family = |container: &str| engine.override_family(m, container, "m");
+        for container in ["R", "A", "C"] {
+            assert_eq!(
+                family(container),
+                family("Base"),
+                "anchored at {container}.m, the same family as at Base.m"
+            );
+        }
+        let mut spellings: Vec<&str> = family("Base").iter().map(|(_, c)| *c).collect();
+        spellings.sort_unstable();
+        assert_eq!(spellings, vec!["A", "Base", "C", "R"]);
 
         std::fs::remove_dir_all(&root).ok();
     }

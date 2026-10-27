@@ -111,7 +111,11 @@ tests. Use before: edits whose blast radius is unclear. Not for: current diagnos
     Tool {
         name: "dartq_fix",
         description: "Anchored fix proposals/patches for the analyzed workspace. Use for: \
-applying lint/quick fixes. Not for: rename edits (dartq_rename) or plugin assists.",
+applying lint/quick fixes. Not for: rename edits (dartq_rename) or plugin assists. Arguments: \
+the daemon fix parameters {paths, role} — role selects the candidate kind the answer serves: \
+primary (default, one code change per diagnostic), ignore_line, ignore_file, or suppress (the \
+ignore-comment spellings; never auto-applied unless named). Every returned row carries its \
+role key.",
         kind: ToolKind::Daemon("dartq/fix"),
     },
     Tool {
@@ -151,7 +155,9 @@ results. Not for: live session/analysis progress (dartq_events).",
         description: "The session's unified event stream or its cold-analysis progress \
 (files scanned, current package). Use for: 'is it still working' during a long first \
 analysis, and lifecycle reads. Not for: test-run result events \
-(dartq_test_events). Arguments: {handle: 'session'|'progress', since, limit}.",
+(dartq_test_events). Arguments: {handle: 'session'|'progress', since (unix seconds, \
+a floor on row timestamps), limit} — the session handle lists newest first, default \
+100 rows.",
         kind: ToolKind::Events,
     },
     Tool {
@@ -611,14 +617,17 @@ fn parse_target(spec: &str) -> Result<(PathBuf, u32, u32), String> {
     Ok((PathBuf::from(path), line, column))
 }
 
-/// The events read, local to the worktree.
+/// The events read, local to the worktree. The session handle lists
+/// newest first (#2622) with `since` as a UNIX-seconds floor and
+/// `limit` keeping the newest rows — the same contract as the CLI verb.
 fn events_call(params: &Value, mcp: &Mcp) -> Result<Value, String> {
     match params["handle"].as_str().unwrap_or("session") {
         "session" => {
             let log = EventLog::new(&mcp.layout);
-            let since = params["since"].as_u64().unwrap_or_default();
+            let since_ms =
+                params["since"].as_u64().map_or(0, |secs| u128::from(secs) * 1000);
             let limit = params["limit"].as_u64().unwrap_or(100).min(1000) as usize;
-            Ok(json!({"events": log.read(None, since, limit)
+            Ok(json!({"events": log.read_newest(None, since_ms, limit)
                 .into_iter()
                 .map(|(_, value)| value)
                 .collect::<Vec<_>>()}))
@@ -708,6 +717,11 @@ mod tests {
 
     #[test]
     fn mcp_serves_the_session_over_stdio() {
+        // In-process serve loop: collateral of the session module's real
+        // signal test (its SIGTERM is process-wide and would tear this
+        // serve down mid-drive) — same serialization lock.
+        let _serial =
+            crate::session::tests::SIGNAL_SERIALIZATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = fixture();
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
@@ -1012,8 +1026,9 @@ mod tests {
     }
 
     /// The events tool is a local face: without a session it still reads
-    /// the event log (handle filtering, since/limit) and the progress
-    /// snapshot, and an unknown handle is the usage error.
+    /// the event log (newest first, UNIX-seconds floor, limit keeping
+    /// the newest rows) and the progress snapshot, and an unknown handle
+    /// is the usage error.
     #[test]
     fn events_tool_reads_local_faces_without_a_session() {
         let root = std::env::temp_dir().join(format!("dqs-mcp-events-{}", std::process::id()));
@@ -1024,13 +1039,24 @@ mod tests {
         log.append("session", "serving", json!({})).expect("append");
         log.append("session", "client_attached", json!({})).expect("append");
         let mcp = Mcp { layout, root: root.clone(), session: Err("read-only checkout".into()) };
+        let now_s =
+            u64::try_from(dartq_session::SessionState::now_ms() / 1000).expect("unix seconds");
 
         let events = events_call(&json!({}), &mcp).expect("default handle is session");
-        assert_eq!(events["events"].as_array().expect("events").len(), 2);
-        let tail = events_call(&json!({"since": 1, "limit": 10}), &mcp).expect("cursor read");
-        assert_eq!(tail["events"].as_array().expect("events").len(), 1);
+        let rows = events["events"].as_array().expect("events");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0]["event"], "client_attached",
+            "newest first: the last append leads the page"
+        );
+        let floored = events_call(&json!({"since": now_s - 60}), &mcp).expect("floor read");
+        assert_eq!(floored["events"].as_array().expect("events").len(), 2);
+        let future = events_call(&json!({"since": now_s + 60}), &mcp).expect("future floor");
+        assert!(future["events"].as_array().expect("events").is_empty());
         let limited = events_call(&json!({"limit": 1}), &mcp).expect("limit read");
-        assert_eq!(limited["events"].as_array().expect("events").len(), 1);
+        let page = limited["events"].as_array().expect("events");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0]["event"], "client_attached", "the limit keeps the newest row");
 
         let progress = events_call(&json!({"handle": "progress"}), &mcp).expect("progress");
         assert_eq!(progress["files_scanned"], 0, "no trace in this tree");

@@ -18,6 +18,7 @@
 //! | `refs`            | resolved [`RefRow`]s targeting the primary declaration |
 //! | `deps`            | the declaring library's importers ([`RevImportGraph`]) |
 //! | `tests`           | the declaring library's [`TestGraph`] rows             |
+//! | `others`          | the remaining same-named hits, ranked like the primary |
 //!
 //! The supertype split follows the clause each edge was written in (the
 //! `supertypes_of` face carries the index's resolved edges as
@@ -36,9 +37,13 @@
 //! the `file_label_of` / `label_of` closures and the [`StringTable`]. Every
 //! array sorts by a documented key so the output is deterministic:
 //!
-//! * `declaration` — the primary declaration is the path-ascending first
-//!   hit (a name declared in several files resolves to the first path; the
-//!   remaining hits are the query face's domain).
+//! * `declaration` — the primary declaration is the selection-order first
+//!   hit: non-test files before test files, public containers before
+//!   `_`-private ones, then the stable (path, line) order — so a test
+//!   tree's same-named fake never shadows the library declaration. The
+//!   remaining hits ride `others` in the same rank order (the next-best
+//!   candidate first), each as a locator row for re-querying
+//!   (`Container.name`).
 //! * `bases`/`ifaces` — ascending by supertype name, then by
 //!   target file path; unresolved rows (a supertype outside the analyzed
 //!   set, no file) sort before resolved rows of the same name.
@@ -61,7 +66,8 @@
 //! # Verbosity
 //!
 //! * `minimal` — `declaration` plus a `counts` object (one entry per
-//!   section); the section arrays are dropped, never the locators.
+//!   section, `others` included); the section arrays are dropped, never
+//!   the locators.
 //! * `compact` (default) — every section as an array, empty sections
 //!   included (a missing section is indistinguishable from an empty one
 //!   otherwise).
@@ -164,6 +170,10 @@ pub struct ExplainReport {
     /// The test libraries exercising the declaring library. Wire: `tests`.
     #[serde(rename = "tests", skip_serializing_if = "Option::is_none")]
     pub affected_tests: Option<Vec<AffectedTest>>,
+    /// The remaining same-named declarations the primary was picked over,
+    /// in rank order — the disambiguation face (#2621). Wire: `others`.
+    #[serde(rename = "others", skip_serializing_if = "Option::is_none")]
+    pub others: Option<Vec<OtherDeclRow>>,
     /// Per-section row counts (`minimal` only, replacing the arrays).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub counts: Option<SectionCounts>,
@@ -186,6 +196,22 @@ pub struct DeclarationRow {
     pub off: u32,
     /// The name token's span length.
     pub len: u32,
+}
+
+/// One row of `others`: a remaining same-named candidate the primary was
+/// picked over — a locator shaped for disambiguation and re-querying
+/// (`Container.name` on this face), never a full declaration row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtherDeclRow {
+    /// The candidate's declaring file's path.
+    pub file: String,
+    /// The declaration family (the frozen v1 spelling, [`decl_kind_name`]).
+    pub kind: String,
+    /// The enclosing container's name; absent for top-level candidates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// The name token's 1-based line.
+    pub line: u32,
 }
 
 /// One supertype row of `inheritance`/`interfaces`.
@@ -280,7 +306,7 @@ pub struct DependencyRow {
 }
 
 /// The `minimal`-tier replacement for the section arrays: one entry per
-/// section, always all seven (a zero is a value, not an absent section).
+/// section, always all eight (a zero is a value, not an absent section).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SectionCounts {
     /// Rows `inheritance` would carry (wire: `bases`).
@@ -303,6 +329,9 @@ pub struct SectionCounts {
     /// Rows `affected_tests` would carry (wire: `tests`).
     #[serde(rename = "tests")]
     pub affected_tests: u32,
+    /// Rows `others` would carry: the remaining same-named candidates.
+    #[serde(rename = "others")]
+    pub others: u32,
 }
 
 /// Stable machine spelling of the constructor family — the `constructors`
@@ -362,7 +391,8 @@ pub fn ref_kind_name(kind: RefKind) -> &'static str {
 ///
 /// * `decls` — every declaration hit for the name (the index's by-name
 ///   probe, mapped to [`SymbolDeclHit`]s). The primary declaration is the
-///   path-ascending first hit.
+///   selection-order first hit; the rest ride `others` (module docs,
+///   "Provenance and ordering").
 /// * `refs` — resolved reference rows for the name; rows targeting other
 ///   same-named declarations are filtered by the query, so the by-name
 ///   union is a valid input.
@@ -381,6 +411,11 @@ pub fn ref_kind_name(kind: RefKind) -> &'static str {
 ///   two id spaces. Each face carries its own borrow lifetime: the faces
 ///   usually live in different caller tables, and one shared lifetime
 ///   would force the longest to cover them all.
+/// * `is_test_of(file)` — whether the hit's file is a test-tree file (the
+///   selection order's first key; a real-path property the labels do not
+///   carry, which is why the caller owns it).
+/// * `line_of(file, offset)` — the 1-based line of a position (the
+///   `others` rows' locator).
 /// * `tests` — the test graph over the same library id space.
 /// * `strings` — the intern table the ids resolve through.
 ///
@@ -407,18 +442,37 @@ pub fn explain<'d, 's, 'c, 'l, 'f>(
     importers: &RevImportGraph,
     label_of: impl Fn(u32) -> &'l str,
     file_label_of: impl Fn(FileId) -> &'f str,
+    is_test_of: impl Fn(FileId) -> bool,
+    line_of: impl Fn(FileId, u32) -> u32,
     tests: &TestGraph,
     strings: &StringTable,
 ) -> ExplainReport {
-    // Primary declaration: path-ascending first hit (FileId breaks a
-    // label tie deterministically).
-    let mut hits: Vec<&SymbolDeclHit<'_>> = decls.iter().collect();
-    hits.sort_by(|a, b| {
-        file_label_of(a.file)
-            .cmp(file_label_of(b.file))
-            .then_with(|| a.file.cmp(&b.file))
-    });
-    let primary = hits.first().copied();
+    // Primary declaration selection (#2621), one decorated sort: non-test
+    // files first, public (effective) containers before `_`-private ones,
+    // then the stable (path, offset) order — a test tree's same-named
+    // fake never shadows the library declaration, whatever the paths'
+    // lexicographic order says. The privacy key is the enclosing
+    // container for a member and the declaration itself at top level;
+    // the offset is the line proxy within a file (monotone), and FileId
+    // breaks a label tie deterministically.
+    let rank_of = |hit: &SymbolDeclHit<'_>| {
+        let surface = decls_of(hit.file);
+        let name = if hit.decl.container != DeclRow::NONE {
+            surface[hit.decl.container as usize].name
+        } else {
+            hit.decl.name
+        };
+        (
+            is_test_of(hit.file),
+            strings.resolve(name).starts_with('_'),
+            file_label_of(hit.file),
+            hit.file,
+            hit.decl.range.offset,
+        )
+    };
+    let mut ranked: Vec<_> = decls.iter().map(|hit| (rank_of(hit), hit)).collect();
+    ranked.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let primary = ranked.first().map(|&(_, hit)| hit);
 
     let declaration = primary.map(|hit| declaration_row(hit, &decls_of, &file_label_of, strings));
     let edges: &'s [(TargetRef, SuperClause)] =
@@ -491,6 +545,8 @@ pub fn explain<'d, 's, 'c, 'l, 'f>(
                 Some(hit) => distinct(tests.tests_of(hit.library)),
                 None => 0,
             }),
+            // The candidates the primary was picked over.
+            others: count(ranked.len().saturating_sub(usize::from(primary.is_some()))),
         }
     });
 
@@ -518,6 +574,13 @@ pub fn explain<'d, 's, 'c, 'l, 'f>(
         sections.then(|| reference_rows(primary.map(|hit| hit.file), refs, &file_label_of));
     let dependencies = sections.then(|| dependency_rows(primary, importers, &label_of));
     let affected_tests = sections.then(|| affected_test_rows(primary, tests, &label_of));
+    let others = sections.then(|| {
+        ranked
+            .iter()
+            .skip(1)
+            .map(|&(_, hit)| other_row(hit, &decls_of, &file_label_of, &line_of, strings))
+            .collect()
+    });
 
     ExplainReport {
         schema_version: EXPLAIN_SCHEMA_VERSION,
@@ -539,6 +602,7 @@ pub fn explain<'d, 's, 'c, 'l, 'f>(
         references,
         dependencies,
         affected_tests,
+        others,
         counts,
     }
 }
@@ -564,6 +628,29 @@ fn declaration_row<'d, 'f>(
         container,
         off: hit.decl.range.offset,
         len: hit.decl.range.length,
+    }
+}
+
+/// One `others` row: the candidate's locator — the declaring file, the
+/// family, the enclosing container (absent at top level), and the name
+/// token's 1-based line. The container anchor resolution shares the
+/// `declaration_row` contract (an out-of-range anchor is a caller bug and
+/// stops on the slice bounds check).
+fn other_row<'d, 'f>(
+    hit: &SymbolDeclHit<'_>,
+    decls_of: &impl Fn(FileId) -> &'d [DeclRow],
+    file_label_of: &impl Fn(FileId) -> &'f str,
+    line_of: &impl Fn(FileId, u32) -> u32,
+    strings: &StringTable,
+) -> OtherDeclRow {
+    let surface = decls_of(hit.file);
+    let container = (hit.decl.container != DeclRow::NONE)
+        .then(|| strings.resolve(surface[hit.decl.container as usize].name).to_owned());
+    OtherDeclRow {
+        file: file_label_of(hit.file).to_owned(),
+        kind: decl_kind_name(hit.decl.kind).to_owned(),
+        container,
+        line: line_of(hit.file, hit.decl.range.offset),
     }
 }
 
@@ -898,6 +985,8 @@ mod tests {
             &importers,
             labels,
             file_labels,
+            |_| false,
+            |_, off| off + 1,
             &tests,
             &fx.strings,
         );
@@ -938,6 +1027,7 @@ mod tests {
                     {"path": "package:t/c.dart"},
                 ],
                 "tests": [{"path": "package:t/a_test.dart"}],
+                "others": [],
             }),
             "every section present, sorted by its documented key"
         );
@@ -965,6 +1055,8 @@ mod tests {
             &importers,
             labels,
             file_labels,
+            |_| false,
+            |_, off| off + 1,
             &tests,
             &fx.strings,
         );
@@ -981,6 +1073,7 @@ mod tests {
                 references: 0,
                 dependencies: 3,
                 affected_tests: 1,
+                others: 0,
             })
         );
         let value = serde_json::to_value(&report).expect("serialize");
@@ -1022,6 +1115,8 @@ mod tests {
                 &importers,
                 labels,
                 file_labels,
+                |_| false,
+                |_, off| off + 1,
                 &tests,
                 &fx.strings,
             )
@@ -1065,6 +1160,8 @@ mod tests {
                 &importers,
                 labels,
                 file_labels,
+                |_| false,
+                |_, off| off + 1,
                 &tests,
                 &fx.strings,
             );
@@ -1090,6 +1187,8 @@ mod tests {
             &importers,
             labels,
             file_labels,
+            |_| false,
+            |_, off| off + 1,
             &tests,
             &fx.strings,
         );
@@ -1097,6 +1196,7 @@ mod tests {
         assert_eq!(report.interfaces, Some(Vec::new()));
         assert_eq!(report.constructors, Some(Vec::new()));
         assert_eq!(report.methods, Some(Vec::new()));
+        assert_eq!(report.others, Some(Vec::new()), "the seam stays visible");
         assert!(report.counts.is_none(), "counts are a minimal-tier field");
     }
 
@@ -1120,6 +1220,8 @@ mod tests {
             &importers,
             labels,
             file_labels,
+            |_| false,
+            |_, off| off + 1,
             &tests,
             &fx.strings,
         );
@@ -1154,6 +1256,8 @@ mod tests {
             &importers,
             labels,
             file_labels,
+            |_| false,
+            |_, off| off + 1,
             &tests,
             &fx.strings,
         );
@@ -1199,6 +1303,8 @@ mod tests {
             &importers,
             labels,
             file_labels,
+            |_| false,
+            |_, off| off + 1,
             &tests,
             &fx.strings,
         );
@@ -1225,6 +1331,8 @@ mod tests {
             &importers,
             labels,
             file_labels,
+            |_| false,
+            |_, off| off + 1,
             &tests,
             &fx.strings,
         );
@@ -1237,9 +1345,10 @@ mod tests {
         assert!(value["declaration"].get("container").is_none());
     }
 
-    /// Several hits for one name across files: the path-ascending first
-    /// is primary, and only its references ride the report (the union
-    /// input is filtered by target file).
+    /// Several hits for one name across files: the selection-order first
+    /// is primary (both non-test public containers here, so the path
+    /// decides), and only its references ride the report (the union input
+    /// is filtered by target file).
     #[test]
     fn multi_file_hits_pick_the_primary_and_filter_references() {
         let mut fx = fixture();
@@ -1275,6 +1384,8 @@ mod tests {
             &importers,
             labels,
             file_labels,
+            |_| false,
+            |_, off| off + 1,
             &tests,
             &fx.strings,
         );
@@ -1293,6 +1404,170 @@ mod tests {
             report.dependencies.as_ref().map(Vec::len),
             Some(3),
             "the primary's library drives the graph joins"
+        );
+    }
+
+    /// The selection order (#2621): a test-tree hit and a `_`-private
+    /// lib hit both sort after the public lib hit — even when their paths
+    /// sort first — and the remaining candidates ride `others` in rank
+    /// order (next-best first) as locator rows. `a.dart` is the test
+    /// file, `b.dart` the private container's file, `c.dart` the public
+    /// primary's: the path-ascending order of the old rule would have
+    /// answered the test fake.
+    #[test]
+    fn selection_order_beats_the_path_order_and_others_list_the_rest() {
+        let fx = fixture();
+        // The line face under test: offset/10 + 1.
+        // a.dart (the test file): the fake — a member of Holder.
+        let surface_a = vec![
+            row(fx.strings.intern("Holder"), DeclKind::Class, 0, DeclRow::NONE),
+            row(fx.foo, DeclKind::Field, 300, 0),
+        ];
+        // b.dart: the private container's member.
+        let surface_b = vec![
+            row(fx.strings.intern("_Priv"), DeclKind::Class, 100, DeclRow::NONE),
+            row(fx.foo, DeclKind::Method, 200, 0),
+        ];
+        // c.dart: the public lib declaration.
+        let surface_c = vec![row(fx.foo, DeclKind::Class, 500, DeclRow::NONE)];
+        let (importers, tests) = graphs();
+        let hits = vec![
+            SymbolDeclHit {
+                library: 0,
+                file: fx.file_a,
+                decl: &surface_a[1], // the test fake
+            },
+            SymbolDeclHit {
+                library: 1,
+                file: fx.file_b,
+                decl: &surface_b[1], // the private container's member
+            },
+            SymbolDeclHit {
+                library: 2,
+                file: fx.file_c,
+                decl: &surface_c[0], // the public lib declaration
+            },
+        ];
+        let surfaces = |file: FileId| match file.index() {
+            0 => surface_a.as_slice(),
+            1 => surface_b.as_slice(),
+            _ => surface_c.as_slice(),
+        };
+        let run = |verbosity| {
+            explain(
+                "Foo",
+                verbosity,
+                &hits,
+                &[],
+                surfaces,
+                |_, _| &[],
+                |_, _| &[],
+                &importers,
+                labels,
+                file_labels,
+                |file| file == fx.file_a,
+                |_, off| off / 10 + 1,
+                &tests,
+                &fx.strings,
+            )
+        };
+        let report = run(Verbosity::Compact);
+        assert_eq!(
+            report.declaration.as_ref().expect("primary").file,
+            "c.dart",
+            "the public non-test declaration wins over both lower paths"
+        );
+        assert_eq!(
+            report.others,
+            Some(vec![
+                OtherDeclRow {
+                    file: "b.dart".to_owned(),
+                    kind: "method".to_owned(),
+                    container: Some("_Priv".to_owned()),
+                    line: 21,
+                },
+                OtherDeclRow {
+                    file: "a.dart".to_owned(),
+                    kind: "field".to_owned(),
+                    container: Some("Holder".to_owned()),
+                    line: 31,
+                },
+            ]),
+            "rank order: the private lib candidate, then the test fake"
+        );
+
+        // The same hits at minimal: the array drops, the count carries.
+        let minimal = run(Verbosity::Minimal);
+        assert!(minimal.others.is_none(), "the array drops at minimal");
+        assert_eq!(minimal.counts.expect("counts").others, 2);
+    }
+
+    /// The privacy key's top-level arm: a `_`-private top-level candidate
+    /// orders after a same-named member of a public container (both hits
+    /// non-test, the public container wins), and the top-level candidate's
+    /// row carries no `container` key.
+    #[test]
+    fn top_level_privacy_orders_by_the_own_name() {
+        let fx = fixture();
+        let under = fx.strings.intern("_helper");
+        // a.dart: the private top-level function.
+        let surface_a = vec![row(under, DeclKind::TopLevelFn, 0, DeclRow::NONE)];
+        // b.dart: the public container's same-named member.
+        let surface_b = vec![
+            row(fx.strings.intern("Repo"), DeclKind::Class, 100, DeclRow::NONE),
+            row(under, DeclKind::Method, 200, 0),
+        ];
+        let (importers, tests) = graphs();
+        let hits = vec![
+            SymbolDeclHit {
+                library: 0,
+                file: fx.file_a,
+                decl: &surface_a[0],
+            },
+            SymbolDeclHit {
+                library: 1,
+                file: fx.file_b,
+                decl: &surface_b[1],
+            },
+        ];
+        let report = explain(
+            "_helper",
+            Verbosity::Compact,
+            &hits,
+            &[],
+            |file| match file.index() {
+                0 => surface_a.as_slice(),
+                _ => surface_b.as_slice(),
+            },
+            |_, _| &[],
+            |_, _| &[],
+            &importers,
+            labels,
+            file_labels,
+            |_| false,
+            |_, off| off / 10 + 1,
+            &tests,
+            &fx.strings,
+        );
+        assert_eq!(
+            report
+                .declaration
+                .as_ref()
+                .expect("primary")
+                .container
+                .as_deref(),
+            Some("Repo"),
+            "the public container's member wins over the private top level"
+        );
+        assert_eq!(
+            report.others,
+            Some(vec![OtherDeclRow {
+                file: "a.dart".to_owned(),
+                kind: "function".to_owned(),
+                container: None,
+                line: 1,
+            }]),
+            "the top-level candidate carries no container key"
         );
     }
 }

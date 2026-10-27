@@ -37,5 +37,6 @@ pub use ring::Ring;
 pub use session::{
     BreakpointHandle, BreakpointLocationSpec, BreakpointSpec, ConditionalResumeLimit, DebugSession,
     EventBatch, ExpandLimits, FrameLocation, FrameSummary, LaunchConfig, LaunchKind, OutputBatch,
-    RestartOutcome, SessionConfig, SessionEvent, StoppedReason, StoppedSnapshot, Variable,
+    RELEASE_RESUME_BUDGET, RestartOutcome, SessionConfig, SessionEvent, StoppedReason,
+    StoppedSnapshot, Variable,
 };

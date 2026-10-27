@@ -704,6 +704,10 @@ pub(crate) struct MemberFold {
     unused_fields: Arc<[(Arc<Diagnostic>, StringId)]>,
     unused_imports: Arc<[Arc<Diagnostic>]>,
     doc_refs: Box<[StringId]>,
+    /// The unit's resolved member-access reference rows (#2618), served
+    /// with the memoized product — the library reference surface reads
+    /// them beside the parser-level sites at the `LibraryAnalyzed` point.
+    pub(crate) member_refs: Arc<[dartq_semantic::MemberRef]>,
     face: CompactUseFace,
 }
 
@@ -732,6 +736,7 @@ impl MemberFold {
             + self.unused_fields.len() * size_of::<(Arc<Diagnostic>, StringId)>()
             + self.unused_imports.len() * size_of::<Arc<Diagnostic>>()
             + self.doc_refs.len() * size_of::<StringId>()
+            + self.member_refs.len() * size_of::<dartq_semantic::MemberRef>()
             + self.face.heap_bytes()
     }
 }
@@ -842,16 +847,33 @@ pub(crate) struct MemoHandle<'a> {
 }
 
 impl MemoHandle<'_> {
-    /// The member's standing product, when its identity stood.
-    fn hit(&self, file: FileId, content: ContentId) -> Option<Arc<MemberFold>> {
+    /// The member's standing product, when its identity stood — the raw
+    /// probe both access faces share (#2618): lock, one hash lookup, the
+    /// freshness predicate, a refcount bump. Side-effect free; the
+    /// callers decide what an access counts as.
+    fn probe(&self, file: FileId, content: ContentId) -> Option<Arc<MemberFold>> {
         let memo = self.memo.lock().unwrap_or_else(PoisonError::into_inner);
         let fold = memo
             .folds
             .get(&file)
             .filter(|fold| fold.serves(content, &self.inputs))?;
-        #[cfg(test)]
-        memo.serves.fetch_add(1, Ordering::Relaxed);
         Some(Arc::clone(fold))
+    }
+
+    /// The member's standing product, when its identity stood, tallied as
+    /// a served fold: `serves` measures folds reused instead of
+    /// recomputed, so only the diagnoser's fold path counts — a surface
+    /// read over an already-produced product is [`Self::probe`], not a
+    /// serve.
+    fn hit(&self, file: FileId, content: ContentId) -> Option<Arc<MemberFold>> {
+        let fold = self.probe(file, content)?;
+        #[cfg(test)]
+        self.memo
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .serves
+            .fetch_add(1, Ordering::Relaxed);
+        Some(fold)
     }
 
     /// Stores the freshly folded product under the member's file.
@@ -865,7 +887,7 @@ impl MemoHandle<'_> {
 }
 
 impl SemanticDiagnoser for Diagnoser {
-    fn diagnose_library(&self, library: LibraryView<'_>, out: &mut Vec<Arc<Diagnostic>>) {
+    fn diagnose_library(&self, library: &LibraryView<'_>, out: &mut Vec<Arc<Diagnostic>>) {
         let duplicate = duplicate_definition_name();
         let unused = unused_element_name();
         let unused_fields = unused_field_names();
@@ -968,7 +990,7 @@ impl SemanticDiagnoser for Diagnoser {
             let ops = library
                 .types
                 .map(|types| dartq_semantic::ResolvedTypeOps::new(types, library.strings, file));
-            let (report, face) = dartq_semantic::diagnose_unit_with_ops(
+            let fold = dartq_semantic::fold_unit_with_ops(
                 text,
                 tokens,
                 ParserFeatures::from_feature_set(feature_set),
@@ -997,6 +1019,10 @@ impl SemanticDiagnoser for Diagnoser {
                 feature_set.is_enabled(Feature::InferenceUpdate2),
                 ops.as_ref(),
             );
+            let dartq_semantic::UnitFold {
+                report, face, ..
+            } = fold;
+            let member_refs = report.member_refs.into();
             // The bake in `l1::duplicate_diagnostics` is the single source,
             // so the fold drops the re-issued rows; the filtered set is
             // what the memo stores. The `unused_element` candidates split
@@ -1092,6 +1118,7 @@ impl SemanticDiagnoser for Diagnoser {
                     unused_fields: field_rows.into(),
                     unused_imports: import_rows.into(),
                     doc_refs: doc_names,
+                    member_refs,
                     face: compact,
                 },
             );
@@ -1133,6 +1160,30 @@ impl SemanticDiagnoser for Diagnoser {
                 .filter_map(|(row, name)| (!consumed.read(name)).then_some(row)),
         );
         release_unused_imports(&library, staged_imports, &doc_refs, &consumed, out);
+    }
+
+    /// The memo-backed member-ref face (#2618): every member's fold is
+    /// current at this point (`diagnose_library` just folded or served
+    /// each), so one memo probe per member hands the rows out — the file's
+    /// residency facts supply the content id the memo's freshness gate
+    /// reads. The probe is the non-counting access: a surface read
+    /// re-reads a product this same analyze already produced, so it is
+    /// not a served fold and never touches the `serves` tally. A
+    /// pairing-miss member (the store degrade path) contributes
+    /// nothing — the under-report direction the fold itself keeps.
+    fn member_refs(
+        &self,
+        library: &LibraryView<'_>,
+    ) -> Vec<(FileId, Arc<[dartq_semantic::MemberRef]>)> {
+        library
+            .files
+            .iter()
+            .filter_map(|&file| {
+                let content = library.facts[&file].content;
+                let fold = library.memo.probe(file, content)?;
+                Some((file, Arc::clone(&fold.member_refs)))
+            })
+            .collect()
     }
 }
 
@@ -1471,7 +1522,7 @@ mod tests {
     struct FoldProbe(AtomicUsize);
 
     impl SemanticDiagnoser for FoldProbe {
-        fn diagnose_library(&self, _library: LibraryView<'_>, _out: &mut Vec<Arc<Diagnostic>>) {
+        fn diagnose_library(&self, _library: &LibraryView<'_>, _out: &mut Vec<Arc<Diagnostic>>) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
     }

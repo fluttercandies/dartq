@@ -14,6 +14,12 @@ legs_06_run() {
   export DART_SDK="$base/sdk"
 
   # --- fix --apply: the clean apply ------------------------------------
+  # One unused_import diagnostic materializes three candidates (no
+  # analysis_options.yaml in the fixture, so the suppress row never
+  # mints): the import deletion (primary), a line ignore comment, and a
+  # file ignore comment. The dry run lists every candidate with its
+  # `role` key; the apply writes only the primary one — one candidate per
+  # diagnostic, the ignore comments never auto-applied.
   leg_begin fix-apply "fix applies the unused-import removal and re-analyzes clean"
   make_pkg "$base/fx" "fx"
   wf "$base/fx/lib/helper.dart" 'int helper() => 1;
@@ -26,6 +32,12 @@ int main() => 2;
   assert_eq "$DQ_RC" 0 "the dry run proposes without writing"
   assert_contains "$(cat "$(out_file fix-dry)")" 'edits:[' \
     "the lon document carries the edit set"
+  assert_contains "$(cat "$(out_file fix-dry)")" 'role:primary' \
+    "every proposal row carries its role key"
+  assert_contains "$(cat "$(out_file fix-dry)")" 'role:ignore_line' \
+    "the ignore-comment candidates are listed beside the primary one"
+  assert_contains "$(cat "$(out_file fix-dry)")" 'role:ignore_file' \
+    "the file-level ignore candidate is listed too"
   assert_contains "$(cat "$base/fx/lib/main.dart")" "import 'helper.dart';" \
     "the dry run left the file untouched"
 
@@ -35,8 +47,31 @@ int main() => 2;
     "the file was rewritten in place"
   assert_not_contains "$(cat "$base/fx/lib/main.dart")" "import 'helper.dart';" \
     "the unused import is gone"
+  assert_not_contains "$(cat "$base/fx/lib/main.dart")" "ignore" \
+    "the ignore-comment candidates were not auto-applied"
+  assert_contains "$(cat "$(out_file fix-apply)")" 'role:primary' \
+    "the apply record carries only the primary rows"
+  assert_not_contains "$(cat "$(out_file fix-apply)")" 'ignore_line' \
+    "rows the role selection filtered out are omitted from the record"
   run_dartq_in fix-recheck "$base/fx" analyze lib
   assert_eq "$DQ_RC" 0 "the post-fix tree analyzes clean"
+
+  # --- fix --role: the explicit suppression selection -------------------
+  # The opt-in face: `--role ignore_line` applies only the ignore-comment
+  # candidates; the code change (and the file-level comment) never lands.
+  leg_begin fix-role "fix --role ignore_line writes only the ignore comment"
+  wf "$base/fx/lib/main.dart" "import 'helper.dart';
+
+int main() => 2;
+"
+  run_dartq_in fix-role "$base/fx" fix --role ignore_line lib
+  assert_eq "$DQ_RC" 0 "the role-selected apply exits clean"
+  assert_contains "$(cat "$base/fx/lib/main.dart")" "import 'helper.dart';" \
+    "the code-change candidate was not applied"
+  assert_contains "$(cat "$base/fx/lib/main.dart")" "// ignore: unused_import" \
+    "only the line ignore comment was written"
+  assert_not_contains "$(cat "$base/fx/lib/main.dart")" "ignore_for_file" \
+    "the file-level candidate stayed a proposal"
 
   # --- fix: changed-under-us is refused, not clobbered -------------------
   # The drift-correction contract: an edit whose anchor no longer holds
@@ -168,8 +203,12 @@ int main() => extra();
   run_dartq_in rename-outside "$base/pd/pg" rename "lib/main.dart:3:15" --new-name zulu \
     --sdk "$base/sdk" --write
   assert_eq "$DQ_RC" 64 "the outside-workspace edit set is the usage tier"
-  assert_contains "$(err_of rename-outside)" "refusing to write outside the workspace" \
+  assert_contains "$(err_of rename-outside)" "error:outside_workspace" \
     "the refusal names its reason"
+  assert_contains "$(err_of rename-outside)" "workspace:$base/pd/pg" \
+    "the refusal document names the workspace it defends"
+  assert_contains "$(err_of rename-outside)" "dep/lib/extra.dart]" \
+    "every out-of-boundary file is listed (the dependency's own file)"
   assert_contains "$(cat "$base/pd/pg/lib/main.dart")" "extra();" "the consumer file is untouched"
   assert_contains "$(cat "$base/pd/dep/lib/extra.dart")" "int extra() => 1;" \
     "the dependency file is untouched"

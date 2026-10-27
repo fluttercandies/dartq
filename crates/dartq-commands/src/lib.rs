@@ -35,10 +35,13 @@
 //!   counterpart of the daemon's plugin weave.
 //! * [`uri`] — the `file:` URI ↔ path mapping (the daemon's overlay keys,
 //!   the analyze faces' document URIs).
-//! * `pkg_label` — the stable package-form file reference the output
-//!   faces print (the one implementation of the reference-label grammar).
+//! * `pkg_label` — the output faces' file references: the lon/text file
+//!   locator ([`locate`], relative-inside-root/absolute-outside) and the
+//!   frozen package-form reference-label grammar the exchange faces print.
 //!
 //! [`EngineConfig`]: dartq_engine::EngineConfig
+
+pub use pkg_label::locate;
 
 pub mod analyze;
 pub mod check;

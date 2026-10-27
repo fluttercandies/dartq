@@ -17,12 +17,20 @@ impl SdkSnapshot {
     /// `"dart2js"`, `"dartdevc"`, …), or `None` when this SDK's
     /// `libraries.json` has no such segment.
     ///
+    /// An embedder-backed snapshot answers **every** segment with the
+    /// embedder's full-replacement table — the analyzer's `EmbedderSdk`
+    /// has no target segments; `dart:` URIs resolve through the one
+    /// `embedded_libs` map whatever the declared target.
+    ///
     /// Segment sets drift across SDK versions, so segments are addressed by
     /// their `libraries.json` name — never a hardcoded enumeration
     ///.
     #[must_use]
     pub fn target(&self, segment: &str) -> Option<&TargetLibraries> {
-        self.sdk_libraries.get(segment)
+        match &self.embedder {
+            Some(embedder) => Some(&embedder.table),
+            None => self.sdk_libraries.get(segment),
+        }
     }
 
     /// Resolves a `dart:` URI against target segment `segment` to a source
@@ -107,21 +115,61 @@ impl SdkSnapshot {
     /// `web_sql`, on disk in the SDK tree but tabulated by neither side)
     /// yields `None`.
     ///
+    /// An embedder-backed snapshot answers from the embedder's replacement
+    /// table instead (the analyzer's `EmbedderSdk` answers every `dart:`
+    /// URI existence question from its own map): the mapped names resolve
+    /// under the yaml's directory, unmapped names — including every name
+    /// only the plain dart SDK tabulates — yield `None`.
+    ///
     /// [`FLAT_LIBRARIES`] is generated from the pinned oracle SDK — see
     /// `tools/sdk-faces-gen`; the per-segment tables above stay authoritative
     /// for `dart.library.*` support values.
     #[must_use]
     pub fn flat_library_to_path(&self, library: &str, part: &str) -> Option<PathBuf> {
+        // Replacement, not overlay: while an embedder backs the snapshot,
+        // only its table answers — a miss is a miss even when the flat
+        // dart-sdk table lists the name.
+        if let Some(table) = self.embedder_target() {
+            let info = table.libraries.get(library)?;
+            return Some(self.join_part(&info.uri, part));
+        }
         let index = crate::FLAT_LIBRARIES
             .binary_search_by_key(&library, |entry| entry.0)
             .ok()?;
         Some(self.join_part(crate::FLAT_LIBRARIES[index].1, part))
     }
 
-    /// The single path builder behind both faces: `<root>/lib/<library uri>`
-    /// with `part` joined the analyzer's way.
+    /// The embedder's replacement table, when the snapshot carries one.
+    fn embedder_target(&self) -> Option<&TargetLibraries> {
+        self.embedder.as_ref().map(|embedder| &embedder.table)
+    }
+
+    /// The embedder replacement face, when one backs the load: the yaml's
+    /// base directory (every mapped path resolves against it) and the
+    /// full-replacement library table itself. `None` is the plain
+    /// dart-sdk load — the base every `dart:` URI resolves under is then
+    /// the dart-sdk root's `lib/`, addressable through
+    /// [`Self::dart_sdk_root`] without this face.
+    #[must_use]
+    pub fn embedder(&self) -> Option<(&Path, &TargetLibraries)> {
+        self.embedder
+            .as_ref()
+            .map(|embedder| (embedder.base_dir.as_path(), &embedder.table))
+    }
+
+    /// The single path builder behind both faces: `<library base>/<library
+    /// uri>` with `part` joined the analyzer's way. The library base is
+    /// the embedder yaml's directory while an embedder backs the snapshot,
+    /// the dart-sdk `lib/` root otherwise.
     fn join_part(&self, library_uri: &str, part: &str) -> PathBuf {
-        let lib_root = self.dart_sdk_root.join("lib");
+        let dart_lib_root;
+        let lib_root: &Path = match self.embedder.as_ref() {
+            Some(embedder) => embedder.base_dir.as_path(),
+            None => {
+                dart_lib_root = self.dart_sdk_root.join("lib");
+                &dart_lib_root
+            }
+        };
         let library_file = lib_root.join(library_uri);
         match part {
             "" => library_file,
@@ -140,7 +188,7 @@ impl SdkSnapshot {
                         matches!(component, Component::RootDir | Component::Prefix(_))
                     })
                     .collect::<PathBuf>();
-                library_file.parent().unwrap_or(&lib_root).join(relative)
+                library_file.parent().unwrap_or(lib_root).join(relative)
             }
         }
     }

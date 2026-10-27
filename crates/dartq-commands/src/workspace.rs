@@ -9,6 +9,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dartq_diagnostics::{
     CodeInfo, DARTQ_PACKAGE_CONFIG_MISSING, DARTQ_PACKAGE_CONFIG_OUT_OF_DATE,
@@ -125,19 +126,18 @@ impl WorkspaceAdvisory {
 /// print no diagnostics (the query family and `impact`): SDK root
 /// resolution, canonicalized package directory (printed paths are
 /// symlink-resolved, the oracle convention), the three pub faces, package
-/// tables, SDK snapshot, and the engine context. The semantic diagnostic
-/// families are disarmed here (`semdiag: None`, the engine's
-/// under-reporting posture): these faces answer from the index rows,
-/// graphs, and facts the pipeline builds regardless, so the per-library
-/// semantic fold would be dead work on every analyzed file.
+/// tables, SDK snapshot, and the engine context. The semantic fold rides
+/// the default diagnoser (#2618): the resolved member-access reference
+/// rows it publishes fold into the library reference surface these faces
+/// answer from, so disarming it would silently shrink `query
+/// callers`/`references` and `rename` to the parser-level sites.
 ///
 /// # Errors
 ///
 /// [`WorkspaceError`] when the SDK, the package directory, or the pub
 /// faces are unusable.
 pub fn open_engine(dir: &Path, sdk: Option<&Path>) -> Result<(Engine, PathBuf), WorkspaceError> {
-    let (mut config, dir, _) = engine_config_with_advisory(dir, sdk)?;
-    config.semdiag = None;
+    let (config, dir, _) = engine_config_with_advisory(dir, sdk)?;
     let engine = Engine::new(config)
         .map_err(|error| WorkspaceError(format!("engine context unusable: {error}")))?;
     Ok((engine, dir))
@@ -257,6 +257,18 @@ pub fn engine_config_with_advisory(
     engine_config_with_overrides(dir, sdk, &AnalyzeOverrides::default())
 }
 
+/// The config-assembly phase clocks the analyze face's `--metrics-json`
+/// split reports (`sdk_ms`): monotonic wall-clock of the SDK snapshot
+/// loads — the plain `SdkSnapshot::load` plus the embedder-table reload
+/// when the resolution carries one, summed. Everything else the assembly
+/// does (pub resolution, package-config reads, the embedder locator walk)
+/// stays in the caller's assembly window.
+#[derive(Debug, Default)]
+pub struct AssemblyPhases {
+    /// Both `SdkSnapshot::load` calls, summed.
+    pub sdk: Duration,
+}
+
 /// [`engine_config_with_advisory`] with the analyze face's CLI overrides
 /// (#938).
 ///
@@ -269,6 +281,23 @@ pub fn engine_config_with_overrides(
     sdk: Option<&Path>,
     overrides: &AnalyzeOverrides,
 ) -> Result<(EngineConfig, PathBuf, Option<WorkspaceAdvisory>), WorkspaceError> {
+    engine_config_with_overrides_phased(dir, sdk, overrides)
+        .map(|(config, dir, advisory, _phases)| (config, dir, advisory))
+}
+
+/// [`engine_config_with_overrides`] plus the assembly's phase clocks
+/// ([`AssemblyPhases`]) — the analyze face's `--metrics-json` attribution;
+/// every other caller takes the unphased spelling.
+///
+/// # Errors
+///
+/// [`WorkspaceError`] when the SDK, the package directory, the pub faces,
+/// or an override value is unusable.
+pub fn engine_config_with_overrides_phased(
+    dir: &Path,
+    sdk: Option<&Path>,
+    overrides: &AnalyzeOverrides,
+) -> Result<(EngineConfig, PathBuf, Option<WorkspaceAdvisory>, AssemblyPhases), WorkspaceError> {
     validate_experiments(&overrides.experiments)?;
     let sdk_root = sdk
         .map(Path::to_path_buf)
@@ -282,8 +311,12 @@ pub fn engine_config_with_overrides(
     // snapshot's Dart version against the config's `generatorVersion`. The
     // message is the oracle's usage text for the unusable-SDK tier,
     // verbatim (upstream Dart SDK source, pkg/dartdev — analyze.dart:208).
+    let sdk_at = Instant::now();
     let sdk_snapshot = SdkSnapshot::load(&sdk_root, None)
         .map_err(|_| WorkspaceError(format!("Invalid Dart SDK path: {}", sdk_root.display())))?;
+    let mut phases = AssemblyPhases {
+        sdk: sdk_at.elapsed(),
+    };
     // The stale-config advisory rides `package_assembly`; the engine-backed
     // faces surface it through their output plumbing.
     let (packages, config, config_dir, dir, stale_advisory) = package_assembly_with(
@@ -291,6 +324,23 @@ pub fn engine_config_with_overrides(
         overrides.packages.as_deref(),
         Some(&sdk_snapshot.dart.version),
     )?;
+    // Flutter's embedder: a `sky_engine` package in the resolution replaces
+    // the whole `dart:` library table with its `_embedder.yaml` mapping (the
+    // analyzer builds an `EmbedderSdk` over the resolved package). The
+    // plain snapshot stays the fallback — an unusable embedder yaml
+    // degrades to the plain dart-sdk table, the analyzer's own posture
+    // (`locateEmbedderYamlFor` returning null → folder SDK); the analysis
+    // never refuses over the embedder.
+    let sdk_snapshot = match embedder_lib_dir(&config, &config_dir) {
+        Some(lib_dir) => {
+            let embedder_at = Instant::now();
+            let reloaded =
+                SdkSnapshot::load(&sdk_root, Some(&lib_dir)).unwrap_or(sdk_snapshot);
+            phases.sdk += embedder_at.elapsed();
+            reloaded
+        }
+        None => sdk_snapshot,
+    };
     Ok((
         EngineConfig {
             // The file-backed CAS store: workspace loads ride read-only
@@ -310,7 +360,58 @@ pub fn engine_config_with_overrides(
         },
         dir,
         stale_advisory,
+        phases,
     ))
+}
+
+/// The embedder directory of an assembled resolution, if any: the package
+/// folder carrying `_embedder.yaml` — a `sky_engine` package's `lib/`, the
+/// analyzer's `EmbedderSdk` trigger.
+///
+/// The locator mirrors the analyzer's `_createSdk`
+/// (`pkg/analyzer/lib/src/dart/analysis/context_builder.dart`): resolve
+/// `package:sky_engine/_embedder.yaml` through the workspace's package
+/// map — the entry named `sky_engine` wins wherever it sits in the config
+/// — with the generic embedder rule as fallback: the first package whose
+/// source root carries an `_embedder.yaml` (the locator the analyzer's
+/// embedder search grew from). A resolution without either is the plain
+/// dart-sdk posture; so are the degraded floors, whose empty package map
+/// resolves no `package:sky_engine/…` URI at all.
+///
+/// The candidate folder is the entry's `packageUri` anchor (the same base
+/// the `package:` URI resolves through; an entry without one anchors at
+/// the package root itself), so `_embedder.yaml` sits exactly where
+/// `package:sky_engine/_embedder.yaml` resolves to. The returned directory
+/// is canonical — realpath when it exists (it does: the yaml probe found a
+/// file in it), lexical normalization as the never-taken fallback — so
+/// `rootUri` `..` spellings and host symlinks (macOS `/var` →
+/// `/private/var`) never leak into SDK paths; the engine's file table is
+/// realpath-normalized and the SDK unit paths must match it byte-for-byte.
+///
+/// Pub for every snapshot reload that holds an assembled resolution (the
+/// compat axes, the impact environments, the daemon context axes): they
+/// route their `SdkSnapshot::load` through this locator so a `sky_engine`
+/// resolution replaces the `dart:` table on those faces too, not only the
+/// default context.
+pub fn embedder_lib_dir(config: &PackageConfig, config_dir: &Path) -> Option<PathBuf> {
+    let mut generic = None;
+    for entry in &config.packages {
+        let Ok(root) = entry.resolve_root(config_dir) else {
+            continue;
+        };
+        let source_root = root.join(entry.package_uri.as_deref().unwrap_or(""));
+        if source_root.join("_embedder.yaml").is_file() {
+            let canonical =
+                source_root
+                    .canonicalize()
+                    .unwrap_or_else(|_| normalize(&source_root));
+            if entry.name == "sky_engine" {
+                return Some(canonical);
+            }
+            generic.get_or_insert(canonical);
+        }
+    }
+    generic
 }
 
 /// The SDK-free pub assembly behind every package-attributed face: the
@@ -2146,5 +2247,157 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `sky_engine` entry in the resolution turns the engine's SDK into
+    /// an embedder-backed snapshot (the analyzer's `EmbedderSdk` over the
+    /// resolved package): `dart:ui` resolves inside the package and
+    /// `dart:core` onto the embedder's file — full-table replacement, the
+    /// plain `libraries.json` table never consulted for `dart:` URIs.
+    #[test]
+    fn sky_engine_entry_backs_the_embedder_sdk_table() {
+        let root = workspace("ws_embedder", &[]);
+        write_sky_engine(&root);
+        write_package_config_with_sky_engine(&root);
+
+        let root = root.canonicalize().expect("root");
+        let (config, _, _) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
+            .expect("the embedder assembly loads");
+        let ui = config
+            .sdk
+            .flat_library_to_path("ui", "")
+            .expect("dart:ui resolves through the embedder");
+        assert_eq!(ui, root.join("sky_engine").join("lib").join("ui").join("ui.dart"));
+        // Full replacement: core comes from the embedder file, not the
+        // dart-sdk table's sdk/lib/core/core.dart.
+        assert_eq!(
+            config.sdk.flat_library_to_path("core", ""),
+            Some(root.join("sky_engine").join("lib").join("embedder_core.dart"))
+        );
+        // A name only the plain table lists is gone under replacement.
+        assert_eq!(config.sdk.flat_library_to_path("io", ""), None);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// No embedder package in the resolution: the plain dart-sdk posture,
+    /// byte-identical to the pre-embedder assembly (`dart:ui` unresolvable,
+    /// `dart:core` on the dart-sdk file).
+    #[test]
+    fn resolution_without_embedder_keeps_the_plain_sdk_table() {
+        let root = workspace("ws_plain", &[]);
+        // A package named sky_engine WITHOUT the yaml is no embedder (the
+        // locator requires the file, not the name).
+        fs::create_dir_all(root.join("sky_engine/lib")).expect("package dir");
+        fs::write(root.join("sky_engine/pubspec.yaml"), "name: sky_engine\n").expect("pubspec");
+        write_package_config_with_sky_engine(&root);
+
+        let root = root.canonicalize().expect("root");
+        let (config, _, _) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
+            .expect("the plain assembly loads");
+        assert_eq!(config.sdk.flat_library_to_path("ui", ""), None);
+        assert_eq!(
+            config.sdk.flat_library_to_path("core", ""),
+            Some(root.join("sdk").join("lib").join("core").join("core.dart"))
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A malformed `_embedder.yaml` degrades to the plain dart-sdk table —
+    /// the analyzer's own posture (`locateEmbedderYamlFor` returning null
+    /// → folder SDK): the assembly never refuses over the embedder.
+    #[test]
+    fn malformed_embedder_yaml_degrades_to_the_plain_table() {
+        let root = workspace("ws_bad_yaml", &[]);
+        write_sky_engine(&root);
+        fs::write(
+            root.join("sky_engine/lib/_embedder.yaml"),
+            "embedded_libs: [unclosed\n",
+        )
+        .expect("malformed embedder yaml");
+        write_package_config_with_sky_engine(&root);
+
+        let root = root.canonicalize().expect("root");
+        let (config, _, _) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
+            .expect("a malformed embedder degrades, never refuses");
+        assert_eq!(
+            config.sdk.flat_library_to_path("ui", ""),
+            None,
+            "the plain table has no dart:ui"
+        );
+        assert_eq!(
+            config.sdk.flat_library_to_path("core", ""),
+            Some(root.join("sdk").join("lib").join("core").join("core.dart")),
+            "the plain dart-sdk core file backs dart:core"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The locator honors the config's `packageUri` anchor (absolute
+    /// `file://` rootUri spellings — a real Flutter config's sky_engine
+    /// entry) and prefers the sky_engine entry over a generic embedder
+    /// wherever it sits in the config.
+    #[test]
+    fn embedder_locator_prefers_sky_engine_over_generic_embedders() {
+        let root = workspace("ws_locator", &[]);
+        write_sky_engine(&root);
+        // A generic embedder package FIRST in config order: it must lose to
+        // the sky_engine entry after it.
+        fs::create_dir_all(root.join("other_engine/lib")).expect("generic engine dir");
+        fs::write(
+            root.join("other_engine/lib/_embedder.yaml"),
+            "embedded_libs:\n  \"dart:core\": \"other_core.dart\"\n",
+        )
+        .expect("generic embedder yaml");
+        fs::write(
+            root.join(".dart_tool/package_config.json"),
+            format!(
+                r#"{{"configVersion": 2, "packages": [{{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}}, {{"name": "other_engine", "rootUri": "file://{}", "packageUri": "lib/", "languageVersion": "3.5"}}, {{"name": "sky_engine", "rootUri": "file://{}", "packageUri": "lib/", "languageVersion": "3.5"}}], "generator": "pub", "generatorVersion": "3.13.1"}}"#,
+                root.join("other_engine").display(),
+                root.join("sky_engine").display(),
+            ),
+        )
+        .expect("config");
+
+        let root = root.canonicalize().expect("root");
+        let (config, _, _) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
+            .expect("the assembly loads");
+        assert_eq!(
+            config.sdk.flat_library_to_path("core", ""),
+            Some(root.join("sky_engine").join("lib").join("embedder_core.dart")),
+            "sky_engine wins wherever it sits in the config"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Writes the sky_engine-shaped package: `lib/_embedder.yaml` mapping
+    /// `dart:core` and `dart:ui` inside the package.
+    fn write_sky_engine(root: &Path) {
+        fs::create_dir_all(root.join("sky_engine/lib/ui")).expect("package dirs");
+        fs::write(
+            root.join("sky_engine/lib/_embedder.yaml"),
+            "embedded_libs:\n  \"dart:core\": \"embedder_core.dart\"\n  \"dart:ui\": \"ui/ui.dart\"\n",
+        )
+        .expect("embedder yaml");
+        fs::write(
+            root.join("sky_engine/lib/embedder_core.dart"),
+            "library dart.core;",
+        )
+        .expect("embedder core");
+        fs::write(root.join("sky_engine/lib/ui/ui.dart"), "library dart.ui;")
+            .expect("embedder ui");
+    }
+
+    /// The fixture config plus one sky_engine entry (config-relative
+    /// `rootUri`, the pub-writer spelling).
+    fn write_package_config_with_sky_engine(root: &Path) {
+        fs::write(
+            root.join(".dart_tool/package_config.json"),
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}, {"name": "sky_engine", "rootUri": "../sky_engine", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
+        )
+        .expect("config");
     }
 }

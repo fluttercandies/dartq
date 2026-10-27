@@ -1,1 +1,1 @@
-{"v":1,"sym":"Widget","decls":[{"file":"package:fixture/a.dart","kind":"class","name":"Widget","line":2,"col":7,"len":6}],"refs":[{"target":"package:fixture/a.dart","kind":"reference","off":33,"len":6},{"target":"package:fixture/a.dart","kind":"invoked","off":41,"len":6}]}
+{"v":1,"root":"FIXTURE_ROOT","sym":"Widget","decls":[{"file":"lib/a.dart","kind":"class","name":"Widget","line":2,"col":7,"len":6}],"refs":[{"target":"lib/a.dart","kind":"reference","off":33,"len":6},{"target":"lib/a.dart","kind":"invoked","off":41,"len":6}]}

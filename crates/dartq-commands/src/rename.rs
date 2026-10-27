@@ -1,11 +1,16 @@
 //! The rename face's core: one anchor position resolved through the
-//! engine's `resolve_at` substrate, joined with the by-name reference rows
-//! (the same join the `query references` face serves), projected onto a
-//! whole-identifier edit set — one edit per declaration name token and
-//! resolved use, ordered by path then offset. The CLI's `dartq rename`
-//! prints the set as the machine document and, under `--write`, splices it
-//! into the on-disk files; the daemon shapes the same result into its RPC
-//! answer.
+//! engine's `resolve_at` substrate, widened to the target's whole scope —
+//! a member target's override family (every declaration of the member in
+//! the subtype/supertype closure of the anchor's container, the
+//! analyzer's whole-hierarchy rename) or the single declaration for a
+//! top-level target — joined with the by-name declaration and reference
+//! rows (the same join the `query references` face serves) and projected
+//! onto a whole-identifier edit set: one edit per family declaration's
+//! name token and every resolved use whose static target is a family
+//! member, ordered by path then offset. The CLI's `dartq rename`
+//! prints the set as the machine document and, under `--write`, splices
+//! it into the on-disk files; the daemon shapes the same result into its
+//! RPC answer.
 //!
 //! # Contract
 //!
@@ -21,8 +26,9 @@
 //!   ASCII-only, the scanner's contract) and not a reserved word (the
 //!   scanner's keyword classification; built-in and pseudo keywords stay
 //!   legal identifier spellings). Shadowing is legal Dart semantics, so
-//!   same-name collisions are deliberately not refused — the reference
-//!   join already scopes the edit set to the resolved target.
+//!   same-name collisions are deliberately not refused — the family join
+//!   already scopes the edit set to the resolved hierarchy (a shadowing
+//!   declaration outside the family keeps its own scope).
 //! * Edit rows carry UTF-16 offsets (the engine's external convention)
 //!   plus 1-based line/column locators, file paths as the file table's
 //!   canonical spellings — the identity spelling a `--write` splices
@@ -36,9 +42,10 @@
 use std::path::{Path, PathBuf};
 
 use dartq_diagnostics::FileLayoutProvider as _;
-use dartq_engine::{DeclKind, Engine, PositionAnswer};
+use dartq_engine::{DeclKind, Engine, PositionAnswer, ReferenceKind};
 use dartq_scanner::{KeywordStyle, keyword_from_str};
 use dartq_source::{FileId, SourceRange};
+use rustc_hash::FxHashSet;
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -98,9 +105,10 @@ impl Anchor {
     }
 }
 
-/// One rename run: the renamed declaration's identity plus the whole
-/// edit set (the declaration's name token and every resolved use), in the
-/// printed order — canonical path bytes, then offset.
+/// One rename run: the anchor declaration's identity plus the whole
+/// edit set (every family declaration's name token and every resolved
+/// use targeting the family), in the printed order — canonical path
+/// bytes, then offset.
 pub struct RenameRun<'a> {
     /// The renamed declaration; `None` when the anchor lands on a position
     /// the maintained rows do not cover (the empty edit set answers).
@@ -243,35 +251,72 @@ pub fn plan<'a>(
         PositionAnswer::Declaration(decl) => (decl.file, decl.name, decl.range),
         PositionAnswer::Use(use_hit) => (use_hit.target_file, use_hit.name, use_hit.target_range),
     };
+    // The target's declaring container (#2618): a member target is scoped
+    // by `(file, container, name)` — two classes in one file may declare
+    // the same member name, and a file-only filter would over-rename. The
+    // member-resolution rows carry the statically resolved container, so
+    // the anchor names one member of the hierarchy whatever it points at.
+    let target_container = match answer {
+        PositionAnswer::Declaration(decl) => decl.container,
+        PositionAnswer::Use(use_hit) => use_hit.container,
+    };
 
-    // The edit rows: the references join's resolved uses filtered to the
-    // target, plus the declaration's own name token. The join is
-    // name-keyed, so the target filter scopes the set to the resolved
-    // declaration — a shadowing declaration's uses target their own
-    // declaration's file and stay out.
-    let mut edits: Vec<RenameEdit> = engine
-        .query_symbols(lookup_name)
-        .refs
+    // The edit scope (#2649): a member target renames the whole override
+    // family — every container declaring the name inside the
+    // subtype/supertype closure of the anchor's container (the engine's
+    // `override_family` face, the same derivation the query boundary's
+    // Override rows mint) — so anchoring at the interface, the deepest
+    // override, or a use resolving to any member of the family answers the
+    // identical edit set. A top-level target (no container) keeps the
+    // single declaration's scope: no hierarchy exists.
+    let family: FxHashSet<(FileId, Option<&str>)> = match target_container {
+        Some(container) => engine
+            .override_family(target_file, container, lookup_name)
+            .into_iter()
+            .map(|(file, container)| (file, Some(container)))
+            .collect(),
+        None => [(target_file, None)].into_iter().collect(),
+    };
+
+    // The edit rows: every family declaration's name token plus every
+    // resolved use whose static target is a family member — the by-name
+    // join's declaration and reference rows filtered to the family, the
+    // Override rows (declaration sites the declaration pass already
+    // edits) excluded. A shadowing declaration outside the family targets
+    // its own declaration's scope and stays out.
+    let joined = engine.query_symbols(lookup_name);
+    let mut edits: Vec<RenameEdit> = joined
+        .decls
         .iter()
-        .filter(|hit| hit.target_file == target_file)
-        .map(|hit| RenameEdit {
-            file: hit.file,
-            range: hit.range,
+        .filter(|decl| family.contains(&(decl.file, decl.container)))
+        .map(|decl| RenameEdit {
+            file: decl.file,
+            range: decl.range,
         })
         .collect();
-    edits.push(RenameEdit {
-        file: target_file,
-        range: declaration,
-    });
+    edits.extend(
+        joined
+            .refs
+            .iter()
+            .filter(|hit| hit.kind != ReferenceKind::Override)
+            .filter(|hit| family.contains(&(hit.target_file, hit.target_container)))
+            .map(|hit| RenameEdit {
+                file: hit.file,
+                range: hit.range,
+            }),
+    );
 
     let layout = EngineLayout::over(engine, edits.iter().map(|edit| edit.file));
     // Output determinism: canonical path byte order, then position (the
-    // query family's printed contract).
+    // query family's printed contract). Identical rows (same file and
+    // span — a site reached through both the declaration and the
+    // reference pass) collapse to one edit: a splice applies a span once.
     edits.sort_by(|a, b| {
         path_key(layout.file_path(a.file))
             .cmp(path_key(layout.file_path(b.file)))
             .then_with(|| a.range.offset.cmp(&b.range.offset))
     });
+    edits.dedup_by(|a, b| a.file == b.file && a.range == b.range);
     Ok(RenameRun {
         target: Some(RenameTarget {
             file: target_file,
@@ -308,16 +353,33 @@ pub fn is_legal_new_name(name: &str) -> bool {
         && !keyword_from_str(name).is_some_and(|keyword| keyword.style() == KeywordStyle::Reserved)
 }
 
-/// The first file outside `workspace` (canonical spellings both sides —
-/// the file table interns canonical paths and the workspace assembly
-/// returns the canonical directory), `None` when every file is inside.
-/// The `--write` gate: only the analyzed workspace's own files are
-/// writable.
+/// Every edit-site path outside `workspace` (canonical spellings both
+/// sides — the file table interns canonical paths and the workspace
+/// assembly returns the canonical directory), in row order, adjacent
+/// duplicates collapsed. The `--write` gate's answer (#2618): the atomic
+/// rule — ANY out-of-boundary site refuses the whole write, and the
+/// refusal names every refusing file so the caller can answer the full
+/// list, never a partial rename behind a first-reason only.
+pub fn outside_workspace_all<'a>(
+    paths: impl IntoIterator<Item = &'a Path>,
+    workspace: &Path,
+) -> Vec<&'a Path> {
+    let mut outside: Vec<&Path> = paths
+        .into_iter()
+        .filter(|path| !path.starts_with(workspace))
+        .collect();
+    outside.dedup();
+    outside
+}
+
+/// The first out-of-boundary path ([`outside_workspace_all`]'s head),
+/// `None` when every file is inside — the single-reason face; the
+/// `--write` gate: only the analyzed workspace's own files are writable.
 pub fn outside_workspace<'a>(
     paths: impl IntoIterator<Item = &'a Path>,
     workspace: &Path,
 ) -> Option<&'a Path> {
-    paths.into_iter().find(|path| !path.starts_with(workspace))
+    outside_workspace_all(paths, workspace).into_iter().next()
 }
 
 /// Applies one file's edits to its on-disk text and returns the patched
@@ -476,6 +538,233 @@ mod tests {
                     .into_owned()
             })
             .collect()
+    }
+
+    /// The #2618 pin: a member send on an interface-typed receiver reaches
+    /// the command faces end to end — `query callers` answers the call
+    /// site as one Invoked reference targeting the INTERFACE declaration,
+    /// and the rename plan edits the interface declaration, the
+    /// implementing override, and the call site.
+    #[test]
+    fn member_send_edges_reach_callers_and_rename() {
+        const M: &str = concat!(
+            "abstract class R {\n",
+            "  Future<void> createTask();\n",
+            "}\n",
+            "class Impl implements R {\n",
+            "  Future<void> createTask() async {}\n",
+            "}\n",
+            "void f(R r) => r.createTask();\n"
+        );
+        let root = workspace("member_send", &[("lib/m.dart", M)]);
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+
+        // Callers: one Invoked row at the call site, targeting the
+        // interface's declaration file; the override rows stay out (they
+        // are declarations, not invocations).
+        let run = crate::query::callers(&mut engine, "createTask").expect("callers");
+        assert_eq!(run.decls.len(), 2, "the interface declaration and the override");
+        assert_eq!(run.refs.len(), 1, "exactly the call site's invocation");
+        let call = M.find("r.createTask()").expect("call site") + 2;
+        let hit = &run.refs[0];
+        assert_eq!(hit.kind, dartq_engine::ReferenceKind::Invoked);
+        assert_eq!(hit.range.offset as usize, call);
+        let m = hit.file;
+
+        // Rename anchored on the call site: the use resolves to the
+        // interface's declaration, and the edit set covers the declaration,
+        // the override's row, and the call site — offset order within the
+        // one file.
+        let m_path = canonical(&root, "lib/m.dart");
+        let run = rename(
+            &mut engine,
+            &m_path,
+            Anchor::ByteOffset(call as u64),
+            "startTask",
+        )
+        .expect("rename");
+        let target = run.target.as_ref().expect("the use resolves");
+        assert_eq!(target.name, "createTask");
+        assert_eq!(target.kind, DeclKind::Method);
+        assert_eq!(target.container, Some("R"));
+        let offsets: Vec<usize> = run
+            .edits
+            .iter()
+            .map(|edit| edit.range.offset as usize)
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![
+                M.find("createTask();").expect("interface declaration"),
+                M.rfind("createTask() async").expect("override declaration"),
+                call,
+            ],
+            "declaration, override, call site — all three edit"
+        );
+        assert!(
+            run.edits.iter().all(|edit| edit.file == m),
+            "the whole family rides the one file"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The family pin (#2649): renaming a member edits the whole override
+    /// family — every declaration of the member in the hierarchy (the
+    /// interface, the implementing override, the extending override) plus
+    /// every call whose static target is a family member — and the edit
+    /// set is identical whatever member of the family the anchor names (a
+    /// declaration or a use resolving to one). A sibling class's unrelated
+    /// same-name member and its call stay untouched.
+    #[test]
+    fn rename_edits_the_whole_override_family_from_any_declaration() {
+        const FAMILY: &str = concat!(
+            "abstract class R {\n",
+            "  void m();\n",
+            "}\n",
+            "class A implements R {\n",
+            "  void m() {}\n",
+            "}\n",
+            "class B extends A {\n",
+            "  void m() {}\n",
+            "}\n",
+            "class S {\n",
+            "  void m() {}\n",
+            "}\n",
+            "void f(R r, A a, B b, S s) {\n",
+            "  r.m();\n",
+            "  a.m();\n",
+            "  b.m();\n",
+            "  s.m();\n",
+            "}\n"
+        );
+        let root = workspace("rename_family", &[("lib/m.dart", FAMILY)]);
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let m_path = canonical(&root, "lib/m.dart");
+
+        // The expected set: the three family declarations' name tokens
+        // (offset order), then the three calls — S.m and `s.m()` absent.
+        let m_sites: Vec<usize> = FAMILY.match_indices("void m()").map(|(at, _)| at).collect();
+        assert_eq!(m_sites.len(), 4, "R, A, B, and the sibling S");
+        let call = |receiver: &str| FAMILY.find(&format!("{receiver}.m()")).expect("call") + 2;
+        let expected: Vec<usize> = m_sites[..3]
+            .iter()
+            .map(|at| at + 5)
+            .chain(["r", "a", "b"].iter().map(|&receiver| call(receiver)))
+            .collect();
+
+        let mut edits_at = |anchor: usize, container: &str| {
+            let run = rename(
+                &mut engine,
+                &m_path,
+                Anchor::ByteOffset(anchor as u64),
+                "n",
+            )
+            .expect("rename");
+            let target = run.target.as_ref().expect("the anchor resolves");
+            assert_eq!(target.name, "m");
+            assert_eq!(target.kind, DeclKind::Method);
+            assert_eq!(target.container, Some(container));
+            run.edits
+                .iter()
+                .map(|edit| edit.range.offset as usize)
+                .collect::<Vec<_>>()
+        };
+        // The three declarations, then the interface-typed call — the same
+        // six edits from every anchor.
+        for (anchor, container) in [
+            (m_sites[0] + 5, "R"),
+            (m_sites[1] + 5, "A"),
+            (m_sites[2] + 5, "B"),
+            (call("r"), "R"),
+        ] {
+            assert_eq!(
+                edits_at(anchor, container),
+                expected,
+                "anchor {anchor} targets {container}.m"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The diamond pin (#2649 fixpoint rework): a subtype joining a second
+    /// branch (`A extends Base implements R`) pulls the whole diamond into
+    /// the edit set — both branches' declarations plus every call —
+    /// identical from every anchor: the other branch's base, the
+    /// interface, the joining subtype, and the plain implementer.
+    #[test]
+    fn rename_edits_the_diamond_family_from_every_branch() {
+        const DIAMOND: &str = concat!(
+            "class Base {\n",
+            "  void m() {}\n",
+            "}\n",
+            "abstract class R {\n",
+            "  void m();\n",
+            "}\n",
+            "class A extends Base implements R {\n",
+            "  void m() {}\n",
+            "}\n",
+            "class C implements R {\n",
+            "  void m() {}\n",
+            "}\n",
+            "void f(Base b, R r, A a, C c) {\n",
+            "  b.m();\n",
+            "  r.m();\n",
+            "  a.m();\n",
+            "  c.m();\n",
+            "}\n"
+        );
+        let root = workspace("rename_diamond", &[("lib/m.dart", DIAMOND)]);
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let m_path = canonical(&root, "lib/m.dart");
+
+        // The expected set: the four family declarations' name tokens
+        // (Base, R, A, C in declaration order), then the four calls.
+        let m_sites: Vec<usize> = DIAMOND.match_indices("void m()").map(|(at, _)| at).collect();
+        assert_eq!(m_sites.len(), 4, "Base, R, A, C");
+        let call = |receiver: &str| {
+            DIAMOND
+                .find(&format!("{receiver}.m()"))
+                .expect("call")
+                + 2
+        };
+        let expected: Vec<usize> = m_sites
+            .iter()
+            .map(|at| at + 5)
+            .chain(["b", "r", "a", "c"].iter().map(|&receiver| call(receiver)))
+            .collect();
+
+        let mut edits_at = |anchor: usize, container: &str| {
+            let run = rename(
+                &mut engine,
+                &m_path,
+                Anchor::ByteOffset(anchor as u64),
+                "n",
+            )
+            .expect("rename");
+            let target = run.target.as_ref().expect("the anchor resolves");
+            assert_eq!(target.name, "m");
+            assert_eq!(target.kind, DeclKind::Method);
+            assert_eq!(target.container, Some(container));
+            run.edits
+                .iter()
+                .map(|edit| edit.range.offset as usize)
+                .collect::<Vec<_>>()
+        };
+        for (anchor, container) in [
+            (m_sites[0] + 5, "Base"),
+            (m_sites[1] + 5, "R"),
+            (m_sites[2] + 5, "A"),
+            (m_sites[3] + 5, "C"),
+        ] {
+            assert_eq!(
+                edits_at(anchor, container),
+                expected,
+                "anchor {anchor} targets {container}.m"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The cross-file join: the anchor on a.dart's `fa` (the byte-offset

@@ -36,8 +36,8 @@ Watch progress instead of guessing:
 ```bash
 dartq events progress            # files scanned, current package
 dartq events progress --since 4210   # cursor: the last-seen file count
-dartq events session             # lifecycle: attach/detach, test runs, debug sessions
-dartq events session --since 17 --limit 50   # cursor-paginated by `seq`
+dartq events session             # lifecycle rows, newest first (limit 100 by default)
+dartq events session --since 1730034000 --limit 50   # rows at/after a unix-seconds timestamp
 ```
 
 ## Monster Monorepos: `dartq packages`

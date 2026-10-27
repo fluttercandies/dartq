@@ -34,8 +34,9 @@ fn dartq_native_faces_are_frozen_at_v1() {
 /// `file` + `schema_version` (the constant pinned at fix.rs:87) + `edits`
 /// with `anchor` objects; every row carries its provenance tag
 /// (`edit_floor`, fix.rs:744-751 — `builtin-lint` for the built-in row,
-/// fix.rs:91, the plugin's manifest name for the plugin row, fix.rs:777);
-/// the second edit shows the empty-context omission at line boundaries
+/// fix.rs:91, the plugin's manifest name for the plugin row, fix.rs:777)
+/// and its `role` key (the candidate's role, plugin rows `primary`); the
+/// second edit shows the empty-context omission at line boundaries
 ///.
 #[test]
 fn compact_fix_patch_passes_validation() {
@@ -48,6 +49,7 @@ fn compact_fix_patch_passes_validation() {
                 "len": 8,
                 "text": "Bar",
                 "src": "builtin-lint",
+                "role": "primary",
                 "anchor": {
                     "line": 10,
                     "col": 7,
@@ -60,6 +62,7 @@ fn compact_fix_patch_passes_validation() {
                 "len": 4,
                 "text": "new",
                 "src": "fixer",
+                "role": "primary",
                 "anchor": {"line": 1, "col": 1},
             },
         ],
@@ -69,8 +72,8 @@ fn compact_fix_patch_passes_validation() {
 
 /// The minimal tier (crate docs, "Verbosity tiers"): the anchor is the
 /// drift-correction extra; the directly-applicable trio is the red line,
-/// and the provenance tag rides it (`edit_floor` never drops it,
-/// fix.rs:744-751 — the writer's own minimal pin, fix.rs:1044-1050).
+/// and the provenance tag and role ride it (`edit_floor` never drops
+/// them, fix.rs:744-751 — the writer's own minimal pin, fix.rs:1044-1050).
 #[test]
 fn minimal_fix_patch_passes_validation() {
     let doc = serde_json::json!({
@@ -81,6 +84,7 @@ fn minimal_fix_patch_passes_validation() {
             "len": 8,
             "text": "Bar",
             "src": "builtin-lint",
+            "role": "suppress",
         }],
     });
     validate_ok(&doc.to_string(), Domain::FixPatch);
@@ -101,6 +105,7 @@ fn full_tier_fix_extras_pass_validation() {
             "len": 8,
             "text": "Bar",
             "src": "builtin-lint",
+            "role": "ignore_line",
             "anchor": {"line": 10, "col": 7, "before": "final Fo"},
             "rule": "unnecessary_new",
             "msg": "Unnecessary 'new' keyword.",
@@ -189,17 +194,20 @@ fn fix_missing_file_is_named() {
 /// `qualified` is the optional qualified-name convenience spelling: the
 /// writer omits it today because the index row carries only the
 /// `isQualified` bit, not the qualifier spelling. Each reference row names
-/// its use file. `v` is the v1 addition (maintainer ruling: every
-/// dartq-native face carries a version stamp); the writer stamps
-/// `crate::SCHEMA_VERSION`.
+/// its use file. The file columns spell through the one file locator
+/// (root-relative inside the analysis root, absolute outside), the envelope
+/// carrying the `root` they locate against. `v` is the v1 addition
+/// (maintainer ruling: every dartq-native face carries a version stamp);
+/// the writer stamps `crate::SCHEMA_VERSION`.
 #[test]
 fn compact_query_answer_passes_validation() {
     let doc = serde_json::json!({
         "v": SCHEMA_VERSION_QUERY,
+        "root": "/w",
         "sym": "fb",
         "decls": [
             {
-                "file": "/w/lib/a.dart",
+                "file": "lib/a.dart",
                 "container": null,
                 "kind": "class",
                 "name": "fb",
@@ -208,7 +216,7 @@ fn compact_query_answer_passes_validation() {
                 "len": 2,
             },
             {
-                "file": "/w/lib/a.dart",
+                "file": "lib/a.dart",
                 "container": "fb",
                 "kind": "method",
                 "name": "fb=",
@@ -219,9 +227,9 @@ fn compact_query_answer_passes_validation() {
         ],
         "refs": [
             {
-                "target": "/w/lib/b.dart",
+                "target": "lib/b.dart",
                 "kind": "invoked",
-                "file": "/w/lib/c.dart",
+                "file": "lib/c.dart",
                 "off": 42,
                 "len": 2,
             },
@@ -239,7 +247,7 @@ fn query_qualified_null_is_named() {
         "decls": [],
         "refs": [
             {
-                "target": "/w/lib/b.dart",
+                "target": "lib/b.dart",
                 "kind": "read",
                 "qualified": null,
                 "off": 7,
@@ -261,7 +269,7 @@ fn query_answer_rows_across_tiers_pass_validation() {
         "sym": "fb",
         "decls": [
             {
-                "file": "/w/lib/a.dart",
+                "file": "lib/a.dart",
                 "container": null,
                 "kind": "class",
                 "name": "fb",
@@ -272,7 +280,7 @@ fn query_answer_rows_across_tiers_pass_validation() {
         ],
         "refs": [
             {
-                "target": "/w/lib/b.dart",
+                "target": "lib/b.dart",
                 "kind": "invoked",
                 "qualified": "fb.fma()",
                 "off": 42,
@@ -287,7 +295,7 @@ fn query_answer_rows_across_tiers_pass_validation() {
         "sym": "fb",
         "decls": [
             {
-                "file": "/w/lib/a.dart",
+                "file": "lib/a.dart",
                 "kind": "class",
                 "name": "fb",
                 "line": 3,
@@ -296,7 +304,7 @@ fn query_answer_rows_across_tiers_pass_validation() {
             },
         ],
         "refs": [
-            {"target": "/w/lib/b.dart", "kind": "invoked", "off": 42, "len": 2},
+            {"target": "lib/b.dart", "kind": "invoked", "off": 42, "len": 2},
         ],
     });
     validate_ok(&minimal.to_string(), Domain::Query);
@@ -324,7 +332,7 @@ fn query_reference_without_offset_is_named() {
         "v": SCHEMA_VERSION_QUERY,
         "sym": "fb",
         "decls": [],
-        "refs": [{"target": "/w/lib/b.dart", "kind": "read"}],
+        "refs": [{"target": "lib/b.dart", "kind": "read"}],
     });
     let violation = violation_of(&doc.to_string(), Domain::Query);
     assert_eq!(violation.path, "refs[0].off");
@@ -342,13 +350,13 @@ fn query_reference_use_file_is_optional() {
         "decls": [],
         "refs": [
             {
-                "target": "/w/lib/a.dart",
+                "target": "lib/a.dart",
                 "kind": "invoked",
-                "file": "/w/lib/p.dart",
+                "file": "lib/p.dart",
                 "off": 9,
                 "len": 4,
             },
-            {"target": "/w/lib/a.dart", "kind": "read", "off": 21, "len": 2},
+            {"target": "lib/a.dart", "kind": "read", "off": 21, "len": 2},
         ],
     });
     validate_ok(&doc.to_string(), Domain::Query);
@@ -363,7 +371,7 @@ fn query_reference_file_type_error_is_named() {
         "sym": "fb",
         "decls": [],
         "refs": [
-            {"target": "/w/lib/a.dart", "kind": "read", "file": 17, "off": 9, "len": 4},
+            {"target": "lib/a.dart", "kind": "read", "file": 17, "off": 9, "len": 4},
         ],
     });
     let violation = violation_of(&doc.to_string(), Domain::Query);
@@ -379,7 +387,7 @@ fn query_unknown_declaration_kind_is_named() {
         "v": SCHEMA_VERSION_QUERY,
         "sym": "fb",
         "decls": [{
-            "file": "/w/lib/a.dart",
+            "file": "lib/a.dart",
             "container": null,
             "kind": "struct",
             "name": "fb",
@@ -401,7 +409,7 @@ fn query_internal_file_id_is_undeclared() {
         "v": SCHEMA_VERSION_QUERY,
         "sym": "fb",
         "decls": [{
-            "file": "/w/lib/a.dart",
+            "file": "lib/a.dart",
             "container": null,
             "kind": "class",
             "name": "fb",
@@ -423,7 +431,7 @@ fn query_container_type_error_is_named() {
         "v": SCHEMA_VERSION_QUERY,
         "sym": "fb",
         "decls": [{
-            "file": "/w/lib/a.dart",
+            "file": "lib/a.dart",
             "container": 3,
             "kind": "class",
             "name": "fb",
@@ -451,7 +459,8 @@ fn query_container_type_error_is_named() {
 fn compact_compat_report_passes_validation() {
     let doc = serde_json::json!({
         "schema_version": SCHEMA_VERSION_COMPAT,
-        "file": "/w/lib/a.dart",
+        "root": "/w",
+        "file": "lib/a.dart",
         "matrix": [
             {"sdk": "3.13.1", "compatible": true},
             {
@@ -459,7 +468,7 @@ fn compact_compat_report_passes_validation() {
                 "compatible": false,
                 "first_failure": {
                     "code": "uri_does_not_exist",
-                    "file": "/w/lib/a.dart",
+                    "file": "lib/a.dart",
                     "line": 1,
                     "col": 8,
                     "message": "Target of URI doesn't exist: dart:async",
@@ -484,7 +493,7 @@ fn compact_compat_report_passes_validation() {
 fn minimal_compat_report_passes_validation() {
     let doc = serde_json::json!({
         "schema_version": SCHEMA_VERSION_COMPAT,
-        "file": "/w/lib/a.dart",
+        "file": "lib/a.dart",
         "matrix": [
             {"sdk": "3.13.1", "compatible": true},
             {"sdk": "3.5.0", "compatible": false},
@@ -498,7 +507,7 @@ fn minimal_compat_report_passes_validation() {
 fn compat_row_without_verdict_is_named() {
     let doc = serde_json::json!({
         "schema_version": SCHEMA_VERSION_COMPAT,
-        "file": "/w/lib/a.dart",
+        "file": "lib/a.dart",
         "matrix": [{"sdk": "3.5.0"}],
     });
     let violation = violation_of(&doc.to_string(), Domain::Compat);
@@ -510,7 +519,7 @@ fn compat_row_without_verdict_is_named() {
 fn compat_unknown_error_kind_is_named() {
     let doc = serde_json::json!({
         "schema_version": SCHEMA_VERSION_COMPAT,
-        "file": "/w/lib/a.dart",
+        "file": "lib/a.dart",
         "matrix": [{
             "sdk": "/w/sdks/broken",
             "compatible": false,
@@ -526,13 +535,13 @@ fn compat_unknown_error_kind_is_named() {
 fn compat_failure_without_message_is_named() {
     let doc = serde_json::json!({
         "schema_version": SCHEMA_VERSION_COMPAT,
-        "file": "/w/lib/a.dart",
+        "file": "lib/a.dart",
         "matrix": [{
             "sdk": "3.5.0",
             "compatible": false,
             "first_failure": {
                 "code": "uri_does_not_exist",
-                "file": "/w/lib/a.dart",
+                "file": "lib/a.dart",
                 "line": 1,
                 "col": 8,
             },
@@ -559,8 +568,12 @@ fn compact_run_metrics_passes_validation() {
         "loc": 3_456,
         "diagnostics": 2,
         "discovery_ms": 4,
+        "sdk_ms": 2,
+        "assembly_ms": 1,
         "analyze_ms": 31,
-        "total_ms": 35,
+        "lints_ms": 5,
+        "render_ms": 1,
+        "total_ms": 46,
         "libraries_analyzed": 9,
         "libraries_from_cache": 3,
         "max_rss_bytes": 84_233_216,
@@ -576,8 +589,12 @@ fn run_metrics_with_null_rss_passes_validation() {
         "loc": 3_456,
         "diagnostics": 2,
         "discovery_ms": 4,
+        "sdk_ms": 2,
+        "assembly_ms": 1,
         "analyze_ms": 31,
-        "total_ms": 35,
+        "lints_ms": 5,
+        "render_ms": 1,
+        "total_ms": 46,
         "libraries_analyzed": 0,
         "libraries_from_cache": 0,
         "max_rss_bytes": null,
@@ -593,7 +610,11 @@ fn run_metrics_missing_total_ms_is_named() {
         "loc": 3_456,
         "diagnostics": 2,
         "discovery_ms": 4,
+        "sdk_ms": 2,
+        "assembly_ms": 1,
         "analyze_ms": 31,
+        "lints_ms": 5,
+        "render_ms": 1,
         "libraries_analyzed": 9,
         "libraries_from_cache": 3,
         "max_rss_bytes": null,
@@ -611,8 +632,12 @@ fn run_metrics_bad_files_type_is_named() {
         "loc": 3_456,
         "diagnostics": 2,
         "discovery_ms": 4,
+        "sdk_ms": 2,
+        "assembly_ms": 1,
         "analyze_ms": 31,
-        "total_ms": 35,
+        "lints_ms": 5,
+        "render_ms": 1,
+        "total_ms": 46,
         "libraries_analyzed": 9,
         "libraries_from_cache": 3,
         "max_rss_bytes": null,
@@ -620,6 +645,35 @@ fn run_metrics_bad_files_type_is_named() {
     let violation = violation_of(&doc.to_string(), Domain::RunMetrics);
     assert_eq!(violation.path, "files");
     assert_eq!(violation.expected, "an integer");
+}
+
+/// The phase split (#2628): every phase key is individually required — a
+/// document missing any one of them is rejected with the key named.
+#[test]
+fn run_metrics_missing_phase_key_is_named() {
+    let doc = serde_json::json!({
+        "schema_version": SCHEMA_VERSION_RUN_METRICS,
+        "files": 12,
+        "loc": 3_456,
+        "diagnostics": 2,
+        "discovery_ms": 4,
+        "sdk_ms": 2,
+        "assembly_ms": 1,
+        "analyze_ms": 31,
+        "lints_ms": 5,
+        "render_ms": 1,
+        "total_ms": 46,
+        "libraries_analyzed": 9,
+        "libraries_from_cache": 3,
+        "max_rss_bytes": null,
+    });
+    for key in ["sdk_ms", "assembly_ms", "lints_ms", "render_ms"] {
+        let mut short = doc.clone();
+        short.as_object_mut().expect("object").remove(key);
+        let violation = violation_of(&short.to_string(), Domain::RunMetrics);
+        assert_eq!(violation.path, key, "missing phase key is named");
+        assert_eq!(violation.found, "missing");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -952,8 +1006,8 @@ fn minimal_assists_pass_and_negatives_are_named() {
 
 /// Tier exactness on the fix face: the anchor is compact-tier content and
 /// the human-name rows (`rule`/`message`/`priority`) full-tier only, so a
-/// tier violation names the field and its tier; the provenance tag rides
-/// every tier (`patch_json`, fix.rs:749).
+/// tier violation names the field and its tier; the provenance tag and the
+/// candidate's role ride every tier (`patch_json`, fix.rs:749).
 #[test]
 fn fix_patch_is_exact_at_its_tier() {
     let compact = serde_json::json!({
@@ -964,6 +1018,7 @@ fn fix_patch_is_exact_at_its_tier() {
             "len": 8,
             "text": "Bar",
             "src": "builtin-lint",
+            "role": "primary",
             "anchor": {"line": 10, "col": 7},
         }],
     });
@@ -983,6 +1038,7 @@ fn fix_patch_is_exact_at_its_tier() {
             "len": 8,
             "text": "Bar",
             "src": "fixer",
+            "role": "primary",
             "anchor": {"line": 10, "col": 7},
             "rule": "unnecessary_new",
             "msg": "insert const",
@@ -1024,7 +1080,7 @@ fn query_answer_is_exact_at_its_tier() {
         "v": SCHEMA_VERSION_QUERY,
         "sym": "fb",
         "decls": [{
-            "file": "/w/lib/a.dart",
+            "file": "lib/a.dart",
             "container": null,
             "kind": "class",
             "name": "fb",
@@ -1034,7 +1090,7 @@ fn query_answer_is_exact_at_its_tier() {
         }],
         "refs": [
             {
-                "target": "/w/lib/b.dart",
+                "target": "lib/b.dart",
                 "kind": "invoked",
                 "qualified": "fb.fma()",
                 "off": 42,
@@ -1067,7 +1123,7 @@ fn query_answer_is_exact_at_its_tier() {
 fn compat_report_is_exact_at_its_tier() {
     let compact = serde_json::json!({
         "schema_version": SCHEMA_VERSION_COMPAT,
-        "file": "/w/lib/a.dart",
+        "file": "lib/a.dart",
         "matrix": [
             {"sdk": "3.13.1", "compatible": true},
             {
@@ -1097,8 +1153,12 @@ fn run_metrics_are_tier_invariant() {
         "loc": 3_456,
         "diagnostics": 2,
         "discovery_ms": 4,
+        "sdk_ms": 2,
+        "assembly_ms": 1,
         "analyze_ms": 31,
-        "total_ms": 35,
+        "lints_ms": 5,
+        "render_ms": 1,
+        "total_ms": 46,
         "libraries_analyzed": 9,
         "libraries_from_cache": 3,
         "max_rss_bytes": null,
@@ -1142,7 +1202,7 @@ fn query_reserved_kind_arrays_are_exact_at_their_tier() {
         "v": SCHEMA_VERSION_QUERY,
         "sym": "fb",
         "decls": [{
-            "file": "/w/lib/a.dart",
+            "file": "lib/a.dart",
             "container": null,
             "kind": "class",
             "name": "fb",
@@ -1152,7 +1212,7 @@ fn query_reserved_kind_arrays_are_exact_at_their_tier() {
         }],
         "refs": [],
         "implementations": [{
-            "file": "/w/lib/sub.dart",
+            "file": "lib/sub.dart",
             "container": "Sub",
             "kind": "class",
             "name": "Sub",
@@ -1160,7 +1220,7 @@ fn query_reserved_kind_arrays_are_exact_at_their_tier() {
             "col": 7,
             "len": 3,
         }],
-        "deps": [{ "path": "/w/lib/app.dart" }],
+        "deps": [{ "path": "lib/app.dart" }],
     });
     assert!(validate_at_tier(&doc.to_string(), Domain::Query, Verbosity::Compact).is_ok());
     assert!(validate_at_tier(&doc.to_string(), Domain::Query, Verbosity::Full).is_ok());

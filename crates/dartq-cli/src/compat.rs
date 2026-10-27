@@ -250,13 +250,11 @@ mod tests {
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
         assert_eq!(json["schema_version"], 1);
         assert_eq!(
-            json["file"],
-            root.canonicalize()
-                .expect("root")
-                .join("lib/a.dart")
-                .display()
-                .to_string(),
+            json["root"],
+            root.canonicalize().expect("root").display().to_string(),
+            "the envelope carries the analysis root once"
         );
+        assert_eq!(json["file"], "lib/a.dart", "the subject spells located");
         let matrix = json["matrix"].as_array().expect("matrix");
         assert_eq!(matrix.len(), 3, "one row per --sdk-root, in CLI order");
 
@@ -267,8 +265,8 @@ mod tests {
             "experiment_not_enabled_off_by_default"
         );
         assert_eq!(
-            matrix[0]["first_failure"]["file"], "package:fixture/a.dart",
-            "the failure file is the package-form label, not the raw path"
+            matrix[0]["first_failure"]["file"], "lib/a.dart",
+            "the failure file is the located spelling, not the raw path"
         );
         assert_eq!(matrix[0]["first_failure"]["line"], 1);
         assert_eq!(
@@ -325,14 +323,11 @@ mod tests {
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
         assert_eq!(json["schema_version"], 1);
         assert_eq!(
-            json["file"],
-            root.canonicalize()
-                .expect("root")
-                .join("lib/a.dart")
-                .display()
-                .to_string(),
-            "the subject label stays"
+            json["root"],
+            root.canonicalize().expect("root").display().to_string(),
+            "the locator root rides at every tier (the subject always does)"
         );
+        assert_eq!(json["file"], "lib/a.dart", "the subject label stays");
         let matrix = json["matrix"].as_array().expect("matrix");
         assert_eq!(matrix.len(), 3, "one row per axis, in CLI order");
         for (axis, sdk) in matrix.iter().zip(["3.5.0", "3.13.1"]) {

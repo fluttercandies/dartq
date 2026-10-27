@@ -33,6 +33,9 @@ dartq-pub = { workspace = true }
 dartq-scanner = { workspace = true }
 dartq-snapshot = { workspace = true }
 dartq-source = { workspace = true }
+# The debug faces' orphan manifests (#2619) live under the session
+# layout's directory — the recovery trail that outlives any one daemon.
+dartq-session = { workspace = true }
 # The `dartq/test/probe` face reports the toolchain a run would use.
 dartq-test = { workspace = true }
 # The watch face's OS-event substrate (FSEvents on macOS, inotify on

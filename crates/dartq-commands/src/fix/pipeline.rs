@@ -278,6 +278,7 @@ pub fn collect_set_with_evidence(
             continue;
         }
         let lines = LineIndex::new(&options_text);
+        let mut group = 0u32;
         let fixes: Vec<RuleFix> = codes
             .into_iter()
             .filter_map(|code| {
@@ -285,13 +286,18 @@ pub fn collect_set_with_evidence(
                     return None;
                 }
                 let (offset, length, replacement) = ignore_options_edit(code, &options_text)?;
-                Some(RuleFix {
+                let row = RuleFix {
                     rule: code,
                     message: format!("Ignore '{code}' in `analysis_options.yaml`"),
                     source: BUILTIN_IGNORE_SOURCE,
                     edit: anchored_edit(&options_text, &lines, offset, length, &replacement),
                     target: None,
-                })
+                    role: FixRole::Suppress,
+                    diag: None,
+                    group,
+                };
+                group += 1;
+                Some(row)
             })
             .collect();
         if !fixes.is_empty() {
@@ -406,6 +412,10 @@ pub(crate) fn from_lints(
             path,
             diagnostics: semantic,
         };
+        let diag = SourceRange {
+            offset: hit.range.start,
+            length: hit.range.end - hit.range.start,
+        };
         if let Some((target, content)) = crate::fix_table::expand_create(spec, &input) {
             if !Path::new(&target).exists() {
                 rows.push(created_file_row(
@@ -414,6 +424,7 @@ pub(crate) fn from_lints(
                     BUILTIN_SOURCE,
                     target,
                     &content,
+                    diag,
                 ));
             }
             continue;
@@ -421,6 +432,8 @@ pub(crate) fn from_lints(
         let Some(edits) = crate::fix_table::expand_multi(spec, &input) else {
             continue;
         };
+        // One group per hit: a multi-edit fix is one candidate.
+        let group = rows.len() as u32;
         for (offset, length, replacement) in edits {
             rows.push(RuleFix {
                 rule,
@@ -428,6 +441,9 @@ pub(crate) fn from_lints(
                 source: BUILTIN_SOURCE,
                 edit: anchored_edit(text, lines, offset, length, &replacement),
                 target: None,
+                role: FixRole::Primary,
+                diag: Some(diag),
+                group,
             });
         }
     }
@@ -536,6 +552,7 @@ pub(crate) fn engine_rows(
             path,
             diagnostics,
         };
+        let diag = d.range;
         if let Some((target, content)) = crate::fix_table::expand_create(spec, &input) {
             if !Path::new(&target).exists() {
                 rows.push(created_file_row(
@@ -544,6 +561,7 @@ pub(crate) fn engine_rows(
                     provenance,
                     target,
                     &content,
+                    diag,
                 ));
             }
             continue;
@@ -551,6 +569,8 @@ pub(crate) fn engine_rows(
         let Some(edits) = crate::fix_table::expand_multi(spec, &input) else {
             continue;
         };
+        // One group per diagnostic: a multi-edit fix is one candidate.
+        let group = rows.len() as u32;
         for (offset, length, replacement) in edits {
             rows.push(RuleFix {
                 rule: d.code.name,
@@ -558,6 +578,9 @@ pub(crate) fn engine_rows(
                 source: provenance,
                 edit: anchored_edit(text, lines, offset, length, &replacement),
                 target: None,
+                role: FixRole::Primary,
+                diag: Some(diag),
+                group,
             });
         }
     }
@@ -574,6 +597,7 @@ pub(crate) fn created_file_row(
     provenance: &'static str,
     target: String,
     content: &str,
+    diag: SourceRange,
 ) -> RuleFix {
     let lines = LineIndex::new("");
     RuleFix {
@@ -582,6 +606,9 @@ pub(crate) fn created_file_row(
         source: provenance,
         edit: anchored_edit("", &lines, 0, 0, content),
         target: Some(target),
+        role: FixRole::Primary,
+        diag: Some(diag),
+        group: 0,
     }
 }
 

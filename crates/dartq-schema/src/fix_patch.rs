@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use crate::SchemaViolation;
 use crate::Verbosity;
 use crate::support::{
-    absent, boolean, describe, edit_floor, exact_fields, field, join, object, pinned_version, rows,
-    string, violation,
+    absent, boolean, describe, edit_floor, enum_spelling, exact_fields, field, join, object,
+    pinned_version, rows, string, violation,
 };
 
 /// The patch document's contract version. Mirrors the fix face's
@@ -39,7 +39,7 @@ static FIX_PATCH_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "edits": { "type": "array", "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["off", "len", "text", "src"],
+                "required": ["off", "len", "text", "src", "role"],
                 "properties": {
                     "off": { "type": "integer", "minimum": 0 },
                     "len": { "type": "integer", "minimum": 0 },
@@ -50,6 +50,15 @@ static FIX_PATCH_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
                     // for plugin rows. Never dropped — every tier emits it
                     //.
                     "src": { "type": "string" },
+                    // The candidate's role (the fix face's `FixRole`,
+                    // tagged at the producer): `primary` for a code change
+                    // that resolves the diagnostic (plugin rows included),
+                    // the three suppression spellings for the ignore trio.
+                    // Rides every tier like `src`.
+                    "role": {
+                        "type": "string",
+                        "enum": ["primary", "ignore_line", "ignore_file", "suppress"],
+                    },
                     // The drift-correction locator: compact/full emit
                     // it, minimal omits it (crate docs, "Verbosity tiers";
                     // fix.rs:766-768, 778-780).
@@ -85,8 +94,9 @@ static FIX_PATCH_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
 });
 
 const PATCH_TOP: &[&str] = &["file", "v", "edits"];
-const EDIT: &[&str] = &["off", "len", "text", "src"];
+const EDIT: &[&str] = &["off", "len", "text", "src", "role"];
 const EDIT_OPTIONAL: &[&str] = &["anchor", "rule", "msg", "priority", "stale"];
+const ROLE_SPELLINGS: &[&str] = &["primary", "ignore_line", "ignore_file", "suppress"];
 
 pub(crate) fn validate_fix_patch(value: &Value) -> Result<(), SchemaViolation> {
     let root = object(value, "")?;
@@ -97,9 +107,11 @@ pub(crate) fn validate_fix_patch(value: &Value) -> Result<(), SchemaViolation> {
         let p = format!("edits[{i}]");
         let obj = object(row, &p)?;
         exact_fields(obj, EDIT, EDIT_OPTIONAL, &p)?;
-        // The red-line trio, the provenance tag, and the optional anchor —
-        // the shared edit floor (support::edit_floor).
+        // The red-line trio, the provenance tag, the candidate's role,
+        // and the optional anchor — the shared edit floor
+        // (support::edit_floor).
         edit_floor(obj, &p)?;
+        enum_spelling(field(obj, "role", &p)?, &join(&p, "role"), ROLE_SPELLINGS)?;
         if let Some(rule) = obj.get("rule") {
             string(rule, &join(&p, "rule"))?;
         }
@@ -124,7 +136,8 @@ pub(crate) fn validate_fix_patch(value: &Value) -> Result<(), SchemaViolation> {
 /// The tier-exact check ([`crate::validate_at_tier`]): the anchor is the
 /// compact tier's drift-correction locator and the human-name rows
 /// (`rule`/`message`/`priority`) are full-tier only; the red-line trio,
-/// the provenance tag, and `stale` ride every tier (crate docs, fix table).
+/// the provenance tag, the candidate's `role`, and `stale` ride every
+/// tier (crate docs, fix table).
 pub(crate) fn validate_fix_patch_at_tier(
     value: &Value,
     tier: Verbosity,
@@ -190,6 +203,7 @@ mod tests {
                 "len": 8,
                 "text": "Bar",
                 "src": "builtin-lint",
+                "role": "primary",
                 "anchor": {"line": 10, "col": 7},
                 "rule": "unnecessary_new",
                 "msg": "Unnecessary 'new' keyword.",
@@ -219,6 +233,7 @@ mod tests {
                 "len": 8,
                 "text": "Bar",
                 "src": "fixer",
+                "role": "primary",
                 "anchor": {"line": 10, "col": 7},
                 "msg": "insert const",
                 "priority": 1,
@@ -236,6 +251,7 @@ mod tests {
                 "len": 8,
                 "text": "Bar",
                 "src": "fixer",
+                "role": "ignore_line",
                 "anchor": {"line": 10, "col": 7},
                 "priority": -1,
             }],
@@ -246,8 +262,8 @@ mod tests {
         assert_eq!(violation.expected, "omitted at the compact tier");
 
         // The minimal floor: the red-line trio plus the provenance tag
-        // (`edit_floor` never drops it, fix.rs:744-751) — the anchor and
-        // the human names are the trims.
+        // and the role (`edit_floor` never drops them, fix.rs:744-751)
+        // — the anchor and the human names are the trims.
         let minimal = serde_json::json!({
             "file": "lib/foo.dart",
             "v": SCHEMA_VERSION_FIX_PATCH,
@@ -256,6 +272,7 @@ mod tests {
                 "len": 8,
                 "text": "Bar",
                 "src": "builtin-lint",
+                "role": "suppress",
                 "stale": true,
             }],
         });
@@ -266,16 +283,45 @@ mod tests {
         let no_source = serde_json::json!({
             "file": "lib/foo.dart",
             "v": SCHEMA_VERSION_FIX_PATCH,
-            "edits": [{"off": 123, "len": 8, "text": "Bar"}],
+            "edits": [{"off": 123, "len": 8, "text": "Bar", "role": "primary"}],
         });
         let violation = validate_fix_patch(&no_source).expect_err("provenance is required");
         assert_eq!(violation.path, "edits[0].src");
         assert_eq!(violation.found, "missing");
 
+        // The role key is required and one of the four spellings — no
+        // aliases.
+        let no_role = serde_json::json!({
+            "file": "lib/foo.dart",
+            "v": SCHEMA_VERSION_FIX_PATCH,
+            "edits": [{"off": 123, "len": 8, "text": "Bar", "src": "builtin-lint"}],
+        });
+        let violation = validate_fix_patch(&no_role).expect_err("role is required");
+        assert_eq!(violation.path, "edits[0].role");
+        assert_eq!(violation.found, "missing");
+
+        let bad_role = serde_json::json!({
+            "file": "lib/foo.dart",
+            "v": SCHEMA_VERSION_FIX_PATCH,
+            "edits": [{
+                "off": 123,
+                "len": 8,
+                "text": "Bar",
+                "src": "builtin-lint",
+                "role": "ignore",
+            }],
+        });
+        let violation = validate_fix_patch(&bad_role).expect_err("role is one of the spellings");
+        assert_eq!(violation.path, "edits[0].role");
+        assert_eq!(
+            violation.expected,
+            "\"primary\" or \"ignore_line\" or \"ignore_file\" or \"suppress\""
+        );
+
         let wrong_types = serde_json::json!({
             "file": "lib/foo.dart",
             "v": SCHEMA_VERSION_FIX_PATCH,
-            "edits": [{"off": 123, "len": 8, "text": "Bar", "src": 7}],
+            "edits": [{"off": 123, "len": 8, "text": "Bar", "src": 7, "role": "primary"}],
         });
         let violation = validate_fix_patch(&wrong_types).expect_err("source is a string");
         assert_eq!(violation.path, "edits[0].src");
@@ -289,6 +335,7 @@ mod tests {
                 "len": 8,
                 "text": "Bar",
                 "src": "fixer",
+                "role": "primary",
                 "priority": "high",
             }],
         });

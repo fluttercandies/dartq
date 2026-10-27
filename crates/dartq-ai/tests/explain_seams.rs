@@ -159,6 +159,8 @@ fn explain_foo(
         importers,
         labels,
         file_labels,
+        |_| false,
+        |_, off| off + 1,
         tests,
         &fx.strings,
     )
@@ -236,16 +238,17 @@ fn mixed_clause_edges_split_by_clause_and_constructors_fill() {
 
     let value = serde_json::to_value(&report).expect("serialize");
     assert_eq!(
-        value["inheritance"][0]["clause"],
+        value["bases"][0]["clause"],
         serde_json::json!("extends"),
         "the clause rides the serialized row"
     );
     assert_eq!(
-        value["constructors"],
+        value["ctors"],
         serde_json::json!([
-            {"name": "Foo", "kind": "constructor", "signature": "Foo()"},
-            {"name": "Foo.named", "kind": "constructor", "signature": "Foo.named(bool flag)"},
-        ])
+            {"name": "Foo", "kind": "constructor", "sig": "Foo()"},
+            {"name": "Foo.named", "kind": "constructor", "sig": "Foo.named(bool flag)"},
+        ]),
+        "the snake_case wire keys the vocabulary wave froze"
     );
 }
 
@@ -269,6 +272,7 @@ fn minimal_counts_mirror_the_filled_sections() {
             references: 0,
             dependencies: 2,
             affected_tests: 1,
+            others: 0,
         })
     );
 }

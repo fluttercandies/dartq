@@ -179,7 +179,7 @@ fn real_sdk_experiment_whitelist() {
 }
 
 #[test]
-fn real_sdk_identity_is_stable_and_flutter_is_rejected() {
+fn real_sdk_identity_is_stable_and_embedder_face_is_structured() {
     let Some(dart_sdk_root) = real_dart_sdk() else {
         eprintln!("skipped: ~/fvm/default/bin/cache/dart-sdk not present");
         return;
@@ -188,8 +188,11 @@ fn real_sdk_identity_is_stable_and_flutter_is_rejected() {
     let b = SdkSnapshot::load(&dart_sdk_root, None).expect("second load");
     assert_eq!(a.id, b.id, "the same SDK loads to the same id");
 
-    match SdkSnapshot::load(&dart_sdk_root, Some(&dart_sdk_root)) {
-        Err(dartq_sdk::SdkError::FlutterUnsupported { .. }) => {}
-        other => panic!("expected FlutterUnsupported, got {other:?}"),
+    // The dart SDK tree carries no `_embedder.yaml`: an embedder directory
+    // pointing there is the structured missing-file error, never a panic
+    // and never a silently plain load.
+    match SdkSnapshot::load(&dart_sdk_root, Some(&dart_sdk_root.join("lib"))) {
+        Err(dartq_sdk::SdkError::MissingFile { .. }) => {}
+        other => panic!("expected MissingFile, got {other:?}"),
     }
 }

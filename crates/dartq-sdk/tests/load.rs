@@ -409,14 +409,170 @@ fn missing_file_case(relative: &str) -> TempTree {
 }
 
 #[test]
-fn flutter_root_is_rejected_until_embedder_support_lands() {
+fn embedder_dir_without_yaml_is_missing_file() {
     let tree = TempTree::new(&standard_files());
-    let flutter_root = tree.root.join("flutter");
-    std::fs::create_dir_all(&flutter_root).expect("flutter root created");
-    match SdkSnapshot::load(&tree.dart_sdk(), Some(&flutter_root)) {
-        Err(SdkError::FlutterUnsupported { root }) => assert_eq!(root, flutter_root),
-        other => panic!("expected FlutterUnsupported, got {other:?}"),
+    let embedder_dir = tree.root.join("no-yaml-here");
+    std::fs::create_dir_all(&embedder_dir).expect("embedder dir created");
+    // A directory without `_embedder.yaml` is the structured missing-file
+    // error, never a panic.
+    match SdkSnapshot::load(&tree.dart_sdk(), Some(&embedder_dir)) {
+        Err(SdkError::MissingFile { .. }) => {}
+        other => panic!("expected MissingFile, got {other:?}"),
     }
+}
+
+/// The sky_engine-shaped embedder package over the standard fixture:
+/// `dart:core` overridden onto a different file, `dart:ui` added, one
+/// `../`-climbing path, one non-`dart:` key (ignored), one extra top-level
+/// section (ignored).
+const EMBEDDER_YAML: &str = r#"# generated
+embedded_libs:
+  "dart:core": "embedder_core/core.dart"
+  "dart:ui": "ui/ui.dart"
+  "dart:nativewrappers": "../../shared/nativewrappers.dart"
+  "not-a-dart-uri": "ignored.dart"
+embedded_server_libraries:
+  key: value
+"#;
+
+fn embedder_files() -> Vec<(&'static str, &'static str)> {
+    let mut files = standard_files();
+    files.extend([
+        ("sky_engine/lib/_embedder.yaml", EMBEDDER_YAML),
+        ("sky_engine/lib/embedder_core/core.dart", "library core;"),
+        ("sky_engine/lib/ui/ui.dart", "library ui;"),
+        ("shared/nativewrappers.dart", "library nativewrappers;"),
+    ]);
+    files
+}
+
+fn sky_engine_lib(tree: &TempTree) -> std::path::PathBuf {
+    tree.root.join("sky_engine").join("lib")
+}
+
+fn load_embedder(tree: &TempTree) -> SdkSnapshot {
+    SdkSnapshot::load(&tree.dart_sdk(), Some(&sky_engine_lib(tree)))
+        .expect("embedder-backed SDK loads")
+}
+
+#[test]
+fn embedder_table_replaces_every_resolution_face() {
+    let tree = TempTree::new(&embedder_files());
+    let sdk = load_embedder(&tree);
+
+    // Full replacement, not an overlay: `dart:core` resolves onto the
+    // embedder's file for EVERY segment — the plain `libraries.json` table
+    // (whose vm segment maps core → core/core.dart) is never consulted.
+    let core = sdk
+        .uri_to_path("vm", "dart:core")
+        .expect("core resolves through the embedder");
+    assert_eq!(core, sky_engine_lib(&tree).join("embedder_core/core.dart"));
+    assert!(core.is_file());
+    // The embedder's own additions resolve, including on segments the
+    // plain table lacks entirely.
+    let ui = sdk
+        .uri_to_path("ghost-segment", "dart:ui")
+        .expect("the embedder answers every segment");
+    assert_eq!(ui, sky_engine_lib(&tree).join("ui/ui.dart"));
+    // Part files join the embedder library's directory.
+    assert_eq!(
+        sdk.uri_to_path("vm", "dart:ui/painting.dart").expect("part"),
+        sky_engine_lib(&tree).join("ui/painting.dart")
+    );
+    // The flat existence face answers from the replacement table too —
+    // `dart:web_sql` exists in neither table, `dart:ui` only in the
+    // embedder's.
+    assert_eq!(
+        sdk.flat_library_to_path("ui", ""),
+        Some(sky_engine_lib(&tree).join("ui/ui.dart"))
+    );
+    assert_eq!(sdk.flat_library_to_path("web_sql", ""), None);
+    // Every embedder entry answers `dart.library.<name>` true.
+    assert!(sdk.library_support_value("vm", "ui"));
+    assert!(sdk.library_support_value("vm", "nativewrappers"));
+    // Version and experiments stay the dart-sdk's faces.
+    assert_eq!(sdk.dart.version, "3.13.1");
+    assert_eq!(sdk.language_metadata, LanguageVersion::new(3, 13));
+    assert!(sdk.platform_metadata.for_sdk_library("core").is_empty());
+}
+
+#[test]
+fn embedder_paths_climb_relative_segments() {
+    let tree = TempTree::new(&embedder_files());
+    let sdk = load_embedder(&tree);
+    // `../` climbs resolve against the yaml's directory, the analyzer's
+    // `libDir.canonicalizePath` posture. The composed path keeps the climb
+    // lexical (analyzer string form); the filesystem resolves it on open —
+    // the same file as the sibling-directory target.
+    let climbed = sdk
+        .flat_library_to_path("nativewrappers", "")
+        .expect("climbing entry resolves");
+    assert!(climbed.is_file(), "the climb resolves on disk");
+    assert_eq!(
+        climbed.canonicalize().expect("climb canonicalizes"),
+        tree.root
+            .join("shared")
+            .join("nativewrappers.dart")
+            .canonicalize()
+            .expect("target canonicalizes")
+    );
+}
+
+#[test]
+fn embedder_snapshots_fork_identity() {
+    let plain_tree = TempTree::new(&standard_files());
+    let plain = plain_tree.load();
+    let embedder_tree = TempTree::new(&embedder_files());
+    let embedder = load_embedder(&embedder_tree);
+    assert_ne!(
+        plain.id, embedder.id,
+        "the replacement table forks the snapshot id"
+    );
+    // Same table, different install location: one id (the fingerprint
+    // hashes parsed content, never paths).
+    let moved_tree = TempTree::new(&embedder_files());
+    let moved = load_embedder(&moved_tree);
+    assert_eq!(embedder.id, moved.id);
+    // A semantic change in the yaml forks it again.
+    let changed_tree = TempTree::new(&embedder_files());
+    changed_tree.rewrite(
+        "sky_engine/lib/_embedder.yaml",
+        &EMBEDDER_YAML.replace("ui/ui.dart", "ui/ui_v2.dart"),
+    );
+    let changed = load_embedder(&changed_tree);
+    assert_ne!(embedder.id, changed.id);
+}
+
+#[test]
+fn embedder_yaml_load_errors_are_distinct() {
+    // Unparsable yaml.
+    let tree = TempTree::new(&embedder_files());
+    tree.rewrite("sky_engine/lib/_embedder.yaml", "embedded_libs: [unclosed\n");
+    assert!(matches!(
+        load_embedder_result(&tree),
+        Err(SdkError::InvalidEmbedderYaml { .. })
+    ));
+
+    // Parses, but no usable table.
+    let tree = TempTree::new(&embedder_files());
+    tree.rewrite("sky_engine/lib/_embedder.yaml", "embedded_libs: {}\n");
+    assert!(matches!(
+        load_embedder_result(&tree),
+        Err(SdkError::InvalidEmbedderYaml { .. })
+    ));
+
+    // The yaml vanished between discovery and load (TOCTOU): the missing
+    // file tier, not a panic.
+    let tree = TempTree::new(&embedder_files());
+    std::fs::remove_file(sky_engine_lib(&tree).join("_embedder.yaml")).expect("removed");
+    assert!(matches!(
+        load_embedder_result(&tree),
+        Err(SdkError::MissingFile { .. })
+    ));
+}
+
+fn load_embedder_result(tree: &TempTree) -> Result<SdkSnapshot, SdkError> {
+    SdkSnapshot::load(&tree.dart_sdk(), Some(&sky_engine_lib(tree)))
 }
 
 #[test]

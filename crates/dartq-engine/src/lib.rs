@@ -897,6 +897,31 @@ impl Engine {
         query::callers(&self.state, name)
     }
 
+    /// The override-family face: every container that declares `name`
+    /// connected to the container at `file` through the inheritance
+    /// closure, computed as a fixpoint over both directions (each joined
+    /// member contributes its own declaring supertypes and subtypes, so
+    /// second branches join too) — the whole hierarchy a member rename
+    /// edits, an equivalence class whatever member the anchor names. The
+    /// member anchor is the `(file, container spelling, lookup name)`
+    /// triple the cursor faces resolve (a declaration hit's container or a
+    /// use hit's target container); `query::override_family` carries the
+    /// freshness, answer-domain, and cost contracts. Like
+    /// [`Self::query_symbols`] it is a pure read of the latest analyze's
+    /// state, its only side effect interning the two spellings; the
+    /// answer's container spellings borrow, never clone.
+    #[must_use]
+    pub fn override_family<'a>(
+        &'a self,
+        file: FileId,
+        container: &str,
+        name: &str,
+    ) -> Vec<(FileId, &'a str)> {
+        let container = self.state.strings.intern(container);
+        let name = self.state.strings.intern(name);
+        query::override_family(&self.state, (file, container), name)
+    }
+
     /// The position-resolution face: what the maintained index rows hold
     /// under `offset` (UTF-16 code units, the engine's external
     /// convention) in `file` — the shared substrate the
@@ -1865,8 +1890,26 @@ pub struct LibraryView<'a> {
 /// and freshly built rows wrap once in [`Arc::new`] — the engine's stores
 /// share those bytes instead of copying them.
 pub trait SemanticDiagnoser: Send + Sync {
-    /// Appends this library's semantic diagnostics to `out`.
-    fn diagnose_library(&self, library: LibraryView<'_>, out: &mut Vec<Arc<Diagnostic>>);
+    /// Appends this library's semantic diagnostics to `out`. The view
+    /// arrives by reference — one call may be followed by
+    /// [`Self::member_refs`] over the same view.
+    fn diagnose_library(&self, library: &LibraryView<'_>, out: &mut Vec<Arc<Diagnostic>>);
+
+    /// The library's semantically resolved member-access reference rows
+    /// (#2618): one handle per member file, read after
+    /// [`Self::diagnose_library`] ran for the library (the default
+    /// implementor serves them from the same member-fold memo the
+    /// diagnostics came from — no re-fold, one hash probe per member). The
+    /// rows fold into the library's reference surface beside the
+    /// parser-level sites; the default — no rows — is the
+    /// custom-diagnoser degradation (a substituting fold that publishes
+    /// nothing leaves the surface at its parser-level reach).
+    fn member_refs(
+        &self,
+        _library: &LibraryView<'_>,
+    ) -> Vec<(FileId, std::sync::Arc<[dartq_semantic::MemberRef]>)> {
+        Vec::new()
+    }
 }
 
 /// The M1 default store constructor.

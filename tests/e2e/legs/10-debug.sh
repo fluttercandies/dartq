@@ -37,7 +37,7 @@ legs_10_run() {
   assert_eq "$DQ_RC" 0 "the session starts"
   run_dartq dbg-status debug status --dir "$base/w1" --sdk "$base/sdk" --format json
   assert_eq "$DQ_RC" 0 "status on the empty registry is clean"
-  assert_eq "$(cat "$(out_file dbg-status)")" "[]" \
+  assert_eq "$(cat "$(out_file dbg-status)")" '{"v":1,"sessions":[],"orphans":[]}' \
     "status prints the daemon answer verbatim — one JSON line"
   run_dartq dbg-none debug resume --dir "$base/w1" --sdk "$base/sdk" --format json
   assert_eq "$DQ_RC" 1 "no -s with zero live sessions is the domain tier"
@@ -75,7 +75,8 @@ legs_10_run() {
 '
   run_dartq_in dbg-long-status "$long_root/lib" debug status --dir "$long_root" --sdk "$base/sdk" --format json
   assert_eq "$DQ_RC" 0 "the relocated-tree session answers"
-  assert_eq "$(cat "$(out_file dbg-long-status)")" "[]" "its empty debug registry lists empty"
+  assert_eq "$(cat "$(out_file dbg-long-status)")" '{"v":1,"sessions":[],"orphans":[]}' \
+    "its empty debug registry lists empty"
   if [ -e "$long_root/.dart_tool/dartq/session.sock.point" ]; then
     ok "the long tree's socket relocated (the pointer file exists)"
   else
@@ -98,7 +99,8 @@ environment:
 '
   run_dartq_in dbg-member-status "$member" debug status --dir . --sdk "$base/sdk" --format json
   assert_eq "$DQ_RC" 0 "the member-subdirectory session answers"
-  assert_eq "$(cat "$(out_file dbg-member-status)")" "[]" "the member's empty debug registry lists empty"
+  assert_eq "$(cat "$(out_file dbg-member-status)")" '{"v":1,"sessions":[],"orphans":[]}' \
+    "the member's empty debug registry lists empty"
   run_dartq dbg-member-stop session stop "$member"
   assert_eq "$DQ_RC" 0 "member-tree teardown"
 

@@ -267,6 +267,10 @@ pub(crate) enum Request {
     Fix {
         paths: Vec<PathBuf>,
         verbosity: Verbosity,
+        /// The candidate role the answer serves (`primary` by default —
+        /// the patch rows the caller applies; the suppression spellings
+        /// opt into the ignore trio).
+        role: fix::FixRole,
     },
     Compat {
         target: PathBuf,
@@ -594,10 +598,30 @@ fn parse_check_or_fix(method: &str, params: &Value, root: &Path) -> Result<Reque
         })
     } else {
         reject_disk_view_only(params, "dartq/fix")?;
+        let role = fix_role(params)?;
         Ok(Request::Fix {
             paths,
             verbosity: decoded.verbosity,
+            role,
         })
+    }
+}
+
+/// The `dartq/fix` `role` parameter: absent defaults to `primary` (the
+/// plugin rows' nature — one code change per diagnostic on the apply
+/// face). A present value must be one of [`fix::FixRole::parse`]'s exact
+/// spellings; anything else answers the usage-tier message naming the
+/// parameter and the accepted spellings — serde's raw "unknown variant"
+/// names neither the field nor the consumer's fix, so the intake shapes
+/// it here (both intakes share this: the scheduler parse and the live
+/// `fix_stage`, the path the MCP tool's arguments ride verbatim).
+pub(crate) fn fix_role(params: &Value) -> Result<fix::FixRole, String> {
+    const SPELLINGS: &str = "primary, ignore_line, ignore_file, suppress";
+    match params.get("role") {
+        None => Ok(fix::FixRole::default()),
+        Some(Value::String(text)) => fix::FixRole::parse(text)
+            .ok_or_else(|| format!("invalid role `{text}`; expected one of {SPELLINGS}")),
+        Some(_) => Err(format!("invalid role; expected one of {SPELLINGS}")),
     }
 }
 
@@ -839,6 +863,24 @@ impl<'a> Changes<'a> {
     }
 }
 
+/// The changed-table lookup key for a report row's located spelling
+/// (#2613's locator): rows inside the analysis root are spelled
+/// root-relative, rows outside it absolute, while the changed table keys
+/// on the session's absolute paths — a relative tail re-joins against the
+/// workspace root that stripped it (`engine.packages().workspace_root()`,
+/// the one base every producer locates against; locate's exact inverse,
+/// the same re-join dartq-commands' impacted-tests face performs). The
+/// file-id-keyed filters (check, query decls/refs/implementations) read
+/// the file tables' canonical paths and need no re-join.
+fn delta_key(root: &Path, located: &str) -> PathBuf {
+    let path = Path::new(located);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
 /// The session's stable path → short-id table: ids (`s1`,
 /// `s2`, …) are assigned on first payable use and stay stable for the
 /// session; `announced` remembers which ids the client has already seen a
@@ -1070,7 +1112,11 @@ pub(crate) fn answer(drain: &Drain<'_>, request: &Request) -> Result<Value, Sess
             since,
             sdk,
         } => explain_answer(drain, symbol, *verbosity, *since, sdk.as_deref()),
-        Request::Fix { paths, verbosity } => {
+        Request::Fix {
+            paths,
+            verbosity,
+            role,
+        } => {
             // Dead on the live wire: the server intercepts `dartq/fix` at
             // intake (the fix-worker dispatch owns the live plugin hosts,
             // so the real answer carries them) before the `is_command` arm
@@ -1082,7 +1128,7 @@ pub(crate) fn answer(drain: &Drain<'_>, request: &Request) -> Result<Value, Sess
                 "Request::Fix reached the scheduler: `dartq/fix` must be intercepted at intake"
             );
             let mut hosts = fix::PluginHosts::empty();
-            fix_answer(paths, *verbosity, &mut hosts, drain.sdk_root)
+            fix_answer(paths, *verbosity, *role, &mut hosts, drain.sdk_root)
         }
         Request::Compat {
             target,
@@ -1264,7 +1310,11 @@ fn check_disk_view(
         }
         DiscoverError::Io(io) => SessionError::Io(io),
     })?;
-    let run = check::analyze_files(&files).map_err(SessionError::Io)?;
+    // The seam that knows the discovery targets: the run's analysis root
+    // is the target directory the request pointed at, not the bare-list
+    // derivation over the discovered set (dartq-commands' check contract —
+    // the root-derived spellings answer under the caller's target).
+    let run = check::analyze_targets(paths, &files).map_err(SessionError::Io)?;
     let output = run.output();
     let diags: Vec<Value> = output
         .diagnostics
@@ -1388,14 +1438,20 @@ fn query_answer_shaped(
         });
         // The kind arrays filter on their own row locators: the
         // implementations rows are declaration rows (the declaring file);
-        // the dependencies rows carry the importing library's path.
+        // the dependencies rows carry the importing library's path — a
+        // located spelling, so the lookup key re-joins against the
+        // workspace root first (delta_key).
         run.implementations.retain(|decl| {
             drain
                 .changes
                 .changed_since(run.layout.file_path(decl.file), since)
         });
-        run.dependencies
-            .retain(|row| drain.changes.changed_since(Path::new(&row.path), since));
+        let root = drain.engine.packages().workspace_root();
+        run.dependencies.retain(|row| {
+            drain
+                .changes
+                .changed_since(&delta_key(root, &row.path), since)
+        });
     }
     let mut answer = query::to_json_at_tier(&run, name, verbosity);
     if since.is_some() {
@@ -1467,10 +1523,14 @@ fn impact_answer(
             impact_core::ImpactError::Internal(message) => SessionError::Internal(message),
         })?;
     if let Some(since) = since {
-        // Delta mode: affected rows and test rows carry their file path
-        // verbatim; changed rows carry the stable `label|name` symbol form
-        // whose label is the defining file's path.
-        let changed = |path: &str| drain.changes.changed_since(Path::new(path), since);
+        // Delta mode: affected rows and test rows carry their file path,
+        // changed rows the stable `label|name` symbol form whose label is
+        // the defining file's path — all located spellings (#2613), so
+        // each lookup key re-joins against the workspace root first
+        // (delta_key); the bare relative spelling would miss the changed
+        // table and silently drop every in-root row.
+        let root = drain.engine.packages().workspace_root();
+        let changed = |path: &str| drain.changes.changed_since(&delta_key(root, path), since);
         report.affected.retain(|row| changed(&row.path));
         report.affected_tests.retain(|row| changed(&row.path));
         report.changed.retain(|row| {
@@ -1551,8 +1611,12 @@ fn explain_answer(
         // use/import/test row stays when its file changed in this session
         // after the cursor. The declaration-site sections (`declaration`,
         // `inheritance`, `interfaces`, `constructors`, `methods`) describe
-        // the symbol itself and stay — the red line never drops.
-        let changed = |path: &str| drain.changes.changed_since(Path::new(path), since);
+        // the symbol itself and stay — the red line never drops. The rows'
+        // file spellings are located (#2613): the lookup key re-joins
+        // against the workspace root (delta_key) — the report engine's
+        // assembly root is the same tree the session engine canonicalized.
+        let root = drain.engine.packages().workspace_root();
+        let changed = |path: &str| drain.changes.changed_since(&delta_key(root, path), since);
         for section in ["refs", "deps", "tests"] {
             if let Some(rows) = report.get_mut(section).and_then(Value::as_array_mut) {
                 rows.retain(|row| {
@@ -1584,9 +1648,16 @@ fn explain_answer(
 /// engine assembly — the session's resolved root. The fix worker (the
 /// session's off-loop dispatch) passes the live host set; the scheduler
 /// arm has no host set and answers the built-in rows alone.
+///
+/// `role` is the answer's candidate selection — the apply posture the
+/// daemon's caller serves: `primary` (the default) answers one code
+/// change per diagnostic ([`fix::select_by_role`]); a suppression
+/// spelling answers only that role's rows. The documents carry the
+/// `role` key either way.
 pub(crate) fn fix_answer(
     paths: &[PathBuf],
     verbosity: Verbosity,
+    role: fix::FixRole,
     hosts: &mut fix::PluginHosts,
     sdk: &Path,
 ) -> Result<Value, SessionError> {
@@ -1597,6 +1668,7 @@ pub(crate) fn fix_answer(
             }
             DiscoverError::Io(io) => SessionError::Io(io),
         })?;
+    let per_file = fix::select_by_role(per_file, role);
     let files: Vec<Value> = per_file
         .iter()
         // Plugin-only rows are still a patch document (provenance-tagged).

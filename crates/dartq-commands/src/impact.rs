@@ -51,7 +51,7 @@ use dartq_ai::impact::{self as query, FileSnapshot, LibraryChange, content_hash}
 use dartq_diagnostics::{CodeRegistry, Diagnostic, Severity};
 use dartq_engine::state::persist::PersistedFacts;
 use dartq_engine::{CsrGraph, Engine, EngineConfig, LibraryId, memory_store, semdiag};
-use dartq_index::TestGraph;
+use dartq_index::{DeclRow, TestGraph};
 use dartq_package::PackageTable;
 use dartq_pub::{PackageConfig, ResolvedPackageGraph};
 use dartq_sdk::SdkSnapshot;
@@ -60,7 +60,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use thiserror::Error;
 
 use crate::analyze::AnalyzeError;
-use crate::workspace::package_assembly_strict;
+use crate::workspace::{embedder_lib_dir, package_assembly_strict};
 
 /// Why an impact run aborts: target problems are the CLI's usage tier,
 /// prelude failures the internal tier, and the environments axis carries
@@ -242,12 +242,11 @@ fn default_environment_row(
 }
 
 /// The affected set as stable labels: the seed library's member files plus
-/// every affected library's member files — the reference labels the
-/// report's Affected section already names (the same
-/// [`crate::pkg_label::pkg_label`] projection on both sides, so the string
-/// set matches whatever the package context spells). Label strings, not
-/// file ids: the environment axes run their own engines, whose id spaces
-/// are their own.
+/// every affected library's member files — the same located spellings the
+/// report's Affected section already names (the one [`crate::pkg_label::locate`]
+/// projection on both sides, so the string set matches whatever the report
+/// spells). Label strings, not file ids: the environment axes run their own
+/// engines, whose id spaces are their own.
 fn affected_label_set(
     engine: &Engine,
     seed: u32,
@@ -259,7 +258,8 @@ fn affected_label_set(
         .map(|row| row.path.as_str())
         .collect();
     let mut affected_files: FxHashSet<String> = FxHashSet::default();
-    let label = |path| crate::pkg_label::pkg_label(engine.packages(), path);
+    let root = engine.packages().workspace_root();
+    let label = |path| crate::pkg_label::locate(root, path);
     for (library, files) in engine.libraries() {
         let affected_library = library.index() == seed
             || files
@@ -290,12 +290,13 @@ fn compatible_over_affected(
     affected: &FxHashSet<String>,
     diagnostics: &[Diagnostic],
 ) -> bool {
+    let root = engine.packages().workspace_root();
     diagnostics.iter().all(|diag| {
         diag.severity != Severity::Error
             || !engine.file_table().path(diag.file).is_some_and(|path| {
                 // The engine's table builds from the same resolution as
                 // the label set's own projection, so the spellings match.
-                affected.contains(&crate::pkg_label::pkg_label(engine.packages(), path))
+                affected.contains(&crate::pkg_label::locate(root, path))
             })
     })
 }
@@ -315,7 +316,17 @@ fn analyze_environment(
     config_dir: &Path,
     affected: &FxHashSet<String>,
 ) -> Result<bool, ImpactError> {
-    let Ok(snapshot) = SdkSnapshot::load(root, None) else {
+    // The environment's snapshot rides the resolution's embedder table
+    // when the shared config carries a `sky_engine` package (the default
+    // context's posture, the compat face's rule); an unusable embedder
+    // yaml degrades to the plain dart-sdk table.
+    let loaded = match embedder_lib_dir(config, config_dir) {
+        Some(lib_dir) => {
+            SdkSnapshot::load(root, Some(&lib_dir)).or_else(|_| SdkSnapshot::load(root, None))
+        }
+        None => SdkSnapshot::load(root, None),
+    };
+    let Ok(snapshot) = loaded else {
         return Ok(false);
     };
     let packages = PackageTable::build(config, graph, config_dir)
@@ -439,19 +450,22 @@ pub fn impacted_tests(
                 .map_err(|error| format!("cannot assemble the workspace: {error}"))?;
             crate::analyze::run_overlaid(&mut engine, &[], &[])
                 .map_err(|error| format!("the analysis pass failed: {error}"))?;
+            // The report's test paths spell through the file locator
+            // (root-relative inside the analysis root, absolute outside),
+            // so a relative tail resolves back against the root that
+            // stripped it — the engine's own workspace root, the one base
+            // every row's spelling was derived from.
+            let analysis_root = engine.packages().workspace_root().to_path_buf();
             let mut tests = Vec::new();
             for seed in &sources {
                 let report = impact_after_analysis(&engine, seed)
                     .map_err(|error| {
                         format!("{} is outside the analyzed workspace: {error}", seed.display())
                     })?;
-                tests.extend(
-                    report
-                        .affected_tests
-                        .into_iter()
-                        .map(|test| PathBuf::from(test.path))
-                        .filter(|path| path.is_absolute()),
-                );
+                tests.extend(report.affected_tests.into_iter().map(|test| {
+                    let path = PathBuf::from(test.path);
+                    if path.is_absolute() { path } else { analysis_root.join(path) }
+                }));
             }
             Ok(tests)
         })();
@@ -516,14 +530,24 @@ fn unpersisted(_: &str) -> Option<PersistedFacts> {
 /// re-answers the section with the pass's rows.
 ///
 /// `symbols` is the CLI's `--symbol` list: when non-empty, the seed
-/// narrows from the whole face set to the resolved hits — `MyClass` or
-/// `MyClass.member` alike resolve to the container's face name (the
-/// signature fold is per-face, never per-member, so `member` narrows
-/// nothing past its container). Every supplied name must hit: a miss is
-/// the usage tier, not a silent file-level fallback. The propagation set
-/// the affected rows' `reference_lines` collect against is the narrowed
-/// (or full, under an empty `symbols`) seed-name set — a `(target_file,
-/// target_name)` pair whose file is a member of the seed library.
+/// narrows from the whole face set to the resolved hits. Each spelling
+/// resolves against the seed library's own declarations (#2621):
+///
+/// * `name` — the union of every same-named declaration (the library
+///   face `name` itself, plus every container declaring a member or
+///   constructor named `name`);
+/// * `Container.name` — that container's member (a constructor selector
+///   included), narrowing to the container's face (the signature fold is
+///   per-face, never per-member, so `member` narrows nothing past its
+///   container);
+/// * `path/to/file.dart:line` — the declaration whose name token starts
+///   on that line of a seed-library member file.
+///
+/// Every supplied name must hit: a miss is the usage tier, not a silent
+/// file-level fallback. The propagation set the affected rows'
+/// `reference_lines` collect against is the narrowed (or full, under an
+/// empty `symbols`) seed-name set — a `(target_file, target_name)` pair
+/// whose file is a member of the seed library.
 ///
 /// # Errors
 ///
@@ -575,25 +599,24 @@ pub fn impact_after_analysis_with_persisted_facts(
 
     // The propagation set the affected rows' `reference_lines` collect
     // against — the `(member file, face name)` pairs the seed's surfaces
-    // declare. Under `--symbol` the set narrows to the resolved hits only;
-    // under the file-level posture it is the library's whole face.
+    // declare. Under `--symbol` the set narrows to the resolved hits; the
+    // three spellings (#2621) — bare `name` (the union of every
+    // same-named declaration), `Container.name` (that container's
+    // member), and `path/to/file.dart:line` (the declaration at that
+    // line) — resolve against the seed library's captures below.
     let seed_names: FxHashSet<StringId> = if symbols.is_empty() {
         current.member_names.iter().copied().collect()
     } else {
-        // `MyClass` resolves as itself; `MyClass.member` resolves to the
-        // container segment — the face fold is per-container, so the
-        // member part can never narrow past it.
         let mut resolved = FxHashSet::default();
         for symbol in symbols {
-            let face = symbol.split('.').next().unwrap_or(symbol.as_str());
-            let name = strings.intern(face);
-            if current.member_names.binary_search(&name).is_err() {
-                return Err(ImpactError::Usage(format!(
-                    "no such symbol in {}: {symbol}",
-                    canonical.display()
-                )));
-            }
-            resolved.insert(name);
+            resolved.extend(resolve_symbol_spelling(
+                engine,
+                members,
+                strings,
+                &current.member_names,
+                symbol,
+                &canonical,
+            )?);
         }
         resolved
     };
@@ -673,23 +696,213 @@ pub fn impact_after_analysis_with_persisted_facts(
         &[change],
         reference_lines_of,
     );
+    // The locator envelope: the root rides exactly when a file-bearing
+    // section carries a row (a faceless seed library answers an all-empty
+    // report — no file field, no root to disambiguate).
+    if !(report.changed.is_empty()
+        && report.affected.is_empty()
+        && report.affected_tests.is_empty())
+    {
+        report.root = Some(engine.packages().workspace_root().display().to_string());
+    }
     let affected = affected_label_set(engine, seed_library.index(), &report);
     report.affected_environments = vec![default_environment_row(engine, &affected, &[])];
     Ok(report)
 }
 
+/// One `--symbol` spelling resolved to the seed library's face names
+/// (#2621). The signature fold is per face, so every spelling lands on
+/// whole face names — a bare `name` (the union of every same-named
+/// declaration), a `Container.name` (that container's member), or a
+/// `path/to/file.dart:line` (the declaration at that line). A spelling
+/// that resolves to nothing is [`ImpactError::Usage`] — never a silent
+/// file-level fallback.
+fn resolve_symbol_spelling(
+    engine: &Engine,
+    members: &[FileId],
+    strings: &StringTable,
+    faces: &[StringId],
+    symbol: &str,
+    seed: &Path,
+) -> Result<Vec<StringId>, ImpactError> {
+    let usage = || {
+        ImpactError::Usage(format!("no such symbol in {}: {symbol}", seed.display()))
+    };
+    let candidates = if let Some((path, line)) = file_line_of(symbol) {
+        declaration_at(engine, members, path, line, seed)
+    } else if let Some((container, member)) = symbol.split_once('.') {
+        member_of(engine, members, strings, faces, container, member)
+    } else {
+        bare_name(engine, members, strings, faces, symbol)
+    };
+    let mut resolved = candidates.ok_or_else(usage)?;
+    // The face-membership invariant: every resolved name must be one of
+    // the seed's faces — a file:line walk that lands on a faceless row
+    // (an unnamed extension) resolves to nothing.
+    resolved.retain(|name| faces.binary_search(name).is_ok());
+    resolved.sort_unstable();
+    resolved.dedup();
+    if resolved.is_empty() {
+        return Err(usage());
+    }
+    Ok(resolved)
+}
+
+/// The `path/to/file.dart:line` spelling test: the last colon separates a
+/// 1-based line from the path. `None` for anything else — bare names and
+/// `Container.name` spellings never carry a numeric tail.
+fn file_line_of(symbol: &str) -> Option<(&str, u32)> {
+    let (path, line) = symbol.rsplit_once(':')?;
+    let line = line.parse::<u32>().ok()?;
+    (line >= 1).then_some((path, line))
+}
+
+/// The bare `name` spelling: the union of every same-named declaration —
+/// the library-scope face `name` itself, plus every container declaring a
+/// member (any row kind, type parameters included) or a constructor
+/// selector named `name`. Constructors mint no capture rows, so the
+/// selector scan reads the element face.
+fn bare_name(
+    engine: &Engine,
+    members: &[FileId],
+    strings: &StringTable,
+    faces: &[StringId],
+    name: &str,
+) -> Option<Vec<StringId>> {
+    let name_id = strings.intern(name);
+    let mut resolved = Vec::new();
+    if faces.binary_search(&name_id).is_ok() {
+        resolved.push(name_id);
+    }
+    for &file in members {
+        let capture = engine.file_capture(file).expect("resident member");
+        let surface = capture.index.decls();
+        if let Some(rows) = capture.index.by_name(name_id) {
+            resolved.extend(
+                rows.iter()
+                    .filter(|row| row.container != DeclRow::NONE)
+                    .map(|row| surface[row.container as usize].name),
+            );
+        }
+        let facts = engine.file_facts(file).expect("resident member facts");
+        for &container in facts.elements.container_order() {
+            if facts
+                .elements
+                .container(container)
+                .is_some_and(|element| element.constructors.contains(&name_id))
+            {
+                resolved.push(container);
+            }
+        }
+    }
+    (!resolved.is_empty()).then_some(resolved)
+}
+
+/// The `Container.name` spelling: the container must be a face of the
+/// seed library and the member — a captured member row (any kind) or a
+/// constructor selector, the unnamed face included — must declare inside
+/// it. The fold is per face, so the resolution is the container's face
+/// name.
+fn member_of(
+    engine: &Engine,
+    members: &[FileId],
+    strings: &StringTable,
+    faces: &[StringId],
+    container: &str,
+    member: &str,
+) -> Option<Vec<StringId>> {
+    let container_id = strings.intern(container);
+    if faces.binary_search(&container_id).is_err() {
+        return None;
+    }
+    let member_id = strings.intern(member);
+    for &file in members {
+        let capture = engine.file_capture(file).expect("resident member");
+        let surface = capture.index.decls();
+        let member_row = capture.index.by_name(member_id).is_some_and(|rows| {
+            rows.iter().any(|row| {
+                row.container != DeclRow::NONE
+                    && surface[row.container as usize].name == container_id
+            })
+        });
+        if member_row {
+            return Some(vec![container_id]);
+        }
+        let facts = engine.file_facts(file).expect("resident member facts");
+        if facts
+            .elements
+            .container(container_id)
+            .is_some_and(|element| {
+                element.constructors.contains(&member_id)
+                    || (member_id == container_id && element.has_unnamed_constructor)
+            })
+        {
+            return Some(vec![container_id]);
+        }
+    }
+    None
+}
+
+/// The `path/to/file.dart:line` spelling: the declarations whose name
+/// tokens start on `line` of the member file at `path`, resolved to their
+/// face names (the enclosing container's for a member). A relative `path`
+/// resolves as given (cwd, like any path argument), then against the
+/// assembly's workspace root (the base the target itself resolves
+/// against), then against the target file's directory; the file must be a
+/// member of the seed library. Constructor names mint no capture rows and
+/// carry no spans in the element model, so a line cannot select one —
+/// the `Container.name` spelling names constructors.
+fn declaration_at(
+    engine: &Engine,
+    members: &[FileId],
+    path: &str,
+    line: u32,
+    seed: &Path,
+) -> Option<Vec<StringId>> {
+    let resolved = |joined: &Path| -> Option<FileId> {
+        engine
+            .file_table()
+            .try_file_id(&joined.canonicalize().ok()?)
+    };
+    let file = resolved(Path::new(path))
+        .or_else(|| resolved(&engine.packages().workspace_root().join(path)))
+        .or_else(|| seed.parent().and_then(|dir| resolved(&dir.join(path))))?;
+    if !members.contains(&file) {
+        return None;
+    }
+    let capture = engine.file_capture(file).expect("resident member");
+    let surface = capture.index.decls();
+    let index = engine.line_index(file).expect("resident member line index");
+    let content = engine.content(file).expect("resident member content");
+    let text = std::str::from_utf8(content).expect("engine content is UTF-8");
+    let mut faces_at = Vec::new();
+    for row in surface {
+        if index.line_col_utf16(text, row.range.offset).0 != line {
+            continue;
+        }
+        // Walk the container anchors up to the declaring face (top-level
+        // rows carry no anchor; the walk is bounded by nesting depth).
+        let mut face = row;
+        while face.container != DeclRow::NONE {
+            face = &surface[face.container as usize];
+        }
+        faces_at.push(face.name);
+    }
+    (!faces_at.is_empty()).then_some(faces_at)
+}
+
 /// The graph substrate both graph faces read, built once per call (#558):
-/// the engine's import CSR projection, the arena-spaced identity labels,
-/// and the test graph joined over them.
+/// the engine's import CSR projection, the arena-spaced located-path
+/// labels, and the test graph joined over them.
 pub(crate) struct Substrate {
     csr: CsrGraph,
-    /// The stable reference label of every arena slot's defining file —
-    /// projected once per build through [`crate::pkg_label::pkg_label`] —
-    /// `None` on a dead slot. Sized by [`CsrGraph::nodes`] (the arena's
-    /// slot count), never by the live-library count: the consumers iterate
-    /// the CSR's node space, which includes retired slots, so a
-    /// live-count-sized table indexes out of bounds on the first
-    /// retirement (#558 P1).
+    /// The located spelling of every arena slot's defining file — projected
+    /// once per build through [`crate::pkg_label::locate`] against the
+    /// engine's workspace root — `None` on a dead slot. Sized by
+    /// [`CsrGraph::nodes`] (the arena's slot count), never by the
+    /// live-library count: the consumers iterate the CSR's node space,
+    /// which includes retired slots, so a live-count-sized table indexes
+    /// out of bounds on the first retirement (#558 P1).
     idents: Vec<Option<String>>,
     tests: TestGraph,
 }
@@ -698,23 +911,26 @@ pub(crate) struct Substrate {
 /// `libraries` (the faces pass the same fetch they need for their own
 /// member lookups — no second `Engine::libraries` build).
 ///
-/// The labels are the report assembly boundary's projected spellings,
-/// constructed once per live library here (the attribution walk amortizes
-/// over the package table's per-directory memo); a path that is not UTF-8
-/// labels lossily — it cannot ride the JSON faces' string columns
-/// byte-exact anyway.
+/// The labels are the report assembly boundary's located spellings (the
+/// lon/text file locator: root-relative inside the analysis root, absolute
+/// outside), constructed once per live library here; a path that is not
+/// UTF-8 labels lossily — it cannot ride the JSON faces' string columns
+/// byte-exact anyway. The test graph's convention fallback reads the
+/// label's basename and directory, which the locator preserves (only the
+/// prefix spelling changes, never the tail's shape).
 pub(crate) fn impact_substrate(
     engine: &Engine,
     libraries: &[(LibraryId, Vec<FileId>)],
 ) -> Substrate {
     let csr = engine.library_import_graph();
     let count = csr.nodes();
+    let root = engine.packages().workspace_root();
     let mut idents: Vec<Option<String>> = vec![None; count];
     for (library, files) in libraries {
         if let Some(label) = files
             .first()
             .and_then(|&file| engine.file_table().path(file))
-            .map(|path| crate::pkg_label::pkg_label(engine.packages(), path))
+            .map(|path| crate::pkg_label::locate(root, path))
         {
             idents[library.index() as usize] = Some(label);
         }
@@ -748,7 +964,8 @@ impl Substrate {
         &self.csr.edges()[start..end]
     }
 
-    /// The defining-file reference label of `library`.
+    /// The defining file's located spelling of `library` (root-relative
+    /// inside the analysis root, absolute outside — see [`impact_substrate`]).
     ///
     /// Dead slots never reach here — the label consumers are flood-joined:
     /// a retired slot projects no edges, so it appears in no importer row
@@ -949,6 +1166,56 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The report's path columns spell through the one file locator: the
+    /// changed symbols' `label|name` label half, the affected rows, and
+    /// the test rows are root-relative inside the analysis root, and the
+    /// envelope carries the root exactly once. (Files outside the root
+    /// keep the absolute spelling — the foreign-package shape the query
+    /// face's locator test pins.)
+    #[test]
+    fn report_columns_spell_through_the_locator() {
+        let root = workspace(
+            "impact_locator",
+            &[
+                ("lib/a.dart", "class A {}\n"),
+                ("lib/b.dart", "import 'a.dart';\nclass B {}\n"),
+                ("test/a_test.dart", "import 'a.dart';\nvoid main() {}\n"),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let report = impact(&mut engine, &root.join("lib/a.dart"), &[]).expect("impact");
+        let canonical = root.canonicalize().expect("root");
+
+        assert_eq!(
+            report.root.as_deref(),
+            Some(canonical.display().to_string().as_str()),
+            "the locator root rides exactly once"
+        );
+        assert!(
+            report
+                .changed
+                .iter()
+                .all(|row| row.symbol.starts_with("lib/a.dart|")),
+            "the sym label half is the located path: {:?}",
+            report.changed
+        );
+        let paths: Vec<&str> = report.affected.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(paths, vec!["lib/b.dart"], "the affected row is located");
+        let tests: Vec<&str> = report
+            .affected_tests
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
+        assert_eq!(tests, vec!["test/a_test.dart"], "the test row is located");
+        dartq_schema::validate(
+            &serde_json::to_string(&report).expect("serialize"),
+            dartq_schema::Domain::Impact,
+        )
+        .expect("the born report is schema-valid");
+
+        std::fs::remove_dir_all(&canonical).ok();
     }
 
     /// The `--impacted` selection's input shape: the workspace fixture with
@@ -1587,13 +1854,15 @@ mod tests {
 
     /// The canonical fixture report (the shaper tests' input): every row
     /// shape in one document — both signature verdicts, both impact
-    /// levels, the test section, and the two-row environment matrix.
-    /// `reference_lines` rides the v3 row: non-empty on the semantic hit
-    /// (its file holds resolved uses of the change's names) and empty on
-    /// the transitive-only row.
+    /// levels, the test section, the two-row environment matrix, and the
+    /// locator envelope (`/w` is the root the relative paths spell
+    /// against). `reference_lines` rides the v3 row: non-empty on the
+    /// semantic hit (its file holds resolved uses of the change's names)
+    /// and empty on the transitive-only row.
     fn golden_report() -> query::ImpactReport {
         query::ImpactReport {
             schema_version: query::IMPACT_SCHEMA_VERSION,
+            root: Some("/w".to_owned()),
             changed: vec![
                 query::ChangedSymbol {
                     symbol: "lib/a.dart|Foo".to_owned(),
@@ -1738,6 +2007,111 @@ mod tests {
                 b.reference_lines
             );
         }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The three `--symbol` spellings (#2621) over one fixture: a bare
+    /// member name unions every container declaring it, `Container.name`
+    /// narrows to that container (constructor selectors included), and
+    /// `file:line` selects the declaration whose name token starts on the
+    /// line — a member line resolving to its container's face. Every miss
+    /// stays the usage tier.
+    ///
+    /// `lib/repo.dart` under test (the seed):
+    ///
+    /// ```text
+    /// 1: abstract class TodoRepository {
+    /// 2:   Future<void> createTask(String title);
+    /// 3: }
+    /// 4: class Other {
+    /// 5:   Future<void> createTask(String title) {}
+    /// 6:   Other.named();
+    /// 7: }
+    /// ```
+    #[test]
+    fn symbol_spellings_resolve_members_containers_and_lines() {
+        let root = workspace(
+            "impact_symbol_spellings",
+            &[
+                (
+                    "lib/repo.dart",
+                    "abstract class TodoRepository {\n  Future<void> createTask(String title);\n}\nclass Other {\n  Future<void> createTask(String title) {}\n  Other.named();\n}\n",
+                ),
+                (
+                    "lib/client.dart",
+                    "import 'repo.dart';\nclass Client {\n  void run() {}\n}\n",
+                ),
+            ],
+        );
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+        let target = root.join("lib/repo.dart");
+        let faces = |report: &query::ImpactReport| -> Vec<String> {
+            let mut names: Vec<String> = report
+                .changed
+                .iter()
+                .map(|row| row.symbol.clone())
+                .collect();
+            names.sort();
+            names
+        };
+
+        // Bare `createTask`: the union — both containers declaring it.
+        let report =
+            impact(&mut engine, &target, &["createTask".to_owned()]).expect("bare member name");
+        let names = faces(&report);
+        assert_eq!(names.len(), 2, "both declaring containers seed: {names:?}");
+        assert!(names.iter().all(|row| {
+            row.ends_with("|TodoRepository") || row.ends_with("|Other")
+        }));
+
+        // `Container.name`: the named container's face alone.
+        let report = impact(&mut engine, &target, &["TodoRepository.createTask".to_owned()])
+            .expect("container-qualified spelling");
+        let names = faces(&report);
+        assert_eq!(names.len(), 1);
+        assert!(names[0].ends_with("|TodoRepository"), "{names:?}");
+
+        // A constructor selector: `Other.named` narrows to `Other`.
+        let report = impact(&mut engine, &target, &["Other.named".to_owned()])
+            .expect("constructor selector spelling");
+        let names = faces(&report);
+        assert_eq!(names.len(), 1);
+        assert!(names[0].ends_with("|Other"), "{names:?}");
+
+        // `file:line`: the container header (line 1), the member (line 2,
+        // resolving to its container), and the second container (line 4).
+        for (line, face) in [(1u32, "|TodoRepository"), (2, "|TodoRepository"), (4, "|Other")] {
+            let spelling = format!("{}:{line}", target.display());
+            let report = impact(&mut engine, &target, &[spelling]).expect("file:line seed");
+            let names = faces(&report);
+            assert_eq!(names.len(), 1, "line {line}: {names:?}");
+            assert!(names[0].ends_with(face), "line {line}: {names:?}");
+        }
+
+        // Misses stay the usage tier: a member no container declares, a
+        // container that declares nowhere, a line with no name token (the
+        // closing brace), a file outside the seed library, and a line the
+        // element face cannot name (the constructor at line 6 — capture
+        // rows carry no constructors).
+        for spelling in [
+            "TodoRepository.absent".to_owned(),
+            "NoSuchClass.createTask".to_owned(),
+            format!("{}:7", target.display()),
+            format!("{}:1", root.join("lib/client.dart").display()),
+            format!("{}:6", target.display()),
+        ] {
+            let error = impact(&mut engine, &target, &[spelling.clone()])
+                .expect_err("a miss is the usage tier");
+            assert!(
+                matches!(error, ImpactError::Usage(_)),
+                "{spelling}: {error:?}"
+            );
+            assert!(
+                error.to_string().contains(&spelling),
+                "the spelling rides: {error}"
+            );
+        }
+
         fs::remove_dir_all(&root).ok();
     }
 
@@ -1887,4 +2261,71 @@ mod tests {
         );
         fs::remove_dir_all(&root).ok();
     }
+
+    /// Writes the `sky_engine`-shaped package: `lib/_embedder.yaml` mapping
+    /// `dart:core` and `dart:ui` inside the package, plus the mapped files.
+    fn write_sky_engine(root: &Path) {
+        fs::create_dir_all(root.join("sky_engine/lib/ui")).expect("package dirs");
+        fs::write(
+            root.join("sky_engine/lib/_embedder.yaml"),
+            "embedded_libs:\n  \"dart:core\": \"embedder_core.dart\"\n  \"dart:ui\": \"ui/ui.dart\"\n",
+        )
+        .expect("embedder yaml");
+        fs::write(
+            root.join("sky_engine/lib/embedder_core.dart"),
+            "library dart.core;",
+        )
+        .expect("embedder core");
+        fs::write(root.join("sky_engine/lib/ui/ui.dart"), "library dart.ui;")
+            .expect("embedder ui");
+    }
+
+    /// The fixture's package config plus one `sky_engine` entry
+    /// (config-relative `rootUri`, the pub-writer spelling).
+    fn rewrite_config_with_sky_engine(root: &Path) {
+        fs::write(
+            root.join(".dart_tool/package_config.json"),
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}, {"name": "sky_engine", "rootUri": "../sky_engine", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
+        )
+        .expect("config");
+    }
+
+    /// The environment axis rides the resolution's embedder table (#2633):
+    /// a `sky_engine` entry turns the axis engine's `dart:` table into the
+    /// embedder's replacement, so an affected `import 'dart:ui'` file
+    /// analyzes compatible; without the entry the same file's
+    /// `uri_does_not_exist` ERROR flips the verdict. The affected set
+    /// spells through the locator (the verdict rule's own projection).
+    #[test]
+    fn environment_verdict_rides_the_resolution_embedder_table() {
+        let affected: FxHashSet<String> = ["lib/main.dart".to_owned()].into_iter().collect();
+
+        // The embedder-backed resolution: the environment is compatible.
+        let root = workspace("impact_embedder", &[("lib/main.dart", UI_IMPORT)]);
+        write_sky_engine(&root);
+        rewrite_config_with_sky_engine(&root);
+        let root = root.canonicalize().expect("root");
+        let (config, graph, config_dir, _) = package_assembly_strict(&root).expect("assembly");
+        assert!(
+            analyze_environment(&root.join("sdk"), &config, &graph, &config_dir, &affected)
+                .expect("the embedder environment answers"),
+            "dart:ui resolves through the embedder"
+        );
+        fs::remove_dir_all(&root).ok();
+
+        // The plain resolution: the missing `dart:ui` ERROR flips it.
+        let plain = workspace("impact_embedder_plain", &[("lib/main.dart", UI_IMPORT)]);
+        let plain = plain.canonicalize().expect("root");
+        let (config, graph, config_dir, _) = package_assembly_strict(&plain).expect("assembly");
+        assert!(
+            !analyze_environment(&plain.join("sdk"), &config, &graph, &config_dir, &affected)
+                .expect("the plain environment answers"),
+            "dart:ui does not exist on the plain table"
+        );
+        fs::remove_dir_all(&plain).ok();
+    }
+
+    /// The environment-axis target of the embedder test: one `dart:ui`
+    /// import, clean of every other diagnostic face.
+    const UI_IMPORT: &str = "import 'dart:ui';\nvoid main() {}\n";
 }

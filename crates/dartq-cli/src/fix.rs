@@ -8,7 +8,11 @@
 //!
 //! - `--dry-run` only outputs the patches, never writes; without it
 //!   the edits apply in place (the machine document still prints, as the
-//!   record of what was written);
+//!   record of what was written). Every proposal row carries its `role`
+//!   key (`primary`, `ignore_line`, `ignore_file`, `suppress`); an apply
+//!   run writes only `--role`'s candidates — `primary` by default, one
+//!   code change per diagnostic, the ignore comments never
+//!   auto-applied;
 //! - both faces dispatch the discovered plugin hosts (the `plugins/`
 //!   convention and the pub-native `plugins:` section under the working
 //!   directory): built-in lint rows, the
@@ -58,9 +62,24 @@ pub(crate) struct FixArgs {
     /// `dart fix --code` selection).
     #[arg(long, value_delimiter = ',')]
     pub(crate) code: Vec<String>,
+    /// The candidate role an apply run writes: `primary` (the default —
+    /// the code change that resolves each diagnostic, one candidate per
+    /// diagnostic; the ignore-comment spellings apply only when named) or
+    /// one of `ignore_line`, `ignore_file`, `suppress`. `--dry-run`
+    /// always lists every candidate with its `role` key, whatever this
+    /// flag says.
+    #[arg(long, value_parser = parse_role, default_value = "primary")]
+    pub(crate) role: fix::FixRole,
     /// Targets; empty resolves to the current directory.
     #[arg(default_value = ".")]
     pub(crate) paths: Vec<PathBuf>,
+}
+
+/// The `--role` parser: the exact spellings, a usage-tier message on
+/// anything else.
+fn parse_role(text: &str) -> Result<fix::FixRole, String> {
+    fix::FixRole::parse(text)
+        .ok_or_else(|| format!("invalid role '{text}': one of primary, ignore_line, ignore_file, suppress"))
 }
 
 #[derive(Args)]
@@ -335,6 +354,14 @@ fn run(args: &FixArgs, out: &mut impl Write) -> u8 {
     report_errors(&mut hosts);
     hosts.shutdown();
     let per_file = fix::select_by_codes(per_file, &args.code);
+    // The proposal lists every candidate with its `role` key; an apply
+    // run writes only the selected role's candidates — primary by
+    // default, one code change per diagnostic.
+    let per_file = if args.dry_run {
+        per_file
+    } else {
+        fix::select_by_role(per_file, args.role)
+    };
     apply_and_report(&per_file, args.dry_run, args.format, out)
 }
 
@@ -572,13 +599,28 @@ mod tests {
         let args = parse(&["fix", "--dry-run", "--format=json", "/tmp/w"]);
         assert!(args.dry_run);
         assert!(matches!(args.format, crate::OutputFormat::Json));
-        assert_eq!(args.paths, vec![PathBuf::from("/tmp/w")]);
+        assert_eq!(args.paths, vec![PathBuf::from("/tmp/w")], "default target cwd");
+
+        // The role axis: primary is the default; the three suppression
+        // spellings parse; anything else is clap's usage tier.
+        assert_eq!(parse(&["fix"]).role, fix::FixRole::Primary);
+        for (flag, role) in [
+            ("primary", fix::FixRole::Primary),
+            ("ignore_line", fix::FixRole::IgnoreLine),
+            ("ignore_file", fix::FixRole::IgnoreFile),
+            ("suppress", fix::FixRole::Suppress),
+        ] {
+            let arg = format!("--role={flag}");
+            assert_eq!(parse(&["fix", arg.as_str()]).role, role);
+        }
 
         for rejected in [
             &["fix", "--format"][..],
             &["fix", "--format=yaml"][..],
             &["fix", "--format=machine"][..],
             &["fix", "--bogus"][..],
+            &["fix", "--role=ignore"][..],
+            &["fix", "--role=IgnoreLine"][..],
         ] {
             assert!(
                 Cli::try_parse_from(std::iter::once("dartq").chain(rejected.iter().copied()))
@@ -680,6 +722,9 @@ mod tests {
                 source: fix::BUILTIN_SOURCE,
                 edit: fix::anchored_edit(source, &lines, 19, 4, ""),
                 target: None,
+                role: fix::FixRole::Primary,
+                diag: None,
+                group: 0,
             }],
             plugin: Vec::new(),
         }
@@ -731,6 +776,132 @@ mod tests {
             "the applied row names the rule: {applied}"
         );
         assert!(text.contains("1 fix applied in 1 file."), "{text}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The role-selection contract over the #2617 quartet: one
+    /// `unused_import` diagnostic materializes four candidates — the
+    /// import deletion (`primary`), the line and file ignore comments,
+    /// and the analysis-options suppression. The proposal lists all four
+    /// with their `role` keys; the default apply writes exactly the
+    /// import deletion (no ignore comment, the options file untouched);
+    /// `--role ignore_line` (the same selection through
+    /// [`fix::select_by_role`], the `run` face's own composition) writes
+    /// only the ignore comment; the apply record omits the rows the
+    /// selection filtered out.
+    #[test]
+    fn fix_apply_selects_one_role_from_the_candidates() {
+        let root = std::env::temp_dir().join(format!("dq_cli_fix_role_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("mkdir");
+        let path = root.join("main.dart");
+        let options = root.join("analysis_options.yaml");
+        let source = "import 'helper.dart';\n\nint main() => 2;\n";
+        fs::write(&path, source).expect("write");
+        fs::write(&options, "linter:\n  rules: []\n").expect("options");
+
+        // The quartet exactly as the producers mint it: the semantic
+        // deletion, the two ignore comments, and the options suppression
+        // in its own file set.
+        let lines = LineIndex::new(source);
+        let diag = dartq_source::SourceRange {
+            offset: 7,
+            length: 13,
+        };
+        let deletion = fix::RuleFix {
+            rule: "unused_import",
+            message: "Unused import.".to_owned(),
+            source: fix::BUILTIN_SEMANTIC_SOURCE,
+            edit: fix::anchored_edit(source, &lines, 0, 22, ""),
+            target: None,
+            role: fix::FixRole::Primary,
+            diag: Some(diag),
+            group: 0,
+        };
+        let line_comment =
+            fix::ignore_line_fix("unused_import", 7..20, source, &lines).expect("line fix");
+        let file_comment = fix::ignore_file_fix("unused_import", source, &lines)
+            .expect("file fix");
+        let options_text = "linter:\n  rules: []\n";
+        let options_lines = LineIndex::new(options_text);
+        let (off, len, replacement) =
+            fix::ignore_options_edit("unused_import", options_text).expect("options edit");
+        let suppression = fix::RuleFix {
+            rule: "unused_import",
+            message: "Ignore 'unused_import' in `analysis_options.yaml`".to_owned(),
+            source: fix::BUILTIN_IGNORE_SOURCE,
+            edit: fix::anchored_edit(options_text, &options_lines, off, len, &replacement),
+            target: None,
+            role: fix::FixRole::Suppress,
+            diag: None,
+            group: 0,
+        };
+        let quartet = vec![
+            FileFixSet {
+                path: path.display().to_string(),
+                fixes: vec![deletion, line_comment, file_comment],
+                plugin: Vec::new(),
+            },
+            FileFixSet {
+                path: options.display().to_string(),
+                fixes: vec![suppression],
+                plugin: Vec::new(),
+            },
+        ];
+
+        // The proposal lists every candidate with its role key.
+        let doc = fix::patch_json(&quartet[0], Verbosity::Compact);
+        let roles: Vec<_> = doc["edits"]
+            .as_array()
+            .expect("edits")
+            .iter()
+            .map(|row| row["role"].as_str().expect("role key"))
+            .collect();
+        assert_eq!(roles, ["primary", "ignore_line", "ignore_file"], "{doc}");
+        assert_eq!(
+            fix::patch_json(&quartet[1], Verbosity::Compact)["edits"][0]["role"],
+            "suppress"
+        );
+
+        // The default apply: only the import deletion lands.
+        let selected = fix::select_by_role(quartet.clone(), fix::FixRole::Primary);
+        let mut out = Vec::new();
+        assert_eq!(
+            apply_and_report(&selected, false, crate::OutputFormat::Lon, &mut out),
+            exit::CLEAN
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "\nint main() => 2;\n",
+            "the apply wrote exactly the import deletion"
+        );
+        assert_eq!(
+            fs::read_to_string(&options).expect("read"),
+            options_text,
+            "the suppression candidate never wrote the options file"
+        );
+        let record = String::from_utf8(out).expect("utf-8");
+        assert!(
+            record.contains("role:primary") && !record.contains("ignore_line"),
+            "the record carries only the applied role's rows: {record}"
+        );
+
+        // The ignore_line selection: only the comment lands, the import
+        // survives.
+        fs::write(&path, source).expect("reset");
+        let selected =
+            fix::select_by_role(quartet.clone(), fix::FixRole::IgnoreLine);
+        let mut out = Vec::new();
+        assert_eq!(
+            apply_and_report(&selected, false, crate::OutputFormat::Text, &mut out),
+            exit::CLEAN
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "// ignore: unused_import\nimport 'helper.dart';\n\nint main() => 2;\n",
+            "only the ignore comment was written"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -995,6 +1166,9 @@ mod tests {
                 source: fix::BUILTIN_SEMANTIC_SOURCE,
                 edit: fix::anchored_edit("", &lines, 0, 0, born),
                 target: Some(target.display().to_string()),
+                role: fix::FixRole::Primary,
+                diag: None,
+                group: 0,
             }],
             plugin: Vec::new(),
         }];

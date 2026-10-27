@@ -1,6 +1,9 @@
 //! The `--metrics-json` run summary shared by `dartq check` and
 //! `dartq analyze` (`RunMetrics::json` in `crates/dartq-cli`): one JSON
-//! object at exit, the benchmark face. Tier-invariant
+//! object at exit, the benchmark face. The phase keys
+//! (`discovery_ms`/`sdk_ms`/`assembly_ms`/`analyze_ms`/`lints_ms`/
+//! `render_ms`) are non-overlapping sub-intervals of `total_ms` by the
+//! writer's capture discipline. Tier-invariant
 //! (crate docs, "Verbosity tiers") — a benchmark sidecar has no trimmable
 //! prose.
 
@@ -37,7 +40,11 @@ static RUN_METRICS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "loc",
             "diagnostics",
             "discovery_ms",
+            "sdk_ms",
+            "assembly_ms",
             "analyze_ms",
+            "lints_ms",
+            "render_ms",
             "total_ms",
             "libraries_analyzed",
             "libraries_from_cache",
@@ -49,7 +56,11 @@ static RUN_METRICS_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
             "loc": { "type": "integer", "minimum": 0 },
             "diagnostics": { "type": "integer", "minimum": 0 },
             "discovery_ms": { "type": "integer", "minimum": 0 },
+            "sdk_ms": { "type": "integer", "minimum": 0 },
+            "assembly_ms": { "type": "integer", "minimum": 0 },
             "analyze_ms": { "type": "integer", "minimum": 0 },
+            "lints_ms": { "type": "integer", "minimum": 0 },
+            "render_ms": { "type": "integer", "minimum": 0 },
             "total_ms": { "type": "integer", "minimum": 0 },
             "libraries_analyzed": { "type": "integer", "minimum": 0 },
             "libraries_from_cache": { "type": "integer", "minimum": 0 },
@@ -66,7 +77,11 @@ const RUN_METRICS_TOP: &[&str] = &[
     "loc",
     "diagnostics",
     "discovery_ms",
+    "sdk_ms",
+    "assembly_ms",
     "analyze_ms",
+    "lints_ms",
+    "render_ms",
     "total_ms",
     "libraries_analyzed",
     "libraries_from_cache",
@@ -82,7 +97,11 @@ pub(crate) fn validate_run_metrics(value: &Value) -> Result<(), SchemaViolation>
         "loc",
         "diagnostics",
         "discovery_ms",
+        "sdk_ms",
+        "assembly_ms",
         "analyze_ms",
+        "lints_ms",
+        "render_ms",
         "total_ms",
         "libraries_analyzed",
         "libraries_from_cache",
@@ -105,5 +124,37 @@ mod tests {
             crate::support::schema_keys(metrics),
             crate::support::const_names(RUN_METRICS_TOP)
         );
+    }
+
+    /// The phase split (#2628): the phased shape validates, and a document
+    /// missing any one phase key is rejected with the key named.
+    #[test]
+    fn phase_keys_are_required_individually() {
+        let document = json!({
+            "schema_version": SCHEMA_VERSION_RUN_METRICS,
+            "files": 1,
+            "loc": 2,
+            "diagnostics": 0,
+            "discovery_ms": 1,
+            "sdk_ms": 2,
+            "assembly_ms": 3,
+            "analyze_ms": 4,
+            "lints_ms": 5,
+            "render_ms": 6,
+            "total_ms": 25,
+            "libraries_analyzed": 1,
+            "libraries_from_cache": 0,
+            "max_rss_bytes": null,
+        });
+        assert!(validate_run_metrics(&document).is_ok());
+        for key in ["sdk_ms", "assembly_ms", "lints_ms", "render_ms"] {
+            let mut short = document.clone();
+            short.as_object_mut().expect("object").remove(key);
+            let Err(violation) = validate_run_metrics(&short) else {
+                panic!("missing `{key}` must be rejected");
+            };
+            assert_eq!(violation.path, key);
+            assert_eq!(violation.found, "missing");
+        }
     }
 }

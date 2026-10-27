@@ -103,6 +103,11 @@ pub(crate) struct ImportContext {
 /// oracle's canonical-URI rule (upstream `PackageMapUriResolver.pathToUri`;
 /// `dartq_resolution`'s `compose_canonical_uri` composes the identical
 /// pair but takes that crate's own `PackageTable`, unreachable here).
+/// This is a Dart import URI inserted into source (`from_imports`'s
+/// `import '<uri>';` edit), not a display label: a locator spelling
+/// relative to the analysis root would resolve against the *importing
+/// file's* directory once compiled — the output faces' locator never
+/// applies to this grammar.
 fn import_uri(engine: &dartq_engine::Engine, path: &Path) -> String {
     let label = crate::pkg_label::pkg_label(engine.packages(), path);
     if label.starts_with("package:") {
@@ -255,12 +260,19 @@ pub(crate) fn from_imports(
             else {
                 continue;
             };
+            // Each candidate library is its own primary candidate — the
+            // group id keeps them apart under the one diagnostic, so the
+            // apply face's one-candidate-per-diagnostic rule keeps the
+            // first (dart: first, the producer's sort).
             rows.push(RuleFix {
                 rule: diagnostic.code.name,
                 message: format!("Add 'import' of '{}'", candidate.uri),
                 source: BUILTIN_SEMANTIC_SOURCE,
                 edit: anchored_edit(text, lines, offset, length, &replacement),
                 target: None,
+                role: FixRole::Primary,
+                diag: Some(diagnostic.range),
+                group: rows.len() as u32,
             });
         }
     }

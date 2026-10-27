@@ -27,7 +27,7 @@ dartq debug resume                          # release; the program stops on your
 
 **The session selector is optional.** Most interactions hold exactly one
 debug session, and every verb drives it by default — `dartq debug resume`,
-`dartq debug evaluate n --frameIndex 0`, `dartq debug step over`. With
+`dartq debug evaluate n --frame-index 0`, `dartq debug step over`. With
 zero live sessions the answer is a `DARTQ/DEBUG/NO_SESSIONS` error naming
 the way out (launch or attach); with several, a
 `DARTQ/DEBUG/AMBIGUOUS_SESSION` error listing every candidate
@@ -40,7 +40,7 @@ ws://…` connects to a running VM service — including one owned by a live
 `flutter run`; the tool's own console keeps working.
 
 Exit contract: 0 the answer rode stdout; 1 the engine answered a domain
-error (one `{"error":{"code","message"}}` line — the `DARTQ/DEBUG/*`
+error (one `{"error":{"code","msg"}}` line — the `DARTQ/DEBUG/*`
 machine code names the cause); 64 usage; 4 the proxy never reached the
 engine (no resident session, transport).
 
@@ -77,9 +77,10 @@ Pick stop for launched sessions you own; detach for apps you borrowed.
 
 - `dartq debug reload` — hot reload (`reloadSources`); on
   a Flutter session this is the tool's own orchestrated reload (source
-  push + reassemble), so edits on disk take effect. A broken edit
-  answers the **compile error as data**; the session stays usable — fix
-  and reload again.
+  push + reassemble), so edits on disk take effect. The answer is
+  `{ok isolates_reloaded ms err?}` — a failed reload keeps the session
+  alive and `err` carries the VM's own text (the compile error as data);
+  fix and reload again.
 - `dartq debug restart` — hot restart (Flutter): state
   resets like the tool's `R`, isolates are rebuilt, and the session
   **re-arms its breakpoints on the new isolate** (the answer lists
@@ -90,13 +91,13 @@ Pick stop for launched sessions you own; detach for apps you borrowed.
 
 | Command | Answer |
 | --- | --- |
-| `dartq debug status [-s N]` | the worktree's debug sessions and their stopped states — orientation after any stop event; with `-s`, that session's breakpoints too |
+| `dartq debug status [-s N]` | always the document `{v:1 sessions:[…] orphans:[…]}`, empty arrays included — the worktree's debug sessions and their stopped states, plus the `orphans` re-attach trail (`{id ws_uri kind since released?}`); with `-s`, that session's breakpoints too |
 | `dartq debug snapshot --isolate I` | the stopped frame: why, where, the stack summary, and the top frame's variables with lazy-expansion handles |
-| `dartq debug evaluate [--frameIndex F] 'expr'` | one Dart expression in a paused frame (`--frameIndex`) or the root library (absent) — inspect what the snapshot only names, verify a fix from inside the app |
+| `dartq debug evaluate [--frame-index F] 'expr'` | one Dart expression in a paused frame (`--frame-index`) or the root library (absent) — inspect what the snapshot only names, verify a fix from inside the app |
 | `dartq debug step into\|over\|out` | advance one frame's worth |
 | `dartq debug pause` | interrupt a running session to inspect state |
 | `dartq debug exception-pause none\|uncaught\|all` | break on throws |
-| `dartq debug breakpoint add/rm` | arm/clear stops (`--script`+`--line`, or `--functionId`; `--condition` makes it conditional) |
+| `dartq debug breakpoint add/rm` | arm/clear stops (`--script`+`--line`, or `--function-id`; `--condition` makes it conditional) |
 
 ## Streams (cursor-paginated; keep the cursor)
 
@@ -110,6 +111,19 @@ Both answer one page per call; feed the last line's `nextCursor` back as
 
 ## Rules of Thumb
 
+- Debug sessions live in the worktree's resident session process. It exits
+  after 15 min with no client, on eviction past the 5-session-per-user cap,
+  or when a newer dartq binary wins the next election — but a daemon
+  holding debug sessions never idle-reaps, and SIGTERM/SIGINT (the
+  election takeover included) run a graceful shutdown: every paused
+  isolate is resumed first, a `session`/`shutdown` event
+  `{reason: idle|signal|accept_failed, sessions_released}` is written,
+  and each held session leaves a re-attach manifest under
+  `.dart_tool/dartq/debug/<id>.json` — a later `dartq debug status` lists
+  them as `orphans`, and a successful `debug attach` to the same ws_uri
+  consumes one. The election reap's grace is 8 s + 5 s per held session
+  (the daemon advertises the count in its heartbeat), so the resume
+  ladder fits inside the window.
 - Several sessions at once (two apps, or a launch plus an attach): every
   verb then needs `-s <ID>`; `dartq debug status` lists the ids.
 - Long-lived app work: launch once, reload repeatedly, restart only when

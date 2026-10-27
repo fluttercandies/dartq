@@ -23,7 +23,14 @@ resident engine per worktree serves CLI, events, and MCP clients alike.
    test's own codes (0 pass, 1 fail, 64 usage, 65 data error, 79 no tests).
 3. **Commands auto-attach to the worktree's session.** The first command in a
    worktree elects a resident engine (`.dart_tool/dartq/`); later commands
-   reuse it. Nothing to start, nothing to keep alive.
+   reuse it. It exits after 15 min with no client, on eviction past the
+   5-session-per-user cap, or when a newer dartq binary wins the next
+   election — but a daemon holding debug sessions never idle-reaps, and
+   every exit (SIGTERM/SIGINT, the election takeover included) runs a
+   graceful shutdown: paused isolates are resumed first, a
+   `session`/`shutdown` event records what was released, and re-attach
+   manifests stay under `.dart_tool/dartq/debug/` (listed as `orphans` by
+   `dartq debug status`).
 
 ## The Verb Surface
 
@@ -32,13 +39,13 @@ resident engine per worktree serves CLI, events, and MCP clients alike.
 | `analyze` | Full-engine diagnostics; `--fast` = parser-only sweep |
 | `packages` | Every package root and pruned boundary of the enclosing monorepo |
 | `query` | Symbol index: declarations, references, callers, implementations, dependencies, batch |
-| `explain` | One-stop JSON report for one symbol or one diagnostic code |
+| `explain` | JSON report for one symbol (sections `declaration bases ifaces ctors methods refs deps tests`) or one diagnostic code |
 | `impact` | What a change to one file would affect |
-| `rename` | Workspace-wide rename; dry-run edit set or `--write` |
-| `fix` | Emit or apply anchored fix patches |
+| `rename` | Edit-set rename: the declaration's name token plus the reference rows the index resolves; dry run or `--write` |
+| `fix` | Emit or apply anchored fix patches; `--role` picks the candidate kind an apply writes |
 | `test` | `dart test` / `flutter test` with a result cache and `--impacted` |
 | `session` | Manage the resident engine: start / status / stop |
-| `events` | Cursor-paginated session log or cold-analysis progress |
+| `events` | Newest-first session log or cold-analysis progress |
 | `debug` | Drive debug sessions: launch/attach, breakpoints, stepping, snapshots, evaluation, hot reload/restart |
 | `resolve` / `complete` | One-shot `PATH:LINE:COL` cursor answers |
 | `compat` | One workspace under several SDK roots: a compatibility matrix |
@@ -62,10 +69,13 @@ under `references/`. Load the one that matches the task:
 
 ## Defaults That Surprise Newcomers
 
-- `dartq analyze` prints `{v:1 diags:[{code sev file line col len msg doc?}]}` —
-  one LON document, one flat row per diagnostic. `--format json` asks for the
-  oracle envelope (byte parity with `dart analyze --format=json`);
-  `--format text` the grouped human listing (`sev code line:col msg` rows).
+- `dartq analyze` prints `{v:1 root? diags:[{code sev file line col len msg}]}` —
+  one LON document, one flat row per diagnostic; `root` (the absolute
+  analysis root) rides only when rows exist, and `file` is root-relative
+  inside it, absolute outside (SDK, pub cache). `--format json` asks for the
+  oracle envelope (byte parity with `dart analyze --format=json` — absolute
+  paths, `documentation` on lint rows); `--format text` the grouped human
+  listing under a leading `root: <abs>` line.
 - The lon face carries the short field vocabulary everywhere: `v`, `diags`,
   `sev`, `msg`, `doc`, `decls`, `refs`, `off`, `len`, `col`, `sig`, `sym`,
   `deps`, `envs`, `sig_changed`, `new_name`, `age_s` — the same word list the

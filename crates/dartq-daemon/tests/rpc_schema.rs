@@ -363,23 +363,23 @@ fn dartq_explain_answers_validate_at_every_tier() {
     // The arbitration pin (#623B): the full-tier table maps short ids to
     // the substituted rows' file paths, assigned in the economics'
     // deterministic first-seen order. Under the package-form label wave the
-    // lib rows carry `package:fixture/main.dart` (a reference and a
-    // dependency over the declaration), while `test/` has no `package:`
-    // URI and keeps the canonical path — the label wave flipped the
-    // first-seen repeat order, so the test file is `s1` and the labeled
-    // main.dart `s2`.
+    // lib rows carry `lib/main.dart` and the test tree `test/dog_test.dart`
+    // — the locator's root-relative tails. Only the test file's repeats
+    // (refs/deps/tests) pay a preamble id; the twice-seen `lib/main.dart`
+    // tail never beats the entry cost, so the table is one entry and the
+    // lib rows ride spelled out.
     let full = answer_result(&h, 4);
     let symbols = full["symbols"]
         .as_object()
-        .expect("the short-id table pays on the fixture's long temp paths");
+        .expect("the short-id table pays on the test tree's repeats");
     assert_eq!(
-        symbols["s1"],
-        workspace.path("test/dog_test.dart").display().to_string(),
-        "the table maps ids to file paths: {symbols:?}"
+        symbols["s1"], "test/dog_test.dart",
+        "the table maps ids to located file spellings: {symbols:?}"
     );
     assert_eq!(
-        symbols["s2"], "package:fixture/main.dart",
-        "lib members carry the package-form label: {symbols:?}"
+        symbols.len(),
+        1,
+        "the twice-seen `lib/main.dart` tail never pays an id: {symbols:?}"
     );
 
     // Delta economics: nothing was written through this session, so the
@@ -415,9 +415,10 @@ fn dartq_explain_answers_validate_at_every_tier() {
 /// builtin row carries the `builtin-lint` tag, and the full tier adds its
 /// rule id and human message (a plugin row's `msg` + `priority` ride the
 /// same full-only rule; the live-plugin dispatch is the ignored serial
-/// test's scene). The governing options file joins the document set (the
-/// window's cross-file fix face), so the envelope carries two stamped
-/// documents.
+/// test's scene). The answer is role-filtered (#2617): the default
+/// `primary` role answers the hit file's code changes alone, and the
+/// governing options file's suppression document rides the `suppress`
+/// role spelling, pinned after the tier loop.
 #[test]
 fn dartq_fix_documents_validate_with_their_provenance() {
     let workspace = Workspace::new(CLEAN_MAIN);
@@ -454,19 +455,20 @@ fn dartq_fix_documents_validate_with_their_provenance() {
         let files = result["files"].as_array().expect("files array");
         assert_eq!(
             files.len(),
-            2,
-            "the hit file plus the governing options file (the cross-file document set): {result}"
+            1,
+            "the default role answers the hit file alone (the suppression \
+             candidates ride their own role spellings): {result}"
         );
         assert_eq!(
             files[0]["file"],
             fixable.display().to_string(),
-            "the fixable file's document comes first: {result}"
+            "the fixable file's document: {result}"
         );
         assert_valid_at_tier(&files[0], Domain::FixPatch, tier);
         assert_eq!(
             stamp_count(&result),
-            3,
-            "one `v` stamp per level (the envelope plus each document): {result}"
+            2,
+            "one `v` stamp per level (the envelope plus the document): {result}"
         );
 
         let edit = &files[0]["edits"][0];
@@ -489,6 +491,39 @@ fn dartq_fix_documents_validate_with_their_provenance() {
             );
         }
     }
+
+    // The suppression role keeps the options file's document alone — the
+    // hit file's rows are primary/ignore-roled, so its set drops — keeping
+    // the cross-file document schema-pinned through its own role: one row
+    // per code, each appending the `analyzer: errors:` ignore at the
+    // options file's end, provenance-tagged `builtin-ignore`.
+    h.step(
+        &request(
+            5,
+            "dartq/fix",
+            json!({
+                "paths": [fixable.display().to_string()],
+                "role": "suppress",
+            }),
+        ),
+        1,
+    );
+    let result = answer_result(&h, 5);
+    let files = result["files"].as_array().expect("files array");
+    assert_eq!(
+        files.len(),
+        1,
+        "the governing options file alone under `suppress`: {result}"
+    );
+    assert_eq!(
+        files[0]["file"],
+        workspace.path("analysis_options.yaml").display().to_string()
+    );
+    let edits = files[0]["edits"].as_array().expect("edits array");
+    assert_eq!(edits.len(), 2, "one suppression row per code");
+    assert_eq!(edits[0]["src"], "builtin-ignore");
+    assert_eq!(edits[0]["role"], "suppress");
+    assert_valid_at_tier(&files[0], Domain::FixPatch, Verbosity::Compact);
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
@@ -915,12 +950,17 @@ fn the_debug_family_matches_the_frozen_table() {
     }
 
     // The family is closed: an unknown debug-spelled name answers
-    // METHOD_NOT_FOUND, and `status` over the empty registry lists empty.
+    // METHOD_NOT_FOUND, and `status` over the empty registry answers
+    // the always-document shape (#2619 — sessions and orphans both
+    // empty is still a printed document, never blank output).
     h.step(&request(99, "dartq/debug/nope", json!({})), 1);
     let frame = h.wait_answer(99);
     assert_eq!(frame["error"]["code"], -32601, "the debug face set is closed");
     h.step(&request(100, "dartq/debug/status", json!({})), 1);
-    assert_eq!(h.wait_answer(100)["result"], json!([]));
+    assert_eq!(
+        h.wait_answer(100)["result"],
+        json!({"v": 1, "sessions": [], "orphans": []})
+    );
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);

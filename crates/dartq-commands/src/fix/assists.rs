@@ -58,8 +58,8 @@ pub(crate) struct AssistSpec {
 /// on the producer). The table grows with the F5 waves: the if/condition
 /// and surround families land on this same substrate. The flutter-gated
 /// families resolve `package:flutter` elements upstream and stay out
-/// until the `flutter_sdk_root` seam lands (facts-blocked, not a
-/// divergence).
+/// until a Flutter-shaped resolution is exercised over the fix face
+/// (facts-blocked, not a divergence).
 pub(crate) static ASSIST_TABLE: &[AssistSpec] = &[
     AssistSpec {
         kind: "dart.assist.convert.blockComment",

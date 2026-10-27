@@ -61,6 +61,16 @@ packages once and runs later shards with `--no-pub`, so parallel shards
 never contend on `pubspec.lock`. `--platform tester` runs here; any other
 platform, web, devices, and integration tests delegate to the stock tool.
 
+## Plain `dartq test` inside a Flutter package
+
+Without `--flutter`, `dartq test` applies `dart test` semantics even in a
+Flutter package: suites compile and run on the plain Dart VM, where
+`dart:ui` is unavailable — widget tests cannot run this way (use
+`dartq test --flutter`). Positional path arguments resolve against the
+package root — the current directory, which must hold `pubspec.yaml` and
+`.dart_tool/package_config.json`; any other shape delegates to the stock
+runner.
+
 ## Cache Discipline for Agents
 
 - The result cache is per user and content-keyed: every worktree of the same

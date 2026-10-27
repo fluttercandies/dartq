@@ -41,8 +41,13 @@
 #   rpc-fix-answer       `dartq/fix` at compact/full: {v, files} of patch
 #                        documents {file, v, edits[]}; every edit rides the
 #                        red-line floor (off/len/text/src) plus the anchor
-#                        at compact; full adds the builtin rule/msg columns
-#                        (priority is plugin-row-only).
+#                        and its `role` at compact; full adds the builtin
+#                        rule/msg columns (priority is plugin-row-only).
+#                        The answer is role-filtered (`role` param, default
+#                        `primary` — one code change per diagnostic); the
+#                        suppress document (the governing options file) and
+#                        the ignore-comment candidates answer under their
+#                        explicit roles only.
 #   rpc-fix-rejects      `dartq/fix` with agentId/context/since is answered
 #                        INVALID_PARAMS (-32602) naming the disk-view rule —
 #                        never an answer payload.
@@ -378,7 +383,10 @@ cat >"$work/steps.json" <<'EOF'
   {"id": 8, "method": "dartq/assists", "params": {"path": "lib/fixme.dart", "verbosity": "compact"}},
   {"id": 9, "method": "dartq/assists", "params": {"path": "lib/fixme.dart", "since": 1}},
   {"id": 10, "method": "dartq/overlay.set", "params": {"agent_id": "sweep-probe", "files": {}}},
-  {"id": 11, "method": "dartq/overlay.clear", "params": {"agent_id": "sweep-probe"}}
+  {"id": 11, "method": "dartq/overlay.clear", "params": {"agent_id": "sweep-probe"}},
+  {"id": 12, "method": "dartq/fix", "params": {"paths": ["lib/fixme.dart"], "verbosity": "compact", "role": "suppress"}},
+  {"id": 13, "method": "dartq/fix", "params": {"paths": ["lib/fixme.dart"], "verbosity": "compact", "role": "ignore_line"}},
+  {"id": 14, "method": "dartq/fix", "params": {"paths": ["lib/fixme.dart"], "role": "bogus"}}
 ]
 EOF
 
@@ -529,7 +537,7 @@ fi
 
 # Materialize one body file per scripted id; a missing or duplicated response
 # is itself a face failure.
-for id in 1 2 3 4 5 6 7 8 9 10 11; do
+for id in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
   count="$(jq -s --argjson id "$id" \
     '[.[] | select(.from_server.id == $id)] | length' "$rpc_jsonl")"
   if [ "$count" != "1" ]; then
@@ -593,26 +601,29 @@ chk "full: rows keep the compact 7-field set" jq_true "$body" \
 end_face
 
 # --- face: rpc-fix-answer ------------------------------------------------------
-# Re-frozen 2026-10-18 (rcP adjudication): the fix face's v1 surface here is
-# the cross-file document set — the hit file first, the governing options
-# file second (the contract rpc_schema.rs
-# `dartq_fix_documents_validate_with_their_provenance` has pinned since the
-# #631/#632 provenance window), and the provenance spellings are the three
-# builtin families of the shared fix assembly (dartq-commands fix.rs:
-# `builtin-lint` / `builtin-semantic` / `builtin-ignore`). The semantic rows
-# ride the SDK face the daemon drives with, so the answer is wider than a
-# bare CLI pass without `--sdk`. Additive-only: no field moved, v1 stands.
+# Re-frozen 2026-10-18 (rcP adjudication), re-pinned to the role contract
+# (2026-10-27): the answer is role-filtered — `dartq/fix` defaults to
+# `primary`, one code change per diagnostic (dartq-commands fix.rs
+# `select_by_role`, the upstream `dart fix --apply` posture), and every
+# edit row carries its `role`. The cross-file suppress document (the
+# governing analysis_options.yaml, provenance `builtin-ignore`) and the
+# ignore-comment candidates answer under their explicit roles only. The
+# semantic rows ride the SDK face the daemon drives with, so the answer
+# is wider than a bare CLI pass without `--sdk`. Additive-only: no field
+# moved, v1 stands.
 face rpc-fix-answer
 body="$work/body_5.json"
 chk "compact: the intake answer is {v, files}" jq_true "$body" \
   '(.result | keys | sort) == ["files", "v"]'
 chk "compact: v is 1" jq_eq "$body" '.result.v' 1
-chk "compact: the cross-file document set (hit file first, options second)" jq_true "$body" \
-  '(.result.files | length) == 2 and (.result.files[0].file | endswith("fixme.dart")) and (.result.files[1].file | endswith("analysis_options.yaml"))'
+chk "compact: the default answer is the primary role — the hit file alone" jq_true "$body" \
+  '(.result.files | length) == 1 and (.result.files[0].file | endswith("fixme.dart"))'
 chk "compact: file rows are exactly {file, v, edits}" jq_true "$body" \
   '[.result.files[] | (keys | sort) == ["edits", "file", "v"] and .v == 1] | all'
-chk "compact: edits ride the red-line floor plus the anchor" jq_true "$body" \
-  '[.result.files[].edits[] | (keys | sort) == ["anchor", "len", "off", "src", "text"]] | all'
+chk "compact: edits ride the red-line floor plus the anchor and the role" jq_true "$body" \
+  '[.result.files[].edits[] | (keys | sort) == ["anchor", "len", "off", "role", "src", "text"]] | all'
+chk "compact: the default selection keeps only primary rows" jq_true "$body" \
+  '[.result.files[].edits[] | .role == "primary"] | all'
 chk "compact: builtin provenance spellings and a located anchor on every edit" jq_true "$body" \
   '[.result.files[].edits[] | (.src == "builtin-lint" or .src == "builtin-semantic" or .src == "builtin-ignore") and (.anchor | has("line") and has("col"))] | all'
 chk "compact: the probe lint deletions are present and builtin-lint" jq_true "$body" \
@@ -620,9 +631,28 @@ chk "compact: the probe lint deletions are present and builtin-lint" jq_true "$b
 
 body="$work/body_6.json"
 chk "full: edits add the builtin rule/msg columns" jq_true "$body" \
-  '[.result.files[].edits[] | (keys | sort) == ["anchor", "len", "msg", "off", "rule", "src", "text"]] | all'
+  '[.result.files[].edits[] | (keys | sort) == ["anchor", "len", "msg", "off", "role", "rule", "src", "text"]] | all'
 chk "full: rule and msg are strings" jq_true "$body" \
   '[.result.files[].edits[] | (.rule | type == "string") and (.msg | type == "string")] | all'
+
+# The suppress role: the cross-file document this face pinned before the
+# role filter — the governing options file answers only under its
+# explicit role, every row the suppress role over builtin-ignore.
+body="$work/body_12.json"
+chk "suppress: the answer is the options-file document alone" jq_true "$body" \
+  '(.result.files | length) == 1 and (.result.files[0].file | endswith("analysis_options.yaml"))'
+chk "suppress: rows are floor + anchor + role, suppress over builtin-ignore" jq_true "$body" \
+  '[.result.files[0].edits[] | (keys | sort) == ["anchor", "len", "off", "role", "src", "text"] and .role == "suppress" and .src == "builtin-ignore"] | all'
+chk "suppress: the rows write the analyzer errors stanza" jq_true "$body" \
+  '[.result.files[0].edits[] | (.text | startswith("analyzer:"))] | all'
+
+# The ignore_line role: the line-ignore candidates stay proposals on the
+# hit file, selected only by their explicit role.
+body="$work/body_13.json"
+chk "ignore_line: the hit-file document answers" jq_true "$body" \
+  '(.result.files | length) == 1 and (.result.files[0].file | endswith("fixme.dart"))'
+chk "ignore_line: rows carry the line-ignore role and comment text" jq_true "$body" \
+  '[.result.files[0].edits[] | .role == "ignore_line" and (.text | contains("// ignore:"))] | all'
 end_face
 
 # --- face: rpc-fix-rejects -----------------------------------------------------
@@ -632,6 +662,8 @@ chk "agentId/context/since answer INVALID_PARAMS (-32602)" jq_eq "$body" '.error
 chk "the rejection names the disk-view rule and the method" jq_true "$body" \
   '.error.message | test("answers the disk view") and test("dartq/fix")'
 chk "no answer payload rides the rejection" jq_true "$body" '.result == null'
+chk "an unknown role answers INVALID_PARAMS naming the spellings" jq_true "$work/body_14.json" \
+  '.error.code == -32602 and (.error.message | test("invalid role `bogus`") and test("suppress"))'
 end_face
 
 # --- face: rpc-assists ---------------------------------------------------------

@@ -125,6 +125,22 @@
 //! severity the options downgrade never reaches the fix run as a
 //! diagnostic.
 //!
+//! # Candidate roles
+//!
+//! Every candidate carries its [`FixRole`] — what kind of change it is,
+//! tagged at the producer that mints it, never inferred downstream. The
+//! code-change rows are [`FixRole::Primary`]; the ignore trio above is
+//! [`FixRole::IgnoreLine`]/[`FixRole::IgnoreFile`]/[`FixRole::Suppress`].
+//! The proposal document lists every candidate with its `role` key; an
+//! apply run writes only the selected role ([`select_by_role`]) — the
+//! default `primary` answers one code change per diagnostic, upstream
+//! `dart fix --apply`'s bulk-fix posture (upstream Dart SDK source,
+//! pkg/analysis_server/lib/src/services/correction/bulk_fix_processor.dart
+//! — `_fixSingleDiagnostic` applies the first producer's fix per
+//! diagnostic, and its multi-producer guard keeps candidate lists like
+//! the import synthesis from all applying at once). Ignore comments are
+//! never auto-applied; naming their role on the apply face opts in.
+//!
 //! # Plugin source
 //!
 //! Discovered plugin hosts contribute the second fix source. The
@@ -316,6 +332,57 @@ pub struct Edit {
     pub anchor: Anchor,
 }
 
+/// One fix candidate's role — what kind of change it is. Tagged at the
+/// producer that mints the row ([`RuleFix::role`]), never inferred
+/// downstream; plugin candidates are [`FixRole::Primary`] by nature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FixRole {
+    /// A code change that resolves the diagnostic. The only role an
+    /// apply run writes by default — one candidate per diagnostic
+    /// ([`select_by_role`]), the upstream `dart fix --apply` bulk-fix
+    /// posture.
+    Primary,
+    /// A `// ignore: <code>` comment on the line before the hit.
+    IgnoreLine,
+    /// An `// ignore_for_file: <code>` line beside the file's header.
+    IgnoreFile,
+    /// An `analyzer: errors: <code>: ignore` entry in the governing
+    /// `analysis_options.yaml`.
+    Suppress,
+}
+
+impl Default for FixRole {
+    fn default() -> Self {
+        Self::Primary
+    }
+}
+
+impl FixRole {
+    /// The proposal row's `role` key spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::IgnoreLine => "ignore_line",
+            Self::IgnoreFile => "ignore_file",
+            Self::Suppress => "suppress",
+        }
+    }
+
+    /// The exact spellings [`FixRole::as_str`] answers — no aliases.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "primary" => Some(Self::Primary),
+            "ignore_line" => Some(Self::IgnoreLine),
+            "ignore_file" => Some(Self::IgnoreFile),
+            "suppress" => Some(Self::Suppress),
+            _ => None,
+        }
+    }
+}
+
 /// One materialized fix: the anchored edit plus the human-facing row.
 /// `source` is the row's provenance tag ([`BUILTIN_SOURCE`] or
 /// [`BUILTIN_SEMANTIC_SOURCE`] by construction — the plugin source emits
@@ -333,6 +400,20 @@ pub struct RuleFix {
     /// created file's path, lexically normalized. `None` (every same-file
     /// row) addresses the edit to the hit file itself.
     pub target: Option<String>,
+    /// The row's role, tagged at the producer (module docs, "Candidate
+    /// roles").
+    pub role: FixRole,
+    /// The diagnostic this row's candidate serves — its UTF-16 span,
+    /// tagged at the producer. `None` for the file-level candidates (the
+    /// `ignore_for_file` and analysis-options rows), which serve no one
+    /// diagnostic.
+    pub diag: Option<SourceRange>,
+    /// The candidate group: every row one producer invocation minted for
+    /// one candidate shares the id — a multi-edit fix is one candidate in
+    /// several rows. Ids are unique within the producing source only;
+    /// [`select_by_role`] compares them among rows sharing one
+    /// `(rule, diagnostic)` pair, which one producer always owns.
+    pub group: u32,
 }
 
 /// One plugin-proposed change: a titled proposal (the analyzer's
@@ -377,6 +458,58 @@ pub fn select_by_codes(per_file: Vec<FileFixSet>, codes: &[String]) -> Vec<FileF
         set.plugin.clear();
     }
     per_file.retain(|set| !set.fixes.is_empty());
+    per_file
+}
+
+/// The `--role` selection face — which candidates an apply run writes.
+/// `FixRole::Primary` keeps the plugin rows (primary by nature) and, per
+/// file, every primary candidate group of a `(rule, diagnostic)` pair
+/// **first in the producer's deterministic order** — lint table rows,
+/// semantic table rows, import synthesis (its `dart:` candidates first),
+/// parser rows, then switch-case rows — dropping later groups: at most
+/// one primary candidate per diagnostic, the upstream `dart fix --apply`
+/// bulk-fix posture (one canonical fix per lint; ignore comments are
+/// never auto-applied). A suppression role keeps exactly that role's
+/// rows — the plugin rows drop (they are primary candidates) — and
+/// never deduplicates: the producers already mint one row per line,
+/// code, and options file. Sets left without rows drop. Rows filtered
+/// out here never reach an apply record (the record carries only the
+/// selected rows); the proposal document keeps listing every candidate.
+pub fn select_by_role(per_file: Vec<FileFixSet>, role: FixRole) -> Vec<FileFixSet> {
+    let mut per_file = per_file;
+    for set in &mut per_file {
+        if role == FixRole::Primary {
+            // Group-level keep: the first group per (rule, diagnostic)
+            // lives or drops whole, so a multi-edit candidate never loses
+            // an edit. Rows without a diagnostic anchor keep (no dedup
+            // key to share). The retain re-checks the role: group ids are
+            // only unique within a producing source, so another role's
+            // rows (the ignore trio mints group 0 for each of its rows)
+            // must never ride a kept primary group id.
+            let mut served: FxHashSet<(&'static str, u32, u32)> = FxHashSet::default();
+            let mut keep: FxHashSet<u32> = FxHashSet::default();
+            let mut decided: FxHashSet<u32> = FxHashSet::default();
+            for fix in &set.fixes {
+                if fix.role != FixRole::Primary || !decided.insert(fix.group) {
+                    continue;
+                }
+                let keeps = match fix.diag {
+                    None => true,
+                    Some(diag) => served.insert((fix.rule, diag.offset, diag.length)),
+                };
+                if keeps {
+                    keep.insert(fix.group);
+                }
+            }
+            set.fixes.retain(|fix| fix.role == FixRole::Primary && keep.contains(&fix.group));
+        } else {
+            set.fixes.retain(|fix| fix.role == role);
+            set.plugin.clear();
+        }
+    }
+    per_file.retain(|set| {
+        !set.fixes.is_empty() || (role == FixRole::Primary && !set.plugin.is_empty())
+    });
     per_file
 }
 
@@ -650,7 +783,8 @@ fn anchor_json(anchor: &Anchor) -> serde_json::Map<String, serde_json::Value> {
 
 /// One edit row at its locator floor: off/len/text plus the provenance
 /// tag — the red line the patch rows never drop (the minimal tier trims
-/// prose and convenience, never location).
+/// prose and convenience, never location; the caller adds the `role`
+/// key, which rides the same floor).
 fn edit_floor(edit: &Edit, source: &str) -> serde_json::Map<String, serde_json::Value> {
     let mut row = serde_json::Map::new();
     row.insert("off".into(), edit.offset.into());
@@ -663,12 +797,15 @@ fn edit_floor(edit: &Edit, source: &str) -> serde_json::Map<String, serde_json::
 /// The document for one file — `file`, `v`, and the
 /// `edits`: the built-in rows first, then each plugin change's edits
 /// flattened in change order, every row carrying its provenance tag
-/// (`builtin-lint`, or the plugin's manifest name). Empty context strings
-/// are omitted; the anchor rides compact and full, the full tier
-/// adds the row's human name (`rule` for built-in rows, `message` +
-/// `priority` for plugin rows). Files without rows never enter a set.
-/// This is the proposal shape — the dry-run and daemon faces answer it
-/// verbatim; the apply run's record is [`patch_json_applied`].
+/// (`builtin-lint`, or the plugin's manifest name) and its `role` key
+/// ([`FixRole::as_str`] spellings; plugin rows are `primary`). Empty
+/// context strings are omitted; the anchor rides compact and full, the
+/// full tier adds the row's human name (`rule` for built-in rows,
+/// `message` + `priority` for plugin rows). Files without rows never
+/// enter a set. This is the proposal shape — it lists every candidate;
+/// the dry-run and daemon faces answer it verbatim, and the apply run's
+/// record ([`patch_json_applied`]) carries only the rows the role
+/// selection kept.
 #[must_use]
 pub fn patch_json(set: &FileFixSet, verbosity: Verbosity) -> serde_json::Value {
     patch_document(set, verbosity, None)
@@ -679,7 +816,9 @@ pub fn patch_json(set: &FileFixSet, verbosity: Verbosity) -> serde_json::Value {
 /// `"summary"` counts (`{"applied": N, "stale": M}`) — an all-stale run
 /// writes nothing yet stays legible to the machine consumer without
 /// scanning rows. `outcomes` is [`apply`]'s answer, one entry per row in
-/// this document's row order.
+/// this document's row order. Rows the role selection filtered out are
+/// omitted entirely (never labeled `skipped`) — the record answers what
+/// ran; the proposal is the face that lists every candidate.
 #[must_use]
 pub fn patch_json_applied(
     set: &FileFixSet,
@@ -701,6 +840,7 @@ fn patch_document(
     let mut edits = Vec::new();
     for fix in &set.fixes {
         let mut row = edit_floor(&fix.edit, fix.source);
+        row.insert("role".into(), fix.role.as_str().into());
         if anchored {
             row.insert("anchor".into(), anchor_json(&fix.edit.anchor).into());
         }
@@ -721,6 +861,9 @@ fn patch_document(
     for fix in &set.plugin {
         for edit in &fix.edits {
             let mut row = edit_floor(edit, &fix.plugin);
+            // Plugin candidates are primary by nature — the document
+            // carries the same key set as the built-in rows.
+            row.insert("role".into(), FixRole::Primary.as_str().into());
             if anchored {
                 row.insert("anchor".into(), anchor_json(&edit.anchor).into());
             }

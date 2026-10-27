@@ -12,11 +12,12 @@
 //! depends on this file's API surface". The daemon passes real before/after
 //! diffs through the same query.
 //!
-//! Output is the frozen JSON contract (`v: 3`; the labels are
-//! the shared pkg_label projection — a file under a package's `lib` tree
-//! answers its `package:<name>/<path>` form, files outside one keep the
-//! canonical path), schema-valid at birth (the shared core's shaper
-//! validates against `Domain::Impact`). The report is tier-invariant (the
+//! Output is the frozen JSON contract (`v: 3`; the path columns spell
+//! through the one file locator — root-relative inside the analysis root,
+//! absolute outside it, the envelope's `root` riding once when a
+//! file-bearing row does), schema-valid at birth (the shared core's
+//! shaper validates against `Domain::Impact`). The report is
+//! tier-invariant (the
 //! canonical tables: every field a locator or a verdict — nothing to
 //! trim), so `--verbosity` parses for grammar parity and every tier emits
 //! the same bytes.
@@ -51,13 +52,18 @@ pub(crate) struct ImpactArgs {
     /// the same bytes; the default `compact` was already the only shape.
     #[arg(short = 'v', long, value_enum, default_value_t = Verbosity::Compact)]
     pub(crate) verbosity: Verbosity,
-    /// Narrow the hypothetical-change seed to a face of the target's owning
-    /// library — `MyClass` or `MyClass.member` alike resolve to the
-    /// container's face name (the signature fold is per-container, so the
-    /// member part narrows nothing past it). Repeatable; the union of the
-    /// resolved hits seeds the propagation set the `affected[].reference_lines`
-    /// collect against. Omitting the flag is the file-level posture: every
-    /// library-face name of the owning library seeds.
+    /// Narrow the hypothetical-change seed to faces of the target's owning
+    /// library. Three spellings: a bare `name` seeds every same-named
+    /// declaration (the face `name` itself plus every container declaring
+    /// a member or constructor named `name`); `Container.name` seeds that
+    /// container's face (the signature fold is per-container, so the
+    /// member part narrows nothing past it); and `path/to/file.dart:line`
+    /// seeds the declaration whose name token starts on that line of a
+    /// seed-library file. Repeatable; the union of the resolved hits
+    /// seeds the propagation set the `affected[].reference_lines` collect
+    /// against. A spelling that resolves to nothing is a usage error.
+    /// Omitting the flag is the file-level posture: every library-face
+    /// name of the owning library seeds.
     #[arg(long = "symbol", value_name = "NAME")]
     pub(crate) symbols: Vec<String>,
     /// Output format: `lon` (the default) or `json` (the frozen report,
@@ -270,9 +276,14 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
         assert_eq!(json["v"], 3);
-        // Lib files answer their package-form references (the shared
-        // pkg_label projection), ASCII-sorted, hypothetical signature
-        // flags.
+        assert_eq!(
+            json["root"],
+            root.canonicalize().expect("root").display().to_string(),
+            "the envelope carries the analysis root once"
+        );
+        // Every file column spells through the one file locator
+        // (root-relative inside the analysis root), ASCII-sorted,
+        // hypothetical signature flags.
         let symbols: Vec<&str> = json["sym"]
             .as_array()
             .expect("sym")
@@ -281,7 +292,7 @@ mod tests {
             .collect();
         assert_eq!(
             symbols,
-            vec!["package:fixture/a.dart|Foo", "package:fixture/a.dart|foo",],
+            vec!["lib/a.dart|Foo", "lib/a.dart|foo",],
             "every face name, ASCII-sorted, hypothetical signature flags"
         );
         assert!(
@@ -292,10 +303,9 @@ mod tests {
                 .all(|row| row["sig_changed"] == true),
         );
 
-        // The test tree file keeps its canonical path (no `package:` URI
-        // addresses it — the documented fallback), and the path sort puts
-        // it first: `/` sorts before `p` in `package:`.
-        let test_path = root.canonicalize().expect("root").join("test/a_test.dart");
+        // The located spellings are root-relative (the lib and test trees
+        // alike), and the path sort puts `lib/b.dart` before
+        // `test/a_test.dart`.
         let affected: Vec<(String, &str)> = json["files"]
             .as_array()
             .expect("files")
@@ -310,8 +320,8 @@ mod tests {
         assert_eq!(
             affected,
             vec![
-                (test_path.display().to_string(), "semantic"),
-                ("package:fixture/b.dart".to_string(), "semantic"),
+                ("lib/b.dart".to_string(), "semantic"),
+                ("test/a_test.dart".to_string(), "semantic"),
             ],
             "both import a directly; the import of the test resolves through the package URI"
         );
@@ -321,7 +331,7 @@ mod tests {
             .iter()
             .map(|row| row["path"].as_str().expect("path").to_string())
             .collect();
-        assert_eq!(tests, vec![test_path.display().to_string()]);
+        assert_eq!(tests, vec!["test/a_test.dart".to_string()]);
         // The contextless default row is the compat rule's verdict over the
         // affected set, and the set spans the test file: its
         // `package:test` import has no package-config entry, the URI
@@ -415,8 +425,8 @@ mod tests {
             .collect();
         assert_eq!(
             symbols,
-            vec!["package:fixture/a.dart|Foo", "package:fixture/a.dart|foo",],
-            "the seed is the dir-joined lib/a.dart, its label the package form"
+            vec!["lib/a.dart|Foo", "lib/a.dart|foo",],
+            "the seed is the dir-joined lib/a.dart, its label the located spelling"
         );
 
         fs::remove_dir_all(&root).ok();

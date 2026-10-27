@@ -4,6 +4,12 @@
 //! extend this envelope with additive optional arrays under the same
 //! version — see the crate docs, versioning discipline.
 //!
+//! The file columns spell through the one file locator: root-relative
+//! inside the analysis root, absolute outside it, never a `package:` URI.
+//! The envelope's optional `root` (the absolute analysis root) rides
+//! exactly when the answer carries a file-bearing row, making the
+//! relative tails unambiguous.
+//!
 //! Two of those arrays are declared now, on the frozen v1 envelope, as the
 //! freeze-discipline extension point: `implementations` (the
 //! subclass/implementation declaration rows the `query implementations`
@@ -84,6 +90,12 @@ static QUERY_SCHEMA: LazyLock<Value> = LazyLock::new(|| {
         "required": ["v", "sym", "decls", "refs"],
         "properties": {
             "v": { "const": SCHEMA_VERSION_QUERY },
+            // The analysis root the file columns locate against (absolute):
+            // root-relative inside it, absolute outside (the SDK, the pub
+            // cache, another package's checkout). Rides exactly once when
+            // the answer carries a file-bearing row; omitted when it does
+            // not (the unknown-symbol floor).
+            "root": { "type": "string" },
             "sym": { "type": "string" },
             "decls": { "type": "array", "items": DECLARATION_ITEM.clone() },
             "refs": { "type": "array", "items": {
@@ -164,6 +176,9 @@ pub const REF_KINDS: &[&str] = &[
 ];
 
 const QUERY_TOP: &[&str] = &["v", "sym", "decls", "refs"];
+/// The locator envelope's key — the analysis root the file columns locate
+/// against, riding exactly when a file-bearing row does.
+const QUERY_LOCATOR: &[&str] = &["root"];
 const QUERY_SESSION: &[&str] = &["symbols", "since"];
 // The reserved additive kind arrays (crate docs): declared, no writer yet.
 const QUERY_ADDITIVE: &[&str] = &["implementations", "deps"];
@@ -209,16 +224,21 @@ fn validate_declaration_row(
 
 pub(crate) fn validate_query(value: &Value) -> Result<(), SchemaViolation> {
     let root = object(value, "")?;
-    // The additive arrays ride the optional slot next to the session
-    // fields: declared, absent-tolerant, unknown-key rejection intact.
-    let optional: Vec<&str> = QUERY_SESSION
+    // The additive arrays and the locator envelope ride the optional slot
+    // next to the session fields: declared, absent-tolerant, unknown-key
+    // rejection intact.
+    let optional: Vec<&str> = QUERY_LOCATOR
         .iter()
+        .chain(QUERY_SESSION.iter())
         .chain(QUERY_ADDITIVE.iter())
         .copied()
         .collect();
     exact_fields(root, QUERY_TOP, &optional, "")?;
     pinned_version(root, "v", SCHEMA_VERSION_QUERY)?;
     string(field(root, "sym", "")?, "sym")?;
+    if let Some(locator_root) = root.get("root") {
+        string(locator_root, "root")?;
+    }
     session_fields(root)?;
     for (i, row) in rows(root, "decls")? {
         let p = format!("decls[{i}]");
@@ -304,11 +324,12 @@ mod tests {
         let query = query_schema();
         let mut top: Vec<String> = QUERY_TOP
             .iter()
+            .chain(QUERY_LOCATOR.iter())
             .chain(QUERY_SESSION.iter())
             .chain(QUERY_ADDITIVE.iter())
             .map(|s| (*s).to_owned())
             .collect();
-        top.sort_unstable();
+        top.sort();
         assert_eq!(schema_keys(query), top);
         // One declaration-row shape serves both declaration-bearing arrays.
         let declarations = &query["properties"]["decls"]["items"];
@@ -355,6 +376,44 @@ mod tests {
                 .collect();
             assert_eq!(spellings, declared);
         }
+    }
+
+    /// The locator envelope: `root` rides absent-tolerant (the
+    /// unknown-symbol floor carries no file field, so no root), a present
+    /// `root` is a string, and a non-string is named — the relative tails
+    /// it disambiguates are the file columns' only ambiguity.
+    #[test]
+    fn the_locator_root_validates_and_a_non_string_is_named() {
+        let doc = serde_json::json!({
+            "v": SCHEMA_VERSION_QUERY,
+            "root": "/w/pkg",
+            "sym": "fb",
+            "decls": [{
+                "file": "lib/a.dart",
+                "kind": "class",
+                "name": "fb",
+                "line": 3,
+                "col": 7,
+                "len": 2,
+            }],
+            "refs": [],
+        });
+        assert!(validate_query(&doc).is_ok());
+        assert!(validate_query_at_tier(&doc, Verbosity::Minimal).is_ok());
+
+        let floor = serde_json::json!({
+            "v": SCHEMA_VERSION_QUERY,
+            "sym": "Nope",
+            "decls": [],
+            "refs": [],
+        });
+        assert!(validate_query(&floor).is_ok());
+
+        let mut bad = doc.clone();
+        bad["root"] = serde_json::json!(7);
+        let violation = validate_query(&bad).expect_err("non-string root");
+        assert_eq!(violation.path, "root");
+        assert_eq!(violation.expected, "a string");
     }
 
     /// The `override` spelling validates on a reference row — the

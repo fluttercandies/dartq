@@ -32,15 +32,19 @@ Three files, one package (`fixture`):
 - The element-face columns (#1560): the declaration row carries
   `annotations` verbatim; members carry their rendered `sig` in the
   symbol tests' pinned spellings.
-- The package-form reference labels (#1556): `package:fixture/<rel>` for
-  every `lib/` file, in declarations and both reference columns.
-- The non-lib fallback: `tool/note.dart` keeps the canonical path. Its
-  spelling is workspace-root dependent, so the golden carries the
-  `FIXTURE_ROOT` placeholder token; the verifying test substitutes the
-  canonical fixture root before comparing. Every other byte is literal.
-- The verbosity tiers: minimal keeps the red-line locators and drops
-  `container`, the element-face columns, the use-file column, and the
-  reserved kind arrays (the canonical tables' query rows).
+- The located file spellings: every file column is root-relative inside
+  the analysis root (`lib/a.dart`, `tool/note.dart` alike), and the
+  envelope carries the `root` locator key once (impact's and compat's
+  canonical fixtures spell their relative paths against the literal
+  `/w`).
+- The `root` value of the query fixture is workspace-root dependent, so
+  those goldens carry the `FIXTURE_ROOT` placeholder token; the verifying
+  test substitutes the canonical fixture root before comparing. Every
+  other byte is literal.
+- The verbosity tiers: minimal keeps the red-line locators (the `root`
+  envelope among them) and drops `container`, the element-face columns,
+  the use-file column, and the reserved kind arrays (the canonical
+  tables' query rows).
 
 ## Regeneration
 

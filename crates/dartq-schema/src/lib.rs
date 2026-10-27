@@ -54,15 +54,18 @@
 //!   unavailable). The validators accept both spellings for exactly those
 //!   two fields.
 //! * Every entity reference is the stable `label|name` path form; internal
-//!   ids never leave the engine. The label is the package-form file
-//!   reference (`package:<name>/<path under the package's lib>`); a file
-//!   no package lib tree addresses keeps its canonical path — the
-//!   documented fallback. The `|name` suffix is the inline symbol
-//!   reference's (the impact report's `sym[].sym`); the row-shaped file
-//!   columns (`file`, `path`, `target`) carry the bare file label. The
+//!   ids never leave the engine. The label is the located file spelling —
+//!   root-relative inside the analysis root, absolute outside it — the
+//!   same one locator every file column uses; the envelope's optional
+//!   `root` (the absolute analysis root) makes the relative tails
+//!   unambiguous. The `|name` suffix is the inline symbol reference's
+//!   (the impact report's `sym[].sym`); the row-shaped file columns
+//!   (`file`, `path`, `target`) carry the bare located spelling. The
 //!   validator pins the `label|name` form for the impact report's symbol
-//!   refs and the session symbol table's values. Internal-only data
-//!   (e.g. the fix edit's verified original slice, `fix.rs`'s
+//!   refs and the session symbol table's values. The index export's
+//!   schema-frozen path columns are the one face still on the older
+//!   `package:<name>/<lib-relative>` grammar (index_export.rs). Internal-
+//!   only data (e.g. the fix edit's verified original slice, `fix.rs`'s
 //!   `Edit.source` — the edit row's declared `src` key carries the
 //!   provenance tag, a different value) is never emitted; the validator
 //!   rejects anything undeclared.

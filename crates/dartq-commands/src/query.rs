@@ -560,14 +560,22 @@ pub fn batch_after_analysis<'run, 'name>(
     answers
 }
 
-/// The JSON face: one object — `v`, `sym`, and the `decls`/`refs`
-/// arrays carrying the machine rows' short-vocabulary fields. Zero
-/// results produce empty arrays. The `implementations`/`deps` arrays ride
-/// the answer only when their kind's rows exist (the frozen reserved
-/// slots — additive, optional, dropped by the daemon's minimal tier). The
-/// envelope is the query contract (dartq-schema's `Domain::Query`), which
-/// requires the `v` stamp; the queried name rides `sym` (the decl rows'
-/// own `name` field is a row locator and stays).
+/// The JSON face: one object — `v`, the optional `root` (the analysis
+/// root the file columns locate against, riding exactly once when any
+/// file-bearing row exists), `sym`, and the `decls`/`refs` arrays carrying
+/// the machine rows' short-vocabulary fields. Zero results produce empty
+/// arrays and no `root`. The `implementations`/`deps` arrays ride the
+/// answer only when their kind's rows exist (the frozen reserved slots —
+/// additive, optional, dropped by the daemon's minimal tier). The envelope
+/// is the query contract (dartq-schema's `Domain::Query`), which requires
+/// the `v` stamp; the queried name rides `sym` (the decl rows' own `name`
+/// field is a row locator and stays).
+///
+/// Every file column spells through the one file locator
+/// (`crate::pkg_label::locate` against the engine's workspace root):
+/// root-relative inside it, absolute outside (the SDK, the pub cache,
+/// another package's checkout) — one spelling per file, no `package:`
+/// URIs; the envelope's `root` makes the relative tails unambiguous.
 ///
 /// # Panics
 ///
@@ -580,34 +588,51 @@ pub fn to_json(run: &SymbolRun<'_>, name: &str) -> serde_json::Value {
 
 /// The tier-aware spelling of [`to_json`] — the one implementation of the
 /// query JSON face's verbosity axis. `minimal` is the canonical tables'
-/// red line: the declaration rows keep `file` (the stable package-form
-/// label)/`kind`/`name`/`line`/`col`/`len`, the reference rows keep
-/// `target`/`kind`/`off`/`len`; the convenience spellings
-/// (`container`, `qualified`, the use-file column, the element-face
-/// `sig`/`annotations` columns) and the reserved kind arrays
-/// (`implementations`, `deps`) drop. `compact` and `full` answer
-/// [`to_json`] verbatim (the canonical tables list no full-only extras for
-/// query today).
+/// red line: the declaration rows keep `file` (the located spelling)/
+/// `kind`/`name`/`line`/`col`/`len`, the reference rows keep `target`/
+/// `kind`/`off`/`len`; the convenience spellings (`container`,
+/// `qualified`, the use-file column, the element-face `sig`/`annotations`
+/// columns) and the reserved kind arrays (`implementations`, `deps`) drop.
+/// `compact` and `full` answer [`to_json`] verbatim (the canonical tables
+/// list no full-only extras for query today). The `root` locator key is a
+/// locator itself and rides at every tier exactly when that tier's answer
+/// carries a file-bearing row.
 #[must_use]
 pub fn to_json_at_tier(
     run: &SymbolRun<'_>,
     name: &str,
     verbosity: crate::Verbosity,
 ) -> serde_json::Value {
+    let engine = run.layout.engine();
+    let analysis_root = engine.packages().workspace_root();
+    let root = has_file_fields(run, verbosity).then(|| analysis_root.display().to_string());
+    // The locator envelope rides right after the version stamp — the same
+    // reading order the analyze/check document keeps — and drops again
+    // when no file-bearing row rides (the placeholder-null-then-remove
+    // spell keeps the one literal's order).
     if verbosity == crate::Verbosity::Minimal {
-        return json!({
+        let mut json = json!({
             "v": crate::SCHEMA_VERSION,
+            "root": root,
             "sym": name,
             "decls": minimal_declaration_rows(run, &run.decls),
             "refs": minimal_reference_rows(run, &run.refs),
         });
+        if json["root"].is_null() {
+            json.as_object_mut().expect("query envelope").remove("root");
+        }
+        return json;
     }
     let mut json = json!({
         "v": crate::SCHEMA_VERSION,
+        "root": root,
         "sym": name,
         "decls": declaration_rows(run, &run.decls),
         "refs": reference_rows(run, &run.refs, name),
     });
+    if json["root"].is_null() {
+        json.as_object_mut().expect("query envelope").remove("root");
+    }
     if !run.implementations.is_empty() {
         json["implementations"] = serde_json::to_value(declaration_rows(run, &run.implementations))
             .expect("declaration rows serialize");
@@ -619,6 +644,16 @@ pub fn to_json_at_tier(
     json
 }
 
+/// Whether the tier's answer carries any file-bearing row — the `root`
+/// locator key's ride condition: the declaration and reference arrays at
+/// every tier, plus the reserved kind arrays where the tier keeps them.
+fn has_file_fields(run: &SymbolRun<'_>, verbosity: crate::Verbosity) -> bool {
+    !run.decls.is_empty()
+        || !run.refs.is_empty()
+        || (verbosity != crate::Verbosity::Minimal
+            && (!run.implementations.is_empty() || !run.dependencies.is_empty()))
+}
+
 /// The declaration-row shape, shared verbatim by the `decls` and
 /// `implementations` arrays (the schema's one declaration-row contract),
 /// plus the additive signature/annotation columns joined from the file's
@@ -628,8 +663,8 @@ pub fn to_json_at_tier(
 /// extension member) keep the keys omitted.
 fn declaration_rows(run: &SymbolRun<'_>, decls: &[DeclHit<'_>]) -> Vec<serde_json::Value> {
     let engine = run.layout.engine();
-    let packages = engine.packages();
-    let label = |file| crate::pkg_label::pkg_label(packages, run.layout.file_path(file));
+    let root = engine.packages().workspace_root();
+    let label = |file| crate::pkg_label::locate(root, run.layout.file_path(file));
     decls
         .iter()
         .map(|decl| {
@@ -664,13 +699,19 @@ fn declaration_rows(run: &SymbolRun<'_>, decls: &[DeclHit<'_>]) -> Vec<serde_jso
 /// top-level executable's [`TopDecl`]) and the annotations from the
 /// container face (the only face the model carries metadata on). A
 /// declaration with no matching face — an unnamed extension member, a
-/// type parameter — answers the bare row.
+/// type parameter, a dependency-tier declaration (outside the workspace,
+/// whose element face the residency set never carries) — answers the
+/// bare row.
 ///
 /// Public as the machine grammar's column source: the CLI's machine
 /// printer spells the same pair as the JSON face's trailing `signature`/
 /// `annotations` columns, so the two grammars cannot drift.
 pub fn declaration_extras(engine: &Engine, decl: &DeclHit<'_>) -> (Option<String>, Vec<String>) {
-    let facts = engine.file_facts(decl.file).expect("resident member facts");
+    // A dependency-tier declaration (the lazy interface index) has no
+    // resident facts — the bare row is its whole face.
+    let Some(facts) = engine.file_facts(decl.file) else {
+        return (None, Vec::new());
+    };
     let strings = engine.strings();
     let elements = &facts.elements;
     let args = elements.type_args();
@@ -933,12 +974,12 @@ pub(crate) fn render_formals(
 
 /// The reference-row shape: the wire contract plus the optional
 /// use-file and qualified-name columns. The `target`/`file` labels
-/// are the stable package-form references (the shared
-/// [`crate::pkg_label::pkg_label`] projection), the sort order above stays
+/// are the one file locator's spellings ([`crate::pkg_label::locate`]
+/// against the engine's workspace root), the sort order above stays
 /// keyed on canonical paths.
 fn reference_rows(run: &SymbolRun<'_>, refs: &[RefHit<'_>], name: &str) -> Vec<serde_json::Value> {
-    let packages = run.layout.engine().packages();
-    let label = |file| crate::pkg_label::pkg_label(packages, run.layout.file_path(file));
+    let root = run.layout.engine().packages().workspace_root();
+    let label = |file| crate::pkg_label::locate(root, run.layout.file_path(file));
     refs.iter()
         .map(|reference| {
             let mut row = json!({
@@ -962,11 +1003,11 @@ fn reference_rows(run: &SymbolRun<'_>, refs: &[RefHit<'_>], name: &str) -> Vec<s
 }
 
 /// The minimal tier's declaration rows: the red-line locators only — the
-/// stable package-form `file` label, `kind`, `name`, `line`, `col`,
-/// `len` (the daemon's `dartq/query` minimal shaping, mirrored).
+/// located `file` spelling, `kind`, `name`, `line`, `col`, `len` (the
+/// daemon's `dartq/query` minimal shaping, mirrored).
 fn minimal_declaration_rows(run: &SymbolRun<'_>, decls: &[DeclHit<'_>]) -> Vec<serde_json::Value> {
-    let packages = run.layout.engine().packages();
-    let label = |file| crate::pkg_label::pkg_label(packages, run.layout.file_path(file));
+    let root = run.layout.engine().packages().workspace_root();
+    let label = |file| crate::pkg_label::locate(root, run.layout.file_path(file));
     decls
         .iter()
         .map(|decl| {
@@ -987,8 +1028,8 @@ fn minimal_declaration_rows(run: &SymbolRun<'_>, decls: &[DeclHit<'_>]) -> Vec<s
 /// `len` — the qualified spelling and the use-file column are the
 /// compact tier's contribution (the daemon's minimal shaping, mirrored).
 fn minimal_reference_rows(run: &SymbolRun<'_>, refs: &[RefHit<'_>]) -> Vec<serde_json::Value> {
-    let packages = run.layout.engine().packages();
-    let label = |file| crate::pkg_label::pkg_label(packages, run.layout.file_path(file));
+    let root = run.layout.engine().packages().workspace_root();
+    let label = |file| crate::pkg_label::locate(root, run.layout.file_path(file));
     refs.iter()
         .map(|reference| {
             json!({
@@ -1147,8 +1188,8 @@ mod tests {
         assert_eq!(run.refs[0].range.offset, 50);
 
         // The use-file column rides the emitted rows: `file` is the use
-        // site's member label (b.dart, c.dart — the stable package-form
-        // reference), distinct from the target's (a.dart) — the frozen-v1
+        // site's member file (b.dart, c.dart — the locator's root-relative
+        // spellings), distinct from the target's (a.dart) — the frozen-v1
         // schema's optional reference-row string.
         let run = symbol(&mut engine, "Foo").expect("query");
         let json = to_json(&run, "Foo");
@@ -1160,14 +1201,122 @@ mod tests {
             .collect();
         assert_eq!(
             use_files,
-            vec![
-                Some("package:fixture/b.dart"),
-                Some("package:fixture/c.dart")
-            ],
+            vec![Some("lib/b.dart"), Some("lib/c.dart")],
             "each row names the member file its use site sits in"
         );
 
         fs_remove(&root);
+    }
+
+    /// A second package outside the analysis root (the pub-cache shape):
+    /// the app imports it through the config, so its files ride the
+    /// engine's lazy dependency tier (interface declarations, never
+    /// libraries) while lying outside the engine's workspace root — the
+    /// one mixed-answer shape (a workspace row beside a checkout row) the
+    /// package-form grammar could not spell without a second convention.
+    /// The dependency declares `Widget`; the app's use site references it.
+    /// Returns the app root; the dependency sits at `<parent>/dep`.
+    fn foreign_package_fixture(tag: &str) -> PathBuf {
+        let parent =
+            std::env::temp_dir().join(format!("dq_cmd_{tag}_pair_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        let write = |dir: &std::path::Path, relative: &str, content: &str| {
+            let path = dir.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, content).expect("file");
+        };
+        let app = parent.join("app");
+        write(
+            &app,
+            "pubspec.yaml",
+            "name: fixture\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
+        );
+        write(
+            &app,
+            "pubspec.lock",
+            "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+        );
+        write(
+            &app,
+            ".dart_tool/package_config.json",
+            // `dep`'s rootUri escapes the app root — the checked-out
+            // dependency beside the workspace, never under it.
+            r#"{"configVersion": 2, "packages": [{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}, {"name": "dep", "rootUri": "../../dep", "packageUri": "lib/", "languageVersion": "3.5"}], "generator": "pub", "generatorVersion": "3.13.1"}"#,
+        );
+        write(&app, "sdk/version", "3.13.1\n");
+        write(
+            &app,
+            "sdk/lib/libraries.json",
+            r#"{"vm": {"libraries": {"core": {"uri": "core/core.dart"}}}}"#,
+        );
+        write(
+            &app,
+            "sdk/lib/_internal/allowed_experiments.json",
+            r#"{"version": 1, "experimentSets": {"sdkExperiments": []}, "sdk": {"default": {"experimentSet": "sdkExperiments"}}, "packages": {}}"#,
+        );
+        write(
+            &app,
+            "lib/use.dart",
+            "import 'package:dep/decl.dart';\nvoid use() {\n  var w = Widget();\n}\n",
+        );
+        write(
+            &parent.join("dep"),
+            "lib/decl.dart",
+            "class Widget {}\n",
+        );
+        app
+    }
+
+    /// The locator policy on the answer rows: the declaration sits outside
+    /// the analysis root (the dependency's checkout — the `SDK/pub-cache
+    /// file → absolute` side of the rule, riding the lazy dependency tier),
+    /// the use site inside it spells root-relative (`lib/use.dart`), and
+    /// the envelope carries the root exactly once, the minimal tier
+    /// included.
+    #[test]
+    fn rows_spell_through_the_locator_with_the_root_envelope() {
+        let app = foreign_package_fixture("locator");
+        let (mut engine, _) = open_engine(&app, Some(&app.join("sdk"))).expect("engine");
+        let canonical = app.canonicalize().expect("root");
+        let dep_decl = canonical
+            .parent()
+            .expect("parent")
+            .join("dep/lib/decl.dart")
+            .display()
+            .to_string();
+
+        let run = symbol(&mut engine, "Widget").expect("query");
+        let json = to_json(&run, "Widget");
+        assert_eq!(
+            json["root"],
+            canonical.display().to_string(),
+            "the root rides exactly once"
+        );
+        assert_eq!(
+            json["decls"][0]["file"], dep_decl,
+            "outside the root (the dependency's checkout): absolute"
+        );
+        let refs = json["refs"].as_array().expect("references array");
+        assert_eq!(refs.len(), 1, "the one cross-package use site: {json}");
+        assert_eq!(
+            refs[0]["target"], dep_decl,
+            "the target declares outside the root"
+        );
+        assert_eq!(
+            refs[0]["file"], "lib/use.dart",
+            "inside the root: root-relative"
+        );
+
+        // The callers answer keeps the spelling, minimal tier included —
+        // the locator key is a locator, never a convenience to trim.
+        let run = callers(&mut engine, "Widget").expect("callers");
+        let minimal = to_json_at_tier(&run, "Widget", crate::Verbosity::Minimal);
+        assert_eq!(minimal["root"], canonical.display().to_string());
+        assert_eq!(minimal["refs"][0]["target"], dep_decl);
+        dartq_schema::validate(&minimal.to_string(), dartq_schema::Domain::Query)
+            .expect("schema-valid");
+
+        fs_remove(canonical.parent().expect("parent"));
     }
 
     /// The JSON face is the frozen v1 query contract: the real writer
@@ -1297,6 +1446,10 @@ mod tests {
         assert_eq!(json["sym"], "Nope");
         assert_eq!(json["decls"].as_array().expect("arrays").len(), 0);
         assert_eq!(json["refs"].as_array().expect("arrays").len(), 0);
+        assert!(
+            json.get("root").is_none(),
+            "no file fields ride, so no root to disambiguate them"
+        );
 
         fs_remove(&root);
     }
@@ -1433,7 +1586,7 @@ mod tests {
             .collect();
         assert_eq!(
             rows,
-            vec![("package:fixture/a.dart", Some("Animal"))],
+            vec![("lib/a.dart", Some("Animal"))],
             "b.dart's import edge plus the consumed symbol"
         );
 
@@ -1442,7 +1595,7 @@ mod tests {
         assert_eq!(deps.len(), 1);
         assert_eq!(
             deps[0],
-            json!({"path": "package:fixture/a.dart", "name": "Animal"}),
+            json!({"path": "lib/a.dart", "name": "Animal"}),
             "the DependencyRow shape: the joined library's path plus the consumed name"
         );
         dartq_schema::validate(&json.to_string(), dartq_schema::Domain::Query)
@@ -1489,18 +1642,15 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                ("package:fixture/a.dart", Some("Unused")),
-                ("package:fixture/b.dart", None),
+                ("lib/a.dart", Some("Unused")),
+                ("lib/b.dart", None),
             ],
             "the consumed symbol rides its library, the bare edge stands alone"
         );
         let json = to_json(&run, "C");
         let deps = json["deps"].as_array().expect("array");
-        assert_eq!(
-            deps[0],
-            json!({"path": "package:fixture/a.dart", "name": "Unused"})
-        );
-        assert_eq!(deps[1], json!({"path": "package:fixture/b.dart"}));
+        assert_eq!(deps[0], json!({"path": "lib/a.dart", "name": "Unused"}));
+        assert_eq!(deps[1], json!({"path": "lib/b.dart"}));
         dartq_schema::validate(&json.to_string(), dartq_schema::Domain::Query)
             .expect("schema-valid");
 
@@ -1708,17 +1858,19 @@ mod tests {
     /// The golden fixture's use file (goldens/ai/README.md): the
     /// constructor site lands at the shared fixtures' pinned offset 41.
     const GOLDEN_B: &str = "import 'a.dart';\nvoid main() {\n  var w = Widget();\n  top(1);\n}\n";
-    /// The golden fixture's non-lib member: no `package:` URI addresses
-    /// it, so its label is the canonical path — root-dependent, which is
-    /// why the golden carries the `FIXTURE_ROOT` placeholder token.
+    /// The golden fixture's non-lib member: it lies inside the analysis
+    /// root, so the locator spells it `tool/note.dart` like every other
+    /// in-root file.
     const GOLDEN_NOTE: &str = "import 'package:fixture/a.dart';\nWidget? probe() => null;\n";
 
     /// The AI-face goldens (`goldens/ai/query_symbol_{compact,minimal}
     /// .json`): the promoted envelopes over the golden fixture, pinned
     /// against live producer output. They carry #1560's element-face
-    /// columns, #1556's package-form labels, and the non-lib canonical
-    /// fallback (the `FIXTURE_ROOT` placeholder substituted with the
-    /// canonical fixture root). Values derive from the pinned tests
+    /// columns and the locator spellings (every file column root-relative
+    /// — the fixture's files all lie inside the root). The envelope's
+    /// `root` value is workspace-root dependent, so the golden carries the
+    /// `FIXTURE_ROOT` placeholder token, substituted with the canonical
+    /// fixture root before comparing. Values derive from the pinned tests
     /// (goldens/ai/README.md); a mismatch is a regression, not a golden to
     /// edit.
     #[test]

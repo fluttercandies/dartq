@@ -41,7 +41,7 @@ never duplicated.
 | Fact | Value |
 | --- | --- |
 | Heartbeat | `state.json` rewritten every 5 s while serving |
-| Idle reaper | exits after 15 min with no connected client |
+| Idle reaper | exits after 15 min with no connected client — never while a debug session is held |
 | Cold-start timeout | a listening socket must appear within 30 s |
 | Session cap | 5 live sessions per user; the least-recently-heartbeat is evicted past it |
 

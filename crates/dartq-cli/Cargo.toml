@@ -47,6 +47,10 @@ serde_yaml = { workspace = true }
 # The default output encoding (`--format lon` everywhere; the MCP tool
 # content payload).
 lon = { workspace = true }
+# The session serve loop's exit-signal watchdog (#2619): SIGTERM/SIGINT
+# land in a polled flag so every exit path can detach (resume) held
+# debug sessions before the daemon dies.
+signal-hook = { workspace = true }
 
 # Test-only: the stale-config advisory tests pin the pub faces' mtime
 # chain.

@@ -30,6 +30,7 @@
 //! internal-tier error — never clamped, never a dead process.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -38,7 +39,7 @@ use dartq_ai::explain::{self as query, ConstructorFact, SymbolDeclHit};
 use dartq_ai::rev_import_graph::RevImportGraph;
 use dartq_diagnostics::{Diagnostic, FileLayoutProvider};
 use dartq_engine::Engine;
-use dartq_index::{RefRow, SuperClause, TargetRef};
+use dartq_index::{DeclRow, RefRow, SuperClause, TargetRef};
 use dartq_source::{FileId, StringId};
 use serde_json::Value;
 use thiserror::Error;
@@ -120,10 +121,19 @@ fn explain_answer(
 ) -> Result<Value, ExplainError> {
     // The queried name interns into the engine's table once — the rows'
     // native table (the documented query posture: the only side effect).
-    let sym = engine.strings().intern(symbol);
+    // A `Container.name` spelling (#2621) names the member inside the
+    // container: the member segment drives the by-name probe, the
+    // container segment filters the hits, and the report still echoes the
+    // caller's whole spelling.
+    let (container, name) = match symbol.split_once('.') {
+        Some((container, name)) => (Some(container), name),
+        None => (None, symbol),
+    };
+    let sym = engine.strings().intern(name);
 
     // Declaration hits from the maintained captures: live libraries ×
-    // members, the equal-name run per declaring file. The rows borrow the
+    // members, the equal-name run per declaring file, filtered to the
+    // spelled container when one rode along. The rows borrow the
     // captures — nothing copies.
     let libraries = engine.libraries();
     let mut hits: Vec<SymbolDeclHit<'_>> = Vec::new();
@@ -132,14 +142,30 @@ fn explain_answer(
         let library = library.index();
         for &file in members {
             let capture = engine.file_capture(file).expect("analyzed member");
-            if let Some(rows) = capture.index.by_name(sym) {
-                hits.extend(rows.iter().map(|decl| SymbolDeclHit {
-                    library,
-                    file,
-                    decl,
-                }));
-                hit_files.entry(library).or_default().push(file);
+            let Some(rows) = capture.index.by_name(sym) else {
+                continue;
+            };
+            let surface = capture.index.decls();
+            let strings = engine.strings();
+            let matched: Vec<&DeclRow> = rows
+                .iter()
+                .filter(|decl| match container {
+                    None => true,
+                    Some(want) => {
+                        decl.container != DeclRow::NONE
+                            && strings.resolve(surface[decl.container as usize].name) == want
+                    }
+                })
+                .collect();
+            if matched.is_empty() {
+                continue;
             }
+            hits.extend(matched.into_iter().map(|decl| SymbolDeclHit {
+                library,
+                file,
+                decl,
+            }));
+            hit_files.entry(library).or_default().push(file);
         }
     }
 
@@ -186,9 +212,10 @@ fn explain_answer(
     let count = substrate.node_count();
     let importers = RevImportGraph::build(count, |library| substrate.neighbors(library));
 
-    // Stable reference labels for every file id the answer carries — the
-    // package-form projection (the shared [`crate::pkg_label::pkg_label`]
-    // rule; internal ids never leave the engine boundary).
+    // Stable file spellings for every file id the answer carries — the one
+    // file locator's projection (the shared [`crate::pkg_label::locate`]
+    // rule against the engine's workspace root: root-relative inside it,
+    // absolute outside; internal ids never leave the engine boundary).
     let file_table = engine.file_table();
     let mut ids: Vec<FileId> = Vec::new();
     ids.extend(hits.iter().map(|hit| hit.file));
@@ -201,17 +228,32 @@ fn explain_answer(
     }));
     ids.sort_unstable();
     ids.dedup();
-    // Projected once per answer file here (the attribution walk amortizes
-    // over the package table's per-directory memo); non-UTF-8 paths label
-    // lossily — the JSON string columns cannot carry them raw either way.
-    let packages = engine.packages();
+    // Projected once per answer file here; non-UTF-8 paths spell lossily —
+    // the JSON string columns cannot carry them raw either way.
+    let analysis_root = engine.packages().workspace_root();
     let file_labels: Vec<String> = ids
         .iter()
         .map(|&file| {
-            crate::pkg_label::pkg_label(packages, file_table.path(file).expect("answer file"))
+            crate::pkg_label::locate(
+                analysis_root,
+                file_table.path(file).expect("answer file"),
+            )
         })
         .collect();
 
+    // The engine-owned selection faces the pure assembler cannot derive:
+    // the hit files' test-tree membership (a real-path property, read
+    // from the engine's file table rather than parsed back out of any
+    // spelling) and the 1-based line resolution the `others` rows locate
+    // by.
+    let is_test_of =
+        |file: FileId| engine.file_table().path(file).is_some_and(is_test_path);
+    let line_of = |file: FileId, offset: u32| {
+        let index = engine.line_index(file).expect("answer file line index");
+        let content = engine.content(file).expect("answer file content");
+        let text = std::str::from_utf8(content).expect("engine content is UTF-8");
+        index.line_col_utf16(text, offset).0
+    };
     let report = query::explain(
         symbol,
         verbosity.into(),
@@ -230,6 +272,8 @@ fn explain_answer(
             let index = ids.binary_search(&file).expect("answer file label");
             file_labels[index].as_str()
         },
+        is_test_of,
+        line_of,
         substrate.tests(),
         engine.strings(),
     );
@@ -239,7 +283,31 @@ fn explain_answer(
     // re-parsed. Both conversions are total for this payload (plain
     // derived data: strings, numbers, options, vectors), so the two
     // expects are true invariants; the validator is the real gate.
-    let value = serde_json::to_value(&report).expect("explain report serializes");
+    let mut value = serde_json::to_value(&report).expect("explain report serializes");
+    // The locator envelope: the root rides exactly when the answer carries
+    // a file field, and the report's file-bearing row sources all hang off
+    // the primary declaration (its own `file` is always present, every
+    // section is empty without one) — so the declaration is the ride
+    // condition. It slots in right after the version stamp, the reading
+    // order every located document keeps; the assembler's struct stays
+    // spelling-agnostic, so the envelope is stitched here at the one
+    // boundary that knows the root.
+    if report.declaration.is_some() {
+        let object = value
+            .as_object_mut()
+            .expect("the explain report serializes as an object");
+        let mut located = serde_json::Map::with_capacity(object.len() + 1);
+        located.insert(
+            "v".to_owned(),
+            object.remove("v").expect("the version stamp"),
+        );
+        located.insert(
+            "root".to_owned(),
+            serde_json::Value::String(analysis_root.display().to_string()),
+        );
+        located.append(object);
+        *object = located;
+    }
     let json = serde_json::to_string(&value).expect("explain report serializes");
     // The published-schema gate, tier-exact: the producing tier threads
     // through, so a wrong-tier section (the minimal-only `counts`
@@ -612,6 +680,19 @@ fn constructor_facts(engine: &Engine, file: FileId, sym: StringId) -> Vec<Constr
     rows
 }
 
+/// Whether `path` is a test-tree file — the selection order's first key
+/// (#2621): any `test` path component (the directory convention) or a
+/// `_test.dart` file name. A real-path property, read from the engine's
+/// file table before the label projection can blur it.
+fn is_test_path(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == OsStr::new("test"))
+        || path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.ends_with("_test.dart"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -697,11 +778,9 @@ mod tests {
         // The dependency rows enumerate the live importers only: dog's
         // library retired, the test library's row survives — the dead
         // slot's name (and its row) are gone, never a mislabel.
-        let root = root.canonicalize().expect("canonical root");
-        let animal_test = root.join("test/animal_test.dart").display().to_string();
         assert_eq!(
             json["deps"],
-            json!([{ "path": animal_test }]),
+            json!([{ "path": "test/animal_test.dart" }]),
             "the retired importer's row is gone, the live one intact"
         );
 
@@ -727,14 +806,14 @@ mod tests {
         let root = fixture("explain");
         let json = explain(&root, Some(&root.join("sdk")), "Dog", Verbosity::Compact)
             .expect("explain run");
-        // Lib files project to the stable package-form references; the
-        // test tree file keeps its canonical path (no `package:` URI
-        // addresses it — the documented fallback).
+        // Every file column spells through the locator: root-relative
+        // inside the analysis root (the lib and test trees alike), and the
+        // envelope carries the root once, right after the version stamp.
         let root = root.canonicalize().expect("root");
-        let animal = "package:fixture/animal.dart".to_owned();
-        let dog = "package:fixture/dog.dart".to_owned();
-        let main = "package:fixture/main.dart".to_owned();
-        let dog_test = root.join("test/dog_test.dart").display().to_string();
+        let animal = "lib/animal.dart".to_owned();
+        let dog = "lib/dog.dart".to_owned();
+        let main = "lib/main.dart".to_owned();
+        let dog_test = "test/dog_test.dart".to_owned();
 
         // The entry routes through the published validator at the producing
         // tier; the assertion pins that the answer is born schema-valid.
@@ -747,6 +826,7 @@ mod tests {
         .expect("schema-valid at the producing tier");
 
         assert_eq!(json["v"], 1);
+        assert_eq!(json["root"], root.display().to_string());
         assert_eq!(json["sym"], "Dog");
         assert_eq!(
             json["declaration"],
@@ -785,17 +865,18 @@ mod tests {
         assert_eq!(
             json["refs"],
             json!([
-                {"file": dog_test, "kind": "invoked", "off": offset(TEST, "Dog"), "len": 3, "qualified": false},
                 {"file": main, "kind": "invoked", "off": offset(MAIN, "Dog"), "len": 3, "qualified": false},
+                {"file": dog_test, "kind": "invoked", "off": offset(TEST, "Dog"), "len": 3, "qualified": false},
             ]),
-            "each row names its use site's file, label-projection order (`/` sorts before `p` in `package:` labels)"
+            "each row names its use site's file, label order (`lib/` sorts before `test/`)"
         );
         assert_eq!(
             json["deps"],
-            json!([{"path": dog_test}, {"path": main}]),
-            "the libraries that import dog.dart, label-projection order"
+            json!([{"path": main}, {"path": dog_test}]),
+            "the libraries that import dog.dart, label order"
         );
         assert_eq!(json["tests"], json!([{"path": dog_test}]));
+        assert_eq!(json["others"], json!([]), "one declaration, no candidates");
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -827,6 +908,7 @@ mod tests {
                 "refs": 2,
                 "deps": 2,
                 "tests": 1,
+                "others": 0,
             })
         );
 
@@ -856,6 +938,7 @@ mod tests {
             "refs": 2,
             "deps": 2,
             "tests": 1,
+            "others": 0,
         });
         let text = serde_json::to_string(&mutated).expect("serialize");
         let violation = dartq_schema::validate_at_tier(
@@ -879,10 +962,13 @@ mod tests {
         let root = fixture("explain_unknown");
         let json = explain(&root, Some(&root.join("sdk")), "Nope", Verbosity::Compact)
             .expect("explain run");
-        let root = root.canonicalize().expect("root");
 
         assert_eq!(json["v"], 1);
         assert_eq!(json["sym"], "Nope");
+        assert!(
+            json.get("root").is_none(),
+            "no declaration means no file field, so no locator root"
+        );
         assert!(json.get("declaration").is_none());
         assert_eq!(json["bases"], json!([]));
         assert_eq!(json["ifaces"], json!([]));
@@ -891,10 +977,118 @@ mod tests {
         assert_eq!(json["refs"], json!([]));
         assert_eq!(json["deps"], json!([]));
         assert_eq!(json["tests"], json!([]));
+        assert_eq!(json["others"], json!([]));
         assert!(
             json.get("counts").is_none(),
             "counts are a minimal-tier field"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The #2621 shape: `createTask` declares in two public lib containers
+    /// and in the test tree's private fake — `createTask` at line 2 of the
+    /// lib file (the abstract repository), line 5 (the client), and line 3
+    /// of the test file.
+    const REPO_LIB: &str = "abstract class TodoRepository {\n  Future<void> createTask(String title);\n}\nclass TodoRepositoryClient implements TodoRepository {\n  Future<void> createTask(String title) {}\n}\n";
+    const REPO_TEST: &str = "import 'package:fixture/todo_repository.dart';\nclass _FailingTodoRepository implements TodoRepository {\n  Future<void> createTask(String title) => throw 'boom';\n}\n";
+
+    fn multi_declaration_fixture(tag: &str) -> PathBuf {
+        workspace(
+            tag,
+            &[
+                ("lib/todo_repository.dart", REPO_LIB),
+                ("test/todo_repository_test.dart", REPO_TEST),
+            ],
+        )
+    }
+
+    /// The multi-declaration pick (#2621): a bare name shared by lib
+    /// declarations and a test-tree fake answers the lib declaration —
+    /// the test file loses on the selection order's first key, whatever
+    /// its path sorts like — and `others` lists the remaining candidates
+    /// in rank order, each as a `file`/`kind`/`container`/`line` locator.
+    #[test]
+    fn same_name_picks_the_lib_declaration_and_lists_the_rest() {
+        let root = multi_declaration_fixture("explain_multi_decl");
+        let json = explain(
+            &root,
+            Some(&root.join("sdk")),
+            "createTask",
+            Verbosity::Compact,
+        )
+        .expect("explain run");
+        let repo = "lib/todo_repository.dart".to_owned();
+        let test = "test/todo_repository_test.dart".to_owned();
+
+        assert_eq!(json["sym"], "createTask");
+        assert_eq!(json["declaration"]["file"], repo);
+        assert_eq!(json["declaration"]["container"], "TodoRepository");
+        assert_eq!(
+            json["declaration"]["off"],
+            offset(REPO_LIB, "createTask"),
+            "the earliest lib declaration of the name"
+        );
+        assert_eq!(
+            json["others"],
+            json!([
+                {"file": repo, "kind": "method", "container": "TodoRepositoryClient", "line": 5},
+                {"file": test, "kind": "method", "container": "_FailingTodoRepository", "line": 3},
+            ]),
+            "rank order: the other lib declaration, then the test fake"
+        );
+
+        // The minimal tier swaps the array for the count.
+        let minimal = explain(
+            &root,
+            Some(&root.join("sdk")),
+            "createTask",
+            Verbosity::Minimal,
+        )
+        .expect("minimal run");
+        assert!(minimal.get("others").is_none(), "the array drops");
+        assert_eq!(minimal["counts"]["others"], 2);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `Container.name` disambiguator (#2621): the spelling picks the
+    /// named container's member out of the same-named set, the report
+    /// echoes the caller's spelling, and a container without the member —
+    /// or one that declares nowhere — answers the empty seam report, the
+    /// unknown-symbol posture (never an error).
+    #[test]
+    fn container_qualified_symbol_picks_the_named_declaration() {
+        let root = multi_declaration_fixture("explain_qualified");
+        let json = explain(
+            &root,
+            Some(&root.join("sdk")),
+            "TodoRepositoryClient.createTask",
+            Verbosity::Compact,
+        )
+        .expect("explain run");
+        let repo = "lib/todo_repository.dart".to_owned();
+
+        assert_eq!(
+            json["sym"],
+            "TodoRepositoryClient.createTask",
+            "the caller's spelling rides"
+        );
+        assert_eq!(json["declaration"]["file"], repo);
+        assert_eq!(json["declaration"]["container"], "TodoRepositoryClient");
+        assert_eq!(
+            json["declaration"]["off"],
+            offset(REPO_LIB, "createTask(String title) {}"),
+            "the client's member, not the first same-named row"
+        );
+        assert_eq!(json["others"], json!([]), "the filter leaves one hit");
+
+        for miss in ["TodoRepository.absent", "NoSuchClass.createTask"] {
+            let json = explain(&root, Some(&root.join("sdk")), miss, Verbosity::Compact)
+                .expect("the seam report, never an error");
+            assert!(json.get("declaration").is_none(), "{miss}: no hit");
+            assert_eq!(json["others"], json!([]), "{miss}: no candidates");
+        }
 
         std::fs::remove_dir_all(&root).ok();
     }

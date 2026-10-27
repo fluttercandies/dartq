@@ -25,6 +25,7 @@
 //! convention.
 
 mod code;
+mod lint_docs;
 mod model;
 mod writer;
 

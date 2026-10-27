@@ -185,12 +185,17 @@ fn dartq_query_equals_the_cli_json_face() {
     let result = answer_result(&h, 2);
     assert_eq!(result["v"], 1);
     assert_eq!(result["sym"], "Foo");
+    assert_eq!(
+        result["root"],
+        workspace.root.display().to_string(),
+        "the locator envelope rides once, the analysis root itself"
+    );
 
     let decls = result["decls"].as_array().expect("decls");
     assert_eq!(decls.len(), 1);
     assert_eq!(
-        decls[0]["file"], "package:fixture/a.dart",
-        "the stable package-form label (the shared shaper's projection)"
+        decls[0]["file"], "lib/a.dart",
+        "inside the analysis root: the locator's root-relative spelling"
     );
     assert_eq!(decls[0]["kind"], "class");
     assert_eq!(decls[0]["name"], "Foo");
@@ -205,7 +210,7 @@ fn dartq_query_equals_the_cli_json_face() {
 
     let refs = result["refs"].as_array().expect("refs");
     assert_eq!(refs.len(), 2, "the type use plus the invocation");
-    assert_eq!(refs[0]["target"], "package:fixture/a.dart");
+    assert_eq!(refs[0]["target"], "lib/a.dart");
     assert_eq!(refs[0]["kind"], "reference");
     // The frozen contract types `qualified` as the qualified-name string and
     // the row model carries only the bit, so the shared writer omits the
@@ -535,6 +540,11 @@ fn dartq_impact_matches_the_cli_report() {
     );
     let result = answer_result(&h, 2);
     assert_eq!(result["v"], SCHEMA_VERSION_IMPACT);
+    assert_eq!(
+        result["root"],
+        workspace.root.display().to_string(),
+        "the locator envelope rides once, the analysis root itself"
+    );
 
     let symbols: Vec<String> = result["sym"]
         .as_array()
@@ -545,16 +555,12 @@ fn dartq_impact_matches_the_cli_report() {
     assert_eq!(
         symbols,
         vec![
-            "package:fixture/a.dart|Foo".to_string(),
-            "package:fixture/a.dart|foo".to_string()
+            "lib/a.dart|Foo".to_string(),
+            "lib/a.dart|foo".to_string()
         ],
-        "every face name, ASCII-sorted (the shared pkg_label projection)"
+        "every face name, ASCII-sorted (the locator's located labels)"
     );
 
-    let test_path = workspace
-        .path("test/a_test.dart")
-        .canonicalize()
-        .expect("canonical test path");
     let affected: Vec<(String, String)> = result["files"]
         .as_array()
         .expect("files")
@@ -569,10 +575,10 @@ fn dartq_impact_matches_the_cli_report() {
     assert_eq!(
         affected,
         vec![
-            (test_path.display().to_string(), "semantic".to_string()),
-            ("package:fixture/b.dart".to_string(), "semantic".to_string()),
+            ("lib/b.dart".to_string(), "semantic".to_string()),
+            ("test/a_test.dart".to_string(), "semantic".to_string()),
         ],
-        "the test tree keeps its canonical path and sorts first: `/` before `p`"
+        "both files sit inside the root: located tails, `l` sorts before `t`"
     );
     let tests: Vec<String> = result["tests"]
         .as_array()
@@ -580,7 +586,7 @@ fn dartq_impact_matches_the_cli_report() {
         .iter()
         .map(|row| row["path"].as_str().expect("path").to_string())
         .collect();
-    assert_eq!(tests, vec![test_path.display().to_string()]);
+    assert_eq!(tests, vec!["test/a_test.dart".to_string()]);
     assert_eq!(
         result["envs"],
         json!([{ "label": "default", "compatible": true }]),
@@ -630,10 +636,6 @@ fn seeded_explain_workspace() -> Workspace {
 fn dartq_explain_answers_the_report() {
     let _guard = workspace_lock();
     let workspace = seeded_explain_workspace();
-    let dog_test = workspace
-        .path("test/dog_test.dart")
-        .canonicalize()
-        .expect("canonical test path");
     let dog_source = "import 'animal.dart';\nclass Dog extends Animal {\n  void bark() {}\n}\n";
     let dog_at = dog_source.find("Dog").expect("Dog in source") as u64;
     let bark_at = dog_source.find("bark").expect("bark in source") as u64;
@@ -651,9 +653,14 @@ fn dartq_explain_answers_the_report() {
     assert_eq!(result["v"], 1);
     assert_eq!(result["sym"], "Dog");
     assert_eq!(
+        result["root"],
+        workspace.root.display().to_string(),
+        "the declaration rides, so the locator envelope does too"
+    );
+    assert_eq!(
         result["declaration"],
         json!({
-            "file": "package:fixture/dog.dart",
+            "file": "lib/dog.dart",
             "name": "Dog",
             "kind": "class",
             "off": dog_at,
@@ -664,7 +671,7 @@ fn dartq_explain_answers_the_report() {
         result["bases"],
         json!([{
             "name": "Animal",
-            "file": "package:fixture/animal.dart",
+            "file": "lib/animal.dart",
             "clause": "extends",
         }])
     );
@@ -674,21 +681,21 @@ fn dartq_explain_answers_the_report() {
     );
     let refs = result["refs"].as_array().expect("refs");
     assert_eq!(refs.len(), 2, "the main use plus the test use");
-    // Row order keys on the projected label (`package:fixture/main.dart`
-    // vs the test tree's canonical path): `/` sorts before `p`.
-    assert_eq!(refs[0]["file"], dog_test.display().to_string());
+    // Row order keys on the located label: both uses sit inside the
+    // analysis root, so the tails sort `lib/` before `test/`.
+    assert_eq!(refs[0]["file"], "lib/main.dart");
     assert_eq!(refs[0]["kind"], "invoked");
-    assert_eq!(refs[1]["file"], "package:fixture/main.dart");
+    assert_eq!(refs[1]["file"], "test/dog_test.dart");
     assert_eq!(
         result["deps"],
         json!([
-            { "path": dog_test.display().to_string() },
-            { "path": "package:fixture/main.dart" },
+            { "path": "lib/main.dart" },
+            { "path": "test/dog_test.dart" },
         ])
     );
     assert_eq!(
         result["tests"],
-        json!([{ "path": dog_test.display().to_string() }])
+        json!([{ "path": "test/dog_test.dart" }])
     );
 
     // Delta mode: nothing was written through this session, so the
@@ -862,7 +869,12 @@ fn dartq_compat_matches_the_cli_matrix() {
     );
     let result = answer_result(&h, 2);
     assert_eq!(result["schema_version"], 1);
-    assert_eq!(result["file"], a.display().to_string());
+    assert_eq!(result["file"], "lib/a.dart");
+    assert_eq!(
+        result["root"],
+        workspace.root.display().to_string(),
+        "the subject rides located, so the root envelope does too"
+    );
 
     let matrix = result["matrix"].as_array().expect("matrix");
     assert_eq!(matrix.len(), 2, "one row per axis, in request order");
@@ -874,8 +886,8 @@ fn dartq_compat_matches_the_cli_matrix() {
     );
     assert_eq!(
         matrix[0]["first_failure"]["file"],
-        "package:fixture/a.dart",
-        "the failure file is the package-form label, matching the CLI matrix"
+        "lib/a.dart",
+        "the failure file is the locator's root-relative spelling, matching the CLI matrix"
     );
     assert_eq!(matrix[0]["first_failure"]["line"], 1);
     assert_eq!(matrix[0]["first_failure"]["col"], 11, "the `in` modifier span");
@@ -1138,11 +1150,12 @@ fn dartq_context_routes_and_unknown_tag_fails_loud() {
 /// notice at the drain, answer one worker hop later): a file carrying an
 /// `unnecessary_new` hit materializes an anchored edit through the #355
 /// bridge, provenance-tagged `builtin-lint`, and an `agent_id` selector is
-/// rejected (the disk-view rule). The #2070/#2120-window fix face widens
-/// the answer legitimately: the unused local rides its `builtin-semantic`
-/// rename producer, every diagnostic rides the line/file ignore offers,
-/// and the governing `analysis_options.yaml` enters the document set with
-/// its own per-code ignore rows.
+/// rejected (the disk-view rule). The answer is role-filtered (#2617): the
+/// default `primary` role serves one code change per diagnostic — the lint
+/// rewrite plus the `builtin-semantic` unused-local rename, each row
+/// carrying its `role` key — while the ignore-comment candidates answer
+/// only under their own role spelling (`ignore_line` pinned here: the two
+/// line comments alone, still provenance-tagged `builtin-ignore`).
 #[test]
 fn dartq_fix_emits_real_builtin_rows_with_provenance() {
     let _guard = workspace_lock();
@@ -1171,89 +1184,74 @@ fn dartq_fix_emits_real_builtin_rows_with_provenance() {
     let files = result["files"].as_array().expect("files array");
     assert_eq!(
         files.len(),
-        2,
-        "the hit file plus the governing options file (the cross-file document set)"
+        1,
+        "the default role answers the hit file's code changes alone (the \
+         ignore trio and the options suppression ride their own roles)"
     );
     assert_eq!(files[0]["file"], fixable.display().to_string());
     let edits = files[0]["edits"].as_array().expect("edits array");
     assert_eq!(
         edits.len(),
-        6,
-        "the rewrite, the unused-local rename, and the two codes' ignore offers"
+        2,
+        "the rewrite plus the unused-local rename, one primary candidate \
+         per diagnostic"
     );
     assert_eq!(edits[0]["src"], "builtin-lint");
+    assert_eq!(edits[0]["role"], "primary");
     assert_eq!(edits[0]["off"], 19);
     assert_eq!(edits[0]["len"], 4, "keyword plus trailing space");
     assert_eq!(edits[0]["anchor"]["line"], 1);
     // The `unused_local_variable` semantic row rides its rename producer
     // (the #2070 producer wave): `a` never reads, so it becomes `_a`.
     assert_eq!(edits[1]["src"], "builtin-semantic");
+    assert_eq!(edits[1]["role"], "primary");
     assert_eq!(edits[1]["off"], 15);
     assert_eq!(edits[1]["len"], 1);
     assert_eq!(edits[1]["text"], "_a");
     assert_eq!(edits[1]["anchor"]["line"], 1);
-    // Every diagnostic also rides the line and file ignore offers (the
-    // builtin-ignore provenance), both anchored at the file head — the
-    // lint code first, then the semantic one.
-    assert_eq!(edits[2]["src"], "builtin-ignore");
-    assert_eq!(edits[2]["off"], 0);
-    assert_eq!(edits[2]["len"], 0);
-    assert_eq!(edits[2]["text"], "// ignore: unnecessary_new\n");
-    assert_eq!(edits[2]["anchor"]["line"], 1);
-    assert_eq!(edits[3]["src"], "builtin-ignore");
-    assert_eq!(edits[3]["off"], 0);
-    assert_eq!(edits[3]["len"], 0);
-    assert_eq!(
-        edits[3]["text"],
-        "// ignore_for_file: unnecessary_new\n\n"
-    );
-    assert_eq!(edits[3]["anchor"]["line"], 1);
-    assert_eq!(edits[4]["src"], "builtin-ignore");
-    assert_eq!(edits[4]["off"], 0);
-    assert_eq!(edits[4]["len"], 0);
-    assert_eq!(edits[4]["text"], "// ignore: unused_local_variable\n");
-    assert_eq!(edits[4]["anchor"]["line"], 1);
-    assert_eq!(edits[5]["src"], "builtin-ignore");
-    assert_eq!(edits[5]["off"], 0);
-    assert_eq!(edits[5]["len"], 0);
-    assert_eq!(
-        edits[5]["text"],
-        "// ignore_for_file: unused_local_variable\n\n"
-    );
-    assert_eq!(edits[5]["anchor"]["line"], 1);
-    // The options-file set: one row per code in sorted order, each
-    // appending the `analyzer: errors:` ignore at the options file's end
-    // (off = its UTF-16 length), anchored against the options text.
-    assert_eq!(
-        files[1]["file"],
-        workspace.path("analysis_options.yaml").display().to_string()
-    );
-    let options = files[1]["edits"].as_array().expect("options edits array");
-    assert_eq!(options.len(), 2, "one ignore row per code");
-    assert_eq!(options[0]["src"], "builtin-ignore");
-    assert_eq!(options[0]["off"], 39);
-    assert_eq!(options[0]["len"], 0);
-    assert_eq!(
-        options[0]["text"],
-        "analyzer:\n  errors:\n    unnecessary_new: ignore\n"
-    );
-    assert_eq!(options[0]["anchor"]["line"], 4);
-    assert_eq!(options[1]["src"], "builtin-ignore");
-    assert_eq!(options[1]["off"], 39);
-    assert_eq!(
-        options[1]["text"],
-        "analyzer:\n  errors:\n    unused_local_variable: ignore\n"
-    );
 
+    // The suppression spelling opts into its own candidates alone: the
+    // line-comment offers for both codes, anchored at the file head — the
+    // lint code first, then the semantic one.
     h.step(
         &request(
             3,
+            "dartq/fix",
+            json!({
+                "paths": [fixable.display().to_string()],
+                "role": "ignore_line",
+            }),
+        ),
+        1,
+    );
+    let result = answer_result(&h, 3);
+    let files = result["files"].as_array().expect("files array");
+    assert_eq!(files.len(), 1, "the line comments address the hit file: {result}");
+    assert_eq!(files[0]["file"], fixable.display().to_string());
+    let edits = files[0]["edits"].as_array().expect("edits array");
+    assert_eq!(edits.len(), 2, "one line-comment offer per code");
+    assert_eq!(edits[0]["src"], "builtin-ignore");
+    assert_eq!(edits[0]["role"], "ignore_line");
+    assert_eq!(edits[0]["off"], 0);
+    assert_eq!(edits[0]["len"], 0);
+    assert_eq!(edits[0]["text"], "// ignore: unnecessary_new\n");
+    assert_eq!(edits[0]["anchor"]["line"], 1);
+    assert_eq!(edits[1]["src"], "builtin-ignore");
+    assert_eq!(edits[1]["role"], "ignore_line");
+    assert_eq!(edits[1]["off"], 0);
+    assert_eq!(edits[1]["len"], 0);
+    assert_eq!(edits[1]["text"], "// ignore: unused_local_variable\n");
+    assert_eq!(edits[1]["anchor"]["line"], 1);
+
+    h.step(
+        &request(
+            4,
             "dartq/fix",
             json!({ "paths": [fixable.display().to_string()], "agent_id": "a" }),
         ),
         1,
     );
-    let error = answer_error(&h, 3);
+    let error = answer_error(&h, 4);
     assert_eq!(error["code"], -32602, "INVALID_PARAMS: {error}");
     assert!(
         error["message"].as_str().unwrap_or("").contains("agent_id"),

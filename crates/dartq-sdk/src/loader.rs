@@ -2,7 +2,8 @@
 //!
 //! Step order follows the SDK loader contract: version file →
 //! revision → `libraries.json` (with target resolution) →
-//! `allowed_experiments.json` → canonical id.
+//! `allowed_experiments.json` → optional `_embedder.yaml` (the
+//! full-replacement table of an embedder package) → canonical id.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -17,8 +18,8 @@ use dartq_source::content_hash;
 
 use crate::identity;
 use crate::metadata::{
-    AllowedExperiments, Importability, SdkIdentity, SdkLibraries, SdkLibrary, SdkSnapshot,
-    TargetLibraries,
+    AllowedExperiments, EmbedderLibraries, Importability, SdkIdentity, SdkLibraries, SdkLibrary,
+    SdkSnapshot, TargetLibraries,
 };
 
 impl SdkSnapshot {
@@ -29,32 +30,29 @@ impl SdkSnapshot {
     /// All metadata is read eagerly; `dart:` source bodies are resolved
     /// lazily via [`uri_to_path`](SdkSnapshot::uri_to_path).
     ///
-    /// `flutter_sdk_root` is the reserved seam for Flutter SDK support
-    /// (M2): folding in `bin/cache/flutter.version.json` and replacing the
-    /// library table with the `sky_engine` `_embedder.yaml` mapping, with
-    /// analyzer `EmbedderSdk` semantics (full table replacement, not
-    /// overlay — a flutter project's `dart:core` and `dart:ui` come from
-    /// `sky_engine`). Passing a root
-    /// before that lands is a hard error rather than a silently partial
-    /// load, and `None` is fully self-sufficient: the dart-sdk
+    /// `embedder_lib_dir` — the directory holding an `_embedder.yaml`
+    /// (a `sky_engine` package's `lib/`) — installs the analyzer
+    /// `EmbedderSdk` semantics: the yaml's `embedded_libs` mapping becomes
+    /// the **full replacement** of the `dart:` library table (not an
+    /// overlay — in a Flutter project `dart:core` and `dart:ui` both come
+    /// from `sky_engine`, and every mapped path resolves relative to the
+    /// yaml's directory). The dart-sdk metadata below still loads and keeps
+    /// answering version, revision, and the experiment whitelist — the
+    /// analyzer's embedder construction equally keeps the folder SDK's
+    /// language version. `None` is fully self-sufficient: the dart-sdk
     /// `libraries.json` covers every non-embedder `dart:` library.
     ///
     /// # Errors
     ///
     /// Hard-errors ([`SdkError`]) on any missing or malformed metadata —
-    /// including an empty library table, a malformed include chain, or an
-    /// unusable `allowed_experiments.json` — where the analyzer would
+    /// including an empty library table, a malformed include chain, an
+    /// unusable `allowed_experiments.json`, or (on the embedder path) an
+    /// unreadable or unusable `_embedder.yaml` — where the analyzer would
     /// silently degrade; see the crate docs.
     pub fn load(
         dart_sdk_root: &Path,
-        flutter_sdk_root: Option<&Path>,
+        embedder_lib_dir: Option<&Path>,
     ) -> Result<SdkSnapshot, SdkError> {
-        if let Some(flutter_root) = flutter_sdk_root {
-            return Err(SdkError::FlutterUnsupported {
-                root: flutter_root.to_path_buf(),
-            });
-        }
-
         let version_path = dart_sdk_root.join("version");
         let version_text = read_required(&version_path)?;
         let version = version_text.trim();
@@ -119,8 +117,17 @@ impl SdkSnapshot {
             revision,
             libraries_json_hash: content_hash(libraries_text.as_bytes()),
         };
-        let id =
-            identity::snapshot_id(&dart, language_metadata, &sdk_libraries, &platform_metadata);
+        // The embedder table rides the same load: its parsed form joins the
+        // fingerprint, so an embedder-backed snapshot never shares a cache
+        // id with the plain dart-sdk table over the same root.
+        let embedder = embedder_lib_dir.map(load_embedder).transpose()?;
+        let id = identity::snapshot_id(
+            &dart,
+            language_metadata,
+            &sdk_libraries,
+            &platform_metadata,
+            embedder.as_ref().map(|embedder| &embedder.table),
+        );
 
         Ok(SdkSnapshot {
             id,
@@ -128,6 +135,7 @@ impl SdkSnapshot {
             sdk_libraries,
             platform_metadata,
             language_metadata,
+            embedder,
             dart_sdk_root: dart_sdk_root.to_path_buf(),
         })
     }
@@ -177,14 +185,13 @@ pub enum SdkError {
         path: std::path::PathBuf,
         message: String,
     },
-    /// A flutter SDK root was supplied. Flutter (embedder) support is
-    /// reserved for M2 — see [`SdkSnapshot::load`].
-    #[error(
-        "flutter SDK support is not implemented yet (root: {root}); \
-         load the dart SDK at `<flutter>/bin/cache/dart-sdk` with \
-         `flutter_sdk_root: None` instead"
-    )]
-    FlutterUnsupported { root: std::path::PathBuf },
+    /// `_embedder.yaml` is absent from the given embedder directory, or
+    /// does not parse into a usable `embedded_libs` table.
+    #[error("invalid _embedder.yaml {path}: {message}")]
+    InvalidEmbedderYaml {
+        path: std::path::PathBuf,
+        message: String,
+    },
 }
 
 /// Reads a required UTF-8 file, distinguishing absence
@@ -449,6 +456,89 @@ fn check_library_uri(name: &str, uri: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// --- _embedder.yaml ---
+
+/// The keys of `_embedder.yaml` that shape the SDK table. Every other
+/// top-level key (generation annotations, server-library sections, …) is
+/// ignored — the analyzer's embedder reader consults `embedded_libs` alone
+/// (`EmbedderSdk._processEmbedderYaml`).
+#[derive(Deserialize)]
+struct RawEmbedderYaml {
+    embedded_libs: BTreeMap<String, String>,
+}
+
+/// Loads one embedder package's `_embedder.yaml` from `lib_dir` into the
+/// full-replacement table.
+///
+/// # Errors
+///
+/// [`SdkError::MissingFile`] when the yaml is absent;
+/// [`SdkError::InvalidEmbedderYaml`] when it does not parse into a usable
+/// `embedded_libs` table (unparsable YAML, a non-mapping root, a missing
+/// key, a non-string entry, an unusable path value, or no `dart:` entry at
+/// all).
+fn load_embedder(lib_dir: &Path) -> Result<EmbedderLibraries, SdkError> {
+    let yaml_path = lib_dir.join("_embedder.yaml");
+    let yaml_text = read_required(&yaml_path)?;
+    let libraries = parse_embedder_yaml(&yaml_text)
+        .map_err(|message| SdkError::InvalidEmbedderYaml {
+            path: yaml_path,
+            message,
+        })?;
+    Ok(EmbedderLibraries {
+        base_dir: lib_dir.to_path_buf(),
+        table: TargetLibraries { libraries },
+    })
+}
+
+/// Parses `_embedder.yaml` content into the replacement table.
+///
+/// Mirrors the analyzer's embedder reader entry by entry: a key not
+/// starting with `dart:` is skipped silently (SDK libraries must begin
+/// with `dart:`), every kept key maps to a path relative to the yaml's
+/// directory (validated by the same [`check_library_uri`] rule as
+/// `libraries.json` entries — an absolute or empty value would escape the
+/// join below), and the installed entries carry no gates: upstream
+/// constructs each `SdkLibraryImpl` with defaults only, so every embedder
+/// library answers `dart.library.<name>` true and imports directly —
+/// the `_`-prefixed forced-off rule of `libraries.json` parsing does not
+/// apply here.
+///
+/// # Errors
+///
+/// Returns a message on any structural violation, including a table that
+/// keeps no `dart:` entry (upstream would install an empty table and
+/// degrade every `dart:` URI to unresolved; dartq refuses the load — the
+/// caller's degrade posture falls back to the plain dart-sdk table).
+pub(crate) fn parse_embedder_yaml(text: &str) -> Result<BTreeMap<String, SdkLibrary>, String> {
+    let raw: RawEmbedderYaml =
+        serde_yaml::from_str(text).map_err(|err| format!("not a usable embedder yaml: {err}"))?;
+    let mut libraries = BTreeMap::new();
+    for (dart_uri, path) in raw.embedded_libs {
+        // Non-`dart:` keys are silently ignored, the reader's own rule.
+        let Some(name) = dart_uri.strip_prefix("dart:") else {
+            continue;
+        };
+        if name.is_empty() {
+            return Err(format!("library key `{dart_uri}` names no library after `dart:`"));
+        }
+        check_library_uri(&dart_uri, &path)?;
+        libraries.insert(
+            name.to_owned(),
+            SdkLibrary {
+                uri: path,
+                patches: Vec::new(),
+                support_conditional_import: true,
+                support_direct_import: Importability::Always,
+            },
+        );
+    }
+    if libraries.is_empty() {
+        return Err("`embedded_libs` maps no `dart:` library".to_owned());
+    }
+    Ok(libraries)
 }
 
 // --- allowed_experiments.json ---

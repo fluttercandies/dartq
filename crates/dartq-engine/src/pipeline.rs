@@ -458,6 +458,7 @@ pub(crate) fn analyze(
                 // library skips this run — under-report, never a panic.
                 return None;
             };
+            let mut member_refs = Vec::new();
             let mut diagnostics = diagnose_library(
                 state,
                 resolved,
@@ -467,12 +468,13 @@ pub(crate) fn analyze(
                 class_modifiers.as_ref(),
                 clauses.as_ref(),
                 *library,
+                &mut member_refs,
             );
             // The run's canonical sort rides the job too (a pure read of the
             // file table).
             diagnostics.sort_by(|a, b| compare_canonical(&state.files, a, b));
             let info = state.libraries.info(*library).expect("live library");
-            let surface = library_surface(state, resolved, *library, info);
+            let surface = library_surface(state, resolved, *library, info, &member_refs);
             // The surface's use view is a pure function of its rows: it
             // rides the job too, so the serial store loop only installs it.
             let view = crate::state::use_view_of(&surface);
@@ -881,6 +883,7 @@ fn diagnose_library(
     class_modifiers: Option<&LibraryClassModifiers>,
     clauses: Option<&dartq_semantic::ClauseTrees>,
     library: LibraryId,
+    member_refs: &mut Vec<(FileId, std::sync::Arc<[dartq_semantic::MemberRef]>)>,
 ) -> Vec<Arc<Diagnostic>> {
     let info = state.libraries.info(library).expect("live library");
     let members = member_files(info);
@@ -1102,7 +1105,12 @@ fn diagnose_library(
             // fold records the members it skips on a store/UTF-8 miss.
             degrades: &state.residency_degrades,
         };
-        diagnoser.diagnose_library(view, &mut out);
+        diagnoser.diagnose_library(&view, &mut out);
+        // The resolved member-access rows (#2618): read back through the
+        // same view (the default diagnoser serves them from the fold memo
+        // the call above just populated) — the surface build folds them in
+        // right after this returns.
+        member_refs.extend(diagnoser.member_refs(&view));
     }
     // The imports-verification faces (library_analyzer.dart:501-509): the
     // whole ImportsVerifier — duplicate imports/exports and duplicate
@@ -1408,12 +1416,15 @@ fn part_diagnostic(
 /// Rebuilds a library's symbol-index reference surface at its
 /// `LibraryAnalyzed` point: the member captures (fresh from the drain)
 /// resolve through the graph namespaces — whole-unit replacement, the shape
-/// `query_symbols` serves.
+/// `query_symbols` serves — and the semantically resolved member-access
+/// rows the diagnose fold just published (#2618) fold in beside the
+/// parser-level sites.
 fn library_surface(
     state: &EngineState,
     resolved: &ResolvedGraph,
     library: LibraryId,
     info: &LibraryInfo,
+    member_refs: &[(FileId, std::sync::Arc<[dartq_semantic::MemberRef]>)],
 ) -> dartq_index::LibraryIndex {
     let mut builder = dartq_index::LibraryBuilder::new(
         resolved.graph_ids[&library],
@@ -1432,6 +1443,26 @@ fn library_surface(
             continue;
         };
         builder.add_file(&capture);
+    }
+    // The semantic edges (#2618): interned spellings and u32 offsets
+    // through — the map is the index's own kind byte; no text on this
+    // path. Rows the capture pairing skipped stay dropped (the degrade
+    // posture the captures keep).
+    for (file, rows) in member_refs {
+        builder.add_resolved_refs(rows.iter().map(|row| dartq_index::RefRow {
+            file: *file,
+            target_file: row.target_file,
+            target_name: row.target_name,
+            target_container: row.target_container,
+            kind: match row.kind {
+                dartq_semantic::MemberRefKind::Read => dartq_index::RefKind::Read,
+                dartq_semantic::MemberRefKind::Invoked => dartq_index::RefKind::Invoked,
+                dartq_semantic::MemberRefKind::Written => dartq_index::RefKind::Written,
+                dartq_semantic::MemberRefKind::ReadWritten => dartq_index::RefKind::ReadWritten,
+            },
+            range: row.range,
+            qualifier: StringId::NONE,
+        }));
     }
     builder.finish()
 }

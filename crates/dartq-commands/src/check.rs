@@ -196,10 +196,16 @@ fn parent_dir(canonical: &Path) -> io::Result<&Path> {
 }
 
 /// Runs the M0 pipeline over a discovered file set (see
-/// [`crate::discover::discover`]). A read failure aborts the run — a partial
-/// diagnostic set must never masquerade as a valid result; an undecodable
-/// file is not a partial result but the oracle's own empty-content face
-/// (see [`read_source`]).
+/// [`crate::discover::discover`]) — the bare-list face: no discovery
+/// targets are known, so the analysis root falls back to
+/// [`crate::pkg_label::common_root`] over the canonical set (the deepest
+/// covering directory). Callers that still hold the targets the set was
+/// discovered from route through [`analyze_targets`] instead, whose root
+/// is the target directory itself.
+///
+/// A read failure aborts the run — a partial diagnostic set must never
+/// masquerade as a valid result; an undecodable file is not a partial
+/// result but the oracle's own empty-content face (see [`read_source`]).
 ///
 /// Duplicate spellings are analyzed once: the discovery set's dedup is
 /// component-wise, so a file whose spellings differ as component vectors (a
@@ -213,13 +219,34 @@ fn parent_dir(canonical: &Path) -> io::Result<&Path> {
 /// Source read or UTF-8 decode failure, or a canonical path without a
 /// parent directory (defensive — see [`parent_dir`]).
 pub fn analyze_files(files: &BTreeSet<PathBuf>) -> Result<CheckRun, io::Error> {
+    analyze_targets(&[], files)
+}
+
+/// [`analyze_files`] over a discovery that started at `targets` (the check
+/// face's path arguments): the analysis root is the deepest directory
+/// covering the targets — the directory the run was pointed at, the
+/// enclosing package root in the common CLI shape — so rows spell under
+/// the target (`lib/main.dart`, not `main.dart` under a `lib/` root the
+/// file set alone would derive). An empty target list is the bare-list
+/// face (see [`analyze_files`]).
+///
+/// # Errors
+///
+/// Source read or UTF-8 decode failure, or a canonical path without a
+/// parent directory (defensive — see [`parent_dir`]).
+pub fn analyze_targets(
+    targets: &[PathBuf],
+    files: &BTreeSet<PathBuf>,
+) -> Result<CheckRun, io::Error> {
     let mut files_state = FileSet::default();
     let mut diags = Vec::new();
+    let mut canonical_paths = Vec::new();
     for path in files {
         let (canonical, source) = read_source(path)?;
         if files_state.file_id(&canonical).is_some() {
             continue;
         }
+        canonical_paths.push(canonical.clone());
         let file = files_state.push(&source, &canonical);
         // Relative directive targets compose against the canonical file's
         // directory (canonical paths are absolute, so the parent exists).
@@ -247,6 +274,11 @@ pub fn analyze_files(files: &BTreeSet<PathBuf>) -> Result<CheckRun, io::Error> {
             .then_with(|| a.range.offset.cmp(&b.range.offset))
             .then_with(|| a.message.cmp(&b.message))
     });
+    // The check face's analysis root: the target directory when the call
+    // site knows one, the deepest covering directory of the canonical set
+    // otherwise (the lon/text locator's projection base either way).
+    files_state.root = crate::pkg_label::target_root(targets)
+        .or_else(|| crate::pkg_label::common_root(&canonical_paths));
     Ok(CheckRun {
         files: files_state,
         diagnostics: diags,
@@ -335,6 +367,11 @@ pub struct FileSet {
     table: FileTable,
     sources: Vec<String>,
     indexes: Vec<LineIndex>,
+    /// The run's analysis root (the lon/text locator's base), set by
+    /// [`analyze_targets`] — the covering directory of the discovery
+    /// targets, or of the canonical set when no targets are known; `None`
+    /// for a hand-built set (the unit fixtures) or a degenerate root.
+    root: Option<PathBuf>,
 }
 
 impl FileSet {
@@ -358,6 +395,10 @@ impl FileSet {
 impl FileLayoutProvider for FileSet {
     fn file_path(&self, file: FileId) -> &Path {
         self.table.path(file).expect("interned FileId")
+    }
+
+    fn analysis_root(&self) -> Option<&Path> {
+        self.root.as_deref()
     }
 
     fn line_col(&self, file: FileId, utf16_offset: u32) -> (u32, u32) {
@@ -1383,6 +1424,61 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// The check face's analysis root (the lon/text locator's base): the
+    /// directory the run was pointed at, so a one-target run locates its
+    /// files under the target (`lib/broken.dart`, not `broken.dart` under
+    /// the `lib/` root the file set alone would derive) — sibling targets
+    /// climb to their covering parent, and a bare file list (no targets)
+    /// keeps the deepest covering directory of the files.
+    #[test]
+    fn analyze_files_derives_the_analysis_root() {
+        let root = std::env::temp_dir().join(format!("dq_cmd_root_{}", std::process::id()));
+        fs::create_dir_all(root.join("lib")).expect("mkdir");
+        fs::write(root.join("lib/broken.dart"), "void f() { x }\n").expect("write");
+
+        let files = crate::discover::discover(std::slice::from_ref(&root)).expect("discover");
+        let run = analyze_targets(std::slice::from_ref(&root), &files).expect("check core");
+        let derived = run.output().files.analysis_root().expect("one root");
+        assert_eq!(
+            derived,
+            root.canonicalize().expect("canonical").as_path(),
+            "the target directory is the root"
+        );
+        let diag = &run.diagnostics()[0];
+        let path = run.output().files.file_path(diag.file);
+        assert_eq!(
+            crate::pkg_label::locate(derived, path),
+            "lib/broken.dart",
+            "the row locates under the root"
+        );
+        let bare = analyze_files(&files).expect("check core");
+        assert_eq!(
+            bare.output().files.analysis_root(),
+            Some(root.canonicalize().expect("canonical").join("lib").as_path()),
+            "no targets: the deepest covering directory of the files"
+        );
+
+        // Two sibling targets: the root climbs to their common parent —
+        // the covering directory of the targets, not the first target.
+        let other = std::env::temp_dir().join(format!("dq_cmd_root2_{}", std::process::id()));
+        fs::create_dir_all(&other).expect("mkdir");
+        fs::write(other.join("b.dart"), "void g() { y }\n").expect("write");
+        let mut siblings = files;
+        siblings.insert(other.join("b.dart"));
+        let run = analyze_targets(&[root.clone(), other.clone()], &siblings).expect("check core");
+        // Canonical spelling throughout: macOS temp dirs live behind the
+        // `/var` → `/private/var` symlink, and the root follows the files.
+        let canonical_temp = std::env::temp_dir().canonicalize().expect("canonical temp");
+        assert_eq!(
+            run.output().files.analysis_root(),
+            Some(canonical_temp.as_path()),
+            "the common parent covers both sibling targets"
+        );
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&other).ok();
     }
 
     /// The disk pipeline's URI face (the row the CLI check face and the

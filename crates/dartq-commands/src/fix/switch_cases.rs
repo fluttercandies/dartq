@@ -208,6 +208,9 @@ pub(crate) fn from_switch_cases(
             source: BUILTIN_SEMANTIC_SOURCE,
             edit: anchored_edit(text, lines, offset, length, &replacement),
             target: None,
+            role: FixRole::Primary,
+            diag: Some(diagnostic.range),
+            group: rows.len() as u32,
         });
     }
     rows

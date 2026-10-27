@@ -71,6 +71,9 @@ simdutf8 = "0.1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# The session serve loop's exit-signal watchdog (#2619): SIGTERM/SIGINT
+# land in an AtomicBool the loop's tick polls — no threads, no async.
+signal-hook = "0.3"
 thiserror = "2"
 # The VM Service Protocol is served over WebSocket; rustls-tls enables the
 # `wss:` scheme (TLS without pulling in platform-native TLS stacks).

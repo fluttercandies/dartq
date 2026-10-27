@@ -81,8 +81,8 @@ use dartq_commands::discover::{DiscoverError, discover};
 use dartq_commands::explain::ExplainError;
 use dartq_commands::query::{BatchQuery, QueryKind, to_json_at_tier};
 use dartq_commands::workspace::{
-    AnalyzeOverrides, WorkspaceAdvisory, engine_config_with_advisory, engine_config_with_overrides,
-    open_engine,
+    AnalyzeOverrides, WorkspaceAdvisory, engine_config_with_advisory,
+    engine_config_with_overrides_phased, open_engine,
 };
 use dartq_diagnostics::{
     AnalysisOutput, Diagnostic, FileLayoutProvider, Severity, write_json,
@@ -125,7 +125,7 @@ mod exit {
     /// channel (the one-shot faces keep exit 4).
     pub const SOFTWARE: u8 = 70;
     /// A domain failure the resident engine answered over the protocol —
-    /// the debug face's data tier: one `{"error":{"code","message"}}`
+    /// the debug face's data tier: one `{"error":{"code","msg"}}`
     /// line rides stdout (the `DARTQ/DEBUG/*` machine code names the
     /// cause), rc 1.
     pub const DEBUG_DOMAIN: u8 = 1;
@@ -799,8 +799,23 @@ fn severity_exit(diags: &[Diagnostic], fatal_warnings: bool, fatal_infos: bool) 
 }
 
 fn check(args: &CheckArgs) -> u8 {
+    // Buffered like the analyze/query faces: the writers emit one writeln
+    // per line, and an unbuffered lock would flush per diagnostic line.
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    check_run(args, &mut out)
+}
+
+/// [`check`] over a caller-supplied writer — the sibling faces'
+/// writer-taking shape (`query_symbol_run`, `explain_run`), so the output
+/// documents are pinnable without capturing the process stdout.
+fn check_run(args: &CheckArgs, out: &mut impl Write) -> u8 {
     let started = Instant::now();
     let discovery_at = Instant::now();
+    // The check face's own setup window: run start → discovery walk start.
+    // Two adjacent captures — scan+parse has no SDK/assembly work, so the
+    // phase is structurally ~0, measured rather than hardcoded.
+    let assembly_ms = elapsed_ms(discovery_at.duration_since(started));
     let files = match discover(&args.paths) {
         Ok(files) => files,
         Err(DiscoverError::Missing(path)) => {
@@ -821,7 +836,7 @@ fn check(args: &CheckArgs) -> u8 {
     // valid {0,1,2,3} result.
     let analyze_at = Instant::now();
     let analyzed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        dartq_commands::check::analyze_files(&files)
+        dartq_commands::check::analyze_targets(&args.paths, &files)
     }));
     let analyze_ms = elapsed_ms(analyze_at.elapsed());
     let run = match analyzed {
@@ -836,20 +851,18 @@ fn check(args: &CheckArgs) -> u8 {
         }
     };
 
-    // Buffered like the analyze/query faces: the writers emit one writeln
-    // per line, and an unbuffered lock would flush per diagnostic line.
-    let stdout = io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
     let output = run.output();
+    let render_at = Instant::now();
     let written = match args.format {
-        CheckFormat::Lon => write_lon(&mut out, &diags_document(&output)),
-        CheckFormat::Json => write_json(&mut out, &output),
-        CheckFormat::Text => write_human(&mut out, output.diagnostics, output.files),
+        CheckFormat::Lon => write_lon(out, &diags_document(&output)),
+        CheckFormat::Json => write_json(out, &output),
+        CheckFormat::Text => write_human(out, output.diagnostics, output.files),
     };
     if let Err(error) = written.and_then(|()| out.flush()) {
         eprintln!("dartq: internal error: writing diagnostics failed: {error}");
         return exit::INTERNAL_ERROR;
     }
+    let render_ms = elapsed_ms(render_at.elapsed());
 
     if let Some(metrics_path) = &args.metrics_json {
         let metrics = RunMetrics {
@@ -857,7 +870,12 @@ fn check(args: &CheckArgs) -> u8 {
             loc: run.loc(),
             diagnostics: run.diagnostics().len(),
             discovery_ms,
+            // No SDK and no lint stage on the scan+parse face.
+            sdk_ms: 0,
+            assembly_ms,
             analyze_ms,
+            lints_ms: 0,
+            render_ms,
             total_ms: elapsed_ms(started.elapsed()),
             // No engine libraries on the check face; the counters exist to
             // keep the JSON shape identical to `analyze`.
@@ -882,12 +900,48 @@ fn check(args: &CheckArgs) -> u8 {
 /// from `DiscoveryStats` and `LibraryAnalyzed` events; `check` reports its
 /// own walk/parse phases and zero library counters — the JSON shape is
 /// identical because both faces' flag grammar pins `--metrics-json`.
+///
+/// Phase split (#2628): every phase is a monotonic-clock (`Instant`)
+/// wall-clock, and the phases are non-overlapping sub-intervals of the
+/// `total_ms` window, so `discovery_ms + sdk_ms + assembly_ms + analyze_ms
+/// + lints_ms + render_ms <= total_ms` always holds; the unattributed
+/// remainder (target injection, the plugin weave, the merged sort, the
+/// notice prints) is the slack. Interval boundaries, per face:
+///
+/// * `discovery_ms` — `analyze`: each engine run's
+///   `Engine::discover_workspace()` call, summed across engines;
+///   `check`: the `discover` walk.
+/// * `sdk_ms` — `analyze`: the `SdkSnapshot::load` calls inside the config
+///   assembly (the plain snapshot plus the embedder-table reload), summed
+///   across workspace groups; `check`: no SDK face, `0`.
+/// * `assembly_ms` — `analyze`: from the run start (target grouping)
+///   through overlay loading — the config-assembly remainder, plugin
+///   launch, `Engine::new`, runtime arming — minus the SDK loads;
+///   `check`: the setup window between run start and the discovery walk
+///   (structurally ~0).
+/// * `analyze_ms` — the engine pass (`analyze_pass`), ending where the
+///   lint stage begins — lints never double-count into it.
+/// * `lints_ms` — the lint stage block after the engine pass
+///   (`analyze_lints` plus the options registry/conflict/removed rows);
+///   `check`: no lint stage, `0`.
+/// * `render_ms` — the diagnostics render and flush (lon/json/text
+///   writers); the metrics write itself is excluded — it happens after
+///   `total_ms` is read.
+/// * `total_ms` — the whole run window, read at metrics-construction time
+///   (after the render, before the metrics file write).
+///
+/// Without `--metrics-json` the only cost of the split is the `Instant`
+/// captures — no formatting, no allocation.
 struct RunMetrics {
     files: usize,
     loc: u64,
     diagnostics: usize,
     discovery_ms: u64,
+    sdk_ms: u64,
+    assembly_ms: u64,
     analyze_ms: u64,
+    lints_ms: u64,
+    render_ms: u64,
     total_ms: u64,
     libraries_analyzed: usize,
     libraries_from_cache: usize,
@@ -905,7 +959,11 @@ impl RunMetrics {
             "loc": self.loc,
             "diagnostics": self.diagnostics,
             "discovery_ms": self.discovery_ms,
+            "sdk_ms": self.sdk_ms,
+            "assembly_ms": self.assembly_ms,
             "analyze_ms": self.analyze_ms,
+            "lints_ms": self.lints_ms,
+            "render_ms": self.render_ms,
             "total_ms": self.total_ms,
             "libraries_analyzed": self.libraries_analyzed,
             "libraries_from_cache": self.libraries_from_cache,
@@ -1064,21 +1122,27 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
     let mut roots: Vec<PathBuf> = Vec::new();
     let mut advisories: Vec<WorkspaceAdvisory> = Vec::new();
     let mut plugin_sets: Vec<dartq_commands::plugins::PluginSet> = Vec::with_capacity(groups.len());
+    // The SDK snapshot loads, summed across workspace groups — the one
+    // sub-interval of the setup window attributed to `sdk_ms`.
+    let mut sdk = Duration::ZERO;
     for (root, group) in groups {
         // The assembled config — not the opened engine — because the plugin
         // set launches off `pub_config`/`config_dir` before `Engine::new`
-        // consumes the config.
-        let (config, dir, stale_advisory) = match engine_config_with_overrides(
-            &root,
-            args.sdk_path.as_deref(),
-            &analyze_overrides(args),
-        ) {
-            Ok(faces) => faces,
-            Err(error) => {
-                eprintln!("error: {error}");
-                return exit::USAGE;
-            }
-        };
+        // consumes the config. The phased spelling carries the SDK-load
+        // clock for the metrics split.
+        let (config, dir, stale_advisory, phases) =
+            match engine_config_with_overrides_phased(
+                &root,
+                args.sdk_path.as_deref(),
+                &analyze_overrides(args),
+            ) {
+                Ok(faces) => faces,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return exit::USAGE;
+                }
+            };
+        sdk += phases.sdk;
         // The launch is lazy (no sidecar starts): a plugin-free workspace
         // pays the two absence probes and nothing more.
         let plugin_set = if plugins_enabled {
@@ -1146,6 +1210,12 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
         }
     };
 
+    // The setup window (run start → first analysis step) closes here; the
+    // SDK loads measured inside it take `sdk_ms`, the assembly phase keeps
+    // the remainder, so the two never overlap.
+    let sdk_ms = elapsed_ms(sdk);
+    let assembly_ms = elapsed_ms(started.elapsed().saturating_sub(sdk));
+
     // A run per engine, each filtered to its targets' covered files. The
     // runs borrow their engines, so `engines` must outlive them — declared
     // above, dropped after `analyze_finish`. The overlay set (empty on
@@ -1178,7 +1248,7 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
         runs.push(run);
     }
     let merged = dartq_commands::analyze::merge_runs(runs);
-    let code = analyze_finish(args, &merged, started, out, &advisories);
+    let code = analyze_finish(args, &merged, started, out, &advisories, sdk_ms, assembly_ms);
     // The graceful teardown: each live plugin handshake-completes before the
     // process exits (a bare drop is kill-only).
     for set in plugin_sets {
@@ -1261,9 +1331,12 @@ fn analyze_finish(
     started: Instant,
     out: &mut impl Write,
     advisories: &[WorkspaceAdvisory],
+    sdk_ms: u64,
+    assembly_ms: u64,
 ) -> u8 {
     let discovery_ms = elapsed_ms(run.discovery);
     let analyze_ms = elapsed_ms(run.analysis);
+    let lints_ms = elapsed_ms(run.lints);
 
     for line in &run.degrade_notices {
         eprintln!("{line}");
@@ -1272,6 +1345,9 @@ fn analyze_finish(
     // The data faces (lon, json) keep the advisory off stdout — one
     // `Info • code • message` line on stderr per advisory; the text face
     // leads stdout with the same human line, ahead of the groups.
+    // The render window: the format writer plus the flush (the metrics
+    // write below stays outside every phase).
+    let render_at = Instant::now();
     let written = match args.format {
         AnalyzeFormat::Lon => {
             for advisory in advisories {
@@ -1322,6 +1398,7 @@ fn analyze_finish(
         eprintln!("dartq: internal error: writing diagnostics failed: {error}");
         return exit::INTERNAL_ERROR;
     }
+    let render_ms = elapsed_ms(render_at.elapsed());
 
     if let Some(metrics_path) = &args.metrics_json {
         let metrics = RunMetrics {
@@ -1329,7 +1406,11 @@ fn analyze_finish(
             loc: run.loc,
             diagnostics: run.diagnostics.len(),
             discovery_ms,
+            sdk_ms,
+            assembly_ms,
             analyze_ms,
+            lints_ms,
+            render_ms,
             total_ms: elapsed_ms(started.elapsed()),
             libraries_analyzed: run.libraries_analyzed,
             libraries_from_cache: run.libraries_from_cache,
@@ -1600,7 +1681,23 @@ fn assemble_contexts(
         .map(|context| {
             let root = resolve_locator(&context.label, &context.sdk, workspace_root)
                 .map_err(|error| ContextAssemblyError::Usage(error.to_string()))?;
-            let sdk = SdkSnapshot::load(&root, None).map_err(|error| {
+            // Each context reloads through the embedder locator over the
+            // base resolution (the default context's posture): a
+            // `sky_engine` package replaces the `dart:` table for the
+            // context axes too, and an unusable embedder yaml degrades to
+            // the plain snapshot — the analysis never refuses over the
+            // embedder.
+            let loaded = match dartq_commands::workspace::embedder_lib_dir(
+                &base.pub_config,
+                &base.config_dir,
+            ) {
+                Some(lib_dir) => {
+                    SdkSnapshot::load(&root, Some(&lib_dir))
+                        .or_else(|_| SdkSnapshot::load(&root, None))
+                }
+                None => SdkSnapshot::load(&root, None),
+            };
+            let sdk = loaded.map_err(|error| {
                 ContextAssemblyError::Usage(format!(
                     "context `{}`: Dart SDK at {} unusable: {error}",
                     context.label,
@@ -1645,15 +1742,19 @@ fn target_panel(target: ContextTarget) -> &'static str {
     }
 }
 
-/// Human format: diagnostics grouped by file (paths ascending), the row
-/// grammar `sev code line:col msg` within each group, the count tail
-/// (the oracle's spelling). Not a differential face — layout may change
-/// freely.
+/// Human format: one `root: <absolute>` line when rows exist and the run
+/// has one analysis root (the lon face's own gate — the base the located
+/// headings spell against), diagnostics grouped by file (canonical path
+/// order; headings spelled through the locator — root-relative inside,
+/// absolute outside), the row grammar `sev code line:col msg` under each
+/// group, the count tail (the oracle's spelling). Not a differential
+/// face — layout may change freely.
 fn write_human(
     out: &mut impl Write,
     diags: &[Diagnostic],
     layout: &dyn FileLayoutProvider,
 ) -> io::Result<()> {
+    let root = layout.analysis_root();
     let mut groups: BTreeMap<&Path, Vec<&Diagnostic>> = BTreeMap::new();
     for diag in diags {
         groups
@@ -1661,8 +1762,15 @@ fn write_human(
             .or_default()
             .push(diag);
     }
+    if let Some(root) = root.filter(|_| !groups.is_empty()) {
+        writeln!(out, "root: {}", root.display())?;
+    }
     for (path, group) in &groups {
-        writeln!(out, "{}", path.display())?;
+        let heading = match root {
+            Some(root) => dartq_commands::locate(root, path),
+            None => path.display().to_string(),
+        };
+        writeln!(out, "{heading}")?;
         for diag in group {
             writeln!(out, "  {}", text_diag_row(diag, layout))?;
         }
@@ -2724,6 +2832,59 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The check document's locator root is the target the run was pointed
+    /// at (`analyze_targets`): a directory target spells every row under
+    /// itself (`lib/broken.dart`), and a bare file target anchors at the
+    /// file's parent — never at a `common_root` the file set alone would
+    /// derive one level deeper.
+    #[test]
+    fn check_document_root_is_the_target_directory() {
+        let root = std::env::temp_dir().join(format!("dq_cli_check_root_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("lib")).expect("mkdir");
+        fs::write(root.join("lib/broken.dart"), "void f() { x }\n").expect("write");
+        let canonical = root.canonicalize().expect("root");
+
+        let args = CheckArgs {
+            paths: vec![root.clone()],
+            format: CheckFormat::Lon,
+            metrics_json: None,
+            fatal_warnings: false,
+            no_fatal_warnings: false,
+            fatal_infos: false,
+            dartdev_globals: DartdevGlobals::default(),
+        };
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(check_run(&args, &mut out), exit::ERRORS);
+        let doc = read_lon(&out);
+        assert_eq!(
+            doc["root"],
+            canonical.display().to_string(),
+            "a directory target is the analysis root"
+        );
+        assert_eq!(
+            doc["diags"][0]["file"], "lib/broken.dart",
+            "rows spell under the target directory"
+        );
+
+        // The bare file target: the root anchors at the file's parent.
+        let file_args = CheckArgs {
+            paths: vec![root.join("lib/broken.dart")],
+            ..args
+        };
+        let mut out: Vec<u8> = Vec::new();
+        assert_eq!(check_run(&file_args, &mut out), exit::ERRORS);
+        let doc = read_lon(&out);
+        assert_eq!(
+            doc["root"],
+            canonical.join("lib").display().to_string(),
+            "a bare file target anchors at its parent"
+        );
+        assert_eq!(doc["diags"][0]["file"], "broken.dart");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     /// `--metrics-json` writes the analyze-shaped JSON at exit (the flag
     /// sits in the check grammar too); the library counters stay at zero
     /// because the check face has no engine libraries.
@@ -2755,7 +2916,11 @@ mod tests {
         assert_eq!(metrics["libraries_from_cache"], 0);
         assert!(metrics["max_rss_bytes"].is_u64());
         assert!(metrics["discovery_ms"].is_u64());
+        assert!(metrics["sdk_ms"].is_u64());
+        assert!(metrics["assembly_ms"].is_u64());
         assert!(metrics["analyze_ms"].is_u64());
+        assert!(metrics["lints_ms"].is_u64());
+        assert!(metrics["render_ms"].is_u64());
         assert!(metrics["total_ms"].is_u64());
 
         fs::remove_dir_all(&root).ok();
@@ -3143,28 +3308,32 @@ mod tests {
             &mut out,
         );
 
-        let broken = root.canonicalize().expect("root").join("lib/broken.dart");
         let text = String::from_utf8(out).expect("stdout is UTF-8");
         let document: serde_json::Value =
             lon::from_str(text.trim_end()).expect("one lon document");
         assert_eq!(document["v"], 1, "the vocabulary envelope key");
+        assert_eq!(
+            document["root"],
+            root.canonicalize().expect("root").display().to_string(),
+            "rows exist: the envelope carries the analysis root exactly once"
+        );
         let diags = document["diags"].as_array().expect("diags rows");
         assert_eq!(diags.len(), 2, "the fixture's two oracle rows: {text}");
         assert_eq!(
             diags[0],
             serde_json::json!({
                 "code": "expected_token", "sev": "error",
-                "file": broken.display().to_string(),
+                "file": "lib/broken.dart",
                 "line": 1, "col": 12, "len": 1,
                 "msg": "Expected to find ';'.",
             }),
-            "the flat vocabulary row, message tie-break first"
+            "the flat vocabulary row, located file, message tie-break first"
         );
         assert_eq!(diags[1]["code"], "undefined_identifier");
         assert_eq!(diags[1]["msg"], "Undefined name 'x'.");
         assert!(
-            diags[1].get("doc").is_some(),
-            "the published code carries the docs URL"
+            diags.iter().all(|row| row.get("doc").is_none()),
+            "no doc URL on this face — `code` is the key, `explain` returns the URL: {document}"
         );
         assert_eq!(code, exit::ERRORS, "any ERROR → 3 (analyze.dart:398)");
 
@@ -3177,6 +3346,68 @@ mod tests {
         assert_eq!(metrics["libraries_from_cache"], 0);
         assert!(metrics["max_rss_bytes"].is_u64(), "getrusage hook wired");
         assert!(metrics["total_ms"].is_u64());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `--metrics-json` phase split (#2628): every phase key is always
+    /// present, the phases are non-overlapping sub-intervals of the total
+    /// window (`sum <= total_ms`), and the analyze face's real phases
+    /// (sdk + assembly + engine pass) are non-zero over a temp workspace.
+    #[test]
+    fn analyze_metrics_json_attributes_every_phase() {
+        let root = analyze_fixture(
+            "phases",
+            &[
+                ("lib/broken.dart", "void f() { x }\n"),
+                ("lib/clean.dart", "var ok = 1;\n"),
+            ],
+        );
+        let metrics_path = root.join("metrics.json");
+        let mut out: Vec<u8> = Vec::new();
+        let code = analyze_run(
+            &analyze_args(&root, AnalyzeFormat::Lon, Some(metrics_path.clone())),
+            &mut out,
+        );
+        assert_eq!(code, exit::ERRORS);
+
+        let metrics: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&metrics_path).expect("metrics at exit"))
+                .expect("one JSON object");
+        for key in [
+            "discovery_ms",
+            "sdk_ms",
+            "assembly_ms",
+            "analyze_ms",
+            "lints_ms",
+            "render_ms",
+            "total_ms",
+        ] {
+            assert!(
+                metrics[key].is_u64(),
+                "phase `{key}` always present: {metrics}"
+            );
+        }
+        let phase = |key: &str| metrics[key].as_u64().expect("u64 phase");
+        let attributed: u64 = [
+            "discovery_ms",
+            "sdk_ms",
+            "assembly_ms",
+            "analyze_ms",
+            "lints_ms",
+            "render_ms",
+        ]
+        .into_iter()
+        .map(phase)
+        .sum();
+        assert!(
+            attributed <= phase("total_ms"),
+            "non-overlapping sub-intervals of the total window: {metrics}"
+        );
+        assert!(
+            phase("sdk_ms") + phase("assembly_ms") + phase("analyze_ms") > 0,
+            "the analyze face measures its real phases: {metrics}"
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -3376,7 +3607,8 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
 
-        // The broken twin: both oracle rows under the file heading.
+        // The broken twin: the root line leads once, both oracle rows
+        // under the located file heading.
         let broken_root =
             analyze_fixture("faces-broken", &[("lib/broken.dart", "void f() { x }\n")]);
         let mut out: Vec<u8> = Vec::new();
@@ -3386,13 +3618,18 @@ mod tests {
         );
         assert_eq!(code, exit::ERRORS);
         let text = String::from_utf8(out).expect("UTF-8");
-        let heading = broken_root
-            .canonicalize()
-            .expect("root")
-            .join("lib/broken.dart");
+        let root_line = format!(
+            "root: {}",
+            broken_root.canonicalize().expect("root").display()
+        );
+        assert_eq!(
+            text.lines().next(),
+            Some(root_line.as_str()),
+            "the located headings' root leads once: {text}"
+        );
         assert!(
-            text.contains(heading.to_string_lossy().as_ref()),
-            "file heading: {text}"
+            text.contains("\nlib/broken.dart\n"),
+            "the located file heading: {text}"
         );
         assert!(
             text.contains("error expected_token 1:12 Expected to find ';'.")
@@ -3666,8 +3903,6 @@ mod tests {
             )],
         );
         fs::remove_file(root.join(".dart_tool/package_config.json")).ok();
-        let canonical = root.canonicalize().expect("root");
-        let main = canonical.join("lib/main.dart");
 
         let mut out: Vec<u8> = Vec::new();
         let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Lon, None), &mut out);
@@ -3678,8 +3913,8 @@ mod tests {
         );
         let files = diag_files(&out);
         assert!(
-            files.iter().any(|file| file == &main.display().to_string()),
-            "the package: import is unresolved, the oracle's degraded face: {files:?}"
+            files.iter().any(|file| file == "lib/main.dart"),
+            "the package: import is unresolved, the oracle's degraded face, located under the no-config floor's root: {files:?}"
         );
         assert_eq!(code, exit::ERRORS);
 
@@ -3731,9 +3966,8 @@ mod tests {
             !rows.is_empty()
                 && rows
                     .iter()
-                    .any(|row| row["code"] == "invalid_assignment"
-                        && row["file"] == file.display().to_string()),
-            "the bare file's own diagnostic emits, never a zero-row run: {text}"
+                    .any(|row| row["code"] == "invalid_assignment" && row["file"] == "bad.dart"),
+            "the bare file's own diagnostic emits, located under its no-pubspec floor root, never a zero-row run: {text}"
         );
         assert!(
             rows.iter()
@@ -3817,14 +4051,10 @@ mod tests {
             ..analyze_args(&root, AnalyzeFormat::Lon, None)
         };
         assert_eq!(analyze_run(&broken_overlay, &mut out), exit::ERRORS);
-        let overlay_target = target.canonicalize().expect("root");
         assert_eq!(
             diag_files(&out),
-            vec![
-                overlay_target.display().to_string(),
-                overlay_target.display().to_string(),
-            ],
-            "the overlay path pins the mirrored oracle sort (both rows on the              analyzed path, message tie-break order)"
+            vec!["lib/broken.dart".to_owned(), "lib/broken.dart".to_owned()],
+            "the overlay path pins the mirrored oracle sort (both rows on the analyzed path, located under the run root, message tie-break order)"
         );
 
         // Relative overlay spec resolves against the package dir.
@@ -3849,18 +4079,15 @@ mod tests {
             ..analyze_args(&root, AnalyzeFormat::Lon, None)
         };
         assert_eq!(analyze_run(&introduced, &mut out), exit::ERRORS);
-        let canonical = root.canonicalize().expect("root");
-        let new_file = canonical.join("lib/new.dart");
-        let base_file = canonical.join("lib/broken.dart");
         assert_eq!(
             diag_files(&out),
             vec![
-                base_file.display().to_string(),
-                base_file.display().to_string(),
-                new_file.display().to_string(),
-                new_file.display().to_string(),
+                "lib/broken.dart".to_owned(),
+                "lib/broken.dart".to_owned(),
+                "lib/new.dart".to_owned(),
+                "lib/new.dart".to_owned(),
             ],
-            "the introduced file's rows anchor at the canonical dir-joined path"
+            "the introduced file's rows anchor at the canonical dir-joined path, located under the run root"
         );
 
         // Missing local file → usage tier.
@@ -4125,6 +4352,11 @@ mod tests {
         let answer = read_lon(&out);
         assert_eq!(answer["v"], 1);
         assert_eq!(answer["sym"], "Foo", "the queried name rides sym");
+        assert_eq!(
+            answer["root"],
+            root.canonicalize().expect("root").display().to_string(),
+            "the envelope carries the analysis root once"
+        );
         assert!(
             answer.get("name").is_none(),
             "the long spelling drops at the envelope"
@@ -4134,8 +4366,8 @@ mod tests {
         assert_eq!(decls[0]["kind"], "class");
         assert_eq!(decls[0]["name"], "Foo");
         assert_eq!(
-            decls[0]["file"], "package:fixture/a.dart",
-            "the row labels are the package-form references"
+            decls[0]["file"], "lib/a.dart",
+            "the row labels are the located spellings (root-relative)"
         );
         assert_eq!(decls[0]["line"], 1);
         assert_eq!(decls[0]["col"], 7, "column → col");
@@ -4143,11 +4375,8 @@ mod tests {
         let refs = answer["refs"].as_array().expect("refs");
         assert_eq!(refs.len(), 3);
         assert_eq!(refs[0]["kind"], "reference");
-        assert_eq!(
-            refs[0]["target"], "package:fixture/a.dart",
-            "target_file → target"
-        );
-        assert_eq!(refs[0]["file"], "package:fixture/b.dart");
+        assert_eq!(refs[0]["target"], "lib/a.dart", "target_file → target");
+        assert_eq!(refs[0]["file"], "lib/b.dart");
         assert_eq!(refs[0]["off"], 33, "offset → off");
         assert_eq!(refs[1]["kind"], "invoked");
         assert_eq!(refs[1]["off"], 42);
@@ -4173,8 +4402,8 @@ mod tests {
         );
 
         // JSON face: one object, the same short-vocabulary fields the lon
-        // face prints (the file labels are the stable package-form
-        // references, #1556's grammar).
+        // face prints (the file labels are the located spellings, the
+        // envelope's `root` riding once).
         let mut out: Vec<u8> = Vec::new();
         let code = query_symbol_run(&symbol_args(&root, OutputFormat::Json, "Foo"), &mut out);
         assert_eq!(code, exit::CLEAN);
@@ -4182,20 +4411,25 @@ mod tests {
             serde_json::from_str(&String::from_utf8(out).expect("UTF-8")).expect("one object");
         assert_eq!(json["sym"], "Foo");
         assert_eq!(json["v"], 1);
+        assert_eq!(
+            json["root"],
+            root.canonicalize().expect("root").display().to_string()
+        );
         assert_eq!(json["decls"][0]["kind"], "class");
-        assert_eq!(json["decls"][0]["file"], "package:fixture/a.dart");
+        assert_eq!(json["decls"][0]["file"], "lib/a.dart");
         assert_eq!(json["decls"][0]["col"], 7);
         assert_eq!(json["refs"].as_array().expect("array").len(), 3);
         assert_eq!(json["refs"][0]["kind"], "reference");
-        assert_eq!(json["refs"][0]["target"], "package:fixture/a.dart");
-        assert_eq!(json["refs"][0]["file"], "package:fixture/b.dart");
+        assert_eq!(json["refs"][0]["target"], "lib/a.dart");
+        assert_eq!(json["refs"][0]["file"], "lib/b.dart");
         assert!(json["refs"][0].get("qualified").is_none());
         assert_eq!(json["refs"][0]["off"], 33);
         assert_eq!(json["refs"][2]["qualified"], "p.Foo");
 
-        // The minimal tier on the lon face: the locators stay, the
-        // convenience fields drop (container/sig on decls; the json face
-        // trims its own way, pinned by the frozen contract).
+        // The minimal tier on the lon face: the locators stay (the `root`
+        // envelope among them), the convenience fields drop (container/sig
+        // on decls; the json face trims its own way, pinned by the frozen
+        // contract).
         let mut out: Vec<u8> = Vec::new();
         let args = SymbolArgs {
             verbosity: Verbosity::Minimal,
@@ -4204,7 +4438,12 @@ mod tests {
         assert_eq!(query_symbol_run(&args, &mut out), exit::CLEAN);
         let answer = read_lon(&out);
         let decl = &answer["decls"][0];
-        assert_eq!(decl["file"], "package:fixture/a.dart", "the locator stays");
+        assert_eq!(decl["file"], "lib/a.dart", "the locator stays");
+        assert_eq!(
+            answer["root"],
+            root.canonicalize().expect("root").display().to_string(),
+            "the root rides at every tier"
+        );
         assert!(decl.get("container").is_none(), "the convenience drops");
         assert!(decl.get("sig").is_none());
         assert!(
@@ -4292,7 +4531,7 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0]["kind"], "invoked");
         assert_eq!(refs[0]["off"], 41);
-        assert_eq!(refs[0]["target"], "package:fixture/a.dart");
+        assert_eq!(refs[0]["target"], "lib/a.dart");
 
         // callers foo: the one call site. The top-level function carries
         // its own signature face.
@@ -4335,7 +4574,7 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0]["kind"], "invoked");
         assert_eq!(refs[0]["off"], 41);
-        assert_eq!(refs[0]["target"], "package:fixture/a.dart");
+        assert_eq!(refs[0]["target"], "lib/a.dart");
 
         // Usage tier: missing directory.
         let missing = symbol_args(&root.join("nope"), OutputFormat::Lon, "Foo");
@@ -4527,16 +4766,14 @@ mod tests {
                 ("test/dog_test.dart", EXPLAIN_TEST),
             ],
         );
-        // The answer's file labels are the stable package-form references
-        // (#1556's grammar): every `lib/` member projects to
-        // `package:fixture/<rel>`; the non-lib test file keeps the
-        // canonical path — the identity fallback no `package:` URI
-        // addresses.
+        // The answer's file columns spell through the one file locator:
+        // every file inside the analysis root (the lib and test trees
+        // alike) is root-relative, and the envelope carries the root once.
         let canonical = root.canonicalize().expect("root");
-        let animal = "package:fixture/animal.dart";
-        let dog = "package:fixture/dog.dart";
-        let main = "package:fixture/main.dart";
-        let dog_test = canonical.join("test/dog_test.dart").display().to_string();
+        let animal = "lib/animal.dart";
+        let dog = "lib/dog.dart";
+        let main = "lib/main.dart";
+        let dog_test = "test/dog_test.dart";
 
         // Compact: the full section set.
         let mut out: Vec<u8> = Vec::new();
@@ -4550,6 +4787,7 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(line.trim_end()).expect("the report parses");
         assert_eq!(json["v"], 1);
+        assert_eq!(json["root"], canonical.display().to_string());
         assert_eq!(json["sym"], "Dog");
         assert_eq!(
             json["declaration"],
@@ -4576,15 +4814,15 @@ mod tests {
         );
         let refs = json["refs"].as_array().expect("refs");
         assert_eq!(refs.len(), 2, "the main use plus the test use");
-        // Row order keys on the projected label (`package:fixture/main.dart`
-        // vs the test tree's canonical path): `/` sorts before `p`, the same
-        // posture the impact face pins over this fixture shape.
-        assert_eq!(refs[0]["file"], dog_test);
+        // Row order keys on the located label: `lib/` sorts before
+        // `test/`, the same posture the impact face pins over this fixture
+        // shape.
+        assert_eq!(refs[0]["file"], main);
         assert_eq!(refs[0]["kind"], "invoked");
-        assert_eq!(refs[1]["file"], main);
+        assert_eq!(refs[1]["file"], dog_test);
         assert_eq!(
             json["deps"],
-            serde_json::json!([{ "path": dog_test }, { "path": main }])
+            serde_json::json!([{ "path": main }, { "path": dog_test }])
         );
         assert_eq!(json["tests"], serde_json::json!([{ "path": dog_test }]));
 
@@ -4900,5 +5138,88 @@ mod tests {
         );
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// Writes the `sky_engine`-shaped package: `lib/_embedder.yaml` mapping
+    /// `dart:core` and `dart:ui` inside the package, plus the mapped files.
+    fn write_sky_engine(root: &Path) {
+        fs::create_dir_all(root.join("sky_engine/lib/ui")).expect("package dirs");
+        fs::write(
+            root.join("sky_engine/lib/_embedder.yaml"),
+            "embedded_libs:\n  \"dart:core\": \"embedder_core.dart\"\n  \"dart:ui\": \"ui/ui.dart\"\n",
+        )
+        .expect("embedder yaml");
+        fs::write(
+            root.join("sky_engine/lib/embedder_core.dart"),
+            "library dart.core;",
+        )
+        .expect("embedder core");
+        fs::write(root.join("sky_engine/lib/ui/ui.dart"), "library dart.ui;")
+            .expect("embedder ui");
+    }
+
+    /// The fixture's package config plus one `sky_engine` entry (an
+    /// absolute `file://` rootUri — a real Flutter config's sky_engine
+    /// spelling; `root` is the canonical root so the resolved paths spell
+    /// exactly).
+    fn rewrite_config_with_sky_engine(root: &Path) {
+        fs::write(
+            root.join(".dart_tool/package_config.json"),
+            format!(
+                r#"{{"configVersion": 2, "packages": [{{"name": "fixture", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.5"}}, {{"name": "sky_engine", "rootUri": "file://{}", "packageUri": "lib/", "languageVersion": "3.5"}}], "generator": "pub", "generatorVersion": "3.13.1"}}"#,
+                root.join("sky_engine").display(),
+            ),
+        )
+        .expect("config");
+    }
+
+    /// The context-axis snapshot rides the base resolution's embedder
+    /// table (#2633): a `sky_engine` entry makes every declared context's
+    /// SDK reload resolve `dart:ui` through the embedder and `dart:core`
+    /// onto the embedder's file (full replacement); a plain resolution
+    /// keeps the dart-sdk table for the same contexts.
+    #[test]
+    fn daemon_context_snapshot_rides_the_embedder_table() {
+        let root = analyze_fixture("daemon_embedder", &[])
+            .canonicalize()
+            .expect("root");
+        write_sky_engine(&root);
+        rewrite_config_with_sky_engine(&root);
+        write_daemon_context_config(&root);
+        let (base, _, _) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
+            .expect("assembly");
+        let extras = assemble_contexts(&base, &[]).expect("the declared contexts load");
+        assert_eq!(extras.len(), 2, "plain and web");
+        for (_, engine) in &extras {
+            let ui = engine
+                .sdk
+                .flat_library_to_path("ui", "")
+                .expect("dart:ui resolves through the embedder");
+            assert_eq!(ui, root.join("sky_engine").join("lib").join("ui").join("ui.dart"));
+            assert_eq!(
+                engine.sdk.flat_library_to_path("core", ""),
+                Some(root.join("sky_engine").join("lib").join("embedder_core.dart")),
+                "full replacement: core comes from the embedder file"
+            );
+        }
+        fs::remove_dir_all(&root).ok();
+
+        // The plain resolution: the same contexts keep the dart-sdk table.
+        let plain = analyze_fixture("daemon_embedder_plain", &[]);
+        write_daemon_context_config(&plain);
+        let plain = plain.canonicalize().expect("root");
+        let (base, _, _) = engine_config_with_advisory(&plain, Some(&plain.join("sdk")))
+            .expect("assembly");
+        let extras = assemble_contexts(&base, &[]).expect("the declared contexts load");
+        assert_eq!(extras.len(), 2);
+        for (_, engine) in &extras {
+            assert_eq!(engine.sdk.flat_library_to_path("ui", ""), None);
+            assert_eq!(
+                engine.sdk.flat_library_to_path("core", ""),
+                Some(plain.join("sdk").join("lib").join("core").join("core.dart")),
+                "the plain dart-sdk core file backs dart:core"
+            );
+        }
+        fs::remove_dir_all(&plain).ok();
     }
 }

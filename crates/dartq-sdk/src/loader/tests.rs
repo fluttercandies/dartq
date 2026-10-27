@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use dartq_language::{Feature, FeatureSet, LanguageVersion};
 
-use super::{parse_allowed_experiments, parse_libraries_json};
+use super::{parse_allowed_experiments, parse_embedder_yaml, parse_libraries_json};
 use crate::metadata::Importability;
 use crate::metadata::UnknownExperiments;
 
@@ -225,6 +225,63 @@ fn unknown_keys_are_tolerated() {
     )
     .expect("unknown keys are ignored");
     assert_eq!(libraries.targets["t"].libraries["x"].uri, "x.dart");
+}
+
+#[test]
+fn embedder_yaml_honors_embedded_libs() {
+    // The real sky_engine shape: quoted dart: keys, relative values,
+    // comments, and extra top-level sections the reader never consults.
+    let libraries = parse_embedder_yaml(
+        r#"# generated
+embedded_libs:
+  "dart:core": "core/core.dart"
+  "dart:ui": "ui/ui.dart"
+  "dart:_http": "_http/http.dart"
+  "not-a-dart-uri": "ignored/ignored.dart"
+embedded_server_libraries:
+  whatever: else
+"#,
+    )
+    .expect("usable embedder yaml parses");
+    // Keys keep only the library name; non-`dart:` keys are dropped
+    // silently (the reader's own rule), `_`-prefixed names stay.
+    assert_eq!(
+        libraries.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["_http", "core", "ui"]
+    );
+    assert_eq!(libraries["ui"].uri, "ui/ui.dart");
+    // No gates on embedder entries — every mapped library answers
+    // `dart.library.<name>` true and imports directly, the `_`-forced-off
+    // rule of libraries.json parsing does not apply.
+    assert!(libraries["_http"].support_conditional_import);
+    assert_eq!(libraries["_http"].support_direct_import, Importability::Always);
+    assert!(libraries["core"].patches.is_empty());
+}
+
+#[test]
+fn embedder_yaml_rejects_unusable_shapes() {
+    for (yaml, needle) in [
+        ("embedded_libs: [not, a, map]\n", "embedded_libs"),
+        ("- just\n- a\n- list\n", "embedder yaml"),
+        ("embedded_libs:\n  \"dart:x\": [\"not\", \"a\", \"path\"]\n", "string"),
+        ("embedded_libs: {}\n", "maps no `dart:`"),
+        (
+            "embedded_libs:\n  \"only:other\": \"x.dart\"\n",
+            "maps no `dart:`",
+        ),
+        (
+            "embedded_libs:\n  \"dart:\": \"x.dart\"\n",
+            "names no library",
+        ),
+        (
+            "embedded_libs:\n  \"dart:x\": \"/absolute/x.dart\"\n",
+            "not a non-empty path relative",
+        ),
+        ("missing_key_entirely: true\n", "embedded_libs"),
+    ] {
+        let err = parse_embedder_yaml(yaml).expect_err(yaml);
+        assert!(err.contains(needle), "`{yaml}` → `{err}`");
+    }
 }
 
 /// The real `allowed_experiments.json` content, verbatim from every SDK on
