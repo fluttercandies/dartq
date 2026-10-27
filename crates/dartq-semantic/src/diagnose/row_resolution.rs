@@ -1163,6 +1163,12 @@ impl<'a> Engine<'a> {
             return recv;
         };
         let read_span = self.promoted_recv_reads[index].1;
+        // An index-result latch keys the `]` token, never a variable read:
+        // the flow rows near it describe the operands, so only the
+        // re-derived face (`rederived_receiver`) answers it.
+        if self.index_result_recvs.contains_key(&read_span.offset) {
+            return recv;
+        }
         // A re-bound local's face is authoritative (#2539): the flow read
         // face still spells the parse-time bind — the staging predates the
         // pass-2 promotion re-decision — so the re-decision below would
@@ -2072,6 +2078,21 @@ impl<'a> Engine<'a> {
         // its member token's end and descends through each record's
         // `recv_span`. Offsets are UTF-16 units, so the token end is the
         // name's UTF-16 length past its offset.
+        // The index-result leg: a folded `recv[i]` result row re-types
+        // through its receiver expression's re-derived face — the fold's
+        // push-time result read the unpromoted receiver. Each hop names a
+        // strictly earlier span (the receiver precedes its `]`), so the
+        // walk terminates.
+        if let Some(&(indexed, null_aware)) = self.index_result_recvs.get(&read_span.offset)
+            && indexed.offset < read_span.offset
+        {
+            let recv_ty = self.recv_expression_ty(indexed)?;
+            return match self.index_result_ty(recv_ty) {
+                Ty::Unknown => None,
+                ty if null_aware => Some(Self::nullable_form(ty)),
+                ty => Some(ty),
+            };
+        }
         let prev = self.chain_node_read(read_span, false)?;
         self.chained_read_static_ty(prev)
     }

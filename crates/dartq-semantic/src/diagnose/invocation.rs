@@ -541,6 +541,26 @@ impl<'a> Engine<'a> {
                         );
                     }
                 }
+                // The index-result candidate: a member folded over a folded
+                // `recv[i]` result row whose receiver is itself re-derivable
+                // (a bare read or a chain link) owes the same pass-2
+                // re-derivation — the fold typed the element from the
+                // receiver's unpromoted face. The latch keys the result
+                // row's own span, the index-result leg of
+                // `recv_expression_face` answers it.
+                if matches!(popped_shape, RowShape::Value)
+                    && !(self.in_cascade && is_section)
+                    && self.index_result_recvs.contains_key(&popped.range.offset)
+                {
+                    let member_offset = member.range.offset;
+                    if let Err(index) = self
+                        .promoted_recv_reads
+                        .binary_search_by(|(row, _)| row.cmp(&member_offset))
+                    {
+                        self.promoted_recv_reads
+                            .insert(index, (member_offset, popped.range));
+                    }
+                }
                 let deferred_receiver = match &popped_shape {
                     RowShape::Bare(BareInfo::Missing { .. }) => {
                         !self.members.primitive_ids.contains(&popped.name)
@@ -1335,6 +1355,8 @@ impl<'a> Engine<'a> {
             // otherwise re-type every link on the stale base declaration.
             let face = if span.length == 0 {
                 derived.get(&span.offset).copied()
+            } else if self.index_result_recvs.contains_key(&span.offset) {
+                self.recv_expression_ty(span)
             } else {
                 self.rebound_read_face(span).or_else(|| self.read_type_at(span))
             };
@@ -6566,6 +6588,21 @@ impl<'a> Engine<'a> {
             && let Some((_, call_ret, _)) = self.implicit_call_face(read)
         {
             self.rows[callee].ty = call_ret;
+        }
+        // A PROMOTED function-typed callee: the bare local's declared face
+        // is the nullable function type, but the flow read at the callee's
+        // span carries the promotion standing there (`if (f != null) return
+        // f();` — the invoked expression is the non-null function), and the
+        // send yields that shape's return exactly as the declared-non-null
+        // callee below. The row's own face must still be a function type
+        // (folded through any alias): a non-function promotion rides the
+        // implicit-call arm above instead.
+        if let Some(row) = self.rows.get(callee)
+            && !row.qualified
+            && let Some(Ty::Function { shape, nullable: false }) = self.read_type_at(row.range)
+            && matches!(self.fold_alias_ty(row.ty), Ty::Function { .. })
+        {
+            self.rows[callee].ty = self.boundary.pool().function_shape(shape).return_ty;
         }
         // A function-typed callee's own shape: the invocation yields the
         // shape's return type (`handler(x)` over `typedef H = String

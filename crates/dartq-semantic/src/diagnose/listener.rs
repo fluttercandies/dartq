@@ -5140,6 +5140,10 @@ impl ParserListener for DiagnoseListener<'_> {
             if shorted {
                 engine.null_aware_members.insert(close.range.offset);
             }
+            let indexed = engine.rows[pos].range;
+            engine
+                .index_result_recvs
+                .insert(close.range.offset, (indexed, question.is_some()));
             engine.push_value_row(close);
             if result_ty != Ty::UNKNOWN
                 && let Some(result) = engine.rows.last_mut()
@@ -8124,6 +8128,33 @@ impl ParserListener for DiagnoseListener<'_> {
                 let ty = self.engine.member_declared_ty(container, name_id);
                 if ty != Ty::UNKNOWN {
                     self.engine.bind_var_type(name_id, ty);
+                }
+                // The flow layer's formal slot takes the same field face:
+                // an untyped `this.p` declares raw-unknown there, so the
+                // initializer list's `p == null || p.isNotEmpty` had no
+                // declared type to promote from.
+                if let Ty::Named {
+                    name: ty_name,
+                    nullable,
+                    args,
+                } = ty
+                {
+                    let lexeme = self.engine.strings.resolve(ty_name).to_string();
+                    let tree = staged_arg_tree(
+                        &self.engine.boundary.args.borrow(),
+                        &self.engine.strings,
+                        args,
+                    )
+                    .unwrap_or_default();
+                    let base = self.flow().intern_name(&lexeme);
+                    self.flow().stage_inferred_local(
+                        name.range.offset,
+                        FlowTy {
+                            base: FlowBase::Name(base),
+                            nullable,
+                        },
+                        tree,
+                    );
                 }
             }
         }

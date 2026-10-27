@@ -322,6 +322,7 @@ impl<'a> Engine<'a> {
             prop_promotion_rows: PropPromotionStaging::default(),
             member_reads: Vec::new(),
             member_recv_tys: FxHashMap::default(),
+            index_result_recvs: FxHashMap::default(),
             call_ends: Vec::new(),
             solved_call_params: FxHashMap::default(),
             send_return_staging: None,
@@ -826,6 +827,19 @@ impl<'a> Engine<'a> {
                         .unwrap_or(check.from),
                 }
             };
+            // A staged invocation operand reads the call's RESULT: a callee
+            // whose function face became non-null only through the
+            // substitution above (`if (_create != null) return _create();`
+            // over a private final `T Function()?` field) still spells the
+            // function type here, so the send's value is the shape's return.
+            if self.invocation_span(check.range).is_some()
+                && let Ty::Function {
+                    shape,
+                    nullable: false,
+                } = self.fold_alias_ty(from)
+            {
+                from = self.boundary.pool().function_shape(shape).return_ty;
+            }
             // The promotion-latched initializer's re-bind (#2539's argument
             // face): an argument read whose local's initializer member row
             // re-derived under a promoted receiver (`var e = t.element` past

@@ -809,7 +809,13 @@ impl<'a> Engine<'a> {
             return None;
         }
         let (entry, name, _origin) = self.member_read_resolution(range.offset)?;
-        Self::promotable_field_entry(self, &entry, name).then_some(self.non_null_face(from))
+        // A promoted field's face drops its `?` whatever the head — a
+        // nullable function or record field promotes like a named one.
+        let promoted = match from {
+            Ty::Function { .. } | Ty::Record { .. } => Self::non_null_form(from),
+            _ => self.non_null_face(from),
+        };
+        Self::promotable_field_entry(self, &entry, name).then_some(promoted)
     }
 
     /// The member entry behind one promotable-shaped read, with its

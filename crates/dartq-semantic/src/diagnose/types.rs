@@ -2982,6 +2982,13 @@ pub(crate) struct Engine<'a> {
     /// through it — the official resolver's chain for every one of these
     /// heads.
     pub(crate) member_recv_tys: FxHashMap<u32, Ty>,
+    /// The folded index reads (`a[i]`, `c.l[i]`): the result row's offset
+    /// (the closing `]`) keyed to the indexed receiver's own span and
+    /// whether the access was null-aware (`?[`). Pass 2 re-derives the
+    /// result face from the receiver expression's re-derived type — a
+    /// promoted or re-bound receiver (`fr[i]` over `var fr = e.fragments`
+    /// past `e is PrefixElement`) indexes its promoted element type.
+    pub(crate) index_result_recvs: FxHashMap<u32, (SourceRange, bool)>,
     /// Receiver classes bound to closure formals by the call-time
     /// inference (the solved callee-own parameter's substituted head —
     /// see [`Engine::closure_param_context_ty`]). A closure formal's
