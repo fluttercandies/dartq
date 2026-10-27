@@ -31,7 +31,9 @@ impl Interp<'_> {
             return;
         }
         match ev {
-            Ev::ObjectPattern { name, args } => self.matched_object_pattern(*name, *args),
+            Ev::ObjectPattern { name, args } => {
+                self.matched_object_pattern(*name, *args, object_fields_irrefutable(_events, _i));
+            }
             Ev::BinaryOrPatternBegin => self.or_pattern_begin(),
             Ev::BinaryOrPatternEnd => self.or_pattern_end(),
             Ev::PatternBegin => {
@@ -59,6 +61,19 @@ impl Interp<'_> {
                         // demotes, the fall-through read is clean). The
                         // pre-split reachable state here would intersect
                         // the promotion away at the chain join.
+                        // The scrutinee expression ends first: the
+                        // null-shorting its own `?.` opened rejoins before
+                        // the pattern context is pushed (official
+                        // `finishNullShorting` at the scrutinee boundary), so
+                        // the receiver's non-null arm never leaks into the
+                        // unmatched chain. Only a completed shorted chain
+                        // row (`chain_base`) flushes: a declaration or
+                        // assignment pattern opens before its value, and
+                        // the row beneath it belongs to an enclosing
+                        // expression whose short must stay open.
+                        if self.exprs.last().is_some_and(|e| e.chain_base.is_some()) {
+                            self.flush_null_shorts_above(self.consumer_base(1));
+                        }
                         self.split_cur();
                         // An if-case's scrutinee expression is on the stack.
                         let popped = self.exprs.pop();
@@ -467,6 +482,10 @@ impl Interp<'_> {
                 // collect pre-pass (the rollback does not cover `pattern`).
                 let declared = self.pending_ty.take().unwrap_or(Ty::UNKNOWN);
                 let declared_args = std::mem::take(&mut self.pending_ty_args);
+                // An untyped `_` at depth 1 leaves the case's unmatched
+                // chain to the semantic layer's chain-start emission — the
+                // flow kill here would duplicate those rows through the
+                // per-statement dead facts.
                 if !self.collecting()
                     && self.pattern_depth == 1
                     && declared != Ty::UNKNOWN
@@ -618,7 +637,7 @@ impl Interp<'_> {
         }
     }
 
-    pub(crate) fn matched_object_pattern(&mut self, name: u32, args: u32) {
+    pub(crate) fn matched_object_pattern(&mut self, name: u32, args: u32, fields_irrefutable: bool) {
         // A top-level pattern constrains the matched value; a field's
         // sub-pattern constrains that field (the official sub-pattern face
         // runs under pushPropertySubpattern) and promotes nothing here.
@@ -642,6 +661,18 @@ impl Interp<'_> {
                 if let Some(pattern) = self.pattern.as_mut() {
                     pattern.unmatched = joined;
                 }
+            }
+            return;
+        }
+        // A `dynamic(...)` head's required type is `dynamic`: every matched
+        // type is its subtype, so the head neither promotes (official
+        // `promoteForPattern` never promotes to a top type) nor fails. A
+        // switch case's live-init chain dies like any other cover when no
+        // property sub-pattern can fail either (`case dynamic(:var t)`);
+        // a refutable field keeps the may-fail arm.
+        if self.names.get(name as usize).is_some_and(|n| &**n == "dynamic") {
+            if fields_irrefutable {
+                self.vacuous_cover_kills_chain();
             }
             return;
         }
@@ -1115,4 +1146,30 @@ impl Interp<'_> {
         }
         unmatched
     }
+}
+
+/// Whether every property sub-pattern of the object pattern closing at
+/// `events[at]` is irrefutable: the field events run between the object's
+/// own `PatternBegin` and its `ObjectPattern` close, and only an untyped
+/// binder (`:var name`, `name: final x`) or a bare wildcard cannot fail
+/// (official `DeclaredVariablePattern`/`WildcardPattern` without a type
+/// annotation match every value). Anything else — a constant, a typed
+/// binder, a nested destructure, a null-check — answers refutable, the
+/// may-fail direction. The walk is bounded by the pattern's own events.
+fn object_fields_irrefutable(events: &[Ev], at: usize) -> bool {
+    let mut depth = 0usize;
+    for ev in events[..at].iter().rev() {
+        match ev {
+            Ev::PatternEnd => depth += 1,
+            Ev::PatternBegin => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            Ev::NoType | Ev::DeclaredVarPattern { .. } | Ev::Wildcard { .. } => {}
+            _ => return false,
+        }
+    }
+    false
 }

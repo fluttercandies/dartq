@@ -181,12 +181,31 @@ impl<'a> Engine<'a> {
 
     /// The climb behind [`Engine::walk_members`]: `skip_own` starts at the
     /// container but excludes its own member map (the `super.member` shape —
-    /// the application classes `S&M2` are still the chain).
+    /// the application classes `S&M2` are still the chain). The super climb
+    /// is a concrete-dispatch lookup first (official `getMember(...,
+    /// forSuper: true)`: an abstract redeclaration on the chain — `mixin M
+    /// on S { T get x; }` — is no dispatch target); when no concrete member
+    /// answers, the inherited lookup (`getInherited`) types the read.
     pub(crate) fn walk_from(
         &self,
         container: StringId,
         member: StringId,
+        skip_own: bool,
+    ) -> Walk<'a> {
+        if skip_own
+            && let found @ Walk::Found(_) = self.walk_climb(container, member, true, true)
+        {
+            return found;
+        }
+        self.walk_climb(container, member, skip_own, false)
+    }
+
+    fn walk_climb(
+        &self,
+        container: StringId,
+        member: StringId,
         mut skip_own: bool,
+        for_super: bool,
     ) -> Walk<'a> {
         let mut name = container;
         // The container whose supertype clauses wrote the current `name` —
@@ -295,7 +314,10 @@ impl<'a> Engine<'a> {
                 );
             };
             at_anchor = false;
-            if !skip_own && let Some(entry) = found.members.get(&member) {
+            if !skip_own
+                && let Some(entry) = found.members.get(&member)
+                && !(for_super && entry.is_abstract)
+            {
                 // F1: the found entry belongs to `found_owner`'s pool —
                 // project it before it flows into rows or message text.
                 self.member_faces
@@ -361,6 +383,7 @@ impl<'a> Engine<'a> {
                 }
                 if let Some((mixin_container, mixin_owner)) = mixin_resolved
                     && let Some(entry) = mixin_container.members.get(&member)
+                    && !(for_super && entry.is_abstract)
                 {
                     // The application-site substitution face: the member
                     // was found through `name`'s `with M<Arg>` edge, so its

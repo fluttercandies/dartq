@@ -2355,6 +2355,28 @@ impl<'a> Engine<'a> {
             ext_invoke: context
                 .filter(|(_, kind)| *kind == ContainerKind::Extension)
                 .map(|(container, _)| self.extension_invoke_target(container)),
+            // The implicit `this` of an extension body over a resolvable
+            // nullable `on` type (`on DartType?`): `ThisLookup` resolves the
+            // name against that potentially nullable receiver, and
+            // `type_property_resolver`'s `isNullable` arm reports the
+            // unchecked access before the lexical fall-through — static
+            // members included (probed: the oracle reports there too). An
+            // invalid `on` head is the `InvalidType` `this` — silent.
+            ext_nullable_this: context.is_some_and(|(container, kind)| {
+                kind == ContainerKind::Extension
+                    && match self.this_static_ty(container, ContainerKind::Extension) {
+                        Ty::Named {
+                            name,
+                            nullable: true,
+                            ..
+                        } => {
+                            self.type_params.contains(&name)
+                                || self.pending_type_params.contains(&name)
+                                || self.type_resolution(name).0 == TypeResolution::Type
+                        }
+                        _ => false,
+                    }
+            }),
             in_exec: self.in_executable(),
             // The constraint-member conservatism (#2186 S2), now the
             // oracle's own decision procedure instead of the blanket skip:
@@ -2544,6 +2566,19 @@ impl<'a> Engine<'a> {
         // as an expression, so its rows drop at the resolution pass.
         if self.conditional_uri_window {
             self.conditional_uri_rows.insert(row.range.offset);
+        }
+        // A case header's type head that resolves to `InvalidType` gates the
+        // open switch's exhaustiveness pass off (`hasInvalidType`). Only a
+        // head counts: `List<Missing>` is an interface type, not Invalid.
+        if self.switch.case_sink_open
+            && self.type_arg_depth == 0
+            && matches!(
+                row.shape,
+                RowShape::TypeUse(TypeVerdict::Missing | TypeVerdict::NonType, _)
+            )
+            && let Some(ctx) = self.switch.switches.last_mut()
+        {
+            ctx.has_invalid_type = true;
         }
         self.rows.push(row);
     }

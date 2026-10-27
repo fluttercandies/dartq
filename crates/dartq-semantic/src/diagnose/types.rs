@@ -261,6 +261,11 @@ pub(crate) enum BareInfo {
         /// `InvalidType`/nullable `this` whose lookup is silent (upstream
         /// `unpromotedThisType` — `extension on Missing` never reports).
         ext_invoke: Option<Option<StringId>>,
+        /// The miss sits inside an `extension` body whose `this` is a
+        /// resolvable nullable type (`on C?`, `on T?`): the implicit-`this`
+        /// lookup (`ThisLookup`) runs the nullable receiver arm and reports
+        /// `unchecked_use_of_nullable_value` at the name.
+        ext_nullable_this: bool,
     },
 }
 
@@ -2926,6 +2931,11 @@ pub(crate) struct Engine<'a> {
     /// Open `??` binary groups: rows-stack mark at `begin_binary_expression`,
     /// for the strictly-non-nullable left operand check at close.
     pub(crate) if_null_groups: Vec<(usize, SourceRange)>,
+    /// Closed `??` expressions' static types, keyed by the right operand
+    /// row's offset (the group's last row) → (left operand row offset,
+    /// `LUB(NonNull(lhs), rhs)`). Only name-decidable joins land here; the
+    /// parenthesized close reads it to type `(a ?? b)`.
+    pub(crate) if_null_results: FxHashMap<u32, (u32, Ty)>,
     /// Completed `==`/`!=` comparison extents: an equality's static type is
     /// `bool`, so an equality that ends exactly at the `??` left operand's
     /// rows makes that operand strictly non-nullable (the dead-coalesce

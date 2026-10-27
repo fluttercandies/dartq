@@ -110,6 +110,12 @@ pub struct Flow<'t> {
     /// the flow's unknown-read arm answers on the real element (a switch
     /// scrutinee over the bare read closes its exhaustiveness verdict).
     staged_this_members: FxHashMap<u32, crate::ty::Ty>,
+    /// Explicit-receiver member reads' declared faces (`d.t`), keyed on
+    /// the member identifier's offset: the semantic layer's merged member
+    /// read resolves the accessor the name-level fold cannot, so a switch
+    /// over the read closes its exhaustiveness verdict. Entries whose
+    /// read never folds are inert (bounded by the unit's member reads).
+    staged_members: FxHashMap<u32, crate::ty::Ty>,
     /// The most recent label-reference identifier (a break/continue
     /// target's name, consumed by the next break/continue event).
     pending_label_ref: Option<u32>,
@@ -297,6 +303,7 @@ impl<'t> Flow<'t> {
             staged_calls: FxHashMap::default(),
             staged_this: FxHashMap::default(),
             staged_this_members: FxHashMap::default(),
+            staged_members: FxHashMap::default(),
             extension_on_head: None,
             in_extension_header: false,
             pending_label_ref: None,
@@ -813,6 +820,15 @@ impl<'t> Flow<'t> {
         self.staged_this_members.insert(token_offset, ty);
     }
 
+    /// Stages one explicit-receiver member read's declared face (the
+    /// [`Flow::stage_this_member_type`] sibling for `recv.name`), keyed on
+    /// the member identifier's offset; adopted by the member-access fold
+    /// when its own answer is the unknown face. Shapes the flow lattice
+    /// cannot spell never arrive (the stager drops them).
+    pub fn stage_member_type(&mut self, member_offset: u32, ty: crate::ty::Ty) {
+        self.staged_members.insert(member_offset, ty);
+    }
+
     /// Records the `handleExit` contract: a subexpression's static type is
     /// Never, so the flow state goes unreachable from the expression's end
     /// (official `FlowAnalysis.handleExit`, flow_analysis.dart:919-925).
@@ -913,6 +929,7 @@ impl<'t> Flow<'t> {
         // at `Ev::This` when the fold's own answer is the unknown face.
         interp.staged_this = &self.staged_this;
         interp.staged_this_members = &self.staged_this_members;
+        interp.staged_members = &self.staged_members;
         // The staged invocation-result types (#2567 R18) — read-only
         // here, adopted at the send fold when its own callee read is an
         // unknown face.

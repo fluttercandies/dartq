@@ -16097,8 +16097,10 @@ fn object_pattern_head_reports_undefined_class() {
 /// F2: switch-expression arm heads — both operands of a logical-or
 /// pattern — report independently; the defined arm stays silent. The
 /// bound variable `x` keeps its ordinary `unused_local_variable` row,
-/// and the open switch keeps its `non_exhaustive_switch_expression`
-/// verdict (a wildcard arm would close it).
+/// and an unresolved case head skips the whole exhaustiveness pass
+/// (the oracle's `hasInvalidType`, constant_verifier.dart:1070), so no
+/// `non_exhaustive_switch_expression` row (a wildcard arm would close
+/// it only over resolvable heads).
 #[test]
 fn switch_expression_arm_heads_report() {
     let source = "class Ok {}\nclass Object {}\nvoid f(Object v) {\n  var r = switch (v) {\n    Missing2(:var x) || Missing3() => 1,\n    Ok() => 2,\n  };\n  return r;\n}";
@@ -16106,10 +16108,6 @@ fn switch_expression_arm_heads_report() {
     assert_eq!(
         code_offsets(&r),
         [
-            (
-                "non_exhaustive_switch_expression",
-                offset_of(source, "switch (v)"),
-            ),
             ("undefined_class", offset_of(source, "Missing2")),
             ("unused_local_variable", offset_of(source, "x)")),
             ("undefined_class", offset_of(source, "Missing3")),

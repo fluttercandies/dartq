@@ -77,7 +77,11 @@ impl SwitchTracker {
     /// Collapses one frame's leaves into the restriction it covers
     /// (`||` unions, `&&` intersects, a bare leaf passes through, a
     /// type-free pattern covers its context).
-    pub(crate) fn collapse(leaves: Vec<Restriction>, or_ops: usize) -> Restriction {
+    pub(crate) fn collapse(
+        world: &NameWorld<'_>,
+        leaves: Vec<Restriction>,
+        or_ops: usize,
+    ) -> Restriction {
         if leaves.is_empty() {
             // A type-free variable/wildcard: the context full space. The
             // context is substituted when the case closes.
@@ -89,7 +93,7 @@ impl SwitchTracker {
         // `&&` joins (or a bare single leaf) intersect at name level.
         leaves
             .into_iter()
-            .reduce(Restriction::and)
+            .reduce(|a, b| a.and_in(world, b))
             .unwrap_or(Restriction::Unknown)
     }
 
@@ -125,6 +129,7 @@ impl SwitchTracker {
             default_pos: None,
             pending_root: None,
             if_case_member_scrutinee: member_scrutinee,
+            has_invalid_type: false,
         });
         self.case_sink_open = true;
         self.if_case_window = true;
@@ -173,6 +178,7 @@ impl SwitchTracker {
             default_pos: None,
             pending_root: None,
             if_case_member_scrutinee: None,
+            has_invalid_type: false,
         });
     }
 
@@ -215,8 +221,20 @@ impl SwitchTracker {
         for field in fields {
             match field.leaves.as_slice() {
                 // A type-free sub-pattern (`var x`, `_`, the `:x` shorthand)
-                // covers the whole column.
-                [] => {}
+                // takes the HEAD's column type (`createVariableSpace` /
+                // the wildcard space over the head's property type): it
+                // covers that column, yet not a subtype whose merged
+                // column is wider (a mixin's `String? value` re-surfacing
+                // over the head's own `String value`). Carried only when
+                // a subtype can widen it, i.e. a non-nullable column.
+                [] => {
+                    if let Some(name) = field.name
+                        && let Some(NameTy::Named(column, false)) = world.member_column(ty, name)
+                        && world.is_known_head(column)
+                    {
+                        carried.push((name, Restriction::Named(column, false)));
+                    }
+                }
                 [leaf] => {
                     let Some(name) = field.name else {
                         expressible = false;
@@ -479,6 +497,11 @@ pub(crate) struct SwitchCtx {
     /// re-derives — the nearest-earlier member read would be a stale,
     /// unrelated face.
     pub(crate) if_case_member_scrutinee: Option<SourceRange>,
+    /// A case pattern's type head resolved to `InvalidType` (an
+    /// unresolvable or non-type name): the official `hasInvalidType` gate
+    /// (constant_verifier.dart:1070, set by `createStaticType`) skips the
+    /// whole reachability/covering pass.
+    pub(crate) has_invalid_type: bool,
 }
 
 /// One open `begin_pattern`..`end_pattern` bracket: the leaf restrictions
@@ -584,6 +607,31 @@ impl Restriction {
             return self;
         }
         Restriction::Unknown
+    }
+
+    /// `&&`-conjunction with the subtype lattice: two type tests intersect
+    /// to the narrower one when one subtypes the other, and a type-free
+    /// operand (`var x`, `_`: the context's full space) is the identity
+    /// (official `_createSingleSpaceIntersection`, upstream Dart SDK source,
+    /// pkg/_fe_analyzer_shared/lib/src/exhaustiveness/shared.dart:975-1009).
+    /// Every other pair keeps [`Self::and`]'s answer.
+    pub(crate) fn and_in(self, world: &NameWorld<'_>, other: Restriction) -> Restriction {
+        let as_ty = |r: &Restriction| match *r {
+            Restriction::Named(name, nullable) => Some(NameTy::Named(name, nullable)),
+            Restriction::NamedArgs(name, nullable, args) => {
+                Some(NameTy::NamedArgs(name, nullable, args))
+            }
+            _ => None,
+        };
+        match (&self, &other) {
+            (Restriction::NamedContext, _) => other,
+            (_, Restriction::NamedContext) => self,
+            _ => match (as_ty(&self), as_ty(&other)) {
+                (Some(a), Some(b)) if world.is_subtype_of(&a, &b) => self,
+                (Some(a), Some(b)) if world.is_subtype_of(&b, &a) => other,
+                _ => self.and(other),
+            },
+        }
     }
 }
 
@@ -1311,22 +1359,84 @@ impl<'a> NameWorld<'a> {
     /// taken by a method or setter is no property; a cyclic hierarchy
     /// terminates on the visited set.
     pub(crate) fn member_column(&self, head: StringId, member: StringId) -> Option<NameTy> {
-        let mut current = head;
-        let mut seen = rustc_hash::FxHashSet::default();
-        while seen.insert(current) {
-            let container = self.container(current)?;
-            if let Some(entry) = container.members.get(&member)
-                && !entry.is_static
-            {
-                return match entry.kind {
-                    MemberKind::Field => Some(NameTy::from_semantic(entry.var_ty)),
-                    MemberKind::Getter => Some(NameTy::from_semantic(entry.return_ty)),
-                    _ => None,
-                };
-            }
-            current = container.superclass?;
+        let mut memo = FxHashMap::default();
+        self.member_column_in(head, member, &mut memo).flatten()
+    }
+
+    /// [`Self::member_column`] over the official field-type merge
+    /// (`_getInterfaceFieldTypes`, upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/generated/exhaustiveness.dart:382-414): an own
+    /// declaration wins; otherwise every supertype's merged table is added
+    /// in `allSupertypes` order and the LAST one naming the member wins —
+    /// so a mixin's `String? value` reached after the superclass replaces
+    /// the superclass's `String value`. The outer `Option` is "the table
+    /// names the member", the inner the member's property face (`None` for
+    /// a method/setter name). `memo` bounds the walk to one visit per name
+    /// (and breaks hierarchy cycles).
+    fn member_column_in(
+        &self,
+        head: StringId,
+        member: StringId,
+        memo: &mut FxHashMap<StringId, Option<Option<NameTy>>>,
+    ) -> Option<Option<NameTy>> {
+        if let Some(hit) = memo.get(&head) {
+            return *hit;
         }
-        None
+        memo.insert(head, None);
+        let container = self.container(head)?;
+        let answer = if let Some(entry) = container.members.get(&member)
+            && !entry.is_static
+        {
+            Some(match entry.kind {
+                MemberKind::Field => Some(NameTy::from_semantic(entry.var_ty)),
+                MemberKind::Getter => Some(NameTy::from_semantic(entry.return_ty)),
+                _ => None,
+            })
+        } else {
+            self.all_supertypes(head)
+                .into_iter()
+                .rev()
+                .find_map(|sup| self.member_column_in(sup, member, memo))
+        };
+        memo.insert(head, answer);
+        answer
+    }
+
+    /// The `allSupertypes` order of `name` (`ClassHierarchy._getHierarchy`,
+    /// upstream Dart SDK source,
+    /// pkg/analyzer/lib/src/dart/element/class_hierarchy.dart:39-97): each
+    /// direct supertype (superclass, `on` constraints, interfaces, mixins —
+    /// in that order) followed by its own `allSupertypes`, deduplicated by
+    /// first insertion.
+    fn all_supertypes(&self, name: StringId) -> Vec<StringId> {
+        let mut order: Vec<StringId> = Vec::new();
+        let mut seen = rustc_hash::FxHashSet::default();
+        seen.insert(name);
+        self.append_supertypes(name, &mut order, &mut seen);
+        order
+    }
+
+    fn append_supertypes(
+        &self,
+        name: StringId,
+        order: &mut Vec<StringId>,
+        seen: &mut rustc_hash::FxHashSet<StringId>,
+    ) {
+        let Some(container) = self.container(name) else {
+            return;
+        };
+        let direct = container
+            .superclass
+            .iter()
+            .chain(container.on_clause.iter())
+            .chain(container.implements_clause.iter())
+            .chain(container.with_clause.iter());
+        for &sup in direct {
+            if seen.insert(sup) {
+                order.push(sup);
+                self.append_supertypes(sup, order, seen);
+            }
+        }
     }
 
     /// The witness/diagnostic text for a static type.

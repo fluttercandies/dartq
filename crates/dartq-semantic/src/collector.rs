@@ -842,6 +842,85 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         Some(self.type_args.named(self.strings.intern(head), false, &args))
     }
 
+    /// The face of an unannotated declarator whose initializer is an
+    /// unnamed-constructor creation — `static final _re = RegExp(r'…');`
+    /// declares `RegExp` (the creation's static type is the class itself).
+    /// The same byte-scan posture as [`Self::typed_literal_initializer_ty`]:
+    /// a single capitalized identifier (optionally after `const`/`new`)
+    /// directly followed by a balanced argument group that ends the
+    /// declarator (`;`/`,`). Named constructors and static calls
+    /// (`Foo.parse(…)` may return anything), written or inferred type
+    /// arguments, and every other shape keep the unknown face. A head the
+    /// scope resolves to a non-class or a generic class is filtered at the
+    /// use site ([`Engine::typed_local`]'s consumers treat an unprovable
+    /// head as silent).
+    fn creation_initializer_ty(&self, name_end: u32) -> Option<Ty> {
+        let bytes = self.source.as_bytes();
+        let mut i = name_end as usize;
+        Self::skip_literal_ws(bytes, &mut i);
+        if bytes.get(i) != Some(&b'=') || bytes.get(i + 1) == Some(&b'=') {
+            return None;
+        }
+        i += 1;
+        Self::skip_literal_ws(bytes, &mut i);
+        for keyword in ["const", "new"] {
+            if bytes.get(i..i + keyword.len()) == Some(keyword.as_bytes())
+                && bytes
+                    .get(i + keyword.len())
+                    .is_some_and(|b| b.is_ascii_whitespace())
+            {
+                i += keyword.len();
+                Self::skip_literal_ws(bytes, &mut i);
+                break;
+            }
+        }
+        let start = i;
+        if !bytes.get(start).is_some_and(u8::is_ascii_uppercase) {
+            return None;
+        }
+        while bytes
+            .get(i)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            i += 1;
+        }
+        let head = std::str::from_utf8(&bytes[start..i]).ok()?;
+        if bytes.get(i) != Some(&b'(') {
+            return None;
+        }
+        // The argument group: bracket-balanced, string contents skipped.
+        let mut depth = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                b'\'' | b'"' => {
+                    let quote = bytes[i];
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != quote {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if depth != 0 {
+            return None;
+        }
+        Self::skip_literal_ws(bytes, &mut i);
+        if !matches!(bytes.get(i), Some(b';' | b',')) {
+            return None;
+        }
+        Some(Ty::named(self.strings.intern(head)))
+    }
+
     fn skip_literal_ws(bytes: &[u8], i: &mut usize) {
         while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
             *i += 1;
@@ -2323,6 +2402,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                         && let Some(inferred) = builder
                             .numeric_initializer_ty(range.end())
                             .or_else(|| builder.typed_literal_initializer_ty(range.end()))
+                            .or_else(|| builder.creation_initializer_ty(range.end()))
                     {
                         ty = inferred;
                     }

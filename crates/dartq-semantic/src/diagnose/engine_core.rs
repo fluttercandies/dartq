@@ -303,6 +303,7 @@ impl<'a> Engine<'a> {
             catch_params: 0,
             try_clauses: Vec::new(),
             if_null_groups: Vec::new(),
+            if_null_results: FxHashMap::default(),
             eq_spans: Vec::new(),
             condition_staged: Vec::new(),
             bool_decided: Vec::new(),
@@ -2526,6 +2527,21 @@ impl<'a> Engine<'a> {
             }
         }
         true
+    }
+
+    /// Whether the bytes in `start..end` spell exactly one plain `=`
+    /// (whitespace around it) — the gap between a write target and its
+    /// right side in a simple assignment expression.
+    pub(crate) fn plain_assign_between(&self, start: u32, end: u32) -> bool {
+        let mut seen = false;
+        for at in start..end {
+            match self.byte_at(at) {
+                Some(b' ' | b'\t' | b'\n' | b'\r') => {}
+                Some(b'=') if !seen => seen = true,
+                _ => return false,
+            }
+        }
+        seen
     }
 
     pub(crate) fn ifnull_initializer_ty(&mut self, mark: usize) -> Option<Ty> {

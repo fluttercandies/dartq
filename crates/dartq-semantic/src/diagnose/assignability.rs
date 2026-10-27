@@ -23,7 +23,23 @@ impl<'a> Engine<'a> {
             .rev()
             .find(|(range, _)| range.end() <= left.range.offset)
             .copied()?;
-        if !matches!(self.type_resolution(name), (TypeResolution::Type, _)) {
+        // The type-use must close the group itself: only the nullable
+        // suffix, whitespace and `>` may separate it from the bracket. A
+        // group spelling no type-use row (`<void Function()?>[]`) would
+        // otherwise borrow an unrelated earlier name as its element.
+        let name_end = self.byte_of(name_range.end()).min(cursor);
+        if !bytes[name_end..cursor]
+            .iter()
+            .all(|&b| b == b'?' || b == b'>' || b.is_ascii_whitespace())
+        {
+            return None;
+        }
+        // An unresolvable element head still types the literal: the oracle's
+        // `List<InvalidType>` keeps the `List` face (a closure formal over
+        // its members infers `Object?` from the invalid argument, the walk a
+        // declared `List<Und>` takes). A non-type element keeps the opaque
+        // row.
+        if matches!(self.type_resolution(name), (TypeResolution::NonType, _)) {
             return None;
         }
         // The written element's own nullability (`<String?>[…]`): the
@@ -985,11 +1001,26 @@ impl<'a> Engine<'a> {
                             self.walk_members(container, row.name)
                         };
                         let recv = recv.clone();
+                        // The declaring container of the found member (the
+                        // climb's origin): an inherited accessor (`first`
+                        // declared on `ListMixin<E>`) instantiates against
+                        // the receiver viewed as that container, the same
+                        // `asInstanceOf` env the send solver reads.
+                        let declaring = self.member_faces.last_origin().unwrap_or(container);
                         match found {
                             Walk::Found(entry)
                                 if matches!(entry.kind, MemberKind::Getter | MemberKind::Field) =>
                             {
-                                self.instantiate_accessor_static(container, &recv, answer(&entry))
+                                let declared = answer(&entry);
+                                let inherited = match &recv {
+                                    Receiver::Typed { ty, .. } if declaring != container => self
+                                        .member_recv_env(*ty, declaring, &entry)
+                                        .and_then(|env| self.subst_params(declared, &env)),
+                                    _ => None,
+                                };
+                                inherited.unwrap_or_else(|| {
+                                    self.instantiate_accessor_static(container, &recv, declared)
+                                })
                             }
                             _ => self
                                 .core_accessor_read_ty(row, container, &recv)
@@ -3116,7 +3147,7 @@ impl<'a> Engine<'a> {
         // push-time latch leaves `Unknown` exactly here: no row, or a row
         // whose declared type never resolved — the "complex scrutinee"
         // blind spot, now a clean whole-check suppression.)
-        if ctx.scrutinee == Ty::Unknown {
+        if ctx.scrutinee == Ty::Unknown || ctx.has_invalid_type {
             return;
         }
         // A record- or function-typed scrutinee joins the name-level

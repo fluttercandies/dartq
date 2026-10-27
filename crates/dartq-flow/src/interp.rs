@@ -511,6 +511,13 @@ pub(crate) struct Expr {
     /// silent while the extension's bare `foo is String` deads its
     /// else).
     pub non_reference_invalid: bool,
+    /// A property read whose target chain is rooted at a flow reference
+    /// (a local, `this`, an implicit-`this` member): the official
+    /// `propertyGet` hands such a read a property reference
+    /// (`ExpressionPropertyTarget` versions chain through
+    /// `_PropertyReference`, flow_analysis.dart:7772-7800), so an `is`
+    /// test on it never takes the non-reference literal folds.
+    pub ref_chain: bool,
 }
 
 impl Expr {
@@ -530,6 +537,7 @@ impl Expr {
             chain_base: None,
             literal: false,
             non_reference_invalid: false,
+            ref_chain: false,
         }
     }
 
@@ -549,6 +557,7 @@ impl Expr {
             chain_base: None,
             literal: false,
             non_reference_invalid: false,
+            ref_chain: false,
         }
     }
 
@@ -911,6 +920,11 @@ pub(crate) struct Interp<'o> {
     /// unresolved bare read's declared element, adopted at `Ev::Ident`'s
     /// unknown-read arm.
     pub(crate) staged_this_members: &'o FxHashMap<u32, crate::ty::Ty>,
+    /// Explicit-receiver member reads' declared faces keyed on the member
+    /// identifier's offset (the recorder's `stage_member_type`), adopted
+    /// by the member-access fold over its unknown face. Read-only for the
+    /// replay.
+    pub(crate) staged_members: &'o FxHashMap<u32, crate::ty::Ty>,
     /// The staged invocation-result types the semantic layer resolved for
     /// this unit (#2567 R18), beside their written-argument arena index,
     /// keyed on the callee identifier token's offset — adopted at
@@ -1251,6 +1265,7 @@ impl<'o> Interp<'o> {
             unresolved_writes: FxHashSet::default(),
             staged_this: &NO_STAGED_THIS,
             staged_this_members: &NO_STAGED_THIS,
+            staged_members: &NO_STAGED_THIS,
             staged_calls: &NO_STAGED_CALLS,
             names: &NO_NAMES,
             reach: ReachArena::new(),
@@ -1859,6 +1874,19 @@ impl<'o> Interp<'o> {
             && let Some(boundary) = self.boundaries.get(id as usize).copied().flatten()
         {
             return boundary.class;
+        }
+        // `T?` over an invalid bound is null-or-equivalent: `T? <: Null`
+        // iff `T <: Null` iff `B <: Null`, vacuously true for an invalid
+        // `B` (subtype.dart:274) — a `?.` on it never runs its access and
+        // a `!= null` test deads its then arm, exactly the oracle's rows.
+        if t.nullable
+            && let Base::Name(id) = t.base
+            && let Some(boundary) = self.boundaries.get(id as usize).copied().flatten()
+            && self
+                .ops
+                .is_invalid_typed(boundary.bound.0, boundary.bound.1, self.args, self.names)
+        {
+            return Classification::NullOrEquivalent;
         }
         self.ops.classify(t)
     }

@@ -781,13 +781,15 @@ impl<'a> Engine<'a> {
                             *prefix,
                             popped.name,
                         )
-                        && matches!(resolved.kind, ContainerKind::Class)
-                        // The bare spelling must name the SAME declaration
-                        // (or nothing) in this scope: the typed receiver
-                        // carries no owner, so a same-named local class
+                        && matches!(resolved.kind, ContainerKind::Class) =>
+                    {
+                        // The typed receiver carries no owner, so the bare
+                        // spelling must name the SAME declaration (or
+                        // nothing) in this scope; a same-named local class
                         // (`Link` of the file-system API beside `io.Link`)
-                        // would answer the walk instead.
-                        && resolve_container(
+                        // keeps the dot-joined head, which the member walk
+                        // resolves through the prefix's table.
+                        let head = if resolve_container(
                             self.graph,
                             self.namespaces,
                             self.index,
@@ -795,12 +797,20 @@ impl<'a> Engine<'a> {
                             self.file,
                             popped.name,
                         )
-                        .is_none_or(|(local, _)| std::ptr::eq(local, resolved)) =>
-                    {
-                        
+                        .is_none_or(|(local, _)| std::ptr::eq(local, resolved))
+                        {
+                            popped.name
+                        } else {
+                            let joined = format!(
+                                "{}.{}",
+                                self.strings.resolve(*prefix),
+                                self.strings.resolve(popped.name)
+                            );
+                            self.intern(&joined)
+                        };
                         Receiver::Typed {
-                            type_name: popped.name,
-                            ty: Ty::named(popped.name),
+                            type_name: head,
+                            ty: Ty::named(head),
                         }
                     }
                     RowShape::Member {
@@ -1391,10 +1401,27 @@ impl<'a> Engine<'a> {
             let Walk::Found(entry) = self.walk_members(name, read.name) else {
                 continue;
             };
+            let declaring = self.member_faces.last_origin().unwrap_or(name);
             let result = match entry.kind {
                 MemberKind::Field => self.fold_alias_ty(entry.var_ty),
                 _ => self.fold_alias_ty(entry.return_ty),
             };
+            // The settled result carries the receiver's instantiation (the
+            // official `_executeGetter` face): `List<Tk>.first` reads `Tk`,
+            // never the declaration's raw `E` — an inherited member reads
+            // the receiver viewed as the declaring container. An
+            // uninstantiable face keeps no derived entry (under-report).
+            let recv = Receiver::Typed {
+                type_name: name,
+                ty: face,
+            };
+            let result = match self.member_recv_env(face, declaring, &entry) {
+                Some(env) => self.subst_params(result, &env).unwrap_or(Ty::UNKNOWN),
+                None => self.instantiate_accessor_static(name, &recv, result),
+            };
+            if result == Ty::UNKNOWN {
+                continue;
+            }
             derived.insert(read.offset, result);
         }
     }

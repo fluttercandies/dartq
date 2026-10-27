@@ -466,9 +466,10 @@ impl<'a> Engine<'a> {
     /// equality comparison as the whole left operand counts too: its
     /// static type is `bool` (`x != null ?? false`).
     pub(crate) fn end_if_null(&mut self) {
-        let Some((mark, _op_range)) = self.if_null_groups.pop() else {
+        let Some((mark, op_range)) = self.if_null_groups.pop() else {
             return;
         };
+        self.stage_if_null_result(mark, op_range);
         let mut lhs_is_bool_comparison = false;
         if let Some(eq) = self.eq_spans.last().copied() {
             // The comparison's own extent: its two operand rows — the eq
@@ -514,6 +515,53 @@ impl<'a> Engine<'a> {
             let range = rhs.range;
             self.stage_usage(SemanticCode::DeadNullAwareExpression, range, "");
         }
+    }
+
+    /// The closed `??`'s static type (`resolveIfNull`, upstream Dart SDK
+    /// source, pkg/analyzer/lib/src/dart/resolver/
+    /// binary_expression_resolver.dart: `LUB(NonNull(T1), T2)`), staged
+    /// for the parenthesized close. Only the plain two-row shape (one left
+    /// operand row, one right operand row) is read; the join answers when
+    /// the heads are equal or one names a declared supertype of the other
+    /// (the LUB is then that supertype); every other pair stays untyped.
+    fn stage_if_null_result(&mut self, mark: usize, op_range: SourceRange) {
+        if mark == 0 || self.rows.len() != mark + 1 {
+            return;
+        }
+        let lhs = &self.rows[mark - 1];
+        let rhs = &self.rows[mark];
+        if lhs.range.end() > op_range.offset || rhs.range.offset < op_range.end() {
+            return;
+        }
+        let (
+            Ty::Named {
+                name: l, args: la, ..
+            },
+            rt @ Ty::Named {
+                name: r,
+                nullable: rn,
+                ..
+            },
+        ) = (self.receiver_static_ty(lhs), self.receiver_static_ty(rhs))
+        else {
+            return;
+        };
+        let world = self.name_world();
+        let joined = if l == r {
+            rt
+        } else if world.named_sub(r, l) {
+            Ty::Named {
+                name: l,
+                nullable: rn,
+                args: la,
+            }
+        } else if world.named_sub(l, r) {
+            rt
+        } else {
+            return;
+        };
+        self.if_null_results
+            .insert(rhs.range.offset, (lhs.range.offset, joined));
     }
 
     /// `handle_assignment_expression` for `??=`: the target's read type
@@ -1088,13 +1136,20 @@ impl<'a> Engine<'a> {
         // freezes the stale schema entry. Record the ingredients; the
         // re-bind pass recomputes the schema over the re-derived link
         // face and corrects the formal's reads through the same
-        // `rebound_locals` map the var re-binds ride.
-        if let (Some(below), Some(parse_ty)) = (below_span, schema)
+        // `rebound_locals` map the var re-binds ride. A formal pass 1 could
+        // not solve because the below receiver itself was unclassifiable (a
+        // promoted receiver — `if (x is C) x.items.map((e) => …)`) defers
+        // with the `Unknown` face: pass 2 re-derives the receiver and the
+        // oracle's downward inference stands. A classified receiver whose
+        // schema stayed `dynamic` (horizontal inference fixed the callee's
+        // own parameter) keeps that verdict.
+        if let Some(below) = below_span
+            && (schema.is_some() || matches!(recv, Receiver::Unknown))
             && let Some(decl) = self.locals.last().filter(|decl| decl.name == name)
         {
             self.deferred_closure_formals.push(DeferredClosureFormal {
                 decl_offset: decl.range.offset,
-                parse_ty,
+                parse_ty: schema.unwrap_or(Ty::UNKNOWN),
                 callee_name,
                 slot,
                 formal,
@@ -1757,7 +1812,7 @@ impl<'a> Engine<'a> {
     /// other shape (an unresolvable head, an invalid argument, the
     /// bottom/`void` faces) refuses the substitution — the under-report
     /// posture: no invented types.
-    fn schema_type_is_decidable(&self, ty: Ty) -> bool {
+    pub(crate) fn schema_type_is_decidable(&self, ty: Ty) -> bool {
         match ty {
             Ty::Dynamic => true,
             Ty::Named { name, args, .. } => {
@@ -2227,7 +2282,7 @@ impl<'a> Engine<'a> {
     }
 
     /// The `Object?` recovery type (`_typeSystem.objectQuestion`).
-    fn object_question(&self) -> Ty {
+    pub(crate) fn object_question(&self) -> Ty {
         Ty::Named {
             name: self.intern("Object"),
             nullable: true,
@@ -2278,7 +2333,7 @@ impl<'a> Engine<'a> {
     /// Every written type argument names a type — the oracle's argument
     /// walk: one unresolvable head makes the whole written type
     /// `InvalidType`.
-    fn args_are_types(&self, args: ArgListId) -> bool {
+    pub(crate) fn args_are_types(&self, args: ArgListId) -> bool {
         self.boundary.pool().get(args).iter().all(|arg| match *arg {
             Ty::Named {
                 name,
@@ -2537,11 +2592,16 @@ impl<'a> Engine<'a> {
         // return instantiates with the receiver's written arguments (the
         // anchor's own parameters — an inherited entry's environment is the
         // supertype's, and a wrong substitution must not form: leftover
-        // unprovable names fail the decidability gate below).
+        // unprovable names fail the decidability gate below). A field's
+        // implicit getter answers its declared type the same way.
         if let Walk::Found(entry) = self.walk_members(*type_name, row.name)
-            && entry.kind == MemberKind::Getter
+            && matches!(entry.kind, MemberKind::Getter | MemberKind::Field)
         {
-            let ret = self.fold_alias_ty(entry.return_ty);
+            let ret = self.fold_alias_ty(if entry.kind == MemberKind::Field {
+                entry.var_ty
+            } else {
+                entry.return_ty
+            });
             let Ty::Named { name, nullable, .. } = ret else {
                 return Receiver::Unknown;
             };

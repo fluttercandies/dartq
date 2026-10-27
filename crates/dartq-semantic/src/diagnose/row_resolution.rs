@@ -430,6 +430,28 @@ impl<'a> Engine<'a> {
             };
             let read = self.member_reads[index];
             let recv = self.rederived_receiver(member_offset, read.recv);
+            // An unlatched chain link (`ce.fragments.firstWhere(...)` over a
+            // re-bound `ce`) keeps its merge-time face in the record; the
+            // receiver expression re-derives through the re-bound head, so
+            // its face wins when it refines the same container
+            // (`List<CFrag>` over `List<Frag>`).
+            let recv = match (recv, self.recv_expression_ty(read.recv_span)) {
+                (
+                    Receiver::Typed {
+                        type_name,
+                        ty: Ty::Named { name, nullable, .. },
+                    },
+                    Some(face @ Ty::Named {
+                        name: face_name,
+                        nullable: face_nullable,
+                        ..
+                    }),
+                ) if name == face_name && nullable == face_nullable => Receiver::Typed {
+                    type_name,
+                    ty: face,
+                },
+                (recv, _) => recv,
+            };
             let Receiver::Typed { ty: recv_ty, .. } = recv else {
                 continue;
             };
@@ -578,9 +600,23 @@ impl<'a> Engine<'a> {
         // callee — `rebound.fragments.where((f) => f.isComplete)` — freezes
         // the stale schema entry at pass 1), and the corrected entry joins
         // the same `rebound_locals` map the var re-binds ride, so every
-        // read of the formal re-derives through the re-bound face.
-        let deferred_formals = std::mem::take(&mut self.deferred_closure_formals);
-        for entry in deferred_formals {
+        // read of the formal re-derives through the re-bound face. A formal
+        // pass 1 left unsolved re-derives later, after the flow-blind
+        // locals' initializer pre-pass in [`Self::resolve_rows`]: its below
+        // receiver is often such a local (`var n = d.name; if (n != null)
+        // n.tokens.map((e) => …)`).
+        let (unsolved, solved): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.deferred_closure_formals)
+                .into_iter()
+                .partition(|entry| entry.parse_ty == Ty::UNKNOWN);
+        self.deferred_closure_formals = unsolved;
+        self.apply_deferred_closure_formals(solved);
+    }
+
+    /// [`Self::apply_deferred_rebinds`]' closure-formal leg: each entry's
+    /// schema recomputes over the re-derived below receiver.
+    fn apply_deferred_closure_formals(&mut self, entries: Vec<DeferredClosureFormal>) {
+        for entry in entries {
             let Some(face) = self.recv_expression_ty(entry.below) else {
                 continue;
             };
@@ -600,9 +636,47 @@ impl<'a> Engine<'a> {
             else {
                 continue;
             };
+            // An unsolved pass-1 formal accepts only a decided re-derived
+            // entry: a provable named type, or the `Object?` recovery of an
+            // invalid element argument the receiver itself spells (`List<Und>`
+            // — the face the pass-1 bind gives an unpromoted receiver). A
+            // leaked type-parameter spelling or a callee-own fresh parameter
+            // (`Object?` over a valid receiver) is the horizontal-inference
+            // face pass 2 cannot see, and the unsolved `dynamic` stands.
+            if entry.parse_ty == Ty::UNKNOWN {
+                let decided = match corrected {
+                    Ty::Named { name, nullable: false, args } => {
+                        self.named_type_is_type(name) && self.args_are_types(args)
+                    }
+                    ty if ty == self.object_question() => self
+                        .receiver_first_type_arg(face)
+                        .is_some_and(|arg| match arg {
+                            // An undeclared head (the unresolvable import's
+                            // element) — never a raw stub's leaked parameter
+                            // spelling (`Iterable<V>`), which any graph unit
+                            // or the core parameter table names.
+                            Ty::Named { name, .. } => {
+                                !self.named_type_is_type(name)
+                                    && self.graph.declaring_libraries(name).is_empty()
+                                    && !crate::member_face::CORE_CONTAINER_PARAMS.iter().any(
+                                        |(_, params)| {
+                                            params.contains(&self.strings.resolve(name))
+                                        },
+                                    )
+                            }
+                            _ => false,
+                        }),
+                    _ => false,
+                };
+                if !decided {
+                    continue;
+                }
+            }
             // The same narrowing gate the var re-binds apply: the schema
-            // entry must narrow the frozen pass-1 face, never widen it.
+            // entry must narrow the frozen pass-1 face, never widen it. An
+            // unsolved pass-1 formal (`Unknown`) takes the re-derived entry.
             let narrows = match (corrected, entry.parse_ty) {
+                (_, Ty::UNKNOWN) => true,
                 (
                     Ty::Named {
                         name: c_head,
@@ -750,6 +824,10 @@ impl<'a> Engine<'a> {
                 self.init_derived_types.borrow_mut().insert(decl, ty);
             }
         }
+        // The pass-1-unsolved closure formals re-derive over the locals'
+        // initializer faces just staged.
+        let unsolved = std::mem::take(&mut self.deferred_closure_formals);
+        self.apply_deferred_closure_formals(unsolved);
         // The fold-deferred rows interleave by offset: their emissions keep
         // the report's source order (later merges assume it).
         let mut index = 0usize;
@@ -1524,6 +1602,7 @@ impl<'a> Engine<'a> {
                 in_exec,
                 on_opaque,
                 ext_invoke,
+                ext_nullable_this,
             } => {
                 // Mixin `on` constraints and extension `on` types are
                 // invisible to the model: inside their instance members a
@@ -1531,6 +1610,17 @@ impl<'a> Engine<'a> {
                 if on_opaque {
                     self.record_miss(row.name, row.range, false, use_kind_of(&row.intent));
                     return;
+                }
+                // The nullable implicit `this` (`extension on C?`): the
+                // `ThisLookup` arm reports the unchecked access at the name
+                // first; the lexical miss below still reports for a read
+                // (`undefined_identifier`), an invocation's own miss is
+                // silent (the nullable `ext_invoke` host).
+                if ext_nullable_this
+                    && !Self::synthetic_reference(row.range)
+                    && !self.keyword_bare_reference(row.range)
+                {
+                    self.emit_corrected(SemanticCode::UncheckedUseOfNullableValue, row.range, name_text);
                 }
                 match row.intent {
                     Intent::Invoke => {
@@ -2165,7 +2255,7 @@ impl<'a> Engine<'a> {
 
     /// The staged member-read record whose member token ENDS the span — the
     /// chain node `read_span` names (`skip_bang`: past a trailing `!`).
-    fn chain_node_read(&self, read_span: SourceRange, skip_bang: bool) -> Option<&MemberRead> {
+    pub(crate) fn chain_node_read(&self, read_span: SourceRange, skip_bang: bool) -> Option<&MemberRead> {
         let mut end = read_span.offset + read_span.length;
         let src = self.source.as_bytes();
         while skip_bang && end > read_span.offset && src.get(end as usize - 1) == Some(&b'!') {
@@ -2262,7 +2352,7 @@ impl<'a> Engine<'a> {
         };
         let mut ty = self.receiver_static_ty(&row);
         if ty == Ty::UNKNOWN
-            && let Some(ext) = self.extension_accessor_ty(recv_ty, read.name)
+            && let Some(ext) = self.extension_accessor_ty(recv_ty, read.name, false)
         {
             
             ty = ext;
@@ -2281,6 +2371,14 @@ impl<'a> Engine<'a> {
             name.chars().map(char::len_utf16).sum::<usize>() as u32
         };
         let invoked = self.byte_at(read.offset + units) == Some(b'(');
+        // An applied extension METHOD's send types as its instantiated
+        // return (`l.elementAtOrNull(0)` reads `Tk?`), no implicit call.
+        if ty == Ty::UNKNOWN
+            && invoked
+            && let Some(ret) = self.extension_accessor_ty(recv_ty, read.name, true)
+        {
+            return Some(ret);
+        }
         let ty = if invoked && !self.is_never_ty(ty) {
             match self.implicit_call_face(ty) {
                 Some((_, call_ret, _)) => call_ret,
@@ -3472,7 +3570,34 @@ impl<'a> Engine<'a> {
             );
             return;
         }
-        let Some(kind) = self.container_kind_of(container) else {
+        // A receiver head that arrived through a foreign member signature
+        // (never spelled in this scope) takes its kind from the declaring
+        // user library the member walk re-anchored on — the walk already
+        // decided the clean miss there. SDK heads keep the external-root
+        // face below (their element model is a stub).
+        let foreign_kind = || {
+            // The receiver link must itself be typed: a head read off an
+            // Unknown-receiver send (`f.m()` over an untyped closure
+            // formal) is the name-level fallback's guess, not a resolved
+            // signature.
+            let link_typed = self
+                .member_reads
+                .binary_search_by(|read| read.offset.cmp(&row.range.offset))
+                .ok()
+                .and_then(|index| {
+                    self.chain_node_read(self.member_reads[index].recv_span, true)
+                })
+                .is_none_or(|prev| !matches!(prev.recv, Receiver::Unknown));
+            if !link_typed {
+                return None;
+            }
+            let (file, lib) = self.unique_declared_elsewhere(container, self.lib)?;
+            if self.graph.uri(lib).starts_with("dart:") {
+                return None;
+            }
+            self.index.get(file)?.container(container).map(|c| c.kind)
+        };
+        let Some(kind) = self.container_kind_of(container).or_else(foreign_kind) else {
             // The external-root face: an unindexable receiver type (the
             // core primitives in the CLI world, an undeclared name in the
             // bare unit) decides through the core member table — the
@@ -4492,14 +4617,19 @@ impl<'a> Engine<'a> {
         // arguments cannot match (a different concrete element) never
         // applies; disagreement among the viable faces stays the
         // under-report (`None`).
-        self.extension_accessor_ty(receiver_ty, row.name)
+        self.extension_accessor_ty(receiver_ty, row.name, false)
     }
 
     /// The declared accessor face an accessible extension gives `member`
     /// on `receiver_ty`, over the already-filled extension pool (`None`
     /// before the fill): every viable declarer must instantiate to the
     /// same answer.
-    pub(crate) fn extension_accessor_ty(&self, receiver_ty: Ty, member: StringId) -> Option<Ty> {
+    pub(crate) fn extension_accessor_ty(
+        &self,
+        receiver_ty: Ty,
+        member: StringId,
+        invoked: bool,
+    ) -> Option<Ty> {
         let faces = self.accessible_extensions.as_deref()?;
         let mut answer: Option<Ty> = None;
         for &(face, face_file) in faces {
@@ -4509,6 +4639,10 @@ impl<'a> Engine<'a> {
             let declared = match entry.kind {
                 MemberKind::Getter => entry.return_ty,
                 MemberKind::Field => entry.var_ty,
+                // A send's chain node (`l.elementAtOrNull(0)`) types as the
+                // method's return; a method tear-off is a function value
+                // this face cannot spell.
+                MemberKind::Method if invoked => entry.return_ty,
                 _ => continue,
             };
             // The face's types are foreign-file payloads (argument lists
@@ -4516,7 +4650,37 @@ impl<'a> Engine<'a> {
             // boundary before any argument read, the same cross-pool
             // discipline everywhere else.
             let on_ty = self.boundary.ty(face_file, face.on_ty);
-            if !self.extension_on_applies(on_ty, receiver_ty, &face.type_param_names) {
+            // `_getApplicable` instantiates the extended type against the
+            // receiver's supertype closure: a `List<Tk>` receiver meets
+            // `on Iterable<T>` as `Iterable<Tk>` (`asInstanceOf`). Only a
+            // generic `on` type takes the view — the argument projection is
+            // what the binding needs; a non-generic face keeps the
+            // head-equality gate the use-credit faces agree with.
+            let viewed = match (on_ty, receiver_ty) {
+                (
+                    Ty::Named {
+                        name: on_head,
+                        args: on_args,
+                        ..
+                    },
+                    Ty::Named {
+                        name: recv_head,
+                        nullable,
+                        ..
+                    },
+                ) if on_head != recv_head && on_args != ArgListId::EMPTY => {
+                    let Some(env) = self
+                        .ops
+                        .and_then(|ops| ops.instance_env(receiver_ty, on_head, &self.boundary.args))
+                    else {
+                        continue;
+                    };
+                    let args: Vec<Ty> = env.into_iter().map(|(_, ty)| ty).collect();
+                    self.boundary.args.borrow_mut().named(on_head, nullable, &args)
+                }
+                _ => receiver_ty,
+            };
+            if !self.extension_on_applies(on_ty, viewed, &face.type_param_names) {
                 continue;
             }
             let ty = self.boundary.ty(face_file, declared);
@@ -4526,8 +4690,8 @@ impl<'a> Engine<'a> {
             // the receiver before answering, so the `on` type's
             // bare-parameter arguments pair with the receiver's arguments
             // positionally (`List<X>` binds `T := X`) and the declared
-            // return substitutes through.
-            let map: Vec<(StringId, Ty)> = match (on_ty, receiver_ty) {
+            // return substitutes through — a `T?` leaf keeps its `?`.
+            let map: FxHashMap<StringId, Ty> = match (on_ty, viewed) {
                 (
                     Ty::Named {
                         args: on_args, ..
@@ -4547,26 +4711,43 @@ impl<'a> Engine<'a> {
                         .filter_map(|(on_arg, recv_arg)| {
                             let Ty::Named {
                                 name,
+                                nullable,
                                 args: ArgListId::EMPTY,
-                                ..
                             } = on_arg
                             else {
                                 return None;
                             };
+                            // `on Iterable<T?>` against `Iterable<X?>` binds
+                            // `T := X` (the `?` belongs to the pattern).
+                            let bound = if nullable {
+                                Self::non_null_form(recv_arg)
+                            } else {
+                                recv_arg
+                            };
                             face.type_param_names
                                 .contains(&name)
-                                .then_some((name, recv_arg))
+                                .then_some((name, bound))
                         })
                         .collect()
                 }
-                _ => Vec::new(),
+                _ => FxHashMap::default(),
             };
-            let ty = if map.is_empty() {
-                ty
-            } else {
-                self.subst_params(ty, &map).unwrap_or(ty)
-            };
-            let ty = self.fold_alias_ty(ty);
+            let ty = self.fold_alias_ty(self.substitute_ty(ty, &map));
+            // A parameter still spelled in the answer (an unbound face
+            // parameter, the method's own `R`) is free: the oracle infers
+            // it from the call site, which this face does not model.
+            let mut free = false;
+            self.boundary.pool().visit_named(ty, &mut |named| {
+                if let Ty::Named { name, .. } = named
+                    && (face.type_param_names.contains(&name)
+                        || entry.type_param_names.contains(&name))
+                {
+                    free = true;
+                }
+            });
+            if free {
+                return None;
+            }
             match answer {
                 None => answer = Some(ty),
                 Some(kept) if kept == ty => {}
@@ -4749,6 +4930,31 @@ impl<'a> Engine<'a> {
         target: Option<(FileId, StringId, StringId)>,
     ) {
         if let Some((target_file, target_name, target_container)) = target {
+            if std::env::var_os("DQ_PROBE_2652").is_some() {
+                eprintln!(
+                    "DQ_PROBE_2652 pre file={:?} off={} len={} name_id={:?} target_id={:?} container_id={:?}",
+                    self.file,
+                    row.range.offset,
+                    row.range.length,
+                    row.name,
+                    target_name,
+                    target_container
+                );
+                eprintln!(
+                    "DQ_PROBE_2652 name_text={:?}",
+                    self.strings.resolve(row.name)
+                );
+                eprintln!(
+                    "DQ_PROBE_2652 target_text={:?}",
+                    (target_name != StringId::NONE)
+                        .then(|| self.strings.resolve(target_name))
+                );
+                eprintln!(
+                    "DQ_PROBE_2652 container_text={:?}",
+                    (target_container != StringId::NONE)
+                        .then(|| self.strings.resolve(target_container))
+                );
+            }
             self.report.member_refs.push(MemberRef {
                 range: row.range,
                 kind,

@@ -263,6 +263,32 @@ impl Interp<'_> {
                             {
                                 expr.ty = *this_ty;
                             }
+                            // The undefined bare read (outside any `on`
+                            // context): a spelling the resolved back-end
+                            // certifies resolves nowhere — no container,
+                            // top-level declaration, or member anywhere —
+                            // is the official's `InvalidType` (upstream
+                            // `_resolveUnqualifiedNameRead` records it for
+                            // an undefined identifier), spelled as the
+                            // name itself like the unresolved-call face. A
+                            // class-head or type-parameter spelling is a
+                            // `Type` literal read, never this face.
+                            else if !promoted
+                                && expr.ty == Ty::UNKNOWN_NULLABLE
+                                && !self.local_fns.contains(name)
+                                && !self.is_class_head(*name)
+                                && self
+                                    .boundaries
+                                    .get(*name as usize)
+                                    .is_none_or(Option::is_none)
+                                && self.ops.call_head_unresolved(*name, self.names)
+                            {
+                                expr.ty = Ty {
+                                    base: Base::Name(*name),
+                                    nullable: false,
+                                };
+                                expr.non_reference_invalid = true;
+                            }
                             expr.prop = Some(slot);
                             expr.name = Some(*name);
                             expr.read_span = Some(*token);
@@ -945,7 +971,20 @@ impl Interp<'_> {
                     // (the official's `_current` is untouched): the
                     // deadness rides the branch pair, and a value consumer
                     // that drops the expression never sees it.
-                    else if !operand_invalid
+                    //
+                    // An invalid operand with NO property slot (an
+                    // unresolved call, a member read off a non-reference
+                    // target — `x.foo()`, `nowhere.foo`, `f().bar`) has no
+                    // flow reference, so the succeed fold reads its
+                    // `InvalidType` static type and the 0c arm answers true
+                    // (oracle-probed: every such `e is C` deads its else).
+                    // Only the unresolved property read on a reference
+                    // chain (`x.foo`, `x.foo.bar`, `this.g.foo`) stays open: the
+                    // official `propertyGet` hands flow a property
+                    // reference over the resolver's `dynamic` unpromoted
+                    // type, which neither folds nor factors to bottom.
+                    else if (operand_invalid && !operand.ref_chain)
+                        || !operand_invalid
                         && (self.is_test_guaranteed(operand.ty, operand.args, tested, tested_args)
                             // The invalid-tested face: an unresolved spelling
                             // is the official's `InvalidType` on the checked
@@ -1567,6 +1606,18 @@ impl Interp<'_> {
                 } else if let Some(inner) = self.exprs.last().and_then(|e| e.chain_base) {
                     expr.chain_base = Some(inner);
                 }
+                // An index read on an invalid receiver is invalid itself
+                // (upstream `_resolveIndexRead`'s `isInvalid` arm,
+                // property_element_resolver.dart:660-674).
+                if let Some(recv) = self.exprs.last()
+                    && self
+                        .ops
+                        .is_invalid_typed(recv.ty, recv.args, self.args, self.names)
+                {
+                    expr.ty = recv.ty;
+                    expr.args = recv.args;
+                    expr.non_reference_invalid = true;
+                }
                 // The receiver pops unless it is the innermost cascade's
                 // target — the one receiver a selector must leave in place
                 // (the sections chain on it, and `CascadeEnd` truncates to
@@ -1611,7 +1662,16 @@ impl Interp<'_> {
                     .exit_at
                     .is_some_and(|at| at >= member.range.offset)
                 {
-                    self.dead_code(*member);
+                    // A `?.` whose access path was dead at open (a
+                    // null-or-equivalent receiver) anchors at the member
+                    // name — the official polls the property/method name
+                    // node; `member` is the send's tiled end there.
+                    let anchor = if *null_aware {
+                        self.exprs.last().and_then(|e| e.read_span).unwrap_or(*member)
+                    } else {
+                        *member
+                    };
+                    self.dead_code(anchor);
                 }
                 // The member identifier's own entry sits on top (every
                 // member shape pushes through its primary parse); the
@@ -1775,6 +1835,22 @@ impl Interp<'_> {
                     expr.args = recv.args;
                     expr.non_reference_invalid = true;
                 }
+                // The staged member face: the semantic layer resolved the
+                // accessor's declared type at the member identifier
+                // (`switch (d.t)` over a sealed `T`). A promoted property
+                // keeps its non-null unknown face, a null-shorted access
+                // its own `?` (a face the staged row does not spell).
+                let promoted_prop = expr.prop.is_some() && expr.ty == Ty::UNKNOWN;
+                if !post_send_tile
+                    && !promoted_prop
+                    && !expr.non_reference_invalid
+                    && matches!(expr.ty, Ty::UNKNOWN | Ty::UNKNOWN_NULLABLE)
+                    && expr.chain_base.is_none()
+                    && let Some(span) = member_value.read_span
+                    && let Some(&staged) = self.staged_members.get(&span.range.offset)
+                {
+                    expr.ty = staged;
+                }
                 // The tile's one payload: the send's own result type
                 // stands (the adopted staged return included) — the fresh
                 // access build around it (chain bases, branches, the
@@ -1788,6 +1864,30 @@ impl Interp<'_> {
                 {
                     expr.ty = member_value.ty;
                     expr.args = member_value.args;
+                }
+                // The invalid-receiver invocation (the send twin of the
+                // member read above): a method call on an invalid receiver
+                // resolves without a target and its result is the
+                // official's `InvalidType` whatever the name — `Object`'s
+                // own methods included (upstream Dart SDK source,
+                // pkg/analyzer/lib/src/dart/resolver/
+                // method_invocation_resolver.dart:616-640).
+                else if post_send_tile
+                    && let Some(recv) = self.exprs.last()
+                    && self
+                        .ops
+                        .is_invalid_typed(recv.ty, recv.args, self.args, self.names)
+                {
+                    expr.ty = recv.ty;
+                    expr.args = recv.args;
+                    expr.non_reference_invalid = true;
+                }
+                if !post_send_tile
+                    && let Some(recv) = self.exprs.last()
+                {
+                    expr.ref_chain = recv.ref_chain
+                        || recv.prop_receiver().is_some()
+                        || (recv.prop.is_some() && !recv.non_reference_invalid);
                 }
                 // The receiver pops unless it is the innermost cascade's
                 // target (same discipline as IndexAccess's).
