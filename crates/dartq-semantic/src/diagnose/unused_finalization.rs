@@ -1035,7 +1035,7 @@ impl<'a> Engine<'a> {
                     // parameter pass at the loop bottom still runs for an
                     // unnamed head (`visitFormalParameterList` visits every
                     // formal list; unused_local_elements_verifier.dart:781).
-                    if bare != container {
+                    if bare != container && !self.is_bare_new_head(bare) {
                         // Only when the class declares more than one — a
                         // single constructor may serve to prevent extension.
                         // The upstream count is
