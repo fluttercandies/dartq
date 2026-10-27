@@ -245,15 +245,98 @@ pub(crate) fn drop_dot_new(text: &str, offset16: u32) -> Option<(u32, u32, Strin
     Some((at, u32::try_from(ws + 4).ok()?, String::new()))
 }
 
-/// `unused_import`: the URI literal's span expands to its directive. A
-/// directive alone on its line — `import` with nothing but whitespace
-/// before it, one terminating `;` with nothing but whitespace after it —
-/// drops the whole line, terminator with it; an adjacent comment, a
-/// trailing sibling, or a crossed newline refuses the cut. A directive
-/// whose line opens with a sibling's `;` drops exactly itself, from the
-/// keyword through the `;`, leaving every surrounding byte intact — the
-/// same-line deletion upstream's import-removal edit lands (upstream Dart
-/// SDK source, pkg/analysis_server, remove_unused_import).
+/// The first content offset on `[at, bound)`: the first byte that is
+/// neither horizontal whitespace nor a comment. A `//` run owns the rest
+/// of the line and an unclosed `/*` never reaches content — both answer
+/// `None` (nothing but comments remains on the line). Block comments nest
+/// and must close inside the bound to keep the walk going.
+fn line_content_at(text: &str, mut at: usize, bound: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    while at < bound {
+        match bytes[at] {
+            b' ' | b'\t' | b'\r' => at += 1,
+            b'/' if bytes.get(at + 1) == Some(&b'/') => return None,
+            b'/' if bytes.get(at + 1) == Some(&b'*') => match skip_block_comment(text, at, bound) {
+                Some(next) => at = next,
+                None => return None,
+            },
+            _ => return Some(at),
+        }
+    }
+    None
+}
+
+/// The offset just past a `/* … */` comment opening at `at` (nesting
+/// counted), or `None` when it does not close inside `bound`.
+fn skip_block_comment(text: &str, at: usize, bound: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 1u32;
+    let mut i = at + 2;
+    while i < bound && depth > 0 {
+        if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+            depth -= 1;
+            i += 2;
+        } else if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            depth += 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    (depth == 0).then_some(i)
+}
+
+/// The offset just past the last `;` outside comments and string literals
+/// on `[at, bound)` — a previous same-line directive's end, where the
+/// separator run towards the next directive begins. A `//` run ends the
+/// walk (it owns the line tail); quotes skip to their pair on the line.
+fn last_semicolon_before(text: &str, at: usize, bound: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut prev_end = None;
+    let mut i = at;
+    while i < bound {
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' => i += 1,
+            b';' => {
+                prev_end = Some(i + 1);
+                i += 1;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => return prev_end,
+            b'/' if bytes.get(i + 1) == Some(&b'*') => match skip_block_comment(text, i, bound) {
+                Some(next) => i = next,
+                None => return prev_end,
+            },
+            quote @ (b'\'' | b'"') => match text[i + 1..bound].find(quote as char) {
+                Some(rel) => i = i + rel + 2,
+                None => return prev_end,
+            },
+            _ => i += 1,
+        }
+    }
+    prev_end
+}
+
+/// `unused_import` (and its `duplicate_import`/`unnecessary_import`
+/// siblings): the URI literal's span expands to its directive's deletion
+/// range, the official `RemoveUnusedImport` posture over the analyzer's
+/// line arithmetic (upstream Dart SDK source, pkg/analysis_server,
+/// remove_unused_import.dart — `_deletionRange` over `getLinesRange`):
+///
+/// * a directive alone on its line drops the whole line, terminator with
+///   it (CRLF aware; the last line of the file carries none);
+/// * a same-line sibling that follows owns the separator: the cut runs
+///   from this keyword to that directive's keyword — separator whitespace
+///   and comments between the two go with the removal;
+/// * otherwise only the directive's text goes — keyword through `;`. A
+///   sibling that precedes cedes its separator (the cut starts at its
+///   `;`); a leading comment keeps its line, the cut starting at the
+///   keyword's leading whitespace run; a trailing comment keeps its line
+///   and the terminator, the cut ending past the `;`'s trailing
+///   whitespace run.
+///
+/// A directive whose `;` leaves the URI's line (a clause crossing lines)
+/// never cuts — the report anchors the URI and only a same-line read of
+/// the directive stays verifiable.
 pub(crate) fn drop_import_directive(text: &str, range: SourceRange) -> Option<(u32, u32, String)> {
     let start = utf16_offset_to_byte(text, range.offset);
     let end = utf16_offset_to_byte(text, range.offset + range.length);
@@ -267,34 +350,54 @@ pub(crate) fn drop_import_directive(text: &str, range: SourceRange) -> Option<(u
         return None;
     }
     let keyword_start = line_start + keyword.len();
-    // One `;` closes the directive: the line's tail past the URI carries
-    // it as its only semicolon, at the whitespace-trimmed end.
-    let tail = &text[end..line_end];
-    let tail_t = tail.trim_matches([' ', '\t', '\r']);
-    if !tail_t.ends_with(';') || tail_t[..tail_t.len() - 1].contains(';') {
-        return None;
+    // The directive's own `;` — the first on the line past the URI (the
+    // combinator and config clauses carry none of their own).
+    let directive_end = text[end..line_end].find(';')? + end + 1;
+    // A same-line directive that follows: the cut runs keyword → keyword,
+    // the separator between the two riding the removal.
+    if let Some(next) = line_content_at(text, directive_end, line_end)
+        && ["import", "export", "part", "library"].iter().any(|word| {
+            text[next..line_end].starts_with(word)
+                && !text[next + word.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_identifier_char)
+        })
+    {
+        return Some(cut16(text, keyword_start, next));
     }
-    let directive_end = line_end - (tail.len() - tail.trim_end_matches([' ', '\t', '\r']).len());
     // The directive owns its line: the whole line goes, terminator with it.
     let before = &text[line_start..keyword_start];
-    if before.bytes().all(|b| b == b' ' || b == b'\t')
-        && text[directive_end..line_end]
-            .bytes()
-            .all(|b| matches!(b, b' ' | b'\t' | b'\r'))
-    {
+    let after = &text[directive_end..line_end];
+    let bare = before.bytes().all(|b| b == b' ' || b == b'\t');
+    if bare && after.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\r')) {
         let (offset, length) = cut_line(text, line_start, line_end);
         return Some((offset, length, String::new()));
     }
-    // A sibling's `;` closes right before the keyword: the cut takes
-    // exactly this directive and leaves the line's other bytes alone.
-    if before.trim_end_matches([' ', '\t', '\r']).ends_with(';') {
-        return Some((
-            utf16_count(&text[..keyword_start]),
-            utf16_count(&text[keyword_start..directive_end]),
-            String::new(),
-        ));
+    // Nothing before it on the line but indentation: the cut runs from the
+    // line start through the `;`'s trailing whitespace run — the official
+    // `getLineContentEnd` stop just short of the trailing comment.
+    if bare {
+        let ws = after.len() - after.trim_start_matches([' ', '\t', '\r']).len();
+        return Some(cut16(text, line_start, directive_end + ws));
     }
-    None
+    // Other content leads the line: a preceding directive cedes its
+    // separator (the cut opens just past its `;`); otherwise the keyword's
+    // leading whitespace run opens the cut — `getLineContentStart`'s walk,
+    // a leading comment staying whole.
+    let cut_start = last_semicolon_before(text, line_start, keyword_start).unwrap_or_else(|| {
+        keyword_start - (before.len() - before.trim_end_matches([' ', '\t']).len())
+    });
+    Some(cut16(text, cut_start, directive_end))
+}
+
+/// The `[from, to)` deletion in UTF-16 with an empty replacement.
+fn cut16(text: &str, from: usize, to: usize) -> (u32, u32, String) {
+    (
+        utf16_count(&text[..from]),
+        utf16_count(&text[from..to]),
+        String::new(),
+    )
 }
 
 /// `unused_local_variable`: the name renames to `_{name}` — the wildcard

@@ -20,6 +20,15 @@
 //! face's answer (and the explain face's `dependencies` section), not
 //! this kind's.
 //!
+//! Every kind accepts the `Container.member` spelling (#2655): the last
+//! `.` splits the name ([`split_qualified`]), the bare join runs over the
+//! member segment, and the answer scopes to the declarations named
+//! `member` inside `Container` — the declaration rows to the container's
+//! own, the reference rows to the ones targeting them (the engine's
+//! override-closure widening included, its rows already carrying the
+//! anchor's container). A miss answers the empty document, the same
+//! posture as an unknown bare name.
+//!
 //! The JSON shaper [`to_json`] is the single implementation of the JSON
 //! output face: the CLI's `--format=json` writes it verbatim and the
 //! daemon's `dartq/query` compact verbosity returns it (plus the `v`
@@ -89,15 +98,38 @@ pub fn symbol<'a>(engine: &'a mut Engine, name: &str) -> Result<SymbolRun<'a>, A
     Ok(symbol_after_analysis(engine, name))
 }
 
+/// The `Container.member` spelling's split (#2655): the last `.` separates
+/// the member segment from the container's spelling — a container name
+/// never contains a `.`, so the last dot is the member boundary whatever
+/// the leading segments spell. `None` for bare names. Shared with the
+/// explain face (same crate), which parses the same spelling.
+pub(crate) fn split_qualified(name: &str) -> Option<(&str, &str)> {
+    name.rsplit_once('.')
+}
+
 /// The query over an already-analyzed engine — the daemon path, whose read
 /// task has just run the analysis pass (running it twice would double the
-/// read's cost). The rows borrow the engine's resident data.
+/// read's cost). The rows borrow the engine's resident data. Under a
+/// `Container.member` spelling the bare join runs over the member segment
+/// and the answer scopes to the spelled container's declarations (module
+/// docs).
 #[must_use]
 pub fn symbol_after_analysis<'a>(engine: &'a Engine, name: &str) -> SymbolRun<'a> {
+    let (container, member) = match split_qualified(name) {
+        Some((container, member)) => (Some(container), member),
+        None => (None, name),
+    };
     let SymbolAnswer {
         mut decls,
         mut refs,
-    } = engine.query_symbols(name);
+    } = engine.query_symbols(member);
+    if let Some(container) = container {
+        decls.retain(|decl| decl.container == Some(container));
+        let members: FxHashSet<FileId> = decls.iter().map(|decl| decl.file).collect();
+        refs.retain(|reference| {
+            reference.target_container == Some(container) && members.contains(&reference.target_file)
+        });
+    }
     let layout = EngineLayout::over(
         engine,
         decls
@@ -193,7 +225,9 @@ pub fn implementations<'a>(
 /// The implementations answer over an already-analyzed engine — the daemon
 /// path (see [`symbol_after_analysis`]). The declaration rows stay for
 /// target identity (the callers face's convention); the references array
-/// is empty — use sites are not this kind's semantics.
+/// is empty — use sites are not this kind's semantics. Under a
+/// `Container.member` spelling the seeds are the spelled container's
+/// member hits alone — the spelling names a member, never the type walk.
 ///
 /// # Panics
 ///
@@ -204,14 +238,17 @@ pub fn implementations_after_analysis<'a>(engine: &'a Engine, name: &str) -> Sym
     let mut run = symbol_after_analysis(engine, name);
     run.refs = Vec::new();
 
+    let qualified = split_qualified(name);
     let strings = engine.strings();
-    let sym = strings.intern(name);
+    let sym = strings.intern(qualified.map_or(name, |(_, member)| member));
 
     // The queried name's declaring files, keyed by the face a supertype
     // edge can resolve to. An edge target is a library-scope name (the
     // bare-name resolution a clause head goes through), so a library-face
     // hit keys the subtype rows directly; a member hit keys its container
-    // instead — the subtypes' same-name members are the overrides.
+    // instead — the subtypes' same-name members are the overrides. A
+    // `Container.member` spelling (#2655) seeds no type walk and admits
+    // only the spelled container's member hits.
     let mut type_targets: FxHashSet<(FileId, StringId)> = FxHashSet::default();
     let mut member_containers: FxHashSet<(FileId, StringId)> = FxHashSet::default();
     for (_, files) in engine.libraries() {
@@ -220,16 +257,22 @@ pub fn implementations_after_analysis<'a>(engine: &'a Engine, name: &str) -> Sym
             let Some(rows) = capture.index.by_name(sym) else {
                 continue;
             };
+            let surface = capture.index.decls();
             for row in rows {
                 if row.is_library_face() {
-                    type_targets.insert((file, sym));
+                    if qualified.is_none() {
+                        type_targets.insert((file, sym));
+                    }
                 } else if row.container != DeclRow::NONE
                     && matches!(
                         row.kind,
                         DeclKind::Method | DeclKind::Getter | DeclKind::Setter | DeclKind::Field
                     )
+                    && qualified.is_none_or(|(container, _)| {
+                        strings.resolve(surface[row.container as usize].name) == container
+                    })
                 {
-                    member_containers.insert((file, capture.index.row(row.container).name));
+                    member_containers.insert((file, surface[row.container as usize].name));
                 }
             }
         }
@@ -1450,6 +1493,145 @@ mod tests {
             json.get("root").is_none(),
             "no file fields ride, so no root to disambiguate them"
         );
+
+        fs_remove(&root);
+    }
+
+    /// The #2655 fixture: two same-file containers declaring the same
+    /// member `m`, an overriding subtype of `A`, and one typed call site
+    /// per receiver — the shape a bare-name answer conflates and the
+    /// `Container.member` spelling must cut apart.
+    const MEMBER_A: &str = concat!(
+        "class A {\n",
+        "  void m() {}\n",
+        "}\n",
+        "class B {\n",
+        "  void m() {}\n",
+        "}\n",
+        "class Sub extends A {\n",
+        "  void m() {}\n",
+        "}\n"
+    );
+    const MEMBER_USE: &str = concat!(
+        "import 'a.dart';\n",
+        "void run(A a, B b, Sub s) {\n",
+        "  a.m();\n",
+        "  b.m();\n",
+        "  s.m();\n",
+        "}\n"
+    );
+
+    fn member_fixture(tag: &str) -> PathBuf {
+        workspace(tag, &[("lib/a.dart", MEMBER_A), ("lib/main.dart", MEMBER_USE)])
+    }
+
+    /// The name token's offset (ASCII sources, so byte = UTF-16).
+    #[expect(clippy::cast_possible_truncation)] // span arithmetic narrows under the scanner u32 offset cap
+    fn at(source: &str, needle: &str) -> u32 {
+        source
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} in source")) as u32
+    }
+
+    /// The qualified spelling scopes the symbol face (#2655): `A.m`
+    /// answers A's declaration, A's own call site, and the override-closure
+    /// row for `Sub.m` (targeted at A's member — the engine's widening,
+    /// kept exactly as the bare path serves it); B's and Sub's own sites
+    /// stay out. A container without the member — and a container that
+    /// declares nowhere — answer the empty document, the unknown-name
+    /// posture.
+    #[test]
+    fn qualified_references_scope_to_the_container() {
+        let root = member_fixture("query_qualified");
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+
+        let run = symbol(&mut engine, "A.m").expect("query");
+        assert_eq!(run.decls.len(), 1, "the container filter keeps A's member");
+        assert_eq!(
+            (run.decls[0].name, run.decls[0].container),
+            ("m", Some("A"))
+        );
+        let rows: Vec<(ReferenceKind, u32, Option<&str>)> = run
+            .refs
+            .iter()
+            .map(|r| (r.kind, r.range.offset, r.target_container))
+            .collect();
+        // Sub's overriding declaration: the last `void m()` in a.dart, its
+        // name token five bytes in.
+        let sub_m = MEMBER_A.rfind("void m()").expect("Sub's m") as u32 + 5;
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    ReferenceKind::Invoked,
+                    at(MEMBER_USE, "a.m();") + 2,
+                    Some("A")
+                ),
+                (ReferenceKind::Override, sub_m, Some("A")),
+            ],
+            "A's call site plus Sub's overriding declaration, nothing of B's or Sub's own sites"
+        );
+
+        // The miss spellings: the container exists without the member, and
+        // the container itself declares nowhere.
+        for miss in ["B.absent", "Nope.m"] {
+            let run = symbol(&mut engine, miss).expect("query");
+            assert!(run.decls.is_empty(), "{miss}: no declaration");
+            assert!(run.refs.is_empty(), "{miss}: no reference");
+            let json = to_json(&run, miss);
+            assert_eq!(json["sym"], miss, "the caller's spelling rides");
+            assert_eq!(json["decls"].as_array().expect("arrays").len(), 0);
+            assert_eq!(json["refs"].as_array().expect("arrays").len(), 0);
+            assert!(json.get("root").is_none(), "{miss}: no file fields ride");
+        }
+
+        fs_remove(&root);
+    }
+
+    /// The qualified spelling scopes the callers face: `B.m` answers B's
+    /// declaration and B's invocation alone — the invocation-shaped subset
+    /// of the same scoped join.
+    #[test]
+    fn qualified_callers_scope_to_the_container() {
+        let root = member_fixture("query_qualified_callers");
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+
+        let run = callers(&mut engine, "B.m").expect("query");
+        assert_eq!(run.decls.len(), 1);
+        assert_eq!(
+            (run.decls[0].name, run.decls[0].container),
+            ("m", Some("B"))
+        );
+        let rows: Vec<(ReferenceKind, u32)> = run
+            .refs
+            .iter()
+            .map(|r| (r.kind, r.range.offset))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(ReferenceKind::Invoked, at(MEMBER_USE, "b.m();") + 2)],
+            "only B's call site"
+        );
+
+        fs_remove(&root);
+    }
+
+    /// The qualified spelling scopes the implementations face: `A.m`
+    /// answers the overriding rows of A's subtypes (Sub's member), never
+    /// the same-name members of unrelated containers.
+    #[test]
+    fn qualified_implementations_scope_to_the_container() {
+        let root = member_fixture("query_qualified_impl");
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+
+        let run = implementations(&mut engine, "A.m").expect("query");
+        assert_eq!(run.decls.len(), 1, "A's member declaration stays");
+        let rows: Vec<(&str, Option<&str>)> = run
+            .implementations
+            .iter()
+            .map(|row| (row.name, row.container))
+            .collect();
+        assert_eq!(rows, vec![("m", Some("Sub"))], "Sub's override alone");
 
         fs_remove(&root);
     }

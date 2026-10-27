@@ -1912,13 +1912,17 @@
         assert!(fixes.is_empty(), "{code} on {source:?} produced a fix");
     }
 
-    /// `unused_import`: the bare directive line goes with its terminator —
-    /// `as`/`show`/`hide` clauses included — while an adjacent comment or a
-    /// crossed newline refuses the cut, and a same-line sibling narrows the
-    /// cut to the one directive. The rows carry the engine's production
-    /// span: the URI literal.
+    /// `unused_import`: the URI literal's span expands to the directive's
+    /// deletion range — the official `RemoveUnusedImport` posture. A
+    /// directive alone on its line drops the whole line, terminator with
+    /// it (CRLF keeping CRLF, the file's last line carrying no newline);
+    /// other content on the line survives, only the directive's text
+    /// going — the separator run towards a same-line sibling riding the
+    /// cut in each direction, and a flanking comment keeping its line.
+    /// The rows carry the engine's production span: the URI literal.
     #[test]
     fn unused_import_directive_drops() {
+        // File start, bare line: the whole line, terminator with it.
         assert_sem_rewrite(
             "unused_import",
             "UNUSED_IMPORT",
@@ -1927,6 +1931,35 @@
             8,
             "var x = 1;\n",
         );
+        // Mid-file: same whole-line cut.
+        assert_sem_rewrite(
+            "unused_import",
+            "UNUSED_IMPORT",
+            "import 'dart:math';\nimport 'a.dart';\nvar x = 1;\n",
+            26,
+            8,
+            "import 'dart:math';\nvar x = 1;\n",
+        );
+        // The file's last line without a trailing newline: the text goes,
+        // there is no terminator to carry.
+        assert_sem_rewrite(
+            "unused_import",
+            "UNUSED_IMPORT",
+            "var x = 1;\nimport 'a.dart';",
+            18,
+            8,
+            "var x = 1;\n",
+        );
+        // A CRLF file keeps CRLF: the terminator rides the cut whole.
+        assert_sem_rewrite(
+            "unused_import",
+            "UNUSED_IMPORT",
+            "import 'a.dart';\r\nvar x = 1;\r\n",
+            7,
+            8,
+            "var x = 1;\r\n",
+        );
+        // `as`/`show`/`hide` clauses ride the cut.
         assert_sem_rewrite(
             "unused_import",
             "UNUSED_IMPORT",
@@ -1935,42 +1968,46 @@
             8,
             "var x = p;\n",
         );
-        // The adjacent-comment trap: the line is not bare — no cut.
-        assert_sem_no_fix(
+        // A trailing comment keeps its line: the cut ends past the `;`'s
+        // trailing whitespace run, the terminator staying with the
+        // comment.
+        assert_sem_rewrite(
             "unused_import",
             "UNUSED_IMPORT",
             "import 'a.dart'; // keep\n",
             7,
             8,
+            "// keep\n",
         );
-        // A comment ahead of the keyword on the line: neither whole-line
-        // cut (the comment would go) nor sibling cut — no fix.
-        assert_sem_no_fix(
+        // A leading comment keeps its line: the cut opens at the
+        // keyword's leading whitespace run.
+        assert_sem_rewrite(
             "unused_import",
             "UNUSED_IMPORT",
             "/* note */ import 'a.dart';\n",
             18,
             8,
+            "/* note */\n",
         );
-        // A sibling directive on the line: dropping the second cuts
-        // exactly it — keyword through `;` — and the first directive's
-        // bytes survive.
+        // Dropping the second of a same-line pair takes the separator:
+        // the cut opens just past the survivor's `;`.
         assert_sem_rewrite(
             "unused_import",
             "UNUSED_IMPORT",
             "import 'a.dart'; import 'b.dart';\n",
             24,
             8,
-            "import 'a.dart'; \n",
+            "import 'a.dart';\n",
         );
-        // Dropping the first of the pair refuses: its tail carries the
-        // sibling's `;`, and no whole-line cut may swallow the survivor.
-        assert_sem_no_fix(
+        // Dropping the first of the pair runs keyword → the sibling's
+        // keyword: the separator goes with the removal.
+        assert_sem_rewrite(
             "unused_import",
             "UNUSED_IMPORT",
             "import 'a.dart'; import 'b.dart';\n",
             7,
             8,
+            "import 'b.dart';\n",
         );
         // A directive crossing lines never cuts.
         assert_sem_no_fix(

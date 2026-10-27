@@ -286,3 +286,30 @@ fn interface_typed_receivers_target_the_interface_declaration() {
     let expected = vec![(at(source, "r.createTask()", 2), "invoked", "createTask".to_owned())];
     assert_eq!(rows(source, &report, &strings), expected);
 }
+
+/// Two folds of the same unit mint identical member-ref rows (#2652's
+/// fold-level pin): the rows are a pure function of the unit text and its
+/// resolution — same set, same order — so the serving chain downstream
+/// (library surface, name-keyed groups, workspace join) starts from a
+/// deterministic product.
+#[test]
+fn two_folds_mint_identical_member_refs() {
+    let source = "class Repo {\n\
+                  int total = 0;\n\
+                  void add(int v) { total = v; }\n\
+                  void bump() { total += 1; }\n\
+                  void reset() { this.add(0); add(1); }\n\
+                  }\n\
+                  void use(Repo r, Repo? n) {\n\
+                  r.add(2);\n\
+                  n?.add(3);\n\
+                  r.total;\n\
+                  r.total += 10;\n\
+                  }\n";
+    let (first, _) = report(source);
+    let (second, _) = report(source);
+    assert_eq!(
+        first.member_refs, second.member_refs,
+        "the member-ref rows are a pure function of the unit"
+    );
+}

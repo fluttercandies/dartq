@@ -16,11 +16,21 @@
 //! transient per-answer maps (hit grouping, supertype edges, constructor
 //! render) are symbol-scoped and dropped at the end of the call.
 //!
+//! A `Container.member` spelling (#2655, the last-dot split the query
+//! face shares) answers the member's report: the declaration is that
+//! member, its references are the member's own sites widened through its
+//! override family (the engine's `override_family` face — the same
+//! equivalence class the rename face edits), and the container sections
+//! (`bases`, `ifaces`, `ctors`, `methods`) are empty by nature for a
+//! member. A miss answers the empty seam report, the unknown-name
+//! posture.
+//!
 //! The reverse import graph and the test graph build once per call from
 //! the engine's import CSR — the same per-query posture `impact` keeps
-//! over the same CSR. The semantic fold plays no role in the report, so
-//! the face skips it (`semdiag = None`); the collectors this face retired
-//! skipped it the same way.
+//! over the same CSR. The semantic fold runs with the default config:
+//! its member-access rows (#2618) are the reference surface's member
+//! half, the report's `refs` substrate — only the fold's diagnostics are
+//! discarded on this face.
 //!
 //! The JSON answer is the assembler's serialized report routed through
 //! `dartq-schema`'s `validate_at_tier(payload, Domain::Explain, tier)`
@@ -41,6 +51,7 @@ use dartq_diagnostics::{Diagnostic, FileLayoutProvider};
 use dartq_engine::Engine;
 use dartq_index::{DeclRow, RefRow, SuperClause, TargetRef};
 use dartq_source::{FileId, StringId};
+use rustc_hash::FxHashSet;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -88,10 +99,11 @@ pub fn explain(
     symbol: &str,
     verbosity: Verbosity,
 ) -> Result<Value, ExplainError> {
-    let (mut config, _dir) = engine_config(dir, sdk)?;
-    // The report reads the maintained index state; the semantic fold's
-    // diagnostics are discarded on this face, so the fold is skipped.
-    config.semdiag = None;
+    let (config, _dir) = engine_config(dir, sdk)?;
+    // The semantic fold runs (the default config): its member-access rows
+    // (#2618) are the reference surface's member half — without the fold
+    // every member query would answer an empty `refs` section. The fold's
+    // diagnostics are the discarded part, not the fold itself.
     let mut engine =
         Engine::new(config).map_err(|error| ExplainError::Engine(error.to_string()))?;
     prelude(&mut engine)?;
@@ -121,11 +133,12 @@ fn explain_answer(
 ) -> Result<Value, ExplainError> {
     // The queried name interns into the engine's table once — the rows'
     // native table (the documented query posture: the only side effect).
-    // A `Container.name` spelling (#2621) names the member inside the
+    // A `Container.member` spelling (#2621, the last-dot split shared
+    // with the query face since #2655) names the member inside the
     // container: the member segment drives the by-name probe, the
     // container segment filters the hits, and the report still echoes the
     // caller's whole spelling.
-    let (container, name) = match symbol.split_once('.') {
+    let (container, name) = match crate::query::split_qualified(symbol) {
         Some((container, name)) => (Some(container), name),
         None => (None, symbol),
     };
@@ -166,6 +179,23 @@ fn explain_answer(
                 decl,
             }));
             hit_files.entry(library).or_default().push(file);
+        }
+    }
+
+    // The qualified-member reference scope (#2655): the whole override
+    // family of the spelled member — the same equivalence class the
+    // rename face edits, whatever member the anchor names — widens the
+    // report's reference admission, so a call site statically resolved to
+    // an implementing override rides the report beside the member's own
+    // sites. A bare name needs no widening face: the assembler scopes to
+    // the primary's own target pair.
+    let mut family: FxHashSet<(FileId, StringId)> = FxHashSet::default();
+    if let Some(container) = container {
+        let strings = engine.strings();
+        for hit in &hits {
+            for (file, spelling) in engine.override_family(hit.file, container, name) {
+                family.insert((file, strings.intern(spelling)));
+            }
         }
     }
 
@@ -259,6 +289,7 @@ fn explain_answer(
         verbosity.into(),
         &hits,
         &refs,
+        |file, container| family.contains(&(file, container)),
         |file| {
             engine
                 .file_capture(file)
@@ -1087,6 +1118,103 @@ mod tests {
             let json = explain(&root, Some(&root.join("sdk")), miss, Verbosity::Compact)
                 .expect("the seam report, never an error");
             assert!(json.get("declaration").is_none(), "{miss}: no hit");
+            assert_eq!(json["others"], json!([]), "{miss}: no candidates");
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The #2655 member fixture: two same-file containers declaring the
+    /// same member `m`, an overriding subtype of `A`, and one typed call
+    /// site per receiver.
+    const MEMBER_A: &str = concat!(
+        "class A {\n",
+        "  void m() {}\n",
+        "}\n",
+        "class B {\n",
+        "  void m() {}\n",
+        "}\n",
+        "class Sub extends A {\n",
+        "  void m() {}\n",
+        "}\n"
+    );
+    const MEMBER_USE: &str = concat!(
+        "import 'a.dart';\n",
+        "void run(A a, B b, Sub s) {\n",
+        "  a.m();\n",
+        "  b.m();\n",
+        "  s.m();\n",
+        "}\n"
+    );
+
+    fn member_fixture(tag: &str) -> PathBuf {
+        workspace(
+            tag,
+            &[("lib/a.dart", MEMBER_A), ("lib/main.dart", MEMBER_USE)],
+        )
+    }
+
+    /// The qualified member report (#2655): `A.m` answers A's member as
+    /// the declaration, A's call site plus the site resolved to the
+    /// family's overriding member as `refs` (the override-closure
+    /// widening), the container sections empty by nature, and B's site
+    /// out. The miss spellings answer the empty seam report.
+    #[test]
+    fn qualified_member_report_is_the_members() {
+        let root = member_fixture("explain_qualified_member");
+        let json = explain(&root, Some(&root.join("sdk")), "A.m", Verbosity::Compact)
+            .expect("explain run");
+
+        assert_eq!(json["sym"], "A.m", "the caller's spelling rides");
+        assert_eq!(json["declaration"]["file"], "lib/a.dart");
+        assert_eq!(json["declaration"]["name"], "m");
+        assert_eq!(json["declaration"]["kind"], "method");
+        assert_eq!(json["declaration"]["container"], "A");
+        assert_eq!(
+            json["declaration"]["off"],
+            offset(MEMBER_A, "void m()") + 5,
+            "A's member, the first `m` in a.dart"
+        );
+
+        // The references: A's own site and the site statically resolved
+        // to the family's overriding member — B's same-named member is
+        // another container's, out of the answer.
+        let refs = json["refs"].as_array().expect("references array");
+        let sites: Vec<u64> = refs.iter().filter_map(|row| row["off"].as_u64()).collect();
+        assert_eq!(
+            sites,
+            vec![
+                u64::from(offset(MEMBER_USE, "a.m();") + 2),
+                u64::from(offset(MEMBER_USE, "s.m();") + 2)
+            ],
+            "A's site and Sub's site (the family widening), never B's"
+        );
+
+        // The container sections are empty by nature for a member; the
+        // library faces still answer (main.dart imports the declaring
+        // library).
+        for section in ["bases", "ifaces", "ctors", "methods", "others"] {
+            assert_eq!(json[section], json!([]), "{section} is empty by nature");
+        }
+        assert_eq!(json["deps"], json!([{"path": "lib/main.dart"}]));
+        assert_eq!(json["tests"], json!([]));
+
+        // Born schema-valid at the producing tier.
+        let text = serde_json::to_string(&json).expect("serialize");
+        dartq_schema::validate_at_tier(
+            &text,
+            dartq_schema::Domain::Explain,
+            dartq_schema::Verbosity::Compact,
+        )
+        .expect("schema-valid at the producing tier");
+
+        // The miss spellings: the container without the member, the
+        // container that declares nowhere — the empty seam report.
+        for miss in ["A.absent", "Nope.m"] {
+            let json = explain(&root, Some(&root.join("sdk")), miss, Verbosity::Compact)
+                .expect("the seam report, never an error");
+            assert!(json.get("declaration").is_none(), "{miss}: no hit");
+            assert_eq!(json["refs"], json!([]), "{miss}: no references");
             assert_eq!(json["others"], json!([]), "{miss}: no candidates");
         }
 

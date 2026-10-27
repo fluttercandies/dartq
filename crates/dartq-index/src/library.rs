@@ -227,6 +227,15 @@ impl LibraryIndex {
     /// ascending by `(use file, offset)` (the table order). The workspace
     /// query join's entry point — one search per referencing library
     /// instead of one per (decl file, library) pair.
+    ///
+    /// The group slice runs from the SLOT `name_runs[start]` — the start
+    /// index into `name_runs` itself under-counts (the k-th distinct name
+    /// starts at slot ≥ k), and slicing `name_refs[start..]` leaked the
+    /// first run of every name group preceding the queried one in id
+    /// order (#2652): `query references` answered sibling members' rows
+    /// — which exact siblings leaked followed the StringId allocation
+    /// order, so parallel folds' interleaved interning made the answer
+    /// vary run to run.
     #[must_use]
     pub fn references_named(&self, name: StringId) -> impl Iterator<Item = &[RefRow]> + '_ {
         let group_name = |slot: usize| {
@@ -236,14 +245,16 @@ impl LibraryIndex {
         let start = self
             .name_runs
             .partition_point(|&slot| group_name(slot as usize) < name);
-        let end = match self.name_runs.get(start) {
-            Some(&slot) if group_name(slot as usize) == name => self
-                .name_runs
-                .get(start + 1)
-                .map_or(self.name_refs.len(), |&next| next as usize),
-            _ => start,
+        let (group, end) = match self.name_runs.get(start) {
+            Some(&slot) if group_name(slot as usize) == name => (
+                slot as usize,
+                self.name_runs
+                    .get(start + 1)
+                    .map_or(self.name_refs.len(), |&next| next as usize),
+            ),
+            _ => (0, 0),
         };
-        self.name_refs[start..end].iter().map(move |&run| {
+        self.name_refs[group..end].iter().map(move |&run| {
             let run = run as usize;
             let end = self
                 .runs
@@ -1279,6 +1290,84 @@ pub(crate) mod tests {
         );
         let names: Vec<StringId> = surface.distinct_reference_names().collect();
         assert_eq!(names, vec![fa], "one group per distinct target name");
+    }
+
+    /// The name-keyed group of one name serves exactly that name's runs:
+    /// a queried name whose group starts PAST a multi-run name's group
+    /// must not leak the sibling's trailing run (#2652 — the group slice
+    /// once started at the `name_runs` index instead of the slot, so a
+    /// group whose start slot exceeds its group index — exactly what a
+    /// multi-run predecessor creates — leaked the predecessor's later
+    /// runs into every following name's answer, and parallel interning
+    /// made the leaked set vary run to run). The rows ride
+    /// `add_resolved_refs` (the member-edge face) so one name can span
+    /// two target files exactly as a member declared beside an interface
+    /// double does.
+    #[test]
+    fn name_groups_do_not_leak_neighbor_groups() {
+        let strings: &'static StringTable = Box::leak(Box::new(StringTable::new()));
+        let mut files = FileTable::new();
+        let main = capture_one(strings, &mut files, "m.dart", "void main() {}\n");
+        let twin = capture_one(strings, &mut files, "w.dart", "void main() {}\n");
+        let mut builder = LibraryGraphBuilder::new(strings);
+        let lib_m = builder.intern("package:t/m.dart");
+        builder.declare(lib_m, main.index.decls()[0].name, main.file);
+        let graph = builder.finish();
+        let namespaces = Namespaces::build(&graph);
+
+        // Interned in this order, so ids ascend: first < middle < last.
+        // `first` spans TWO target files — two runs — so `middle`'s group
+        // starts at slot 2 while its group index is 1.
+        let first = strings.intern("alphaMember");
+        let middle = strings.intern("betaMember");
+        let last = strings.intern("gammaMember");
+        let row = |name: StringId, target: FileId, offset: u32| RefRow {
+            file: main.file,
+            target_file: target,
+            target_name: name,
+            target_container: strings.intern("Host"),
+            kind: RefKind::Invoked,
+            range: dartq_source::SourceRange {
+                offset,
+                length: strings.resolve(name).len() as u32,
+            },
+            qualifier: StringId::NONE,
+        };
+        let mut builder = LibraryBuilder::new(lib_m, &graph, &namespaces);
+        builder.add_file(&main);
+        builder.add_resolved_refs([
+            row(first, main.file, 10),
+            row(first, twin.file, 20),
+            row(middle, main.file, 30),
+            row(last, main.file, 40),
+        ]);
+        let surface = builder.finish();
+
+        for (probe, expected) in [(middle, 30), (last, 40)] {
+            let rows: Vec<u32> = surface
+                .references_named(probe)
+                .flatten()
+                .map(|row| row.range.offset)
+                .collect();
+            assert_eq!(
+                rows,
+                vec![expected],
+                "{:?}: exactly its own run, no neighbor group's rows",
+                strings.resolve(probe)
+            );
+        }
+        // The first group keeps its whole two-run span, one run per target
+        // file, and a miss stays empty.
+        let rows: Vec<u32> = surface
+            .references_named(first)
+            .flatten()
+            .map(|row| row.range.offset)
+            .collect();
+        assert_eq!(rows, vec![10, 20]);
+        assert!(surface
+            .references_named(strings.intern("zz_absent"))
+            .next()
+            .is_none());
     }
 
     /// Clause-typed supers through the fold: every clause kind resolves by

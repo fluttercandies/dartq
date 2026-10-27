@@ -4930,31 +4930,6 @@ impl<'a> Engine<'a> {
         target: Option<(FileId, StringId, StringId)>,
     ) {
         if let Some((target_file, target_name, target_container)) = target {
-            if std::env::var_os("DQ_PROBE_2652").is_some() {
-                eprintln!(
-                    "DQ_PROBE_2652 pre file={:?} off={} len={} name_id={:?} target_id={:?} container_id={:?}",
-                    self.file,
-                    row.range.offset,
-                    row.range.length,
-                    row.name,
-                    target_name,
-                    target_container
-                );
-                eprintln!(
-                    "DQ_PROBE_2652 name_text={:?}",
-                    self.strings.resolve(row.name)
-                );
-                eprintln!(
-                    "DQ_PROBE_2652 target_text={:?}",
-                    (target_name != StringId::NONE)
-                        .then(|| self.strings.resolve(target_name))
-                );
-                eprintln!(
-                    "DQ_PROBE_2652 container_text={:?}",
-                    (target_container != StringId::NONE)
-                        .then(|| self.strings.resolve(target_container))
-                );
-            }
             self.report.member_refs.push(MemberRef {
                 range: row.range,
                 kind,

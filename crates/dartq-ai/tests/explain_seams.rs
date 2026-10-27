@@ -150,6 +150,7 @@ fn explain_foo(
         verbosity,
         &hits(fx),
         &[],
+        |_, _| false,
         |file| match file.index() {
             0 => &fx.surface_a,
             _ => &fx.surface_b,

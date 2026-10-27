@@ -30,6 +30,18 @@
 //! and shaped here: the unnamed constructor under the container's own
 //! name, named ones under the `A.named` selector spelling.
 //!
+//! A member primary (a hit with a container anchor, the
+//! `Container.member` spelling's answer) carries no supertype clauses,
+//! no constructors, and no member surface of its own: `bases`, `ifaces`,
+//! `ctors`, and `methods` are empty by nature for it (#2655) — never the
+//! aliased faces a same-named container in the declaring file would
+//! answer. Its `refs` are the primary member's own use sites — the
+//! target pair `(file, container)` scoping, so same-file containers
+//! declaring the same member name never leak into each other — plus the
+//! sites statically resolved to any member of its override closure when
+//! the caller hands the family face (`is_family_ref`, the same
+//! equivalence class the rename face edits).
+//!
 //! # Provenance and ordering
 //!
 //! Internal ids (`FileId`, [`StringId`], library ids) never leave the
@@ -53,8 +65,11 @@
 //! * `ctors` — ascending by constructor name (the unnamed face's
 //!   bare container name sorts before the `A.named` selectors).
 //! * `refs` — ascending by use-site file path, then by range start.
-//!   Rows for same-named declarations in other files are filtered out, so
-//!   a caller may hand the whole by-name reference union.
+//!   Rows for other same-named declarations are filtered out (the
+//!   primary's target pair decides, not the file alone — two classes in
+//!   one file may declare the same member name), so a caller may hand
+//!   the whole by-name reference union; the family face widens the
+//!   admission past the pair for a member query.
 //! * `deps` — ascending by library path, deduplicated. The rows
 //!   are the **reverse** edges: the libraries that import the declaring
 //!   library (the shared [`RevImportGraph`] CSR — who depends on the
@@ -396,6 +411,10 @@ pub fn ref_kind_name(kind: RefKind) -> &'static str {
 /// * `refs` — resolved reference rows for the name; rows targeting other
 ///   same-named declarations are filtered by the query, so the by-name
 ///   union is a valid input.
+/// * `is_family_ref(file, container)` — whether a reference row's target
+///   pair belongs to the primary's override family, the member-spelling
+///   widening (#2655): a row resolved to any member of the closure rides
+///   `refs` beside the primary's own sites. The bare face answers false.
 /// * `decls_of(file)` — the file's declaration surface (members are found
 ///   through the container anchor).
 /// * `supertypes_of(file, name)` — the declaration's clause-typed
@@ -436,6 +455,7 @@ pub fn explain<'d, 's, 'c, 'l, 'f>(
     verbosity: Verbosity,
     decls: &[SymbolDeclHit<'d>],
     refs: &[RefRow],
+    is_family_ref: impl Fn(FileId, StringId) -> bool,
     decls_of: impl Fn(FileId) -> &'d [DeclRow],
     supertypes_of: impl Fn(FileId, StringId) -> &'s [(TargetRef, SuperClause)],
     constructors_of: impl Fn(FileId, StringId) -> &'c [ConstructorFact],
@@ -474,11 +494,41 @@ pub fn explain<'d, 's, 'c, 'l, 'f>(
     ranked.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let primary = ranked.first().map(|&(_, hit)| hit);
 
+    // The primary's target pair (#2655): the `(file, container)` a
+    // reference row must name to be one of its sites — the container
+    // anchor's name for a member, the absent sentinel at top level. The
+    // pair, never the file alone, scopes `refs`: two classes in one file
+    // may declare the same member name, and a file-only filter would
+    // leak one into the other's answer. A row naming the pair, or a
+    // target inside the caller's override family (the member-spelling
+    // widening), is in scope.
+    let container_of = |hit: &SymbolDeclHit<'_>| -> StringId {
+        let surface = decls_of(hit.file);
+        if hit.decl.container != DeclRow::NONE {
+            surface[hit.decl.container as usize].name
+        } else {
+            StringId::NONE
+        }
+    };
+    let in_scope = |hit: &SymbolDeclHit<'_>, row: &RefRow| {
+        (row.target_file == hit.file && row.target_container == container_of(hit))
+            || is_family_ref(row.target_file, row.target_container)
+    };
+
     let declaration = primary.map(|hit| declaration_row(hit, &decls_of, &file_label_of, strings));
-    let edges: &'s [(TargetRef, SuperClause)] =
-        primary.map_or(&[], |hit| supertypes_of(hit.file, hit.decl.name));
-    let ctors: &[ConstructorFact] =
-        primary.map_or(&[], |hit| constructors_of(hit.file, hit.decl.name));
+    // The container sections are a top-level primary's (#2655): a member
+    // has no supertype clauses, constructors, or member surface of its
+    // own — the probes would answer a same-named container's aliased
+    // faces, so the member arm answers the empty sections by nature.
+    let top_level = primary.is_some_and(|hit| hit.decl.container == DeclRow::NONE);
+    let edges: &'s [(TargetRef, SuperClause)] = match primary {
+        Some(hit) if top_level => supertypes_of(hit.file, hit.decl.name),
+        _ => &[],
+    };
+    let ctors: &[ConstructorFact] = match primary {
+        Some(hit) if top_level => constructors_of(hit.file, hit.decl.name),
+        _ => &[],
+    };
 
     // `minimal` replaces the arrays with counts and trims the declaration's
     // container (a convenience field, never a locator); `compact`/`full`
@@ -499,28 +549,31 @@ pub fn explain<'d, 's, 'c, 'l, 'f>(
             .count();
         // `member_rows`: rows anchored to a same-named surface row (Dart
         // forbids same-name containers in one file, so the anchor set
-        // holds at most one row in honest input).
-        let methods = primary.map_or(0, |hit| {
-            let surface = decls_of(hit.file);
-            let containers: Vec<u32> = surface
-                .iter()
-                .enumerate()
-                .filter(|(_, row)| row.name == hit.decl.name)
-                .map(|(index, _)| {
-                    u32::try_from(index).expect("more than u32::MAX declaration rows")
-                })
-                .collect();
-            surface
-                .iter()
-                .filter(|row| containers.contains(&row.container))
-                .count()
-        });
-        // `reference_rows`: only the primary declaration's use sites.
-        let references = primary.map_or(0, |hit| {
-            refs.iter()
-                .filter(|row| row.target_file == hit.file)
-                .count()
-        });
+        // holds at most one row in honest input) — a top-level primary's
+        // face only (#2655).
+        let methods = if top_level {
+            primary.map_or(0, |hit| {
+                let surface = decls_of(hit.file);
+                let containers: Vec<u32> = surface
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| row.name == hit.decl.name)
+                    .map(|(index, _)| {
+                        u32::try_from(index).expect("more than u32::MAX declaration rows")
+                    })
+                    .collect();
+                surface
+                    .iter()
+                    .filter(|row| containers.contains(&row.container))
+                    .count()
+            })
+        } else {
+            0
+        };
+        // `reference_rows`: only the primary declaration's use sites (its
+        // target pair, the family widening admitted).
+        let references =
+            primary.map_or(0, |hit| refs.iter().filter(|row| in_scope(hit, row)).count());
         // Both graph joins sort and dedup by label text — `importers_of`
         // keeps one entry per import directive, so a duplicated directive
         // repeats the importer and the raw row length overcounts. Distinct
@@ -551,8 +604,15 @@ pub fn explain<'d, 's, 'c, 'l, 'f>(
     });
 
     let sections = !minimal;
-    let methods =
-        sections.then(|| primary.map_or_else(Vec::new, |hit| member_rows(hit, &decls_of, strings)));
+    let methods = sections.then(|| {
+        match primary {
+            // A member primary's face is empty by nature (#2655) — the
+            // probe answers a container's members, and a member is not
+            // one.
+            Some(hit) if top_level => member_rows(hit, &decls_of, strings),
+            _ => Vec::new(),
+        }
+    });
     let inheritance = sections.then(|| {
         supertype_rows(
             edges,
@@ -570,8 +630,10 @@ pub fn explain<'d, 's, 'c, 'l, 'f>(
         )
     });
     let constructors = sections.then(|| constructor_rows(ctors));
-    let references =
-        sections.then(|| reference_rows(primary.map(|hit| hit.file), refs, &file_label_of));
+    let references = sections.then(|| match primary {
+        Some(hit) => reference_rows(hit, refs, &in_scope, &file_label_of),
+        None => Vec::new(),
+    });
     let dependencies = sections.then(|| dependency_rows(primary, importers, &label_of));
     let affected_tests = sections.then(|| affected_test_rows(primary, tests, &label_of));
     let others = sections.then(|| {
@@ -732,28 +794,26 @@ fn constructor_rows(facts: &[ConstructorFact]) -> Vec<ConstructorRow> {
     rows
 }
 
-/// The reference rows targeting `primary_file` — the filter keeps a
-/// caller's whole by-name union honest, attributing only the primary
-/// declaration's sites. Sorted by (use-site file, range start).
+/// The reference rows in `in_scope`'s admission — the primary's target
+/// pair plus the family widening, the filter keeping a caller's whole
+/// by-name union honest. Sorted by (use-site file, range start).
 fn reference_rows<'f>(
-    primary_file: Option<FileId>,
+    hit: &SymbolDeclHit<'_>,
     refs: &[RefRow],
+    in_scope: &impl Fn(&SymbolDeclHit<'_>, &RefRow) -> bool,
     file_label_of: &impl Fn(FileId) -> &'f str,
 ) -> Vec<ReferenceRow> {
-    let mut rows: Vec<ReferenceRow> = match primary_file {
-        Some(file) => refs
-            .iter()
-            .filter(|row| row.target_file == file)
-            .map(|row| ReferenceRow {
-                file: file_label_of(row.file).to_owned(),
-                kind: ref_kind_name(row.kind).to_owned(),
-                off: row.range.offset,
-                len: row.range.length,
-                qualified: row.qualified(),
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let mut rows: Vec<ReferenceRow> = refs
+        .iter()
+        .filter(|row| in_scope(hit, row))
+        .map(|row| ReferenceRow {
+            file: file_label_of(row.file).to_owned(),
+            kind: ref_kind_name(row.kind).to_owned(),
+            off: row.range.offset,
+            len: row.range.length,
+            qualified: row.qualified(),
+        })
+        .collect();
     rows.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.off.cmp(&b.off)));
     rows
 }
@@ -973,6 +1033,7 @@ mod tests {
             Verbosity::Compact,
             &hits(&fx),
             &refs,
+            |_, _| false,
             |file| match file.index() {
                 0 => &fx.surface_a,
                 _ => &fx.surface_b,
@@ -1046,6 +1107,7 @@ mod tests {
             Verbosity::Minimal,
             &hits(&fx),
             &[],
+            |_, _| false,
             |file| match file.index() {
                 0 => &fx.surface_a,
                 _ => &fx.surface_b,
@@ -1106,6 +1168,7 @@ mod tests {
                 verbosity,
                 &hits(&fx),
                 &[],
+                |_, _| false,
                 |file| match file.index() {
                     0 => &fx.surface_a,
                     _ => &fx.surface_b,
@@ -1151,6 +1214,7 @@ mod tests {
                 verbosity,
                 &hits(&fx),
                 &refs,
+                |_, _| false,
                 |file| match file.index() {
                     0 => &fx.surface_a,
                     _ => &fx.surface_b,
@@ -1181,6 +1245,7 @@ mod tests {
             Verbosity::Compact,
             &[],
             &[],
+            |_, _| false,
             |_| &fx.surface_b,
             |_, _| &[],
             |_, _| &[],
@@ -1211,6 +1276,7 @@ mod tests {
             Verbosity::Compact,
             &hits(&fx),
             &[],
+            |_, _| false,
             |file| match file.index() {
                 0 => &fx.surface_a,
                 _ => &fx.surface_b,
@@ -1247,6 +1313,7 @@ mod tests {
             Verbosity::Compact,
             &hits(&fx),
             &[],
+            |_, _| false,
             |file| match file.index() {
                 0 => &fx.surface_a,
                 _ => &fx.surface_b,
@@ -1294,6 +1361,7 @@ mod tests {
             Verbosity::Compact,
             &hits,
             &[],
+            |_, _| false,
             |file| match file.index() {
                 0 => &fx.surface_a,
                 _ => &fx.surface_b,
@@ -1322,6 +1390,7 @@ mod tests {
             Verbosity::Minimal,
             &hits,
             &[],
+            |_, _| false,
             |file| match file.index() {
                 0 => &fx.surface_a,
                 _ => &fx.surface_b,
@@ -1343,6 +1412,146 @@ mod tests {
         );
         let value = serde_json::to_value(&minimal).expect("serialize");
         assert!(value["declaration"].get("container").is_none());
+    }
+
+    /// The member-primary scoping (#2655): a member hit's container
+    /// sections answer empty by nature — never the faces a same-named
+    /// container would answer — and its references scope to the member's
+    /// `(file, container)` pair (a same-file container's same-named member
+    /// never leaks in) plus the override-family widening.
+    #[test]
+    fn member_primary_scopes_sections_and_widens_refs_through_the_family() {
+        let fx = fixture();
+        let strings = &fx.strings;
+        let (m, repo, other, sub) = (
+            strings.intern("m"),
+            strings.intern("Repo"),
+            strings.intern("Other"),
+            strings.intern("Sub"),
+        );
+        // a.dart: Repo declaring the member `m` (the primary), Other
+        // declaring its same-named `m`, and Sub — the family member the
+        // widening admits.
+        let surface_a = vec![
+            row(repo, DeclKind::Class, 0, DeclRow::NONE),
+            row(m, DeclKind::Method, 40, 0),
+            row(other, DeclKind::Class, 100, DeclRow::NONE),
+            row(m, DeclKind::Method, 140, 2),
+            row(sub, DeclKind::Class, 200, DeclRow::NONE),
+        ];
+        let hit = SymbolDeclHit {
+            library: 0,
+            file: fx.file_a,
+            decl: &surface_a[1],
+        };
+        // The aliased faces: probed with the member's name they would
+        // answer the same-named container's rows — the member arm must
+        // never consult them.
+        let aliased = vec![(
+            TargetRef::Decl(fx.file_a, repo),
+            SuperClause::Extends,
+        )];
+        let aliased_ctors = vec![ConstructorFact {
+            name: "m".to_owned(),
+            signature: "m()".to_owned(),
+        }];
+        // Three use sites in the by-name union: Repo's (the primary's
+        // pair), Other's (a same-file, same-named member — out), and
+        // Sub's (out of the pair, in through the family face).
+        let member_ref = |file: FileId, container: StringId, offset: u32| RefRow {
+            file,
+            target_file: fx.file_a,
+            target_name: m,
+            target_container: container,
+            kind: RefKind::Invoked,
+            range: SourceRange {
+                offset,
+                length: 1,
+            },
+            qualifier: StringId::NONE,
+        };
+        let refs = vec![
+            member_ref(fx.file_b, repo, 10),
+            member_ref(fx.file_b, other, 50),
+            member_ref(fx.file_c, sub, 300),
+        ];
+        let (importers, tests) = graphs();
+        let report = explain(
+            "Repo.m",
+            Verbosity::Compact,
+            std::slice::from_ref(&hit),
+            &refs,
+            |file, container| file == fx.file_a && container == sub,
+            |file| match file.index() {
+                0 => surface_a.as_slice(),
+                _ => &fx.surface_b,
+            },
+            |_, name| {
+                assert_ne!(name, m, "a member primary probes no container faces");
+                aliased.as_slice()
+            },
+            |_, name| {
+                assert_ne!(name, m, "a member primary probes no constructor faces");
+                aliased_ctors.as_slice()
+            },
+            &importers,
+            labels,
+            file_labels,
+            |_| false,
+            |_, off| off + 1,
+            &tests,
+            strings,
+        );
+        assert_eq!(
+            report.declaration.as_ref().expect("primary").container,
+            Some("Repo".to_owned())
+        );
+        assert_eq!(report.inheritance, Some(Vec::new()), "no clauses by nature");
+        assert_eq!(report.interfaces, Some(Vec::new()));
+        assert_eq!(report.constructors, Some(Vec::new()));
+        assert_eq!(report.methods, Some(Vec::new()), "no member surface");
+        assert_eq!(
+            report
+                .references
+                .expect("references")
+                .iter()
+                .map(|row| (row.file.as_str(), row.off))
+                .collect::<Vec<_>>(),
+            vec![("b.dart", 10), ("c.dart", 300)],
+            "the primary's pair plus the family row; Other's site stays out"
+        );
+        // The minimal counts mirror the same scoping.
+        let minimal = explain(
+            "Repo.m",
+            Verbosity::Minimal,
+            std::slice::from_ref(&hit),
+            &refs,
+            |file, container| file == fx.file_a && container == sub,
+            |file| match file.index() {
+                0 => surface_a.as_slice(),
+                _ => &fx.surface_b,
+            },
+            |_, name| {
+                assert_ne!(name, m, "a member primary probes no container faces");
+                aliased.as_slice()
+            },
+            |_, name| {
+                assert_ne!(name, m, "a member primary probes no constructor faces");
+                aliased_ctors.as_slice()
+            },
+            &importers,
+            labels,
+            file_labels,
+            |_| false,
+            |_, off| off + 1,
+            &tests,
+            strings,
+        );
+        let counts = minimal.counts.expect("counts");
+        assert_eq!(counts.methods, 0);
+        assert_eq!(counts.references, 2);
+        assert_eq!(counts.inheritance, 0);
+        assert_eq!(counts.constructors, 0);
     }
 
     /// Several hits for one name across files: the selection-order first
@@ -1373,6 +1582,7 @@ mod tests {
             Verbosity::Compact,
             &hits,
             &refs(&fx),
+            |_, _| false,
             // `b.dart`'s surface stays empty; the same-named second hit
             // lives in `c.dart`, whose surface is the same Vec here.
             |file| match file.index() {
@@ -1459,6 +1669,7 @@ mod tests {
                 verbosity,
                 &hits,
                 &[],
+                |_, _| false,
                 surfaces,
                 |_, _| &[],
                 |_, _| &[],
@@ -1535,6 +1746,7 @@ mod tests {
             Verbosity::Compact,
             &hits,
             &[],
+            |_, _| false,
             |file| match file.index() {
                 0 => surface_a.as_slice(),
                 _ => surface_b.as_slice(),
