@@ -1285,7 +1285,26 @@ impl Interp<'_> {
                     // therefore never demotes what the read had
                     // promoted).
                     let (written, written_args) = if *plain {
-                        (rhs_ty, rhs_ty_args)
+                        // Downward inference: a raw creation of the target's
+                        // own declared head (`o = Completer()` into
+                        // `Completer<bool>? o`) infers its arguments from
+                        // the write's context type — the instantiated
+                        // `Completer<bool>`, never the raw face whose
+                        // arguments the promotion step would fail.
+                        let declared = self.vars.get(var as usize).map(|meta| (meta.ty, meta.args));
+                        match declared {
+                            Some((declared_ty, declared_args))
+                                if rhs_ty_args == crate::ty::EMPTY_ARGS
+                                    && declared_args != crate::ty::EMPTY_ARGS
+                                    && !rhs_ty.nullable
+                                    && matches!(rhs_ty.base, crate::ty::Base::Name(_))
+                                    && rhs_ty.base == declared_ty.base
+                                    && rhs.reference.is_none() =>
+                            {
+                                (rhs_ty, declared_args)
+                            }
+                            _ => (rhs_ty, rhs_ty_args),
+                        }
                     } else if *if_null {
                         // `LUB(NonNull(readType), rhsType)` — the boundary-
                         // aware non-null form first, then the name-level
@@ -2591,6 +2610,20 @@ impl Interp<'_> {
             }
             dead
         } else {
+            // A `FutureOr<R>` remainder `R` (factorType rule 3, the
+            // `Future<R> <: what` arm) is the argument node itself: its
+            // written-argument tree is the node's own, never the FutureOr
+            // list (`List<int>` would otherwise re-read `[List<int>]` as
+            // its arguments). Every other remainder keeps `previous`'s.
+            let factored_args = match previous.base {
+                Base::Name(id) if self.closed.future_or == Some(id) => self
+                    .args
+                    .get(previous_args as usize)
+                    .and_then(|row| row.first())
+                    .filter(|arg| arg.base == factored.base && factored.base != previous.base)
+                    .map_or(previous_args, |arg| arg.args),
+                _ => previous_args,
+            };
             // Official `isValidPromotionStep`: the factor output is a
             // subtype of `previous` by construction, so the step is valid
             // exactly when `previous` is not a subtype of it (no mutual
@@ -2601,7 +2634,7 @@ impl Interp<'_> {
                 previous,
                 previous_args,
                 factored,
-                previous_args,
+                factored_args,
                 self.args,
                 self.names,
             ) {
@@ -2614,7 +2647,7 @@ impl Interp<'_> {
                 &mut self.lists,
                 var,
                 Some((tested, tested_args)),
-                factored.map(|ty| (ty, previous_args)),
+                factored.map(|ty| (ty, factored_args)),
                 self.args,
                 self.names,
             )

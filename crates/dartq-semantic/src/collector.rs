@@ -3221,9 +3221,18 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         kind: FormalParameterKind,
         member_kind: ParserMemberKind,
     ) {
-        if self.builder.formal_depth != 1 {
-            // A formal inside a function-type shape (depth ≥ 2): its
-            // name/kind feeds the shape's columns — named formals trail
+        // A formal inside a function-type shape: an open function level at
+        // the capture top (the formal's own type already closed) — depth ≥ 2
+        // under an executable, or depth 1 for a top-level `typedef F =
+        // R Function(...)` RHS, whose list opens at depth 0.
+        let in_shape = self.builder.formal_depth != 1
+            || self
+                .builder
+                .capture
+                .as_ref()
+                .is_some_and(|site| site.top_is_function());
+        if in_shape {
+            // Its name/kind feeds the shape's columns — named formals trail
             // the positional ones, exactly like record fields.
             let builder = &mut self.builder;
             let named = matches!(
@@ -3236,7 +3245,14 @@ impl ParserListener for DeclarationCollector<'_, '_> {
             {
                 site.function_formal_end(named, formal_name);
             }
-            return;
+            // A depth-1 shape formal still joins the list-level walk below
+            // (the within-list `duplicate_definition` check of a top-level
+            // `void Function({int d, int d})` reads it); the depth-0
+            // function-type group never attaches its formals to an
+            // executable.
+            if self.builder.formal_depth != 1 {
+                return;
+            }
         }
         let builder = &mut self.builder;
         let Some((name, range)) = builder.capture_name(name) else {

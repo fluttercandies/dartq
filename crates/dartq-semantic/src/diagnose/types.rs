@@ -134,6 +134,52 @@ pub struct FileReport {
     /// frames close out of source order); merged into `diagnostics` by
     /// offset at the end of the pass.
     pub(crate) usage: Vec<Diagnostic>,
+    /// Resolved member-access reference edges (#2618), in resolution
+    /// order: one row per `receiver.member` / implicit-this use the
+    /// pass resolved onto a declaration the element index carries. The
+    /// engine folds them into the library reference surface beside the
+    /// parser-level sites (member sends resolve only with type
+    /// information, so the capture layer cannot produce them).
+    pub member_refs: Vec<MemberRef>,
+}
+
+/// The relation kind of a resolved member-access edge (#2618) — the
+/// dartq-index `RefKind` subset member accesses mint (the engine maps at
+/// the library-surface boundary; `Referenced` is a type-position kind no
+/// member send mints).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberRefKind {
+    /// A value read of a field or getter (a method read as a value is a
+    /// tear-off and mints [`Self::Invoked`], matching the index's
+    /// tear-off-shaped `Invoked` face).
+    Read,
+    /// An invocation or tear-off-shaped use.
+    Invoked,
+    /// The target of a plain `=` assignment.
+    Written,
+    /// The target of a compound assignment.
+    ReadWritten,
+}
+
+/// One resolved member-access reference edge (#2618): the member name
+/// token's span and the declaration the pass's resolution landed on —
+/// the target the diagnostics' own member verdicts trust, so the edge
+/// inherits the resolution fidelity the differential harness pins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemberRef {
+    /// The member name token's span (UTF-16).
+    pub range: SourceRange,
+    /// The relation kind.
+    pub kind: MemberRefKind,
+    /// The file declaring the resolved member.
+    pub target_file: FileId,
+    /// The member's lookup spelling (setter write targets under their
+    /// `name=` spelling).
+    pub target_name: StringId,
+    /// The declaring container's name — `(file, name)` alone cannot name
+    /// a member (two classes in one file may declare the same member
+    /// name), so the container rides the edge and the reference row.
+    pub target_container: StringId,
 }
 
 /// The `shouldIgnoreUndefined` mirror (`element.dart:8217-8250`) over the
@@ -552,6 +598,11 @@ pub(crate) struct ArgLevel {
     /// function literals) never latches: its fold stays with the callee
     /// transport.
     pub(crate) unnamed_head: Option<(StringId, SourceRange)>,
+    /// This level's own named-selector creation head (`C<T>.named(`), the
+    /// [`Self::unnamed_head`] sibling for the named fold alone: a nested
+    /// creation among the arguments (`Future<Never>.error(StateError(..))`)
+    /// overwrites the single engine slot before this level closes.
+    pub(crate) named_head: Option<(StringId, SourceRange)>,
 }
 
 /// One open function literal's written signature capture
@@ -1027,12 +1078,14 @@ pub(crate) struct FaceMemo<'a> {
     pub(crate) walks: RefCell<FxHashMap<(StringId, StringId, bool), Walk<'a>>>,
     /// The declaring container of each memoized `Found` outcome — the hop
     /// the climb found the member on (`List.map` declares on `Iterable`),
-    /// the key the receiver-instantiation environment composes against.
-    pub(crate) origins: RefCell<FxHashMap<(StringId, StringId, bool), StringId>>,
-    /// The declaring container the climb in flight recorded for its
-    /// `Found` return; read back by [`Self::walk`] into `origins`, and by
-    /// the caller as the probe's origin.
-    pub(crate) found_origin: std::cell::Cell<Option<StringId>>,
+    /// the key the receiver-instantiation environment composes against —
+    /// paired with that container's declaring file (#2618: the
+    /// member-reference edge target).
+    pub(crate) origins: RefCell<FxHashMap<(StringId, StringId, bool), (StringId, FileId)>>,
+    /// The declaring container (and its file) the climb in flight recorded
+    /// for its `Found` return; read back by [`Self::walk`] into `origins`,
+    /// and by the caller as the probe's origin.
+    pub(crate) found_origin: std::cell::Cell<Option<(StringId, FileId)>>,
     /// The prefixed supertype-clause faces of the diagnosing file's
     /// container headers, scanned once per pass on the first prefixed-face
     /// question (`(writer container, face local name)` → the written prefix
@@ -1074,7 +1127,14 @@ impl<'a> FaceMemo<'a> {
     /// The declaring container of the most recent probe's `Found` outcome
     /// (memoized or fresh); `None` for a miss or a broken chain.
     pub(crate) fn last_origin(&self) -> Option<StringId> {
-        self.found_origin.get()
+        self.found_origin.get().map(|(origin, _)| origin)
+    }
+
+    /// The file declaring the container of the most recent probe's `Found`
+    /// outcome (#2618) — the member-edge target's declaring file; `None`
+    /// for a miss or a broken chain.
+    pub(crate) fn last_found_file(&self) -> Option<FileId> {
+        self.found_origin.get().map(|(_, file)| file)
     }
 }
 
@@ -1834,6 +1894,14 @@ pub(crate) struct Engine<'a> {
     pub(crate) pending_mixin_uses: Vec<SourceRange>,
     /// Suppression depth inside `new`/`const`/implicit-creation expressions.
     pub(crate) ctor_pos: u32,
+    /// The open argument-list depth ([`Self::arg_levels`]) at each
+    /// `ctor_pos` entry: a call nested in a creation's own argument list
+    /// is a plain send, not the creation head.
+    pub(crate) ctor_pos_levels: Vec<usize>,
+    /// The unit's [`InvalidTypeNames`], latched before the resolve pass
+    /// (which takes `rows`): the InvalidType spellings member and
+    /// extension faces consult.
+    pub(crate) invalid_type_names: InvalidTypeNames,
     /// Depth inside the keyword-less implicit-creation form
     /// (`prefix.C<int>.new()`, `g<int>(...)`). The keyword forms keep the
     /// `ConstructorReference` shape — the `.new` selector resolves silently
@@ -3899,6 +3967,12 @@ pub(crate) enum StagedKind {
     /// with its own fixed sequence instantiation answers through its
     /// clause).
     YieldEach,
+    /// `for_in_of_invalid_type`: the iterable's parse-time type rides in
+    /// `from`, the sequence type (`Iterable<dynamic>` / `Stream<dynamic>`)
+    /// in `to`; a promoted-read fact on the iterable re-decides at the
+    /// teardown join (`_checkForEachParts` reads the iterable's flow-aware
+    /// static type — `if (v is List<Object>) for (var e in v)` is clean).
+    ForIn,
 }
 
 /// A passing constant-pattern candidate (#1351): the parse-time check ran

@@ -298,7 +298,9 @@ impl<'a> Engine<'a> {
             if !skip_own && let Some(entry) = found.members.get(&member) {
                 // F1: the found entry belongs to `found_owner`'s pool —
                 // project it before it flows into rows or message text.
-                self.member_faces.found_origin.set(Some(name));
+                self.member_faces
+                    .found_origin
+                    .set(Some((name, found_owner)));
                 let projected = self.boundary.member(found_owner, name, member, entry);
                 // An ancestor hop's found entry reads through the writer's
                 // written clause arguments — `class B extends A<int>`
@@ -379,7 +381,9 @@ impl<'a> Engine<'a> {
                             )),
                             Instantiated::Unchanged | Instantiated::Undecidable => projected,
                         };
-                    self.member_faces.found_origin.set(Some(*mixin));
+                    self.member_faces
+                        .found_origin
+                        .set(Some((*mixin, mixin_owner)));
                     return Walk::Found(found_entry);
                 }
             }
@@ -499,7 +503,9 @@ impl<'a> Engine<'a> {
             if let Some(entry) = face_container.members.get(&member)
                 && !entry.is_static
             {
-                self.member_faces.found_origin.set(Some(face));
+                self.member_faces
+                    .found_origin
+                    .set(Some((face, face_container_owner)));
                 return Walk::Found(self.boundary.member(
                     face_container_owner,
                     face,
@@ -2693,14 +2699,24 @@ impl<'a> Engine<'a> {
             // `_fe_analyzer_shared` edge is dead but `LintCode`'s interface
             // names report). A top-level miss returns the empty face; a
             // nested miss ends the climb like a `None` superclass.
-            let Some((found, found_owner)) = resolve_container(
+            let resolved = resolve_container(
                 self.graph,
                 self.namespaces,
                 self.index,
                 scope_lib,
                 owner,
                 name,
-            ) else {
+            )
+            .or_else(|| {
+                // A hop naming a TYPE ALIAS binds the alias's right-hand
+                // class (`extends IterableBase<E>` — SDK 3.47 spells
+                // `typedef IterableBase<E> = Iterable<E>`): the oracle's
+                // supertype is the RHS, whose members the walk climbs.
+                let (container, file, head) = self.alias_container_head(name, scope_lib, owner)?;
+                name = head;
+                Some((container, file))
+            });
+            let Some((found, found_owner)) = resolved else {
                 // A dead hop whose spelling names the frozen list face
                 // (`with ListMixin` over a names-only SDK projection the
                 // index cannot model) still contributes its members.
@@ -4361,6 +4377,46 @@ impl<'a> Engine<'a> {
         i
     }
 
+    /// The class a type-alias spelling names, looked up from `file` in
+    /// `lib` (`typedef IterableBase<E> = Iterable<E>` → `Iterable`'s
+    /// container, its declaring file, and the head spelling). Chained
+    /// aliases fold up to the loop depth; only the RHS head resolves (the
+    /// clause arguments ride the member sites). `None` for a non-alias, an
+    /// alias to a non-class RHS, or an unresolvable head.
+    fn alias_container_head(
+        &self,
+        name: StringId,
+        lib: LibraryId,
+        file: FileId,
+    ) -> Option<(&'a Container, FileId, StringId)> {
+        let (mut head, mut scope_lib, mut scope_file) = (name, lib, file);
+        for _ in 0..8 {
+            let (owner, decl) =
+                match lookup_scoped(self.graph, self.namespaces, self.index, scope_lib, scope_file, head)
+                {
+                    ScopedHit::Local(decl) => (scope_file, decl),
+                    ScopedHit::Found(NamespaceEntry::Decl(owner)) => {
+                        (owner, self.index.get(owner)?.decl(head)?)
+                    }
+                    _ => return None,
+                };
+            if decl.kind != crate::model::MicroKind::TypeAlias || decl.var_ty == Ty::UNKNOWN {
+                return None;
+            }
+            let Ty::Named { name: next, .. } = self.boundary.ty(owner, decl.var_ty) else {
+                return None;
+            };
+            let next_lib = self.owner_library_of(owner, head).unwrap_or(scope_lib);
+            if let Some((container, found)) =
+                resolve_container(self.graph, self.namespaces, self.index, next_lib, owner, next)
+            {
+                return Some((container, found, next));
+            }
+            (head, scope_lib, scope_file) = (next, next_lib, owner);
+        }
+        None
+    }
+
     /// Resolves a supertype-clause face as written in `writer`'s header: a
     /// dotted spelling (`idl.X`, recovered by
     /// [`Self::prefixed_clause_prefix`]) binds through the prefix's merged
@@ -4371,7 +4427,7 @@ impl<'a> Engine<'a> {
     /// carry prefix facts; a foreign writer whose bare face misses recovers
     /// the clause's prefix through the writing library's own prefix set
     /// ([`Self::foreign_prefixed_clause`]).
-    fn resolve_clause_face(
+    pub(crate) fn resolve_clause_face(
         &self,
         writer: StringId,
         file: FileId,

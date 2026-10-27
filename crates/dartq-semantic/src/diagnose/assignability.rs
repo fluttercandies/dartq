@@ -910,6 +910,31 @@ impl<'a> Engine<'a> {
                     _ => Ty::UNKNOWN,
                 }
             }
+            // A prefixed top-level read (`diag.deadCode`): the prefix's
+            // import table resolves the declaration, whose declared type is
+            // the read's static type — a variable's `var_ty`, a getter's
+            // return (the bare arm's getter rule; a function tear-off keeps
+            // the unknown face). Containers and misses stay unknown.
+            RowShape::Member {
+                recv: Receiver::Prefix { name: prefix },
+            } => {
+                let dartq_resolution::Lookup::Found(NamespaceEntry::Decl(file)) =
+                    self.namespaces.lookup_prefixed(self.graph, self.lib, *prefix, row.name)
+                else {
+                    return Ty::UNKNOWN;
+                };
+                let Some(decl) = self.index.get(file).and_then(|f| f.decl(row.name)) else {
+                    return Ty::UNKNOWN;
+                };
+                let decl = self.boundary.top(file, row.name, decl);
+                match decl.kind {
+                    MicroKind::TopLevelVar => self.fold_alias_ty(decl.var_ty),
+                    MicroKind::TopLevelFn if decl.formals.is_none() => {
+                        self.fold_alias_ty(decl.return_ty)
+                    }
+                    _ => Ty::UNKNOWN,
+                }
+            }
             RowShape::Member { recv } => {
                 // A `Created` receiver (`Holder().field`) names the created
                 // container exactly like the typed/this faces — the member
@@ -2001,7 +2026,20 @@ impl<'a> Engine<'a> {
         let (from, range) = (self.expression_row_ty(&rhs_row), rhs_row.range);
         let literal = Self::primitive_literal(&rhs_row, &self.members.primitive_ids);
         let target_row = self.rows[target].clone();
-        let to = self.assignment_target_ty(&target_row);
+        // A bare initializer-list target names the FIELD (the
+        // `ConstructorFieldInitializer`'s `fieldName` resolves in the
+        // container, never the formal scope): a same-named parameter
+        // (`content = ''` beside a `Map content` formal) must not lend its
+        // type to the slot.
+        let to = match (in_initializer, &target_row.shape) {
+            (true, RowShape::Bare(_)) if !target_row.qualified => {
+                match self.init_rows.get(&target_row.range.offset).copied() {
+                    Some(container) => self.member_write_ty(container, target_row.name),
+                    None => self.assignment_target_ty(&target_row),
+                }
+            }
+            _ => self.assignment_target_ty(&target_row),
+        };
         // The invalid-source gate (upstream `InvalidType`): a right side
         // whose written head resolves to no type asks no assignability
         // question (probed 3.47.1: `expression = parent` with `AstNode?
@@ -2833,12 +2871,11 @@ impl<'a> Engine<'a> {
             nullable: false,
             args: self.boundary.intern_list(&[Ty::Dynamic]),
         };
+        // A rejection stages: the teardown join re-decides it against the
+        // iterable read's promoted type ([`StagedKind::ForIn`]).
+        let sequence = Ty::named(head);
         match self.assignable(ty, target, literal) {
-            Some(false) => {
-                let sequence = if await_ { "Stream" } else { "Iterable" };
-                let a0 = self.ty_display(ty);
-                self.emit(SemanticCode::ForInOfInvalidType, range, &a0, sequence);
-            }
+            Some(false) => self.stage(StagedKind::ForIn, range, ty, sequence, literal),
             // The undecidable source side re-asks the core-face interface
             // membership (`implements` semantics, never the entity ask —
             // the sequence head is the core interface itself): a clean
@@ -2869,9 +2906,7 @@ impl<'a> Engine<'a> {
                     false,
                 ) == Some(false)
                 {
-                    let sequence = if await_ { "Stream" } else { "Iterable" };
-                    let a0 = self.ty_display(ty);
-                    self.emit(SemanticCode::ForInOfInvalidType, range, &a0, sequence);
+                    self.stage(StagedKind::ForIn, range, ty, sequence, literal);
                 }
             }
             Some(true) => {}
@@ -3493,8 +3528,14 @@ impl<'a> Engine<'a> {
                 None => return None,
             }
         }
-        for (name, from_ty, from_required) in &from.named {
-            let Some((_, to_ty, to_required)) = to.named.iter().find(|(n, _, _)| n == name) else {
+        // Named parameters (subtype.dart:132-179): every named parameter
+        // the target accepts must exist on the source (contravariant type,
+        // no stronger `required`), and the source's extra named parameters
+        // must all be optional — a target call never passes them.
+        for (name, to_ty, to_required) in &to.named {
+            let Some((_, from_ty, from_required)) =
+                from.named.iter().find(|(n, _, _)| n == name)
+            else {
                 return Some(false);
             };
             if *from_required && !to_required {
@@ -3505,6 +3546,13 @@ impl<'a> Engine<'a> {
                 Some(true) => {}
                 None => return None,
             }
+        }
+        if from
+            .named
+            .iter()
+            .any(|(name, _, required)| *required && !to.named.iter().any(|(n, _, _)| n == name))
+        {
+            return Some(false);
         }
         Some(true)
     }

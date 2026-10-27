@@ -588,7 +588,7 @@ mod ticket_2362_tests;
 
 pub(crate) use operand_face::OperandFace;
 pub(crate) use types::*;
-pub use types::{FileReport, NameRow, NameUse, RefTarget, UndefinedGuard, UnitRef};
+pub use types::{FileReport, MemberRef, MemberRefKind, NameRow, NameUse, RefTarget, UndefinedGuard, UnitRef};
 
 /// Parses an int literal body: decimal or `0x` hex, `_` separators
 /// stripped; `None` when the value exceeds `i64` (an unobservable edge —
@@ -1503,6 +1503,7 @@ pub fn fold_unit_with_ops<'t>(
     engine.prop_promotion_rows = PropPromotionStaging {
         rows: prop_promotions.rows.clone(),
     };
+    engine.invalid_type_names = invalid_names.clone();
     engine.resolve_rows(&promotions);
     // The discarded-value folds (`checkConstructorInvocation`) and the
     // `unless` parameter co-row (`_findUndefinedUseResultParameter`) run
@@ -4923,6 +4924,12 @@ mod ticket_2569_tests;
 /// The #2570 pins: usage-cluster and misc tail sweep.
 #[cfg(test)]
 mod ticket_2570_tests;
+
+/// The #2618 pins: resolved member-access reference edges — one per
+/// member-send shape the diagnose fold resolves, with the target
+/// declaration and the intent-derived kind.
+#[cfg(test)]
+mod ticket_2618_tests;
 
 
 /// The operand-face pins: the numeric refinement reads an operand the

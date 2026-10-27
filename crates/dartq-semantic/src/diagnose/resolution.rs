@@ -17,10 +17,21 @@ impl<'a> Engine<'a> {
 
     pub(crate) fn enter_ctor_pos(&mut self) {
         self.ctor_pos += 1;
+        self.ctor_pos_levels.push(self.arg_levels.len());
     }
 
     pub(crate) fn leave_ctor_pos(&mut self) {
         self.ctor_pos -= 1;
+        self.ctor_pos_levels.pop();
+    }
+
+    /// Whether an argument group opening now belongs to the innermost
+    /// creation expression itself — no argument list opened since the
+    /// creation began.
+    pub(crate) fn at_creation_level(&self) -> bool {
+        self.ctor_pos_levels
+            .last()
+            .is_some_and(|&level| level == self.arg_levels.len())
     }
 
     /// A bare name's declared type, innermost frame first.
@@ -1660,6 +1671,20 @@ impl<'a> Engine<'a> {
                 }
             }
             RowShape::Receiver(recv) => *recv,
+            // A prefixed top-level value (`diag.deadCode.atOffset(...)`,
+            // `p.f().m(...)`): the read's declared type (or the callee's
+            // return) is the receiver — the merge's own prefix arm, seen
+            // before the merge runs. A prefixed container hit answers no
+            // type here and keeps the unknown face.
+            RowShape::Member {
+                recv: Receiver::Prefix { .. },
+            } => match self.receiver_static_ty(row) {
+                ty @ Ty::Named { name, .. } => Receiver::Typed {
+                    type_name: name,
+                    ty,
+                },
+                _ => Receiver::Unknown,
+            },
             _ => Receiver::Unknown,
         }
     }

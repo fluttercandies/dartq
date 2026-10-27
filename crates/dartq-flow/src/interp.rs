@@ -578,6 +578,22 @@ pub(crate) const THIS_RECEIVER: u32 = u32::MAX - 1;
 /// an ill-formed `T extends U, U extends T` would otherwise spin on.
 const BOUND_RECURSION_LIMIT: u8 = 16;
 
+/// Step budget per recorded event for one executable's replay
+/// ([`Interp::run`]): the structural termination invariant of the
+/// interpreter. A converging body spends at most a small multiple of its
+/// event count on steps — the initial collect pass, the real replay, and
+/// the per-construct re-walks (loop-head collects, closure-entry
+/// collects, C-`for` header replays) each walk an extent linearly, and
+/// the walks stack with construct nesting depth rather than multiply.
+/// Measured worst legit consumption: 38‰ of this budget (≈4.9 steps per
+/// event, `bundle_reader.dart`-shaped bodies) across the full `analyzer`
+/// corpus under both the name-level and the resolved ops — a 26× margin,
+/// pinned by `ticket_2626_tests` (no corpus body may exceed 10% of the
+/// budget). A body that would step past
+/// `events.len() * STEP_BUDGET_PER_EVENT` cannot converge; the replay
+/// bails (see [`Interp::bailed`]) instead of spinning.
+pub(crate) const STEP_BUDGET_PER_EVENT: u64 = 128;
+
 /// One open null-shorting context (official `_NullAwareAccessContext`,
 /// flow_analysis.dart:9664): the skip path captured at the `?.`/`?[`/`?..`
 /// and the access-path state the condition face can still read back.
@@ -1116,6 +1132,33 @@ pub(crate) struct Interp<'o> {
 
     pub(crate) collect: Option<Vec<Effects>>,
     snapshot: Option<Snapshot>,
+
+    /// Remaining step budget for the current executable (see
+    /// [`STEP_BUDGET_PER_EVENT`]): decremented once per [`Interp::step`],
+    /// initialized by [`Interp::run`]. Read by the recorder's `exec_end`
+    /// for the bail marker and the ratio face.
+    pub(crate) budget: u64,
+    /// The budget ran out mid-replay: every driver loop
+    /// ([`Interp::run`], [`Interp::run_range`], [`Interp::collect_ranges`])
+    /// has unwound, the body's flow facts are dropped (a partial replay's
+    /// state is not evidence — under-reporting is the only sound bail
+    /// posture), and the body contributes no flow rows. Stays `false`
+    /// for every converging body.
+    pub(crate) bailed: bool,
+    /// Test-only budget override: when set, [`Interp::run`] uses this
+    /// instead of `events.len() * STEP_BUDGET_PER_EVENT` (the bail-path
+    /// determinism test drives a legit stream past an artificially small
+    /// budget; production never sets it).
+    #[cfg(test)]
+    budget_override: Option<u64>,
+}
+
+impl Interp<'_> {
+    /// Test-only budget override (see [`Interp::budget_override`]).
+    #[cfg(test)]
+    pub(crate) fn override_step_budget_for_test(&mut self, budget: u64) {
+        self.budget_override = Some(budget);
+    }
 }
 
 /// Interpreter state frozen around a collect run.
@@ -1267,12 +1310,22 @@ impl<'o> Interp<'o> {
             args_bases: Vec::new(),
             collect: None,
             snapshot: None,
+            budget: u64::MAX,
+            bailed: false,
+            #[cfg(test)]
+            budget_override: None,
         }
     }
 
     /// Runs one executable's buffer: the pre-pass collect, then the real
     /// replay.
     pub(crate) fn run(&mut self, events: &[Ev]) {
+        self.bailed = false;
+        self.budget = events.len() as u64 * STEP_BUDGET_PER_EVENT;
+        #[cfg(test)]
+        if let Some(override_budget) = self.budget_override {
+            self.budget = override_budget;
+        }
         // A resolved back-end builds its `Base::Name` bindings from the
         // recorder's lexeme table before the first question arrives — the
         // incremental scan costs one bounds check for a name-level impl
@@ -1281,12 +1334,21 @@ impl<'o> Interp<'o> {
         let match_of = build_match_map(events);
         self.anywhere = self.collect_ranges(events, 0..events.len(), &match_of);
         let mut i = 0;
-        while i < events.len() {
+        while i < events.len() && !self.bailed {
             let control = self.step(events, i, &match_of);
             match control {
                 Control::Continue => i += 1,
                 Control::Jump(to) => i = to,
             }
+        }
+        if self.bailed {
+            // The bail state: no partial flow facts survive as definite
+            // facts (a replay that did not converge established nothing),
+            // and the write-site rows / final covering close are skipped —
+            // the recorder's `exec_end` sees `bailed` and drops the
+            // executable's contribution wholesale.
+            self.facts.clear();
+            return;
         }
         // The write-site rows (the semantic query face's family-c):
         // aggregated from the AssignedVariables anywhere sets —
@@ -2303,7 +2365,7 @@ impl<'o> Interp<'o> {
         let outer = self.collect.replace(vec![Effects::default()]);
         let _ = self.snapshot.replace(snapshot);
         let mut i = range.start;
-        while i < range.end {
+        while i < range.end && !self.bailed {
             match self.step(events, i, match_of) {
                 Control::Continue => i += 1,
                 // Extent handlers consume wholesale in collect runs too.
@@ -2583,7 +2645,7 @@ impl Interp<'_> {
     /// Runs a range of the buffer through the driver, honoring jumps.
     pub(crate) fn run_range(&mut self, events: &[Ev], range: Range<usize>, match_of: &[u32]) {
         let mut i = range.start;
-        while i < range.end {
+        while i < range.end && !self.bailed {
             match self.step(events, i, match_of) {
                 Control::Continue => i += 1,
                 Control::Jump(to) => i = to.max(range.start),
@@ -3358,6 +3420,14 @@ impl Interp<'_> {
     /// collection-`for`, closures) consume the whole extent and return a
     /// jump.
     pub(crate) fn step(&mut self, events: &[Ev], i: usize, match_of: &[u32]) -> Control {
+        // The termination invariant: one counter decrement per step, and
+        // exhaustion flips `bailed` — every driver loop unwinds on it and
+        // the body's facts drop (see [`Interp::run`]).
+        if self.budget == 0 {
+            self.bailed = true;
+            return Control::Continue;
+        }
+        self.budget -= 1;
         let ev = &events[i];
         // One-event lookahead: a case group awaiting its body closes its
         // alternatives before any non-case event processes.

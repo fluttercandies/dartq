@@ -1570,11 +1570,19 @@ impl<'a> Engine<'a> {
                 _ => None,
             })
             .and_then(|(container, ctor_name)| {
+                // A bare `new` head (`const new(...)`) keeps the `(` site
+                // spelling; the collector keys its formals under the class
+                // name (the unnamed face).
+                let key = if self.is_bare_new_head(ctor_name) {
+                    container
+                } else {
+                    ctor_name
+                };
                 self.index
                     .get(self.file)
                     .and_then(|f| f.container(container))?
                     .ctor_formals
-                    .get(&ctor_name)
+                    .get(&key)
                     .map(|formals| {
                         formals
                             .positional
@@ -2039,7 +2047,7 @@ impl<'a> Engine<'a> {
     /// `this.named(` member shape, or the folded `super.named(` selector
     /// ([`Engine::pending_init_super`], the same shapes
     /// [`Engine::init_super_callee`] decides at the arglist close).
-    fn init_invocation_level(&self, level: &ArgLevel) -> bool {
+    pub(crate) fn init_invocation_level(&self, level: &ArgLevel) -> bool {
         let Some(head) = level.callee_row.and_then(|index| self.rows.get(index)) else {
             return false;
         };

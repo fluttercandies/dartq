@@ -762,6 +762,7 @@ mod tests {
             file,
             target_file: target,
             target_name: name,
+            target_container: StringId::NONE,
             kind,
             range: SourceRange { offset, length: 3 },
             qualifier: StringId::NONE,

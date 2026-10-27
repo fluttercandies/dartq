@@ -161,9 +161,9 @@ pub use analysis::{Analysis, Binding, BindingKind, CtorBinding, MemberBinding, a
 pub use clause_capture::{capture_clause_trees, extend_clause_trees};
 pub use collector::{DeclarationCollector, collect, container_modifiers};
 pub use diagnose::{
-    FileReport, NameRow, NameUse, StrictModes, UnitFold, diagnose, diagnose_unit,
-    diagnose_unit_with_ops, diagnose_with, duplicate_definition_diagnostics, fold_unit,
-    fold_unit_with_ops,
+    FileReport, MemberRef, MemberRefKind, NameRow, NameUse, StrictModes, UnitFold, diagnose,
+    diagnose_unit, diagnose_unit_with_ops, diagnose_with, duplicate_definition_diagnostics,
+    fold_unit, fold_unit_with_ops,
 };
 pub use library::{
     ElementIndex, LibraryScopes, ScopeFace, ScopeKind, ScopedHit, lookup_scoped, member_lookup,

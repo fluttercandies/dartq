@@ -685,9 +685,13 @@ impl<'a> Engine<'a> {
                             // read never arms (the local shadows any
                             // same-spelled declaration). An unresolved spelling
                             // keeps Unknown too — its own miss row already
-                            // reports.
+                            // reports. A head whose read already carries a
+                            // static type is a value (`globalContext`, an SDK
+                            // top-level getter), never a container — the
+                            // typed fall-through below owns it.
                             Receiver::Unknown
                                 if !was_local
+                                    && receiver_ty == Ty::UNKNOWN
                                     && matches!(
                                         self.namespaces.lookup(self.graph, self.lib, popped.name),
                                         Lookup::Found(NamespaceEntry::Decl(owner))
@@ -720,7 +724,11 @@ impl<'a> Engine<'a> {
                                 // The record face has no receiver spelling —
                                 // the parse-time type keys the side table the
                                 // pass-2 record-extension application reads.
-                                (Receiver::Unknown, Ty::Record { .. }) => {
+                                // A function-typed receiver has none either:
+                                // its extension face (`extension on
+                                // PostMessage`, a function typedef) rides the
+                                // same table.
+                                (Receiver::Unknown, Ty::Record { .. } | Ty::Function { .. }) => {
                                     self.record_recv_tys
                                         .push((member.range.offset, receiver_ty));
                                     other
@@ -810,7 +818,17 @@ impl<'a> Engine<'a> {
                             name: popped.name,
                             kind: resolved.kind,
                         },
-                        None => Receiver::Unknown,
+                        // A prefixed top-level value (`diag.deadCode.m`,
+                        // `p.f().m`): the read's static type (the declared
+                        // variable/getter type, or the callee's return)
+                        // types the next receiver like the chained face.
+                        None => match receiver_ty {
+                            Ty::Named { name, .. } => Receiver::Typed {
+                                type_name: name,
+                                ty: receiver_ty,
+                            },
+                            _ => Receiver::Unknown,
+                        },
                     },
                     // The chained-receiver face (`a.b().c`, `x.m.y`): a
                     // value/member receiver whose expression static type
@@ -1745,14 +1763,10 @@ impl<'a> Engine<'a> {
             .and_then(|c| c.superclass)
         {
             Some(superclass) => {
-                match resolve_container(
-                    self.graph,
-                    self.namespaces,
-                    self.index,
-                    self.lib,
-                    self.file,
-                    superclass,
-                ) {
+                // The `extends` face as written: a prefixed clause
+                // (`extends p.J`) binds through its import prefix — the
+                // collector keeps only the bare leaf.
+                match self.resolve_clause_face(container, self.file, self.lib, superclass) {
                     Some((super_container, _)) => super_container
                         .ctor_formals
                         .get(&target.unwrap_or(superclass)),
@@ -1858,6 +1872,19 @@ impl<'a> Engine<'a> {
                 length: open - self.utf16_of(start),
             },
         ))
+    }
+
+    /// The UTF-16 offset of the `.` a named-selector creation head writes
+    /// before its selector (`C<int>.named(` → the `.`), trivia skipped —
+    /// the anchor [`Engine::literal_group_args`] reads the class segment's
+    /// group against.
+    fn selector_dot_before(&self, selector: SourceRange) -> Option<u32> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(selector.offset);
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        (cursor > 0 && bytes[cursor - 1] == b'.').then(|| self.utf16_of(cursor - 1))
     }
 
     /// The class segment a named-selector creation head spells (`C.named(`,
@@ -2187,7 +2214,7 @@ impl<'a> Engine<'a> {
                     })
             })
         });
-        let callee = if self.ctor_pos > 0 {
+        let callee = if self.ctor_pos > 0 && self.at_creation_level() {
             // The creation head's callee row must abut the `(`. A member
             // selector of a parameterized named-ctor reference
             // (`List<T>.unmodifiable(...)`) pushes no row — the resolved
@@ -2282,6 +2309,7 @@ impl<'a> Engine<'a> {
             enum_const,
             named_labels: Vec::new(),
             unnamed_head: bare_head.filter(|&(_, range)| self.unnamed_creation_head(range)),
+            named_head: bare_head.filter(|&(_, range)| self.creation_class_before(range).is_some()),
         });
     }
 
@@ -2315,8 +2343,10 @@ impl<'a> Engine<'a> {
         // have consumed it) — the fold below must see the creation it
         // belongs to (`const C<T>(inner())` folds the outer creation, never
         // the inner head the interleaving left in the slot).
-        let bare_head = self
-            .pending_bare_creation
+        let bare_head = levels
+            .as_ref()
+            .and_then(|level| level.named_head)
+            .or(self.pending_bare_creation)
             .or_else(|| levels.as_ref().and_then(|level| level.unnamed_head));
         self.check_arguments(levels, positional, close);
         self.pending_send = self
@@ -2377,6 +2407,25 @@ impl<'a> Engine<'a> {
                     length: close.end().saturating_sub(class_offset),
                 };
                 self.ur_register_creation(class_offset, range, class);
+                // The class segment's written group instantiates the created
+                // type (`Future<Never>.error(..)` is `Future<Never>`), the
+                // same face the unnamed fold reads; the group sits right
+                // before the selector's `.`.
+                let ty = self
+                    .selector_dot_before(head_range)
+                    .and_then(|dot| {
+                        self.literal_group_args(Token {
+                            id: 0,
+                            range: SourceRange {
+                                offset: dot,
+                                length: 1,
+                            },
+                        })
+                    })
+                    .map_or_else(
+                        || Ty::named(class),
+                        |args| self.boundary.args.borrow_mut().named(class, false, &args),
+                    );
                 self.rows.push(Row {
                     name: class,
                     range,
@@ -2387,7 +2436,7 @@ impl<'a> Engine<'a> {
                     }),
                     intent: Intent::Read,
                     write_op: None,
-                    ty: Ty::named(class),
+                    ty,
                 });
             } else if self.keyword_creation_head(head_range.offset)
                 && matches!(self.type_resolution(head).0, TypeResolution::Type)
@@ -3098,6 +3147,23 @@ impl<'a> Engine<'a> {
         let (container, kind, recv_ty) = match *recv {
             Receiver::Typed { type_name, ty } => (type_name, ContainerKind::Class, Some(ty)),
             Receiver::This { container, kind } => (container, kind, None),
+            // A static send (`W.wrap(...)`): the method's own type
+            // parameters infer like any generic send's — its formals never
+            // spell the caller's same-named in-scope parameters.
+            Receiver::Container { name, kind } | Receiver::Created { name, kind } => {
+                let Walk::Found(entry) = self.bare_member_walk(name, kind, member) else {
+                    return None;
+                };
+                if entry.kind != MemberKind::Method
+                    || !entry.is_static
+                    || entry.type_param_names.is_empty()
+                {
+                    return None;
+                }
+                let params: Vec<(StringId, Option<Ty>)> =
+                    entry.type_param_names.iter().map(|name| (*name, None)).collect();
+                return Some((params.into_boxed_slice(), Vec::new()));
+            }
             _ => return None,
         };
         let Walk::Found(entry) = self.bare_member_walk(container, kind, member) else {
@@ -5059,7 +5125,6 @@ impl<'a> Engine<'a> {
         let Some(row) = self.rows.get(callee) else {
             return;
         };
-        // The usage cluster's given-at-call index (the
         // `_addParametersForArguments` face) keys by callee spelling alone
         // and must not wait on the formals: a receiver this face cannot
         // type (a creation-folded `C().m(...)` head) still supplies its
@@ -5122,7 +5187,27 @@ impl<'a> Engine<'a> {
             // member placeholder below — a same-named top-level function
             // must not lend its formals to a member column.
             RowShape::Bare(BareInfo::Plain { .. }) if !row.qualified => {
+                // The lexical lookup sees only the enclosing body's OWN
+                // members (scope.dart `InstanceScope` / `ExtensionScope`
+                // add the element's declared getters/setters/methods): an
+                // inherited or `on`-type member never hides a top-level
+                // declaration in scope — `shuffle(this, ...)` inside
+                // `extension on List<E>` calls the library's `shuffle`,
+                // not `List.shuffle`. The implicit-this face applies only
+                // when the lexical lookup found nothing.
+                let lexical_top = self.container_context().is_some_and(|(container, _)| {
+                    let own = match self.unnamed_extension_members() {
+                        Some(members) => Some(members.get(&row.name).is_some()),
+                        None => self
+                            .index
+                            .get(self.file)
+                            .and_then(|f| f.container(container))
+                            .map(|c| c.members.get(&row.name).is_some()),
+                    };
+                    own == Some(false) && self.top_level_decl(row.name).is_some()
+                });
                 let shadowed = self.frames.iter().any(|f| f.locals.contains(&row.name));
+                let member_gate = shadowed || lexical_top;
                 // #1881: the unnamed extension's own-member face answers
                 // first — the frame's placeholder container has no collector
                 // entry, so the named-container walk below always breaks
@@ -5135,7 +5220,7 @@ impl<'a> Engine<'a> {
                     .map(std::borrow::Cow::Owned);
                 let member = match unnamed {
                     Some(formals) => Some(formals),
-                    None => (!shadowed)
+                    None => (!member_gate)
                         .then(|| self.container_context())
                         .flatten()
                         .filter(|(container, kind)| {
@@ -5159,7 +5244,7 @@ impl<'a> Engine<'a> {
                 // an unmodeled shape yields no formals — the under-report
                 // — but the top-level fallback must never lend its formals
                 // to a call the member already claimed.
-                let member_found = !shadowed
+                let member_found = !member_gate
                     && self.container_context().is_some_and(|(container, kind)| {
                         matches!(
                             self.bare_member_walk(container, kind, row.name),
@@ -5382,6 +5467,29 @@ impl<'a> Engine<'a> {
                     .map(std::borrow::Cow::into_owned)
             }
             _ => None,
+        };
+        // A nullable receiver whose member a nullable-`on` extension
+        // declares resolves through the extension, never the instance
+        // member (`extension E on C? { m }` claims `C? x; x.m(a)` — the
+        // same verdict `member_defined`'s nullable-dereference face takes):
+        // the instance formals must not check the arguments. The
+        // extension's own table is not projected here (under-report).
+        let formals = match send_recv {
+            Some(Receiver::Typed {
+                type_name,
+                ty: ty @ Ty::Named { nullable: true, .. },
+            }) if formals.is_some() => {
+                let claimed = matches!(
+                    self.extension_application(type_name, ty, callee_spelling, false, true),
+                    ExtensionApp::Single
+                );
+                self.members.ext_ref.set(None);
+                if claimed { None } else { formals }
+            }
+            _ => formals,
+        };
+        let Some(row) = self.rows.get(callee) else {
+            return;
         };
         // The implicit-`call` face (the callee's type names a container
         // whose `call` method answers — bare `body(inner)` over
@@ -5762,6 +5870,11 @@ impl<'a> Engine<'a> {
             .as_ref()
             .map(|params| vec![None; params.len()].into())
             .unwrap_or_default();
+        // The slots whose upward candidates disagreed: upstream's LUB merge
+        // solves them to a type this model cannot compute, so their formals
+        // stay undecidable rather than reading the parameter's own spelling
+        // (a callee `S` beside a caller's same-spelled `S`).
+        let mut disagreed: FxHashSet<usize> = FxHashSet::default();
         // The invocation's explicit type arguments (the callee's own
         // type-argument group, keyed by the callee row): the official
         // downward phase fixes them before any inference
@@ -5893,6 +6006,7 @@ impl<'a> Engine<'a> {
                     }
                 }
             }
+            disagreed = poisoned;
         }
         // The effective parameter type: the solution, clamped to the
         // declared bound when it violates it (the constraint solver's
@@ -5905,7 +6019,9 @@ impl<'a> Engine<'a> {
             Some(params) => params
                 .iter()
                 .zip(solutions.iter())
-                .map(|((param, bound), solution)| match (solution, bound) {
+                .enumerate()
+                .map(|(index, ((param, bound), solution))| match (solution, bound) {
+                    _ if disagreed.contains(&index) => Ty::UNKNOWN,
                     (Some(ty), None) => *ty,
                     (Some(ty), Some(bound))
                         if self.assignable(*ty, *bound, false) != Some(false) =>

@@ -52,7 +52,7 @@
 //! Single-threaded like [`TypeTable`] (its interior `RefCell` memo):
 //! the flow replays on the fold's thread.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use dartq_flow::ty::{
     ArgTy, Base, Classification, EMPTY_ARGS, NameTypeOps, TypeOps, Ty as FlowTy,
@@ -1730,6 +1730,34 @@ fn instantiate_to_bounds(
     ))
 }
 
+/// Work budget per armed type-ops call (#2636): the structural
+/// termination invariant of the mapping faces, mirroring
+/// `dartq_flow`'s [`STEP_BUDGET_PER_EVENT`] posture — the flow replay's
+/// step budget bounds the interpreter's steps but cannot bound the work
+/// inside ONE type-ops call (the 4h53m incident's trunk:
+/// `expr_step` → `is_invalid_typed` → `map_name*` spinning on the
+/// mapping faces). Every armed entry below — `map_name`,
+/// `map_named_strict`, `is_subtype`, `is_invalid_typed`,
+/// `observe_names`, `extension_applies_strict` — spends this many work
+/// units (one per charged node visit or loop iteration; the structurally
+/// finite scans — `observe_names`' name table, `chase_typedef`'s
+/// length-bounded hops — spend one per call) before its conservative
+/// bail; nested entries share the outer arming and never re-arm.
+/// Measured worst legit consumption: 9 work units across the full
+/// 447-file `analyzer` corpus folded file-by-file through the
+/// ops-mounted harness in debug (286 s wall, 52 MB peak RSS, zero
+/// bails; the worst body's nested written-type trees) — the constant
+/// keeps a >110× margin, pinned by
+/// `legit_mapping_work_stays_far_under_budget` (no fixture may come
+/// within 10× of the budget). The budget also bounds the `map_name` →
+/// `map_node` recursion depth (one nested frame pair per two units), so
+/// a tripping call unwinds inside a 2 MiB thread stack long before
+/// overflow: a divergent written arena bottoms out in `Invalid` (see
+/// `fuel_trips_on_a_cyclic_written_arena`), never a crash.
+///
+/// [`STEP_BUDGET_PER_EVENT`]: dartq_flow::interp::STEP_BUDGET_PER_EVENT
+const WORK_BUDGET_PER_CALL: u32 = 1_024;
+
 /// The adapter: `dartq_flow`'s `Ty`/`ArgTy` spellings mapped onto the
 /// snapshot's interned `TypeId`s, [`TypeOps`] answered through
 /// [`TypeSystem`]. One instance per `fold_unit` call — the `name_ty`
@@ -1784,6 +1812,26 @@ pub struct ResolvedTypeOps<'a> {
     /// The parameter registry inverted (`TypeParamId` → spelling); the
     /// registry is name-keyed, so the inversion is exact.
     param_names: RefCell<Option<FxHashMap<TypeParamId, StringId>>>,
+    /// Whether a per-call work budget is armed (#2636): the outermost
+    /// armed entry owns it, nested entries share the same budget (see
+    /// [`WORK_BUDGET_PER_CALL`]).
+    work_armed: Cell<bool>,
+    /// Work units the armed call has spent (one per
+    /// [`Self::work_tick`]).
+    work_spent: Cell<u32>,
+    /// The armed call's budget in work units.
+    work_budget: Cell<u32>,
+    /// Armed calls that exhausted their budget so far (monotone; read by
+    /// [`Self::ops_bailed`] — a stability metric, never a diagnostic).
+    work_bailed: Cell<u32>,
+    /// The most work units one armed call spent (read by
+    /// [`Self::ops_peak_work`]).
+    work_peak: Cell<u32>,
+    /// Test-only per-call budget override (the trip-path tests drive a
+    /// legit mapping past an artificially small budget; production never
+    /// sets it).
+    #[cfg(test)]
+    work_budget_override: Cell<Option<u32>>,
     dynamic: TypeId,
     null: TypeId,
     void: TypeId,
@@ -1807,11 +1855,110 @@ impl<'a> ResolvedTypeOps<'a> {
             opaque: RefCell::new(FxHashMap::default()),
             decl_names: RefCell::new(None),
             param_names: RefCell::new(None),
+            work_armed: Cell::new(false),
+            work_spent: Cell::new(0),
+            work_budget: Cell::new(0),
+            work_bailed: Cell::new(0),
+            work_peak: Cell::new(0),
+            #[cfg(test)]
+            work_budget_override: Cell::new(None),
             dynamic: table.intern(UninternedType::Dynamic, false),
             null: table.intern(UninternedType::Null, false),
             void: table.intern(UninternedType::Void, false),
             invalid: table.intern(UninternedType::Invalid, false),
         }
+    }
+
+    // —— #2636: per-call work fuel ———————————————————————————————————
+
+    /// Arms the per-call work budget; the outermost entry owns it — a
+    /// nested entry answers `false` and shares the caller's budget (an
+    /// arming never nests; see [`WORK_BUDGET_PER_CALL`]).
+    #[inline]
+    fn work_enter(&self) -> bool {
+        if self.work_armed.get() {
+            return false;
+        }
+        self.work_armed.set(true);
+        self.work_spent.set(0);
+        #[cfg(test)]
+        if let Some(budget) = self.work_budget_override.get() {
+            self.work_budget.set(budget);
+            return true;
+        }
+        self.work_budget.set(WORK_BUDGET_PER_CALL);
+        true
+    }
+
+    /// Spends one work unit. `false` = the armed call's budget is
+    /// exhausted (a trip — counted once per armed call): the caller
+    /// takes its conservative answer, exactly the posture the flow
+    /// layer's bail takes on its step budget. Every tick site sits
+    /// under an armed entry, so an unarmed tick (none today) proceeds
+    /// unbounded.
+    #[inline]
+    fn work_tick(&self) -> bool {
+        if !self.work_armed.get() {
+            return true;
+        }
+        let spent = self.work_spent.get() + 1;
+        self.work_spent.set(spent);
+        if spent <= self.work_budget.get() {
+            return true;
+        }
+        if spent == self.work_budget.get() + 1 {
+            self.work_bailed.set(self.work_bailed.get() + 1);
+        }
+        false
+    }
+
+    /// Releases the budget the owning entry armed, tracking the call's
+    /// spend against [`Self::work_peak`] — the budget-sizing telemetry
+    /// ([`Self::ops_peak_work`]).
+    fn work_exit(&self, owner: bool) {
+        if !owner {
+            return;
+        }
+        let spent = self.work_spent.get();
+        if spent > self.work_peak.get() {
+            self.work_peak.set(spent);
+        }
+        self.work_armed.set(false);
+    }
+
+    /// The fuel trip count to compare a guarded answer against after its
+    /// walk: a nested entry that tripped mid-walk mapped `Invalid`, and
+    /// the vacuous 0c subtype arms over-report through it — the guarded
+    /// typed ops flip conservative instead ([`Self::work_tripped_since`]).
+    #[inline]
+    fn work_mark(&self) -> u32 {
+        self.work_bailed.get()
+    }
+
+    /// Whether a trip was counted since `mark` (see [`Self::work_mark`]).
+    #[inline]
+    fn work_tripped_since(&self, mark: u32) -> bool {
+        self.work_bailed.get() > mark
+    }
+
+    /// Armed calls that exhausted their work budget so far (monotone).
+    /// Zero after every converging analyze; a nonzero value marks a
+    /// structural spin the fuel converted into a conservative answer —
+    /// the engine's stability metrics face, no diagnostic rides it.
+    pub fn ops_bailed(&self) -> u32 {
+        self.work_bailed.get()
+    }
+
+    /// The most work units one armed call spent — the budget-sizing
+    /// telemetry behind [`WORK_BUDGET_PER_CALL`]'s measured peak.
+    pub fn ops_peak_work(&self) -> u32 {
+        self.work_peak.get()
+    }
+
+    /// Test-only budget override (see [`Self::work_budget_override`]).
+    #[cfg(test)]
+    fn override_work_budget_for_test(&self, budget: u32) {
+        self.work_budget_override.set(Some(budget));
     }
 
     /// The opaque declaration of one resolved-but-unmodeled name at one
@@ -1845,7 +1992,14 @@ impl<'a> ResolvedTypeOps<'a> {
 
     /// Extends the `name_id → (non-null, nullable)` binding through
     /// `names` — one forward scan covering the ids seen since the last
-    /// call. A `Base::Name` spelling whose decl is registered maps to its
+    /// call — under the per-call work fuel (#2636): the call spends ONE
+    /// unit, not one per name — the scan is structurally finite (bounded
+    /// by the recorded table's length), so a name-heavy unit can neither
+    /// hang here nor trip the fuel and lose its observations (a spurious
+    /// trip would under-report parity); a tripped budget skips the scan
+    /// wholesale (the ids stay unobserved, the base ops answer them
+    /// name-level — the pre-mount posture, the under-report direction).
+    /// A `Base::Name` spelling whose decl is registered maps to its
     /// to-bounds interface (interned once per nullability face); a
     /// type-parameter spelling maps to its synthetic [`TypeParameter`]
     /// id; `FutureOr` maps to `FutureOr<dynamic>` (the raw-type face
@@ -1855,6 +2009,16 @@ impl<'a> ResolvedTypeOps<'a> {
     /// function, a synthetic `#<handle>` token, an unindexed import)
     /// caches the `Invalid` pair.
     fn observe_names(&self, names: &[Box<str>]) {
+        let owner = self.work_enter();
+        if self.work_tick() {
+            self.observe_names_walk(names);
+        }
+        self.work_exit(owner);
+    }
+
+    /// [`Self::observe_names`]'s scan (structurally finite; see its fuel
+    /// note).
+    fn observe_names_walk(&self, names: &[Box<str>]) {
         let mut cache = self.name_ty.borrow_mut();
         let start = cache.len();
         if names.len() <= start {
@@ -2130,15 +2294,41 @@ impl<'a> ResolvedTypeOps<'a> {
         self.snapshot.table.intern(un, true)
     }
 
-    /// One written name's resolved mapping — the shared core of
-    /// [`ResolvedTypeOps::map_scrutinee`] (a probe/typed-op `Base::Name`
-    /// with its own written argument list) and
-    /// [`ResolvedTypeOps::map_node`] (a nested argument tree). Precedence
+    /// One written name's resolved mapping — the fueled entry (#2636):
+    /// arms the per-call work budget ([`WORK_BUDGET_PER_CALL`]) around
+    /// [`Self::map_name_walk`]. A tripped budget answers the `Invalid`
+    /// face — the same type an unresolved head maps to today, the
+    /// unknown-is-top posture's suppress arm — never a wrong resolved
+    /// fact; nested entries (the chase terminal's re-entry, every
+    /// `map_node` visit) share this budget, so a divergent mapping
+    /// bottoms out here instead of spinning.
+    fn map_name(
+        &self,
+        lexeme: &str,
+        args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+        nullable: bool,
+    ) -> TypeId {
+        let owner = self.work_enter();
+        let mapped = if self.work_tick() {
+            self.map_name_walk(lexeme, args, arena, names, nullable)
+        } else {
+            self.invalid
+        };
+        self.work_exit(owner);
+        mapped
+    }
+
+    /// [`Self::map_name`]'s resolution walk (the shared core of
+    /// [`ResolvedTypeOps::map_scrutinee`] — a probe/typed-op `Base::Name`
+    /// with its own written argument list — and
+    /// [`ResolvedTypeOps::map_node`] — a nested argument tree). Precedence
     /// mirrors the official scope chain: a type parameter, the
     /// `FutureOr` pseudo type, a registered container, the
     /// `Null`/`Never` kind spellings, the resolved-but-unmodeled opaque
     /// declaration, and finally `Invalid`.
-    fn map_name(
+    fn map_name_walk(
         &self,
         lexeme: &str,
         args: u32,
@@ -2358,8 +2548,30 @@ impl<'a> ResolvedTypeOps<'a> {
 
     /// The `Ty::Named` arm of [`Self::map_ty_strict`]: a type parameter, the
     /// `FutureOr` pseudo type, a registered container, or the `Null`/`Never`
-    /// spellings — precedence mirroring [`Self::map_name`].
+    /// spellings — precedence mirroring [`Self::map_name`]. The fueled
+    /// entry (#2636): arms the per-call work budget around
+    /// [`Self::map_named_strict_walk`], and a tripped budget answers
+    /// `None` — no structural fact, the caller keeps the name-level
+    /// verdict (the under-report direction).
     fn map_named_strict(
+        &self,
+        name: StringId,
+        nullable: bool,
+        args: crate::model::ArgListId,
+        pool: &crate::model::ArgPool,
+    ) -> Option<TypeId> {
+        let owner = self.work_enter();
+        let mapped = if self.work_tick() {
+            self.map_named_strict_walk(name, nullable, args, pool)
+        } else {
+            None
+        };
+        self.work_exit(owner);
+        mapped
+    }
+
+    /// [`Self::map_named_strict`]'s resolution walk.
+    fn map_named_strict_walk(
         &self,
         name: StringId,
         nullable: bool,
@@ -2617,8 +2829,30 @@ impl<'a> ResolvedTypeOps<'a> {
     /// `on` declaration (the `reaches` gate already rejected it — this
     /// arm under-reports the same direction), a shape inside the `on`
     /// type maps no parameter, or a bound question still mentions a
-    /// parameter after the substitution.
+    /// parameter after the substitution. The fueled entry (#2636): a
+    /// tripped budget answers `None` the same way — including the
+    /// binding walk's documented divergent arm, which the fuel makes
+    /// real (a hierarchy whose instantiations keep minting fresh ids
+    /// declines instead of expanding).
     pub(crate) fn extension_applies_strict(
+        &self,
+        receiver: Ty,
+        on_ty: Ty,
+        face_params: &[(TypeParamId, Option<TypeId>)],
+        pool: &crate::model::ArgPool,
+    ) -> Option<bool> {
+        let owner = self.work_enter();
+        let applies = if self.work_tick() {
+            self.extension_applies_strict_walk(receiver, on_ty, face_params, pool)
+        } else {
+            None
+        };
+        self.work_exit(owner);
+        applies
+    }
+
+    /// [`Self::extension_applies_strict`]'s walk.
+    fn extension_applies_strict_walk(
         &self,
         receiver: Ty,
         on_ty: Ty,
@@ -2705,6 +2939,13 @@ impl<'a> ResolvedTypeOps<'a> {
             }
             let mut found = None;
             while let Some(current) = frontier.pop() {
+                if !self.work_tick() {
+                    // Fuel trip (#2636): the walk's `seen` guard bounds
+                    // revisits, not growth — a hierarchy whose instantiations
+                    // keep minting fresh ids would expand forever. Decline
+                    // (the caller keeps the name-level answer).
+                    return None;
+                }
                 if !seen.insert(current) {
                     continue;
                 }
@@ -2873,11 +3114,133 @@ impl<'a> ResolvedTypeOps<'a> {
         self.overload_ids.borrow().contains(&id)
     }
 
+    /// [`ResolvedTypeOps::is_subtype`]'s walk (#2636): a lossy-overload id
+    /// answers name-level ([`Self::overload_ids`]) — the resolved verdict
+    /// would ride whichever class registered bare, or the vacuous
+    /// `Invalid` of an unregistered spelling, and the source may have
+    /// meant the prefixed class.
+    fn is_subtype_walk(&self, left: FlowTy, right: FlowTy) -> bool {
+        if self.id_overloaded(left) || self.id_overloaded(right) {
+            return NameTypeOps.is_subtype(left, right);
+        }
+        match (self.map_base(left), self.map_base(right)) {
+            (Some(l), Some(r)) => self.system.is_subtype(l, r),
+            _ => NameTypeOps.is_subtype(left, right),
+        }
+    }
+
+    /// [`ResolvedTypeOps::is_invalid_typed`]'s walk (#2636 — see the
+    /// trait method's doc).
+    fn is_invalid_typed_walk(
+        &self,
+        ty: FlowTy,
+        args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> bool {
+        self.observe_names(names);
+        if self.id_overloaded(ty) {
+            return false;
+        }
+        matches!(
+            self.snapshot
+                .table
+                .get(self.map_scrutinee(ty, args, arena, names))
+                .kind(),
+            TypeKind::Invalid
+        )
+    }
+
+    /// [`ResolvedTypeOps::factor_typed`]'s walk (#2636): the
+    /// fuel-guarded remainder rules — the outer call flips `from` whole
+    /// on any trip, so the rules below run only over facts a converging
+    /// mapping produced.
+    fn factor_typed_walk(
+        &self,
+        from: FlowTy,
+        from_args: u32,
+        what: FlowTy,
+        what_args: u32,
+        arena: &[Vec<ArgTy>],
+        names: &[Box<str>],
+    ) -> FlowTy {
+        let f = self.map_scrutinee(from, from_args, arena, names);
+        let w = self.map_tested(what, what_args, arena, names);
+        // The signature-less function pair (see `is_subtype_typed`) skips
+        // only the `Never` shortcut — no relation is provable between two
+        // unknown signatures. The nullability rule below still splits the
+        // `Null` half (`factor(Sig?, Sig2)` keeps `Sig?`), and its
+        // recursion re-enters past this point with the non-null face,
+        // keeping the unchanged `from` the official factor's fallthrough
+        // keeps.
+        let unsignatured_pair = from.base == Base::Function && what.base == Base::Function;
+        if !unsignatured_pair && self.system.is_subtype(f, w) {
+            return FlowTy::NEVER;
+        }
+        // Rule 2 of factorType (factor_type.dart:25-31): `R?` factors as
+        // `factor(R, what)` when `Null <: what`, else `factor(R, what)?`
+        // — the resolved face answers the null-half question through
+        // `is_subtype(Null, what)` exactly like the arg-less arm.
+        if from.nullable
+            && !matches!(
+                from.base,
+                Base::Dynamic | Base::Unknown | Base::Void | Base::Null | Base::Never
+            )
+        {
+            if self.system.is_subtype(self.null, w) {
+                return self.factor_typed(from.non_null(), from_args, what, what_args, arena, names);
+            }
+            return self
+                .factor_typed(from.non_null(), from_args, what, what_args, arena, names)
+                .make_nullable();
+        }
+        // Rule 3 of factorType (factor_type.dart:33-41): `FutureOr<R>`
+        // factors as `Future<R>` when `R <: what`, and as `R` when
+        // `Future<R> <: what`. The `Future<R>` remainder reuses the
+        // FutureOr node's own argument list, which is exactly `[R]`.
+        if let Base::Name(id) = from.base
+            && names.get(id as usize).is_some_and(|n| &**n == "FutureOr")
+            && let Some(&arg) = arena.get(from_args as usize).and_then(|a| a.first())
+        {
+            let inner = FlowTy {
+                base: arg.base,
+                nullable: arg.nullable,
+            };
+            let r = self.map_scrutinee(inner, arg.args, arena, names);
+            let future = names.iter().position(|n| &**n == "Future");
+            if self.system.is_subtype(r, w)
+                && let Some(future) = future
+            {
+                return FlowTy {
+                    base: Base::Name(future as u32),
+                    nullable: false,
+                };
+            }
+            if let Some(future) = future {
+                let future_ty = FlowTy {
+                    base: Base::Name(future as u32),
+                    nullable: false,
+                };
+                if self.system.is_subtype(self.map_scrutinee(future_ty, from_args, arena, names), w) {
+                    return inner;
+                }
+            }
+        }
+        from
+    }
+
     /// Maps one `ArgTy` node (recursion for `FutureOr`); `names` and
     /// `arena` are the live faces `is_always_exhaustive` carries. A node
     /// whose name resolves to nothing maps `invalid` — the argument the
     /// enclosing `Interface` arm carries in place of a resolvable type.
+    /// Each visit spends one work unit against the enclosing armed
+    /// entry's budget (#2636): a written-argument arena that references
+    /// itself (the recorder-bug class) bottoms out in `invalid` here
+    /// instead of recursing forever.
     fn map_node(&self, node: &ArgTy, arena: &[Vec<ArgTy>], names: &[Box<str>]) -> TypeId {
+        if !self.work_tick() {
+            return self.invalid;
+        }
         match node.base {
             Base::Dynamic => self.dynamic,
             Base::Void => self.void,
@@ -3119,20 +3482,22 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// side unmapped answers through [`NameTypeOps`] — today's name-level
     /// logic — so a `var`-inferred or unresolvable spelling keeps its
     /// pre-mount answer and a resolved pair gains the real hierarchy
-    /// (`Resource` <: `Object`, `File` <: `Resource` cross-file).
+    /// (`Resource` <: `Object`, `File` <: `Resource` cross-file). The
+    /// fueled entry (#2636): a tripped budget answers `false` — "not
+    /// provable" — which every consumer reads conservatively: the join
+    /// answers `UNKNOWN`, the non-promotion filter keeps its rows, no
+    /// fold or promotion fires; a check gating an error withholds the
+    /// error, one gating an "unnecessary" hint withholds the hint
+    /// (under-report both ways, exactly the flow bail's posture).
     fn is_subtype(&self, left: FlowTy, right: FlowTy) -> bool {
-        // A lossy-overload id answers name-level
-        // ([`Self::overload_ids`]): the resolved verdict would ride
-        // whichever class registered bare — or the vacuous `Invalid`
-        // of an unregistered spelling — and the source may have meant
-        // the prefixed class.
-        if self.id_overloaded(left) || self.id_overloaded(right) {
-            return NameTypeOps.is_subtype(left, right);
-        }
-        match (self.map_base(left), self.map_base(right)) {
-            (Some(l), Some(r)) => self.system.is_subtype(l, r),
-            _ => NameTypeOps.is_subtype(left, right),
-        }
+        let owner = self.work_enter();
+        let verdict = if self.work_tick() {
+            self.is_subtype_walk(left, right)
+        } else {
+            false
+        };
+        self.work_exit(owner);
+        verdict
     }
 
     /// `factor`: the remainder of `from` after `is what` removes it.
@@ -3276,7 +3641,13 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// names a class a PREFIXED import target exports (the graph carries
     /// no element model for it), so the oracle's world resolves it — the
     /// "resolves nowhere" claim needs the bare spelling to be the
-    /// resolved one, and the name-level default (`false`) stands.
+    /// resolved one, and the name-level default (`false`) stands. The
+    /// fueled entry (#2636): the trait's own trip answers `false` ("not
+    /// invalid" — the pattern's type test proceeds as the name-level
+    /// default), and a trip anywhere inside the walk flips a computed
+    /// `true` the same way — a tripped mapping's `Invalid` face must not
+    /// masquerade as the oracle's `InvalidType` and drop the test's
+    /// facts.
     fn is_invalid_typed(
         &self,
         ty: FlowTy,
@@ -3284,17 +3655,15 @@ impl TypeOps for ResolvedTypeOps<'_> {
         arena: &[Vec<ArgTy>],
         names: &[Box<str>],
     ) -> bool {
-        self.observe_names(names);
-        if self.id_overloaded(ty) {
-            return false;
-        }
-        matches!(
-            self.snapshot
-                .table
-                .get(self.map_scrutinee(ty, args, arena, names))
-                .kind(),
-            TypeKind::Invalid
-        )
+        let owner = self.work_enter();
+        let mark = self.work_mark();
+        let verdict = if self.work_tick() {
+            self.is_invalid_typed_walk(ty, args, arena, names)
+        } else {
+            false
+        };
+        self.work_exit(owner);
+        verdict && !self.work_tripped_since(mark)
     }
 
     /// The name-observation hook `Interp::run` calls once per replay: a
@@ -3366,7 +3735,10 @@ impl TypeOps for ResolvedTypeOps<'_> {
     /// ([`ResolvedTypeOps::opaque_decl`]), keeping the remainder live
     /// like the oracle's resolved class. The tested side's arity veto
     /// recovers instead ([`Self::map_tested`]) — the official's
-    /// `Response<InvalidType>` keeps the test decidable.
+    /// `Response<InvalidType>` keeps the test decidable. A fuel trip
+    /// anywhere inside (#2636) keeps `from` whole — a tripped mapping's
+    /// vacuous 0c arm must not bottom the remainder and dead a branch
+    /// the oracle keeps live.
     fn factor_typed(
         &self,
         from: FlowTy,
@@ -3392,69 +3764,13 @@ impl TypeOps for ResolvedTypeOps<'_> {
             return NameTypeOps.factor_typed(from, from_args, what, what_args, arena, names);
         }
         self.observe_names(names);
-        let f = self.map_scrutinee(from, from_args, arena, names);
-        let w = self.map_tested(what, what_args, arena, names);
-        // The signature-less function pair (see `is_subtype_typed`) skips
-        // only the `Never` shortcut — no relation is provable between two
-        // unknown signatures. The nullability rule below still splits the
-        // `Null` half (`factor(Sig?, Sig2)` keeps `Sig?`), and its
-        // recursion re-enters past this point with the non-null face,
-        // keeping the unchanged `from` the official factor's fallthrough
-        // keeps.
-        let unsignatured_pair = from.base == Base::Function && what.base == Base::Function;
-        if !unsignatured_pair && self.system.is_subtype(f, w) {
-            return FlowTy::NEVER;
+        let mark = self.work_mark();
+        let factored =
+            self.factor_typed_walk(from, from_args, what, what_args, arena, names);
+        if self.work_tripped_since(mark) {
+            return from;
         }
-        // Rule 2 of factorType (factor_type.dart:25-31): `R?` factors as
-        // `factor(R, what)` when `Null <: what`, else `factor(R, what)?`
-        // — the resolved face answers the null-half question through
-        // `is_subtype(Null, what)` exactly like the arg-less arm.
-        if from.nullable
-            && !matches!(
-                from.base,
-                Base::Dynamic | Base::Unknown | Base::Void | Base::Null | Base::Never
-            )
-        {
-            if self.system.is_subtype(self.null, w) {
-                return self.factor_typed(from.non_null(), from_args, what, what_args, arena, names);
-            }
-            return self
-                .factor_typed(from.non_null(), from_args, what, what_args, arena, names)
-                .make_nullable();
-        }
-        // Rule 3 of factorType (factor_type.dart:33-41): `FutureOr<R>`
-        // factors as `Future<R>` when `R <: what`, and as `R` when
-        // `Future<R> <: what`. The `Future<R>` remainder reuses the
-        // FutureOr node's own argument list, which is exactly `[R]`.
-        if let Base::Name(id) = from.base
-            && names.get(id as usize).is_some_and(|n| &**n == "FutureOr")
-            && let Some(&arg) = arena.get(from_args as usize).and_then(|a| a.first())
-        {
-            let inner = FlowTy {
-                base: arg.base,
-                nullable: arg.nullable,
-            };
-            let r = self.map_scrutinee(inner, arg.args, arena, names);
-            let future = names.iter().position(|n| &**n == "Future");
-            if self.system.is_subtype(r, w)
-                && let Some(future) = future
-            {
-                return FlowTy {
-                    base: Base::Name(future as u32),
-                    nullable: false,
-                };
-            }
-            if let Some(future) = future {
-                let future_ty = FlowTy {
-                    base: Base::Name(future as u32),
-                    nullable: false,
-                };
-                if self.system.is_subtype(self.map_scrutinee(future_ty, from_args, arena, names), w) {
-                    return inner;
-                }
-            }
-        }
-        from
+        factored
     }
 
     /// `is_subtype` over the instantiated spellings: both sides map
@@ -3477,6 +3793,7 @@ impl TypeOps for ResolvedTypeOps<'_> {
         arena: &[Vec<ArgTy>],
         names: &[Box<str>],
     ) -> bool {
+        let mark = self.work_mark();
         // The undefined tested head keeps the guaranteed-succeed face
         // silent (#2450 — [`Self::tested_head_undefined`]): no subtype
         // verdict runs over a name the oracle reports
@@ -3514,7 +3831,10 @@ impl TypeOps for ResolvedTypeOps<'_> {
         }
         let l = self.map_scrutinee(left, left_args, arena, names);
         let r = self.map_tested(right, right_args, arena, names);
-        self.system.is_subtype(l, r)
+        // Fuel trip (#2636): a tripped mapping answers `Invalid`, whose
+        // vacuous 0c subtype arm is `true` — a false constant-true that
+        // deads a live else. Not provable instead.
+        self.system.is_subtype(l, r) && !self.work_tripped_since(mark)
     }
 
     fn try_promote_to_typed(
@@ -3543,17 +3863,19 @@ impl TypeOps for ResolvedTypeOps<'_> {
             return NameTypeOps.try_promote_to_typed(to, to_args, from, from_args, arena, names);
         }
         self.observe_names(names);
+        let mark = self.work_mark();
         let t = self.map_tested(to, to_args, arena, names);
         let f = self.map_scrutinee(from, from_args, arena, names);
         // The strict-subtype gate (`isValidPromotionStep`,
         // flow_analysis.dart:7229-7247): `to <: from` is required, and a
         // `to` the current type already satisfies (`from <: to` —
         // identical types included, `x is int` on `int x`) is no step.
-        if self.system.is_subtype(t, f) && !self.system.is_subtype(f, t) {
-            Some(to)
-        } else {
-            None
-        }
+        // A fuel trip (#2636) refuses the step — a tripped mapping's
+        // vacuous 0c arm could force `to <: from` and promote wrongly.
+        (self.system.is_subtype(t, f)
+            && !self.system.is_subtype(f, t)
+            && !self.work_tripped_since(mark))
+        .then_some(to)
     }
 
     /// The downward-inferred object-pattern required type: a RAW pattern
@@ -3741,11 +4063,22 @@ mod tests {
     }
 
     /// The unit's flow-driven diagnostic code names — the same harness
-    /// `diagnose/tests.rs` runs, with the ops adapter mounted.
-    fn diagnose_codes(
+    /// `diagnose/tests.rs` runs, with the ops adapter mounted. The
+    /// #2636 probe variant: a mutation hook into the snapshot (the
+    /// synthetic cycles no real build produces), a per-call budget
+    /// override, a probe over the mounted ops (run before the fold), and
+    /// the fuel counters read after it.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the pin's harness shape; folding the closures into a config struct would grow the test surface, not shrink it"
+    )]
+    fn diagnose_codes_probe(
         source: &str,
         make_edge: impl FnOnce(&StringTable) -> Option<ImportEdge>,
-    ) -> Vec<&'static str> {
+        mutate: impl FnOnce(&StringTable, &mut LibraryTypes),
+        budget: Option<u32>,
+        probe: impl FnOnce(&ResolvedTypeOps),
+    ) -> (Vec<&'static str>, u32, u32) {
         let strings = StringTable::new();
         let mut files = FileTable::new();
         let file = files.intern(Path::new("main.dart"));
@@ -3777,8 +4110,13 @@ mod tests {
         }
         let graph = builder.finish();
         let namespaces = Namespaces::build(&graph);
-        let library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
+        let mut library_types = LibraryTypes::build(&graph, &namespaces, &index, &strings, lib);
+        mutate(&strings, &mut library_types);
         let ops = ResolvedTypeOps::new(&library_types, &strings, file);
+        if let Some(budget) = budget {
+            ops.override_work_budget_for_test(budget);
+        }
+        probe(&ops);
         let fold = fold_unit_with_ops(
             source,
             &scanned.tokens,
@@ -3794,11 +4132,22 @@ mod tests {
             set.is_enabled(dartq_language::Feature::InferenceUpdate2),
             Some(&ops),
         );
-        fold.report
+        let codes = fold
+            .report
             .diagnostics
             .iter()
             .map(|d| d.code.name)
-            .collect()
+            .collect();
+        (codes, ops.ops_bailed(), ops.ops_peak_work())
+    }
+
+    /// The unit's flow-driven diagnostic code names — the same harness
+    /// `diagnose/tests.rs` runs, with the ops adapter mounted.
+    fn diagnose_codes(
+        source: &str,
+        make_edge: impl FnOnce(&StringTable) -> Option<ImportEdge>,
+    ) -> Vec<&'static str> {
+        diagnose_codes_probe(source, make_edge, |_, _| {}, None, |_| {}).0
     }
 
     /// `diagnose_codes` with `names` declared in an imported library whose
@@ -5523,8 +5872,167 @@ mod tests {
             "the demoted Object read must miss `length`: {codes:?}"
         );
     }
-}
 
+    // —— #2636: per-call work fuel ———————————————————————————————————
+
+    /// The divergence pin: a written-argument arena whose row references
+    /// itself (the recorder-bug class the fuel defends against — without
+    /// it `map_name` → `map_node` → `map_name` never bottoms out). The
+    /// budget converts the spin into the `Invalid` face with the bail
+    /// counted.
+    #[test]
+    fn fuel_trips_on_a_cyclic_written_arena() {
+        diagnose_codes_probe(
+            "void main() {}\n",
+            |_| None,
+            |strings, snapshot| {
+                snapshot.non_containers.insert(strings.intern("Cyc"));
+            },
+            None,
+            |ops| {
+                let names: Vec<Box<str>> = vec!["Cyc".into()];
+                // The entry trip: a zero budget refuses the first tick and
+                // answers the `Invalid` face.
+                ops.override_work_budget_for_test(0);
+                let mapped = ops.map_name("Cyc", EMPTY_ARGS, &[], &names, false);
+                assert!(
+                    matches!(ops.snapshot.table.get(mapped).kind(), TypeKind::Invalid),
+                    "an entry trip answers the invalid face"
+                );
+                assert!(ops.ops_bailed() >= 1);
+                // The interior trip: arena row 1 references itself —
+                // `Cyc<Cyc<…>>` ad infinitum (row 0 is the reserved
+                // argument-less list) — bottoms out in the opaque arm's
+                // existing unknown face (`opaque_args` reads an `Invalid`
+                // argument as `dynamic`) instead of recursing forever.
+                ops.override_work_budget_for_test(16);
+                let arena: Vec<Vec<ArgTy>> = vec![
+                    Vec::new(),
+                    vec![ArgTy {
+                        base: Base::Name(0),
+                        nullable: false,
+                        args: 1,
+                    }],
+                ];
+                let mapped = ops.map_name("Cyc", 1, &arena, &names, false);
+                assert!(
+                    matches!(
+                        ops.snapshot.table.get(mapped).kind(),
+                        TypeKind::Interface { .. }
+                    ),
+                    "the interior trip bottoms in the opaque unknown face"
+                );
+                assert!(ops.ops_bailed() >= 2);
+            },
+        );
+    }
+
+    /// The `typedef A = B; typedef B = A;` snapshot: the chase is
+    /// length-bounded (the terminal keeps the opaque face — the bound
+    /// the fuel mirrors), converging without a trip under the real
+    /// budget, and a tripped budget answers the `Invalid` face with the
+    /// bail counted.
+    #[test]
+    fn fuel_typedef_cycle_maps_conservatively() {
+        diagnose_codes_probe(
+            "typedef A = B;\ntypedef B = A;\nvoid main() {}\n",
+            |_| None,
+            |strings, snapshot| {
+                let a = strings.intern("A");
+                let b = strings.intern("B");
+                snapshot.typedef_targets.insert(a, (b, false));
+                snapshot.typedef_targets.insert(b, (a, false));
+                snapshot.non_containers.insert(a);
+                snapshot.non_containers.insert(b);
+            },
+            None,
+            |ops| {
+                let arena: Vec<Vec<ArgTy>> = vec![Vec::new()];
+                let names: Vec<Box<str>> = vec!["A".into(), "B".into()];
+                let mapped = ops.map_name("A", EMPTY_ARGS, &arena, &names, false);
+                assert!(
+                    matches!(
+                        ops.snapshot.table.get(mapped).kind(),
+                        TypeKind::Interface { .. }
+                    ),
+                    "the cycle's terminal keeps the opaque face"
+                );
+                assert_eq!(ops.ops_bailed(), 0);
+                ops.override_work_budget_for_test(0);
+                let mapped = ops.map_name("A", EMPTY_ARGS, &arena, &names, false);
+                assert!(
+                    matches!(ops.snapshot.table.get(mapped).kind(), TypeKind::Invalid),
+                    "a tripped chase answers the invalid face"
+                );
+                assert!(ops.ops_bailed() >= 1);
+            },
+        );
+    }
+
+    /// The F-bounded self-reference (`class C<T extends C<T>>`
+    /// instantiated to bounds): converges under the real budget, and a
+    /// tripped budget keeps the conservative posture — no dead row rides
+    /// a vacuous `Invalid` arm (the name-level fallback the trips take
+    /// is the pre-mount behavior, never an over-report) — with the bail
+    /// counted.
+    #[test]
+    fn fuel_f_bounded_generic_converges_and_trips_conservative() {
+        let source = "class C<T extends C<T>> {}\n\nvoid main(C c) {\n  if (c is C) {\n    c;\n  }\n}\n";
+        let (_, bailed, _) = diagnose_codes_probe(source, |_| None, |_, _| {}, None, |_| {});
+        assert_eq!(bailed, 0);
+        let (codes, bailed, _) =
+            diagnose_codes_probe(source, |_| None, |_, _| {}, Some(2), |_| {});
+        assert!(bailed >= 1);
+        assert!(
+            !codes.contains(&"dead_code"),
+            "a tripped fold deads no branch: {codes:?}"
+        );
+    }
+
+    /// The self-nested generic (`typedef F = List<F>`): the RHS cycle
+    /// guard registers no shape (the alias keeps the opaque face — the
+    /// under-report direction), converging under the real budget, and a
+    /// tripped budget keeps the same no-dead-row posture with the bail
+    /// counted.
+    #[test]
+    fn fuel_self_nested_typedef_converges_and_trips_conservative() {
+        let source = "typedef F = List<F>;\n\nvoid main(F f) {\n  if (f is F) {\n    f;\n  }\n}\n";
+        let (_, bailed, _) = diagnose_codes_probe(source, |_| None, |_, _| {}, None, |_| {});
+        assert_eq!(bailed, 0);
+        let (codes, bailed, _) =
+            diagnose_codes_probe(source, |_| None, |_, _| {}, Some(2), |_| {});
+        assert!(bailed >= 1);
+        assert!(
+            !codes.contains(&"dead_code"),
+            "a tripped fold deads no branch: {codes:?}"
+        );
+    }
+
+    /// The budget-sizing pin (mirroring `ticket_2626_tests`'s
+    /// step-budget face): the most work one armed call spends over a
+    /// generic-heavy fixture stays an order of magnitude under
+    /// [`WORK_BUDGET_PER_CALL`]; the corpus-measured worst rides the
+    /// same faces (see the const's rustdoc).
+    #[test]
+    fn legit_mapping_work_stays_far_under_budget() {
+        let source = "typedef JsonMap = Map<String, List<Map<int, Object?>>>;\n\n\
+             abstract class Repo<T extends Object> {\n  \
+             FutureOr<List<T?>> page(FutureOr<JsonMap> source);\n\
+             }\n\n\
+             void main(Repo<String> repo, JsonMap m) {\n  \
+             if (repo is Repo<String>) {\n    print(m);\n  }\n  \
+             switch (m) {\n    \
+             case Map<String, List<int>>():\n      break;\n    \
+             default:\n      break;\n  }\n\
+             }\n";
+        let (_, bailed, peak) = diagnose_codes_probe(source, |_| None, |_, _| {}, None, |_| {});
+        assert_eq!(bailed, 0);
+        assert!(
+            peak * 10 < WORK_BUDGET_PER_CALL,
+            "legit peak {peak} within 10x of the budget"
+        );
+    }
+}
 /// The `?`-stripped projection of `ty` (same kind, non-nullable face).
 /// Function/record shapes have no nullable re-intern here and keep their
 /// suffix — the binding sites that reach them are cold edge faces.

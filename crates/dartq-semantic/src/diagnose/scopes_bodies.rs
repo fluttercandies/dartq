@@ -1301,6 +1301,16 @@ impl<'a> Engine<'a> {
                     _ => false,
                 };
                 if callee_own_param {
+                    // Horizontal inference (upstream `_inferFormalParameters`
+                    // runs after the non-literal arguments' stage): an
+                    // already-passed argument whose formal mentions the
+                    // parameter fixed it before the literal's formals were
+                    // inferred. When that argument's own type is beyond the
+                    // model, the solution is unknown — `dynamic`, never the
+                    // fresh-parameter `Object?` bound.
+                    if callee_row.is_some() && self.untyped_arg_constrains(&recv, callee_name, head) {
+                        return None;
+                    }
                     return Some(self.object_question());
                 }
                 match recv {
@@ -1693,6 +1703,52 @@ impl<'a> Engine<'a> {
         if !map.is_empty() {
             self.solved_call_params.insert(row.range.offset, map);
         }
+    }
+
+    /// Whether an already-passed argument of the open send carries no
+    /// modelled type while its formal mentions the callee parameter
+    /// `param` inside a type argument (`addMapEntryList(entries, (k, v) =>
+    /// …)` with `entries` typed by a generic local function's unsolved
+    /// return): the argument constrained `param` upstream, so the closure
+    /// formal's schema entry is not the fresh parameter. A bare `T`/`T?`
+    /// formal stays out — an invalid-typed argument there solves `param`
+    /// to the invalid face, whose greatest closure is the `Object?` the
+    /// caller answers (`writeOptionalObject<T>(T? object, …)` over an
+    /// unresolvable `Token?`).
+    fn untyped_arg_constrains(&mut self, recv: &Receiver, callee_name: StringId, param: StringId) -> bool {
+        let Some(formals) = self.callee_formals(recv, callee_name) else {
+            return false;
+        };
+        let Some(level) = self.arg_levels.last() else {
+            return false;
+        };
+        let args = self.boundary.args.borrow();
+        let nested_mention = |ty: Ty| -> bool {
+            let Ty::Named { args: list, .. } = ty else {
+                return false;
+            };
+            let mut stack: Vec<Ty> = args.get(list).to_vec();
+            while let Some(ty) = stack.pop() {
+                if let Ty::Named { name, args: list, .. } = ty {
+                    if name == param {
+                        return true;
+                    }
+                    stack.extend(args.get(list).iter().copied());
+                }
+            }
+            false
+        };
+        let mut positional = 0usize;
+        level.args.iter().any(|(label, ty, _, _)| {
+            let formal = match label {
+                Some(label) => formals.named_formal(*label),
+                None => {
+                    positional += 1;
+                    formals.positional.get(positional - 1)
+                }
+            };
+            *ty == Ty::UNKNOWN && formal.is_some_and(|formal| nested_mention(formal.ty))
+        })
     }
 
     /// Whether a substituted schema entry is a type the caller's scope can

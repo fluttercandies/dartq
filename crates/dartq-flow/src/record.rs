@@ -258,6 +258,16 @@ pub struct Flow<'t> {
     /// local (upstream `ConstructorFieldInitializer` writes `this.f`).
     init_starts: Vec<usize>,
     facts: Vec<FlowFact>,
+    /// Executables whose replay exhausted the step budget and bailed
+    /// (see [`crate::interp::STEP_BUDGET_PER_EVENT`]): each contributed
+    /// no flow facts. A bounded counter the engine can count and surface;
+    /// zero on healthy corpora.
+    bail_count: u32,
+    /// The worst fraction of step budget one executable of this unit
+    /// consumed, in thousandths (1000 = exactly the budget): the ratio
+    /// face behind the budget constant's margin, monitored by tests.
+    /// Zero when no executable replayed.
+    max_step_permille: u64,
 }
 
 /// One captured top-level variable declaration's read face: the written
@@ -315,6 +325,8 @@ impl<'t> Flow<'t> {
             initializer_world: 0,
             init_starts: Vec::new(),
             facts: Vec::new(),
+            bail_count: 0,
+            max_step_permille: 0,
         }
     }
 
@@ -710,6 +722,20 @@ impl<'t> Flow<'t> {
         self.ops = Some(ops);
     }
 
+    /// Executables of this unit whose replay exhausted the step budget and
+    /// bailed (see [`crate::interp::STEP_BUDGET_PER_EVENT`]) — the bounded
+    /// marker the engine can count and surface. Zero on healthy units.
+    pub fn bailed_executables(&self) -> u32 {
+        self.bail_count
+    }
+
+    /// The worst fraction of step budget one executable of this unit
+    /// consumed, in thousandths of the budget (1000 = exactly exhausted):
+    /// the ratio face behind the budget constant's margin.
+    pub fn max_step_ratio_permille(&self) -> u64 {
+        self.max_step_permille
+    }
+
     /// Stages one inferred local's declared type (#2140): the semantic
     /// layer's initializer-derived static type for a `var`/`final`
     /// declarator, keyed on the declarator name token's offset. The fold
@@ -895,6 +921,24 @@ impl<'t> Flow<'t> {
         // the callee's spelling (`x = C()` vs a lowercase function call).
         interp.names = &self.names_by_id;
         interp.run(&events);
+        if interp.bailed {
+            // The step budget ran out mid-replay (a non-converging event
+            // walk): the executable's flow analysis is abandoned — no
+            // facts, no completion row, no non-promotion rows. A partial
+            // replay's state is not evidence; under-reporting is the
+            // only sound bail posture. The bounded marker counts it and
+            // the rest of the unit analyzes normally.
+            self.bail_count += 1;
+            return;
+        }
+        let initial_budget = events.len() as u64 * crate::interp::STEP_BUDGET_PER_EVENT;
+        let used = initial_budget - interp.budget;
+        let permille = if initial_budget == 0 {
+            0
+        } else {
+            used * 1000 / initial_budget
+        };
+        self.max_step_permille = self.max_step_permille.max(permille);
         // The async-gap context face: one linear replay over the same
         // buffer (the ids are interned lazily — already-present names keep
         // their ids, so existing name-id assertions never shift).

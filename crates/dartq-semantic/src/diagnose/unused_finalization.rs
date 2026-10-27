@@ -35,7 +35,7 @@ impl<'a> Engine<'a> {
                 continue;
             }
             let name = self.intern(&self.source[start..end]);
-            let Some((container, _)) = resolve_container(
+            let Some((container, owner)) = resolve_container(
                 self.graph,
                 self.namespaces,
                 self.index,
@@ -47,6 +47,19 @@ impl<'a> Engine<'a> {
             };
             if container.kind != ContainerKind::Class
                 || container_modifiers(container).is_mixin_class
+            {
+                continue;
+            }
+            // The mixin element's own library must carry class modifiers
+            // and the use must not ride the platform exemption
+            // (error_verifier.dart `_checkForMixinClass...`: the
+            // `featureSet.isEnabled(Feature.class_modifiers)` and
+            // `!_mayIgnoreClassModifiers` conjuncts) — a pre-3.0 library's
+            // plain class stays a legal mixin.
+            let owner_lib = self.graph.library_of_file(owner).unwrap_or(self.lib);
+            let owner_facts = self.library_facts(owner_lib);
+            if !owner_facts.has_class_modifiers
+                || may_ignore_class_modifiers(owner_facts, self.library_facts(self.lib))
             {
                 continue;
             }

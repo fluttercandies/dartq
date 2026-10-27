@@ -46,7 +46,7 @@
 
 use crate::model::Ty;
 use crate::switch_tracker::CORE_SUPERTYPES;
-use dartq_source::{SourceRange, StringId, StringTable};
+use dartq_source::{FileId, SourceRange, StringId, StringTable};
 use rustc_hash::FxHashMap;
 
 /// Members of `dart:core` `Object`: defined on every class-shaped receiver
@@ -1265,6 +1265,13 @@ pub(crate) struct MemberFace {
     pub(crate) equals_check: Option<EqualsCheck>,
     /// The #748 `noSuchMethod` body-shape latch.
     pub(crate) nsm_check: Option<NsmCheck>,
+    /// The winning extension application's reference-edge target (#2618):
+    /// `(declaring file, lookup spelling, declaring face name, member
+    /// kind)` of the one face an `extension_application` call resolved —
+    /// set only at a `Single`/`UnsafeSingle` conclusion (cleared at
+    /// entry), read by the verdict sites that own the use row.
+    /// Single-slot: the resolution that reads it always just concluded.
+    pub(crate) ext_ref: std::cell::Cell<Option<(FileId, StringId, StringId, crate::model::MemberKind)>>,
 }
 
 /// The #748 `==` operator-parameter latch: the operator's name-token anchor
@@ -1359,6 +1366,7 @@ impl MemberFace {
             pending_must_call_super: None,
             equals_check: None,
             nsm_check: None,
+            ext_ref: std::cell::Cell::new(None),
         }
     }
 

@@ -4061,8 +4061,17 @@ impl ParserListener for DiagnoseListener<'_> {
         engine.nsm_poison();
         // The conditional's condition completed at the `?` — its operand's
         // flow-aware static type is `bool?` — the unchecked-use face
-        // (#1351).
+        // (#1351). The enclosing statement's condition window
+        // (`cond_mark`/`cond_case`) belongs to that statement: a ternary
+        // nested in its condition (`if (f(c ? a : b) case var r?)`) must
+        // neither consume the window nor take its anchor, or the if-case
+        // routing in `begin_pattern` never arms and the scrutinee is
+        // checked as a plain condition.
+        let outer_mark = engine.cond_mark.take();
+        let outer_case = std::mem::take(&mut engine.cond_case);
         engine.check_condition_operand();
+        engine.cond_mark = outer_mark;
+        engine.cond_case = outer_case;
         engine.const_capture.begin_conditional();
     }
 
@@ -4489,8 +4498,16 @@ impl ParserListener for DiagnoseListener<'_> {
         // the arg nodes and folds the invocation to a non-constant leaf for
         // the enclosing initializer window — the generic `ClosedArgs`
         // dispatch never sees a super-arglist (it folds the args away).
-        let init_super =
-            self.engine.initializer_depth > 0 && self.engine.init_super_callee().is_some();
+        // A redirecting `this(...)`/`this.named(...)` list is the same
+        // site (`RedirectingConstructorInvocation`, same verifier arm) —
+        // never a method invocation for the const evaluator. The redirect
+        // is a whole initializer, so its list is the only open level: a
+        // nested creation (`this._(const V())`) inherits the selector row
+        // as its head and must keep the generic close.
+        let init_super = self.engine.initializer_depth > 0
+            && (self.engine.init_super_callee().is_some()
+                || matches!(&self.engine.arg_levels[..], [level]
+                    if self.engine.init_invocation_level(level)));
         let closed = if init_super {
             let closed = self
                 .engine
@@ -4643,6 +4660,17 @@ impl ParserListener for DiagnoseListener<'_> {
                                         name,
                                         kind: ContainerKind::Class,
                                     }) => Some(*name),
+                                    // An unindexed SDK type head (`Stream`
+                                    // re-exported through `dart:core`)
+                                    // resolves as a plain type-valued decl;
+                                    // the frozen [`CORE_CONST_CTOR`] filter
+                                    // below decides its selector.
+                                    RowShape::Bare(BareInfo::Plain { .. })
+                                        if engine.type_resolution(receiver.name).0
+                                            == TypeResolution::Type =>
+                                    {
+                                        Some(receiver.name)
+                                    }
                                     _ => None,
                                 }
                             })
@@ -7448,6 +7476,10 @@ impl ParserListener for DiagnoseListener<'_> {
         if let (Some(row), Some(ty)) = (engine.rows.last_mut(), flat_ty) {
             row.ty = ty;
         }
+        // A bottom-typed await (`await Future<Never>.error(..)`) is the
+        // expression-level `handleExit` (type_analyzer.dart:815-819): the
+        // flow state dies at the await's end, latched like a Never send.
+        let bottom = flat_ty.is_some_and(|ty| ty == Ty::Never || engine.is_never_ty(ty));
         // The extent outlives the rewrite: a member operand's row resolves
         // only in the later pass (its close-time `ty` is still `Unknown`),
         // so the `var`-inferred bind re-applies the flatten over the
@@ -7456,6 +7488,9 @@ impl ParserListener for DiagnoseListener<'_> {
         engine
             .await_operand_extents
             .push((begin.range.end(), end.range.offset));
+        if bottom {
+            self.pending_exit = Some(end);
+        }
     }
 
     fn handle_throw_expression(&mut self, throw: Token, end: Token) {
@@ -9133,6 +9168,38 @@ fn top_level_question(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
     None
 }
 
+/// The `}` closing the brace group opening at `open` (nested `{`/`}` and
+/// quoted strings skipped — an interpolation's braces pair inside the
+/// string skip).
+fn balanced_brace(bytes: &[u8], open: usize, end: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < end {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < end && bytes[i] != quote {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The byte extent of the balanced `(`...`)` group opening at `open`.
 fn balanced_paren(bytes: &[u8], open: usize, end: usize) -> Option<usize> {
     let mut depth = 0usize;
@@ -9543,6 +9610,32 @@ impl Engine<'_> {
                 s + 3 + usize::from(bytes.get(s + 3) == Some(&b'?')),
                 end,
             );
+            // A collection-literal operand: the rows inside it are its
+            // elements, never the operand — `row_in_span` would read an
+            // inner element's type as the spread's. A list literal is an
+            // iterable (set side); a brace literal holding an entry is a
+            // map (the oracle infers it before the outer census); any
+            // other brace literal's own side is hidden.
+            match bytes.get(after) {
+                Some(b'[') => return LeafSide::Set,
+                Some(b'{') => {
+                    let close = balanced_brace(bytes, after, end);
+                    let has_entry = close.is_some_and(|close| {
+                        literal_comma_segments(bytes, after + 1, close)
+                            .into_iter()
+                            .any(|(s, e)| {
+                                let s = trim_trivia(bytes, s, e);
+                                s < e
+                                    && !bytes[s..].starts_with(b"...")
+                                    && top_level_colon(bytes, s, e).is_some_and(|colon| {
+                                        top_level_question(bytes, s, colon).is_none()
+                                    })
+                            })
+                    });
+                    return if has_entry { LeafSide::Map } else { LeafSide::Blind };
+                }
+                _ => {}
+            }
             if let Some((ty, _)) = self.row_in_span(s16, e16) {
                 let Ty::Named { name, .. } = ty else {
                     return LeafSide::Either;

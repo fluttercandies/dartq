@@ -626,10 +626,17 @@ impl<'a> Engine<'a> {
                             nullable: false,
                             args: ArgListId::EMPTY,
                         };
-                        !matches!(
-                            self.declared_subtype_negative(&non_null(c_head), &non_null(p_head)),
-                            Some(false)
-                        )
+                        // A nullable entry over a non-null face widens
+                        // (the pass-1 upward solve's `T` against the
+                        // re-bind's unsolved `Object?` recovery).
+                        nullability_ok
+                            && !matches!(
+                                self.declared_subtype_negative(
+                                    &non_null(c_head),
+                                    &non_null(p_head)
+                                ),
+                                Some(false)
+                            )
                     }
                 }
                 _ => false,
@@ -1213,7 +1220,9 @@ impl<'a> Engine<'a> {
                 })
             }
             Ty::Named { name, .. }
-                if promoted != static_ty && !self.widened_face(&promoted, &static_ty) =>
+                if promoted != static_ty
+                    && !self.widened_face(&promoted, &static_ty)
+                    && !self.flow_leaf_of(type_name, name) =>
             {
                 Some(Receiver::Typed {
                     type_name: name,
@@ -1235,6 +1244,11 @@ impl<'a> Engine<'a> {
             return None;
         };
         if flow_ty == static_ty || self.widened_face(&flow_ty, &static_ty) {
+            return None;
+        }
+        if let Ty::Named { name: static_head, .. } = static_ty
+            && self.flow_leaf_of(static_head, name)
+        {
             return None;
         }
         Some(Receiver::Typed {
@@ -1316,6 +1330,54 @@ impl<'a> Engine<'a> {
                 // parse-time self-reference exclusions skip their rows.
                 if !self.self_scope_rows.contains(&row.range.offset) {
                     self.used_names.insert(row.name);
+                }
+                // The implicit-this member edge (#2618): the push-time
+                // resolution published this row's target (`RefTarget::Member`
+                // names the enclosing container — its walk ran at push time,
+                // and the container stack is gone by pass 2), while the
+                // FINAL intent — refined by the send/assignment events after
+                // push time — decides the kind here. The re-walk reads the
+                // pass's face memo (one hash probe); a write resolves its
+                // setter side (`name=` spelling first, then a field's
+                // implicit setter — a getter-only hit is the erroneous-write
+                // face and resolves no element).
+                if let Ok(at) = self.refs.binary_search_by(|published| {
+                    published.range.offset.cmp(&row.range.offset)
+                })
+                    && self.refs[at].range == row.range
+                    && let RefTarget::Member { container } = self.refs[at].target
+                {
+                    let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
+                    if write {
+                        let setter = self.setter_spelling(row.name);
+                        if self.member_found(container, setter, false) {
+                            let landing = self.last_landing();
+                            let kind = Self::member_ref_kind(&row.intent, MemberKind::Setter);
+                            self.note_member_ref(
+                                row,
+                                kind,
+                                landing.map(|(file, origin)| (file, setter, origin)),
+                            );
+                        } else if let Walk::Found(entry) = self.walk_members(container, row.name)
+                            && entry.kind == MemberKind::Field
+                        {
+                            let landing = self.last_landing();
+                            let kind = Self::member_ref_kind(&row.intent, entry.kind);
+                            self.note_member_ref(
+                                row,
+                                kind,
+                                landing.map(|(file, origin)| (file, row.name, origin)),
+                            );
+                        }
+                    } else if let Walk::Found(entry) = self.walk_members(container, row.name) {
+                        let landing = self.last_landing();
+                        let kind = Self::member_ref_kind(&row.intent, entry.kind);
+                        self.note_member_ref(
+                            row,
+                            kind,
+                            landing.map(|(file, origin)| (file, row.name, origin)),
+                        );
+                    }
                 }
                 // The implicit-this face (`_checkForInvalidInstanceMember
                 // Access2`, upstream Dart SDK source, pkg/analyzer/lib/src/
@@ -1516,6 +1578,10 @@ impl<'a> Engine<'a> {
                                 ExtensionApp::Single | ExtensionApp::UnsafeSingle
                             )
                         {
+                            // The application resolved the bare invocation
+                            // (#2618): the edge targets the winning
+                            // extension's member.
+                            self.note_extension_ref(row);
                             self.record_miss(row.name, row.range, false, NameUse::Invoke);
                             return;
                         }
@@ -2327,7 +2393,6 @@ impl<'a> Engine<'a> {
         row: &Row,
         recv: Receiver,
     ) {
-        
         if matches!(recv, Receiver::Unknown)
             && matches!(row.intent, Intent::Read | Intent::ReadWrite)
         {
@@ -2564,7 +2629,7 @@ impl<'a> Engine<'a> {
             // sits behind the prefix table), so the check re-resolves
             // through [`prefixed_container`] directly.
             Receiver::PrefixedContainer { prefix, name, kind } => {
-                if let Some((resolved, _)) = prefixed_container(
+                if let Some((resolved, owner)) = prefixed_container(
                     self.graph,
                     self.namespaces,
                     self.index,
@@ -2572,7 +2637,7 @@ impl<'a> Engine<'a> {
                     prefix,
                     name,
                 ) {
-                    self.container_member_verdict(row, resolved, name, kind);
+                    self.container_member_verdict(row, resolved, owner, name, kind);
                 }
             }
             // A folded creation: class-shaped results resolve on the
@@ -2629,7 +2694,7 @@ impl<'a> Engine<'a> {
         container: StringId,
         kind: ContainerKind,
     ) {
-        let Some((resolved, _)) = resolve_container(
+        let Some((resolved, owner)) = resolve_container(
             self.graph,
             self.namespaces,
             self.index,
@@ -2639,18 +2704,20 @@ impl<'a> Engine<'a> {
         ) else {
             return;
         };
-        self.container_member_verdict(row, resolved, container, kind);
+        self.container_member_verdict(row, resolved, owner, container, kind);
     }
 
     /// [`Engine::check_container_member`] over an already-resolved
     /// container — the resolved-prefix arm (`io.Directory.gone`) holds its
     /// `prefixed_container` hit, which the bare-scope `resolve_container`
     /// above cannot reproduce (the name lives behind the prefix, not in
-    /// the diagnosing library's scope).
+    /// the diagnosing library's scope). `owner` is the resolved
+    /// container's declaring file (the reference edge target, #2618).
     pub(crate) fn container_member_verdict(
         &mut self,
         row: &Row,
         resolved: &Container,
+        owner: FileId,
         container: StringId,
         kind: ContainerKind,
     ) {
@@ -2726,6 +2793,22 @@ impl<'a> Engine<'a> {
             return;
         }
         if defined {
+            // The static/extension face resolved (#2618): the edge targets
+            // the container's own declaration — statics resolve on the
+            // declaring container only, and the write's satisfying arm
+            // (setter or non-final field) picks the lookup spelling.
+            let setter = self.setter_spelling(row.name);
+            let spelling = if write && resolved.members.contains_key(&setter) {
+                setter
+            } else {
+                row.name
+            };
+            let entry_kind = resolved
+                .members
+                .get(&spelling)
+                .map_or(MemberKind::Method, |entry| entry.kind);
+            let ref_kind = Self::member_ref_kind(&row.intent, entry_kind);
+            self.note_member_ref(row, ref_kind, Some((owner, spelling, container)));
             self.check_member_unused_result(
                 row,
                 container,
@@ -2860,6 +2943,19 @@ impl<'a> Engine<'a> {
             }
             _ => false,
         };
+        // A `?`-less `FutureOr<A>` over a potentially-nullable `A` answers
+        // the miss face only: the extension lookups still see the written
+        // non-nullable spelling (an `on FutureOr<V>` face binds `V` to the
+        // nullable argument and applies), so the flag joins at the final
+        // unchecked-vs-undefined split alone.
+        let future_or_nullable = match &recv {
+            Receiver::Typed { ty, .. } => {
+                !receiver_nullable
+                    && self.future_or_potentially_nullable(*ty)
+                    && !self.null_aware_members.contains(&row.range.offset)
+            }
+            _ => false,
+        };
         // `Object`'s own members read on a nullable receiver need no null
         // check: `Null` declares them too, so the oracle resolves
         // `x.hashCode` / `x.toString()` / `x.runtimeType` /
@@ -2931,7 +3027,18 @@ impl<'a> Engine<'a> {
                 // codes the dedicated face; chain-broken receivers defer.
                 let reports = match self.walk_members(container, row.name) {
                     Walk::Missing => true,
-                    Walk::Found(entry) => entry.kind != MemberKind::Field,
+                    Walk::Found(entry) => {
+                        // The initializer's field write resolved (#2618) —
+                        // the edge lands whatever the validity face says.
+                        let landing = self.last_landing();
+                        let kind = Self::member_ref_kind(&row.intent, entry.kind);
+                        self.note_member_ref(
+                            row,
+                            kind,
+                            landing.map(|(file, origin)| (file, row.name, origin)),
+                        );
+                        entry.kind != MemberKind::Field
+                    }
                     Walk::ChainBroken => false,
                 };
                 if reports {
@@ -3013,6 +3120,15 @@ impl<'a> Engine<'a> {
                             name_text,
                         );
                     }
+                    // The operator-merged read resolved (#2618): the member
+                    // read face carries the edge.
+                    let landing = self.last_landing();
+                    let kind = Self::member_ref_kind(&row.intent, entry.kind);
+                    self.note_member_ref(
+                        row,
+                        kind,
+                        landing.map(|(file, origin)| (file, row.name, origin)),
+                    );
                     let ty = Self::member_result_ty(&entry);
                     self.check_operator_expr(ty, row);
                     return;
@@ -3043,10 +3159,15 @@ impl<'a> Engine<'a> {
                         ),
                         ExtensionApp::None
                     );
-                    
+
                     applied
                 } =>
                 {
+                    // The application resolved the operator-merged read
+                    // (#2618) when it was single-faced — the latch holds
+                    // the target only then (an ambiguous application
+                    // resolves nothing and latches nothing).
+                    self.note_extension_ref(row);
                     return;
                 }
                 Walk::ChainBroken => {
@@ -3428,7 +3549,7 @@ impl<'a> Engine<'a> {
         // `unchecked_use_of_nullable_value` code at the selector and never
         // reaches the `undefined_*` family, whatever the member face the
         // model decided the miss on.
-        if receiver_nullable {
+        if receiver_nullable || future_or_nullable {
             self.emit_corrected(
                 SemanticCode::UncheckedUseOfNullableValue,
                 row.range,
@@ -3491,6 +3612,14 @@ impl<'a> Engine<'a> {
         if let Intent::Operator(..) = row.intent {
             match self.walk_super(container, row.name) {
                 Walk::Found(entry) => {
+                    // The operator-merged super read resolved (#2618).
+                    let landing = self.last_landing();
+                    let kind = Self::member_ref_kind(&row.intent, entry.kind);
+                    self.note_member_ref(
+                        row,
+                        kind,
+                        landing.map(|(file, origin)| (file, row.name, origin)),
+                    );
                     let ty = Self::member_result_ty(&entry);
                     self.check_operator_expr(ty, row);
                 }
@@ -3728,6 +3857,46 @@ impl<'a> Engine<'a> {
         self.frozen_faces_verdict(seeds, spelling, false)
     }
 
+    /// Whether a `?`-less `FutureOr<A>` receiver is potentially nullable
+    /// (type_system.dart `_isNonNullable`: `FutureOr<A>` answers `A`'s
+    /// verdict): `A` written with `?`, a top/`Null` argument, an
+    /// InvalidType spelling the file failed to resolve, or a nested
+    /// `FutureOr` of one. A type-parameter argument stays non-nullable here
+    /// (its bound is not modeled — the under-report direction).
+    pub(crate) fn future_or_potentially_nullable(&self, ty: Ty) -> bool {
+        let future_or = self.intern("FutureOr");
+        let mut ty = ty;
+        for _ in 0..8 {
+            let Ty::Named {
+                name,
+                nullable: false,
+                args,
+            } = ty
+            else {
+                return false;
+            };
+            if name != future_or {
+                return false;
+            }
+            let Some(&arg) = self.boundary.pool().get(args).first() else {
+                return false;
+            };
+            match arg {
+                Ty::Dynamic | Ty::Void | Ty::Null => return true,
+                Ty::Named { nullable: true, .. } => return true,
+                Ty::Named { name, .. } if self.invalid_type_names.contains(&name) => return true,
+                // The argument's own unresolved spelling interns as
+                // `Unknown` (the InvalidType slot): nullable exactly when the
+                // unit carries an InvalidType spelling; any other `Unknown`
+                // is unmodeled and keeps the under-report.
+                Ty::Unknown => return !self.invalid_type_names.is_empty(),
+                Ty::Named { .. } => ty = arg,
+                _ => return false,
+            }
+        }
+        false
+    }
+
     /// The one graph-wide declaration of container `name` outside
     /// `scope_lib`, when exactly one library declares it — the anchor face
     /// for a receiver type the diagnosing library's scope does not carry
@@ -3750,6 +3919,19 @@ impl<'a> Engine<'a> {
             .names
             .iter()
             .any(|r| r.name == name && r.use_kind == NameUse::Type && !r.qualified)
+            // The miss rows record at their own resolve step, which may
+            // run after the member probe: the push-time `Missing`/`NonType`
+            // verdict is the same InvalidType spelling (`MessageEvent
+            // event` under a broken `package:web` import while `dart:html`
+            // elsewhere declares `MessageEvent`). The set latches before
+            // the resolve pass; a probe during the parse reads the live
+            // rows.
+            || self.invalid_type_names.contains(&name)
+            || self.rows.iter().any(|r| {
+                r.name == name
+                    && !r.qualified
+                    && matches!(r.shape, RowShape::TypeUse(TypeVerdict::Missing, _))
+            })
         {
             return None;
         }
@@ -4534,6 +4716,69 @@ impl<'a> Engine<'a> {
     /// accepts the setter spelling (`name=`): a same-named getter, field, or
     /// method suppresses with the oracle's assignment-to-* codes, a setter
     /// defines the write.
+    /// The reference-edge kind of a member row's final intent (#2618): the
+    /// send/assignment events finalize the intent before pass 2, so the
+    /// mapping runs at the verdict sites where both facts stand. A method
+    /// read as a value is a tear-off and mints the index's tear-off-shaped
+    /// `Invoked` face; an operator-shaped access (`a.m + 1`, `a.m[i]`)
+    /// reads the member's getter.
+    fn member_ref_kind(intent: &Intent, entry_kind: MemberKind) -> MemberRefKind {
+        match intent {
+            Intent::Invoke => MemberRefKind::Invoked,
+            Intent::Read | Intent::Operator(..) => {
+                if entry_kind == MemberKind::Method {
+                    MemberRefKind::Invoked
+                } else {
+                    MemberRefKind::Read
+                }
+            }
+            Intent::Write => MemberRefKind::Written,
+            Intent::ReadWrite => MemberRefKind::ReadWritten,
+        }
+    }
+
+    /// Records one resolved member-access reference edge (#2618): the use
+    /// row's span against the declaration the resolution landed on —
+    /// `(declaring file, lookup spelling, declaring container)`. Rows
+    /// land beside the bare-reference publications; the engine folds them
+    /// into the library reference surface the query/rename faces serve.
+    fn note_member_ref(
+        &mut self,
+        row: &Row,
+        kind: MemberRefKind,
+        target: Option<(FileId, StringId, StringId)>,
+    ) {
+        if let Some((target_file, target_name, target_container)) = target {
+            self.report.member_refs.push(MemberRef {
+                range: row.range,
+                kind,
+                target_file,
+                target_name,
+                target_container,
+            });
+        }
+    }
+
+    /// The walk-landing facts of a `Found` outcome (#2618): the declaring
+    /// file and container, read as one snapshot before any later probe
+    /// can move the face memo's origin cell.
+    fn last_landing(&self) -> Option<(FileId, StringId)> {
+        Some((self.member_faces.last_found_file()?, self.member_faces.last_origin()?))
+    }
+
+    /// Records the edge for the extension application the last
+    /// [`Engine::extension_application`] call resolved (#2618): the latch
+    /// holds the winning face's target only at a single-face conclusion —
+    /// `Ambiguous` resolves no member and latches nothing.
+    fn note_extension_ref(&mut self, row: &Row) {
+        let target = self.members.ext_ref.take();
+        let kind = target.map_or(MemberRefKind::Read, |(_, _, _, entry)| {
+            Self::member_ref_kind(&row.intent, entry)
+        });
+        let target = target.map(|(file, spelling, face, _)| (file, spelling, face));
+        self.note_member_ref(row, kind, target);
+    }
+
     pub(crate) fn member_defined(
         &mut self,
         container: StringId,
@@ -4543,7 +4788,7 @@ impl<'a> Engine<'a> {
         receiver_nullable: bool,
     ) -> bool {
         let write = matches!(row.intent, Intent::Write | Intent::ReadWrite);
-        
+
         // The write target resolves the SETTER side
         // (`assignment_expression_resolver.dart` `_resolveSimpleAssignment`:
         // `writeElement` is the `name=` lookup): a setter or a field
@@ -4559,12 +4804,43 @@ impl<'a> Engine<'a> {
             } else {
                 self.walk_members(container, row.name)
             };
-            matches!(named, Walk::Found(_)) || {
-                let spelling = self.setter_spelling(row.name);
-                self.member_found(container, spelling, super_walk)
+            // The write's edge target (#2618) resolves its SETTER side —
+            // the `name=` spelling first (the oracle's `writeElement`),
+            // then a non-final field's implicit setter. The plain walk's
+            // landing snapshot reads before the setter probe can move the
+            // face memo's origin cell.
+            let named_hit = if let Walk::Found(entry) = &named {
+                Some((self.last_landing(), entry.kind))
+            } else {
+                None
+            };
+            let setter = self.setter_spelling(row.name);
+            let setter_hit = self.member_found(container, setter, super_walk);
+            if setter_hit {
+                let landing = self.last_landing();
+                let kind = Self::member_ref_kind(&row.intent, MemberKind::Setter);
+                self.note_member_ref(
+                    row,
+                    kind,
+                    landing.map(|(file, origin)| (file, setter, origin)),
+                );
+            } else if let Some((Some((file, origin)), MemberKind::Field)) = named_hit {
+                let kind = Self::member_ref_kind(&row.intent, MemberKind::Field);
+                self.note_member_ref(row, kind, Some((file, row.name, origin)));
             }
+            matches!(named, Walk::Found(_)) || setter_hit
         } else {
-            self.member_found(container, row.name, super_walk)
+            let walk = if super_walk {
+                self.walk_super(container, row.name)
+            } else {
+                self.walk_members(container, row.name)
+            };
+            if let Walk::Found(entry) = &walk {
+                let landing = self.last_landing();
+                let kind = Self::member_ref_kind(&row.intent, entry.kind);
+                self.note_member_ref(row, kind, landing.map(|(file, origin)| (file, row.name, origin)));
+            }
+            matches!(walk, Walk::Found(_))
         };
         if found {
             // The nullable-dereference face (nullable_dereference_verifier
@@ -4624,6 +4900,9 @@ impl<'a> Engine<'a> {
                 if receiver_nullable {
                     self.extension_nullable_resolved.insert(row.range.offset);
                 }
+                // The application resolved the member (#2618): the edge
+                // targets the winning extension's declaration.
+                self.note_extension_ref(row);
                 true
             }
             // The member resolved through a non-nullable `on` face against a
@@ -4640,9 +4919,13 @@ impl<'a> Engine<'a> {
                     row.range,
                     name_text,
                 );
+                self.note_extension_ref(row);
                 true
             }
-            ExtensionApp::UnsafeSingle => true,
+            ExtensionApp::UnsafeSingle => {
+                self.note_extension_ref(row);
+                true
+            }
             ExtensionApp::Ambiguous(displays) => {
                 self.emit_extension_ambiguity(row.name, row.range, displays);
                 // The verdict leaves the property unresolved for the
@@ -4691,6 +4974,10 @@ impl<'a> Engine<'a> {
         accept_setter: bool,
         receiver_nullable: bool,
     ) -> ExtensionApp {
+        // The reference-edge latch (#2618): cleared per call, set only at a
+        // single-face conclusion — the verdict sites read it as the
+        // application's resolved target.
+        self.members.ext_ref.set(None);
         let setter = self.setter_spelling(member);
         // Applicable faces in declaration order, bucketed by specificity:
         // against a non-nullable receiver a non-nullable `on` type
@@ -4758,6 +5045,12 @@ impl<'a> Engine<'a> {
                     .is_none_or(|lib| !self.graph.uri(lib).starts_with("dart:"))
             })
         };
+        // A head the diagnosing file spells but cannot resolve as a type
+        // (the push-time `Missing`/`NonType` verdict) is the oracle's
+        // InvalidType even when another library's same-named declaration
+        // makes the name-level world know it (`JSPromise<Response>` under a
+        // broken `package:web` import beside an unrelated `Response`).
+        let invalid_head = |head: StringId| -> bool { self.invalid_type_names.contains(&head) };
         // The instantiated argument's verdict against a face parameter's
         // declared bound (`applicableTo`'s `tryChooseFinalTypes` bound
         // check): `arg <: bound`. An in-scope type parameter answers
@@ -4896,7 +5189,8 @@ impl<'a> Engine<'a> {
                         && (arg_head == bound_head
                             || reaches(arg_head, bound_head)
                             || (!user_container(arg_head)
-                                && !world.is_known_head(arg_head)))
+                                && (!world.is_known_head(arg_head)
+                                    || invalid_head(arg_head))))
                 }
                 // A shape the name level cannot order (an unknown
                 // instantiation, a record or function bound) keeps the
@@ -5781,6 +6075,31 @@ impl<'a> Engine<'a> {
             self.credit_extension_import(face, face_file);
         }
         
+        // The single-face conclusion latches its reference-edge target
+        // (#2618) — the winning face's declaring file, the resolved lookup
+        // spelling (a write through a face declaring only `name=` targets
+        // the setter), the face's own name (the edge's declaring
+        // container; an unnamed extension has none to name — the sentinel
+        // keeps its rows out of every container-scoped join, the unnamed
+        // face's standing degrade), and the member's kind (the tear-off
+        // shape).
+        if let [(face, face_file, _)] = candidates.as_slice() {
+            let spelling = if accept_setter && face.members.contains_key(&setter) {
+                setter
+            } else {
+                member
+            };
+            let kind = face
+                .members
+                .get(&spelling)
+                .map_or(MemberKind::Method, |entry| entry.kind);
+            self.members.ext_ref.set(Some((
+                *face_file,
+                spelling,
+                face.name.unwrap_or(StringId::NONE),
+                kind,
+            )));
+        }
         match candidates.len() {
             0 => ExtensionApp::None,
             1 if unsafe_match => ExtensionApp::UnsafeSingle,
@@ -5823,6 +6142,49 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The function-receiver twin of [`Self::record_extension_face`]: a
+    /// receiver whose static type is a FUNCTION type (`extension on
+    /// PostMessage` over `typedef PostMessage = void Function(..)`) names
+    /// no container either. Only the exact face applies at the shape
+    /// level — both sides fold through aliases and the function types must
+    /// be identical (a nullable `on` also accepts the non-null receiver);
+    /// a face whose `on` type spells its own type parameters is left
+    /// undecided (no credit, the under-report direction). Single hit only,
+    /// like the record face.
+    fn function_extension_face(
+        &mut self,
+        receiver: Ty,
+        member: StringId,
+    ) -> Option<(&'a ExtensionFace, FileId)> {
+        let Ty::Function {
+            shape: recv_shape,
+            nullable: recv_nullable,
+        } = receiver
+        else {
+            return None;
+        };
+        self.accessible_extension_faces();
+        let faces = self.accessible_extensions.as_deref().unwrap_or(&[]);
+        let mut hits: Vec<(&'a ExtensionFace, FileId)> = Vec::new();
+        for &(face, face_file) in faces {
+            if !face.members.contains_key(&member) || !face.type_param_names.is_empty() {
+                continue;
+            }
+            let on_ty = self.boundary.ty(face_file, face.on_ty);
+            let Ty::Function {
+                shape: on_shape,
+                nullable: on_nullable,
+            } = self.fold_alias_ty(on_ty)
+            else {
+                continue;
+            };
+            if on_shape == recv_shape && (on_nullable || !recv_nullable) {
+                hits.push((face, face_file));
+            }
+        }
+        (hits.len() == 1).then(|| hits[0])
+    }
+
     /// The record-receiver extension application (`extension<BoxedT> on
     /// (BoxedT,)?` — riverpod's `unwrapSentinel`): a receiver whose static
     /// type is a RECORD has no container name, so the named-`on` face loop
@@ -5843,6 +6205,9 @@ impl<'a> Engine<'a> {
         member: StringId,
     ) -> Option<(&'a ExtensionFace, FileId)> {
         let receiver = self.fold_alias_ty(receiver_ty);
+        if let Ty::Function { .. } = receiver {
+            return self.function_extension_face(receiver, member);
+        }
         let Ty::Record {
             shape: recv_shape,
             nullable: recv_nullable,

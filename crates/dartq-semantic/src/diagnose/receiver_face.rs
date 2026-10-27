@@ -65,6 +65,21 @@ impl Engine<'_> {
             Ty::Named { name, nullable, .. } => (Some(name), nullable),
             _ => (None, false),
         };
+        // A flow face spelling the prefixed static head's bare leaf names
+        // the same element: keep the qualified head (see
+        // [`Self::flow_leaf_of`]), narrowing only its nullability.
+        if let Some(head) = static_head
+            && self.flow_leaf_of(head, name)
+        {
+            return if static_nullable && !nullable {
+                Receiver::Typed {
+                    type_name: head,
+                    ty: Self::non_null_form(static_ty),
+                }
+            } else {
+                recv
+            };
+        }
         let renames = static_head != Some(name);
         let narrows = static_nullable && !nullable;
         if !(renames || narrows) {
@@ -74,6 +89,21 @@ impl Engine<'_> {
             type_name: name,
             ty: face,
         }
+    }
+
+    /// Whether a flow-layer type head is a prefixed static head's bare
+    /// leaf (`File` against `io.File`). The flow recorder keys every
+    /// qualified type reference by its last identifier, so a promoted or
+    /// re-read face over an `ast.C` local spells `C` — the same element.
+    /// Re-resolving that leaf in the diagnosing scope would retarget a
+    /// same-spelled unprefixed import's class.
+    pub(crate) fn flow_leaf_of(&self, static_head: StringId, flow_head: StringId) -> bool {
+        static_head != flow_head
+            && self
+                .strings
+                .resolve(static_head)
+                .rsplit_once('.')
+                .is_some_and(|(_, leaf)| leaf == self.strings.resolve(flow_head))
     }
 
     /// The re-bound local face (#2539): a receiver read whose identifier

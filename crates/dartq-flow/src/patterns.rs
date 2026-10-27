@@ -175,6 +175,22 @@ impl Interp<'_> {
                     if self.classify(matched) == Classification::NullOrEquivalent {
                         if_not_null = if_not_null.set_unreachable(&mut self.reach);
                     }
+                    // A switch clause's chain starts live (the clause-begin
+                    // state) where the official `_pushPattern` starts it
+                    // unreachable. The top-level constant IS the whole
+                    // clause pattern, so no other arm joined yet: the
+                    // official join collapses to `ifNotNull` itself —
+                    // joining the live pre-test state would demote the
+                    // fall-through (`case null: return; default: x.p`).
+                    if matches!(
+                        self.pattern.as_ref().map(|p| p.kind),
+                        Some(PatternKind::Switch | PatternKind::SwitchExpr)
+                    ) {
+                        if let Some(pattern) = self.pattern.as_mut() {
+                            pattern.unmatched = if_not_null;
+                        }
+                        return;
+                    }
                     if let Some(chain) = self.pattern.as_ref().map(|p| p.unmatched.clone()) {
                         let joined = self.join(Some(chain), Some(if_not_null));
                         if let Some(pattern) = self.pattern.as_mut() {

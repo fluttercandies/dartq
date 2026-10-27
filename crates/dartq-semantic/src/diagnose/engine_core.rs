@@ -109,6 +109,8 @@ impl<'a> Engine<'a> {
             non_type_pos: 0,
             is_type_pos: 0,
             ctor_pos: 0,
+            ctor_pos_levels: Vec::new(),
+            invalid_type_names: InvalidTypeNames::default(),
             implicit_creation_depth: 0,
             creation_ref: None,
             ctor_prefix_heads: Vec::new(),
@@ -781,6 +783,37 @@ impl<'a> Engine<'a> {
                 }
                 continue;
             }
+            if let StagedKind::ForIn = check.kind {
+                // The parse-time rejection stands unless a promotion on
+                // the iterable read re-decides it: a promoted type the
+                // sequence accepts (or one the matrix cannot decide)
+                // cleans the row (the under-report direction).
+                let from = match promotions.promoted(check.range) {
+                    None => check.from,
+                    Some(Ty::Unknown) => continue,
+                    Some(promoted) => {
+                        if self.assignable(promoted, check.to, check.literal) != Some(false) {
+                            continue;
+                        }
+                        promoted
+                    }
+                };
+                let sequence = match check.to {
+                    Ty::Named { name, .. } => self.strings.resolve(name).to_string(),
+                    _ => continue,
+                };
+                let a0 = self.ty_display(from);
+                let code = SemanticCode::ForInOfInvalidType;
+                survivors.push(Diagnostic::new(
+                    code.severity(),
+                    code.code_info(),
+                    code.message(&a0, &sequence),
+                    self.file,
+                    check.range,
+                    None,
+                ));
+                continue;
+            }
             let staged_promotion = promotions.promoted(check.range);
             // The invalid-type vacuous arm (subtype.dart's 0c case): either
             // side's head resolving nowhere makes every assignability ask
@@ -1123,7 +1156,7 @@ impl<'a> Engine<'a> {
                 // Routed by the early blocks above; the arms only keep the
                 // match total.
                 StagedKind::NeverReceiver | StagedKind::NullableCondition => continue,
-                StagedKind::YieldEach { .. } => continue,
+                StagedKind::YieldEach { .. } | StagedKind::ForIn => continue,
                 StagedKind::Assignment => (SemanticCode::InvalidAssignment, None),
                 StagedKind::Argument => (SemanticCode::ArgumentTypeNotAssignable, None),
                 StagedKind::Yield => (SemanticCode::YieldOfInvalidType, None),
@@ -2102,6 +2135,12 @@ impl<'a> Engine<'a> {
         // result.
         if !row.qualified
             && let Some(sig) = self.fn_var_sigs.get(&row.name)
+            // A formal-claimed signature binds only while that formal is in
+            // scope: outside its executable the spelling names something
+            // else (a sibling `open()` method beside another method's
+            // `Conn Function() open` formal).
+            && (!self.fn_param_sigs.contains_key(&row.name)
+                || self.frames.iter().any(|f| f.locals.contains(&row.name)))
         {
             return sig.return_ty;
         }

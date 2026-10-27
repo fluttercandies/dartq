@@ -93,14 +93,18 @@ pub struct RefRow {
     pub target_file: FileId,
     /// The target's lookup-spelling name.
     pub target_name: StringId,
+    /// The target's declaring CONTAINER name for member targets (#2618) —
+    /// `(file, name)` alone cannot name a member (two classes in one file
+    /// may declare the same member name); [`StringId::NONE`] for
+    /// library-face targets (top-level declarations).
+    pub target_container: StringId,
     /// The relation kind.
     pub kind: RefKind,
     /// The use site's span (UTF-16).
     pub range: SourceRange,
     /// The import prefix that armed the resolution (`p` in `p.fa`), interned;
     /// [`StringId::NONE`] for bare uses. `qualified` — the use cannot be
-    /// shadowed by a local declaration — derives from the sentinel, so the
-    /// row stays 28 B.
+    /// shadowed by a local declaration — derives from the sentinel.
     pub qualifier: StringId,
 }
 
@@ -113,12 +117,12 @@ impl RefRow {
     }
 }
 
-/// The packed-row pin: four ids (16 B) + the kind byte + the range (8 B)
+/// The packed-row pin: five ids (20 B) + the kind byte + the range (8 B)
 /// plus tail pad. `refs` is the crate's largest standing table (~0.5 KB per
-/// KB of source at corpus scale); the qualifier sentinel and the derived
-/// `qualified` bit hold the row at 28 B — any future field re-negotiates it
-/// here, not silently.
-const _: () = assert!(std::mem::size_of::<RefRow>() == 28);
+/// KB of source at corpus scale); the member-target container column (#2618,
+/// the difference between naming a member and renaming the wrong class's)
+/// moved the row 28 → 32 B — renegotiated here, never silently.
+const _: () = assert!(std::mem::size_of::<RefRow>() == 32);
 
 /// One unresolved name use — a names-table row (the recovery surface
 /// for the `undefined_*` family and the only reference signal when
@@ -395,6 +399,7 @@ impl<'a> LibraryBuilder<'a> {
                             file,
                             target_file: target,
                             target_name: name,
+                            target_container: StringId::NONE,
                             kind,
                             range,
                             qualifier: StringId::NONE,
@@ -422,6 +427,7 @@ impl<'a> LibraryBuilder<'a> {
                                 file,
                                 target_file: target,
                                 target_name: name,
+                                target_container: StringId::NONE,
                                 kind,
                                 range,
                                 qualifier: prefix,
@@ -466,6 +472,19 @@ impl<'a> LibraryBuilder<'a> {
             Lookup::Found(NamespaceEntry::Prefix) => BareHit::Prefix(name),
             Lookup::Ambiguous(_) | Lookup::NotFound => BareHit::Miss,
         }
+    }
+
+    /// Folds the semantically resolved member-access reference edges of
+    /// one file (#2618): each row is a complete [`RefRow`] (use site, kind,
+    /// target) pushed beside the parser-level sites. Member sends resolve
+    /// only with receiver type information, so the capture layer cannot
+    /// produce them — the diagnose fold publishes them and the engine
+    /// hands them in here. Order is irrelevant ([`Self::finish`] sorts the
+    /// merged table); duplicate protection is by construction (one row per
+    /// use site — the capture's continuation sites for member sends never
+    /// resolve bare, so no parser-level row can double a semantic one).
+    pub fn add_resolved_refs(&mut self, rows: impl IntoIterator<Item = RefRow>) {
+        self.refs.extend(rows);
     }
 
     /// Sorts the tables into their probed order and finishes the index.
