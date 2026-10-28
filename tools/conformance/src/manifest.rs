@@ -11,7 +11,10 @@ pub struct Row {
 /// Builds rows from (id, case bytes) pairs.
 pub fn build<'a>(cases: impl Iterator<Item = (&'a String, &'a [u8])>) -> Vec<Row> {
     let mut rows: Vec<Row> = cases
-        .map(|(id, bytes)| Row { id: id.clone(), hash: blake3::hash(bytes).to_string() })
+        .map(|(id, bytes)| Row {
+            id: id.clone(),
+            hash: blake3::hash(bytes).to_string(),
+        })
         .collect();
     rows.sort();
     rows
@@ -40,7 +43,10 @@ pub fn parse(text: &str) -> Result<Vec<Row>, String> {
         let Some((id, hash)) = line.split_once('\t') else {
             return Err(format!("line {}: expected `id<TAB>hash`", no + 1));
         };
-        rows.push(Row { id: id.to_string(), hash: hash.to_string() });
+        rows.push(Row {
+            id: id.to_string(),
+            hash: hash.to_string(),
+        });
     }
     Ok(rows)
 }
@@ -90,17 +96,29 @@ mod tests {
         let rows = build(ids.iter().zip(bytes.iter().copied()));
         assert_eq!(rows[0].id, "a");
         assert_eq!(rows[1].id, "b");
-        assert_eq!(render(&rows), format!("a\t{}\nb\t{}\n", rows[0].hash, rows[1].hash));
+        assert_eq!(
+            render(&rows),
+            format!("a\t{}\nb\t{}\n", rows[0].hash, rows[1].hash)
+        );
     }
 
     #[test]
     fn diff_reports_all_directions() {
-        let mk = |id: &str, h: &str| Row { id: id.into(), hash: h.into() };
+        let mk = |id: &str, h: &str| Row {
+            id: id.into(),
+            hash: h.into(),
+        };
         let expected = vec![mk("a", "1"), mk("b", "2"), mk("c", "3")];
         let actual = vec![mk("a", "9"), mk("d", "4")];
         let (missing, unexpected, changed) = diff(&expected, &actual);
-        assert_eq!(missing.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["b", "c"]);
-        assert_eq!(unexpected.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["d"]);
+        assert_eq!(
+            missing.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["b", "c"]
+        );
+        assert_eq!(
+            unexpected.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["d"]
+        );
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].0.id, "a");
     }

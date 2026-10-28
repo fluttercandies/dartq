@@ -128,8 +128,13 @@ pub fn analysis_options_from_call(args: &[crate::dart::Arg]) -> Option<String> {
     ))
 }
 
+/// Parses a string-list argument; the bare `experiments` identifier stands
+/// for the official `experimentsForTests` getter the tests pass through.
 pub fn string_list(expr: &str) -> Option<Vec<String>> {
     let expr = expr.trim();
+    if expr == "experiments" {
+        return Some(DEFAULT_EXPERIMENTS.iter().map(|s| s.to_string()).collect());
+    }
     if expr == "const []" || expr == "[]" {
         return Some(Vec::new());
     }
@@ -198,7 +203,15 @@ mod tests {
 
     #[test]
     fn rules_section_last() {
-        let yaml = analysis_options_content(&["enhanced-parts".into()], &["avoid_print".into()], false, true, false, &[], &[]);
+        let yaml = analysis_options_content(
+            &["enhanced-parts".into()],
+            &["avoid_print".into()],
+            false,
+            true,
+            false,
+            &[],
+            &[],
+        );
         assert!(yaml.ends_with("linter:\n  rules:\n    - avoid_print\n"));
         assert!(yaml.contains("    - enhanced-parts\n"));
         assert!(yaml.contains("    strict-inference: true\n"));
@@ -208,13 +221,22 @@ mod tests {
     fn parses_analysis_options_call() {
         use crate::dart::Arg;
         let args = vec![
-            Arg { label: None, expr: "x".into() }, // noise filtered below via label None
+            Arg {
+                label: None,
+                expr: "x".into(),
+            }, // noise filtered below via label None
         ];
         // positional argument cannot be modeled
         assert!(analysis_options_from_call(&args).is_none());
         let args = vec![
-            Arg { label: Some("experiments".into()), expr: "['enhanced-parts']".into() },
-            Arg { label: Some("strictCasts".into()), expr: "true".into() },
+            Arg {
+                label: Some("experiments".into()),
+                expr: "['enhanced-parts']".into(),
+            },
+            Arg {
+                label: Some("strictCasts".into()),
+                expr: "true".into(),
+            },
         ];
         let yaml = analysis_options_from_call(&args).expect("models");
         assert!(yaml.contains("    - enhanced-parts\n"));
@@ -224,7 +246,10 @@ mod tests {
     #[test]
     fn empty_list_literals() {
         assert_eq!(string_list("const []"), Some(vec![]));
-        assert_eq!(string_list("['a', 'b']"), Some(vec!["a".into(), "b".into()]));
+        assert_eq!(
+            string_list("['a', 'b']"),
+            Some(vec!["a".into(), "b".into()])
+        );
         assert_eq!(string_list("[]"), Some(vec![]));
     }
 }

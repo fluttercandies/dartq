@@ -81,6 +81,13 @@ pub const UNVERIFIED_DOCS: &[&str] = &[
     "depend_on_referenced_packages",
     "file_names",
     "prefer_inlined_adds_single",
+    "library_annotations",
+    "package_prefixed_library_names",
+    "prefer_relative_imports",
+    "public_member_api_docs",
+    "recursive_getters",
+    "extension_declares_instance_field",
+    "deprecated_extends_function",
 ];
 
 /// One skipped doc snippet and why.
@@ -176,7 +183,14 @@ fn parse_documentation(documentation: &str) -> Vec<(Section, Block)> {
             if !file_type.is_empty() {
                 parts.push((
                     current,
-                    Block { text: text.join("\n"), file_type, uri, experiments, ignores, language_version },
+                    Block {
+                        text: text.join("\n"),
+                        file_type,
+                        uri,
+                        experiments,
+                        ignores,
+                        language_version,
+                    },
                 ));
             }
             continue;
@@ -241,7 +255,9 @@ pub fn extract_messages(entries: &[MessageEntry], origin: &str) -> DocExtraction
     let mut out = DocExtraction::default();
     let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for entry in entries {
-        let Some(documentation) = &entry.documentation else { continue };
+        let Some(documentation) = &entry.documentation else {
+            continue;
+        };
         if entry.removed_in.is_some() {
             out.skips.push(DocSkip {
                 id: format!("diagnostics/{}/", variable_name(entry)),
@@ -265,7 +281,15 @@ pub fn extract_messages(entries: &[MessageEntry], origin: &str) -> DocExtraction
         }
         let first_aux = examples.first().map(|s| s.aux.clone()).unwrap_or_default();
         for (i, snippet) in examples.iter().enumerate() {
-            push_snippet(&mut out, &mut seen_ids, &code, &format!("doc_{i}"), snippet, origin, entry);
+            push_snippet(
+                &mut out,
+                &mut seen_ids,
+                &code,
+                &format!("doc_{i}"),
+                snippet,
+                origin,
+                entry,
+            );
         }
         for (i, snippet) in fixes.iter().enumerate() {
             let mut owned = Snippet {
@@ -280,7 +304,15 @@ pub fn extract_messages(entries: &[MessageEntry], origin: &str) -> DocExtraction
                     owned.aux.push((uri.clone(), text.clone()));
                 }
             }
-            push_snippet(&mut out, &mut seen_ids, &code, &format!("fix_{i}"), &owned, origin, entry);
+            push_snippet(
+                &mut out,
+                &mut seen_ids,
+                &code,
+                &format!("fix_{i}"),
+                &owned,
+                origin,
+                entry,
+            );
         }
     }
     out
@@ -411,7 +443,10 @@ mod tests {
         // The raw `[!..!]` marker stays as the human-readable spec.
         assert_eq!(out.cases[0].files[0].1, "var [!x!] = 1;\n");
         assert_eq!(out.cases[1].id, "diagnostics/foo_bar/fix_0");
-        assert_eq!(out.cases[0].packages, vec!["meta", "ffi", "flutter", "angular_meta"]);
+        assert_eq!(
+            out.cases[0].packages,
+            vec!["meta", "ffi", "flutter", "angular_meta"]
+        );
     }
 
     #[test]
@@ -419,11 +454,19 @@ mod tests {
         let yaml = "E:\n  documentation: |-\n    #### Example\n\n    ```yaml\n    %uri=\"shared.yaml\"\n    x: 1\n    ```\n\n    ```dart\n    var [!x!] = 1;\n    ```\n\n    ```dart\n    %uri=\"package:p/p.dart\"\n    var p = 1;\n    ```\n\n    #### Common fixes\n\n    ```dart\n    var x = 1;\n    ```\n";
         let out = extract_messages_text(yaml, "m");
         // example 0 has aux shared.yaml; the dart example follows.
-        let example = out.cases.iter().find(|c| c.id.ends_with("doc_0")).expect("example");
+        let example = out
+            .cases
+            .iter()
+            .find(|c| c.id.ends_with("doc_0"))
+            .expect("example");
         assert_eq!(example.files.len(), 2);
         assert_eq!(example.files[1].0, "shared.yaml");
         // fix inherits the first example's aux files.
-        let fix = out.cases.iter().find(|c| c.id.ends_with("fix_0")).expect("fix");
+        let fix = out
+            .cases
+            .iter()
+            .find(|c| c.id.ends_with("fix_0"))
+            .expect("fix");
         assert!(fix.files.iter().any(|(p, _)| p == "shared.yaml"));
     }
 
@@ -441,7 +484,8 @@ mod tests {
 
     #[test]
     fn example_without_range_is_extracted_as_no_error() {
-        let yaml = "E:\n  documentation: |-\n    #### Example\n\n    ```dart\n    var x = 1;\n    ```\n";
+        let yaml =
+            "E:\n  documentation: |-\n    #### Example\n\n    ```dart\n    var x = 1;\n    ```\n";
         let out = extract_messages_text(yaml, "m");
         assert_eq!(out.cases.len(), 1);
         assert_eq!(out.cases[0].files[0].1, "var x = 1;\n");
@@ -453,6 +497,10 @@ mod tests {
         let out = extract_messages_text(yaml, "m");
         assert_ne!(out.cases[0].id, out.cases[1].id);
         assert!(out.cases[0].id.starts_with("diagnostics/foo_bar/"));
-        assert!(out.cases[1].id.starts_with("diagnostics/foo_bar/"), "{}", out.cases[1].id);
+        assert!(
+            out.cases[1].id.starts_with("diagnostics/foo_bar/"),
+            "{}",
+            out.cases[1].id
+        );
     }
 }

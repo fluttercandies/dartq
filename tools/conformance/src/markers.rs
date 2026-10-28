@@ -20,7 +20,9 @@
 /// A caret marker line: whitespace, `//`, whitespace, a `^` run, whitespace.
 pub fn is_caret_line(text: &str) -> bool {
     let rest = text.trim_start_matches([' ', '\t']);
-    let Some(rest) = rest.strip_prefix("//") else { return false };
+    let Some(rest) = rest.strip_prefix("//") else {
+        return false;
+    };
     let rest = rest.trim_start_matches([' ', '\t']);
     let Some(caret_end) = rest.find(|c| c != '^') else {
         return !rest.is_empty();
@@ -32,12 +34,19 @@ pub fn is_caret_line(text: &str) -> bool {
 /// `[diag.Name]` or `[context N]`.
 pub fn is_expectation_line(text: &str) -> bool {
     let rest = text.trim_start_matches([' ', '\t']);
-    let Some(rest) = rest.strip_prefix("//") else { return false };
+    let Some(rest) = rest.strip_prefix("//") else {
+        return false;
+    };
     let rest = rest.trim_start_matches([' ', '\t']);
-    let Some(rest) = rest.strip_prefix('[') else { return false };
+    let Some(rest) = rest.strip_prefix('[') else {
+        return false;
+    };
     if let Some(rest) = rest.strip_prefix("diag.") {
         let mut chars = rest.chars();
-        if !chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') {
+        if !chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        {
             return false;
         }
         let name_len = rest[1..]
@@ -47,7 +56,9 @@ pub fn is_expectation_line(text: &str) -> bool {
     }
     if let Some(rest) = rest.strip_prefix("context") {
         let digits = rest.trim_start_matches([' ', '\t']);
-        let num_len = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+        let num_len = digits
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(digits.len());
         if num_len == 0 {
             return false;
         }
@@ -77,14 +88,20 @@ pub fn parse_lines(content: &str) -> Vec<Line<'_>> {
                 if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
                     end += 1;
                 }
-                lines.push(Line { text: &content[start..i], terminator: &content[i..end] });
+                lines.push(Line {
+                    text: &content[start..i],
+                    terminator: &content[i..end],
+                });
                 start = end;
                 i = end;
             }
             _ => i += 1,
         }
     }
-    lines.push(Line { text: &content[start..], terminator: "" });
+    lines.push(Line {
+        text: &content[start..],
+        terminator: "",
+    });
     lines
 }
 
@@ -241,7 +258,10 @@ mod tests {
         // 2: no trailing terminator for a removed final line.
         assert_eq!(remove_expectations("a\n//  ^^^"), "a");
         // 3: caret line is the only line removed; \r\n preserved verbatim.
-        assert_eq!(remove_expectations("a\r\n//\t^\r\n// [diag.x] m\r\nb"), "a\r\nb");
+        assert_eq!(
+            remove_expectations("a\r\n//\t^\r\n// [diag.x] m\r\nb"),
+            "a\r\nb"
+        );
         // 4: expectation lines without preceding caret.
         assert_eq!(remove_expectations("a\n// [diag.fooBar] msg\nb"), "a\nb");
         // 5: context markers are also expectation lines.
@@ -311,10 +331,16 @@ mod tests {
 
     #[test]
     fn camel_snake_mapping() {
-        assert_eq!(camel_to_snake("abstractFieldInitializer"), "abstract_field_initializer");
+        assert_eq!(
+            camel_to_snake("abstractFieldInitializer"),
+            "abstract_field_initializer"
+        );
         assert_eq!(camel_to_snake("uriDoesNotExist"), "uri_does_not_exist");
         assert_eq!(camel_to_snake("x"), "x");
-        assert_eq!(snake_to_camel("abstract_field_initializer"), "abstractFieldInitializer");
+        assert_eq!(
+            snake_to_camel("abstract_field_initializer"),
+            "abstractFieldInitializer"
+        );
         assert_eq!(snake_to_camel("already_snake"), "alreadySnake");
         for name in ["abstractFieldInitializer", "uriDoesNotExist", "a"] {
             assert_eq!(snake_to_camel(&camel_to_snake(name)), name, "{name}");

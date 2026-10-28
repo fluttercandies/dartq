@@ -114,7 +114,10 @@ pub fn parse(text: &str) -> Vec<MessageEntry> {
             continue;
         }
         let key = line.trim_end_matches(':').trim_start().to_string();
-        let mut entry = MessageEntry { analyzer_code: key.clone(), ..Default::default() };
+        let mut entry = MessageEntry {
+            analyzer_code: key.clone(),
+            ..Default::default()
+        };
         i += 1;
         while i < lines.len() {
             let field = lines[i];

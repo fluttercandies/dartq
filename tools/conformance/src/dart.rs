@@ -40,14 +40,17 @@ pub fn parse_string_expression(src: &str, pos: &mut usize) -> Option<DartString>
             break;
         };
         cursor += part.consumed;
-        parts.push(LiteralPart { value: part.value, interpolated: part.interpolated });
+        parts.push(LiteralPart {
+            value: part.value,
+            interpolated: part.interpolated,
+        });
         // Adjacent literals may be separated only by whitespace/comments,
         // which the loop head skips; anything else ends the run.
         let rest = &src[cursor..];
         let after = cursor + skip_ws_and_comments(rest);
         let rest = &src[after..];
-        let raw = rest.starts_with('r')
-            && matches!(rest.as_bytes().get(1), Some(b'\'') | Some(b'"'));
+        let raw =
+            rest.starts_with('r') && matches!(rest.as_bytes().get(1), Some(b'\'') | Some(b'"'));
         if !raw && !rest.starts_with('\'') && !rest.starts_with('"') {
             break;
         }
@@ -58,7 +61,10 @@ pub fn parse_string_expression(src: &str, pos: &mut usize) -> Option<DartString>
     let interpolated = parts.iter().any(|p| p.interpolated);
     let value = parts.into_iter().map(|p| p.value).collect::<String>();
     *pos = cursor;
-    Some(DartString { value, interpolated })
+    Some(DartString {
+        value,
+        interpolated,
+    })
 }
 
 struct SingleString {
@@ -67,7 +73,22 @@ struct SingleString {
     consumed: usize,
 }
 
+/// Advances one full UTF-8 character from `pos`. Everything outside string
+/// literals and comments in Dart source is ASCII, so a multi-byte byte can
+/// only be met while scanning comments or fallback paths; stepping whole
+/// characters keeps every offset a char boundary.
+pub fn next_char(src: &str, pos: usize) -> usize {
+    let len = match src.as_bytes().get(pos) {
+        Some(0xC0..=0xDF) => 2,
+        Some(0xE0..=0xEF) => 3,
+        Some(0xF0..=0xF7) => 4,
+        _ => 1,
+    };
+    (pos + len).min(src.len())
+}
+
 /// Parses one string literal at the head of `src`.
+
 fn parse_single_string(src: &str) -> Option<SingleString> {
     let bytes = src.as_bytes();
     let mut i = 0usize;
@@ -94,7 +115,11 @@ fn parse_single_string(src: &str) -> Option<SingleString> {
             // A triple-quoted closer cannot share a prefix with a shorter
             // one; single-quote closer is unambiguous here.
             let consumed = i + closer.len();
-            return Some(SingleString { value, interpolated, consumed });
+            return Some(SingleString {
+                value,
+                interpolated,
+                consumed,
+            });
         }
         let b = *bytes.get(i)?;
         match b {
@@ -195,7 +220,7 @@ pub fn skip_ws_and_comments(src: &str) -> usize {
                         depth -= 1;
                         j += 2;
                     } else {
-                        j += 1;
+                        j = next_char(src, j);
                     }
                 }
                 i = j;
@@ -218,8 +243,8 @@ pub fn find_call(
     let bytes = src.as_bytes();
     while pos < src.len() {
         let rest = &src[pos..];
-        let raw_string = rest.starts_with('r')
-            && matches!(bytes.get(pos + 1), Some(b'\'') | Some(b'"'));
+        let raw_string =
+            rest.starts_with('r') && matches!(bytes.get(pos + 1), Some(b'\'') | Some(b'"'));
         if raw_string || rest.starts_with('\'') || rest.starts_with('"') {
             parse_single_string_at(src, &mut pos);
             continue;
@@ -239,7 +264,7 @@ pub fn find_call(
                     depth -= 1;
                     j += 2;
                 } else {
-                    j += 1;
+                    j = next_char(src, j);
                 }
             }
             pos = j;
@@ -263,7 +288,7 @@ pub fn find_call(
             pos = end;
             continue;
         }
-        pos += 1;
+        pos = next_char(src, pos);
     }
     None
 }
@@ -272,7 +297,7 @@ fn parse_single_string_at(src: &str, pos: &mut usize) {
     if let Some(s) = parse_single_string(&src[*pos..]) {
         *pos += s.consumed;
     } else {
-        *pos += 1;
+        *pos = next_char(src, *pos);
     }
 }
 
@@ -307,7 +332,7 @@ pub fn match_paren(src: &str, open: usize) -> Option<usize> {
                     depth2 -= 1;
                     j += 2;
                 } else {
-                    j += 1;
+                    j = next_char(src, j);
                 }
             }
             pos = j;
@@ -323,7 +348,7 @@ pub fn match_paren(src: &str, open: usize) -> Option<usize> {
             }
             _ => {}
         }
-        pos += 1;
+        pos = next_char(src, pos);
     }
     None
 }
@@ -353,7 +378,7 @@ pub fn split_args(body: &str) -> Vec<String> {
         if rest.starts_with("/*") {
             pos += 2;
             while pos < body.len() && !body[pos..].starts_with("*/") {
-                pos += 1;
+                pos = next_char(body, pos);
             }
             pos = (pos + 2).min(body.len());
             continue;
@@ -371,7 +396,7 @@ pub fn split_args(body: &str) -> Vec<String> {
             }
             _ => {}
         }
-        pos += 1;
+        pos = next_char(body, pos);
     }
     if start < body.len() {
         let last = body[start..].trim();
@@ -394,7 +419,8 @@ pub fn named_arg(arg: &str) -> Option<(String, &str)> {
         pos += arg[pos..].chars().next()?.len_utf8();
     }
     let rest = arg[pos..].trim_start();
-    rest.strip_prefix(':').map(|expr| (arg[..pos].to_string(), expr.trim_start()))
+    rest.strip_prefix(':')
+        .map(|expr| (arg[..pos].to_string(), expr.trim_start()))
 }
 
 /// One parsed call argument: its optional label and the expression text.
@@ -409,8 +435,14 @@ pub fn parse_args(body: &str) -> Vec<Arg> {
     split_args(body)
         .into_iter()
         .map(|text| match named_arg(&text) {
-            Some((label, expr)) => Arg { label: Some(label), expr: expr.to_string() },
-            None => Arg { label: None, expr: text },
+            Some((label, expr)) => Arg {
+                label: Some(label),
+                expr: expr.to_string(),
+            },
+            None => Arg {
+                label: None,
+                expr: text,
+            },
         })
         .collect()
 }
@@ -518,9 +550,14 @@ mod tests {
 
     #[test]
     fn split_args_respects_nesting() {
-        let args = split_args(r#"PackageConfigFileBuilder()..add(name: 'a', rootFolder: getFolder(x)), meta: true, r'''b(), c'''"#);
+        let args = split_args(
+            r#"PackageConfigFileBuilder()..add(name: 'a', rootFolder: getFolder(x)), meta: true, r'''b(), c'''"#,
+        );
         assert_eq!(args.len(), 3);
-        assert_eq!(args[0], "PackageConfigFileBuilder()..add(name: 'a', rootFolder: getFolder(x))");
+        assert_eq!(
+            args[0],
+            "PackageConfigFileBuilder()..add(name: 'a', rootFolder: getFolder(x))"
+        );
         assert_eq!(args[2], "r'''b(), c'''");
     }
 

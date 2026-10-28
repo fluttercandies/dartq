@@ -96,7 +96,11 @@ pub fn write(case: &Case) -> String {
         if norm.is_empty() {
             continue;
         }
-        for line in norm.strip_suffix('\n').expect("ends with newline").split('\n') {
+        for line in norm
+            .strip_suffix('\n')
+            .expect("ends with newline")
+            .split('\n')
+        {
             if line.is_empty() {
                 out.push_str("//+\n");
             } else {
@@ -124,11 +128,7 @@ pub fn read(text: &str) -> Result<Case, CaseError> {
             files.push((path, join_continuations(&lines)));
         }
     };
-    fn flush_options(
-        section: Section,
-        options: &mut Vec<String>,
-        target: &mut Option<String>,
-    ) {
+    fn flush_options(section: Section, options: &mut Vec<String>, target: &mut Option<String>) {
         if section == Section::Options {
             *target = Some(options.join("\n"));
             options.clear();
@@ -181,7 +181,11 @@ pub fn read(text: &str) -> Result<Case, CaseError> {
             match section {
                 Section::Options => options.push(String::new()),
                 Section::File => {
-                    current.as_mut().expect("continuation outside a section").1.push(String::new());
+                    current
+                        .as_mut()
+                        .expect("continuation outside a section")
+                        .1
+                        .push(String::new());
                 }
                 Section::Header => return err(no, "continuation outside a section"),
             }
@@ -189,7 +193,11 @@ pub fn read(text: &str) -> Result<Case, CaseError> {
             match section {
                 Section::Options => options.push(rest.to_string()),
                 Section::File => {
-                    current.as_mut().expect("continuation outside a section").1.push(rest.to_string());
+                    current
+                        .as_mut()
+                        .expect("continuation outside a section")
+                        .1
+                        .push(rest.to_string());
                 }
                 Section::Header => return err(no, "continuation outside a section"),
             }
@@ -232,10 +240,7 @@ fn err(no: usize, why: &str) -> Result<Case, CaseError> {
 
 #[allow(dead_code)] // format reader for the consuming lanes; exercised by tests
 fn truncate(s: &str) -> &str {
-    let end = s
-        .char_indices()
-        .nth(40)
-        .map_or(s.len(), |(i, _)| i);
+    let end = s.char_indices().nth(40).map_or(s.len(), |(i, _)| i);
     &s[..end]
 }
 
@@ -329,7 +334,10 @@ mod tests {
             files: vec![("lib/test.dart".into(), String::new())],
         };
         let text = write(&case);
-        assert!(text.trim_end().ends_with("//- file: lib/test.dart"), "{text}");
+        assert!(
+            text.trim_end().ends_with("//- file: lib/test.dart"),
+            "{text}"
+        );
         assert_eq!(read(&text).expect("parses"), case);
     }
 
