@@ -619,10 +619,13 @@ impl ParserListener for DiagnoseListener<'_> {
     fn begin_function_type(&mut self, _begin: Token) {
         let depth = std::mem::take(&mut self.engine.type_arg_depth);
         self.engine.type_arg_depth_saved.push(depth);
-        // Function-type shapes are outside the capture's model: poison the
-        // open windows (a function-type bound's leaves also fail the
-        // one-root claim — this is the belt to those braces).
-        self.engine.bounds.poison();
+        // The function form is a first-class capture fact: its columns
+        // open their own level in every open window (the shared sink
+        // folds them into a function tree), so a written
+        // `NativeFunction<Handle Function()>` argument survives to its
+        // consumers. The poison belt stays reserved for the shapes the
+        // model cannot represent (records, headless groups).
+        self.engine.bounds.begin_function();
         // The #612 capture models them: the frame routes its return, bounds
         // of its own type parameters, and formals by region.
         self.engine.var_begin_function_type();
@@ -752,6 +755,10 @@ impl ParserListener for DiagnoseListener<'_> {
         self.engine.var_formal_boundary();
         self.engine.equals_formal_boundary();
         self.engine.fn_capture_formals_begin();
+        // A list under a captured function level is the shape's own formal
+        // region (the return/formal split latches here; the sink guards
+        // itself to function levels).
+        self.engine.bounds.function_formals_begin();
         // The #1351 capture: the open typedef RHS's formals region opens —
         // the trees since the `Function` head become the return type (the
         // head event precedes the return parse).
@@ -8063,6 +8070,17 @@ impl ParserListener for DiagnoseListener<'_> {
         // An unnamed GFT formal's pending type claims at its own close (a
         // named formal's identifier event already claimed it — no-op).
         self.engine.fn_capture_formal_unnamed();
+        // A captured function level's formal: the name pairs with the type
+        // node that just landed (named formals trail the positional ones —
+        // the sink guards itself to function levels).
+        {
+            let named = matches!(
+                kind,
+                FormalParameterKind::RequiredNamed | FormalParameterKind::OptionalNamed
+            );
+            let formal_name = named.then(|| self.engine.name_of(name)).flatten();
+            self.engine.bounds.function_formal_end(named, formal_name);
+        }
         // The inferred-formal face (`_inferFormalParameters`'s flow half):
         // an implicitly typed formal of an open function literal binds its
         // context schema entry in `var_types` at the name event, but the
@@ -8475,6 +8493,17 @@ impl ParserListener for DiagnoseListener<'_> {
         if let Some(depth) = self.engine.type_arg_depth_saved.pop() {
             self.engine.type_arg_depth = depth;
         }
+        // The window level seals into its function node (the mirror of
+        // `begin_function_type`'s routing; the range spans the keyword
+        // through the written `?`, the same extent the collector arms).
+        let range = SourceRange {
+            offset: function.range.offset,
+            length: question
+                .map_or(function.range, |q| q.range)
+                .end()
+                - function.range.offset,
+        };
+        self.engine.bounds.end_function(question.is_some(), range);
         self.flow().end_function_type(function, question);
         self.engine.var_end_function_type(question.is_some());
         self.engine.fn_capture_end(question.is_some());

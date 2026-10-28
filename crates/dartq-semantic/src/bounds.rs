@@ -711,6 +711,60 @@ impl<'a> Bounds<'a> {
         Some(site.done)
     }
 
+    /// A function type opened inside an open capture window: the shape's
+    /// columns open their own level, so the completed node folds into a
+    /// first-class function tree (`Handle Function()` survives as a
+    /// capture fact) instead of poisoning the window. Only an already
+    /// open window routes — a bare function annotation outside the
+    /// capture windows opens no site here, matching [`Self::leaf`].
+    pub(crate) fn begin_function(&mut self) {
+        if let Some((_, header)) = self.header.as_mut() {
+            header.sink.begin_function();
+        } else if let Some(sink) = self.bound_sink.as_mut() {
+            sink.begin_function();
+        } else if let Some(site) = self.site.as_mut() {
+            site.begin_function();
+        }
+    }
+
+    /// A function type closed: the level seals into its function node in
+    /// the same window [`Self::begin_function`] opened it (the cascade is
+    /// static, and the parser pairs the two events).
+    pub(crate) fn end_function(&mut self, nullable: bool, end: SourceRange) {
+        if let Some((_, header)) = self.header.as_mut() {
+            header.sink.end_function(nullable, end);
+        } else if let Some(sink) = self.bound_sink.as_mut() {
+            sink.end_function(nullable, end);
+        } else if let Some(site) = self.site.as_mut() {
+            site.end_function(nullable, end);
+        }
+    }
+
+    /// A formal list opened under a captured function level: everything
+    /// before it is the written return type. A no-op unless the open
+    /// window's top level is a function level (the sink guards itself).
+    pub(crate) fn function_formals_begin(&mut self) {
+        if let Some((_, header)) = self.header.as_mut() {
+            header.sink.function_formals_begin();
+        } else if let Some(sink) = self.bound_sink.as_mut() {
+            sink.function_formals_begin();
+        } else if let Some(site) = self.site.as_mut() {
+            site.function_formals_begin();
+        }
+    }
+
+    /// One function-level formal closed: its name pairs with the type
+    /// node that just landed (the sink guards itself).
+    pub(crate) fn function_formal_end(&mut self, named: bool, name: Option<StringId>) {
+        if let Some((_, header)) = self.header.as_mut() {
+            header.sink.function_formal_end(named, name);
+        } else if let Some(sink) = self.bound_sink.as_mut() {
+            sink.function_formal_end(named, name);
+        } else if let Some(site) = self.site.as_mut() {
+            site.function_formal_end(named, name);
+        }
+    }
+
     /// An unmodelable shape inside any open capture.
     pub(crate) fn poison(&mut self) {
         if let Some((_, header)) = self.header.as_mut() {
@@ -1477,6 +1531,13 @@ impl MapCtx<'_, '_> {
         scope: &FxHashMap<StringId, TypeParamId>,
     ) -> Option<TypeId> {
         if tree.poisoned {
+            return None;
+        }
+        // A record/function-form node has no registry head (its `head`
+        // slot is the `StringId::NONE` sentinel): the boundedness
+        // snapshot cannot map it — the same refusal the clause trees
+        // apply (`clause_tree_ty`), the under-report direction.
+        if tree.record.is_some() || tree.function.is_some() {
             return None;
         }
         let text = self.strings.resolve(tree.head);

@@ -205,8 +205,8 @@ impl ParserListener for CaptureListener<'_, '_> {
         };
         // The routing mirrors `crate::bounds`: an open container header
         // wins (a nested function type's own `<T>` group inside a clause
-        // completes its bound leaves into the header sink — they land as
-        // unclaimed roots and mark the capture `open`); otherwise the
+        // completes its bound leaves into that function's own level —
+        // they fold into the one function node); otherwise the
         // type-variables window's bound sink takes them (a container's own
         // `<T extends num>` parses before its header opens).
         if let Some((_, header)) = self.header.as_mut() {
@@ -251,14 +251,36 @@ impl ParserListener for CaptureListener<'_, '_> {
     }
 
     fn begin_function_type(&mut self, _begin: Token) {
-        // Function-type shapes are outside the clause/bound model: poison
-        // every open window (the same belt `crate::bounds` keeps — a
-        // function-typed bound fails its one-root claim anyway).
+        // The function form is a first-class capture fact here too: its
+        // columns open their own level in the open window, so a
+        // function-shaped clause argument (`extends S<void Function()>`)
+        // or a function-shaped bound captures as one faithful root
+        // instead of poisoning the window. The poison belt stays for the
+        // shapes the model cannot represent (record types, headless
+        // groups); a function-form tree a consumer cannot map still
+        // degrades there (the fold sites refuse it), the same
+        // under-report direction the poison produced.
         if let Some((_, header)) = self.header.as_mut() {
-            header.sink.poison();
+            header.sink.begin_function();
         }
         if let Some(sink) = self.bound_sink.as_mut() {
-            sink.poison();
+            sink.begin_function();
+        }
+    }
+
+    fn end_function_type(&mut self, function: Token, question: Option<Token>) {
+        let range = SourceRange {
+            offset: function.range.offset,
+            length: question
+                .map_or(function.range, |q| q.range)
+                .end()
+                - function.range.offset,
+        };
+        if let Some((_, header)) = self.header.as_mut() {
+            header.sink.end_function(question.is_some(), range);
+        }
+        if let Some(sink) = self.bound_sink.as_mut() {
+            sink.end_function(question.is_some(), range);
         }
     }
 

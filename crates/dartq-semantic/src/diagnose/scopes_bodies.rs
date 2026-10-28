@@ -2635,8 +2635,33 @@ impl<'a> Engine<'a> {
     /// and the subtree interns bottom-up into the boundary pool (#611) so
     /// nested written arguments compare structurally. A poisoned subtree
     /// keeps the name-only shape — its deeper structure is recovery
-    /// residue, never a written fact.
+    /// residue, never a written fact. A function-form node folds through
+    /// its own arm into the interned [`Ty::Function`] (the collector's
+    /// annotation arm applies the same discipline); a poisoned one
+    /// suppresses to [`Ty::Unknown`], never a fabricated shape.
     pub(crate) fn tree_ty(&self, tree: &crate::capture::TypeTree) -> Ty {
+        if let Some(fn_tree) = tree.function.as_ref() {
+            if tree.poisoned {
+                return Ty::Unknown;
+            }
+            let ret = fn_tree
+                .ret
+                .as_deref()
+                .map_or(Ty::Dynamic, |ret| self.tree_ty(ret));
+            let positional: Vec<Ty> = fn_tree.positional.iter().map(|f| self.tree_ty(f)).collect();
+            let named: Vec<(StringId, Ty)> = fn_tree
+                .named
+                .iter()
+                .map(|(name, f)| (*name, self.tree_ty(f)))
+                .collect();
+            return self.boundary.args.borrow_mut().function(
+                fn_tree.type_params,
+                ret,
+                &positional,
+                &named,
+                tree.nullable,
+            );
+        }
         match self.strings.resolve(tree.head) {
             "dynamic" => return Ty::Dynamic,
             "void" => return Ty::Void,

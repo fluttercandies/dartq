@@ -2617,9 +2617,14 @@ impl<'a> Engine<'a> {
 
     /// The written function-type face of a type argument: `Some((ret,
     /// param_heads))` when the type resolves (aliases fold) to a function
-    /// shape; `None` for every other type.
+    /// shape; `None` for every other type. A first-class function form
+    /// (`NativeFunction<R Function(...)>`'s captured argument) reads
+    /// directly; a named head keeps the alias-expansion face.
     fn ffi_function_shape(&self, ty: Ty) -> Option<(StringId, Vec<StringId>)> {
-        let expanded = self.ffi_expanded_head(ty).map(|(_, expanded)| expanded)?;
+        let expanded = match ty {
+            Ty::Function { .. } => ty,
+            _ => self.ffi_expanded_head(ty).map(|(_, expanded)| expanded)?,
+        };
         match expanded {
             Ty::Function { shape, .. } => {
                 let fn_shape = {

@@ -350,7 +350,6 @@ fn invalid_field_type_in_struct() {
     assert_row(&report(f), "invalid_field_type_in_struct", at(f, 4, 12), 6);
 }
 
-#[ignore = "leaf pair: function-form capture model — follow-up ticket"]
 #[test]
 fn leaf_call_must_not_return_handle() {
     let f = "\nvoid f(Pointer<NativeFunction<Handle Function()>> p) {\n\
@@ -363,7 +362,6 @@ fn leaf_call_must_not_return_handle() {
     );
 }
 
-#[ignore = "leaf pair: function-form capture model — follow-up ticket"]
 #[test]
 fn leaf_call_must_not_take_handle() {
     let f = "\nvoid f(Pointer<NativeFunction<Void Function(Handle)>> p) {\n\
