@@ -72,9 +72,12 @@ enum Command {
         /// The pinned SDK source root.
         #[arg(long)]
         sdk_src: PathBuf,
-        /// Output directory for the `.case` tree.
-        #[arg(long, default_value = CASES)]
-        out: PathBuf,
+        /// Output directory for the `.case` tree. Required for a write run;
+        /// a bare run without `--out` or `--check` is refused (it once
+        /// wiped the default corpus by accident). With `--check` alone the
+        /// default corpus location is verified.
+        #[arg(long)]
+        out: Option<PathBuf>,
         /// The manifest file to write (or compare with `--check`).
         #[arg(long, default_value = "conformance/cases.manifest")]
         manifest: PathBuf,
@@ -92,8 +95,10 @@ enum Command {
         #[arg(long)]
         sdk_src: PathBuf,
         /// Output directory (the tracked `conformance/mocks/` tree).
-        #[arg(long, default_value = MOCKS)]
-        out: PathBuf,
+        /// Required for a write run; a bare run without `--out` or
+        /// `--check` is refused for the same reason as `extract`.
+        #[arg(long)]
+        out: Option<PathBuf>,
         /// Compare instead of write.
         #[arg(long)]
         check: bool,
@@ -169,12 +174,12 @@ fn main() {
             manifest,
             co19,
             check,
-        } => extract_command(&sdk_src, &out, &manifest, co19.as_deref(), check),
+        } => extract_command(&sdk_src, out.as_deref(), &manifest, co19.as_deref(), check),
         Command::Mocks {
             sdk_src,
             out,
             check,
-        } => mocks_command(&sdk_src, &out, check),
+        } => mocks_command(&sdk_src, out.as_deref(), check),
         Command::Oracle {
             oracle_sdk,
             filter,
@@ -295,12 +300,20 @@ const LINTER_PKG: &str = "pkg/linter";
 
 fn extract_command(
     sdk_src: &Path,
-    out: &Path,
+    out: Option<&Path>,
     manifest_path: &Path,
     co19: Option<&Path>,
     check: bool,
 ) -> i32 {
     let started = std::time::Instant::now();
+    let Some(out) = resolve_write_target("extract", out, CASES, check) else {
+        return 2;
+    };
+    if let Some(dir) = co19 {
+        for warning in co19_pin_warnings(dir, Path::new(PIN)) {
+            eprintln!("warn: {warning}");
+        }
+    }
     let analyzer_messages = sdk_src.join(format!("{ANALYZER_PKG}/messages.yaml"));
     let shared_messages = sdk_src.join("pkg/_fe_analyzer_shared/messages.yaml");
     let test_root = sdk_src.join(TEST_ROOT_REL);
@@ -717,7 +730,10 @@ fn fmt_counts(counts: &std::collections::BTreeMap<String, usize>) -> String {
         .join(", ")
 }
 
-fn mocks_command(sdk_src: &Path, out: &Path, check: bool) -> i32 {
+fn mocks_command(sdk_src: &Path, out: Option<&Path>, check: bool) -> i32 {
+    let Some(out) = resolve_write_target("mocks", out, MOCKS, check) else {
+        return 2;
+    };
     let mock_root = sdk_src.join("pkg/analyzer_testing/lib/src/mock_packages");
     let context =
         sdk_src.join("pkg/analyzer/test/src/dart/resolution/context_collection_resolution.dart");
@@ -816,5 +832,267 @@ fn prune_dir(dir: &Path, root: &Path, keep: &[mocks::MockFile]) {
                 let _ = std::fs::remove_file(&path);
             }
         }
+    }
+}
+
+/// Resolves the write-vs-check mode. `--out` is the explicit write target
+/// and `--check` verifies an existing tree (defaulting to `default`)
+/// without writing; a bare run with neither is refused instead of writing
+/// into the default location, which once wiped a derived corpus by
+/// accident. `None` means the refusal message was printed.
+fn resolve_write_target<'a>(
+    command: &str,
+    out: Option<&'a Path>,
+    default: &'a str,
+    check: bool,
+) -> Option<&'a Path> {
+    match (out, check) {
+        (Some(out), _) => Some(out),
+        (None, true) => Some(Path::new(default)),
+        (None, false) => {
+            eprintln!(
+                "error: `{command}` without --out or --check would write by default; \
+                 that default is refused\n\
+                 modes: write a fresh tree with `--out <dir>` (the tree is cleared first)\n       \
+                 verify without writing with `--check` (verifies `{default}`)\n       \
+                 verify a specific tree with `--check --out <dir>`"
+            );
+            None
+        }
+    }
+}
+
+/// Reads one flat `key = "value"` entry from the pin file; the pin is a
+/// flat string map, so this avoids a TOML dependency.
+fn pin_value(pin_path: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(pin_path).ok()?;
+    text.lines().map(str::trim).find_map(|line| {
+        let rest = line.strip_prefix(key)?.trim_start().strip_prefix('=')?;
+        Some(rest.trim().trim_matches('"').to_string())
+    })
+}
+
+/// The HEAD commit of a plain git clone, read from `.git` directly (no
+/// subprocess): a detached SHA in `HEAD`, or `ref: <name>` resolved via the
+/// loose ref file and then `packed-refs`. `None` when `.git` is not a
+/// directory (e.g. a worktree pointer) or the layout is unrecognized.
+fn read_git_head(dir: &Path) -> Option<String> {
+    let git = dir.join(".git");
+    let head = std::fs::read_to_string(git.join("HEAD")).ok()?;
+    let head = head.trim();
+    if let Some(rev) = head.strip_prefix("ref:") {
+        let rev = rev.trim();
+        if let Ok(sha) = std::fs::read_to_string(git.join(rev)) {
+            return Some(sha.trim().to_string());
+        }
+        let packed = std::fs::read_to_string(git.join("packed-refs")).ok()?;
+        packed.lines().find_map(|line| {
+            let (sha, r) = line.trim().split_once(' ')?;
+            (r.trim() == rev).then(|| sha.trim().to_string())
+        })
+    } else {
+        Some(head.to_string())
+    }
+}
+
+/// The co19 pin diagnostics for a `--co19` checkout: a missing pin entry, a
+/// revision mismatch, or an unreadable checkout revision. Empty means the
+/// checkout agrees with the pin. Mismatches warn but never block, since
+/// local checkouts may legitimately be dirty or newer.
+fn co19_pin_warnings(co19: &Path, pin_path: &Path) -> Vec<String> {
+    let Some(pinned) = pin_value(pin_path, "co19_revision") else {
+        return vec![format!(
+            "{} has no co19_revision; the co19 corpus revision is unpinned",
+            pin_path.display()
+        )];
+    };
+    match read_git_head(co19) {
+        Some(rev) if rev == pinned => Vec::new(),
+        Some(rev) => vec![format!(
+            "co19 checkout {} is at {rev} but the pin is {pinned}; \
+             the extracted co19 cases may not match the pinned corpus",
+            co19.display()
+        )],
+        None => vec![format!(
+            "cannot determine the revision of co19 checkout {} (pin {pinned}); \
+             the extracted co19 cases may not match the pinned corpus",
+            co19.display()
+        )],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fake co19 checkout whose HEAD resolves to `sha` via a loose ref.
+    fn fake_checkout(dir: &Path, sha: &str) {
+        let git = dir.join(".git");
+        std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/master\n").unwrap();
+        std::fs::write(git.join("refs/heads/master"), format!("{sha}\n")).unwrap();
+    }
+
+    #[test]
+    fn read_git_head_resolves_detached_loose_and_packed() {
+        let dir = std::env::temp_dir().join("dartq-conf-head-detached");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "8c17c2fa3d018098494422557d195ad396a0daf8\n")
+            .unwrap();
+        assert_eq!(
+            read_git_head(&dir).as_deref(),
+            Some("8c17c2fa3d018098494422557d195ad396a0daf8")
+        );
+
+        let dir = std::env::temp_dir().join("dartq-conf-head-loose");
+        fake_checkout(&dir, "a83e218200000000000000000000000000000001");
+        assert_eq!(
+            read_git_head(&dir).as_deref(),
+            Some("a83e218200000000000000000000000000000001")
+        );
+
+        let dir = std::env::temp_dir().join("dartq-conf-head-packed");
+        std::fs::create_dir_all(dir.join(".git/refs/heads")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/master\n").unwrap();
+        std::fs::write(
+            dir.join(".git/packed-refs"),
+            "# pack-refs\n\
+             0000000000000000000000000000000000000009 refs/heads/main\n\
+             a83e218200000000000000000000000000000002 refs/heads/master\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_git_head(&dir).as_deref(),
+            Some("a83e218200000000000000000000000000000002")
+        );
+
+        // Not a git checkout at all.
+        let dir = std::env::temp_dir().join("dartq-conf-head-none");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(read_git_head(&dir), None);
+    }
+
+    /// A bare `extract` (no `--out`, no `--check`) must fail fast with the
+    /// tutorial exit code and leave the default case tree and the manifest
+    /// untouched — the #2763 corpus-wipe footgun, pinned.
+    #[test]
+    fn extract_without_out_or_check_refuses_and_writes_nothing() {
+        let work = std::env::temp_dir().join("dartq-conf-refuse");
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(work.join("sdk/pkg/analyzer")).unwrap();
+        std::fs::create_dir_all(work.join("sdk/pkg/_fe_analyzer_shared")).unwrap();
+        std::fs::create_dir_all(work.join("sdk/pkg/analyzer/test")).unwrap();
+        std::fs::create_dir_all(work.join("sdk/pkg/linter/test/rules")).unwrap();
+        std::fs::create_dir_all(work.join("sdk/tests/language")).unwrap();
+        std::fs::create_dir_all(work.join("sdk/pkg/front_end/parser_testcases")).unwrap();
+        for yaml in [
+            "sdk/pkg/analyzer/messages.yaml",
+            "sdk/pkg/_fe_analyzer_shared/messages.yaml",
+            "sdk/pkg/linter/messages.yaml",
+        ] {
+            std::fs::write(work.join(yaml), "").unwrap();
+        }
+
+        // A sentinel in the default case tree must survive untouched, and
+        // no manifest may appear in the (temp) manifest location.
+        let cases = PathBuf::from(CASES);
+        std::fs::create_dir_all(&cases).unwrap();
+        std::fs::write(cases.join("sentinel.case"), "untouched").unwrap();
+        let before = dir_listing(&cases);
+
+        let code = extract_command(
+            &work.join("sdk"),
+            None,
+            &work.join("cases.manifest"),
+            None,
+            false,
+        );
+
+        assert_eq!(code, 2, "bare extract must be refused with exit 2");
+        assert_eq!(dir_listing(&cases), before, "case tree must be untouched");
+        assert!(
+            !work.join("cases.manifest").exists(),
+            "no manifest may be written by a refused run"
+        );
+        let _ = std::fs::remove_file(cases.join("sentinel.case"));
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    fn dir_listing(dir: &Path) -> Vec<String> {
+        let mut paths = Vec::new();
+        fn walk(dir: &Path, root: &Path, paths: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, paths);
+                } else {
+                    paths.push(
+                        path.strip_prefix(root)
+                            .expect("under root")
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+        walk(dir, dir, &mut paths);
+        paths.sort();
+        paths
+    }
+
+    #[test]
+    fn co19_pin_warns_on_fake_revision_mismatch() {
+        let work = std::env::temp_dir().join("dartq-conf-co19pin");
+        let _ = std::fs::remove_dir_all(&work);
+        let checkout = work.join("co19");
+        fake_checkout(&checkout, "8c17c2fa3d018098494422557d195ad396a0daf8");
+        let pin = work.join("pin.toml");
+        std::fs::write(&pin, "sdk_version = \"3.13.7\"\nco19_revision = \"a83e2182\"\n").unwrap();
+
+        let warnings = co19_pin_warnings(&checkout, &pin);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("8c17c2fa3d018098494422557d195ad396a0daf8")
+                && warnings[0].contains("a83e2182"),
+            "mismatch warning must carry both revisions: {warnings:?}"
+        );
+
+        // A matching checkout produces no warning.
+        fake_checkout(&checkout, "a83e2182");
+        assert!(co19_pin_warnings(&checkout, &pin).is_empty());
+
+        // An unreadable checkout warns too.
+        let bare = work.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let warnings = co19_pin_warnings(&bare, &pin);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("cannot determine"));
+
+        // A pin without the co19 entry warns that the pin is incomplete.
+        let pin = work.join("pin-no-co19.toml");
+        std::fs::write(&pin, "sdk_version = \"3.13.7\"\n").unwrap();
+        let warnings = co19_pin_warnings(&checkout, &pin);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("no co19_revision"));
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn pin_value_reads_flat_entries() {
+        let work = std::env::temp_dir().join("dartq-conf-pinvalue");
+        std::fs::create_dir_all(&work).unwrap();
+        let pin = work.join("pin.toml");
+        std::fs::write(
+            &pin,
+            "# comment\nsdk_version = \"3.13.7\"\nsdk_revision = \"416e\"\n",
+        )
+        .unwrap();
+        assert_eq!(pin_value(&pin, "sdk_version").as_deref(), Some("3.13.7"));
+        assert_eq!(pin_value(&pin, "sdk_revision").as_deref(), Some("416e"));
+        assert_eq!(pin_value(&pin, "co19_revision"), None);
+        let _ = std::fs::remove_dir_all(&work);
     }
 }

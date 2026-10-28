@@ -6,3 +6,4 @@
 # the DARTQ_SDK_SRC environment variable (see tools/upstream-gen).
 sdk_version = "3.13.7"
 sdk_revision = "416e33b0ffaef062a60ec966bb8c82ed2b83f128"
+co19_revision = "a83e2182"
