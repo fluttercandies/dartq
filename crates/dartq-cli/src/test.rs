@@ -1533,6 +1533,7 @@ fn run_grouped(
     let mut settled: FxHashSet<usize> = FxHashSet::default();
     let mut recorded: Vec<(PathBuf, u64)> = Vec::new();
     let mut peak = 0u64;
+    let mut tester_peak = 0u64;
     let mut failure: Option<io::Error> = None;
     std::thread::scope(|scope| {
         let handles: Vec<_> = parts
@@ -1577,12 +1578,13 @@ fn run_grouped(
         for (shard, handle) in handles.into_iter().enumerate() {
             if let Ok(Ok(execution)) = handle.join() {
                 peak += execution.peak_rss;
+                tester_peak = tester_peak.max(execution.peak_tester_rss);
                 finished[shard] = execution.complete;
             }
         }
     });
     drop(lease);
-    profile.observe("grouped", peak, workers, parts.len());
+    profile.observe("grouped", peak, tester_peak, workers, parts.len());
     durations.record(root, &recorded);
     if let Some(error) = failure {
         return Err(error);

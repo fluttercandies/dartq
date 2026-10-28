@@ -109,8 +109,8 @@ pub fn capacity_units() -> usize {
 
 /// The memory profile of one kind of run: what a runner invocation holds
 /// before its first suite, and what each concurrent suite adds, in
-/// [`UNIT`]s. Seeded from measurements and refined from the peak resident
-/// size of real runs ([`Profile::observe`]).
+/// [`UNIT`]s. Seeded from measurements and refined from real runs'
+/// heaviest worker process ([`Profile::observe`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Profile {
     pub base: usize,
@@ -147,11 +147,13 @@ impl Profile {
 
     /// `self` with the per-worker share raised to any larger value recorded
     /// for `kind` by earlier runs on this host ([`Self::observe`]); the
-    /// built-in seed is the floor. A record folds one run's whole-tree peak
-    /// across every worker, so it measures the average worker at one
-    /// instant — below the seed it is under-measurement, not a lighter
-    /// host, and booking under the seed would break the lease's bound where
-    /// booking over it only costs parallelism.
+    /// built-in seed is the floor. A record folds the peak of the single
+    /// heaviest worker process a run spawned (or, where a run's workers
+    /// share one process, the tree peak spread across them) — a bound on
+    /// one worker, not the tree. Below the seed a record is
+    /// under-measurement, not a lighter host: booking under the seed would
+    /// break the lease's bound where booking over it only costs
+    /// parallelism.
     #[must_use]
     pub fn calibrated(self, kind: &str) -> Self {
         let recorded = cache_dir()
@@ -169,30 +171,53 @@ impl Profile {
         }
     }
 
-    /// Fold one run's measured peak (`peak` bytes resident across the run's
-    /// `processes` process trees, with `workers` concurrent suites leased
-    /// under `self`) into the per-worker share recorded for `kind`:
-    /// re-derived from the peak above every process's base, rounded up, and
-    /// moved halfway from the current share toward it, so one quiet run
-    /// cannot undersize the next while a heavy package's real footprint is
-    /// learned within a few runs.
-    pub fn observe(self, kind: &str, peak: u64, workers: usize, processes: usize) {
+    /// Fold one run's measurement into the per-worker share recorded for
+    /// `kind`. A run's workers are its concurrent suites; their honest
+    /// bound is the peak of the heaviest worker process the run spawned
+    /// (`tester_peak`, sampled alongside the tree peak — a tester's own
+    /// maximum, undiluted by the rest of the tree). Where workers share
+    /// one process (`dart test` grouped shards: isolates, not processes)
+    /// no tester exists and the measurement falls back to the trees' peak
+    /// above every process's base, spread across the workers. Nothing is
+    /// recorded when neither was sampled.
+    pub fn observe(self, kind: &str, peak: u64, tester_peak: u64, workers: usize, processes: usize) {
         let Some(dir) = cache_dir() else {
             return;
         };
-        if peak == 0 {
+        let Some(measured) = self.measurement(peak, tester_peak, workers, processes) else {
             return;
-        }
-        let units = usize::try_from(peak.div_ceil(UNIT)).unwrap_or(usize::MAX);
-        let measured = units
-            .saturating_sub(self.base * processes.max(1))
-            .div_ceil(workers.max(1))
-            .max(1);
-        let next = (self.per_worker + measured).div_ceil(2).max(1);
+        };
+        let next = self.absorb(measured).per_worker;
         let _ = crate::stamp::write_atomic(
             &dir.join("test").join(format!("profile-{kind}")),
             format!("{next}\n").as_bytes(),
         );
+    }
+
+    /// One run's per-worker measurement in [`UNIT`]s, `None` when the run
+    /// sampled nothing ([`Self::observe`]'s no-op).
+    #[must_use]
+    fn measurement(self, peak: u64, tester_peak: u64, workers: usize, processes: usize) -> Option<usize> {
+        if tester_peak > 0 {
+            return Some(usize::try_from(tester_peak.div_ceil(UNIT)).unwrap_or(usize::MAX).max(1));
+        }
+        if peak == 0 {
+            return None;
+        }
+        let units = usize::try_from(peak.div_ceil(UNIT)).unwrap_or(usize::MAX);
+        Some(units.saturating_sub(self.base * processes.max(1)).div_ceil(workers.max(1)).max(1))
+    }
+
+    /// The run fold: a measurement above the current share books in full —
+    /// one heavy run converges the record — while a lighter one moves the
+    /// share only halfway down, so one quiet run cannot undersize the
+    /// next. The booking floor stays the built-in seed ([`Self::refine`]).
+    #[must_use]
+    fn absorb(self, measured: usize) -> Self {
+        Self {
+            per_worker: measured.max((self.per_worker + measured).div_ceil(2)).max(1),
+            ..self
+        }
     }
 }
 
@@ -559,8 +584,8 @@ mod tests {
     }
 
     /// A recorded per-worker share refines the booking above its built-in
-    /// seed, never below it: the record is a tree-wide average, the seed
-    /// the heaviest measured worker.
+    /// seed, never below it: a record is the heaviest worker process a run
+    /// measured, the seed the heaviest measured worker at seeding time.
     #[test]
     fn calibration_refines_upward_only() {
         let grouped = Profile::FLUTTER_GROUPED;
@@ -572,5 +597,43 @@ mod tests {
         assert_eq!(Profile::STOCK.refine(Some(1)).per_worker, Profile::STOCK.per_worker);
         assert_eq!(Profile::FLUTTER.refine(Some(3)).per_worker, 3);
         assert_eq!(Profile::GROUPED.refine(Some(1)).per_worker, Profile::GROUPED.per_worker);
+    }
+
+    /// The run fold converges in one run: a run whose heaviest worker
+    /// process is N units records N, not the halfway average, while a
+    /// lighter run only decays the share halfway (one quiet run cannot
+    /// undersize the next).
+    #[test]
+    fn worker_peak_converges_in_one_run() {
+        let grouped = Profile::FLUTTER_GROUPED;
+        // 3 units of heaviest tester over the 2-unit seed: 4 recorded,
+        // where the round-2 half-life fold would have written 3.
+        assert_eq!(grouped.absorb(4).per_worker, 4);
+        // Decay from above stays halfway: 5 recorded, a 2-unit run moves
+        // the share to 4, not to 2.
+        let heavy = Profile { per_worker: 5, ..grouped };
+        assert_eq!(heavy.absorb(2).per_worker, 4);
+        // A measurement at the seed holds it.
+        assert_eq!(grouped.absorb(2).per_worker, grouped.per_worker);
+    }
+
+    /// The measurement is the heaviest tester's own peak where the run
+    /// spawned testers, and the trees' peak above every base spread across
+    /// the workers where it did not (grouped `dart test`: workers are
+    /// isolates); nothing sampled, nothing measured.
+    #[test]
+    fn measurement_prefers_the_worker_process() {
+        let grouped = Profile::FLUTTER_GROUPED;
+        let unit = UNIT;
+        // One heavy tester (2 units) among four workers: recorded as 2,
+        // where the tree average would dilute it below the seed.
+        assert_eq!(grouped.measurement(6 * unit, 3 * unit / 2 + 1, 4, 1), Some(2));
+        // No testers (dart isolates): the round-2 tree division.
+        assert_eq!(grouped.measurement(6 * unit, 0, 4, 1), Some(1));
+        // Seven workers over two shard processes, twelve units of tree:
+        // twelve above the two bases, spread across seven, rounds to 2.
+        assert_eq!(Profile::GROUPED.measurement(12 * unit, 0, 7, 2), Some(2));
+        // Nothing sampled.
+        assert_eq!(grouped.measurement(0, 0, 4, 1), None);
     }
 }

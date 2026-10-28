@@ -645,7 +645,8 @@ fn run_shards(
     });
     drop(lease);
     let peak: u64 = results.iter().flatten().flatten().map(|execution| execution.peak_rss).sum();
-    profile.observe("flutter", peak, workers, parts.len());
+    let tester: u64 = results.iter().flatten().flatten().map(|execution| execution.peak_tester_rss).max().unwrap_or(0);
+    profile.observe("flutter", peak, tester, workers, parts.len());
     durations.record(root, &recorded);
     if let Some(error) = failure {
         return Err(error);
@@ -873,7 +874,13 @@ fn grouped_pass(
         return Err(error);
     }
     if let Some(Ok(outcome)) = &outcome {
-        profile.observe("flutter-grouped", outcome.execution.peak_rss, workers, 1);
+        profile.observe(
+            "flutter-grouped",
+            outcome.execution.peak_rss,
+            outcome.execution.peak_tester_rss,
+            workers,
+            1,
+        );
     }
     dartq_test::group::Durations::load(root).record(root, &recorded);
     stock.extend(hosted_index.iter().copied().filter(|index| !settled.contains(index)));

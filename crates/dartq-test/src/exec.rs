@@ -98,6 +98,11 @@ pub struct Execution {
     /// Peak resident size of the runner's whole process tree (its process
     /// group), sampled once a second; `0` where it cannot be read.
     pub peak_rss: u64,
+    /// Peak resident size of the heaviest single tester process
+    /// (`flutter_tester`) in the tree across the run, from the same
+    /// samples as [`Self::peak_rss`]; `0` when the run spawned no tester
+    /// (a `dart test` run's workers are isolates) or it cannot be read.
+    pub peak_tester_rss: u64,
     /// The reporter's own events, grouped per suite in emission order.
     pub blocks: Vec<SuiteBlock>,
     /// Events that belong to no suite (a runner-level `error`), and test
@@ -220,6 +225,7 @@ fn batched(
                 all.complete &= next.complete;
                 all.suites.extend(next.suites);
                 all.peak_rss = all.peak_rss.max(next.peak_rss);
+                all.peak_tester_rss = all.peak_tester_rss.max(next.peak_tester_rss);
                 all.blocks.extend(next.blocks);
                 all.loose.extend(next.loose);
                 all.stderr.push_str(&next.stderr);
@@ -263,6 +269,7 @@ fn run_command(mut cmd: Command, cfg: &ExecConfig) -> Result<Execution, ExecErro
         text
     });
     let mut peak_rss = 0u64;
+    let mut peak_tester_rss = 0u64;
     let mut sampled = Instant::now() - RSS_SAMPLE;
     loop {
         if child.try_wait().map_err(ExecError::Wait)?.is_some() {
@@ -270,7 +277,9 @@ fn run_command(mut cmd: Command, cfg: &ExecConfig) -> Result<Execution, ExecErro
         }
         if sampled.elapsed() >= RSS_SAMPLE {
             sampled = Instant::now();
-            peak_rss = peak_rss.max(group_rss(child.id()));
+            let (tree, tester) = group_rss(child.id());
+            peak_rss = peak_rss.max(tree);
+            peak_tester_rss = peak_tester_rss.max(tester);
         }
         let idle_since = spawned + Duration::from_millis(activity.load(std::sync::atomic::Ordering::Relaxed));
         if idle_since.elapsed() > timeout {
@@ -293,6 +302,7 @@ fn run_command(mut cmd: Command, cfg: &ExecConfig) -> Result<Execution, ExecErro
         complete: parsed.done,
         suites: parsed.suites,
         peak_rss,
+        peak_tester_rss,
         blocks: parsed.blocks,
         loose: parsed.loose,
         stderr,
@@ -321,33 +331,50 @@ impl<R: std::io::Read> std::io::Read for Activity<R> {
 /// How often the run's resident size is sampled.
 const RSS_SAMPLE: Duration = Duration::from_secs(1);
 
-/// Resident bytes of every process in the process group `pgid` (the runner
-/// and everything it spawned: compiler, isolate hosts). Read through `ps`,
-/// which every unix ships; one call per sample.
+/// The worker process of every flutter run — the tool's own and the
+/// grouped pass's: the engine tester binary at the end of its path. A
+/// `dart test` run's workers are isolates inside one process, so no
+/// sampled row matches and the run calibrates from its tree peak alone.
+const TESTER_PROCESS: &str = "flutter_tester";
+
+/// Resident bytes of the process group `pgid` (the runner and everything
+/// it spawned: compiler, testers), as (tree, heaviest tester): the sum
+/// over the group's processes, and the peak of the single heaviest
+/// [`TESTER_PROCESS`] among them. Read through `ps`, which every unix
+/// ships; one call per sample.
 #[cfg(unix)]
-fn group_rss(pgid: u32) -> u64 {
+fn group_rss(pgid: u32) -> (u64, u64) {
     let Ok(out) = Command::new("ps")
-        .args(["-A", "-o", "pgid=,rss="])
+        .args(["-A", "-o", "pgid=,rss=,comm="])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
     else {
-        return 0;
+        return (0, 0);
     };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let group: u32 = fields.next()?.parse().ok()?;
-            let kib: u64 = fields.next()?.parse().ok()?;
-            (group == pgid).then_some(kib * 1024)
-        })
-        .sum()
+    let (mut tree, mut tester) = (0u64, 0u64);
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        // `comm` is a path that may hold spaces: everything after the
+        // pgid and rss fields belongs to it.
+        let rest = line.trim_start();
+        let Some((group, rest)) = rest.split_once(' ') else { continue };
+        if group.parse().ok() != Some(pgid) {
+            continue;
+        }
+        let Some((kib, command)) = rest.trim_start().split_once(' ') else { continue };
+        let Some(kib) = kib.parse::<u64>().ok() else { continue };
+        let bytes = kib * 1024;
+        tree += bytes;
+        if command.ends_with(TESTER_PROCESS) {
+            tester = tester.max(bytes);
+        }
+    }
+    (tree, tester)
 }
 
 #[cfg(not(unix))]
-fn group_rss(_pgid: u32) -> u64 {
-    0
+fn group_rss(_pgid: u32) -> (u64, u64) {
+    (0, 0)
 }
 
 /// How often the watchdog checks the runner.
@@ -522,6 +549,7 @@ mod tests {
             complete: true,
             suites: files.to_vec(),
             peak_rss: 0,
+            peak_tester_rss: 0,
             blocks: Vec::new(),
             loose: Vec::new(),
             stderr: String::new(),
