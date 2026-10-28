@@ -696,12 +696,12 @@ fn corrupted_live_answers_are_named_at_their_path() {
     fs::remove_dir_all(&workspace.root).ok();
 }
 
-/// The frozen `dartq/*` method family: the daemon's 15-method request
+/// The frozen `dartq/*` method family: the daemon's 16-method request
 /// table, pinned here as the independent copy the live face must serve.
 /// dartq-schema validates answer shapes per domain and has no method-name
 /// registry, so the frozen wire shape is the pin — an added, renamed, or
 /// removed method drifts the table and fails the gate below.
-const FROZEN_METHODS: [&str; 15] = [
+const FROZEN_METHODS: [&str; 16] = [
     "dartq/index",
     "dartq/analyze",
     "dartq/check",
@@ -714,6 +714,7 @@ const FROZEN_METHODS: [&str; 15] = [
     "dartq/assists",
     "dartq/compat",
     "dartq/explain",
+    "dartq/rename",
     "dartq/overlay.set",
     "dartq/overlay.commit",
     "dartq/overlay.clear",
@@ -733,7 +734,7 @@ fn every_frozen_method_is_a_live_face() {
     // Params chosen to reach each face's own intake (a valid selector where
     // the face validates one) — the pin is "answered, never METHOD_NOT_FOUND".
     let paths = json!({ "paths": [a.display().to_string()] });
-    let cases: [(i64, &str, Value); 15] = [
+    let cases: [(i64, &str, Value); 16] = [
         (1, "dartq/index", json!({})),
         (2, "dartq/analyze", json!({})),
         (3, "dartq/check", paths.clone()),
@@ -772,11 +773,16 @@ fn every_frozen_method_is_a_live_face() {
         ),
         (
             13,
+            "dartq/rename",
+            json!({ "path": a.display().to_string(), "line": 1, "col": 1, "new_name": "gb" }),
+        ),
+        (
+            14,
             "dartq/overlay.set",
             json!({ "agent_id": "A", "files": {} }),
         ),
-        (14, "dartq/overlay.commit", json!({ "agent_id": "A" })),
-        (15, "dartq/overlay.clear", json!({ "agent_id": "A" })),
+        (15, "dartq/overlay.commit", json!({ "agent_id": "A" })),
+        (16, "dartq/overlay.clear", json!({ "agent_id": "A" })),
     ];
     for (id, method, params) in cases {
         h.step(&request(id, method, params), 1);
@@ -798,8 +804,8 @@ fn every_frozen_method_is_a_live_face() {
 
     // The family is closed: a `dartq/`-spelled unknown answers
     // METHOD_NOT_FOUND, so nothing outside the frozen table answers.
-    h.step(&request(16, "dartq/nope", json!({})), 1);
-    let frame = h.wait_answer(16);
+    h.step(&request(17, "dartq/nope", json!({})), 1);
+    let frame = h.wait_answer(17);
     assert_eq!(frame["error"]["code"], -32601, "the face set is closed");
 
     let (code, _) = h.join_ended();

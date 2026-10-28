@@ -27,20 +27,19 @@
 //!
 //! [Language Object Notation v1]: https://github.com/fluttercandies/lon/blob/main/spec/lon-v1.md
 
-use std::io::{self, Write};
-
 use clap::ValueEnum;
-use serde_json::Value;
 
 /// The analyze/check faces' lon document — the shared builder both the CLI
 /// and the daemon's `dartq/analyze` render through (`dartq-commands`' own,
 /// #2657: no second encoder).
 pub(crate) use dartq_commands::analyze::diags_document;
-// The relocated per-format renderers (#2627): the one writer per format —
-// `dartq-commands::render` — that the cold path here and the daemon's
-// routed face both call; re-exported so the CLI's call sites keep their
-// spelling.
-pub(crate) use dartq_commands::render::{lon_line, write_human, write_lon};
+// The relocated per-format renderers (#2627/#2629): the one writer per
+// format — `dartq-commands::render` — that the cold path here and the
+// daemon's routed faces both call; re-exported so the CLI's call sites
+// keep their spelling.
+pub(crate) use dartq_commands::render::{
+    lon_line, write_human, write_json_value, write_lon, write_text_value,
+};
 
 /// The unified `--format` axis. `lon` is the constant default; an invalid
 /// spelling is clap's usage error (exit 64), the same tier every other
@@ -55,25 +54,11 @@ pub(crate) enum OutputFormat {
     Text,
 }
 
-/// The `json` face: the frozen single-line shape, untouched.
-pub(crate) fn write_json_value(out: &mut impl Write, value: &Value) -> io::Result<()> {
-    writeln!(out, "{value}")
-}
-
-/// The generic `text` face: the value, indented — the read verbs without
-/// a bespoke renderer (query, explain, impact, compat, index, rename,
-/// resolve, the debug status listing).
-pub(crate) fn write_text_value(out: &mut impl Write, value: &Value) -> io::Result<()> {
-    writeln!(
-        out,
-        "{}",
-        serde_json::to_string_pretty(value).expect("the value pretty-prints")
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
+
+    use serde_json::Value;
 
     use dartq_diagnostics::{
         AnalysisOutput, Diagnostic, FileId, Severity, SourceRange, UNDEFINED_IDENTIFIER,

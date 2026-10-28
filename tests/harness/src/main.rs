@@ -18,6 +18,12 @@ mod replay_edit;
 mod report;
 mod repro;
 
+// Frozen gate-universe artifacts (m1/m2_warning/m3_unused codes): the
+// derivations, --check pins, and regen entry points live in freeze.rs —
+// test-only, like the pins in `mod tests` below.
+#[cfg(test)]
+mod freeze;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -1113,256 +1119,6 @@ mod tests {
         );
     }
 
-    /// Derivation pin: the M1 gate codes file (`tests/harness/m1_codes.txt`)
-    /// must equal its documented derivation (the m1_codes.txt file header):
-    /// the `undefined_*` and `wrong_number_of_*` wildcard families expanded
-    /// over the SDK main unified registry (upstream Dart SDK, pkg/analyzer
-    /// lib/src/diagnostic/diagnostic.g.dart, `name:` literals), unioned with
-    /// the explicit picks (`uri_does_not_exist`, `duplicate_definition`, the
-    /// static-nullability four), plus `undefined_annotation`, minus
-    /// `undefined_lint` (an analysis-options code, not a Dart-language
-    /// diagnostic; present in the registry, so the exclusion is load-bearing).
-    ///
-    /// The analyzer-8.4.1 side of the header's union contributes exactly one
-    /// gate code (`undefined_annotation`, `lib/src/error/codes.g.dart`); it is
-    /// pinned as a frozen const because a published package version is
-    /// immutable — re-reading it at test time detects nothing — and no
-    /// workspace lockfile pins 8.4.1 into pub-cache, so a live read would be
-    /// a spurious environmental failure. The SDK main registry is the live
-    /// drift surface: an SDK checkout update that adds or removes a wildcard
-    /// family member fails this pin and forces a conscious re-freeze.
-    /// `wrong_number_of_type_arguments_method` exists only in analyzer-8.4.1,
-    /// never in the SDK main registry, and is intentionally not gated; the
-    /// SDK-main-anchored derivation needs no exclusion for it.
-    #[test]
-    fn m1_codes_file_matches_derivation() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("harness lives at <repo>/tests/harness");
-        let Some(sdk) = std::env::var("DARTQ_SDK_CHECKOUT").ok() else {
-            eprintln!(
-                "skipped: set DARTQ_SDK_CHECKOUT to a dart-lang/sdk checkout to run the live-registry derivation pin"
-            );
-            return;
-        };
-        let registry = std::fs::read_to_string(
-            Path::new(&sdk).join("pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart"),
-        )
-        .expect("SDK main diagnostic registry present in $DARTQ_SDK_CHECKOUT");
-        let txt = std::fs::read_to_string(root.join("tests/harness/m1_codes.txt"))
-            .expect("gate codes file present");
-        let gate_codes = parse_codes_file(&txt).expect("gate file parses");
-
-        // `name: 'snake_case',` at line start; `uniqueName:` never matches
-        // because the anchor sits directly after leading whitespace.
-        let registry_codes: BTreeSet<String> = registry
-            .lines()
-            .filter_map(|line| {
-                let rest = line.trim_start().strip_prefix("name: '")?;
-                rest.strip_suffix("',")
-            })
-            .map(str::to_string)
-            .collect();
-        let mut expected: BTreeSet<String> = BTreeSet::new();
-        for prefix in ["undefined_", "wrong_number_of_"] {
-            expected.extend(
-                registry_codes
-                    .iter()
-                    .filter(|code| code.starts_with(prefix))
-                    .cloned(),
-            );
-        }
-        expected.extend(
-            [
-                "uri_does_not_exist",
-                "duplicate_definition",
-                "invalid_assignment",
-                "argument_type_not_assignable",
-                "return_of_invalid_type",
-                "invalid_null_aware_operator",
-                // Frozen analyzer-8.4.1-only addition (see doc above).
-                "undefined_annotation",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        );
-        expected.remove("undefined_lint");
-
-        assert_eq!(gate_codes.len(), 36, "M1 gate freezes 36 codes");
-        // 36 raw data lines (comments/blanks excluded): a duplicated line
-        // would hide in the set comparison but still be drift.
-        assert_eq!(
-            txt.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .count(),
-            36
-        );
-        assert_eq!(
-            gate_codes, expected,
-            "gate file = documented M1 derivation over the SDK main registry"
-        );
-    }
-
-    /// Derivation pin: the M2 WARNING-tier gate codes file
-    /// (`tests/harness/m2_warning_codes.txt`) must equal its documented
-    /// derivation: the SDK main
-    /// unified registry's WARNING severity family (`type:
-    /// DiagnosticType.STATIC_WARNING`, what `dart analyze --format=machine`
-    /// reports as WARNING) intersected with the per-bucket freeze list
-    /// (M1 frozen-set continuation, flow/null-safety soundness,
-    /// patterns/records/switch exhaustiveness, class modifiers, const and
-    /// literal semantics, combinator duplicates, override semantics).
-    /// Unlike the M1 pin, the derivation pairs each `name:` literal with
-    /// the following `type:` line: severity is per-entry, not per-name
-    /// (`multiple_combinators` is registered under two types; it is
-    /// excluded by the tooling family either way). Three long-named
-    /// entries wrap the `name:` value onto the next line and are skipped
-    /// by the line-anchored parse; all three are `COMPILE_TIME_ERROR`, so
-    /// the WARNING family is unaffected.
-    #[test]
-    #[expect(clippy::too_many_lines)] // derives the frozen row from the official diagnostics table line by line
-    fn m2_warning_codes_file_matches_derivation() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("harness lives at <repo>/tests/harness");
-        let Some(sdk) = std::env::var("DARTQ_SDK_CHECKOUT").ok() else {
-            eprintln!(
-                "skipped: set DARTQ_SDK_CHECKOUT to a dart-lang/sdk checkout to run the live-registry derivation pin"
-            );
-            return;
-        };
-        let registry = std::fs::read_to_string(
-            Path::new(&sdk).join("pkg/analyzer/lib/src/diagnostic/diagnostic.g.dart"),
-        )
-        .expect("SDK main diagnostic registry present in $DARTQ_SDK_CHECKOUT");
-        let txt = std::fs::read_to_string(root.join("tests/harness/m2_warning_codes.txt"))
-            .expect("gate codes file present");
-        let gate_codes = parse_codes_file(&txt).expect("gate file parses");
-
-        // Pair each `name: 'snake_case',` (line-anchored) with the next
-        // `type: DiagnosticType.X,` line; collect the STATIC_WARNING names.
-        let mut pending: Option<String> = None;
-        let mut warning_family: BTreeSet<String> = BTreeSet::new();
-        for line in registry.lines() {
-            let trimmed = line.trim_start();
-            if let Some(rest) = trimmed.strip_prefix("name: '") {
-                pending = rest.strip_suffix("',").map(str::to_string);
-            } else if let Some(rest) = trimmed.strip_prefix("type: DiagnosticType.")
-                && let Some(name) = pending.take()
-                && rest.strip_suffix(',') == Some("STATIC_WARNING")
-            {
-                warning_family.insert(name);
-            }
-        }
-        let frozen: BTreeSet<String> = [
-            // (a) M1 frozen-set continuation
-            "invalid_null_aware_operator",
-            "undefined_hidden_name",
-            "undefined_referenced_parameter",
-            "undefined_shown_name",
-            // (b) flow analysis & null-safety soundness
-            "body_might_complete_normally_nullable",
-            "cast_from_null_always_fails",
-            "cast_from_nullable_always_fails",
-            "dead_code",
-            "dead_code_catch_following_catch",
-            "dead_code_on_catch_subtype",
-            "dead_null_aware_expression",
-            "null_argument_to_non_null_type",
-            "null_check_always_fails",
-            "nullable_type_in_catch_clause",
-            "receiver_of_type_never",
-            "type_check_with_null",
-            "unnecessary_cast",
-            "unnecessary_nan_comparison",
-            "unnecessary_non_null_assertion",
-            "unnecessary_null_comparison",
-            "unnecessary_question_mark",
-            "unnecessary_type_check",
-            // (c) patterns / records / switch exhaustiveness & reachability
-            "constant_pattern_never_matches_value_type",
-            "missing_enum_constant_in_switch",
-            "pattern_never_matches_value_type",
-            "unreachable_switch_case",
-            "unreachable_switch_default",
-            "unnecessary_cast_pattern",
-            "unnecessary_null_assert_pattern",
-            "unnecessary_null_check_pattern",
-            "unnecessary_wildcard_pattern",
-            // (d) class modifiers / sealed
-            "mixin_on_sealed_class",
-            "subtype_of_sealed_class",
-            // (e) const & literal semantics
-            "equal_elements_in_set",
-            "equal_keys_in_map",
-            "non_const_call_to_literal_constructor",
-            // (f) import/export combinator duplicates
-            "duplicate_export",
-            "duplicate_hidden_name",
-            "duplicate_import",
-            "duplicate_shown_name",
-            // (g) override & interface-member semantics
-            "non_nullable_equals_parameter",
-            "override_on_non_overriding_member",
-            "unnecessary_no_such_method",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-        assert_eq!(
-            frozen.len(),
-            43,
-            "the documented bucket freeze holds 43 codes"
-        );
-        // Registry drift in the removing direction (a frozen name re-typed
-        // or dropped from the STATIC_WARNING family) shrinks the
-        // intersection and fails here before the set comparison.
-        let expected: BTreeSet<String> = frozen.intersection(&warning_family).cloned().collect();
-        assert_eq!(
-            expected.len(),
-            43,
-            "every frozen bucket member must still be STATIC_WARNING in the registry"
-        );
-        assert_eq!(gate_codes.len(), 43, "M2 WARNING tier freezes 43 codes");
-        // 43 raw data lines (comments/blanks excluded): a duplicated line
-        // would hide in the set comparison but still be drift.
-        assert_eq!(
-            txt.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .count(),
-            43
-        );
-        assert_eq!(
-            gate_codes, expected,
-            "gate file = documented M2 WARNING derivation over the SDK main registry"
-        );
-        // Load-bearing exclusions: family members kept out on purpose
-        // (file-header exclusion families). `undefined_lint` is the M1
-        // precedent (analysis-options code); `unused_import` is
-        // WARNING-severity yet M3 usage analysis; `strict_raw_type` is
-        // opt-in via analysis options; `multiple_combinators` is the
-        // dual-type ambiguity case.
-        for excluded in [
-            "undefined_lint",
-            "unused_import",
-            "strict_raw_type",
-            "multiple_combinators",
-        ] {
-            assert!(
-                warning_family.contains(excluded),
-                "{excluded} must still be in the WARNING family for this guard to be load-bearing"
-            );
-            assert!(
-                !gate_codes.contains(excluded),
-                "{excluded} must stay excluded from the M2 WARNING tier"
-            );
-        }
-    }
-
     /// Corpus-hygiene pin for the M2 WARNING-tier gate corpus
     /// (`tests/corpus/m2-warning`, the run of `scripts/m2-gate.sh`): the
     /// gate's 1.000 bar over the 43-code universe holds only while the
@@ -2335,127 +2091,27 @@ mod tests {
             .expect("harness lives at <repo>/tests/harness")
     }
 
-    /// Coverage-manifest pin (audit finding: no committed per-code exposure
-    /// artifact — coverage claims were prose, not pins): the committed
-    /// table must equal the live derivation over the gate universe.
-    ///
-    /// Schema: every row carries 7 cells; `covered` rows show at least one
-    /// evidence cell and no note; `documented_gap` rows carry all-empty
-    /// evidence plus a hand-authored reason; the scanner-goldens column is
-    /// syntax-tier only. Universe: exactly one row per (tier, code) — the
-    /// five diagnostic tiers over their frozen codes files, the lint tier
-    /// over the registry's live gate face (`registered_gate_codes`:
-    /// registered emittable minus the divergence ledger's excluded rows).
-    /// The row count is fully determined by those universes (647 rows at
-    /// the 2026-10-14 derivation: 255 + 36 + 43 + 11 + 237 + 65; the lint
-    /// term moves with the registry). Cells: targeted, annotation and
-    /// scanner-goldens columns must equal the corpora-derived evidence
-    /// byte-for-byte, and every derived gap must carry its manifest
-    /// exclusion row. Any corpus, frozen-file or registry edit that moves
-    /// coverage fails here and forces a conscious re-derive (regen test
-    /// below).
-    #[test]
-    fn fixture_coverage_manifest_matches_corpus_derivation() {
-        let root = fixture_coverage_repo_root();
-        let derived = derive_fixture_coverage(root);
-        let manifest_text = std::fs::read_to_string(root.join(FIXTURE_COVERAGE_MANIFEST))
+    /// The manifest's canonical text — the single serializer the check
+    /// below and its regen share, so the checked-in file and the regen
+    /// output cannot diverge: the committed `#` header verbatim, then the
+    /// live derivation's rows in tier-table order (codes sorted within a
+    /// tier), with `documented_gap` notes carried over from the committed
+    /// table (a derived gap the committed table has no note for fails
+    /// here — the note is deliberate prose, authored never derived).
+    fn coverage_manifest_canonical(root: &Path) -> String {
+        let old_text = std::fs::read_to_string(root.join(FIXTURE_COVERAGE_MANIFEST))
             .expect("coverage manifest present");
-        let rows = parse_coverage_manifest(&manifest_text);
-
-        for row in &rows {
-            let cell = |i: usize| row[i].as_str();
-            match row[2].as_str() {
-                "covered" => {
-                    assert!(
-                        cell(3) != "-" || cell(4) != "-" || cell(5) != "-",
-                        "covered row without evidence: {row:?}"
-                    );
-                    assert_eq!(cell(6), "-", "covered rows carry no note: {row:?}");
-                }
-                "documented_gap" => {
-                    assert_eq!(cell(3), "-", "gap row carries no targeted fixture: {row:?}");
-                    assert_eq!(cell(4), "-", "gap row carries no annotation: {row:?}");
-                    assert_eq!(cell(5), "-", "gap row carries no scanner goldens: {row:?}");
-                    assert_ne!(cell(6), "-", "documented_gap rows must state their reason");
-                }
-                other => panic!("illegal coverage value {other:?}: {row:?}"),
-            }
-            if row[0] != "syntax" {
-                assert_eq!(
-                    cell(5),
-                    "-",
-                    "scanner_goldens evidence is syntax-tier only: {row:?}"
-                );
-            }
-        }
-
-        // Universe equality: the manifest is exactly the (tier, code)
-        // universe — no missing row, no duplicate, no invention.
-        let mut universe: Vec<(String, String)> = Vec::new();
-        for tier in FIXTURE_COVERAGE_TIERS {
-            universe.extend(
-                tier_codes(tier, root)
-                    .into_iter()
-                    .map(|code| (tier.tier.to_string(), code)),
-            );
-        }
-        universe.sort();
-        let mut manifest_keys: Vec<(String, String)> =
-            rows.iter().map(|r| (r[0].clone(), r[1].clone())).collect();
-        manifest_keys.sort();
-        assert_eq!(
-            manifest_keys, universe,
-            "manifest rows must be exactly the (tier, code) universe"
-        );
-
-        // Cell equality against the live derivation.
-        let derived_map: BTreeMap<(&str, &str), &CoverageRow> = derived
-            .iter()
-            .map(|r| (r[0].as_str(), r[1].as_str(), r))
-            .map(|(t, c, r)| ((t, c), r))
-            .collect();
-        for row in &rows {
-            let d = derived_map
-                .get(&(row[0].as_str(), row[1].as_str()))
-                .unwrap_or_else(|| {
-                    panic!("derivation missing a manifest row: {}::{}", row[0], row[1])
-                });
-            let hint = "re-derive with: cargo test -p harness \
-                        regen_fixture_coverage_manifest -- --ignored";
-            assert_eq!(
-                row[2], d[2],
-                "coverage verdict drift for {}::{}; {}",
-                row[0], row[1], hint
-            );
-            for col in 3..=5 {
-                assert_eq!(
-                    row[col], d[col],
-                    "evidence drift for {}::{} column {}; {}",
-                    row[0], row[1], col, hint
-                );
-            }
-        }
-    }
-
-    /// Regen (writes the manifest; not run by default):
-    /// `cargo test -p harness regen_fixture_coverage_manifest -- --ignored`
-    /// re-derives the evidence live and rewrites the data rows, preserving
-    /// the committed header verbatim and carrying the `documented_gap` notes
-    /// of still-dark codes over from the current table. A new dark code
-    /// without an existing note fails here — the note is deliberate prose
-    /// (the reason a code has no fixture) and must be authored, never
-    /// derived.
-    #[test]
-    #[ignore = "regenerates the manifest in place; run explicitly with --ignored"]
-    fn regen_fixture_coverage_manifest() {
-        let root = fixture_coverage_repo_root();
-        let mut derived = derive_fixture_coverage(root);
-        let manifest_path = root.join(FIXTURE_COVERAGE_MANIFEST);
-        let old_text = std::fs::read_to_string(&manifest_path).expect("coverage manifest present");
         let old_notes: BTreeMap<(String, String), String> = parse_coverage_manifest(&old_text)
             .into_iter()
             .filter(|r| r[2] == "documented_gap")
-            .map(|r| ((r[0].clone(), r[1].clone()), r[6].clone()))
+            .map(|r| {
+                assert_ne!(
+                    r[6], "-",
+                    "documented_gap row {}::{} must state its reason",
+                    r[0], r[1]
+                );
+                ((r[0].clone(), r[1].clone()), r[6].clone())
+            })
             .collect();
         // The committed header block: every leading comment line, verbatim.
         let header_len = old_text.lines().take_while(|l| l.starts_with('#')).count();
@@ -2465,27 +2121,66 @@ mod tests {
             .map(|l| l.to_owned() + "\n")
             .collect();
 
-        for row in &mut derived {
-            let row: &mut CoverageRow = row;
+        for mut row in derive_fixture_coverage(root) {
             if row[2] == "documented_gap" {
                 let key = (row[0].clone(), row[1].clone());
-                match old_notes.get(&key) {
-                    Some(note) => row[6] = note.clone(),
-                    None => panic!(
+                row[6] = old_notes.get(&key).cloned().unwrap_or_else(|| {
+                    panic!(
                         "new documented_gap code {}::{} needs a hand-authored note in {} \
                          (why this code has no fixture yet)",
                         row[0], row[1], FIXTURE_COVERAGE_MANIFEST
-                    ),
-                }
+                    )
+                });
             }
             out.push_str(&row.join("\t"));
             out.push('\n');
         }
-        std::fs::write(&manifest_path, out).expect("rewrite coverage manifest");
-        println!(
-            "regenerated {} ({} data rows)",
-            manifest_path.display(),
-            derived.len()
+        out
+    }
+
+    /// Coverage-manifest pin (audit finding: no committed per-code exposure
+    /// artifact — coverage claims were prose, not pins): the committed
+    /// table must equal the live derivation over the gate universe, byte
+    /// for byte — one row per (tier, code) over the five diagnostic tiers'
+    /// frozen codes files and the lint tier's registry gate face
+    /// (`registered_gate_codes`), every evidence cell equal to the
+    /// corpora-derived value, gap notes carried over (schema and universe
+    /// equality are subsumed: the canonical text IS the derived rows under
+    /// the committed header). Any corpus, frozen-file or registry edit
+    /// that moves coverage fails here and forces a conscious re-derive;
+    /// the regen test below writes this same canonical text.
+    #[test]
+    fn fixture_coverage_manifest_matches_corpus_derivation() {
+        let root = fixture_coverage_repo_root();
+        let manifest_text = std::fs::read_to_string(root.join(FIXTURE_COVERAGE_MANIFEST))
+            .expect("coverage manifest present");
+        crate::freeze::assert_freeze_bytes(
+            FIXTURE_COVERAGE_MANIFEST,
+            &manifest_text,
+            &coverage_manifest_canonical(root),
+            "cargo test -p harness regen_fixture_coverage_manifest -- --ignored",
         );
+    }
+
+    /// Regen (writes the manifest; not run by default):
+    /// `cargo test -p harness regen_fixture_coverage_manifest -- --ignored`
+    /// writes the canonical text the check above asserts — the derivation
+    /// live, the committed header verbatim, the `documented_gap` notes of
+    /// still-dark codes carried over from the current table. A new dark
+    /// code without an existing note fails here — the note is deliberate
+    /// prose (the reason a code has no fixture) and must be authored,
+    /// never derived.
+    #[test]
+    #[ignore = "regenerates the manifest in place; run explicitly with --ignored"]
+    fn regen_fixture_coverage_manifest() {
+        let root = fixture_coverage_repo_root();
+        let canonical = coverage_manifest_canonical(root);
+        let data_rows = canonical
+            .lines()
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .count();
+        std::fs::write(root.join(FIXTURE_COVERAGE_MANIFEST), canonical)
+            .expect("rewrite coverage manifest");
+        println!("regenerated {FIXTURE_COVERAGE_MANIFEST} ({data_rows} data rows)");
     }
 }

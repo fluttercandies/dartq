@@ -1,0 +1,1 @@
+void f(Object o) { if (o case int(: var isEven)) {} }

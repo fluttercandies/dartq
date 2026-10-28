@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{Check, Group, RuleSpec};
+use super::{Check, RuleSpec};
 use crate::rules::{MemberQuery, NONE_TOKEN, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -33,14 +33,11 @@ use crate::rules::{MemberQuery, NONE_TOKEN, utf16_token_span};
 /// where the official defers to the compile error — the lexical face
 /// is exact on valid code, where the pattern's member necessarily
 /// exists. Message: `diagnostic.g.dart` `simplifyVariablePattern`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "simplify_variable_pattern",
-    group: Group::Standalone,
-    problem: "The {1} identification '{0}:' is redundant and can be removed.",
-    correction: "Try removing the redundant {1} identification.",
-    kinds: &[NodeKind::PatternField],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "simplify_variable_pattern",
+    &[NodeKind::PatternField],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The registration bail (:32).

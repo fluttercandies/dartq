@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{Check, Group, RuleSpec};
+use super::{Check, RuleSpec};
 use crate::rules::NONE_TOKEN;
 
 /// Official: `upstream Dart SDK source,
@@ -31,14 +31,11 @@ use crate::rules::NONE_TOKEN;
 /// are the documented under-report — interpolation segments produce
 /// no AST rows (the token-layer carry). Message:
 /// `diagnostic.g.dart` `switchOnType`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "switch_on_type",
-    group: Group::Standalone,
-    problem: "Avoid switch statements on a 'Type'.",
-    correction: "Try using pattern matching on a variable instead.",
-    kinds: &[NodeKind::SwitchStatement, NodeKind::SwitchExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "switch_on_type",
+    &[NodeKind::SwitchStatement, NodeKind::SwitchExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The registration bail (:34).

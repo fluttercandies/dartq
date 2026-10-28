@@ -1,8 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{
-    Check, Group, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces as faces,
-};
+use super::{Check, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces as faces};
 use crate::rules::{TypeFace, type_before, type_face};
 
 /// Official: `upstream Dart SDK source,
@@ -28,19 +26,16 @@ use crate::rules::{TypeFace, type_before, type_face};
 /// targets stay silent; member-write assignment targets stay silent
 /// (no same-file written type). Message: `diagnostic.g.dart`
 /// `noDynamicCasts`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "no_dynamic_casts",
-    group: Group::Standalone,
-    problem: "Implicit cast from 'dynamic'.",
-    correction: "Try adding an explicit cast or changing the target type.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "no_dynamic_casts",
+    &[
         NodeKind::VariablesDeclaration,
         NodeKind::Assignment,
         NodeKind::ReturnStatement,
         NodeKind::Arguments,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

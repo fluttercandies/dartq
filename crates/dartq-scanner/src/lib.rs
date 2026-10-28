@@ -159,9 +159,10 @@ pub use keyword::{Keyword, KeywordStyle, keyword_from_str};
 pub use token::{Token, TokenKind, TokenTable};
 
 /// Scan configuration (isomorphic to the official `ScannerConfiguration`; two
-/// booleans only, derived by the caller from the `FeatureSet`; the scanner does
-/// not depend on `FeatureSet` itself).
-#[derive(Clone, Copy, Debug)]
+/// booleans only). Derived from a library's [`FeatureSet`] through
+/// [`ScanConfig::from_feature_set`] — the lexical-stance fold; the lexer
+/// itself reads only the two plain bools and never touches `FeatureSet`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanConfig {
     /// Whether `>>>` / `>>>=` form a single token (when false, `>>>` scans as `>>` + `>`).
     pub enable_triple_shift: bool,
@@ -169,6 +170,90 @@ pub struct ScanConfig {
     /// identifier — official tokenizeKeywordOrIdentifier,
     /// `abstract_scanner.dart:2106`; pinned by `front_end` scanner_test.dart:480-489).
     pub enable_augmentations: bool,
+}
+
+impl ScanConfig {
+    /// The all-off fold every feature application starts from.
+    const OFF: Self = Self {
+        enable_triple_shift: false,
+        enable_augmentations: false,
+    };
+
+    /// Folds a [`FeatureSet`] into the lexical gates — one pass over the
+    /// generated registry (`Feature::ALL`), each enabled feature applied
+    /// through [`ScanConfig::enable`], the scanner's stance table. The
+    /// match there is exhaustive over the generated enum with no wildcard
+    /// arm, so a re-vendored yaml entry without a lexical stance fails
+    /// compilation until it gets one. The official analogue: the CFE feeds
+    /// `ExperimentalFeatures` into `ScannerConfiguration` exactly once at
+    /// construction (`parser_impl.dart`'s initializer fold).
+    #[must_use]
+    pub fn from_feature_set(features: dartq_language::FeatureSet) -> Self {
+        let mut folded = Self::OFF;
+        for feature in dartq_language::Feature::ALL {
+            if features.is_enabled(feature) {
+                folded.enable(feature);
+            }
+        }
+        folded
+    }
+
+    /// Applies one enabled feature to the fold — the scanner's lexical
+    /// stance table, exhaustive over the generated registry enum on
+    /// purpose (no wildcard arm).
+    fn enable(&mut self, feature: dartq_language::Feature) {
+        match feature {
+            dartq_language::Feature::TripleShift => self.enable_triple_shift = true,
+            dartq_language::Feature::Augmentations => self.enable_augmentations = true,
+            // No lexical stance: these entries never change token shapes
+            // (`>>>` and the `augment` keyword are the only
+            // feature-gated lexical faces), so the scanner ignores them.
+            dartq_language::Feature::Variance
+            | dartq_language::Feature::ConstFunctions
+            | dartq_language::Feature::Macros
+            | dartq_language::Feature::RecordUse
+            | dartq_language::Feature::DataAssets
+            | dartq_language::Feature::EnhancedParts
+            | dartq_language::Feature::UnquotedImports
+            | dartq_language::Feature::InferenceUpdate4
+            | dartq_language::Feature::ThisPromotion
+            | dartq_language::Feature::StaticExtensions
+            | dartq_language::Feature::AnonymousMethods
+            | dartq_language::Feature::TestExperiment
+            | dartq_language::Feature::PrimaryConstructors
+            | dartq_language::Feature::PrivateNamedParameters
+            | dartq_language::Feature::DotShorthands
+            | dartq_language::Feature::NativeAssets
+            | dartq_language::Feature::GetterSetterError
+            | dartq_language::Feature::SoundFlowAnalysis
+            | dartq_language::Feature::NullAwareElements
+            | dartq_language::Feature::InferenceUsingBounds
+            | dartq_language::Feature::WildcardVariables
+            | dartq_language::Feature::DigitSeparators
+            | dartq_language::Feature::InferenceUpdate3
+            | dartq_language::Feature::InlineClass
+            | dartq_language::Feature::InferenceUpdate2
+            | dartq_language::Feature::SealedClass
+            | dartq_language::Feature::ClassModifiers
+            | dartq_language::Feature::Records
+            | dartq_language::Feature::Patterns
+            | dartq_language::Feature::UnnamedLibraries
+            | dartq_language::Feature::AlternativeInvalidationStrategy
+            | dartq_language::Feature::InferenceUpdate1
+            | dartq_language::Feature::EnhancedEnums
+            | dartq_language::Feature::NamedArgumentsAnywhere
+            | dartq_language::Feature::SuperParameters
+            | dartq_language::Feature::ConstructorTearoffs
+            | dartq_language::Feature::GenericMetadata
+            | dartq_language::Feature::NonfunctionTypeAliases
+            | dartq_language::Feature::NonNullable
+            | dartq_language::Feature::ExtensionMethods
+            | dartq_language::Feature::ConstantUpdate2018
+            | dartq_language::Feature::ControlFlowCollections
+            | dartq_language::Feature::SetLiterals
+            | dartq_language::Feature::SpreadCollections => {}
+        }
+    }
 }
 
 /// Scan result.

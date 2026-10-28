@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, slice};
+use super::{Check, NodeKind, RuleSpec, slice};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_constructor_name.dart`
 /// — a written `.new` constructor name reports at the name token. Faces
@@ -19,18 +19,15 @@ use super::{Check, Group, NodeKind, RuleSpec, slice};
 /// erroneous `p.Missing.new(…)` reports on both sides alike — an
 /// agreement face. Message: `diagnostic.g.dart`
 /// `unnecessaryConstructorName`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_constructor_name",
-    group: Group::Recommended,
-    problem: "Unnecessary '.new' constructor name.",
-    correction: "Try removing the '.new'.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_constructor_name",
+    &[
         NodeKind::Constructor,
         NodeKind::PrimaryConstructor,
         NodeKind::Send,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

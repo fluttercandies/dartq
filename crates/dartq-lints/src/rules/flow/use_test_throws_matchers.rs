@@ -1,4 +1,4 @@
-use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec};
+use super::{Check, NONE_TOKEN, NodeKind, RuleSpec};
 use crate::rules::{is_statement_row, slice};
 
 /// Official: `pkg/linter/lib/src/rules/use_test_throws_matchers.dart`
@@ -20,14 +20,11 @@ use crate::rules::{is_statement_row, slice};
 /// still reports. Under-report: `fail` re-exported through a helper
 /// package with no direct test-framework import stays silent. Message:
 /// `diagnostic.g.dart` `useTestThrowsMatchers`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "use_test_throws_matchers",
-    group: Group::Standalone,
-    problem: "Use the 'throwsA' matcher instead of using 'fail' when there is no exception thrown.",
-    correction: "Try removing the try-catch and using 'throwsA' to expect an exception.",
-    kinds: &[NodeKind::TryStatement],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_test_throws_matchers",
+    &[NodeKind::TryStatement],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

@@ -1,8 +1,5 @@
-use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
-use crate::rules::{
-    byte_span_of_token, initialized_identifier_name, is_statement_row,
-    variables_declaration_keyword,
-};
+use super::{Check, NodeKind, RuleSpec, same_file, slice};
+use crate::rules::{byte_span_of_token, initialized_identifier_name, is_statement_row, variables_declaration_keyword};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/cascade_invocations.dart`
 /// — consecutive statements on one cascadable reference report at the
@@ -41,14 +38,11 @@ use crate::rules::{
 /// sibling-executable and closure arms are out of the substrate; two
 /// same-named elements (shadowing) join as one (over-report).
 /// Message: `diagnostic.g.dart` `cascadeInvocations`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "cascade_invocations",
-    group: Group::Standalone,
-    problem: "Unnecessary duplication of receiver.",
-    correction: "Try using a cascade to avoid the duplication.",
-    kinds: &[NodeKind::Block, NodeKind::BlockBody, NodeKind::SwitchCase],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "cascade_invocations",
+    &[NodeKind::Block, NodeKind::BlockBody, NodeKind::SwitchCase],
     check,
-};
+);
 
 /// One statement's cascadable face: the element it anchors or joins,
 /// the upstream capability bits, the critical scan spans (the

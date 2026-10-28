@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
 use crate::rules::utf16_token_span;
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/noop_primitive_operations.dart`
@@ -36,14 +36,11 @@ use crate::rules::utf16_token_span;
 /// into the synthetic SDK face is core, a workspace binding shadows
 /// it, which under-reports a shadowing import. Message:
 /// `diagnostic.g.dart` `noopPrimitiveOperations`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "noop_primitive_operations",
-    group: Group::Standalone,
-    problem: "The expression has no effect and can be removed.",
-    correction: "Try removing the expression.",
-    kinds: &[NodeKind::Send, NodeKind::StringLiteral],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "noop_primitive_operations",
+    &[NodeKind::Send, NodeKind::StringLiteral],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

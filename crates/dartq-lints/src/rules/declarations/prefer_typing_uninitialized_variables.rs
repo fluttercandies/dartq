@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_typing_uninitialized_variables.dart:31-51`
 /// — an untyped declaration (`node.type == null`) with an uninitialized
@@ -7,14 +7,11 @@ use super::{Check, Group, NodeKind, RuleSpec};
 /// `diagnostic.g.dart:2839/2852`). The type is the child before the
 /// first variable (`NoType` = absent). Core set of
 /// upstream `package:lints` (`lib/core.yaml`).
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_typing_uninitialized_variables",
-    group: Group::Core,
-    problem: "An uninitialized variable should have an explicit type annotation.",
-    correction: "Try adding a type annotation.",
-    kinds: &[NodeKind::VariablesDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_typing_uninitialized_variables",
+    &[NodeKind::VariablesDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

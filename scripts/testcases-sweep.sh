@@ -92,6 +92,16 @@
 #        DARTQ_CMD              dartq side template; default
 #                               "./target/release/dartq analyze
 #                               --format=json --sdk <DARTQ_DART_SDK>".
+#        DARTQ_SWEEP_EXCLUDE    optional file of corpus-relative .dart paths
+#                               (one per line, relative to the scanned corpus
+#                               root) deleted from the staging clone before
+#                               the differential. Purpose: crash isolation —
+#                               a file that aborts the dartq side (panic /
+#                               stack overflow) would otherwise void the
+#                               whole face. Exclusions are recorded in
+#                               versions.tsv; both sides see the identical
+#                               reduced set, so exclusions are agreed
+#                               silence, never one-sided loss.
 #        HARNESS_BIN            default ./target/release/harness.
 set -euo pipefail
 # Locale-stable byte order for the sort/uniq summary sites (precedent: scripts/incremental-gate.sh).
@@ -295,6 +305,32 @@ config = {"configVersion": 2, "generator": "pub", "packages": packages}
 print(f"package_config: {len(packages) - 1} mapped helper package(s): "
       + ", ".join(p["name"] for p in packages[1:]))
 PY
+
+# --- face 2.5: crash isolation (optional, DARTQ_SWEEP_EXCLUDE) -------------------
+# Deletes the listed corpus-relative files from the staging clone so one
+# dartq-crashing file cannot void the face. Applied before BOTH sides run —
+# the oracle and dartq see the identical reduced set. Every removed file is
+# recorded in versions.tsv; a listed path missing from staging is an error,
+# never a silent skip.
+if [ -n "${DARTQ_SWEEP_EXCLUDE:-}" ]; then
+  if [ ! -f "$DARTQ_SWEEP_EXCLUDE" ]; then
+    echo "testcases-sweep: DARTQ_SWEEP_EXCLUDE=$DARTQ_SWEEP_EXCLUDE is not a file" >&2
+    exit 2
+  fi
+  excluded=0
+  while IFS= read -r rel; do
+    [ -z "$rel" ] && continue
+    target="$STAGE_CORPUS/$rel"
+    if [ ! -f "$target" ]; then
+      echo "testcases-sweep: excluded file not found in staging: $rel" >&2
+      exit 2
+    fi
+    rm -f "$target"
+    excluded=$((excluded + 1))
+    printf 'excluded_file\t%s\n' "$rel" >>"$MANIFEST"
+  done <"$DARTQ_SWEEP_EXCLUDE"
+  echo "testcases-sweep: excluded $excluded dartq-crashing file(s) from staging (see versions.tsv)"
+fi
 
 # --- face 3: differential -------------------------------------------------------
 # harness exit codes: 0 pass, 1 divergences found (discovery — cases

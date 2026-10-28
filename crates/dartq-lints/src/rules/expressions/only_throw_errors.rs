@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/only_throw_errors.dart`
 /// — a `throw` whose expression is a literal reports at the expression
@@ -12,14 +12,11 @@ use super::{Check, Group, NodeKind, RuleSpec};
 /// operands (identifiers, invocations) stay silent, and a user
 /// `Exception` subclass construction under-reports the same way.
 /// Message: `diagnostic.g.dart` `onlyThrowErrors`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "only_throw_errors",
-    group: Group::Standalone,
-    problem: "Don't throw instances of classes that don't extend either 'Exception' or 'Error'.",
-    correction: "Try throwing a different class of object.",
-    kinds: &[NodeKind::ThrowExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "only_throw_errors",
+    &[NodeKind::ThrowExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The production tiling: throw is a childless adopted container

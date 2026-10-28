@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, slice, static_type_faces as faces};
+use super::{Check, NodeKind, RuleSpec, slice, static_type_faces as faces};
 use crate::rules::{type_face, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -12,14 +12,11 @@ use crate::rules::{type_face, utf16_token_span};
 /// (documented, under-report): an operand without a static-type face
 /// (a chain, a creation, a literal) stays silent. Message:
 /// `diagnostic.g.dart` `castNullableToNonNullable`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "cast_nullable_to_non_nullable",
-    group: Group::Standalone,
-    problem: "Don't cast a nullable value to a non-nullable type.",
-    correction: "Try adding a not-null assertion ('!') to make the type non-nullable.",
-    kinds: &[NodeKind::AsExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "cast_nullable_to_non_nullable",
+    &[NodeKind::AsExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

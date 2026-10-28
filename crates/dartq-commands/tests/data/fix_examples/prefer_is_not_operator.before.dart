@@ -1,0 +1,1 @@
+var b = !('is' is int);

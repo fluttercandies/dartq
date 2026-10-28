@@ -6723,6 +6723,8 @@ mod tests {
             RequestId::Num(id),
             Request::Impact {
                 target,
+                symbols: Vec::new(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 agent: None,
                 context: None,
@@ -9827,6 +9829,7 @@ mod tests {
             RequestId::Num(2),
             Request::Explain {
                 symbol: "main".into(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 since: None,
                 sdk: None,
@@ -9844,6 +9847,7 @@ mod tests {
             RequestId::Num(3),
             Request::Explain {
                 symbol: "main".into(),
+                format: None,
                 verbosity: Verbosity::Compact,
                 since: None,
                 sdk: Some(workspace.path("no-such-sdk")),

@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, slice};
+use super::{Check, NodeKind, RuleSpec, slice};
 use crate::rules::{first_child, last_child};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_null_aware_assignments.dart:42-49`
@@ -12,14 +12,11 @@ use crate::rules::{first_child, last_child};
 /// `x[0] ??= null`, whose write element is not a setter upstream) report,
 /// matching the official branch. Message: `diagnostic.g.dart`
 /// `unnecessaryNullAwareAssignments`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_null_aware_assignments",
-    group: Group::Recommended,
-    problem: "Unnecessary assignment of 'null'.",
-    correction: "Try removing the assignment.",
-    kinds: &[NodeKind::Assignment],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_null_aware_assignments",
+    &[NodeKind::Assignment],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

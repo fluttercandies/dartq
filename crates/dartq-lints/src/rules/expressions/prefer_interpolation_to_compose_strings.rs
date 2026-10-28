@@ -1,6 +1,6 @@
 use dartq_scanner::TokenKind;
 
-use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
+use super::{Check, NodeKind, RuleSpec, same_file, slice};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_interpolation_to_compose_strings.dart:32-88`
 /// — an adjacent `(literal, value)` pair in a `+` chain reports over the
@@ -26,14 +26,11 @@ use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
 /// pairs pass verbatim (:70-75); a `toString` invocation with arguments
 /// passes (:78-82). Message: `diagnostic.g.dart`
 /// `preferInterpolationToComposeStrings`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_interpolation_to_compose_strings",
-    group: Group::Recommended,
-    problem: "Use interpolation to compose strings and values.",
-    correction: "Try using string interpolation to build the composite string.",
-    kinds: &[NodeKind::BinaryExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_interpolation_to_compose_strings",
+    &[NodeKind::BinaryExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

@@ -1,4 +1,4 @@
-use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec, query_site};
+use super::{Check, NONE_TOKEN, NodeKind, RuleSpec, query_site};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/literal_only_boolean_expressions.dart`
 /// — a `do`/`for`/`if`/`while` condition (or a `when` guard) composed
@@ -34,18 +34,15 @@ use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec, query_site};
 /// type-position binding, so a type parameter is undecidable from an
 /// unresolvable name and both keep silent). Message: `diagnostic.g.dart`
 /// `literalOnlyBooleanExpressions`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "literal_only_boolean_expressions",
-    group: Group::Standalone,
-    problem: "The Boolean expression has a constant value.",
-    correction: "Try changing the expression.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "literal_only_boolean_expressions",
+    &[
         NodeKind::ParenthesizedCondition,
         NodeKind::ForParts,
         NodeKind::SwitchCaseWhenClause,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

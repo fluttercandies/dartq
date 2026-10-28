@@ -20,7 +20,7 @@ use crate::comments::Comment;
 use dartq_ast::NodeKind;
 
 use crate::engine::Check;
-use crate::registry::{Group, RuleSpec};
+use crate::registry::RuleSpec;
 use crate::rules::NONE_TOKEN;
 
 /// The domain's incoming registrations: a new standalone rule appends its
@@ -56,23 +56,18 @@ pub(crate) const DOC_KINDS: &[NodeKind] = &[
 ];
 
 pub(crate) mod slash_for_doc_comments {
-    use super::{
-        Check, DOC_KINDS, Group, NodeKind, RuleSpec, comment_lexeme, doc_group, group_span_utf16,
-    };
+    use super::{Check, DOC_KINDS, NodeKind, RuleSpec, comment_lexeme, doc_group, group_span_utf16};
 
     /// Official: `pkg/linter/lib/src/rules/slash_for_doc_comments.dart:26-30`
     /// — a Java-style (`/** ... */`) doc comment on a registered declaration
     /// reports at the whole doc comment. `isJavaStyle` (:22-24) checks the
     /// first doc token's lexeme. Message: `diagnostic.g.dart`
     /// `slashForDocComments`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "slash_for_doc_comments",
-        group: Group::Recommended,
-        problem: "Use the end-of-line form ('///') for doc comments.",
-        correction: "Try rewriting the comment to use '///'.",
-        kinds: DOC_KINDS,
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "slash_for_doc_comments",
+    DOC_KINDS,
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -108,7 +103,7 @@ pub(crate) mod slash_for_doc_comments {
 }
 
 pub(crate) mod unintended_html_in_doc_comment {
-    use super::{Check, Comment, Group, NodeKind, RuleSpec, comment_lexeme, is_doc_form};
+    use super::{Check, Comment, NodeKind, RuleSpec, comment_lexeme, is_doc_form};
 
     /// Official: `pkg/linter/lib/src/rules/unintended_html_in_doc_comment.dart:118-186`
     /// — doc-comment lines are scanned for angle-bracket text that Markdown
@@ -132,14 +127,11 @@ pub(crate) mod unintended_html_in_doc_comment {
     /// declaration/directive doc groups (the official dispatch is the
     /// `Comment` AST node, i.e. documentation comments only). Message:
     /// `diagnostic.g.dart` `unintendedHtmlInDocComment`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "unintended_html_in_doc_comment",
-        group: Group::Core,
-        problem: "Angle brackets will be interpreted as HTML.",
-        correction: "Try using backticks around the content with angle brackets, or try replacing `<` with `&lt;` and `>` with `&gt;`.",
-        kinds: &[NodeKind::CompilationUnit],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unintended_html_in_doc_comment",
+    &[NodeKind::CompilationUnit],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         // The official face is per documentation comment
@@ -585,10 +577,7 @@ pub(crate) mod unintended_html_in_doc_comment {
 }
 
 pub(crate) mod dangling_library_doc_comments {
-    use super::{
-        Check, Comment, Group, NodeKind, RuleSpec, blank_between, comment_span_utf16,
-        group_span_utf16, is_doc_form, line_of,
-    };
+    use super::{Check, Comment, NodeKind, RuleSpec, blank_between, comment_span_utf16, group_span_utf16, is_doc_form, line_of};
 
     /// Official: `pkg/linter/lib/src/rules/dangling_library_doc_comments.dart:42-134`
     /// — a doc comment that reads like library documentation reports. The
@@ -606,14 +595,11 @@ pub(crate) mod dangling_library_doc_comments {
     /// runs over every comment attached to the declaration's begin token
     /// (:112-131).
     /// Message: `diagnostic.g.dart` `danglingLibraryDocComments`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "dangling_library_doc_comments",
-        group: Group::Core,
-        problem: "Dangling library doc comment.",
-        correction: "Add a 'library' directive after the library comment.",
-        kinds: &[NodeKind::CompilationUnit],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "dangling_library_doc_comments",
+    &[NodeKind::CompilationUnit],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -744,7 +730,7 @@ pub(crate) mod dangling_library_doc_comments {
 }
 
 pub(crate) mod document_ignores {
-    use super::{Check, Group, NodeKind, RuleSpec, comment_lexeme};
+    use super::{Check, NodeKind, RuleSpec, comment_lexeme};
 
     /// Official: `pkg/linter/lib/src/rules/document_ignores.dart:59-104` —
     /// an `// ignore:`/`// ignore_for_file:` comment citing at least one
@@ -756,14 +742,11 @@ pub(crate) mod document_ignores {
     /// the trailing [`IgnoredDiagnosticComment`] — documents the ignore.
     /// An empty citation (`// ignore:` or `// ignore: 42`) never reports.
     /// Message: `diagnostic.g.dart` `documentIgnores`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "document_ignores",
-        group: Group::Standalone,
-        problem: "Missing documentation explaining why the diagnostic is ignored.",
-        correction: "Try adding a comment immediately above the ignore comment.",
-        kinds: &[NodeKind::CompilationUnit],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "document_ignores",
+    &[NodeKind::CompilationUnit],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         for comment in c.comments.all() {
@@ -937,7 +920,7 @@ pub(crate) mod document_ignores {
 }
 
 pub(crate) mod flutter_style_todos {
-    use super::{Check, Group, NodeKind, RuleSpec, comment_lexeme};
+    use super::{Check, NodeKind, RuleSpec, comment_lexeme};
 
     /// Official: `pkg/linter/lib/src/rules/flutter_style_todos.dart:24-84`
     /// — a comment whose lexeme starts with the trigger face (`//+`, one
@@ -947,14 +930,11 @@ pub(crate) mod flutter_style_todos {
     /// (`String.startsWith`), so a `TODO` after other text never fires and
     /// `/// TODO(…)…` reports (the expected `//` cannot cross the third
     /// slash). Message: `diagnostic.g.dart` `flutterStyleTodos`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "flutter_style_todos",
-        group: Group::Standalone,
-        problem: "To-do comment doesn't follow the Flutter style.",
-        correction: "Try following the Flutter style for to-do comments.",
-        kinds: &[NodeKind::CompilationUnit],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "flutter_style_todos",
+    &[NodeKind::CompilationUnit],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         for comment in c.comments.all() {
@@ -1049,7 +1029,7 @@ pub(crate) mod flutter_style_todos {
 }
 
 pub(crate) mod missing_code_block_language_in_doc_comment {
-    use super::{Check, Comment, Group, NodeKind, RuleSpec, is_doc_form};
+    use super::{Check, Comment, NodeKind, RuleSpec, is_doc_form};
 
     /// Official: `pkg/linter/lib/src/rules/missing_code_block_language_in_doc_comment.dart:24-58`
     /// — every FENCED doc-comment code block whose info string is missing
@@ -1065,14 +1045,11 @@ pub(crate) mod missing_code_block_language_in_doc_comment {
     /// space stripped), whose length covers the whole line. Lines inside a
     /// markdown code region never open blocks. Message:
     /// `diagnostic.g.dart` `missingCodeBlockLanguageInDocComment`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "missing_code_block_language_in_doc_comment",
-        group: Group::Standalone,
-        problem: "The code block is missing a specified language.",
-        correction: "Try adding a language to the code block.",
-        kinds: &[NodeKind::CompilationUnit],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "missing_code_block_language_in_doc_comment",
+    &[NodeKind::CompilationUnit],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         // The official face is per documentation comment (`registry
@@ -1243,11 +1220,8 @@ pub(crate) mod missing_code_block_language_in_doc_comment {
 }
 
 pub(crate) mod public_member_api_docs {
-    use super::{Check, Group, NodeKind, RuleSpec, is_doc_form};
-    use crate::rules::{
-        MemberQuery, NONE_TOKEN, body_members, get_set_token, initialized_identifier_name,
-        member_annotations, member_matches, member_name, same_file_ancestors, utf16_token_span,
-    };
+    use super::{Check, NodeKind, RuleSpec, is_doc_form};
+    use crate::rules::{MemberQuery, NONE_TOKEN, body_members, get_set_token, initialized_identifier_name, member_annotations, member_matches, member_name, same_file_ancestors, utf16_token_span};
 
     /// Official: `pkg/linter/lib/src/rules/public_member_api_docs.dart` — a
     /// public declaration or member without a preceding doc comment reports
@@ -1288,12 +1262,9 @@ pub(crate) mod public_member_api_docs {
     /// at the row's head token). Primary constructors are outside the
     /// substrate (the [`DOC_KINDS`] note), so their two faces (:55-56,
     /// :251-291) stay unported.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "public_member_api_docs",
-        group: Group::Standalone,
-        problem: "Missing documentation for a public member.",
-        correction: "Try adding documentation for the member.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "public_member_api_docs",
+    &[
             NodeKind::ClassDeclaration,
             NodeKind::MixinDeclaration,
             NodeKind::NamedMixinApplication,
@@ -1309,8 +1280,8 @@ pub(crate) mod public_member_api_docs {
             NodeKind::Fields,
             NodeKind::TopLevelFields,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         // The registration gate (:37-40): the official visitors mount only
@@ -2065,10 +2036,7 @@ fn container_name(c: &Check<'_>, row: u32) -> Option<u32> {
 }
 
 pub(crate) mod comment_references {
-    use super::{
-        Check, Comment, Group, NodeKind, RuleSpec, comment_lexeme, container_name_token,
-        doc_group_of, is_doc_form,
-    };
+    use super::{Check, Comment, NodeKind, RuleSpec, comment_lexeme, container_name_token, doc_group_of, is_doc_form};
     use crate::comments::CommentKind;
     use dartq_parser::IdentifierContext;
     use dartq_source::StringId;
@@ -2140,14 +2108,11 @@ pub(crate) mod comment_references {
     /// (the official leaves its own skip as an open note at :50-52) and
     /// link definitions do not exempt keywords. Message: `diagnostic.g.dart`
     /// `commentReferences`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "comment_references",
-        group: Group::Standalone,
-        problem: "The referenced name isn't visible in scope.",
-        correction: "Try adding an import for the referenced name.",
-        kinds: REFERENCE_KINDS,
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "comment_references",
+    REFERENCE_KINDS,
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         if c.kind(c.node()) == NodeKind::CompilationUnit {
@@ -2615,7 +2580,7 @@ pub(crate) mod comment_references {
 }
 
 pub(crate) mod unnecessary_ignore {
-    use crate::registry::{Group, RuleSpec};
+    use crate::registry::RuleSpec;
     use crate::rules::not_dispatched;
 
     /// Official: `pkg/linter/lib/src/rules/unnecessary_ignore.dart` — an
@@ -2647,14 +2612,11 @@ pub(crate) mod unnecessary_ignore {
     /// promotion this name joins `STRUCTURALLY_SILENT`
     /// (`tests/registry_pin.rs`) beside the freeze regen — the freeze flip
     /// stays the serial-phase step gated on the differential.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "unnecessary_ignore",
-        group: Group::Standalone,
-        problem: "The diagnostic '{0}' isn't produced at this location so it doesn't need to be ignored.",
-        correction: "Try removing the ignore comment.",
-        kinds: &[],
-        check: not_dispatched,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_ignore",
+    &[],
+    not_dispatched,
+);
 }
 
 #[cfg(test)]

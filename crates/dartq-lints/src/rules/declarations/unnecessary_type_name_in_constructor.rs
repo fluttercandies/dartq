@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, type_name_echo};
+use super::{Check, NodeKind, RuleSpec, type_name_echo};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_type_name_in_constructor.dart`
 /// — every constructor declaration reports at its type name (:32-43),
@@ -11,16 +11,13 @@ use super::{Check, Group, NodeKind, RuleSpec, type_name_echo};
 /// ([`type_name_echo`]; a recovered no-name head falls back to the row
 /// head). Message: `diagnostic.g.dart`
 /// `unnecessaryTypeNameInConstructor`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_type_name_in_constructor",
-    group: Group::Standalone,
-    problem: "Unnecessary type name in a constructor.",
-    correction: "Try removing the type name.",
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_type_name_in_constructor",
     // A factory is a `ConstructorDeclaration` upstream — the `C.name`
     // echo carries the same unnecessary type name (:32-43 covers both).
-    kinds: &[NodeKind::Constructor, NodeKind::Factory],
+    &[NodeKind::Constructor, NodeKind::Factory],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     if !c.unit.features.primary_constructors {

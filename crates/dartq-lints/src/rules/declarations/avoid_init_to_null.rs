@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 use crate::rules::{NONE_TOKEN, first_child};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/avoid_init_to_null.dart:59-88`
@@ -20,14 +20,11 @@ use crate::rules::{NONE_TOKEN, first_child};
 /// `VariablesDeclaration` `modifier` word; the parameter's init range is
 /// its `init_start`/`init_end` words). Message: `diagnostic.g.dart`
 /// `avoidInitToNull`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_init_to_null",
-    group: Group::Recommended,
-    problem: "Redundant initialization to 'null'.",
-    correction: "Try removing the initializer.",
-    kinds: &[NodeKind::InitializedIdentifier, NodeKind::FormalParameter],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_init_to_null",
+    &[NodeKind::InitializedIdentifier, NodeKind::FormalParameter],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     match c.kind(c.node()) {

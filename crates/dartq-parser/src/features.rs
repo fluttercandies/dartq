@@ -9,13 +9,22 @@
 //! Division of labor with the scanner (its `ScanConfig`): `triple_shift` and
 //! `augmentations` are **lexical** gates — the scanner decides whether
 //! `>>>` lexes as one token and whether `augment` is a keyword (scanner
-//! crate docs). The parser needs no fields for them: when the feature is
-//! off, the scanner hands it plain `>>`+`>` sequences and identifiers, and
-//! the ordinary grammar paths do the right thing. `patterns` and `variance`
+//! crate docs). The parser needs no field for `triple_shift`: when the
+//! feature is off, the scanner hands it plain `>>`+`>` sequences and the
+//! ordinary grammar paths do the right thing. `patterns` and `variance`
 //! are **syntactic** gates owned here.
+//!
+//! The fold is keyed by the generated registry: one pass over
+//! [`Feature::ALL`], each enabled feature applied through
+//! [`ParserFeatures::enable`] — the parser's per-feature stance table,
+//! exhaustive over the generated enum with no wildcard arm, so a
+//! re-vendored yaml entry without a parser stance fails compilation until
+//! it gets one (an explicit inert arm or a new fold bit). No field here
+//! hand-mirrors the yaml's `enabledIn`; version comparison stays in
+//! `FeatureSet::for_language_version`.
 
 use crate::listener::ExperimentalFlag;
-use dartq_language::FeatureSet;
+use dartq_language::{Feature, FeatureSet};
 
 /// Grammar variants decided once at parser construction (mirrors the
 /// official `FeatureSet` record, which is likewise a flat flag bundle).
@@ -56,21 +65,94 @@ pub struct ParserFeatures {
 }
 
 impl ParserFeatures {
+    /// The all-off fold every feature application starts from.
+    const OFF: Self = Self {
+        patterns_enabled: false,
+        variance_enabled: false,
+        primary_constructors_enabled: false,
+        augmentations_enabled: false,
+        enhanced_parts_enabled: false,
+        dot_shorthands_enabled: false,
+    };
+
     /// Folds a [`FeatureSet`] into the parser's plain flags.
     ///
-    /// Version-derived enablement comes from the registry's `enabledIn`
+    /// One pass over the generated registry (`Feature::ALL`), each
+    /// enabled feature applied through [`ParserFeatures::enable`] — the
+    /// single place a feature's parser stance lives. Version-derived
+    /// enablement comes from the registry's `enabledIn`
     /// (`FeatureSet::for_language_version`); the caller can additionally
     /// layer `--enable-experiment` opt-ins onto the set beforehand.
     #[must_use]
     pub fn from_feature_set(features: FeatureSet) -> Self {
-        Self {
-            patterns_enabled: features.is_enabled(dartq_language::Feature::Patterns),
-            variance_enabled: features.is_enabled(dartq_language::Feature::Variance),
-            primary_constructors_enabled: features
-                .is_enabled(dartq_language::Feature::PrimaryConstructors),
-            augmentations_enabled: features.is_enabled(dartq_language::Feature::Augmentations),
-            enhanced_parts_enabled: features.is_enabled(dartq_language::Feature::EnhancedParts),
-            dot_shorthands_enabled: features.is_enabled(dartq_language::Feature::DotShorthands),
+        let mut folded = Self::OFF;
+        for feature in Feature::ALL {
+            if features.is_enabled(feature) {
+                folded.enable(feature);
+            }
+        }
+        folded
+    }
+
+    /// Applies one enabled feature to the fold — the parser's stance
+    /// table, exhaustive over the generated registry enum on purpose (no
+    /// wildcard arm): a re-vendored yaml entry stops compiling here until
+    /// its parser stance is decided.
+    fn enable(&mut self, feature: Feature) {
+        match feature {
+            Feature::Patterns => self.patterns_enabled = true,
+            Feature::Variance => self.variance_enabled = true,
+            Feature::PrimaryConstructors => self.primary_constructors_enabled = true,
+            Feature::Augmentations => self.augmentations_enabled = true,
+            Feature::EnhancedParts => self.enhanced_parts_enabled = true,
+            Feature::DotShorthands => self.dot_shorthands_enabled = true,
+            // Lexical only: `triple-shift` decides in the scanner
+            // (`>>>` as one token); the parser sees its effect through
+            // the token stream (the module docs' division of labor).
+            Feature::TripleShift => {}
+            // No parser stance: the grammar surface is version-blind for
+            // these entries (the fixed 3.15 surface accepts the shipped
+            // shapes; the experimental ones have no production here), and
+            // their lint/semantic faces live in their own projections.
+            Feature::ConstFunctions
+            | Feature::Macros
+            | Feature::RecordUse
+            | Feature::DataAssets
+            | Feature::UnquotedImports
+            | Feature::InferenceUpdate4
+            | Feature::ThisPromotion
+            | Feature::StaticExtensions
+            | Feature::AnonymousMethods
+            | Feature::TestExperiment
+            | Feature::PrivateNamedParameters
+            | Feature::NativeAssets
+            | Feature::GetterSetterError
+            | Feature::SoundFlowAnalysis
+            | Feature::NullAwareElements
+            | Feature::InferenceUsingBounds
+            | Feature::WildcardVariables
+            | Feature::DigitSeparators
+            | Feature::InferenceUpdate3
+            | Feature::InlineClass
+            | Feature::InferenceUpdate2
+            | Feature::SealedClass
+            | Feature::ClassModifiers
+            | Feature::Records
+            | Feature::UnnamedLibraries
+            | Feature::AlternativeInvalidationStrategy
+            | Feature::InferenceUpdate1
+            | Feature::EnhancedEnums
+            | Feature::NamedArgumentsAnywhere
+            | Feature::SuperParameters
+            | Feature::ConstructorTearoffs
+            | Feature::GenericMetadata
+            | Feature::NonfunctionTypeAliases
+            | Feature::NonNullable
+            | Feature::ExtensionMethods
+            | Feature::ConstantUpdate2018
+            | Feature::ControlFlowCollections
+            | Feature::SetLiterals
+            | Feature::SpreadCollections => {}
         }
     }
 }
@@ -90,5 +172,64 @@ impl ExperimentalFlag {
             Self::Augmentations => dartq_language::Feature::Augmentations,
             Self::PrimaryConstructors => dartq_language::Feature::PrimaryConstructors,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fold must equal the registry's own truth, field for field, at
+    /// every version that decides differently: each bit is exactly the
+    /// `enabledIn <= version` predicate over its yaml entry (clamped at
+    /// the data horizon like every version-derived face). The matrix
+    /// brackets every shipped boundary the six stances cross; a new fold
+    /// bit without its registry truth — or a stance flip — fails here.
+    #[test]
+    fn fold_matches_the_registry_truth_across_versions() {
+        const MATRIX: [dartq_language::LanguageVersion; 9] = [
+            dartq_language::LanguageVersion::new(2, 12),
+            dartq_language::LanguageVersion::new(2, 16),
+            dartq_language::LanguageVersion::new(2, 19),
+            dartq_language::LanguageVersion::new(2, 99),
+            dartq_language::LanguageVersion::new(3, 0),
+            dartq_language::LanguageVersion::new(3, 9),
+            dartq_language::LanguageVersion::new(3, 10),
+            dartq_language::LanguageVersion::new(3, 12),
+            dartq_language::LanguageVersion::new(3, 15),
+        ];
+        let shipped = |feature: Feature, version: dartq_language::LanguageVersion| {
+            let horizon = dartq_language::NEWEST_KNOWN_VERSION;
+            let version = if version > horizon { horizon } else { version };
+            feature
+                .meta()
+                .enabled_in
+                .is_some_and(|enabled_in| version >= enabled_in)
+        };
+        for version in MATRIX {
+            let folded = ParserFeatures::from_feature_set(
+                dartq_language::FeatureSet::for_language_version(version),
+            );
+            let expected = ParserFeatures {
+                patterns_enabled: shipped(Feature::Patterns, version),
+                variance_enabled: shipped(Feature::Variance, version),
+                primary_constructors_enabled: shipped(Feature::PrimaryConstructors, version),
+                augmentations_enabled: shipped(Feature::Augmentations, version),
+                enhanced_parts_enabled: shipped(Feature::EnhancedParts, version),
+                dot_shorthands_enabled: shipped(Feature::DotShorthands, version),
+            };
+            assert_eq!(folded, expected, "parser fold drifts at {version}");
+        }
+    }
+
+    /// The explicit opt-in face: a set carrying an unshipped experiment
+    /// folds its bit on while the version-derived set keeps it off — the
+    /// two construction faces `from_feature_set` must keep distinct.
+    #[test]
+    fn experiment_opt_in_folds_only_through_the_set() {
+        let latest = dartq_language::FeatureSet::latest();
+        assert!(!ParserFeatures::from_feature_set(latest).variance_enabled);
+        let opted_in = latest.with_experiment(Feature::Variance);
+        assert!(ParserFeatures::from_feature_set(opted_in).variance_enabled);
     }
 }

@@ -36,9 +36,14 @@ pub(crate) fn narrow_u32(value: usize) -> u32 {
     value as u32
 }
 
-/// The language-feature bits a rule may query. Features the caller does not
-/// know are treated per their shipped defaults; the caller pins the bits it
-/// wants to control (e.g. from `// @dart=` / experiment config).
+/// The language-feature bits a rule may query. Derived from the library's
+/// [`dartq_language::FeatureSet`] ([`Features::from_feature_set`]) — one
+/// keyed fold over the generated registry, no hand-listed yaml mirrors —
+/// with the registration polarity carried by the gate table
+/// ([`crate::registry::REGISTRATION_GATES`]) and the in-body exemption
+/// reads below. Features the caller does not know are treated per their
+/// shipped defaults; the caller pins the bits it wants to control (e.g.
+/// from `// @dart=` / experiment config).
 #[expect(
     clippy::struct_excessive_bools,
     reason = "one independent bit per shipped language feature, mirroring the \
@@ -89,17 +94,163 @@ pub struct Features {
     pub super_parameters: bool,
 }
 
-impl Default for Features {
-    fn default() -> Self {
-        Self {
-            wildcard_variables: true,
-            enhanced_parts: false,
-            unnamed_libraries: true,
-            patterns: true,
-            primary_constructors: true,
-            null_aware_elements: true,
-            super_parameters: true,
+impl Features {
+    /// The all-off fold every feature application starts from.
+    const OFF: Self = Self {
+        wildcard_variables: false,
+        enhanced_parts: false,
+        unnamed_libraries: false,
+        patterns: false,
+        primary_constructors: false,
+        null_aware_elements: false,
+        super_parameters: false,
+    };
+
+    /// Derives the bits from a [`dartq_language::FeatureSet`] — one pass
+    /// over the generated registry (`Feature::ALL`), each enabled feature
+    /// applied through [`Features::enable`], the single place a feature's
+    /// linter-visible stance lives. The stance match is exhaustive over
+    /// the generated enum with no wildcard arm, so a re-vendored yaml
+    /// entry without a lints stance fails compilation until it gets one.
+    /// Version-derived enablement comes from the registry's `enabledIn`
+    /// (`FeatureSet::for_language_version`); the caller can additionally
+    /// layer `--enable-experiment` opt-ins onto the set beforehand.
+    #[must_use]
+    pub fn from_feature_set(set: dartq_language::FeatureSet) -> Self {
+        let mut folded = Self::OFF;
+        for feature in dartq_language::Feature::ALL {
+            if set.is_enabled(feature) {
+                folded.enable(feature);
+            }
         }
+        folded
+    }
+
+    /// Applies one enabled feature to the fold — the linter-visible stance
+    /// table, exhaustive over the generated registry enum on purpose (no
+    /// wildcard arm).
+    fn enable(&mut self, feature: dartq_language::Feature) {
+        match feature {
+            dartq_language::Feature::WildcardVariables => self.wildcard_variables = true,
+            dartq_language::Feature::EnhancedParts => self.enhanced_parts = true,
+            dartq_language::Feature::UnnamedLibraries => self.unnamed_libraries = true,
+            dartq_language::Feature::Patterns => self.patterns = true,
+            dartq_language::Feature::PrimaryConstructors => self.primary_constructors = true,
+            dartq_language::Feature::NullAwareElements => self.null_aware_elements = true,
+            dartq_language::Feature::SuperParameters => self.super_parameters = true,
+            // No linter-visible stance: no rule registration or exemption
+            // reads these entries; their parser/scanner faces live in
+            // their own projections.
+            dartq_language::Feature::Variance
+            | dartq_language::Feature::ConstFunctions
+            | dartq_language::Feature::Macros
+            | dartq_language::Feature::RecordUse
+            | dartq_language::Feature::DataAssets
+            | dartq_language::Feature::UnquotedImports
+            | dartq_language::Feature::Augmentations
+            | dartq_language::Feature::InferenceUpdate4
+            | dartq_language::Feature::ThisPromotion
+            | dartq_language::Feature::StaticExtensions
+            | dartq_language::Feature::AnonymousMethods
+            | dartq_language::Feature::TestExperiment
+            | dartq_language::Feature::PrivateNamedParameters
+            | dartq_language::Feature::DotShorthands
+            | dartq_language::Feature::NativeAssets
+            | dartq_language::Feature::GetterSetterError
+            | dartq_language::Feature::SoundFlowAnalysis
+            | dartq_language::Feature::InferenceUsingBounds
+            | dartq_language::Feature::DigitSeparators
+            | dartq_language::Feature::InferenceUpdate3
+            | dartq_language::Feature::InlineClass
+            | dartq_language::Feature::InferenceUpdate2
+            | dartq_language::Feature::SealedClass
+            | dartq_language::Feature::ClassModifiers
+            | dartq_language::Feature::Records
+            | dartq_language::Feature::AlternativeInvalidationStrategy
+            | dartq_language::Feature::InferenceUpdate1
+            | dartq_language::Feature::EnhancedEnums
+            | dartq_language::Feature::NamedArgumentsAnywhere
+            | dartq_language::Feature::ConstructorTearoffs
+            | dartq_language::Feature::GenericMetadata
+            | dartq_language::Feature::TripleShift
+            | dartq_language::Feature::NonfunctionTypeAliases
+            | dartq_language::Feature::NonNullable
+            | dartq_language::Feature::ExtensionMethods
+            | dartq_language::Feature::ConstantUpdate2018
+            | dartq_language::Feature::ControlFlowCollections
+            | dartq_language::Feature::SetLiterals
+            | dartq_language::Feature::SpreadCollections => {}
+        }
+    }
+
+    /// Whether `feature` is enabled — the keyed lookup the registration
+    /// gates evaluate ([`crate::registry`]'s gate table resolves every
+    /// entry through this face). Exhaustive over the generated enum: a
+    /// re-vendored yaml entry without a stance arm fails compilation.
+    #[must_use]
+    pub fn is_enabled(&self, feature: dartq_language::Feature) -> bool {
+        match feature {
+            dartq_language::Feature::WildcardVariables => self.wildcard_variables,
+            dartq_language::Feature::EnhancedParts => self.enhanced_parts,
+            dartq_language::Feature::UnnamedLibraries => self.unnamed_libraries,
+            dartq_language::Feature::Patterns => self.patterns,
+            dartq_language::Feature::PrimaryConstructors => self.primary_constructors,
+            dartq_language::Feature::NullAwareElements => self.null_aware_elements,
+            dartq_language::Feature::SuperParameters => self.super_parameters,
+            // No linter-visible bit: the feature gates no rule and no
+            // exemption, so its enabled answer is immaterial — `false`
+            // keeps a stray `Gate::Feature` entry on it structurally
+            // silent (the table's own startup arm names its rules).
+            dartq_language::Feature::Variance
+            | dartq_language::Feature::ConstFunctions
+            | dartq_language::Feature::Macros
+            | dartq_language::Feature::RecordUse
+            | dartq_language::Feature::DataAssets
+            | dartq_language::Feature::UnquotedImports
+            | dartq_language::Feature::Augmentations
+            | dartq_language::Feature::InferenceUpdate4
+            | dartq_language::Feature::ThisPromotion
+            | dartq_language::Feature::StaticExtensions
+            | dartq_language::Feature::AnonymousMethods
+            | dartq_language::Feature::TestExperiment
+            | dartq_language::Feature::PrivateNamedParameters
+            | dartq_language::Feature::DotShorthands
+            | dartq_language::Feature::NativeAssets
+            | dartq_language::Feature::GetterSetterError
+            | dartq_language::Feature::SoundFlowAnalysis
+            | dartq_language::Feature::InferenceUsingBounds
+            | dartq_language::Feature::DigitSeparators
+            | dartq_language::Feature::InferenceUpdate3
+            | dartq_language::Feature::InlineClass
+            | dartq_language::Feature::InferenceUpdate2
+            | dartq_language::Feature::SealedClass
+            | dartq_language::Feature::ClassModifiers
+            | dartq_language::Feature::Records
+            | dartq_language::Feature::AlternativeInvalidationStrategy
+            | dartq_language::Feature::InferenceUpdate1
+            | dartq_language::Feature::EnhancedEnums
+            | dartq_language::Feature::NamedArgumentsAnywhere
+            | dartq_language::Feature::ConstructorTearoffs
+            | dartq_language::Feature::GenericMetadata
+            | dartq_language::Feature::TripleShift
+            | dartq_language::Feature::NonfunctionTypeAliases
+            | dartq_language::Feature::NonNullable
+            | dartq_language::Feature::ExtensionMethods
+            | dartq_language::Feature::ConstantUpdate2018
+            | dartq_language::Feature::ControlFlowCollections
+            | dartq_language::Feature::SetLiterals
+            | dartq_language::Feature::SpreadCollections => false,
+        }
+    }
+}
+
+impl Default for Features {
+    /// The latest shipped posture — derived from
+    /// [`dartq_language::FeatureSet::latest`], never hand-listed: every
+    /// feature with `enabledIn` at or below the registry's current version
+    /// folds on (the experimental entries stay off).
+    fn default() -> Self {
+        Self::from_feature_set(dartq_language::FeatureSet::latest())
     }
 }
 
@@ -123,10 +274,11 @@ pub struct Unit<'a> {
     /// settled face [`Features`] derives from, mounted by assignment at the
     /// caller's hand-off (`unit.version = …`, the [`Unit::workspace`]
     /// shape). The version-gated registrations
-    /// (`crate::registry::VERSION_GATES`) consult it once per run. `None`
-    /// — a caller without a settled face (bare test fixtures) — applies no
-    /// gate: the official posture for a library with no version info is the
-    /// latest default, which admits every current gate.
+    /// (`crate::registry::REGISTRATION_GATES`) consult it once per run.
+    /// `None` — a caller without a settled face (bare test fixtures) —
+    /// applies no version gate: the official posture for a library with no
+    /// version info is the latest default, which admits every current
+    /// gate.
     pub version: Option<dartq_language::LanguageVersion>,
     /// The containing-package facts the pub-aware rules read
     /// ([`WorkspaceFacts`]). `None` — outside any known package, or where
@@ -539,24 +691,23 @@ fn run_semantics(
         Some(root) if enabled != &EnableSet::none() => root,
         _ => return Vec::new(),
     };
-    // The registration version gate: the rules whose upstream registration
-    // consults the library's settled language version join the run only
-    // when the carried version admits them. One filtered copy per run —
-    // the per-node dispatch keeps testing bits.
-    let enabled = match unit.version {
-        Some(version) => crate::registry::version_gated(enabled, version),
-        None => *enabled,
-    };
+    // The registration consult: feature- and version-gated rules join the
+    // run only when the unit's faces admit them — every upstream
+    // `isFeatureEnabled` registration bail plus the version gates live in
+    // one table ([`crate::registry::REGISTRATION_GATES`], resolved
+    // against `unit.features`/`unit.version` here). One filtered copy per
+    // run — the per-node dispatch keeps testing bits.
+    let enabled = crate::registry::registration_gated(enabled, &unit.features, unit.version);
     let comments = Comments::extract(unit.source, unit.tokens);
     let ignore = IgnoreInfo::parse(unit.source, &comments);
     let suppressed = core::cell::RefCell::new(Vec::new());
     // The wildcard table is collected inside the same DFS (one `Identifier`
     // kind test per node) and only when the one rule that reads it runs —
     // the rule registers only with the wildcard feature OFF
-    // (no_wildcard_variable_uses.dart:36-38).
-    let no_wildcard = rule_by_name("no_wildcard_variable_uses")
-        .is_some_and(|id| enabled.is_enabled(id))
-        && !unit.features.wildcard_variables;
+    // (no_wildcard_variable_uses.dart:36-38), a polarity the gate table
+    // already carried into `enabled`.
+    let no_wildcard =
+        rule_by_name("no_wildcard_variable_uses").is_some_and(|id| enabled.is_enabled(id));
     let mut wildcards: Vec<WildcardScope> = Vec::new();
 
     let mut out = Vec::new();
@@ -2387,5 +2538,78 @@ void f(int x) {
         let lints = f.run_semantic(&one_rule("noop_primitive_operations"));
         assert_eq!(lints.len(), 2, "{lints:?}");
         assert_ne!(lints[0].range, lints[1].range);
+    }
+
+    /// The `Features` fold must equal the registry's own truth, bit for
+    /// bit, at every version that decides differently: each bit is
+    /// exactly the `enabledIn <= version` predicate over its yaml entry
+    /// (clamped at the data horizon like every version-derived face), and
+    /// the default is the latest-version fold. The matrix brackets every
+    /// shipped boundary the seven stances cross; a new stance bit without
+    /// its registry truth — or a flip — fails here.
+    #[test]
+    fn features_fold_matches_the_registry_truth_across_versions() {
+        use dartq_language::{Feature, FeatureSet, LanguageVersion, NEWEST_KNOWN_VERSION};
+        const MATRIX: [LanguageVersion; 8] = [
+            LanguageVersion::new(2, 12),
+            LanguageVersion::new(2, 16),
+            LanguageVersion::new(2, 18),
+            LanguageVersion::new(2, 19),
+            LanguageVersion::new(3, 0),
+            LanguageVersion::new(3, 6),
+            LanguageVersion::new(3, 7),
+            LanguageVersion::new(3, 8),
+        ];
+        let shipped = |feature: Feature, version: LanguageVersion| {
+            let version = if version > NEWEST_KNOWN_VERSION {
+                NEWEST_KNOWN_VERSION
+            } else {
+                version
+            };
+            feature
+                .meta()
+                .enabled_in
+                .is_some_and(|enabled_in| version >= enabled_in)
+        };
+        for version in MATRIX {
+            let folded = Features::from_feature_set(FeatureSet::for_language_version(version));
+            let expected = Features {
+                wildcard_variables: shipped(Feature::WildcardVariables, version),
+                enhanced_parts: shipped(Feature::EnhancedParts, version),
+                unnamed_libraries: shipped(Feature::UnnamedLibraries, version),
+                patterns: shipped(Feature::Patterns, version),
+                primary_constructors: shipped(Feature::PrimaryConstructors, version),
+                null_aware_elements: shipped(Feature::NullAwareElements, version),
+                super_parameters: shipped(Feature::SuperParameters, version),
+            };
+            assert_eq!(folded, expected, "Features fold drifts at {version}");
+            // The keyed lookup agrees with the registry truth on every
+            // stanced feature (its inert arms answer `false` by stance,
+            // pinned by the gate-resolution test in `registry`).
+            for feature in [
+                Feature::WildcardVariables,
+                Feature::EnhancedParts,
+                Feature::UnnamedLibraries,
+                Feature::Patterns,
+                Feature::PrimaryConstructors,
+                Feature::NullAwareElements,
+                Feature::SuperParameters,
+            ] {
+                assert_eq!(
+                    folded.is_enabled(feature),
+                    shipped(feature, version),
+                    "is_enabled drifts from the registry truth at {version}"
+                );
+            }
+        }
+        // The default is the latest-version fold, and the horizon clamp
+        // keeps everything past the vendored data at the latest posture.
+        assert_eq!(Features::default(), Features::from_feature_set(FeatureSet::latest()));
+        assert_eq!(
+            Features::from_feature_set(FeatureSet::for_language_version(
+                LanguageVersion::new(3, 15)
+            )),
+            Features::default(),
+        );
     }
 }

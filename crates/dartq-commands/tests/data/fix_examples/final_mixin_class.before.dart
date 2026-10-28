@@ -1,0 +1,1 @@
+final mixin class C {}

@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, slice, value_run_end};
+use super::{Check, NodeKind, RuleSpec, slice, value_run_end};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/avoid_null_checks_in_equality_operators.dart`
 /// — inside an `operator ==` whose single parameter is nullable, the
@@ -31,14 +31,11 @@ use super::{Check, Group, NodeKind, RuleSpec, slice, value_run_end};
 /// bare property's receiver group does — so `other?.foo.bar()` fires
 /// on `other?.foo` alone. Message: `diagnostic.g.dart`
 /// `avoidNullChecksInEqualityOperators`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_null_checks_in_equality_operators",
-    group: Group::Standalone,
-    problem: "Unnecessary null comparison in implementation of '=='.",
-    correction: "Try removing the comparison.",
-    kinds: &[NodeKind::BinaryExpression, NodeKind::DotAccess],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_null_checks_in_equality_operators",
+    &[NodeKind::BinaryExpression, NodeKind::DotAccess],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let Some((method, param)) = equality_parameter(c) else {

@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
 
 /// Official: `upstream Dart SDK source,
 /// pkg/linter/lib/src/rules/use_truncating_division.dart` — a `/`
@@ -20,14 +20,11 @@ use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_fac
 /// under-report): a non-`int`, unresolved, or compound operand, a
 /// user-declared `/` (the dart:core element face), and a
 /// non-parenthesized division stay silent.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "use_truncating_division",
-    group: Group::Standalone,
-    problem: "Use truncating division.",
-    correction: "Try using truncating division, '~/', instead of regular division ('/') followed by 'toInt()'.",
-    kinds: &[NodeKind::BinaryExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_truncating_division",
+    &[NodeKind::BinaryExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let Some(analysis) = c.semantics() else {

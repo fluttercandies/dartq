@@ -1,118 +1,31 @@
-//! The first-party lint documentation table: which registered lint codes
-//! carry a published docs page, the one fact the JSON face's
-//! `documentation` field keys on for lint rows.
+//! The first-party lint documentation table: which lint codes carry a
+//! published docs page, the one fact the JSON face's `documentation`
+//! field keys on for lint rows (#2676: derived — the rows come from the
+//! generated table `tools/upstream-gen`'s `linter-meta-gen` emits from
+//! `pkg/linter/messages.yaml` of the pinned SDK tree, one row per
+//! first-party linter rule; `--check` byte-compares it in CI).
 //!
 //! Upstream truth (`LinterLintCode.url`, upstream Dart SDK source,
 //! `pkg/linter/lib/src/lint_codes.dart`): every first-party lint code has
 //! a URL — `https://dart.dev/diagnostics/<name>` when the code is
 //! `hasPublishedDocs: true`, else `https://dart.dev/lints/<name>` — unlike
 //! analyzer codes, whose `url` is null unless published
-//! (`_fe_analyzer_shared` `errors.dart`). The `hasPublishedDocs` flag per
-//! code is captured from the generated upstream code table
-//! (`pkg/linter/lib/src/diagnostic.g.dart`, dart 3.15 main pin); a name
-//! carried by several codes resolves by its base code (`uniqueName ==
-//! name`), which agrees with the any-published fold for every colliding
-//! name. The table covers the full registered lint universe (the same
-//! universe the options faces validate against): a lint-typed row whose
-//! code is absent here is not a first-party linter code — plugin codes
-//! take no `documentation` (the analyzer's own `LintCode.url` is null) —
-//! and dartq-own codes never spell `DiagnosticType::Lint`.
+//! (`_fe_analyzer_shared` `errors.dart`). A family's flag folds
+//! any-variant (upstream mixes flags within one shared name —
+//! `always_specify_types`); the universe is every first-party linter rule
+//! of the pinned tree, the same universe the options faces validate
+//! against: a lint-typed row whose code is absent here is not a
+//! first-party linter code — plugin codes take no `documentation` (the
+//! analyzer's own `LintCode.url` is null) — and dartq-own codes never
+//! spell `DiagnosticType::Lint`.
 //!
 //! Version-pinned data like `crate::code`'s generated table: sorted by
 //! name, membership and flag read by one binary search.
 
 /// One lint code's documentation fact: the rule name and whether the
-/// upstream code is `hasPublishedDocs: true`.
-static LINT_DOCS: &[(&str, bool)] = &[
-    ("always_declare_return_types", true), ("always_put_control_body_on_new_line", true), ("always_put_required_named_parameters_first", true),
-    ("always_require_non_null_named_parameters", false), ("always_specify_types", true), ("always_use_package_imports", true),
-    ("annotate_overrides", true), ("annotate_redeclares", true), ("async_return_with_no_await", true),
-    ("avoid_annotating_with_dynamic", true), ("avoid_as", false), ("avoid_bool_literals_in_conditional_expressions", true),
-    ("avoid_catches_without_on_clauses", true), ("avoid_catching_errors", false), ("avoid_classes_with_only_static_members", false),
-    ("avoid_double_and_int_checks", true), ("avoid_dynamic_calls", true), ("avoid_empty_else", true),
-    ("avoid_equals_and_hash_code_on_mutable_classes", false), ("avoid_escaping_inner_quotes", false), ("avoid_field_initializers_in_const_classes", false),
-    ("avoid_final_parameters", true), ("avoid_function_literals_in_foreach_calls", true), ("avoid_futureor_void", true),
-    ("avoid_implementing_value_types", false), ("avoid_init_to_null", true), ("avoid_js_rounded_ints", true),
-    ("avoid_multiple_declarations_per_line", false), ("avoid_null_checks_in_equality_operators", false), ("avoid_positional_boolean_parameters", true),
-    ("avoid_print", true), ("avoid_private_typedef_functions", false), ("avoid_redundant_argument_values", true),
-    ("avoid_relative_lib_imports", true), ("avoid_renaming_method_parameters", true), ("avoid_return_types_on_setters", true),
-    ("avoid_returning_null", false), ("avoid_returning_null_for_future", false), ("avoid_returning_null_for_void", true),
-    ("avoid_returning_this", false), ("avoid_setters_without_getters", false), ("avoid_shadowing_type_parameters", true),
-    ("avoid_single_cascade_in_expression_statements", true), ("avoid_slow_async_io", true), ("avoid_type_to_string", true),
-    ("avoid_types_as_parameter_names", true), ("avoid_types_on_closure_parameters", true), ("avoid_unnecessary_containers", true),
-    ("avoid_unstable_final_fields", false), ("avoid_unused_constructor_parameters", true), ("avoid_void_async", false),
-    ("avoid_web_libraries_in_flutter", true), ("await_only_futures", true), ("camel_case_extensions", true),
-    ("camel_case_types", true), ("cancel_subscriptions", true), ("cascade_invocations", false),
-    ("cast_nullable_to_non_nullable", false), ("close_sinks", true), ("collection_methods_unrelated_type", true),
-    ("combinators_ordering", false), ("comment_references", false), ("conditional_uri_does_not_exist", false),
-    ("constant_identifier_names", true), ("control_flow_in_finally", true), ("curly_braces_in_flow_control_structures", true),
-    ("dangling_library_doc_comments", true), ("depend_on_referenced_packages", true), ("deprecated_consistency", false),
-    ("deprecated_member_use_from_same_package", false), ("diagnostic_describe_all_properties", true), ("directives_ordering", false),
-    ("discarded_futures", false), ("do_not_use_environment", false), ("document_ignores", false),
-    ("empty_catches", true), ("empty_constructor_bodies", true), ("empty_container_bodies", true),
-    ("empty_statements", true), ("enable_null_safety", false), ("eol_at_end_of_file", false),
-    ("erase_dart_type_extension_types", false), ("exhaustive_cases", true), ("file_names", true),
-    ("flutter_style_todos", false), ("hash_and_equals", true), ("implementation_imports", true),
-    ("implicit_call_tearoffs", true), ("implicit_reopen", false), ("initialize_in_field_declaration", true),
-    ("invalid_case_patterns", false), ("invalid_runtime_check_with_js_interop_types", true), ("invariant_booleans", false),
-    ("iterable_contains_unrelated_type", false), ("join_return_with_assignment", false), ("leading_newlines_in_multiline_strings", false),
-    ("library_annotations", true), ("library_names", true), ("library_prefixes", true),
-    ("library_private_types_in_public_api", true), ("lines_longer_than_80_chars", false), ("list_remove_unrelated_type", false),
-    ("literal_only_boolean_expressions", true), ("matching_super_parameters", false), ("migrate_design_widgets", false),
-    ("missing_code_block_language_in_doc_comment", false), ("missing_whitespace_between_adjacent_strings", true), ("no_adjacent_strings_in_list", true),
-    ("no_default_cases", true), ("no_duplicate_case_values", true), ("no_dynamic_casts", false),
-    ("no_leading_underscores_for_library_prefixes", true), ("no_leading_underscores_for_local_identifiers", true), ("no_literal_bool_comparisons", false),
-    ("no_logic_in_create_state", true), ("no_raw_types", true), ("no_runtimetype_tostring", false),
-    ("no_self_assignments", false), ("no_wildcard_variable_uses", true), ("non_constant_identifier_names", true),
-    ("noop_primitive_operations", false), ("null_check_on_nullable_type_parameter", true), ("null_closures", false),
-    ("omit_local_variable_types", false), ("omit_obvious_local_variable_types", false), ("omit_obvious_property_types", false),
-    ("one_member_abstracts", false), ("only_throw_errors", true), ("overridden_fields", true),
-    ("package_api_docs", false), ("package_names", true), ("package_prefixed_library_names", true),
-    ("parameter_assignments", true), ("prefer_adjacent_string_concatenation", true), ("prefer_asserts_in_initializer_lists", true),
-    ("prefer_asserts_with_message", true), ("prefer_bool_in_asserts", false), ("prefer_collection_literals", true),
-    ("prefer_conditional_assignment", true), ("prefer_const_constructors", true), ("prefer_const_constructors_in_immutables", true),
-    ("prefer_const_declarations", true), ("prefer_const_literals_to_create_immutables", true), ("prefer_constructors_over_static_methods", true),
-    ("prefer_contains", true), ("prefer_double_quotes", true), ("prefer_equal_for_default_values", false),
-    ("prefer_expression_function_bodies", true), ("prefer_final_fields", true), ("prefer_final_in_for_each", true),
-    ("prefer_final_locals", true), ("prefer_final_parameters", true), ("prefer_for_elements_to_map_fromiterable", true),
-    ("prefer_foreach", true), ("prefer_function_declarations_over_variables", true), ("prefer_generic_function_type_aliases", true),
-    ("prefer_if_elements_to_conditional_expressions", true), ("prefer_if_null_operators", true), ("prefer_initializing_formals", true),
-    ("prefer_inlined_adds", true), ("prefer_int_literals", true), ("prefer_interpolation_to_compose_strings", true),
-    ("prefer_is_empty", true), ("prefer_is_not_empty", true), ("prefer_is_not_operator", true),
-    ("prefer_iterable_wheretype", true), ("prefer_mixin", false), ("prefer_null_aware_method_calls", false),
-    ("prefer_null_aware_operators", true), ("prefer_relative_imports", true), ("prefer_single_quotes", true),
-    ("prefer_spread_collections", true), ("prefer_typing_uninitialized_variables", true), ("prefer_void_to_null", true),
-    ("provide_deprecation_message", true), ("public_member_api_docs", true), ("recursive_getters", true),
-    ("remove_deprecations_in_breaking_versions", true), ("require_trailing_commas", false), ("secure_pubspec_urls", true),
-    ("simple_directive_paths", true), ("simplify_variable_pattern", true), ("sized_box_for_whitespace", true),
-    ("sized_box_shrink_expand", true), ("slash_for_doc_comments", true), ("sort_child_properties_last", true),
-    ("sort_constructors_first", true), ("sort_pub_dependencies", true), ("sort_unnamed_constructors_first", true),
-    ("specify_nonobvious_local_variable_types", false), ("specify_nonobvious_property_types", false), ("strict_top_level_inference", false),
-    ("super_goes_last", false), ("switch_on_type", true), ("test_types_in_equals", true),
-    ("throw_in_finally", true), ("tighten_type_of_initializing_formals", true), ("type_annotate_public_apis", true),
-    ("type_init_formals", true), ("type_literal_in_constant_pattern", true), ("unawaited_futures", true),
-    ("unintended_html_in_doc_comment", true), ("unnecessary_async", true), ("unnecessary_await_in_return", true),
-    ("unnecessary_brace_in_string_interps", true), ("unnecessary_breaks", true), ("unnecessary_const", true),
-    ("unnecessary_const_in_enum_constructor", true), ("unnecessary_constructor_name", true), ("unnecessary_final", true),
-    ("unnecessary_getters_setters", true), ("unnecessary_ignore", true), ("unnecessary_lambdas", true),
-    ("unnecessary_late", true), ("unnecessary_library_directive", true), ("unnecessary_library_name", true),
-    ("unnecessary_new", true), ("unnecessary_null_aware_assignments", true), ("unnecessary_null_aware_operator_on_extension_on_nullable", true),
-    ("unnecessary_null_checks", true), ("unnecessary_null_in_if_null_operators", true), ("unnecessary_nullable_for_final_variable_declarations", true),
-    ("unnecessary_overrides", true), ("unnecessary_parenthesis", true), ("unnecessary_primary_constructor_body", true),
-    ("unnecessary_raw_strings", true), ("unnecessary_statements", true), ("unnecessary_string_escapes", true),
-    ("unnecessary_string_interpolations", true), ("unnecessary_this", true), ("unnecessary_to_list_in_spreads", true),
-    ("unnecessary_type_name_in_constructor", true), ("unnecessary_unawaited", true), ("unnecessary_underscores", true),
-    ("unreachable_from_main", true), ("unrelated_type_equality_checks", true), ("unsafe_html", false),
-    ("unsafe_variance", true), ("use_build_context_synchronously", true), ("use_colored_box", true),
-    ("use_declaring_parameters", true), ("use_decorated_box", true), ("use_enums", false),
-    ("use_full_hex_values_for_flutter_colors", true), ("use_function_type_syntax_for_parameters", true), ("use_if_null_to_convert_nulls_to_bools", true),
-    ("use_is_even_rather_than_modulo", true), ("use_key_in_widget_constructors", true), ("use_late_for_private_fields_and_variables", true),
-    ("use_named_constants", true), ("use_null_aware_elements", true), ("use_primary_constructors", false),
-    ("use_raw_strings", true), ("use_rethrow_when_possible", true), ("use_setters_to_change_properties", true),
-    ("use_string_buffers", true), ("use_string_in_part_of_directives", true), ("use_super_parameters", true),
-    ("use_test_throws_matchers", false), ("use_to_and_as_if_applicable", false), ("use_truncating_division", true),
-    ("valid_regexps", true), ("var_with_no_type_annotation", true), ("void_checks", true),
-];
+/// upstream code is `hasPublishedDocs: true`. The included file is the
+/// generated row slice (single expression, the `include!` shape).
+static LINT_DOCS: &[(&str, bool)] = include!("generated/lint_docs_table.rs");
 
 /// The documentation URL prefix a first-party lint code carries, `None`
 /// when `name` is not a registered first-party linter code (plugin codes:
@@ -137,17 +50,22 @@ mod tests {
     use super::{LINT_DOCS, lint_doc_prefix};
 
     /// The capture invariants: sorted (binary search's contract), the
-    /// universe size, and the pinned prefix decisions — a published core
-    /// lint and `unnecessary_ignore` take the diagnostics page, an
-    /// unpublished code takes the lint page, an unknown/plugin code takes
-    /// none.
+    /// universe size (every first-party linter rule of the pinned tree —
+    /// the yaml carries 322 consts folding to these names), and the pinned
+    /// prefix decisions — a published core lint and `unnecessary_ignore`
+    /// take the diagnostics page, an unpublished code takes the lint page,
+    /// an unknown/plugin code takes none. The 14 rows over the old
+    /// hand-copied table are the #2676 find: `future_sync_value` and
+    /// `unnecessary_this_alias` (base codes the old capture skipped) and
+    /// the 12 internal-universe rules — every LinterLintCode carries a URL
+    /// upstream.
     #[test]
     fn lint_doc_prefix_decides_by_table_membership() {
         assert!(
             LINT_DOCS.windows(2).all(|pair| pair[0].0 < pair[1].0),
             "sorted: binary search's contract"
         );
-        assert_eq!(LINT_DOCS.len(), 264);
+        assert_eq!(LINT_DOCS.len(), 278);
         assert_eq!(
             lint_doc_prefix("avoid_empty_else"),
             Some("https://dart.dev/diagnostics/")
@@ -155,6 +73,11 @@ mod tests {
         assert_eq!(
             lint_doc_prefix("unnecessary_ignore"),
             Some("https://dart.dev/diagnostics/")
+        );
+        assert_eq!(
+            lint_doc_prefix("future_sync_value"),
+            Some("https://dart.dev/diagnostics/"),
+            "the row the hand-copied table missed"
         );
         // `always_require_non_null_named_parameters` is a removed rule with
         // no published docs page upstream.

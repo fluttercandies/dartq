@@ -1,10 +1,5 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, constructor_name_part, container_members,
-    is_deprecated_metadata, top_level_annotations, type_name_echo,
-};
-use crate::rules::{
-    NONE_TOKEN, initialized_identifier_name, member_annotations, tail_token, utf16_token_span,
-};
+use super::{Check, NodeKind, RuleSpec, constructor_name_part, container_members, is_deprecated_metadata, top_level_annotations, type_name_echo};
+use crate::rules::{NONE_TOKEN, initialized_identifier_name, member_annotations, tail_token, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/deprecated_consistency.dart:41-102`
 /// — deprecation must agree across related declarations. Three faces
@@ -22,18 +17,15 @@ use crate::rules::{
 /// the constant, `Deprecated` the class — a prefix chain's trailing
 /// segment answers). Messages: `diagnostic.g.dart`
 /// `deprecatedConsistency{Constructor,Field,Parameter}`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "deprecated_consistency",
-    group: Group::Standalone,
-    problem: "Missing deprecated annotation.",
-    correction: "",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "deprecated_consistency",
+    &[
         NodeKind::Constructor,
         NodeKind::Factory,
         NodeKind::FormalParameter,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     match c.kind(c.node()) {

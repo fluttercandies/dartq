@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, operator_name};
+use super::{Check, NodeKind, RuleSpec, operator_name};
 use crate::rules::{member_name, same_file_declaration, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_equals_and_hash_code_on_mutable_classes.dart:43-58`
@@ -21,14 +21,11 @@ use crate::rules::{member_name, same_file_declaration, utf16_token_span};
 /// metadata reports at the name where the official reports at the
 /// `get` keyword (a one-token shift on that rare shape). Message:
 /// `diagnostic.g.dart` `avoidEqualsAndHashCodeOnMutableClasses`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_equals_and_hash_code_on_mutable_classes",
-    group: Group::Standalone,
-    problem: "The method '{0}' should not be overridden in classes not annotated with '@immutable'.",
-    correction: "Try removing the override or annotating the class with '@immutable'.",
-    kinds: &[NodeKind::Method],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_equals_and_hash_code_on_mutable_classes",
+    &[NodeKind::Method],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, formal_parameter_rows};
+use super::{Check, NodeKind, RuleSpec, formal_parameter_rows};
 use crate::rules::{MemberQuery, has_override_annotation, member_matches, same_file_ancestors};
 
 /// Official: `pkg/linter/lib/src/rules/annotate_overrides.dart` — an
@@ -32,18 +32,15 @@ use crate::rules::{MemberQuery, has_override_annotation, member_matches, same_fi
 /// `name` — analyzer setter elements are named `x=` (`displayName`
 /// `x`), so a setter override renders `x=`.
 /// Message: `diagnostic.g.dart` `annotateOverrides`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "annotate_overrides",
-    group: Group::Recommended,
-    problem: "The member '{0}' overrides an inherited member but isn't annotated with '@override'.",
-    correction: "Try adding the '@override' annotation.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "annotate_overrides",
+    &[
         NodeKind::Fields,
         NodeKind::Method,
         NodeKind::PrimaryConstructor,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

@@ -1,10 +1,5 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, local_written_type, name_written_in_window,
-    utf16_token_run_span,
-};
-use crate::rules::{
-    initialized_identifier_name, last_child, utf16_token_span, variables_declaration_keyword,
-};
+use super::{Check, NodeKind, RuleSpec, local_written_type, name_written_in_window, utf16_token_run_span};
+use crate::rules::{initialized_identifier_name, last_child, utf16_token_span, variables_declaration_keyword};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_final_locals.dart:166-189`
 /// — a non-`const`/non-`final` local variable list (:167) inside a
@@ -20,14 +15,11 @@ use crate::rules::{
 /// plain reads — including inside closures — pass, matching the
 /// resolved `isPotentiallyMutatedInScope`. Message: `diagnostic.g.dart`
 /// `preferFinalLocals`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_final_locals",
-    group: Group::Standalone,
-    problem: "Local variables should be final.",
-    correction: "Try making the variable final.",
-    kinds: &[NodeKind::VariablesDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_final_locals",
+    &[NodeKind::VariablesDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

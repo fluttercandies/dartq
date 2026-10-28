@@ -106,7 +106,9 @@ pub(crate) fn run_entry(args: &RenameArgs) -> u8 {
 /// address a phantom file), the workspace assembly and the plan are the
 /// command core's, and `--write` gates, patches, and writes before the
 /// document prints.
-fn run(args: &RenameArgs, out: &mut impl Write) -> u8 {
+/// One rename run over a caller-supplied writer (`pub(crate)` for the
+/// resident tests' byte pins).
+pub(crate) fn run(args: &RenameArgs, out: &mut impl Write) -> u8 {
     let (path, anchor) = match parse_target(&args.target) {
         Ok(pair) => pair,
         Err(message) => {
@@ -121,6 +123,17 @@ fn run(args: &RenameArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
+    // The resident consult (#2629), the dry run only: the daemon answers
+    // the edit-set document over the analyzed view; `--write` routes never
+    // — the write applies through this face's own engine-local splice
+    // machinery (the drift gates read the analyzed view), which cannot be
+    // remoted.
+    if !args.write
+        && let Some(code) =
+            crate::resident::route_rename(args, &path, anchor, out)
+    {
+        return code;
+    }
     let (mut engine, dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {

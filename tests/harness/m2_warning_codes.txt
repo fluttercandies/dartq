@@ -13,10 +13,13 @@
 # severity family `dart analyze --format=machine` reports as WARNING;
 # 190 unique names at freeze time -- and intersect it with the per-bucket
 # freeze below. The pin test
-# m2_warning_codes_file_matches_derivation (tests/harness/src/main.rs)
-# derives the family live and asserts set equality against this file, so
+# freeze_check_m2_warning_codes (tests/harness/src/freeze.rs) derives the
+# family from the repo-internal analyzer registry table
+# (crates/dartq-diagnostics/data/analyzer-codes.tsv, the frozen mirror of
+# the SDK main registry) and asserts byte equality against this file, so
 # a registry drift (a name re-typed or removed) forces a conscious
-# re-freeze.
+# re-freeze; regenerate the entry block with
+#   cargo test -p harness regen_m2_warning_codes -- --ignored
 #
 # Included buckets (43 codes):
 #  (a) M1 frozen-set continuation (4): the m1_codes.txt entries whose
@@ -165,8 +168,8 @@ undefined_shown_name
 unnecessary_cast
 unnecessary_cast_pattern
 unnecessary_nan_comparison
-unnecessary_non_null_assertion
 unnecessary_no_such_method
+unnecessary_non_null_assertion
 unnecessary_null_assert_pattern
 unnecessary_null_check_pattern
 unnecessary_null_comparison

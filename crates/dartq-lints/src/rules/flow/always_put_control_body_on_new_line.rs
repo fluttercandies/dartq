@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, first_child, last_child};
+use super::{Check, NodeKind, RuleSpec, first_child, last_child};
 
 /// Official: `pkg/linter/lib/src/rules/always_put_control_body_on_new_line.dart:30-78`
 /// — a control structure's body statement on the same line as the
@@ -7,12 +7,9 @@ use super::{Check, Group, NodeKind, RuleSpec, first_child, last_child};
 /// `for`/`while` bodies and the `if` then-branch (against the closing
 /// `)`), and the `else` branch when it is not another `if` (against the
 /// `else` keyword's end). An empty block body skips (:56).
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "always_put_control_body_on_new_line",
-    group: Group::Standalone,
-    problem: "Statement should be on a separate line.",
-    correction: "Try moving the statement to a new line.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "always_put_control_body_on_new_line",
+    &[
         NodeKind::IfStatement,
         NodeKind::WhileStatement,
         NodeKind::ForStatement,
@@ -20,7 +17,7 @@ pub(crate) static SPEC: RuleSpec = RuleSpec {
         NodeKind::DoWhileStatement,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

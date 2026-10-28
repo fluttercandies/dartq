@@ -1,0 +1,21 @@
+// Ported by port_upstream from the upstream linter test file
+// (pkg/linter/test/rules, upstream Dart SDK source); regenerate
+// with the converter rather than editing. Case names are the
+// upstream test method names, verbatim. The first file block of
+// each case is the analyzed unit; later blocks are the test's
+// supporting files.
+//- lint: prefer_is_not_operator
+
+//- case: test_is_wrappedInNot
+//- file: /lib/test.dart
+
+void f(Object p) {
+  [!!(p is int)!];
+}
+
+//- case: test_isNot
+//- file: /lib/test.dart
+
+void f(Object p) {
+  p is! int;
+}

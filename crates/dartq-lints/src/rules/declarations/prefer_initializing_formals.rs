@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, container_name_token};
+use super::{Check, NodeKind, RuleSpec, container_name_token};
 use crate::rules::{NONE_TOKEN, token_seq_equal};
 use dartq_semantic::model::Ty;
 
@@ -33,14 +33,11 @@ use dartq_semantic::model::Ty;
 /// skip — the `private_named_parameters` face is feature-gated off.
 /// Primary constructors are outside the substrate. Message:
 /// `diagnostic.g.dart` `preferInitializingFormals`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_initializing_formals",
-    group: Group::Recommended,
-    problem: "Use an initializing formal to assign a parameter to a field.",
-    correction: "Try using an initializing formal ('this.{0}') to initialize the field.",
-    kinds: &[NodeKind::Constructor],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_initializing_formals",
+    &[NodeKind::Constructor],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

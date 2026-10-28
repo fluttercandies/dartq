@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, query_site};
+use super::{Check, NodeKind, RuleSpec, query_site};
 use crate::rules::{class_declaration_name, initialized_identifier_name, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -39,14 +39,11 @@ use crate::rules::{class_declaration_name, initialized_identifier_name, utf16_to
 /// experiment) is not tiled into the scan, and `catch (self)`
 /// parameters do not rebinder-exclude. Message: `diagnostic.g.dart`
 /// `unnecessaryThisAlias`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_this_alias",
-    group: Group::Standalone,
-    problem: "Unnecessary 'this' alias.",
-    correction: "Try removing the variable and using 'this' directly.",
-    kinds: &[NodeKind::InitializedIdentifier],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_this_alias",
+    &[NodeKind::InitializedIdentifier],
     check,
-};
+);
 
 #[expect(
     clippy::too_many_lines,

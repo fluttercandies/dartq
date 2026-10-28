@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 use crate::rules::{NONE_TOKEN, byte_span_of_token, first_child, last_child};
 
 const PROBLEM: &str = "Don't return 'null' from a function with a return type of 'void'.";
@@ -31,14 +31,11 @@ const CORRECTION: &str = "Try removing the 'null'.";
 /// context (`list.map(() { return null; })` under a
 /// `void Function()`-typed parameter), and a non-`Future`/`void`
 /// user-defined same-name type shadowing `dart:async`/`dart:core`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_returning_null_for_void",
-    group: Group::Recommended,
-    problem: PROBLEM,
-    correction: CORRECTION,
-    kinds: &[NodeKind::ReturnStatement, NodeKind::ExpressionBody],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_returning_null_for_void",
+    &[NodeKind::ReturnStatement, NodeKind::ExpressionBody],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

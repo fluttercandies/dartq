@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// The `external` `ModSet` bit (bridge `mod_bits`, member family).
 const EXTERNAL_BIT: u16 = 1 << 2;
@@ -23,14 +23,11 @@ const VAR_FINAL_OR_CONST_BIT: u16 = 1 << 6;
 /// initializers only — method bodies never count, matching the
 /// official. Message: `diagnostic.g.dart`
 /// `avoidUnusedConstructorParameters`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_unused_constructor_parameters",
-    group: Group::Standalone,
-    problem: "The parameter '{0}' is not used in the constructor.",
-    correction: "Try using the parameter or removing it.",
-    kinds: &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_unused_constructor_parameters",
+    &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     match c.kind(c.node()) {

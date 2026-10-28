@@ -1,0 +1,391 @@
+//! GENERATED lint rule metadata — DO NOT EDIT.
+//! Regenerate with:
+//!   cargo run -p upstream-gen --bin linter-meta-gen -- --sdk-src <dart-sdk-tree> --lints-src <lints-tree>
+//! Source: pkg/linter/messages.yaml of the pinned SDK checkout (dart 3.15.0 (main channel)),
+//!   canonical code selection from the pkg/linter/lib/src/rules/*.dart
+//!   registrations, group sets from the pinned package:lints snapshot
+//!   (lib/core.yaml, lib/recommended.yaml), removed/deprecated since
+//!   versions from those registrations (version constants of
+//!   pkg/analyzer/lib/analysis_rule/rule_state.dart).
+//! 322 consts fold to 278 name rows; the selection chain, its overrides,
+//!   and the pinned wordings are documented in tools/upstream-gen/src/
+//!   linter_meta.rs. Rows are sorted by name; messages render '{i}'
+//!   positional slots (the yaml '#param' references resolved through
+//!   the const's parameter order). Removed rules carry no message —
+//!   the options face renders the removed_lint templates.
+
+use crate::registry::Group;
+
+/// The upstream rule state the option faces render. `Stable` covers
+/// every live state (stable/experimental/internal/testing — none of
+/// those carries a face).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetaState {
+    Stable,
+    /// `RemovedAnalysisRule`, with the registration's `since` version
+    /// (`None` — the unversioned face — for `avoid_unstable_final_fields`).
+    Removed(Option<&'static str>),
+    /// `RuleState.deprecated`, with the registration's `since` version.
+    Deprecated(Option<&'static str>),
+}
+
+/// One rule's upstream-derived metadata — the single generated source
+/// for the group, message templates, rule state, and docs flag the
+/// registry, the option faces, and the documentation URL face read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuleMeta {
+    pub name: &'static str,
+    pub group: Group,
+    pub problem: &'static str,
+    pub correction: &'static str,
+    pub state: MetaState,
+    pub docs_published: bool,
+}
+
+const TABLE: &[RuleMeta] = &[
+    RuleMeta { name: "always_declare_return_types", group: Group::Standalone, problem: "The function '{0}' should have a return type but doesn't.", correction: "Try adding a return type to the function.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "always_put_control_body_on_new_line", group: Group::Standalone, problem: "Statement should be on a separate line.", correction: "Try moving the statement to a new line.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "always_put_required_named_parameters_first", group: Group::Standalone, problem: "Required named parameters should be before optional named parameters.", correction: "Try moving the required named parameter to be before any optional named parameters.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "always_require_non_null_named_parameters", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(Some("3.3.0")), docs_published: false },
+    RuleMeta { name: "always_specify_types", group: Group::Standalone, problem: "Missing type annotation.", correction: "Try adding a type annotation.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "always_use_package_imports", group: Group::Standalone, problem: "Use 'package:' imports for files in the 'lib' directory.", correction: "Try converting the URI to a 'package:' URI.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "analyzer_element_model_tracking_bad", group: Group::Standalone, problem: "Bad tracking annotation for this member.", correction: "", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "analyzer_element_model_tracking_more_than_one", group: Group::Standalone, problem: "There can be only one tracking annotation.", correction: "", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "analyzer_element_model_tracking_zero", group: Group::Standalone, problem: "No required tracking annotation.", correction: "", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "analyzer_public_api_bad_part_directive", group: Group::Standalone, problem: "Part directives in the analyzer public API should point to files in the analyzer public API.", correction: "", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "analyzer_public_api_bad_type", group: Group::Standalone, problem: "Element makes use of type(s) which is not part of the analyzer public API: {0}.", correction: "", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "analyzer_public_api_experimental_inconsistency", group: Group::Standalone, problem: "Element makes use of experimental type(s), but is not itself marked with `@experimental`: {0}.", correction: "", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "analyzer_public_api_exports_non_public_name", group: Group::Standalone, problem: "Export directive exports element(s) that are not part of the analyzer public API: {0}.", correction: "", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "analyzer_public_api_impl_in_public_api", group: Group::Standalone, problem: "Declarations in the analyzer public API should not end in \"Impl\".", correction: "", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "analyzer_to_be_deprecated_use", group: Group::Standalone, problem: "'{0}' is to be deprecated, and should be used only by declarations that are also to be deprecated.{1}", correction: "Try using the replacement, or annotating the enclosing declaration with '@ToBeDeprecated'.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "annotate_overrides", group: Group::Recommended, problem: "The member '{0}' overrides an inherited member but isn't annotated with '@override'.", correction: "Try adding the '@override' annotation.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "annotate_redeclares", group: Group::Standalone, problem: "The member '{0}' is redeclaring but isn't annotated with '@redeclare'.", correction: "Try adding the '@redeclare' annotation.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "async_return_with_no_await", group: Group::Standalone, problem: "Returning a 'Future' without 'await'.", correction: "Try adding an 'await' or making the body non-async.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_annotating_with_dynamic", group: Group::Standalone, problem: "Unnecessary 'dynamic' type annotation.", correction: "Try removing the type 'dynamic'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_as", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(Some("2.12.0")), docs_published: false },
+    RuleMeta { name: "avoid_bool_literals_in_conditional_expressions", group: Group::Standalone, problem: "Conditional expressions with a 'bool' literal can be simplified.", correction: "Try rewriting the expression to use either '&&' or '||'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_catches_without_on_clauses", group: Group::Standalone, problem: "Catch clause should use 'on' to specify the type of exception being caught.", correction: "Try adding an 'on' clause before the 'catch'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_catching_errors", group: Group::Standalone, problem: "The type 'Error' should not be caught.", correction: "Try removing the catch or catching an 'Exception' instead.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "avoid_classes_with_only_static_members", group: Group::Standalone, problem: "Classes should define instance members.", correction: "Try adding instance behavior or moving the members out of the class.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "avoid_double_and_int_checks", group: Group::Standalone, problem: "Explicit check for double or int.", correction: "Try removing the check.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_dynamic_calls", group: Group::Standalone, problem: "Method invocation or property access on a 'dynamic' target.", correction: "Try giving the target a type.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_empty_else", group: Group::Core, problem: "Empty statements are not allowed in an 'else' clause.", correction: "Try removing the empty statement or removing the else clause.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_equals_and_hash_code_on_mutable_classes", group: Group::Standalone, problem: "The method '{0}' should not be overridden in classes not annotated with '@immutable'.", correction: "Try removing the override or annotating the class with '@immutable'.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "avoid_escaping_inner_quotes", group: Group::Standalone, problem: "Unnecessary escape of '{0}'.", correction: "Try changing the outer quotes to '{1}'.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "avoid_field_initializers_in_const_classes", group: Group::Standalone, problem: "Fields in 'const' classes should not have initializers.", correction: "Try converting the field to a getter or initializing the field in the constructors.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "avoid_final_parameters", group: Group::Standalone, problem: "Parameters should not be marked as 'final'.", correction: "Try removing the keyword 'final'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_function_literals_in_foreach_calls", group: Group::Recommended, problem: "Function literals shouldn't be passed to 'forEach'.", correction: "Try using a 'for' loop.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_futureor_void", group: Group::Standalone, problem: "Don't use the type 'FutureOr<void>'.", correction: "Try using 'Future<void>?' or 'void'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_implementing_value_types", group: Group::Standalone, problem: "Classes that override '==' should not be implemented.", correction: "Try removing the class from the 'implements' clause.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "avoid_init_to_null", group: Group::Recommended, problem: "Redundant initialization to 'null'.", correction: "Try removing the initializer.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_js_rounded_ints", group: Group::Standalone, problem: "Integer literal can't be represented exactly when compiled to JavaScript.", correction: "Try using a 'BigInt' to represent the value.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_multiple_declarations_per_line", group: Group::Standalone, problem: "Multiple variables declared on a single line.", correction: "Try splitting the variable declarations into multiple lines.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "avoid_null_checks_in_equality_operators", group: Group::Standalone, problem: "Unnecessary null comparison in implementation of '=='.", correction: "Try removing the comparison.", state: MetaState::Deprecated(Some("3.11.0")), docs_published: false },
+    RuleMeta { name: "avoid_positional_boolean_parameters", group: Group::Standalone, problem: "'bool' parameters should be named parameters.", correction: "Try converting the parameter to a named parameter.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_print", group: Group::Standalone, problem: "Don't invoke 'print' in production code.", correction: "Try using a logging framework.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_private_typedef_functions", group: Group::Standalone, problem: "The typedef is unnecessary because it is only used in one place.", correction: "Try inlining the type or using it in other places.", state: MetaState::Deprecated(Some("3.13.0")), docs_published: false },
+    RuleMeta { name: "avoid_redundant_argument_values", group: Group::Standalone, problem: "The value of the argument is redundant because it matches the default value.", correction: "Try removing the argument.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_relative_lib_imports", group: Group::Core, problem: "Can't use a relative path to import a library in 'lib'.", correction: "Try fixing the relative path or changing the import to a 'package:' import.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_renaming_method_parameters", group: Group::Recommended, problem: "The parameter name '{0}' doesn't match the name '{1}' in the overridden method.", correction: "Try changing the name to '{1}'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_return_types_on_setters", group: Group::Recommended, problem: "Unnecessary return type on a setter.", correction: "Try removing the return type.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_returning_null", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(Some("3.3.0")), docs_published: false },
+    RuleMeta { name: "avoid_returning_null_for_future", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(Some("3.3.0")), docs_published: false },
+    RuleMeta { name: "avoid_returning_null_for_void", group: Group::Recommended, problem: "Don't return 'null' from a function with a return type of 'void'.", correction: "Try removing the 'null'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_returning_this", group: Group::Standalone, problem: "Don't return 'this' from a method.", correction: "Try changing the return type to 'void' and removing the return.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "avoid_setters_without_getters", group: Group::Standalone, problem: "Setter has no corresponding getter.", correction: "Try adding a corresponding getter or removing the setter.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "avoid_shadowing_type_parameters", group: Group::Core, problem: "The type parameter '{0}' shadows a type parameter from the enclosing {1}.", correction: "Try renaming one of the type parameters.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_single_cascade_in_expression_statements", group: Group::Recommended, problem: "Unnecessary cascade expression.", correction: "Try using the operator '{0}'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_slow_async_io", group: Group::Standalone, problem: "Use of an async 'dart:io' method.", correction: "Try using the synchronous version of the method.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_type_to_string", group: Group::Standalone, problem: "Using 'toString' on a 'Type' is not safe in production code.", correction: "Try a normal type check or compare the 'runtimeType' directly.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_types_as_parameter_names", group: Group::Core, problem: "The parameter name '{0}' matches a visible type name.", correction: "Try adding a name for the parameter or changing the parameter name to not match an existing type.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_types_on_closure_parameters", group: Group::Standalone, problem: "Unnecessary type annotation on a function expression parameter.", correction: "Try removing the type annotation.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_unnecessary_containers", group: Group::Standalone, problem: "Unnecessary instance of 'Container'.", correction: "Try removing the 'Container' (but not its children) from the widget tree.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_unstable_final_fields", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(None), docs_published: false },
+    RuleMeta { name: "avoid_unused_constructor_parameters", group: Group::Standalone, problem: "The parameter '{0}' is not used in the constructor.", correction: "Try using the parameter or removing it.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "avoid_void_async", group: Group::Standalone, problem: "An 'async' function should have a 'Future' return type when it doesn't return a value.", correction: "Try changing the return type.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "avoid_web_libraries_in_flutter", group: Group::Standalone, problem: "Don't use web-only libraries outside Flutter web plugins.", correction: "Try finding a different library for your needs.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "await_only_futures", group: Group::Core, problem: "Uses 'await' on an instance of '{0}', which is not a subtype of 'Future'.", correction: "Try removing the 'await' or changing the expression.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "camel_case_extensions", group: Group::Core, problem: "The extension name '{0}' isn't an UpperCamelCase identifier.", correction: "Try changing the name to follow the UpperCamelCase style.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "camel_case_types", group: Group::Core, problem: "The type name '{0}' isn't an UpperCamelCase identifier.", correction: "Try changing the name to follow the UpperCamelCase style.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "cancel_subscriptions", group: Group::Standalone, problem: "Uncancelled instance of 'StreamSubscription'.", correction: "Try invoking 'cancel' in the function in which the 'StreamSubscription' was created.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "cascade_invocations", group: Group::Standalone, problem: "Unnecessary duplication of receiver.", correction: "Try using a cascade to avoid the duplication.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "cast_nullable_to_non_nullable", group: Group::Standalone, problem: "Don't cast a nullable value to a non-nullable type.", correction: "Try adding a not-null assertion ('!') to make the type non-nullable.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "close_sinks", group: Group::Standalone, problem: "Unclosed instance of 'Sink'.", correction: "Try invoking 'close' in the function in which the 'Sink' was created.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "collection_methods_unrelated_type", group: Group::Core, problem: "The argument type '{0}' isn't related to '{1}'.", correction: "Try changing the argument or element type to match.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "combinators_ordering", group: Group::Standalone, problem: "Sort combinator names alphabetically.", correction: "Try sorting the combinator names alphabetically.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "comment_references", group: Group::Standalone, problem: "The referenced name isn't visible in scope.", correction: "Try adding an import for the referenced name.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "conditional_uri_does_not_exist", group: Group::Standalone, problem: "The target of the conditional URI '{0}' doesn't exist.", correction: "Try creating the file referenced by the URI, or try using a URI for a file that does exist.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "constant_identifier_names", group: Group::Recommended, problem: "The constant name '{0}' isn't a lowerCamelCase identifier.", correction: "Try changing the name to follow the lowerCamelCase style.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "control_flow_in_finally", group: Group::Recommended, problem: "Use of '{0}' in a 'finally' clause.", correction: "Try restructuring the code.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "curly_braces_in_flow_control_structures", group: Group::Core, problem: "Statements in {0} should be enclosed in a block.", correction: "Try wrapping the statement in a block.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "dangling_library_doc_comments", group: Group::Core, problem: "Dangling library doc comment.", correction: "Add a 'library' directive after the library comment.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "depend_on_referenced_packages", group: Group::Core, problem: "The imported package '{0}' isn't a dependency of the importing package.", correction: "Try adding a dependency for '{0}' in the 'pubspec.yaml' file.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "deprecated_consistency", group: Group::Standalone, problem: "Missing deprecated annotation.", correction: "", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "deprecated_member_use_from_same_package", group: Group::Standalone, problem: "'{0}' is deprecated and shouldn't be used.", correction: "Try replacing the use of the deprecated member with the replacement, if a replacement is specified.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "diagnostic_describe_all_properties", group: Group::Standalone, problem: "The public property isn't described by either 'debugFillProperties' or 'debugDescribeChildren'.", correction: "Try describing the property.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "directives_ordering", group: Group::Standalone, problem: "Sort directive sections alphabetically.", correction: "Try sorting the directives.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "discarded_futures", group: Group::Standalone, problem: "'Future'-returning calls in a non-'async' function.", correction: "Try either making the enclosing function 'async' and awaiting the expression or wrapping the expression in 'unawaited'.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "do_not_use_environment", group: Group::Standalone, problem: "Invalid use of an environment declaration.", correction: "Try removing the environment declaration usage.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "document_ignores", group: Group::Standalone, problem: "Missing documentation explaining why the diagnostic is ignored.", correction: "Try adding a comment immediately above the ignore comment.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "empty_catches", group: Group::Core, problem: "Empty catch block.", correction: "Try adding statements to the block, adding a comment to the block, or removing the 'catch' clause.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "empty_constructor_bodies", group: Group::Recommended, problem: "Empty constructor bodies should be written using a ';' rather than '{}'.", correction: "Try replacing the constructor body with ';'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "empty_container_bodies", group: Group::Standalone, problem: "Empty {0} bodies should be written using a ';' rather than '{}'.", correction: "Try replacing the {0} body with ';'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "empty_statements", group: Group::Recommended, problem: "Unnecessary empty statement.", correction: "Try removing the empty statement or restructuring the code.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "enable_null_safety", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(Some("3.0.0")), docs_published: false },
+    RuleMeta { name: "eol_at_end_of_file", group: Group::Standalone, problem: "Missing a newline at the end of the file.", correction: "Try adding a newline at the end of the file.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "erase_dart_type_extension_types", group: Group::Standalone, problem: "Unsafe use of 'DartType' in an 'is' check.", correction: "Ensure DartType extension types are erased by using a helper method.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "exhaustive_cases", group: Group::Recommended, problem: "Missing case clauses for some constants in '{0}'.", correction: "Try adding case clauses for the missing constants.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "file_names", group: Group::Core, problem: "The file name '{0}' isn't a lower_case_with_underscores identifier.", correction: "Try changing the name to follow the lower_case_with_underscores style.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "flutter_style_todos", group: Group::Standalone, problem: "To-do comment doesn't follow the Flutter style.", correction: "Try following the Flutter style for to-do comments.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "future_sync_value", group: Group::Standalone, problem: "For synchronous values, `Future.syncValue` is more performant.", correction: "Try replacing `Future.value` with `Future.syncValue`.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "hash_and_equals", group: Group::Core, problem: "Missing a corresponding override of '{0}'.", correction: "Try overriding '{0}' or removing '{1}'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "implementation_imports", group: Group::Recommended, problem: "Import of a library in the 'lib/src' directory of another package.", correction: "Try importing a public library that exports this library, or removing the import.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "implicit_call_tearoffs", group: Group::Core, problem: "Implicit tear-off of the 'call' method.", correction: "Try explicitly tearing off the 'call' method.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "implicit_reopen", group: Group::Standalone, problem: "The {0} '{1}' reopens '{2}' because it is not marked '{3}'.", correction: "Try marking '{1}' '{3}' or annotating it with '@reopen'.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "initialize_in_field_declaration", group: Group::Standalone, problem: "Field should be initialized in the field declaration.", correction: "Try initializing the field where it's declared.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "invalid_case_patterns", group: Group::Standalone, problem: "This expression is not valid in a 'case' clause in Dart 3.0.", correction: "Try refactoring the expression to be valid in 3.0.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "invalid_runtime_check_with_js_interop_types", group: Group::Recommended, problem: "Runtime check between '{0}' and '{1}' checks whether a Dart value is a JS interop type, which might not be platform-consistent.", correction: "Try using 'isA' from 'dart:js_interop' to check if the Dart value is a JS interop type.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "invariant_booleans", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(Some("3.0.0")), docs_published: false },
+    RuleMeta { name: "iterable_contains_unrelated_type", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(Some("3.3.0")), docs_published: false },
+    RuleMeta { name: "join_return_with_assignment", group: Group::Standalone, problem: "Assignment could be inlined in 'return' statement.", correction: "Try inlining the assigned value in the 'return' statement.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "leading_newlines_in_multiline_strings", group: Group::Standalone, problem: "Missing a newline at the beginning of a multiline string.", correction: "Try adding a newline at the beginning of the string.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "library_annotations", group: Group::Core, problem: "This annotation should be attached to a library directive.", correction: "Try attaching the annotation to a library directive.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "library_names", group: Group::Standalone, problem: "The library name '{0}' isn't a lower_case_with_underscores identifier.", correction: "Try changing the name to follow the lower_case_with_underscores style.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "library_prefixes", group: Group::Recommended, problem: "The prefix '{0}' isn't a lower_case_with_underscores identifier.", correction: "Try changing the prefix to follow the lower_case_with_underscores style.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "library_private_types_in_public_api", group: Group::Recommended, problem: "Invalid use of a private type in a public API.", correction: "Try making the private type public, or making the API that uses the private type also be private.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "lines_longer_than_80_chars", group: Group::Standalone, problem: "The line length exceeds the 80-character limit.", correction: "Try breaking the line across multiple lines.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "list_remove_unrelated_type", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(Some("3.3.0")), docs_published: false },
+    RuleMeta { name: "literal_only_boolean_expressions", group: Group::Standalone, problem: "The Boolean expression has a constant value.", correction: "Try changing the expression.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "matching_super_parameters", group: Group::Standalone, problem: "The super parameter named '{0}' does not share the same name as the corresponding parameter in the super constructor, '{1}'.", correction: "Try using the name of the corresponding parameter in the super constructor.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "migrate_design_widgets", group: Group::Standalone, problem: "The '{0}' library is deprecated.", correction: "Try using the Material or Cupertino package.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "missing_code_block_language_in_doc_comment", group: Group::Standalone, problem: "The code block is missing a specified language.", correction: "Try adding a language to the code block.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "missing_whitespace_between_adjacent_strings", group: Group::Standalone, problem: "Missing whitespace between adjacent strings.", correction: "Try adding whitespace between the strings.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "no_adjacent_strings_in_list", group: Group::Standalone, problem: "Don't use adjacent strings in a list literal.", correction: "Try adding a comma between the strings.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "no_default_cases", group: Group::Standalone, problem: "Invalid use of 'default' member in a switch.", correction: "Try enumerating all the possible values of the switch expression.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "no_duplicate_case_values", group: Group::Core, problem: "The value of the case clause ('{0}') is equal to the value of an earlier case clause ('{1}').", correction: "Try removing or changing the value.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "no_dynamic_casts", group: Group::Standalone, problem: "Implicit cast from 'dynamic'.", correction: "Try adding an explicit cast or changing the target type.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "no_leading_underscores_for_library_prefixes", group: Group::Recommended, problem: "The library prefix '{0}' starts with an underscore.", correction: "Try renaming the prefix to not start with an underscore.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "no_leading_underscores_for_local_identifiers", group: Group::Recommended, problem: "The local variable '{0}' starts with an underscore.", correction: "Try renaming the variable to not start with an underscore.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "no_literal_bool_comparisons", group: Group::Standalone, problem: "Unnecessary comparison to a boolean literal.", correction: "Remove the comparison and use the negation operator `!` if necessary.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "no_logic_in_create_state", group: Group::Standalone, problem: "Don't put any logic in 'createState'.", correction: "Try moving the logic out of 'createState'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "no_raw_types", group: Group::Standalone, problem: "The generic type '{0}' should have explicit type arguments but doesn't.", correction: "Use explicit type arguments for '{0}'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "no_runtimetype_tostring", group: Group::Standalone, problem: "Using 'toString' on a 'Type' is not safe in production code.", correction: "Try removing the usage of 'toString' or restructuring the code.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "no_self_assignments", group: Group::Standalone, problem: "The variable or property is being assigned to itself.", correction: "Try removing the assignment that has no direct effect.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "no_solo_tests", group: Group::Standalone, problem: "Don't commit soloed tests.", correction: "Try removing the 'soloTest' annotation or 'solo_' prefix.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "no_trailing_spaces", group: Group::Standalone, problem: "Don't create string literals with trailing spaces in tests.", correction: "Try removing the trailing spaces.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "no_wildcard_variable_uses", group: Group::Core, problem: "The referenced identifier is a wildcard.", correction: "Use an identifier name that is not a wildcard.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "non_constant_identifier_names", group: Group::Core, problem: "The variable name '{0}' isn't a lowerCamelCase identifier.", correction: "Try changing the name to follow the lowerCamelCase style.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "noop_primitive_operations", group: Group::Standalone, problem: "The expression has no effect and can be removed.", correction: "Try removing the expression.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "null_check_on_nullable_type_parameter", group: Group::Core, problem: "The null check operator shouldn't be used on a variable whose type is a potentially nullable type parameter.", correction: "Try explicitly testing for 'null'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "null_closures", group: Group::Recommended, problem: "Closure can't be 'null' because it might be invoked.", correction: "Try providing a non-null closure.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "omit_local_variable_types", group: Group::Standalone, problem: "Unnecessary type annotation on a local variable.", correction: "Try removing the type annotation.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "omit_obvious_local_variable_types", group: Group::Standalone, problem: "Omit the type annotation on a local variable when the type is obvious.", correction: "Try removing the type annotation.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "omit_obvious_property_types", group: Group::Standalone, problem: "The type annotation isn't needed because it is obvious.", correction: "Try removing the type annotation.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "one_member_abstracts", group: Group::Standalone, problem: "Unnecessary use of an abstract class.", correction: "Try making '{0}' a top-level function and removing the class.", state: MetaState::Deprecated(Some("3.13.0")), docs_published: false },
+    RuleMeta { name: "only_throw_errors", group: Group::Standalone, problem: "Don't throw instances of classes that don't extend either 'Exception' or 'Error'.", correction: "Try throwing a different class of object.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "overridden_fields", group: Group::Recommended, problem: "Field overrides a field inherited from '{0}'.", correction: "Try removing the field, overriding the getter and setter if necessary.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "package_api_docs", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(Some("3.7.0")), docs_published: false },
+    RuleMeta { name: "package_names", group: Group::Recommended, problem: "The package name '{0}' isn't a lower_case_with_underscores identifier.", correction: "Try changing the name to follow the lower_case_with_underscores style.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "package_prefixed_library_names", group: Group::Standalone, problem: "The library name is not a dot-separated path prefixed by the package name.", correction: "Try changing the name to '{0}'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "parameter_assignments", group: Group::Standalone, problem: "Invalid assignment to the parameter '{0}'.", correction: "Try using a local variable in place of the parameter.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_adjacent_string_concatenation", group: Group::Recommended, problem: "String literals shouldn't be concatenated by the '+' operator.", correction: "Try removing the operator to use adjacent strings.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_asserts_in_initializer_lists", group: Group::Standalone, problem: "Assert should be in the initializer list.", correction: "Try moving the assert to the initializer list.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_asserts_with_message", group: Group::Standalone, problem: "Missing a message in an assert.", correction: "Try adding a message to the assert.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_bool_in_asserts", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(Some("3.0.0")), docs_published: false },
+    RuleMeta { name: "prefer_collection_literals", group: Group::Recommended, problem: "Unnecessary constructor invocation.", correction: "Try using a collection literal.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_conditional_assignment", group: Group::Recommended, problem: "The 'if' statement could be replaced by a null-aware assignment.", correction: "Try using the '??=' operator to conditionally assign a value.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_const_constructors", group: Group::Standalone, problem: "Use 'const' with the constructor to improve performance.", correction: "Try adding the 'const' keyword to the constructor invocation.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_const_constructors_in_immutables", group: Group::Standalone, problem: "Constructors in '@immutable' classes should be declared as 'const'.", correction: "Try adding 'const' to the constructor declaration.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_const_declarations", group: Group::Standalone, problem: "Use 'const' for final variables initialized to a constant value.", correction: "Try replacing 'final' with 'const'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_const_literals_to_create_immutables", group: Group::Standalone, problem: "Use 'const' literals as arguments to constructors of '@immutable' classes.", correction: "Try adding 'const' before the literal.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_constructors_over_static_methods", group: Group::Standalone, problem: "Static method should be a constructor.", correction: "Try converting the method into a constructor.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_contains", group: Group::Recommended, problem: "Unnecessary use of 'indexOf' to test for containment.", correction: "Try using 'contains'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_double_quotes", group: Group::Standalone, problem: "Unnecessary use of single quotes.", correction: "Try using double quotes unless the string contains double quotes.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_equal_for_default_values", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(Some("3.0.0")), docs_published: false },
+    RuleMeta { name: "prefer_expression_function_bodies", group: Group::Standalone, problem: "Unnecessary use of a block function body.", correction: "Try using an expression function body.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_final_fields", group: Group::Recommended, problem: "The private field {0} could be 'final'.", correction: "Try making the field 'final'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_final_in_for_each", group: Group::Standalone, problem: "The variable '{0}' should be final.", correction: "Try making the variable final.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_final_locals", group: Group::Standalone, problem: "Local variables should be final.", correction: "Try making the variable final.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_final_parameters", group: Group::Standalone, problem: "The parameter '{0}' should be final.", correction: "Try making the parameter final.", state: MetaState::Deprecated(Some("3.11.0")), docs_published: true },
+    RuleMeta { name: "prefer_for_elements_to_map_fromiterable", group: Group::Recommended, problem: "Use 'for' elements when building maps from iterables.", correction: "Try using a collection literal with a 'for' element.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_foreach", group: Group::Standalone, problem: "Use 'forEach' and a tear-off rather than a 'for' loop to apply a function to every element.", correction: "Try using 'forEach' and a tear-off rather than a 'for' loop.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_function_declarations_over_variables", group: Group::Recommended, problem: "Use a function declaration rather than a variable assignment to bind a function to a name.", correction: "Try rewriting the closure assignment as a function declaration.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_generic_function_type_aliases", group: Group::Core, problem: "Use the generic function type syntax in 'typedef's.", correction: "Try using the generic function type syntax ('{0}').", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_if_elements_to_conditional_expressions", group: Group::Standalone, problem: "Use an 'if' element to conditionally add elements.", correction: "Try using an 'if' element rather than a conditional expression.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_if_null_operators", group: Group::Recommended, problem: "Use the '??' operator rather than '?:' when testing for 'null'.", correction: "Try rewriting the code to use '??'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_initializing_formals", group: Group::Recommended, problem: "Use an initializing formal to assign a parameter to a field.", correction: "Try using an initializing formal ('this.{0}') to initialize the field.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_inlined_adds", group: Group::Recommended, problem: "The addition of multiple list items could be inlined.", correction: "Try adding the items to the list literal directly.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_int_literals", group: Group::Standalone, problem: "Unnecessary use of a 'double' literal.", correction: "Try using an 'int' literal.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_interpolation_to_compose_strings", group: Group::Recommended, problem: "Use interpolation to compose strings and values.", correction: "Try using string interpolation to build the composite string.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_is_empty", group: Group::Core, problem: "Use 'isEmpty' instead of 'length' to test whether the collection is empty.", correction: "Try rewriting the expression to use 'isEmpty'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_is_not_empty", group: Group::Core, problem: "Use 'isNotEmpty' rather than negating the result of 'isEmpty'.", correction: "Try rewriting the expression to use 'isNotEmpty'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_is_not_operator", group: Group::Recommended, problem: "Use the 'is!' operator rather than negating the value of the 'is' operator.", correction: "Try rewriting the condition to use the 'is!' operator.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_iterable_wheretype", group: Group::Core, problem: "Use 'whereType' to select elements of a given type.", correction: "Try rewriting the expression to use 'whereType'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_mixin", group: Group::Standalone, problem: "Only mixins should be mixed in.", correction: "Try converting '{0}' to a mixin.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "prefer_null_aware_method_calls", group: Group::Standalone, problem: "Use a null-aware invocation of the 'call' method rather than explicitly testing for 'null'.", correction: "Try using '?.call()' to invoke the function.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "prefer_null_aware_operators", group: Group::Recommended, problem: "Use the null-aware operator '?.' rather than an explicit 'null' comparison.", correction: "Try using '?.'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_relative_imports", group: Group::Standalone, problem: "Use relative imports for files in the 'lib' directory.", correction: "Try converting the URI to a relative URI.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_single_quotes", group: Group::Standalone, problem: "Unnecessary use of double quotes.", correction: "Try using single quotes unless the string contains single quotes.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_spread_collections", group: Group::Recommended, problem: "The addition of multiple elements could be inlined.", correction: "Try using the spread operator ('...') to inline the addition.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_typing_uninitialized_variables", group: Group::Core, problem: "An uninitialized variable should have an explicit type annotation.", correction: "Try adding a type annotation.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "prefer_void_to_null", group: Group::Standalone, problem: "Unnecessary use of the type 'Null'.", correction: "Try using 'void' instead.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "provide_deprecation_message", group: Group::Core, problem: "Missing a deprecation message.", correction: "Try using the constructor to provide a message ('@Deprecated(\"message\")').", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "public_member_api_docs", group: Group::Standalone, problem: "Missing documentation for a public member.", correction: "Try adding documentation for the member.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "recursive_getters", group: Group::Recommended, problem: "The getter '{0}' recursively returns itself.", correction: "Try changing the value being returned.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "remove_deprecations_in_breaking_versions", group: Group::Standalone, problem: "Remove deprecated elements in breaking versions.", correction: "Try removing the deprecated element.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "require_trailing_commas", group: Group::Standalone, problem: "Missing a required trailing comma.", correction: "Try adding a trailing comma.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "secure_pubspec_urls", group: Group::Core, problem: "The '{0}' protocol shouldn't be used because it isn't secure.", correction: "Try using a secure protocol, such as 'https'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "simple_directive_paths", group: Group::Standalone, problem: "Use simple directive paths.", correction: "Try simplifying the directive path.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "simplify_variable_pattern", group: Group::Standalone, problem: "The {1} identification '{0}:' is redundant and can be removed.", correction: "Try removing the redundant {1} identification.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "sized_box_for_whitespace", group: Group::Standalone, problem: "Use a 'SizedBox' to add whitespace to a layout.", correction: "Try using a 'SizedBox' rather than a 'Container'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "sized_box_shrink_expand", group: Group::Standalone, problem: "Use 'SizedBox.{0}' to avoid needing to specify the 'height' and 'width'.", correction: "Try using 'SizedBox.{0}' and removing the 'height' and 'width' arguments.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "slash_for_doc_comments", group: Group::Recommended, problem: "Use the end-of-line form ('///') for doc comments.", correction: "Try rewriting the comment to use '///'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "sort_child_properties_last", group: Group::Standalone, problem: "The '{0}' argument should be last in widget constructor invocations.", correction: "Try moving the argument to the end of the argument list.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "sort_constructors_first", group: Group::Standalone, problem: "Constructor declarations should be before non-constructor declarations.", correction: "Try moving the constructor declaration before all other members.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "sort_pub_dependencies", group: Group::Standalone, problem: "Dependencies not sorted alphabetically.", correction: "Try sorting the dependencies alphabetically (A to Z).", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "sort_unnamed_constructors_first", group: Group::Standalone, problem: "Invalid location for the unnamed constructor.", correction: "Try moving the unnamed constructor before all other constructors.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "specify_nonobvious_local_variable_types", group: Group::Standalone, problem: "Specify the type of a local variable when the type is non-obvious.", correction: "Try adding a type annotation.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "specify_nonobvious_property_types", group: Group::Standalone, problem: "A type annotation is needed because it isn't obvious.", correction: "Try adding a type annotation.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "strict_top_level_inference", group: Group::Standalone, problem: "Missing type annotation.", correction: "Try adding a type annotation.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "super_goes_last", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(Some("3.0.0")), docs_published: false },
+    RuleMeta { name: "switch_on_type", group: Group::Standalone, problem: "Avoid switch statements on a 'Type'.", correction: "Try using pattern matching on a variable instead.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "test_types_in_equals", group: Group::Standalone, problem: "Missing type test for '{0}' in '=='.", correction: "Try testing the type of '{0}'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "throw_in_finally", group: Group::Standalone, problem: "Use of '{0}' in a 'finally' block.", correction: "Try moving the '{0}' outside the 'finally' block.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "tighten_type_of_initializing_formals", group: Group::Standalone, problem: "Use a type annotation rather than 'assert' to enforce non-nullability.", correction: "Try adding a type annotation and removing the 'assert'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "type_annotate_public_apis", group: Group::Standalone, problem: "Missing type annotation on a public API.", correction: "Try adding a type annotation.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "type_init_formals", group: Group::Recommended, problem: "Don't needlessly type annotate initializing formals.", correction: "Try removing the type.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "type_literal_in_constant_pattern", group: Group::Core, problem: "Use 'TypeName _' instead of a type literal.", correction: "Replace with 'TypeName _'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unawaited_futures", group: Group::Standalone, problem: "Missing an 'await' for the 'Future' computed by this expression.", correction: "Try adding an 'await' or wrapping the expression with 'unawaited' (if it is a 'Future').", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unintended_html_in_doc_comment", group: Group::Core, problem: "Angle brackets will be interpreted as HTML.", correction: "Try using backticks around the content with angle brackets, or try replacing `<` with `&lt;` and `>` with `&gt;`.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_async", group: Group::Standalone, problem: "Don't make a function 'async' if it doesn't use 'await'.", correction: "Try removing the 'async' modifier.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_await_in_return", group: Group::Standalone, problem: "Unnecessary 'await'.", correction: "Try removing the 'await'.", state: MetaState::Deprecated(Some("3.13.0")), docs_published: true },
+    RuleMeta { name: "unnecessary_brace_in_string_interps", group: Group::Recommended, problem: "Unnecessary braces in a string interpolation.", correction: "Try removing the braces.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_breaks", group: Group::Standalone, problem: "Unnecessary 'break' statement.", correction: "Try removing the 'break'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_const", group: Group::Recommended, problem: "Unnecessary 'const' keyword.", correction: "Try removing the keyword.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_const_in_enum_constructor", group: Group::Standalone, problem: "Unnecessary 'const' keyword in an enum constructor.", correction: "Try removing the keyword.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_constructor_name", group: Group::Recommended, problem: "Unnecessary '.new' constructor name.", correction: "Try removing the '.new'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_final", group: Group::Standalone, problem: "Local variables should not be marked as 'final'.", correction: "Replace 'final' with 'var'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_getters_setters", group: Group::Recommended, problem: "Unnecessary use of getter and setter to wrap a field.", correction: "Try removing the getter and setter and renaming the field.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_ignore", group: Group::Standalone, problem: "The diagnostic '{0}' isn't produced at this location so it doesn't need to be ignored.", correction: "Try removing the ignore comment.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_lambdas", group: Group::Standalone, problem: "Closure should be a tearoff.", correction: "Try using a tearoff rather than a closure.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_late", group: Group::Recommended, problem: "Unnecessary 'late' modifier.", correction: "Try removing the 'late'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_library_directive", group: Group::Standalone, problem: "Library directives without comments or annotations should be avoided.", correction: "Try deleting the library directive.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_library_name", group: Group::Recommended, problem: "Library names are not necessary.", correction: "Remove the library name.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_new", group: Group::Recommended, problem: "Unnecessary 'new' keyword.", correction: "Try removing the 'new' keyword.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_null_aware_assignments", group: Group::Recommended, problem: "Unnecessary assignment of 'null'.", correction: "Try removing the assignment.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_null_aware_operator_on_extension_on_nullable", group: Group::Standalone, problem: "Unnecessary use of a null-aware operator to invoke an extension method on a nullable type.", correction: "Try removing the '?'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_null_checks", group: Group::Standalone, problem: "Unnecessary use of a null check ('!').", correction: "Try removing the null check.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_null_in_if_null_operators", group: Group::Recommended, problem: "Unnecessary use of '??' with 'null'.", correction: "Try removing the '??' operator and the 'null' operand.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_nullable_for_final_variable_declarations", group: Group::Recommended, problem: "Type could be non-nullable.", correction: "Try changing the type to be non-nullable.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_overrides", group: Group::Core, problem: "Unnecessary override.", correction: "Try adding behavior in the overriding member or removing the override.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_parenthesis", group: Group::Standalone, problem: "Unnecessary use of parentheses.", correction: "Try removing the parentheses.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_primary_constructor_body", group: Group::Standalone, problem: "Unnecessary primary constructor body.", correction: "Try removing the body.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_raw_strings", group: Group::Standalone, problem: "Unnecessary use of a raw string.", correction: "Try using a normal string.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_statements", group: Group::Standalone, problem: "Unnecessary statement.", correction: "Try completing the statement or breaking it up.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_string_escapes", group: Group::Recommended, problem: "Unnecessary escape in string literal.", correction: "Remove the '\\' escape.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_string_interpolations", group: Group::Recommended, problem: "Unnecessary use of string interpolation.", correction: "Try replacing the string literal with the variable name.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_this", group: Group::Recommended, problem: "Unnecessary 'this.' qualifier.", correction: "Try removing 'this.'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_this_alias", group: Group::Standalone, problem: "Unnecessary 'this' alias.", correction: "Try removing the variable and using 'this' directly.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "unnecessary_to_list_in_spreads", group: Group::Recommended, problem: "Unnecessary use of 'toList' in a spread.", correction: "Try removing the invocation of 'toList'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_type_name_in_constructor", group: Group::Standalone, problem: "Unnecessary type name in a constructor.", correction: "Try removing the type name.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_unawaited", group: Group::Standalone, problem: "Unnecessary use of 'unawaited'.", correction: "Try removing the use of 'unawaited', as the unawaited element is annotated with '@awaitNotRequired'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unnecessary_underscores", group: Group::Standalone, problem: "Unnecessary use of multiple underscores.", correction: "Try using '_'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unreachable_from_main", group: Group::Standalone, problem: "Unreachable member '{0}' in an executable library.", correction: "Try referencing the member or removing it.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unrelated_type_equality_checks", group: Group::Core, problem: "The type of the right operand ('{0}') isn't a subtype or a supertype of the left operand ('{1}').", correction: "Try changing one or both of the operands.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "unsafe_html", group: Group::Removed, problem: "", correction: "", state: MetaState::Removed(Some("3.7.0")), docs_published: false },
+    RuleMeta { name: "unsafe_variance", group: Group::Standalone, problem: "This type is unsafe: a type parameter occurs in a non-covariant position.", correction: "Try using a more general type that doesn't contain any type parameters in such a position.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_build_context_synchronously", group: Group::Standalone, problem: "Don't use 'BuildContext's across async gaps.", correction: "Try rewriting the code to not use the 'BuildContext', or guard the use with a 'mounted' check.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_colored_box", group: Group::Standalone, problem: "Use a 'ColoredBox' rather than a 'Container' with only a 'Color'.", correction: "Try replacing the 'Container' with a 'ColoredBox'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_declaring_parameters", group: Group::Standalone, problem: "Use a declaring parameter.", correction: "Try using a declaring parameter.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_decorated_box", group: Group::Standalone, problem: "Use 'DecoratedBox' rather than a 'Container' with only a 'Decoration'.", correction: "Try replacing the 'Container' with a 'DecoratedBox'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_enums", group: Group::Standalone, problem: "Class should be an enum.", correction: "Try using an enum rather than a class.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "use_full_hex_values_for_flutter_colors", group: Group::Standalone, problem: "Instances of 'Color' should be created using an 8-digit hexadecimal integer (such as '0xFFFFFFFF').", correction: "", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_function_type_syntax_for_parameters", group: Group::Recommended, problem: "Use the generic function type syntax to declare the parameter '{0}'.", correction: "Try using the generic function type syntax.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_if_null_to_convert_nulls_to_bools", group: Group::Standalone, problem: "Use an if-null operator to convert a 'null' to a 'bool'.", correction: "Try using an if-null operator.", state: MetaState::Deprecated(Some("3.11.0")), docs_published: true },
+    RuleMeta { name: "use_is_even_rather_than_modulo", group: Group::Standalone, problem: "Use '{0}' rather than '% 2'.", correction: "Try using '{0}'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_key_in_widget_constructors", group: Group::Standalone, problem: "Constructors for public widgets should have a named 'key' parameter.", correction: "Try adding a named parameter to the constructor.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_late_for_private_fields_and_variables", group: Group::Standalone, problem: "Use 'late' for private members with a non-nullable type.", correction: "Try adding the 'late' modifier.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_named_constants", group: Group::Standalone, problem: "Use the constant '{0}' rather than a constructor returning the same object.", correction: "Try using '{0}'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_null_aware_elements", group: Group::Standalone, problem: "Use the null-aware marker '?' rather than a null check via an 'if'.", correction: "Try using '?'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_primary_constructors", group: Group::Standalone, problem: "Use a primary constructor.", correction: "Try using a primary constructor.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "use_raw_strings", group: Group::Standalone, problem: "Use a raw string to avoid using escapes.", correction: "Try making the string a raw string and removing the escapes.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_rethrow_when_possible", group: Group::Recommended, problem: "Use 'rethrow' to rethrow a caught exception.", correction: "Try replacing the 'throw' with a 'rethrow'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_setters_to_change_properties", group: Group::Standalone, problem: "The method is used to change a property.", correction: "Try converting the method to a setter.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_string_buffers", group: Group::Standalone, problem: "Use a string buffer rather than '+' to compose strings.", correction: "Try writing the parts of a string to a string buffer.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_string_in_part_of_directives", group: Group::Core, problem: "The part-of directive uses a library name.", correction: "Try converting the directive to use the URI of the library.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_super_parameters", group: Group::Recommended, problem: "Parameter '{0}' could be a super parameter.", correction: "Trying converting '{0}' to a super parameter.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "use_test_throws_matchers", group: Group::Standalone, problem: "Use the 'throwsA' matcher instead of using 'fail' when there is no exception thrown.", correction: "Try removing the try-catch and using 'throwsA' to expect an exception.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "use_to_and_as_if_applicable", group: Group::Standalone, problem: "Start the name of the method with 'to' or 'as'.", correction: "Try renaming the method to use either 'to' or 'as'.", state: MetaState::Stable, docs_published: false },
+    RuleMeta { name: "use_truncating_division", group: Group::Standalone, problem: "Use truncating division.", correction: "Try using truncating division, '~/', instead of regular division ('/') followed by 'toInt()'.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "valid_regexps", group: Group::Core, problem: "Invalid regular expression syntax.", correction: "Try correcting the regular expression.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "var_with_no_type_annotation", group: Group::Standalone, problem: "Avoid declaring parameters with `var` and no type annotation.", correction: "Try removing the keyword 'var' or replacing `var` with a type annotation.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "visit_registered_nodes", group: Group::Standalone, problem: "Declare 'visit' methods for all registered node types.", correction: "Try declaring a 'visit' method for all registered node types.", state: MetaState::Stable, docs_published: true },
+    RuleMeta { name: "void_checks", group: Group::Core, problem: "Assignment to a variable of type 'void'.", correction: "Try removing the assignment or changing the type of the variable.", state: MetaState::Stable, docs_published: true },
+];
+
+/// The name-sorted metadata table — the runtime read face.
+pub static RULE_META: &[RuleMeta] = TABLE;
+
+/// The metadata of rule `name`, `None` when the name is not a first-party
+/// linter rule of the pinned tree (the diagnostic mirrors and unknown
+/// names). Binary search; a once-per-run lookup face.
+#[must_use]
+pub fn rule_meta(name: &str) -> Option<&'static RuleMeta> {
+    RULE_META
+        .binary_search_by(|meta| meta.name.cmp(name))
+        .ok()
+        .map(|index| &RULE_META[index])
+}
+
+/// The compile-time face: the `spec!` macro resolves a rule's group at
+/// its `static SPEC` initializer, so a rule the table does not carry
+/// fails the build (not the first query). One linear scan per site.
+pub(crate) const fn meta_group(name: &str) -> Group {
+    let mut i = 0;
+    while i < TABLE.len() {
+        if str_eq(TABLE[i].name, name) {
+            return TABLE[i].group;
+        }
+        i += 1;
+    }
+    panic!("lint rule has no generated metadata row; regenerate the table or add the name to the registry exemption list");
+}
+
+/// The compile-time `problemMessage` face of [`meta_group`].
+pub(crate) const fn meta_problem(name: &str) -> &'static str {
+    let mut i = 0;
+    while i < TABLE.len() {
+        if str_eq(TABLE[i].name, name) {
+            return TABLE[i].problem;
+        }
+        i += 1;
+    }
+    panic!("lint rule has no generated metadata row; regenerate the table or add the name to the registry exemption list");
+}
+
+/// The compile-time `correctionMessage` face of [`meta_group`].
+pub(crate) const fn meta_correction(name: &str) -> &'static str {
+    let mut i = 0;
+    while i < TABLE.len() {
+        if str_eq(TABLE[i].name, name) {
+            return TABLE[i].correction;
+        }
+        i += 1;
+    }
+    panic!("lint rule has no generated metadata row; regenerate the table or add the name to the registry exemption list");
+}
+
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}

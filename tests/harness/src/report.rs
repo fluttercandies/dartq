@@ -1689,28 +1689,28 @@ mod tests {
     }
 
     /// `daemon_template` drops every analysis-only token: the subcommand, both
-/// `--format` spellings (`=` and the space pair), keeping everything else
-/// (#2606: the dartq templates now say `--format=json`; the retired
-/// `--format=machine` spelling stays dropped too).
-#[test]
-fn daemon_template_drops_format_spellings() {
-    assert_eq!(
-        daemon_template("./dartq analyze --format=json --sdk X"),
-        "./dartq daemon {dir} --sdk X"
-    );
-    assert_eq!(
-        daemon_template("./dartq analyze --format json --sdk X"),
-        "./dartq daemon {dir} --sdk X",
-        "the space spelling drops its value token too"
-    );
-    assert_eq!(
-        daemon_template("./dartq check --format=machine"),
-        "./dartq daemon {dir}",
-        "the retired machine spelling still drops"
-    );
-}
+    /// `--format` spellings (`=` and the space pair), keeping everything else
+    /// (#2606: the dartq templates now say `--format=json`; the retired
+    /// `--format=machine` spelling stays dropped too).
+    #[test]
+    fn daemon_template_drops_format_spellings() {
+        assert_eq!(
+            daemon_template("./dartq analyze --format=json --sdk X"),
+            "./dartq daemon {dir} --sdk X"
+        );
+        assert_eq!(
+            daemon_template("./dartq analyze --format json --sdk X"),
+            "./dartq daemon {dir} --sdk X",
+            "the space spelling drops its value token too"
+        );
+        assert_eq!(
+            daemon_template("./dartq check --format=machine"),
+            "./dartq daemon {dir}",
+            "the retired machine spelling still drops"
+        );
+    }
 
-/// Attribution report (dartq crash tier): `dartq_panic_files` with corpus
+    /// Attribution report (dartq crash tier): `dartq_panic_files` with corpus
     /// labels, the not-judged gate marker, partial flag and probe accounting.
     #[test]
     fn panic_report_carries_attribution_fields() {

@@ -6,7 +6,7 @@
 use dartq_ast::NodeKind;
 
 use crate::engine::{Check, narrow_u32};
-use crate::registry::{Group, RuleSpec};
+use crate::registry::RuleSpec;
 use crate::rules::{NONE_TOKEN, first_child, last_child, utf16_token_span};
 
 /// The domain's incoming registrations: a new standalone rule appends its
@@ -21,12 +21,9 @@ pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
 /// `else` (`if (c) return;` on one line is allowed, :59-70). Message:
 /// `diagnostic.g.dart` `curlyBracesInFlowControlStructures` with the
 /// construct spelled into `{0}`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "curly_braces_in_flow_control_structures",
-    group: Group::Core,
-    problem: "Statements in {0} should be enclosed in a block.",
-    correction: "Try wrapping the statement in a block.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "curly_braces_in_flow_control_structures",
+    &[
         NodeKind::IfStatement,
         NodeKind::WhileStatement,
         NodeKind::ForStatement,
@@ -34,7 +31,7 @@ pub(crate) static SPEC: RuleSpec = RuleSpec {
         NodeKind::DoWhileStatement,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

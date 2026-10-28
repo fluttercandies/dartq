@@ -12,6 +12,7 @@ categories = ["development-tools"]
 
 [dependencies]
 blake3 = { workspace = true }
+dartq-diagnostics = { workspace = true }
 dartq-index = { workspace = true }
 dartq-source = { workspace = true }
 serde = { workspace = true }

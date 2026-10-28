@@ -23,7 +23,7 @@ use dartq_ast::NodeKind;
 use dartq_scanner::TokenKind;
 
 use crate::engine::Check;
-use crate::registry::{Group, RuleSpec};
+use crate::registry::RuleSpec;
 
 /// The domain's incoming registrations: a new standalone rule appends its
 /// `SPEC` reference here (name order) and joins the registry through the
@@ -53,7 +53,7 @@ fn closes_literal(lexeme: &str, quote: u8) -> bool {
 }
 
 pub(crate) mod unnecessary_brace_in_string_interps {
-    use super::{Check, Group, NodeKind, RuleSpec, TokenKind, closes_literal};
+    use super::{Check, NodeKind, RuleSpec, TokenKind, closes_literal};
 
     /// Official: `pkg/linter/lib/src/rules/unnecessary_brace_in_string_interps.dart:41-83`
     /// — an interpolation `${e}` whose expression is a bare identifier
@@ -61,14 +61,11 @@ pub(crate) mod unnecessary_brace_in_string_interps {
     /// brace is not followed by an identifier-part character, reports at the
     /// interpolation. Message: `diagnostic.g.dart`
     /// `unnecessaryBraceInStringInterps`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "unnecessary_brace_in_string_interps",
-        group: Group::Recommended,
-        problem: "Unnecessary braces in a string interpolation.",
-        correction: "Try removing the braces.",
-        kinds: &[NodeKind::StringLiteral],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_brace_in_string_interps",
+    &[NodeKind::StringLiteral],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -157,21 +154,18 @@ pub(crate) mod unnecessary_brace_in_string_interps {
 }
 
 pub(crate) mod unnecessary_string_escapes {
-    use super::{Check, Group, NodeKind, RuleSpec, TokenKind};
+    use super::{Check, NodeKind, RuleSpec, TokenKind};
 
     /// Official: `pkg/linter/lib/src/rules/unnecessary_string_escapes.dart:24-117`
     /// — an escape of a character that needs no escaping reports at the
     /// backslash. Raw strings skip; multiline strings keep escaped quotes
     /// only where unescaping would merge the closing quotes. Message:
     /// `diagnostic.g.dart` `unnecessaryStringEscapes`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "unnecessary_string_escapes",
-        group: Group::Recommended,
-        problem: "Unnecessary escape in string literal.",
-        correction: "Remove the '\\' escape.",
-        kinds: &[NodeKind::StringLiteral],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_string_escapes",
+    &[NodeKind::StringLiteral],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -344,7 +338,7 @@ pub(crate) mod unnecessary_string_interpolations {
     use dartq_scanner::TokenKind;
     use dartq_semantic::model::Ty;
 
-    use super::{Check, Group, RuleSpec};
+    use super::{Check, RuleSpec};
     use crate::rules::expressions::{query_site, static_type_faces as faces};
     use crate::rules::slice;
 
@@ -375,14 +369,11 @@ pub(crate) mod unnecessary_string_interpolations {
     /// literal can end) and after the closing quote (a `String` segment) —
     /// exactly where the official reads the `AdjacentStrings` parent.
     /// Message: `diagnostic.g.dart` `unnecessaryStringInterpolations`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "unnecessary_string_interpolations",
-        group: Group::Recommended,
-        problem: "Unnecessary use of string interpolation.",
-        correction: "Try replacing the string literal with the variable name.",
-        kinds: &[NodeKind::StringLiteral],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_string_interpolations",
+    &[NodeKind::StringLiteral],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -643,7 +634,7 @@ pub(crate) mod unnecessary_string_interpolations {
 }
 
 pub(crate) mod avoid_escaping_inner_quotes {
-    use super::{Check, Group, NodeKind, RuleSpec, TokenKind, closes_literal};
+    use super::{Check, NodeKind, RuleSpec, TokenKind, closes_literal};
 
     /// Official: `pkg/linter/lib/src/rules/avoid_escaping_inner_quotes.dart:30-67`
     /// — a non-raw, non-multiline string (plain literal or interpolation)
@@ -658,14 +649,11 @@ pub(crate) mod avoid_escaping_inner_quotes {
     /// segments are walked from the head — `String` segments are unescaped
     /// before the quote scan (identity, `\xHH`, `\uHHHH`, `\u{H+}`), `$id`
     /// markers contribute nothing, `${...}` groups hold their own literals.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "avoid_escaping_inner_quotes",
-        group: Group::Standalone,
-        problem: "Unnecessary escape of '{0}'.",
-        correction: "Try changing the outer quotes to '{1}'.",
-        kinds: &[NodeKind::StringLiteral],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_escaping_inner_quotes",
+    &[NodeKind::StringLiteral],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -922,7 +910,7 @@ fn literal_token_extent(c: &Check<'_>, node: u32) -> core::ops::Range<u32> {
 }
 
 pub(crate) mod leading_newlines_in_multiline_strings {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/leading_newlines_in_multiline_strings.dart:61-72`
     /// — a multiline string (triple-quoted, the `isMultiline` lexeme face)
@@ -932,14 +920,11 @@ pub(crate) mod leading_newlines_in_multiline_strings {
     /// lexeme (an escape never counts). Interpolated literals read their
     /// first segment (:54-59 — the opening `'''…` token). Message:
     /// `diagnostic.g.dart` `leadingNewlinesInMultilineStrings`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "leading_newlines_in_multiline_strings",
-        group: Group::Standalone,
-        problem: "Missing a newline at the beginning of a multiline string.",
-        correction: "Try adding a newline at the beginning of the string.",
-        kinds: &[NodeKind::StringLiteral],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "leading_newlines_in_multiline_strings",
+    &[NodeKind::StringLiteral],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -974,13 +959,25 @@ pub(crate) mod leading_newlines_in_multiline_strings {
         // The first content character must be a newline (:65-67).
         match lexeme.as_bytes().get(content_at) {
             Some(b'\n' | b'\r') => {}
-            _ => c.report(c.utf16_span(node), &[]),
+            _ => {
+                // The official reports the whole literal (`reportAtNode`)
+                // — through the closing quotes and any interpolation tail;
+                // the node row covers only the first segment, so the
+                // extent walk bounds both ends.
+                let (Some(start), Some(end)) = (
+                    c.utf16_of_token(range.start),
+                    c.utf16_end_of_token(range.end - 1),
+                ) else {
+                    return;
+                };
+                c.report(start..end, &[]);
+            }
         }
     }
 }
 
 pub(crate) mod missing_whitespace_between_adjacent_strings {
-    use super::{Check, Group, NodeKind, RuleSpec, TokenKind};
+    use super::{Check, NodeKind, RuleSpec, TokenKind};
 
     /// Official: `pkg/linter/lib/src/rules/missing_whitespace_between_adjacent_strings.dart:40-69`
     /// — for each adjacent pair, when the left part carries whitespace but
@@ -992,14 +989,11 @@ pub(crate) mod missing_whitespace_between_adjacent_strings {
     /// Strings passed to a bare `RegExp(…)`/`matches(…)` call skip
     /// (:43-53). Message: `diagnostic.g.dart`
     /// `missingWhitespaceBetweenAdjacentStrings`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "missing_whitespace_between_adjacent_strings",
-        group: Group::Standalone,
-        problem: "Missing whitespace between adjacent strings.",
-        correction: "Try adding whitespace between the strings.",
-        kinds: &[NodeKind::StringLiteral],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "missing_whitespace_between_adjacent_strings",
+    &[NodeKind::StringLiteral],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -1199,7 +1193,7 @@ pub(crate) mod missing_whitespace_between_adjacent_strings {
 }
 
 pub(crate) mod no_adjacent_strings_in_list {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/no_adjacent_strings_in_list.dart:38-82`
     /// — an adjacent-strings group in a list literal, a set literal (never
@@ -1207,14 +1201,11 @@ pub(crate) mod no_adjacent_strings_in_list {
     /// arm when no `else` follows or its else arm (:52-59), or a list
     /// pattern's constant elements (:73-81) reports at the whole group.
     /// Message: `diagnostic.g.dart` `noAdjacentStringsInList`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "no_adjacent_strings_in_list",
-        group: Group::Standalone,
-        problem: "Don't use adjacent strings in a list literal.",
-        correction: "Try adding a comma between the strings.",
-        kinds: &[NodeKind::StringLiteral],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "no_adjacent_strings_in_list",
+    &[NodeKind::StringLiteral],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -1513,7 +1504,7 @@ fn strip_segment_suffix(lexeme: &str) -> &str {
 }
 
 pub(crate) mod eol_at_end_of_file {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/eol_at_end_of_file.dart:36-58` —
     /// a non-empty file ends in exactly one newline: several trailing
@@ -1522,14 +1513,11 @@ pub(crate) mod eol_at_end_of_file {
     /// pairs are carried verbatim (`diagnostic.g.dart`
     /// `eolAtEndOfFileMissing` / `eolAtEndOfFileTooMany`), so
     /// [`Check::report_texts`] selects per shape.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "eol_at_end_of_file",
-        group: Group::Standalone,
-        problem: "Missing a newline at the end of the file.",
-        correction: "Try adding a newline at the end of the file.",
-        kinds: &[NodeKind::CompilationUnit],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "eol_at_end_of_file",
+    &[NodeKind::CompilationUnit],
+    check,
+);
 
     const TOO_MANY_PROBLEM: &str = "Too many newlines at the end of the file.";
     const TOO_MANY_CORRECTION: &str = "Try removing the extra newlines at the end of the file.";
@@ -1591,7 +1579,7 @@ pub(crate) mod eol_at_end_of_file {
 }
 
 pub(crate) mod lines_longer_than_80_chars {
-    use super::{Check, Group, NodeKind, RuleSpec, TokenKind};
+    use super::{Check, NodeKind, RuleSpec, TokenKind};
 
     /// Official: `pkg/linter/lib/src/rules/lines_longer_than_80_chars.dart:139-186`
     /// — every line longer than 80 code units (terminators excluded, a
@@ -1602,14 +1590,11 @@ pub(crate) mod lines_longer_than_80_chars {
     /// comment covers a line for every one of its content lines containing
     /// `/` or `\` (a `// ignore:` comment's own line is always covered,
     /// :33-40). Message: `diagnostic.g.dart` `linesLongerThan80Chars`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "lines_longer_than_80_chars",
-        group: Group::Standalone,
-        problem: "The line length exceeds the 80-character limit.",
-        correction: "Try breaking the line across multiple lines.",
-        kinds: &[NodeKind::CompilationUnit],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "lines_longer_than_80_chars",
+    &[NodeKind::CompilationUnit],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let lines = LineTable::new(c.unit.source);
@@ -1882,7 +1867,7 @@ pub(crate) mod lines_longer_than_80_chars {
 }
 
 pub(crate) mod prefer_double_quotes {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_double_quotes.dart`
     /// — the shared `QuoteVisitor`'s `useSingle: false` face
@@ -1894,14 +1879,11 @@ pub(crate) mod prefer_double_quotes {
     /// is itself nested inside an interpolation (`isNestedString`,
     /// :48-50/:60/:83). Double-quoted literals never report. Message:
     /// `diagnostic.g.dart` `preferDoubleQuotes`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_double_quotes",
-        group: Group::Standalone,
-        problem: "Unnecessary use of single quotes.",
-        correction: "Try using double quotes unless the string contains double quotes.",
-        kinds: &[NodeKind::StringLiteral],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_double_quotes",
+    &[NodeKind::StringLiteral],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -2024,7 +2006,7 @@ pub(crate) mod prefer_double_quotes {
 }
 
 pub(crate) mod prefer_single_quotes {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_single_quotes.dart:73-106`
     /// — a double-quoted literal (simple or interpolated, `r` included)
@@ -2036,14 +2018,11 @@ pub(crate) mod prefer_single_quotes {
     /// never report; the `prefer_double_quotes` counterpart shares these
     /// three guards with this rule through the module-level helpers.
     /// Message: `diagnostic.g.dart` `preferSingleQuotes`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_single_quotes",
-        group: Group::Standalone,
-        problem: "Unnecessary use of double quotes.",
-        correction: "Try using single quotes unless the string contains single quotes.",
-        kinds: &[NodeKind::StringLiteral],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_single_quotes",
+    &[NodeKind::StringLiteral],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -2074,7 +2053,7 @@ pub(crate) mod prefer_single_quotes {
 }
 
 pub(crate) mod unnecessary_raw_strings {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/unnecessary_raw_strings.dart:29-34`
     /// — a raw simple string whose lexeme carries neither `\` nor `$`
@@ -2083,14 +2062,11 @@ pub(crate) mod unnecessary_raw_strings {
     /// raw head lexeme is the whole literal — an interpolated literal's
     /// middle segment can still open with an `r` (`"${x}rest"`) and must
     /// stay silent. Message: `diagnostic.g.dart` `unnecessaryRawStrings`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "unnecessary_raw_strings",
-        group: Group::Standalone,
-        problem: "Unnecessary use of a raw string.",
-        correction: "Try using a normal string.",
-        kinds: &[NodeKind::StringLiteral],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_raw_strings",
+    &[NodeKind::StringLiteral],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let extent = super::literal_token_extent(c, c.node());
@@ -2109,21 +2085,18 @@ pub(crate) mod unnecessary_raw_strings {
 }
 
 pub(crate) mod use_raw_strings {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/use_raw_strings.dart:29-56` — a
     /// non-raw simple string whose every escape is `\\` or `\$` reports at
     /// the literal (those are exactly the escapes a raw string preserves;
     /// any other escape bails). Interpolated literals are not simple and
     /// never enter. Message: `diagnostic.g.dart` `useRawStrings`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "use_raw_strings",
-        group: Group::Standalone,
-        problem: "Use a raw string to avoid using escapes.",
-        correction: "Try making the string a raw string and removing the escapes.",
-        kinds: &[NodeKind::StringLiteral],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_raw_strings",
+    &[NodeKind::StringLiteral],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let extent = super::literal_token_extent(c, c.node());
@@ -2163,7 +2136,7 @@ pub(crate) mod use_raw_strings {
 }
 
 pub(crate) mod use_string_buffers {
-    use super::{Check, Group, NodeKind, RuleSpec, TokenKind};
+    use super::{Check, NodeKind, RuleSpec, TokenKind};
     use crate::rules::slice::parameter_assignments::{parameter_name, parameter_rows};
     use crate::rules::{NONE_TOKEN, initialized_identifier_name, type_face, type_face_of_field};
 
@@ -2199,14 +2172,11 @@ pub(crate) mod use_string_buffers {
     /// `if`/`switch`/`try` arms inside a loop body stay silent. The `+=`
     /// face reports at the assignment, the `=` face at the target
     /// identifier (the official reports the left-hand side).
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "use_string_buffers",
-        group: Group::Standalone,
-        problem: "Use a string buffer rather than '+' to compose strings.",
-        correction: "Try writing the parts of a string to a string buffer.",
-        kinds: &[NodeKind::Assignment],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_string_buffers",
+    &[NodeKind::Assignment],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -3323,6 +3293,23 @@ mod w3_pins {
         );
         let literal = tok(&f.source, &f.tokens, "'''this\n is multiline'''", 0);
         assert_eq!(lints[0].range.start, utf16_at(&f, literal));
+        // The report spans the whole literal (`reportAtNode`).
+        let closing = f.source.rfind("'''").expect("closing quotes");
+        assert_eq!(lints[0].range.end as usize, closing + 3);
+    }
+
+    /// `test_textBeforeNewline_withInterpolation` — the report spans the
+    /// whole interpolated literal through the closing quotes (the node
+    /// row alone covers only the first segment).
+    #[test]
+    fn leading_newlines_interpolated_spans_the_literal() {
+        let f = Fixture::parse("var a = 'a';\nvar x = '''this\n is a multiline string$a''';\n");
+        let lints = f.run(&one_rule("leading_newlines_in_multiline_strings"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        let start = f.source.find("'''this").expect("literal start");
+        let end = f.source.rfind("'''").expect("literal end") + 3;
+        assert_eq!(lints[0].range.start as usize, start);
+        assert_eq!(lints[0].range.end as usize, end);
     }
 
     /// A leading newline, a single-line multiline spelling and a raw

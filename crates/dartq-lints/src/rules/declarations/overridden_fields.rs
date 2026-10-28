@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 use crate::rules::{MemberQuery, class_declaration_name, member_matches, same_file_ancestors};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/overridden_fields.dart` — an
@@ -27,14 +27,11 @@ use crate::rules::{MemberQuery, class_declaration_name, member_matches, same_fil
 /// and skips, and extension-type representation formals take no
 /// keyword) and checks like a field, reporting at its name token.
 /// Message: `diagnostic.g.dart` `overriddenFields`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "overridden_fields",
-    group: Group::Recommended,
-    problem: "Field overrides a field inherited from '{0}'.",
-    correction: "Try removing the field, overriding the getter and setter if necessary.",
-    kinds: &[NodeKind::Fields, NodeKind::PrimaryConstructor],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "overridden_fields",
+    &[NodeKind::Fields, NodeKind::PrimaryConstructor],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

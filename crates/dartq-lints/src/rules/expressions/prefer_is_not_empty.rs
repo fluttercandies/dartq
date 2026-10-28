@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice};
+use super::{Check, NodeKind, RuleSpec, query_site, slice};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_is_not_empty.dart:31-63` —
 /// `!x.isEmpty` reports at the prefix expression.
@@ -13,14 +13,11 @@ use super::{Check, Group, NodeKind, RuleSpec, query_site, slice};
 /// the operand run at the argument boundaries — a later argument's
 /// access no longer leaks into the run (the documented false-fire
 /// face). Message: `diagnostic.g.dart` `preferIsNotEmpty`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_is_not_empty",
-    group: Group::Core,
-    problem: "Use 'isNotEmpty' rather than negating the result of 'isEmpty'.",
-    correction: "Try rewriting the expression to use 'isNotEmpty'.",
-    kinds: &[NodeKind::UnaryPrefix],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_is_not_empty",
+    &[NodeKind::UnaryPrefix],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
@@ -71,11 +68,35 @@ fn check(c: &mut Check<'_>) {
             owner_kids[..container_pos].to_vec()
         }
     };
-    let pieces: Vec<u32> = run
+    let mut pieces: Vec<u32> = run
         .iter()
         .copied()
         .filter(|&piece| c.byte_span(piece).start >= bang_end)
         .collect();
+    // `node.operand.unParenthesized` (:50-55): a parenthesized operand
+    // carries its access chain inside the ParenthesizedExpression row —
+    // unwrap until the access marker appears, the outermost container
+    // bounding the report (the official `reportAtNode(node)` spans the
+    // whole prefix expression, closing parens included). A receiver-side
+    // paren (`!(a.b).isEmpty`) keeps its marker in the run and never
+    // unwraps.
+    let mut operand_end = None;
+    loop {
+        if pieces.iter().any(|&p| c.kind(p) == NodeKind::DotAccess) {
+            break;
+        }
+        let Some(pos) = pieces
+            .iter()
+            .rposition(|&p| c.kind(p) == NodeKind::ParenthesizedExpression)
+        else {
+            return;
+        };
+        if operand_end.is_none() {
+            operand_end = Some(c.utf16_span(pieces[pos]).end);
+        }
+        let inner = c.collect_direct(pieces[pos]);
+        pieces.splice(pos..pos + 1, inner);
+    }
     // `node.operand.unParenthesized` is a property access (:50-55): the
     // operand's tail is its access marker (`!(a || b)` carries none).
     let Some(marker_index) = pieces
@@ -121,10 +142,14 @@ fn check(c: &mut Check<'_>) {
         }
     }
     // The official reports at the prefix expression — from the `!`
-    // through the member name. The completion marker's span trails one
-    // token past the access (the lazy rows anchor at the following
-    // token), so the name row bounds the end.
+    // through the operand's end: the member name on the plain shape (the
+    // completion marker's span trails one token past the access — the
+    // lazy rows anchor at the following token — so the name row bounds
+    // the end), the outermost closing paren on the parenthesized shape.
     let start = c.utf16_span(node).start;
-    let end = c.utf16_span(chain[name]).end;
+    let end = match operand_end {
+        Some(end) => end,
+        None => c.utf16_span(chain[name]).end,
+    };
     c.report(start..end, &[]);
 }

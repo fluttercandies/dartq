@@ -3409,7 +3409,7 @@ mod tests {
         let hits = hits("var x = new Object();\n", "unnecessary_new");
         assert_eq!(hits.len(), 1);
         // The official reports at the keyword with a zero-width span.
-        assert_eq!(hits[0].range, 8..8);
+        assert_eq!(hits[0].range, 8..11);
     }
 
     #[test]

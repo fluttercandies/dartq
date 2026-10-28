@@ -83,14 +83,17 @@ pub fn completion(
 /// view's own text. Line breaks follow the line index's semantics (`\n`,
 /// `\r\n`, or a lone `\r`); the column counts UTF-16 code units, so a
 /// column just past a line's last character is the legitimate cursor
-/// position completion answers at.
+/// position completion answers at. The one conversion both one-shot faces
+/// and the daemon's routed `line`/`col` request shape run (#2629) — the
+/// analyzed snapshot's own text is the base, so the routed answer and the
+/// cold answer convert identically.
 ///
 /// # Panics
 ///
 /// Panics when the resident content is not UTF-8 or is missing — both
 /// internal invariant breaches (content is validated at `set_content`
 /// time; a resident file of the just-analyzed view carries its text).
-fn position_offset(
+pub fn position_offset(
     engine: &Engine,
     file: &Path,
     line: u32,

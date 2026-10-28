@@ -1,7 +1,4 @@
-use super::{
-    Check, Group, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, for_in_binds,
-    parameters_bind, statement_binds,
-};
+use super::{Check, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, for_in_binds, parameters_bind, statement_binds};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_final_parameters.dart` —
 /// a parameter that is neither `final`/`const` nor reassigned in its
@@ -34,12 +31,9 @@ use super::{
 /// variable patterns), and a nearer binder of the same lexeme (the
 /// shared shadow-check face's binder set) captures the write first.
 /// Message: `diagnostic.g.dart` `preferFinalParameters`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_final_parameters",
-    group: Group::Standalone,
-    problem: "The parameter '{0}' should be final.",
-    correction: "Try making the parameter final.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_final_parameters",
+    &[
         NodeKind::Constructor,
         NodeKind::Method,
         NodeKind::FunctionExpression,
@@ -51,7 +45,7 @@ pub(crate) static SPEC: RuleSpec = RuleSpec {
         NodeKind::LocalFunctionDeclaration,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     if c.unit.features.primary_constructors {

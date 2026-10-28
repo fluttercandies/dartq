@@ -223,12 +223,20 @@
 mod bridge;
 mod comments;
 mod engine;
+mod generated;
 mod ignore;
 mod registry;
 mod rules;
 
-#[cfg(test)]
-mod testsupport;
+/// The production test bridge: the in-crate rule tests (its pre-existing
+/// `cfg(test)` posture) and, with the `test-support` feature, the
+/// out-of-crate behavioral harnesses (the dartq-fixture crate's upstream
+/// port runner) — [`testsupport::Fixture`], its run faces, and the
+/// semantic-fold mount. Feature-off builds are byte-identical to the
+/// pre-feature crate: the module compiles under `cfg(test)` exactly as it
+/// always has.
+#[cfg(any(test, feature = "test-support"))]
+pub mod testsupport;
 
 pub use bridge::{ParsedUnit, parse_unit, parse_unit_with_tokens};
 pub use comments::{Comment, CommentKind, Comments};
@@ -242,6 +250,14 @@ pub use registry::{
     EnableSet, Group, RULES, RuleId, RuleSpec, SEMANTIC_RULES, emittable_rule_names,
     incompatible_rules, mounts_semantics, rule_by_name, rules,
 };
+// The generated upstream metadata (#2676): the rule-state faces of
+// dartq-commands read since versions and states through this accessor —
+// the one source the generator (`tools/upstream-gen`'s `linter-meta-gen`)
+// emits and `--check` byte-compares.
+pub use generated::rule_meta::{MetaState, RuleMeta, rule_meta};
+// The SPEC-literal macro (registry.rs) — re-exported so every rule file
+// writes `crate::spec!`.
+pub(crate) use registry::spec;
 // The pubspec-pass verdicts (#434): the mounting face (dartq-commands'
 // `analyze_lints`) walks the scanned pubspec facts through these — the
 // rules themselves stay crate-internal (`kinds: &[]`, no AST dispatch).

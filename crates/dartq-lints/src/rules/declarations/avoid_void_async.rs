@@ -1,6 +1,4 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, async_words, member_declaration_name, name_row_token,
-};
+use super::{Check, NodeKind, RuleSpec, async_words, member_declaration_name, name_row_token};
 use crate::rules::{NONE_TOKEN, last_child, member_name};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_void_async.dart:39-59` —
@@ -12,18 +10,15 @@ use crate::rules::{NONE_TOKEN, last_child, member_name};
 /// an inferred return type never reports, exactly as the element face
 /// (`dynamic` is not `VoidType`). Message: `diagnostic.g.dart`
 /// `avoidVoidAsync`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_void_async",
-    group: Group::Standalone,
-    problem: "An 'async' function should have a 'Future' return type when it doesn't return a value.",
-    correction: "Try changing the return type.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_void_async",
+    &[
         NodeKind::TopLevelMethod,
         NodeKind::Method,
         NodeKind::LocalFunctionDeclaration,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

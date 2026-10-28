@@ -2,7 +2,7 @@ use core::ops::Range;
 
 use dartq_ast::NodeKind;
 
-use super::{Check, Group, RuleSpec};
+use super::{Check, RuleSpec};
 
 /// Official: `upstream Dart SDK source,
 /// pkg/linter/lib/src/rules/invalid_case_patterns.dart` — a legacy
@@ -27,14 +27,11 @@ use super::{Check, Group, RuleSpec};
 /// implicit-const constructor-call face (`C()` where the constructor
 /// is const, :78-81) needs constructor resolution and under-reports.
 /// Message: `diagnostic.g.dart` `invalidCasePatterns`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "invalid_case_patterns",
-    group: Group::Standalone,
-    problem: "This expression is not valid in a 'case' clause in Dart 3.0.",
-    correction: "Try refactoring the expression to be valid in 3.0.",
-    kinds: &[NodeKind::SwitchCase],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "invalid_case_patterns",
+    &[NodeKind::SwitchCase],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The registration bail (:41).

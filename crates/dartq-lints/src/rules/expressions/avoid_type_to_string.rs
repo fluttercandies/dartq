@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
 use crate::rules::utf16_token_span;
 
 /// Official: `upstream Dart SDK source,
@@ -16,14 +16,11 @@ use crate::rules::utf16_token_span;
 /// bare-name tear-off faces (:116-131), and the enclosing-class
 /// `thisType` face stay silent. Message: `diagnostic.g.dart`
 /// `avoidTypeToString`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_type_to_string",
-    group: Group::Standalone,
-    problem: "Using 'toString' on a 'Type' is not safe in production code.",
-    correction: "Try a normal type check or compare the 'runtimeType' directly.",
-    kinds: &[NodeKind::Send],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_type_to_string",
+    &[NodeKind::Send],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

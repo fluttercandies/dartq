@@ -1,0 +1,1 @@
+interface mixin M {}

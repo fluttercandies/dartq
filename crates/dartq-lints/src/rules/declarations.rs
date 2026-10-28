@@ -23,7 +23,7 @@ use rustc_hash::FxHashMap;
 
 use crate::engine::Check;
 use crate::engine::narrow_u32;
-use crate::registry::{Group, RuleSpec};
+use crate::registry::RuleSpec;
 use crate::rules::{NONE_TOKEN, SupertypeClause, body_members, member_name, slice, type_before};
 
 /// The domain's incoming registrations: a new standalone rule appends its

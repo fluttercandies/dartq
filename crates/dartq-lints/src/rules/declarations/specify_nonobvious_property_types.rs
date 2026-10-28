@@ -1,8 +1,5 @@
-use super::{Check, Group, NodeKind, RuleSpec, fields_written_type, obvious_spelling};
-use crate::rules::{
-    MemberQuery, last_child, member_matches, same_file_ancestors, same_file_declaration,
-    supertypes,
-};
+use super::{Check, NodeKind, RuleSpec, fields_written_type, obvious_spelling};
+use crate::rules::{MemberQuery, last_child, member_matches, same_file_ancestors, same_file_declaration, supertypes};
 
 /// Official: `pkg/linter/lib/src/rules/specify_nonobvious_property_types.dart:47-120`
 /// — a top-level or field variable list (:43-44) with no written type
@@ -18,14 +15,11 @@ use crate::rules::{
 /// `allSupertypes` walk is unavailable); static and top-level
 /// variables carry no such face. Message: `diagnostic.g.dart`
 /// `specifyNonobviousPropertyTypes`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "specify_nonobvious_property_types",
-    group: Group::Standalone,
-    problem: "A type annotation is needed because it isn't obvious.",
-    correction: "Try adding a type annotation.",
-    kinds: &[NodeKind::VariablesDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "specify_nonobvious_property_types",
+    &[NodeKind::VariablesDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

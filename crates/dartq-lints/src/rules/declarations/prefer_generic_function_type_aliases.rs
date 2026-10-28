@@ -1,4 +1,4 @@
-use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec};
+use super::{Check, NONE_TOKEN, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_generic_function_type_aliases.dart:44-64`
 /// — every old-form `typedef` (no `=`; the analyzer's `FunctionTypeAlias`,
@@ -12,14 +12,11 @@ use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec};
 /// this written-tail face; the report position is unaffected). A
 /// synthetic semicolon (recovery) skips (:48-49). Message:
 /// `diagnostic.g.dart` `preferGenericFunctionTypeAliases`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_generic_function_type_aliases",
-    group: Group::Core,
-    problem: "Use the generic function type syntax in 'typedef's.",
-    correction: "Try using the generic function type syntax ('{0}').",
-    kinds: &[NodeKind::Typedef],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_generic_function_type_aliases",
+    &[NodeKind::Typedef],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

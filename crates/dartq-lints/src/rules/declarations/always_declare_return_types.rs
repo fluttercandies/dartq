@@ -1,6 +1,6 @@
 use std::path::Component;
 
-use super::{Check, Group, NodeKind, RuleSpec, get_set_token, narrow_u32, type_before};
+use super::{Check, NodeKind, RuleSpec, get_set_token, narrow_u32, type_before};
 
 /// Official: `pkg/linter/lib/src/rules/always_declare_return_types.dart:38-85`
 /// — a function, method, getter, or old-form `typedef` written without a
@@ -27,19 +27,16 @@ use super::{Check, Group, NodeKind, RuleSpec, get_set_token, narrow_u32, type_be
 /// `workspace.dart:127-131` — a `test` / `integration_test` /
 /// `test_driver` prefix of the package-relative path); without package
 /// facts mounted the face stays out, the official no-package posture.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "always_declare_return_types",
-    group: Group::Standalone,
-    problem: "The function '{0}' should have a return type but doesn't.",
-    correction: "Try adding a return type to the function.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "always_declare_return_types",
+    &[
         NodeKind::TopLevelMethod,
         NodeKind::Method,
         NodeKind::LocalFunctionDeclaration,
         NodeKind::Typedef,
     ],
     check,
-};
+);
 
 const METHODS_PROBLEM: &str = "The method '{0}' should have a return type but doesn't.";
 const METHODS_CORRECTION: &str = "Try adding a return type to the method.";

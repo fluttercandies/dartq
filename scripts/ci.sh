@@ -17,7 +17,13 @@
 # drift, never a designed one: add the targeted fixture it demands first,
 # then `cargo test -p dartq-semantic --test m3_codes_pin
 # regen_m3_unused_codes -- --ignored` and reconcile the header prose —
-# never regen blind.
+# never regen blind. The harness pins include the freeze --check family
+# (#2681): tests/harness/src/freeze.rs re-derives the m1/m2_warning/m3
+# codes freezes byte-for-byte from repo-internal sources
+# (analyzer-codes.tsv, the m3 targeted fixtures), and the fixture-coverage
+# manifest check below its tier table asserts byte equality against the
+# same canonical builder its regen writes — a stale freeze fails the gate
+# naming its regen command.
 #
 # `--check-only` runs a fast `cargo check -p <crate>` instead (no pins: the
 # mode compiles only). The script
@@ -132,6 +138,61 @@ if [ "$mode" = "gate" ]; then
     echo "== cargo test pins: dartq-semantic m3_codes_pin"
     if ! cargo test -q -p dartq-semantic --test m3_codes_pin; then
         echo "ci: cargo test pins FAILED: dartq-semantic (m3_codes_pin)" >&2
+        exit 1
+    fi
+    # Registry drift pin (#2677): the tracked analyzer-codes.tsv must be
+    # exactly what tools/upstream-gen derives from the SDK tree of record.
+    # Env-gated like the repo's other SDK-tree steps — the checkout is a
+    # local read-only tree tracked code never references.
+    if [ -n "${DART_SDK_SRC:-}" ]; then
+        echo "== analyzer-codes-gen --check (DART_SDK_SRC set)"
+        if ! cargo run -q --offline -p upstream-gen --bin analyzer-codes-gen -- --check --sdk-src "$DART_SDK_SRC"; then
+            echo "ci: analyzer-codes-gen --check FAILED (stale data/analyzer-codes.tsv)" >&2
+            exit 1
+        fi
+    else
+        echo "== analyzer-codes-gen --check: skipped (DART_SDK_SRC not set)"
+    fi
+    # Lint metadata drift pin (#2676): the tracked rule_meta.rs and
+    # lint_docs_table.rs must be exactly what tools/upstream-gen derives
+    # from the SDK tree plus the pinned package:lints snapshot (both local
+    # read-only trees). Gated on both env vars — either missing skips.
+    if [ -n "${DART_SDK_SRC:-}" ] && [ -n "${DART_LINTS_SRC:-}" ]; then
+        echo "== linter-meta-gen --check (DART_SDK_SRC and DART_LINTS_SRC set)"
+        if ! cargo run -q --offline -p upstream-gen --bin linter-meta-gen -- --check --sdk-src "$DART_SDK_SRC" --lints-src "$DART_LINTS_SRC"; then
+            echo "ci: linter-meta-gen --check FAILED (stale generated rule metadata)" >&2
+            exit 1
+        fi
+    else
+        echo "== linter-meta-gen --check: skipped (DART_SDK_SRC or DART_LINTS_SRC not set)"
+    fi
+    # Harness freeze --check (#2681): the gate-universe codes freezes
+    # must equal their repo-internal derivations byte-for-byte (the
+    # analyzer-codes.tsv mirror for m1/m2_warning, the targeted fixtures
+    # for m3) — no env gating. These also run inside the harness pins
+    # above; this named step pins the drift face next to the generator
+    # checks. The fixture-coverage manifest byte check rides the harness
+    # pins step (fixture_coverage_manifest_matches_corpus_derivation).
+    echo "== harness freeze --check (m1/m2_warning/m3 codes freezes)"
+    if ! cargo test -q -p harness freeze_check; then
+        echo "ci: harness freeze --check FAILED (stale gate-universe freeze; the failing test prints its regen command)" >&2
+        exit 1
+    fi
+fi
+
+# e2e goldens (#2631, gate mode): the routed-vs-cold parity leg over the
+# release binary — analyze routed (default) == `--cold` byte for byte,
+# target filters included, a killed daemon between calls included. The
+# leg list stays selectable (tests/e2e/run.sh [legs...]); CI runs the
+# golden leg alone — the full e2e suite remains a serial-phase face.
+if [ "$mode" = "gate" ]; then
+    echo "== e2e: routed-parity leg (release build)"
+    if ! cargo build -q --release -p dartq-cli; then
+        echo "ci: release build FAILED (e2e leg)" >&2
+        exit 1
+    fi
+    if ! bash tests/e2e/run.sh 11; then
+        echo "ci: e2e routed-parity leg FAILED" >&2
         exit 1
     fi
 fi

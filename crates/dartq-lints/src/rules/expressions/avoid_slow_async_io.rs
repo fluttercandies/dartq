@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces};
+use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces};
 use crate::rules::{same_file_declaration, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -30,14 +30,11 @@ use crate::rules::{same_file_declaration, utf16_token_span};
 /// `this`/`super` receivers, extension-type receivers implementing the
 /// interface, and cross-file shadowing classes resolve to nothing
 /// here. Message: `diagnostic.g.dart` `avoidSlowAsyncIo`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_slow_async_io",
-    group: Group::Standalone,
-    problem: "Use of an async 'dart:io' method.",
-    correction: "Try using the synchronous version of the method.",
-    kinds: &[NodeKind::Send],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_slow_async_io",
+    &[NodeKind::Send],
     check,
-};
+);
 
 /// The slow `FileSystemEntity` statics: `exists` is instance-only.
 const STATIC_SLOW: [&str; 5] = ["stat", "type", "isDirectory", "isFile", "isLink"];

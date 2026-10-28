@@ -1,6 +1,8 @@
-//! The one-shot faces' resident routing (#2627): `dartq analyze` and
-//! `dartq check` consult the worktree's resident session by default, and
-//! `--cold` forces the in-process path.
+//! The one-shot faces' resident routing (#2627/#2629): `dartq analyze`,
+//! `dartq check`, and the answer faces (`query` and its batch, `explain`,
+//! `impact`, `rename`'s dry run, `resolve`, `complete`) consult the
+//! worktree's resident session by default; `--cold` (the faces that carry
+//! it) forces the in-process path.
 //!
 //! # Why
 //!
@@ -61,6 +63,37 @@
 //! multi-workspace target sets, an unresolvable SDK root — route never
 //! and run cold silently: the cold path owns those semantics and their
 //! errors.
+//!
+//! # The answer faces (#2629)
+//!
+//! The value-answer faces consult the same resident layer, their daemon
+//! counterparts carrying a `format` parameter that switches the answer to
+//! the rendered stdout bytes of the one writer per format the cold face
+//! prints through (`dartq_commands::render`) — the routed bytes are the
+//! cold bytes structurally, and the value faces' exit tier is 0 on an
+//! answered document (their usage errors re-derive on the cold fallback).
+//! Posture:
+//!
+//! * Every answer face **attaches** a live session, never spawning — the
+//!   check face's doctrine. The election (spawn + wait) belongs to the
+//!   faces that own a worktree's residency (`session start`, `analyze`);
+//!   a one-shot read that spawned would leave a resident engine behind an
+//!   invocation that asked for one answer, and its first call pays the
+//!   same engine assembly either way. A live session answers from its
+//!   maintained view; no live session falls straight through to the cold
+//!   path with no advisory (nothing was lost).
+//! * The engine-view answers (`query` every kind, `query batch`,
+//!   `impact`, `rename`'s dry run, `resolve`, `complete`) carry the
+//!   universe stamp the caller verifies exactly as analyze's does
+//!   (`universe_matches_disk`).
+//! * `rename --write` routes never: the write applies through the CLI
+//!   face's own engine-local splice machinery (drift checks against the
+//!   analyzed view), which the daemon must not remote — the daemon
+//!   answers the edit set, the write stays here.
+//! * `explain`'s rendered answer carries no universe stamp: the daemon
+//!   rebuilds a per-query engine over the on-disk base (the visibility
+//!   table's posture — a warm session engine would silently miss
+//!   declarations), so its bytes read the disk fresh every time.
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -307,7 +340,7 @@ pub(crate) fn route_analyze(
             // the answer must not be printed; the cold path owns the
             // fresh universe.
             if !universe_matches_disk(&root, &answer) {
-                advisory("the session answered a stale package universe");
+                advisory("the session answered a stale package universe", "analyzing");
                 return None;
             }
             Some(print_routed(
@@ -325,11 +358,11 @@ pub(crate) fn route_analyze(
         // is a divergence, not a crash: fall back to the bytes the cold
         // path owns (`session_call` defaults a missing result to `{}`).
         Ok(_) => {
-            advisory("the session's answer lacked the rendered face");
+            advisory("the session's answer lacked the rendered face", "analyzing");
             None
         }
         Err(reason) => {
-            advisory(&reason);
+            advisory(&reason, "analyzing");
             None
         }
     }
@@ -441,13 +474,282 @@ pub(crate) fn route_check(
             started,
         )),
         Ok(_) => {
-            advisory("the session's answer lacked the rendered face");
+            advisory("the session's answer lacked the rendered face", "analyzing");
             None
         }
         Err(error) => {
-            advisory(&error.reason());
+            advisory(&error.reason(), "analyzing");
             None
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The answer faces' routes (#2629): query (every kind) + batch, explain,
+// impact, rename (dry run), resolve, complete — attach-only, the check
+// face's doctrine (see the module docs)
+// ---------------------------------------------------------------------------
+
+/// One engine-view answer face's route: attach a live session for the
+/// face's workspace root — under the FULL triple, so the session's engine
+/// is the one the cold path would assemble — send `method` the face's
+/// params, and print the daemon-rendered stdout bytes. `Some(code)` finishes the run (exit 0 —
+/// the value faces' tier on an answered document); `None` falls back to
+/// the in-process path — silently when nothing is live (the normal
+/// shape), with the fallback advisory on stderr when a session was found
+/// and lost. `stamped` faces carry the answer's universe stamp and verify
+/// it against the disk exactly as analyze's does; `explain`'s answer
+/// carries none (its per-query engine reads the disk fresh).
+fn route_answer(
+    root: &Path,
+    sdk_path: Option<&Path>,
+    method: &str,
+    params: &Value,
+    out: &mut impl Write,
+) -> Option<u8> {
+    // The triple keys on the concrete SDK root; without one the cold
+    // path owns the usage error (its assembly resolves the same way).
+    let sdk_root = resolved_sdk_root(sdk_path).ok()?;
+    let socket = attached_socket_for(root, &sdk_root)?;
+    match session_call(&socket, method, params, CALL_TIMEOUT) {
+        Ok(answer) if answer["stdout"].is_string() => {
+            if !universe_matches_disk(root, &answer) {
+                advisory("the session answered a stale package universe", ANSWERING);
+                return None;
+            }
+            print_answer(out, &answer)
+        }
+        Ok(_) => {
+            advisory("the session's answer lacked the rendered face", ANSWERING);
+            None
+        }
+        Err(error) => {
+            advisory(&error.reason(), ANSWERING);
+            None
+        }
+    }
+}
+
+/// The attach-only route over an already-probed socket (explain's shape —
+/// no SDK triple, no universe stamp: the per-query engine reads the disk
+/// fresh).
+fn route_attached(
+    socket: &Path,
+    method: &str,
+    params: &Value,
+    out: &mut impl Write,
+) -> Option<u8> {
+    match session_call(socket, method, params, CALL_TIMEOUT) {
+        Ok(answer) if answer["stdout"].is_string() => print_answer(out, &answer),
+        Ok(_) => {
+            advisory("the session's answer lacked the rendered face", ANSWERING);
+            None
+        }
+        Err(error) => {
+            advisory(&error.reason(), ANSWERING);
+            None
+        }
+    }
+}
+
+/// Prints one rendered answer's bytes and finishes the run: the value
+/// faces exit 0 on an answered document — their usage errors are the cold
+/// path's own, re-derived there whenever the route falls back.
+fn print_answer(out: &mut impl Write, answer: &Value) -> Option<u8> {
+    // The answer shape is this binary generation's own (the attach probe
+    // pins the protocol generation by binary hash): a missing field is a
+    // program bug, not a runtime case.
+    let stdout = answer["stdout"]
+        .as_str()
+        .expect("the routed answer carries the rendered stdout");
+    if out
+        .write_all(stdout.as_bytes())
+        .and_then(|()| out.flush())
+        .is_err()
+    {
+        eprintln!("dartq: internal error: writing the answer failed");
+        return Some(exit::INTERNAL_ERROR);
+    }
+    Some(exit::CLEAN)
+}
+
+/// The answer faces' fallback advisory tail (analyze/check keep their own
+/// "analyzing" spelling).
+const ANSWERING: &str = "answering";
+
+/// The face's package directory as the canonical resolution base: the
+/// same base `open_engine` resolves against below. `None` (an
+/// unresolvable directory) routes never — the cold path owns the usage
+/// error.
+fn face_root(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let dir = dir.canonicalize().ok()?;
+    Some((crate::workspace_root_of(&dir), dir))
+}
+
+/// `dartq query <face> NAME` over one kind: the daemon's `dartq/query`
+/// answers the same tier-shaped envelope the cold face prints.
+pub(crate) fn route_query(
+    args: &crate::SymbolArgs,
+    kind: crate::QueryKind,
+    out: &mut impl Write,
+) -> Option<u8> {
+    let (root, _dir) = face_root(&args.dir)?;
+    let params = json!({
+        "name": args.name,
+        "kind": query_kind_word(kind),
+        "format": output_word(args.format),
+        "verbosity": verbosity_word(args.verbosity),
+    });
+    route_answer(&root, args.sdk.as_deref(), "dartq/query", &params, out)
+}
+
+/// `dartq query batch`: the daemon's `dartq/queryBatch` answers every
+/// item in one round trip over the session graph, rendered as the cold
+/// face prints them — one line per envelope, request order.
+pub(crate) fn route_query_batch(args: &crate::BatchArgs, out: &mut impl Write) -> Option<u8> {
+    let (root, _dir) = face_root(&args.dir)?;
+    let kinds: Vec<&str> = if args.kinds.is_empty() {
+        vec!["symbol"]
+    } else {
+        args.kinds.iter().map(|kind| query_kind_word(*kind)).collect()
+    };
+    let queries: Vec<Value> = args
+        .symbols
+        .iter()
+        .map(|name| json!({"name": name, "kinds": kinds}))
+        .collect();
+    let params = json!({
+        "queries": queries,
+        "format": output_word(args.format),
+        "verbosity": verbosity_word(args.verbosity),
+    });
+    route_answer(&root, args.sdk.as_deref(), "dartq/queryBatch", &params, out)
+}
+
+/// `dartq impact`: the daemon's `dartq/impact` over the same target and
+/// the same `--symbol` narrowing list (#2666).
+pub(crate) fn route_impact(args: &crate::impact::ImpactArgs, out: &mut impl Write) -> Option<u8> {
+    let (root, dir) = face_root(&args.dir)?;
+    // The same resolution base the cold face resolves against (the
+    // assembly's canonical package directory): a relative target joins it,
+    // an absolute one passes through (the core canonicalizes either way).
+    let target = if args.path.is_absolute() {
+        args.path.clone()
+    } else {
+        dir.join(&args.path)
+    };
+    let params = json!({
+        "path": target.display().to_string(),
+        "symbols": args.symbols,
+        "format": output_word(args.format),
+        "verbosity": verbosity_word(args.verbosity),
+    });
+    route_answer(&root, args.sdk.as_deref(), "dartq/impact", &params, out)
+}
+
+/// `dartq explain` (the symbol face; the `--diagnostic` face is a
+/// different query with no daemon spelling and stays cold).
+pub(crate) fn route_explain(
+    args: &crate::ExplainArgs,
+    symbol: &str,
+    out: &mut impl Write,
+) -> Option<u8> {
+    let (root, _dir) = face_root(&args.dir)?;
+    let mut params = json!({
+        "symbol": symbol,
+        "format": output_word(args.format),
+        "verbosity": verbosity_word(args.verbosity),
+    });
+    if let Some(sdk) = &args.sdk {
+        params["sdk"] = json!(sdk.display().to_string());
+    }
+    // No universe stamp, and the plain attach probe (the SDK-free one):
+    // the daemon's explain rebuilds a per-query engine over the on-disk
+    // base under the request's own `sdk`, so its bytes read the disk
+    // fresh and never the session's engine.
+    let socket = attached_socket(&root)?;
+    route_attached(&socket, "dartq/explain", &params, out)
+}
+
+/// `dartq rename` — the dry run only (`--write` routes never: the write
+/// applies through the CLI's engine-local splice machinery): the daemon's
+/// `dartq/rename` answers the same edit-set document over the analyzed
+/// view. The anchor rides the wire as the user spelled it; the daemon
+/// converts against the analyzed text exactly where the cold face
+/// converts against its own.
+pub(crate) fn route_rename(
+    args: &crate::rename::RenameArgs,
+    target: &Path,
+    anchor: dartq_commands::rename::Anchor,
+    out: &mut impl Write,
+) -> Option<u8> {
+    let (root, _dir) = face_root(&args.dir)?;
+    let mut params = json!({
+        "path": target.display().to_string(),
+        "new_name": args.new_name,
+        "format": output_word(args.format),
+    });
+    match anchor {
+        dartq_commands::rename::Anchor::LineCol { line, column } => {
+            params["line"] = json!(line);
+            params["col"] = json!(column);
+        }
+        dartq_commands::rename::Anchor::Utf16Offset(offset) => {
+            params["offset"] = json!(offset);
+        }
+    }
+    route_answer(&root, args.sdk.as_deref(), "dartq/rename", &params, out)
+}
+
+/// `dartq resolve` / `dartq complete`: the daemon's position faces answer
+/// the same envelope; the cursor rides the wire in the line/col spelling
+/// and converts against the analyzed view's own text (the same
+/// conversion, the same snapshot, as the cold face's).
+pub(crate) fn route_position(
+    args: &crate::resolve::PositionArgs,
+    method: &str,
+    file: &Path,
+    line: u32,
+    column: u32,
+    out: &mut impl Write,
+) -> Option<u8> {
+    let (root, _dir) = face_root(&args.dir)?;
+    let params = json!({
+        "file": file.display().to_string(),
+        "line": line,
+        "col": column,
+        "format": output_word(args.format),
+    });
+    route_answer(&root, args.sdk.as_deref(), method, &params, out)
+}
+
+/// The CLI output format's wire word (the daemon `format` parameter's
+/// spellings).
+fn output_word(format: crate::OutputFormat) -> &'static str {
+    match format {
+        crate::OutputFormat::Lon => "lon",
+        crate::OutputFormat::Json => "json",
+        crate::OutputFormat::Text => "text",
+    }
+}
+
+/// The CLI verbosity tier's wire word.
+fn verbosity_word(verbosity: crate::Verbosity) -> &'static str {
+    match verbosity {
+        crate::Verbosity::Minimal => "minimal",
+        crate::Verbosity::Compact => "compact",
+        crate::Verbosity::Full => "full",
+    }
+}
+
+/// One query kind's wire word (the daemon `kind` parameter's spellings).
+fn query_kind_word(kind: crate::QueryKind) -> &'static str {
+    match kind {
+        crate::QueryKind::Symbol => "symbol",
+        crate::QueryKind::References => "references",
+        crate::QueryKind::Callers => "callers",
+        crate::QueryKind::Implementations => "implementations",
+        crate::QueryKind::Dependencies => "dependencies",
     }
 }
 
@@ -504,9 +806,31 @@ fn attached_socket(root: &Path) -> Option<PathBuf> {
     .then(|| layout.socket.clone())
 }
 
-/// The one-line fallback advisory (the ticket's wording).
-fn advisory(reason: &str) {
-    eprintln!("dartq: resident session unavailable ({reason}); analyzing in-process");
+/// The engine-view answer faces' attach probe (#2629):
+/// [`attached_socket`]'s checks with the FULL session triple — the SDK
+/// root included. These answers read the session's semantic engine: a
+/// daemon raised under another SDK would answer bytes the cold path
+/// (assembling under this SDK) never prints, so a foreign-SDK session is
+/// no session for these faces — the cold path owns the answer.
+fn attached_socket_for(root: &Path, sdk_root: &Path) -> Option<PathBuf> {
+    let layout = Layout::new(root);
+    let state = SessionState::read(&layout)?;
+    let fresh = SessionState::now_ms().saturating_sub(state.heartbeat_ms)
+        <= STALE_HEARTBEAT.as_millis();
+    let here = SessionTriple::compute(root, sdk_root);
+    (state.triple == here
+        && state.pid != 0
+        && dartq_session::pid_alive(state.pid)
+        && fresh
+        && dartq_session::socket_open(&layout))
+    .then(|| layout.socket.clone())
+}
+
+/// The one-line fallback advisory (the ticket's wording; `doing` is the
+/// face's own gerund — "analyzing" for the diagnostics faces, "answering"
+/// for the value faces).
+fn advisory(reason: &str, doing: &str) {
+    eprintln!("dartq: resident session unavailable ({reason}); {doing} in-process");
 }
 
 // ---------------------------------------------------------------------------
@@ -677,14 +1001,6 @@ mod tests {
     /// and the ladder test's bring-up failure runs on it.
     fn refused_spawn() -> impl Fn(&Layout, &SessionTriple) -> io::Result<()> {
         move |_, _| Err(io::Error::other("bring-up refused by the test"))
-    }
-
-    /// The live session's pid, straight off the state file — the tests'
-    /// teardown signal.
-    fn state_pid(root: &Path) -> u32 {
-        SessionState::read(&Layout::new(root))
-            .expect("state")
-            .pid
     }
 
     /// Ends the fixture's session and removes the tree.
@@ -1312,5 +1628,493 @@ mod tests {
         let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
         dartq_session::Registry::open().remove(&canonical);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // The answer faces (#2629): query (every kind) + batch, explain,
+    // impact, rename (dry run), resolve, complete
+    // -----------------------------------------------------------------------
+
+    /// The answer faces' fixture: a declaring library and its importing
+    /// use site — every face has a real symbol to answer over.
+    fn answer_fixture(tag: &str) -> PathBuf {
+        crate::tests::analyze_fixture(
+            tag,
+            &[
+                ("lib/a.dart", "class Foo {\n  void meth() {}\n}\nvoid foo() {}\n"),
+                ("lib/b.dart", "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  foo();\n}\n"),
+            ],
+        )
+    }
+
+    fn symbol_args(root: &Path, name: &str, format: crate::OutputFormat) -> crate::SymbolArgs {
+        crate::SymbolArgs {
+            name: name.to_owned(),
+            dir: root.to_path_buf(),
+            format,
+            verbosity: crate::Verbosity::Compact,
+            sdk: Some(root.join("sdk")),
+        }
+    }
+
+    fn batch_args(root: &Path, format: crate::OutputFormat) -> crate::BatchArgs {
+        crate::BatchArgs {
+            symbols: vec!["foo".into(), "Foo".into()],
+            kinds: Vec::new(),
+            verbosity: crate::Verbosity::Compact,
+            format,
+            dir: root.to_path_buf(),
+            sdk: Some(root.join("sdk")),
+        }
+    }
+
+    fn explain_args(root: &Path, format: crate::OutputFormat) -> crate::ExplainArgs {
+        crate::ExplainArgs {
+            symbol: Some("Foo".into()),
+            diagnostic: None,
+            file: None,
+            dir: root.to_path_buf(),
+            format,
+            sdk: Some(root.join("sdk")),
+            verbosity: crate::Verbosity::Compact,
+        }
+    }
+
+    fn impact_args(
+        root: &Path,
+        format: crate::OutputFormat,
+        symbols: Vec<String>,
+    ) -> crate::impact::ImpactArgs {
+        crate::impact::ImpactArgs {
+            path: root.join("lib/a.dart"),
+            dir: root.to_path_buf(),
+            sdk: Some(root.join("sdk")),
+            verbosity: crate::Verbosity::Compact,
+            symbols,
+            format,
+        }
+    }
+
+    fn rename_args(root: &Path, format: crate::OutputFormat) -> crate::rename::RenameArgs {
+        let a = root
+            .canonicalize()
+            .unwrap_or_else(|_| root.to_path_buf())
+            .join("lib/a.dart");
+        crate::rename::RenameArgs {
+            target: format!("{}:4:6", a.display()),
+            new_name: "gb".into(),
+            write: false,
+            format,
+            dir: root.to_path_buf(),
+            sdk: Some(root.join("sdk")),
+        }
+    }
+
+    fn position_args(root: &Path, selector: &str, format: crate::OutputFormat) -> crate::resolve::PositionArgs {
+        crate::resolve::PositionArgs {
+            selector: selector.to_owned(),
+            dir: root.to_path_buf(),
+            format,
+            sdk: Some(root.join("sdk")),
+        }
+    }
+
+    /// The money pin per face (#2629): the routed answer's stdout is the
+    /// cold path's stdout, byte for byte, and the exit tier (0) matches —
+    /// the daemon renders through the same writers the cold face prints
+    /// with. The cold passes run first (nothing live — the attach-only
+    /// consult declines silently), then the serve loop answers.
+    #[test]
+    fn routed_query_matches_the_cold_bytes_on_every_format() {
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let root = answer_fixture("route-q");
+        let formats = [
+            (crate::OutputFormat::Lon, "lon"),
+            (crate::OutputFormat::Json, "json"),
+            (crate::OutputFormat::Text, "text"),
+        ];
+        let mut cold: Vec<(crate::OutputFormat, Vec<u8>)> = Vec::new();
+        for (format, _) in formats {
+            let mut bytes: Vec<u8> = Vec::new();
+            let code = crate::query_symbol_run(&symbol_args(&root, "foo", format), &mut bytes);
+            assert_eq!(code, exit::CLEAN);
+            assert!(!bytes.is_empty(), "the fixture keeps the bytes honest");
+            cold.push((format, bytes));
+        }
+        serve(&root);
+        for (format, cold) in cold {
+            let mut routed: Vec<u8> = Vec::new();
+            let code = crate::query_symbol_run(&symbol_args(&root, "foo", format), &mut routed);
+            assert_eq!(code, exit::CLEAN);
+            assert_eq!(
+                String::from_utf8_lossy(&routed),
+                String::from_utf8_lossy(&cold),
+                "routed query stdout == cold stdout, byte for byte"
+            );
+        }
+        teardown(&root);
+    }
+
+    /// The batch face rides the same identity (#2629): one round trip over
+    /// the session graph, the same per-line envelopes, byte for byte.
+    #[test]
+    fn routed_batch_matches_the_cold_bytes() {
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let root = answer_fixture("route-qb");
+        let mut cold: Vec<u8> = Vec::new();
+        let code = crate::query_batch_run(&batch_args(&root, crate::OutputFormat::Lon), &mut cold);
+        assert_eq!(code, exit::CLEAN);
+        assert!(cold.len() > 1, "two items answer two lines");
+        serve(&root);
+        let mut routed: Vec<u8> = Vec::new();
+        let code = crate::query_batch_run(&batch_args(&root, crate::OutputFormat::Lon), &mut routed);
+        assert_eq!(code, exit::CLEAN);
+        assert_eq!(
+            String::from_utf8_lossy(&routed),
+            String::from_utf8_lossy(&cold),
+            "routed batch stdout == cold stdout, byte for byte"
+        );
+        teardown(&root);
+    }
+
+    /// The explain face (#2629): attach-only — the daemon rebuilds the
+    /// same per-query disk engine and renders the same report.
+    #[test]
+    fn routed_explain_matches_the_cold_bytes() {
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let root = answer_fixture("route-ex");
+        let mut cold: Vec<u8> = Vec::new();
+        let code = crate::explain_run(&explain_args(&root, crate::OutputFormat::Lon), &mut cold);
+        assert_eq!(code, exit::CLEAN);
+        assert!(!cold.is_empty(), "the report prints");
+        serve(&root);
+        let mut routed: Vec<u8> = Vec::new();
+        let code = crate::explain_run(&explain_args(&root, crate::OutputFormat::Lon), &mut routed);
+        assert_eq!(code, exit::CLEAN);
+        assert_eq!(
+            String::from_utf8_lossy(&routed),
+            String::from_utf8_lossy(&cold),
+            "routed explain stdout == cold stdout, byte for byte"
+        );
+        teardown(&root);
+    }
+
+    /// The impact face (#2629), file-level and `--symbol`-narrowed (#2666):
+    /// the routed report is the cold report, byte for byte, both postures.
+    #[test]
+    fn routed_impact_matches_the_cold_bytes() {
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let root = answer_fixture("route-im");
+        let postures: [(Vec<String>, &str); 2] = [
+            (Vec::new(), "file-level"),
+            (vec!["foo".to_owned()], "narrowed"),
+        ];
+        let mut cold: Vec<(Vec<String>, Vec<u8>)> = Vec::new();
+        for (symbols, _) in &postures {
+            let mut bytes: Vec<u8> = Vec::new();
+            let code = crate::impact::run(&impact_args(&root, crate::OutputFormat::Lon, symbols.clone()), &mut bytes);
+            assert_eq!(code, exit::CLEAN, "the cold face answers ({symbols:?})");
+            cold.push((symbols.clone(), bytes));
+        }
+        serve(&root);
+        for (symbols, cold) in cold {
+            let mut routed: Vec<u8> = Vec::new();
+            let code = crate::impact::run(&impact_args(&root, crate::OutputFormat::Lon, symbols.clone()), &mut routed);
+            assert_eq!(code, exit::CLEAN);
+            assert_eq!(
+                String::from_utf8_lossy(&routed),
+                String::from_utf8_lossy(&cold),
+                "routed impact stdout == cold stdout, byte for byte ({symbols:?})"
+            );
+        }
+        teardown(&root);
+    }
+
+    /// The rename dry run (#2629): the daemon answers the edit-set
+    /// document, the same bytes the cold plan prints.
+    #[test]
+    fn routed_rename_matches_the_cold_bytes() {
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let root = answer_fixture("route-rn");
+        let mut cold: Vec<u8> = Vec::new();
+        let code = crate::rename::run(&rename_args(&root, crate::OutputFormat::Lon), &mut cold);
+        assert_eq!(code, exit::CLEAN);
+        assert!(String::from_utf8_lossy(&cold).contains("new_name:gb"), "{cold:?}");
+        serve(&root);
+        let mut routed: Vec<u8> = Vec::new();
+        let code = crate::rename::run(&rename_args(&root, crate::OutputFormat::Lon), &mut routed);
+        assert_eq!(code, exit::CLEAN);
+        assert_eq!(
+            String::from_utf8_lossy(&routed),
+            String::from_utf8_lossy(&cold),
+            "routed rename stdout == cold stdout, byte for byte"
+        );
+        teardown(&root);
+    }
+
+    /// The position faces (#2629): `resolve` and `complete` answer the
+    /// same envelopes over the session's maintained view; the line/col
+    /// cursor converts against the analyzed text exactly where the cold
+    /// face converts against its own.
+    #[test]
+    fn routed_resolve_and_complete_match_the_cold_bytes() {
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let root = answer_fixture("route-pos");
+        let resolve = position_args(&root, "lib/b.dart:4:3", crate::OutputFormat::Lon);
+        let complete = position_args(&root, "lib/b.dart:4:5", crate::OutputFormat::Lon);
+        let mut cold_resolve: Vec<u8> = Vec::new();
+        let mut cold_complete: Vec<u8> = Vec::new();
+        assert_eq!(
+            crate::resolve::resolve_at_run(&resolve, &mut cold_resolve),
+            exit::CLEAN
+        );
+        assert_eq!(
+            crate::resolve::completion_run(&complete, &mut cold_complete),
+            exit::CLEAN
+        );
+        assert!(!cold_resolve.is_empty() && !cold_complete.is_empty());
+        serve(&root);
+        let mut routed: Vec<u8> = Vec::new();
+        assert_eq!(
+            crate::resolve::resolve_at_run(&resolve, &mut routed),
+            exit::CLEAN
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&routed),
+            String::from_utf8_lossy(&cold_resolve),
+            "routed resolve stdout == cold stdout"
+        );
+        let mut routed: Vec<u8> = Vec::new();
+        assert_eq!(
+            crate::resolve::completion_run(&complete, &mut routed),
+            exit::CLEAN
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&routed),
+            String::from_utf8_lossy(&cold_complete),
+            "routed complete stdout == cold stdout"
+        );
+        teardown(&root);
+    }
+
+    /// The default consults (#2629's "by default"): against a live-looking
+    /// session held by a sentinel listener, every answer face's run
+    /// consults (the sentinel counts the connections) and still answers —
+    /// the sentinel's refusals fall the runs back cold.
+    #[test]
+    fn the_answer_faces_consult_the_session_by_default() {
+        use std::os::unix::net::UnixListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let root = answer_fixture("route-consult");
+        let layout = Layout::new(&root);
+        std::fs::create_dir_all(&layout.dir).expect("the state dir");
+        std::fs::create_dir_all(layout.socket.parent().expect("socket dir")).expect("dir");
+        let _ = std::fs::remove_file(&layout.socket);
+        let sentinel = Arc::new(
+            UnixListener::bind(&layout.socket).expect("the sentinel socket binds"),
+        );
+        sentinel.set_nonblocking(true).expect("the sentinel polls");
+        let hits = Arc::new(AtomicUsize::new(0));
+        {
+            let listener = Arc::clone(&sentinel);
+            let hits = Arc::clone(&hits);
+            std::thread::spawn(move || loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        drop(stream);
+                        hits.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            });
+        }
+        let live_state = || SessionState {
+            pid: std::process::id(),
+            heartbeat_ms: SessionState::now_ms(),
+            triple: SessionTriple::compute(&root, &root.join("sdk")),
+            debug_sessions: 0,
+        };
+        live_state().write(&layout).expect("the state writes");
+
+        let consulted = |face: &str| {
+            live_state().write(&layout).expect("the state stays fresh");
+            let before = hits.load(Ordering::Relaxed);
+            let face_call: Box<dyn FnOnce() -> u8> = match face {
+                "query" => Box::new(|| {
+                    let mut out = Vec::new();
+                    crate::query_symbol_run(&symbol_args(&root, "foo", crate::OutputFormat::Lon), &mut out);
+                    exit::CLEAN
+                }),
+                "batch" => Box::new(|| {
+                    let mut out = Vec::new();
+                    crate::query_batch_run(&batch_args(&root, crate::OutputFormat::Lon), &mut out);
+                    exit::CLEAN
+                }),
+                "explain" => Box::new(|| {
+                    let mut out = Vec::new();
+                    crate::explain_run(&explain_args(&root, crate::OutputFormat::Lon), &mut out);
+                    exit::CLEAN
+                }),
+                "impact" => Box::new(|| {
+                    let mut out = Vec::new();
+                    crate::impact::run(
+                        &impact_args(&root, crate::OutputFormat::Lon, Vec::new()),
+                        &mut out,
+                    );
+                    exit::CLEAN
+                }),
+                "rename" => Box::new(|| {
+                    let mut out = Vec::new();
+                    crate::rename::run(
+                        &rename_args(&root, crate::OutputFormat::Lon),
+                        &mut out,
+                    );
+                    exit::CLEAN
+                }),
+                "resolve" => Box::new(|| {
+                    let mut out = Vec::new();
+                    crate::resolve::resolve_at_run(
+                        &position_args(&root, "lib/b.dart:4:3", crate::OutputFormat::Lon),
+                        &mut out,
+                    );
+                    exit::CLEAN
+                }),
+                "complete" => Box::new(|| {
+                    let mut out = Vec::new();
+                    crate::resolve::completion_run(
+                        &position_args(&root, "lib/b.dart:4:5", crate::OutputFormat::Lon),
+                        &mut out,
+                    );
+                    exit::CLEAN
+                }),
+                _ => unreachable!("the face table"),
+            };
+            face_call();
+            std::thread::sleep(Duration::from_millis(100));
+            let gained = hits.load(Ordering::Relaxed) - before;
+            assert!(gained >= 1, "{face} consults the session ({gained} hits)");
+        };
+        for face in [
+            "query",
+            "batch",
+            "explain",
+            "impact",
+            "rename",
+            "resolve",
+            "complete",
+        ] {
+            consulted(face);
+        }
+
+        drop(sentinel);
+        let _ = std::fs::remove_file(&layout.socket);
+        let _ = std::fs::remove_file(&layout.state);
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
+        dartq_session::Registry::open().remove(&canonical);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Kill-the-daemon mid-work (#2629's fallback): the next call finds the
+    /// killed session's residue — a fresh state naming a pid that died, a
+    /// socket nothing answers — and every answer face still answers with
+    /// the cold bytes.
+    #[test]
+    fn a_killed_daemon_falls_back_cold_on_the_answer_faces() {
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let root = answer_fixture("route-kill2");
+        // The cold bytes first, over a quiet tree.
+        let mut cold_query: Vec<u8> = Vec::new();
+        crate::query_symbol_run(&symbol_args(&root, "foo", crate::OutputFormat::Lon), &mut cold_query);
+        let mut cold_impact: Vec<u8> = Vec::new();
+        crate::impact::run(
+            &impact_args(&root, crate::OutputFormat::Lon, Vec::new()),
+            &mut cold_impact,
+        );
+        let mut cold_rename: Vec<u8> = Vec::new();
+        crate::rename::run(&rename_args(&root, crate::OutputFormat::Lon), &mut cold_rename);
+
+        // The killed-mid-work residue (the analyze test's shape): a dead
+        // child's pid under a fresh heartbeat, a plain file where the
+        // socket was.
+        let layout = Layout::new(&root);
+        std::fs::create_dir_all(&layout.dir).expect("the state dir");
+        std::fs::create_dir_all(layout.socket.parent().expect("socket dir")).expect("dir");
+        let mut child = std::process::Command::new("sleep").arg("0").spawn().expect("child");
+        let residue_pid = child.id();
+        let _ = child.wait();
+        SessionState {
+            pid: residue_pid,
+            heartbeat_ms: SessionState::now_ms(),
+            triple: SessionTriple::compute(&root, &root.join("sdk")),
+            debug_sessions: 0,
+        }
+        .write(&layout)
+        .expect("the residue writes");
+        std::fs::write(&layout.socket, b"").expect("the dead socket file");
+
+        let mut query: Vec<u8> = Vec::new();
+        crate::query_symbol_run(&symbol_args(&root, "foo", crate::OutputFormat::Lon), &mut query);
+        assert_eq!(
+            String::from_utf8_lossy(&query),
+            String::from_utf8_lossy(&cold_query),
+            "the query face still answers via the fallback"
+        );
+        let mut impact: Vec<u8> = Vec::new();
+        crate::impact::run(
+            &impact_args(&root, crate::OutputFormat::Lon, Vec::new()),
+            &mut impact,
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&impact),
+            String::from_utf8_lossy(&cold_impact),
+            "the impact face still answers via the fallback"
+        );
+        let mut rename: Vec<u8> = Vec::new();
+        crate::rename::run(&rename_args(&root, crate::OutputFormat::Lon), &mut rename);
+        assert_eq!(
+            String::from_utf8_lossy(&rename),
+            String::from_utf8_lossy(&cold_rename),
+            "the rename face still answers via the fallback"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Freshness for the engine-view family (#2629's hard requirement,
+    /// pinned on the query face — impact/rename/resolve/complete ride the
+    /// same drain): an out-of-band edit (no sync notification) lands in
+    /// the very next routed call.
+    #[test]
+    fn a_routed_query_reconciles_out_of_band_edits() {
+        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let root = answer_fixture("route-fresh2");
+        serve(&root);
+        let args = symbol_args(&root, "bar", crate::OutputFormat::Lon);
+        let mut before: Vec<u8> = Vec::new();
+        let code = crate::query_symbol_run(&args, &mut before);
+        assert_eq!(code, exit::CLEAN);
+        assert!(
+            !String::from_utf8_lossy(&before).contains("name:bar"),
+            "the fixture starts without bar"
+        );
+
+        // The edit adds the declaration; no notification rides — the next
+        // plain request must reconcile against the disk.
+        std::fs::write(root.join("lib/a.dart"), "class Foo {\n  void meth() {}\n}\nvoid foo() {}\nvoid bar() {}\n")
+            .expect("edit");
+        let mut after: Vec<u8> = Vec::new();
+        let code = crate::query_symbol_run(&args, &mut after);
+        assert_eq!(code, exit::CLEAN);
+        assert!(
+            String::from_utf8_lossy(&after).contains("name:bar"),
+            "the edit lands in the next routed answer: {}",
+            String::from_utf8_lossy(&after)
+        );
+        teardown(&root);
     }
 }

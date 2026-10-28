@@ -1,17 +1,14 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_js_rounded_ints.dart:24-41`
 /// — an integer literal whose value does not survive the f64 round
 /// trip (`value.toDouble().toInt() != value`, :29) reports at the
 /// literal. Hexadecimal literals wrap modulo 2^64 (the VM face).
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_js_rounded_ints",
-    group: Group::Standalone,
-    problem: "Integer literal can't be represented exactly when compiled to JavaScript.",
-    correction: "Try using a 'BigInt' to represent the value.",
-    kinds: &[NodeKind::LiteralInt],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_js_rounded_ints",
+    &[NodeKind::LiteralInt],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

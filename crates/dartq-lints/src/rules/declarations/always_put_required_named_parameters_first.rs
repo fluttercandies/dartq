@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, narrow_u32};
+use super::{Check, NodeKind, RuleSpec, narrow_u32};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/always_put_required_named_parameters_first.dart:31-92`
 /// — a required named parameter written after a non-required named
@@ -18,17 +18,14 @@ use super::{Check, Group, NodeKind, RuleSpec, narrow_u32};
 /// `superConstructorParameter == null` posture. At most one named
 /// super-formal is trivially in order (:71) — the shipped `super.key`
 /// widget shape never resolves anything.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "always_put_required_named_parameters_first",
-    group: Group::Standalone,
-    problem: "Required named parameters should be before optional named parameters.",
-    correction: "Try moving the required named parameter to be before any optional named parameters.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "always_put_required_named_parameters_first",
+    &[
         NodeKind::FormalParameters,
         NodeKind::OptionalFormalParameters,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

@@ -775,6 +775,91 @@ fn dartq_impact_matches_the_cli_report() {
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
 }
 
+/// The `--symbol` narrowing on the daemon face (#2666): the snake_case
+/// plural `symbols` array routes into the shared core's narrowed report —
+/// a valid spelling answers a strict subset of the file-level sym rows —
+/// and an unknown spelling answers the face's own usage tier carrying the
+/// `no such symbol` wording (the MCP face's isError pin and the CLI's
+/// cold usage error share it).
+#[test]
+fn dartq_impact_symbols_narrow_and_unknown_spellings_answer_usage() {
+    let _guard = workspace_lock();
+    let workspace = seeded_query_workspace();
+    let a = workspace.path("lib/a.dart");
+    let mut h = spawn(&workspace, &store_root("rpc-impact-symbols"));
+
+    // The file-level posture: every face name of the owning library.
+    h.step(
+        &request(
+            2,
+            "dartq/impact",
+            json!({ "path": a.display().to_string() }),
+        ),
+        1,
+    );
+    let file_level: Vec<String> = answer_result(&h, 2)["sym"]
+        .as_array()
+        .expect("sym")
+        .iter()
+        .map(|row| row["sym"].as_str().expect("sym").to_string())
+        .collect();
+    assert_eq!(
+        file_level,
+        vec!["lib/a.dart|Foo".to_string(), "lib/a.dart|foo".to_string()],
+        "absent symbols is the file-level posture (backward compatible)"
+    );
+
+    // A valid spelling narrows: only the resolved face seeds.
+    h.step(
+        &request(
+            3,
+            "dartq/impact",
+            json!({ "path": a.display().to_string(), "symbols": ["foo"] }),
+        ),
+        1,
+    );
+    let narrowed: Vec<String> = answer_result(&h, 3)["sym"]
+        .as_array()
+        .expect("sym")
+        .iter()
+        .map(|row| row["sym"].as_str().expect("sym").to_string())
+        .collect();
+    assert_eq!(narrowed, vec!["lib/a.dart|foo".to_string()]);
+    assert!(
+        narrowed.iter().all(|row| file_level.contains(row)) && narrowed.len() < file_level.len(),
+        "the narrowed rows are a strict subset of the file-level rows"
+    );
+
+    // An unknown spelling: the usage tier, the face's own wording.
+    h.step(
+        &request(
+            4,
+            "dartq/impact",
+            json!({ "path": a.display().to_string(), "symbols": ["NoSuch"] }),
+        ),
+        1,
+    );
+    let error = answer_error(&h, 4);
+    assert_eq!(error["code"], -32602, "the usage tier: {error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no such symbol in"),
+        "the wording names the target: {error}"
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("NoSuch"),
+        "the wording names the spelling: {error}"
+    );
+
+    let (code, _) = h.join_ended();
+    assert_eq!(code, dartq_daemon::EXIT_CLEAN);
+}
+
 /// The environment axis parity (#2657): the daemon's `dartq/impact`
 /// computes its `envs` verdict through the same shared function the CLI
 /// face does, over the analyzed view's diagnostics — on a workspace whose

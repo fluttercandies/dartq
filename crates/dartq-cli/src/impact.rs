@@ -87,11 +87,18 @@ pub(crate) fn run_entry(args: &ImpactArgs) -> u8 {
     code
 }
 
-fn run(args: &ImpactArgs, out: &mut impl Write) -> u8 {
+/// One impact run over a caller-supplied writer (`pub(crate)` for the
+/// resident tests' byte pins).
+pub(crate) fn run(args: &ImpactArgs, out: &mut impl Write) -> u8 {
     // The tier parses for grammar parity and shapes nothing: the report is
     // tier-invariant (the canonical tables trim nothing here), the same
     // accept-and-document posture the daemon's `dartq/impact` answer holds.
     let _ = args.verbosity;
+    // The resident consult (#2629) leads: the session's maintained view
+    // answers the same report, rendered through the same writers.
+    if let Some(code) = crate::resident::route_impact(args, out) {
+        return code;
+    }
     let (mut engine, dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {

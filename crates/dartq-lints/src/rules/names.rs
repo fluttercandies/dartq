@@ -7,11 +7,8 @@
 use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
-use crate::registry::{Group, RuleSpec};
-use crate::rules::{
-    has_leading_underscore, is_field_name_shortcut, is_just_underscores, is_lower_camel_case,
-    is_upper_camel_case, utf16_token_span,
-};
+use crate::registry::RuleSpec;
+use crate::rules::{has_leading_underscore, is_field_name_shortcut, is_just_underscores, is_lower_camel_case, is_upper_camel_case, utf16_token_span};
 
 /// The domain's incoming registrations: a new standalone rule appends its
 /// `SPEC` reference here (name order) and joins the registry through the
@@ -26,6 +23,9 @@ fn utf16_start_of(c: &Check<'_>, token: u32) -> Option<u32> {
 }
 
 /// Reports `token`/`lexeme` when the lowerCamelCase style check fails.
+/// The official `reportAtToken(id)` spans the name token
+/// (constant_identifier_names.dart:40-43) — the markup of every upstream
+/// case marks the full identifier.
 fn check_lower_camel(c: &mut Check<'_>, token: u32, lexeme: &str) {
     if is_lower_camel_case(lexeme) {
         return;
@@ -33,11 +33,12 @@ fn check_lower_camel(c: &mut Check<'_>, token: u32, lexeme: &str) {
     let Some(start) = utf16_start_of(c, token) else {
         return;
     };
-    c.report(start..start, &[lexeme]);
+    let end = c.utf16_end_of_token(token).unwrap_or(start);
+    c.report(start..end, &[lexeme]);
 }
 
 pub(crate) mod camel_case_types {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/camel_case_types.dart:33-88` —
     /// every type-introducing declaration's name must be `UpperCamelCase`
@@ -49,12 +50,9 @@ pub(crate) mod camel_case_types {
     /// layout, the name-Identifier container). The official
     /// augmentation skips are wave-1 inert: `augment` is gated off at the
     /// scanner, so no augmentation declaration reaches the AST.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "camel_case_types",
-        group: Group::Core,
-        problem: "The type name '{0}' isn't an UpperCamelCase identifier.",
-        correction: "Try changing the name to follow the UpperCamelCase style.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "camel_case_types",
+    &[
             NodeKind::ClassDeclaration,
             NodeKind::MixinDeclaration,
             NodeKind::EnumDeclaration,
@@ -62,8 +60,8 @@ pub(crate) mod camel_case_types {
             NodeKind::NamedMixinApplication,
             NodeKind::Typedef,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let Some(parent) = c.ancestor(1) else {
@@ -94,21 +92,18 @@ pub(crate) mod camel_case_types {
 }
 
 pub(crate) mod camel_case_extensions {
-    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/camel_case_extensions.dart:31-42`
     /// — a named extension's name must be `UpperCamelCase`. The name is
     /// payload word 1 of [`NodeKind::ExtensionDeclaration`]
     /// (`extension: T, name: O, on: O`). Message:
     /// `diagnostic.g.dart` `camelCaseExtensions`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "camel_case_extensions",
-        group: Group::Core,
-        problem: "The extension name '{0}' isn't an UpperCamelCase identifier.",
-        correction: "Try changing the name to follow the UpperCamelCase style.",
-        kinds: &[NodeKind::ExtensionDeclaration],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "camel_case_extensions",
+    &[NodeKind::ExtensionDeclaration],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -131,7 +126,7 @@ pub(crate) mod camel_case_extensions {
 }
 
 pub(crate) mod constant_identifier_names {
-    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/constant_identifier_names.dart:36-73`
     /// — `const` variables (fields, top-level, locals), enum constants, and
@@ -139,18 +134,15 @@ pub(crate) mod constant_identifier_names {
     /// `pkg/linter/lib/src/utils.dart:31`). Object-pattern field-name
     /// shortcuts (`Foo(:name)`) are exempt. Message: `diagnostic.g.dart`
     /// `constantIdentifierNames`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "constant_identifier_names",
-        group: Group::Recommended,
-        problem: "The constant name '{0}' isn't a lowerCamelCase identifier.",
-        correction: "Try changing the name to follow the lowerCamelCase style.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "constant_identifier_names",
+    &[
             NodeKind::VariablesDeclaration,
             NodeKind::EnumElement,
             NodeKind::DeclaredVariablePattern,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -188,17 +180,35 @@ pub(crate) mod constant_identifier_names {
                 }
             }
             NodeKind::EnumElement => {
-                // The constant name is the first direct Identifier child
-                // (the `EnumElement` row names via children).
-                let name = c
-                    .direct_children(node)
-                    .iter()
-                    .copied()
-                    .find(|&ch| c.kind(ch) == NodeKind::Identifier);
-                if let Some(name) = name {
-                    let token = c.head_token(name);
-                    super::check_lower_camel(c, token, c.lexeme(token));
+                // The constant name rides the element's `Name` word — the
+                // production row is a childless handle over the element
+                // extent (the name identifier tiles ahead of it, bridge
+                // `handle_enum_element`); hand-built tables carry the same
+                // word. `augment Xy;` elements are augmentation constants
+                // and skip (`node.isAugmentation`,
+                // constant_identifier_names.dart:59-61 — a new value inside
+                // `augment enum E` carries no own `augment` and still
+                // checks). The begin-token anchor of an annotated element
+                // sits on the metadata, so only a real identifier token
+                // names the constant.
+                let Some(name) = c.field(node, PayloadField::Name) else {
+                    return;
+                };
+                if name == crate::rules::NONE_TOKEN
+                    || c
+                        .field(node, PayloadField::AugmentKeyword)
+                        .is_some_and(|kw| kw != crate::rules::NONE_TOKEN)
+                    || !c
+                        .unit
+                        .tokens
+                        .get(name as usize)
+                        .is_some_and(|token| {
+                            token.kind == dartq_scanner::TokenKind::Identifier
+                        })
+                {
+                    return;
                 }
+                super::check_lower_camel(c, name, c.lexeme(name));
             }
             NodeKind::DeclaredVariablePattern => {
                 // Name token is the pattern's `Variable` word (`variable: T`).
@@ -217,7 +227,7 @@ pub(crate) mod constant_identifier_names {
 }
 
 pub(crate) mod no_leading_underscores_for_local_identifiers {
-    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/no_leading_underscores_for_local_identifiers.dart:36-133`
     /// — local identifiers (local variables, catch parameters, non-named
@@ -227,12 +237,9 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
     /// variant (the *shadowing* rename suggestion, `:126-133`) needs the
     /// element model and is not part of wave 1. Message: `diagnostic.g.dart`
     /// `noLeadingUnderscoresForLocalIdentifiers`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "no_leading_underscores_for_local_identifiers",
-        group: Group::Recommended,
-        problem: "The local variable '{0}' starts with an underscore.",
-        correction: "Try renaming the variable to not start with an underscore.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "no_leading_underscores_for_local_identifiers",
+    &[
             NodeKind::VariablesDeclaration,
             NodeKind::CatchClause,
             NodeKind::FormalParameters,
@@ -240,8 +247,8 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
             NodeKind::LocalFunctionDeclaration,
             NodeKind::DeclaredVariablePattern,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -361,7 +368,7 @@ pub(crate) mod no_leading_underscores_for_local_identifiers {
 }
 
 pub(crate) mod non_constant_identifier_names {
-    use super::{PayloadField, Check, Group, NodeKind, RuleSpec, is_just_underscores};
+    use super::{PayloadField, Check, NodeKind, RuleSpec, is_just_underscores};
     use crate::rules::NONE_TOKEN;
 
     /// Official: `pkg/linter/lib/src/rules/non_constant_identifier_names.dart:36-169`
@@ -380,12 +387,9 @@ pub(crate) mod non_constant_identifier_names {
     /// (:87-91, :123-125): an extension-type representation-constructor
     /// name checks without the underscore exemption, a class primary
     /// constructor name with it.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "non_constant_identifier_names",
-        group: Group::Core,
-        problem: "The variable name '{0}' isn't a lowerCamelCase identifier.",
-        correction: "Try changing the name to follow the lowerCamelCase style.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "non_constant_identifier_names",
+    &[
             NodeKind::VariablesDeclaration,
             NodeKind::CatchClause,
             NodeKind::Constructor,
@@ -399,8 +403,8 @@ pub(crate) mod non_constant_identifier_names {
             NodeKind::RecordLiteral,
             NodeKind::RecordType,
         ],
-        check,
-    };
+    check,
+);
 
     #[expect(
         clippy::too_many_lines,
@@ -657,7 +661,7 @@ pub(crate) mod non_constant_identifier_names {
 }
 
 pub(crate) mod file_names {
-    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/file_names.dart:24-42` — the file
     /// base name must be `lowercase_with_underscores`
@@ -670,14 +674,11 @@ pub(crate) mod file_names {
     /// the library's name into the part's own coordinates — the URI form
     /// (`part of 'foo.dart';`) carries the name lexically, the name form
     /// (`part of foo;`) is resolution-bound and stays silent.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "file_names",
-        group: Group::Core,
-        problem: "The file name '{0}' isn't a lower_case_with_underscores identifier.",
-        correction: "Try changing the name to follow the lower_case_with_underscores style.",
-        kinds: &[NodeKind::CompilationUnit],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "file_names",
+    &[NodeKind::CompilationUnit],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         // A `part of` unit never judges its own name: the official reads
@@ -810,7 +811,7 @@ pub(crate) mod file_names {
 }
 
 pub(crate) mod no_wildcard_variable_uses {
-    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
     use dartq_parser::IdentifierContext;
 
     /// Official: `pkg/linter/lib/src/rules/no_wildcard_variable_uses.dart:36-77`
@@ -830,14 +831,11 @@ pub(crate) mod no_wildcard_variable_uses {
     /// element binds no variable, so its uses are not wildcard-variable
     /// uses). Message:
     /// `diagnostic.g.dart` `noWildcardVariableUses`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "no_wildcard_variable_uses",
-        group: Group::Core,
-        problem: "The referenced identifier is a wildcard.",
-        correction: "Use an identifier name that is not a wildcard.",
-        kinds: &[NodeKind::Identifier],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "no_wildcard_variable_uses",
+    &[NodeKind::Identifier],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         // Feature gate: with wildcards on, `_` never binds, so there is no
@@ -875,7 +873,7 @@ pub(crate) mod no_wildcard_variable_uses {
 }
 
 pub(crate) mod avoid_types_as_parameter_names {
-    use super::{PayloadField, Check, Group, NodeKind, RuleSpec, utf16_start_of};
+    use super::{PayloadField, Check, NodeKind, RuleSpec, utf16_start_of};
 
     /// The dart:core type names every scope resolves to a class (the bare
     /// lexical face of the official's element test — `ClassElement`
@@ -922,14 +920,11 @@ pub(crate) mod avoid_types_as_parameter_names {
     /// `FieldFormalParameterElement` gate — the official
     /// `test_constructor_primary_declaring` no-hit) and skips, an unmarked
     /// one keeps reporting (`test_constructor_primary_requiredPositional`).
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "avoid_types_as_parameter_names",
-        group: Group::Core,
-        problem: FORMAL_PROBLEM,
-        correction: FORMAL_CORRECTION,
-        kinds: &[NodeKind::FormalParameter, NodeKind::TypeVariable],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_types_as_parameter_names",
+    &[NodeKind::FormalParameter, NodeKind::TypeVariable],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         match c.kind(c.node()) {
@@ -1144,7 +1139,7 @@ pub(crate) mod avoid_types_as_parameter_names {
 }
 
 pub(crate) mod use_super_parameters {
-    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
     use crate::rules::expressions::query_site;
     use crate::rules::types::leak_formal_rows;
     use crate::rules::{NONE_TOKEN, body_members};
@@ -1209,14 +1204,11 @@ pub(crate) mod use_super_parameters {
     /// (conservative, under-reports the conversion). The `super_parameters`
     /// feature gate reads the [`crate::engine::Features`] bit at check
     /// entry (:43-45).
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "use_super_parameters",
-        group: Group::Recommended,
-        problem: SINGLE_PROBLEM,
-        correction: SINGLE_CORRECTION,
-        kinds: &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_super_parameters",
+    &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
+    check,
+);
 
     /// One constructor parameter: source-order index, written name, whether
     /// it sits in a `{...}` group (kind word 1|2), and the receiver keyword
@@ -2021,7 +2013,11 @@ mod tests {
             lints[0].message,
             "The constant name 'PI' isn't a lowerCamelCase identifier."
         );
+        // Upstream `reportAtToken(name)` spans the identifier
+        // (constant_identifier_names_test.dart `test_topLevel_allCaps`
+        // marks `[!PI!]`), so the end pins the token's tail.
         assert_eq!(lints[0].range.start, utf16_at(&f, 1));
+        assert_eq!(lints[0].range.end, utf16_at(&f, 1) + 2);
     }
 
     #[test]
@@ -2060,7 +2056,9 @@ mod tests {
         assert!(f.run(&one_rule("constant_identifier_names")).is_empty());
     }
 
-    /// Enum constants are checked (`test_enum` in the official test).
+    /// Enum constants are checked (`test_enumValue_upperFirstLetter` in
+    /// the official test — the name is the element's `Name` word; the
+    /// production row is a childless handle).
     #[test]
     fn constant_identifier_names_reports_a_bad_enum_constant() {
         let source = "enum C { DEFAULT_COLOR }";
@@ -2088,6 +2086,58 @@ mod tests {
         let lints = f.run(&one_rule("constant_identifier_names"));
         assert_eq!(lints.len(), 1);
         assert_eq!(lints[0].range.start, utf16_at(&f, 3));
+        // The full name span (`test_enumValue_upperFirstLetter` marks
+        // `[!Baz!]`).
+        assert_eq!(lints[0].range.end, utf16_at(&f, 3) + 13);
+    }
+
+    /// Production-bridge pins: the childless element row reads its name
+    /// through the `Name` word, and a new value inside `augment enum` (no
+    /// own `augment`) still checks (`test_augmentationEnum`). An
+    /// `augment Xy;` element would skip via the `AugmentKeyword` word
+    /// (`node.isAugmentation`, constant_identifier_names.dart:59-61), but
+    /// the parser does not yet bind element-level `augment` — the same
+    /// posture as the upstream analyzer, whose own
+    /// `test_augmentedEnumValue` is `@FailingTest` (issue 56174); no pin
+    /// until either side implements it.
+    #[test]
+    fn constant_identifier_names_production_enum_faces() {
+        let f = Fixture::parse("enum Foo {\n  bar,\n  Baz,\n}\n");
+        let lints = f.run(&one_rule("constant_identifier_names"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].range.end - lints[0].range.start,
+            "Baz".encode_utf16().count() as u32
+        );
+
+        let f = Fixture::parse("part of 'a.dart';\n\naugment enum E {\n  Xy;\n}\n");
+        let lints = f.run(&one_rule("constant_identifier_names"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(lints[0].range.end - lints[0].range.start, 2);
+    }
+
+    /// Production-bridge pins for the pattern-field faces: a labeled
+    /// field's variable reports spanning the name
+    /// (`test_destructuredObjectField_switch`), the field-name shortcut
+    /// `:var x` and its null-aware variants stay clean
+    /// (`test_destructuredObjectField_switch_ok` — the official
+    /// `isFieldNameShortcut` guard over the label-less field).
+    #[test]
+    fn constant_identifier_names_production_pattern_faces() {
+        let f = Fixture::parse(
+            "class A {\n  var a;\n}\n\nf(A a) {\n  switch (a) {\n    case A(a: int a_b):\n  }\n}\n",
+        );
+        let lints = f.run(&one_rule("constant_identifier_names"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].range.end - lints[0].range.start,
+            "a_b".encode_utf16().count() as u32
+        );
+
+        let f = Fixture::parse(
+            "class A {\n  var a_b;\n}\n\nf(A a) {\n  switch (a) {\n    case A(:var a_b):\n  }\n  switch (a) {\n    case A(:var a_b?):\n    case A(:var a_b!):\n  }\n}\n",
+        );
+        assert!(f.run(&one_rule("constant_identifier_names")).is_empty());
     }
 
     /// `test/rules/no_leading_underscores_for_local_identifiers_test.dart`
@@ -3579,7 +3629,7 @@ fn is_unnamed_or_new(c: &Check<'_>, ctor: u32) -> bool {
 }
 
 pub(crate) mod sort_unnamed_constructors_first {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/sort_unnamed_constructors_first.dart`
     /// — an unnamed constructor (element name `new`) that follows a named
@@ -3589,18 +3639,15 @@ pub(crate) mod sort_unnamed_constructors_first {
     /// the same constructor element shape, so an unnamed factory
     /// arms/reports identically. Message: `diagnostic.g.dart`
     /// `sortUnnamedConstructorsFirst`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "sort_unnamed_constructors_first",
-        group: Group::Standalone,
-        problem: "Invalid location for the unnamed constructor.",
-        correction: "Try moving the unnamed constructor before all other constructors.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "sort_unnamed_constructors_first",
+    &[
             NodeKind::ClassDeclaration,
             NodeKind::EnumDeclaration,
             NodeKind::ExtensionTypeDeclaration,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -3693,7 +3740,7 @@ pub(crate) mod sort_unnamed_constructors_first {
 }
 
 pub(crate) mod sort_constructors_first {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/sort_constructors_first.dart`
     /// — a constructor that follows a non-constructor member in a class,
@@ -3705,18 +3752,15 @@ pub(crate) mod sort_constructors_first {
     /// is inert here: a primary body is part of the declaration header, not
     /// a body member, so it never appears in the member walk. Message:
     /// `diagnostic.g.dart` `sortConstructorsFirst`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "sort_constructors_first",
-        group: Group::Standalone,
-        problem: "Constructor declarations should be before non-constructor declarations.",
-        correction: "Try moving the constructor declaration before all other members.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "sort_constructors_first",
+    &[
             NodeKind::ClassDeclaration,
             NodeKind::EnumDeclaration,
             NodeKind::ExtensionTypeDeclaration,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -3790,7 +3834,7 @@ pub(crate) mod sort_constructors_first {
 }
 
 pub(crate) mod matching_super_parameters {
-    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
     use crate::rules::expressions::query_site;
     use crate::rules::types::leak_formal_rows;
     use crate::rules::{NONE_TOKEN, body_members};
@@ -3822,14 +3866,11 @@ pub(crate) mod matching_super_parameters {
     /// quirk since normalized in main's `#p0` scheme (the vendored main
     /// template carries single quotes); mirrored verbatim, the gate
     /// oracle is 3.13.1.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "matching_super_parameters",
-        group: Group::Standalone,
-        problem: "The super parameter named '{0}'' does not share the same name as the corresponding parameter in the super constructor, '{1}'.",
-        correction: "Try using the name of the corresponding parameter in the super constructor.",
-        kinds: &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "matching_super_parameters",
+    &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -4047,9 +4088,7 @@ pub(crate) mod matching_super_parameters {
     #[cfg(test)]
     mod tests {
         use dartq_parser::ParserFeatures;
-        use dartq_resolution::{
-            LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces,
-        };
+        use dartq_resolution::{LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces};
         use dartq_semantic::{ElementIndex, MicroKind, StrictModes, analyze_unit, collect};
         use dartq_source::{FileTable, StringTable};
 
@@ -4132,7 +4171,7 @@ pub(crate) mod matching_super_parameters {
             assert_eq!(lints.len(), 1, "{lints:?}");
             assert_eq!(
                 lints[0].message,
-                "The super parameter named 'abc'' does not share the same name as the corresponding parameter in the super constructor, 'xyz'."
+                "The super parameter named 'abc' does not share the same name as the corresponding parameter in the super constructor, 'xyz'."
             );
         }
 
@@ -4160,7 +4199,7 @@ pub(crate) mod matching_super_parameters {
             assert_eq!(lints.len(), 1, "{lints:?}");
             assert_eq!(
                 lints[0].message,
-                "The super parameter named 'abc'' does not share the same name as the corresponding parameter in the super constructor, 'xyz'."
+                "The super parameter named 'abc' does not share the same name as the corresponding parameter in the super constructor, 'xyz'."
             );
 
             let source = "class A {\n  A(int xyz);\n}\n\nclass B extends A {\n  B(super.abc);\n}\n";

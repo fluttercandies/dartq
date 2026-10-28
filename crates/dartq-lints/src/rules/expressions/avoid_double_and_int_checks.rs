@@ -1,7 +1,7 @@
 use crate::rules::last_child;
 
 use super::same_file::{BindingScope, binding};
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_double_and_int_checks.dart:28-59`
 /// — an else-if chain whose branches test the same simple identifier —
@@ -20,14 +20,11 @@ use super::{Check, Group, NodeKind, RuleSpec};
 /// binding face is the shadow-correct same-file walk ([`binding`]), so
 /// a same-file-typed local/parameter answers and a catch/for-in/pattern
 /// bound one under-reports (the crate's documented posture).
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_double_and_int_checks",
-    group: Group::Standalone,
-    problem: "Explicit check for double or int.",
-    correction: "Try removing the check.",
-    kinds: &[NodeKind::IfStatement],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_double_and_int_checks",
+    &[NodeKind::IfStatement],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

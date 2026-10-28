@@ -44,6 +44,18 @@ thiserror = { workspace = true }
 # cannot set them and the freshness rules are stated in strict mtime
 # ordering (equal counts as stale).
 filetime = { workspace = true }
+# The example suite (`tests/fix_examples.rs`) enumerates the fix table
+# through `fix_table::all_specs`; an integration test builds this crate as
+# its own library dependency, where `cfg(test)` is off — this self edge
+# turns the `test-support` feature on for that build (the same shape
+# dartq-lints' fixture bridge uses).
+dartq-commands = { path = ".", features = ["test-support"] }
+
+[features]
+# Exposes the fix table's row enumeration (`fix_table::all_specs`) to the
+# out-of-crate example suite. Feature-off builds are byte-identical to
+# before the feature existed.
+test-support = []
 
 [lints]
 workspace = true

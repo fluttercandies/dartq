@@ -1,10 +1,8 @@
 use rustc_hash::FxHashSet;
 
-use super::{Check, Group, RuleSpec, container_name_token};
+use super::{Check, RuleSpec, container_name_token};
 use crate::engine::ReachabilityFace;
-use crate::rules::{
-    initialized_identifier_name, member_name, rows_with_parent, utf16_token_span,
-};
+use crate::rules::{initialized_identifier_name, member_name, rows_with_parent, utf16_token_span};
 use dartq_ast::NodeKind;
 
 /// Official: upstream Dart SDK source,
@@ -51,14 +49,11 @@ use dartq_ast::NodeKind;
 /// over-suppresses (the flutter-family approximation register). An
 /// unnamed extension has no name token to key a face flag with: it
 /// never reports, and its members judge on their own flags.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unreachable_from_main",
-    group: Group::Standalone,
-    problem: "Unreachable member '{0}' in an executable library.",
-    correction: "Try referencing the member or removing it.",
-    kinds: &[NodeKind::CompilationUnit],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unreachable_from_main",
+    &[NodeKind::CompilationUnit],
     check,
-};
+);
 
 /// The candidate class the widget-preview suppression reads (upstream
 /// `hasWidgetPreview`: constructors, top-level functions, and static

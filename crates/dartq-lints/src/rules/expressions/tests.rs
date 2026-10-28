@@ -114,7 +114,8 @@ fn run_semantic(
 }
 
 /// `test/rules/unnecessary_new_test.dart` `test_new` — the keyword
-/// reports, zero-width at its start.
+/// reports, spanning it (`reportAtToken(keyword)`; the upstream markup
+/// marks `[!new!]`).
 #[test]
 fn unnecessary_new_reports_the_keyword() {
     let source = "new B();";
@@ -136,6 +137,7 @@ fn unnecessary_new_reports_the_keyword() {
     assert_eq!(lints.len(), 1);
     assert_eq!(lints[0].message, "Unnecessary 'new' keyword.");
     assert_eq!(lints[0].range.start, utf16_at(&f, 0));
+    assert_eq!(lints[0].range.end, utf16_at(&f, 0) + 3);
 }
 
 /// Implicit creation (`test_implicit`) never dispatches.
@@ -1236,15 +1238,39 @@ fn prefer_is_not_empty_reports_bang_is_empty() {
     assert_eq!(lints[0].range.end, utf16_at(&f, is_empty) + 7);
 }
 
-/// A negated `isNotEmpty` (or any other property) passes.
-#[test]
-fn prefer_is_not_empty_other_property_passes() {
-    let f = Fixture::parse("void f(List<int> xs) { if (!xs.isNotEmpty) {} }");
-    assert!(f.run(&one_rule("prefer_is_not_empty")).is_empty());
+    /// A negated `isNotEmpty` (or any other property) passes.
+    #[test]
+    fn prefer_is_not_empty_other_property_passes() {
+        let f = Fixture::parse("void f(List<int> xs) { if (!xs.isNotEmpty) {} }");
+        assert!(f.run(&one_rule("prefer_is_not_empty")).is_empty());
 
-    let f = Fixture::parse("void f(bool a, bool b) { if (!(a || b)) {} }");
-    assert!(f.run(&one_rule("prefer_is_not_empty")).is_empty());
-}
+        let f = Fixture::parse("void f(bool a, bool b) { if (!(a || b)) {} }");
+        assert!(f.run(&one_rule("prefer_is_not_empty")).is_empty());
+    }
+
+    /// `test_list_isEmpty_parens_not` /
+    /// `test_list_isEmpty_doubleParens_not` — the parenthesized operand
+    /// unwraps (`node.operand.unParenthesized`) and the report spans the
+    /// whole prefix expression through the outermost closing paren.
+    #[test]
+    fn prefer_is_not_empty_parenthesized_operand_reports() {
+        let f = Fixture::parse("var x = !([3].isEmpty);");
+        let lints = f.run(&one_rule("prefer_is_not_empty"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        // ASCII source: the end sits one past the closing paren.
+        assert_eq!(
+            lints[0].range.end as usize,
+            f.source.find(')').expect("closing paren") + 1
+        );
+
+        let f = Fixture::parse("var x = !(([4].isEmpty));");
+        let lints = f.run(&one_rule("prefer_is_not_empty"));
+        assert_eq!(lints.len(), 1, "{lints:?}");
+        assert_eq!(
+            lints[0].range.end as usize,
+            f.source.rfind(')').expect("outer closing paren") + 1
+        );
+    }
 
 /// A string-literal receiver carries `isNotEmpty` on `String` and
 /// reports through the face query (:57-62).

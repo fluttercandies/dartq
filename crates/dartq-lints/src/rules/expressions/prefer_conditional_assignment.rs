@@ -1,5 +1,5 @@
 use super::prefer_null_aware_method_calls::then_branch_run;
-use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec};
+use super::{Check, NONE_TOKEN, NodeKind, RuleSpec};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_conditional_assignment.dart`
 /// — an `if` without `else` (`visitIfStatement` :70-79) whose condition
@@ -20,14 +20,11 @@ use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec};
 /// identity; the difference is confined to renames across scopes a
 /// lint cannot see either. Message: `diagnostic.g.dart`
 /// `preferConditionalAssignment`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_conditional_assignment",
-    group: Group::Recommended,
-    problem: "The 'if' statement could be replaced by a null-aware assignment.",
-    correction: "Try using the '??=' operator to conditionally assign a value.",
-    kinds: &[NodeKind::IfStatement],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_conditional_assignment",
+    &[NodeKind::IfStatement],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

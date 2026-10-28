@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_multiple_declarations_per_line.dart:30-49`
 /// — a declaration list with more than one variable reports once, at
@@ -6,14 +6,11 @@ use super::{Check, Group, NodeKind, RuleSpec};
 /// per-declaration-list, not per-line). The classic `for` initializer
 /// list skips (:38-40 `ForPartsWithDeclarations`). Message:
 /// `diagnostic.g.dart` `avoidMultipleDeclarationsPerLine`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_multiple_declarations_per_line",
-    group: Group::Standalone,
-    problem: "Multiple variables declared on a single line.",
-    correction: "Try splitting the variable declarations into multiple lines.",
-    kinds: &[NodeKind::VariablesDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_multiple_declarations_per_line",
+    &[NodeKind::VariablesDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

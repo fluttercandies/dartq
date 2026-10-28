@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{Check, Group, NONE_TOKEN, RuleSpec, last_child};
+use super::{Check, NONE_TOKEN, RuleSpec, last_child};
 use crate::rules::utf16_token_span;
 
 /// Official: `upstream Dart SDK source,
@@ -27,14 +27,11 @@ use crate::rules::utf16_token_span;
 /// is `Type`, not the enum. Over-reports: none — a binding's written
 /// type is its static type. Message: `diagnostic.g.dart`
 /// `noDefaultCases`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "no_default_cases",
-    group: Group::Standalone,
-    problem: "Invalid use of 'default' member in a switch.",
-    correction: "Try enumerating all the possible values of the switch expression.",
-    kinds: &[NodeKind::SwitchStatement],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "no_default_cases",
+    &[NodeKind::SwitchStatement],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

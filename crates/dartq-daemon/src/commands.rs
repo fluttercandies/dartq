@@ -56,6 +56,9 @@
 //! |                 | prefixes; no rows for a delta cursor to      |
 //! |                 | filter)                                   |
 //! | `dartq/impact`  | requested view                                   |
+//! | `dartq/rename`  | requested view (the plan over the analyzed view;  |
+//! |                 | the applying write never routes — it stays the    |
+//! |                 | CLI face's own act)                              |
 //! | `dartq/fix`     | disk, always (`agent_id`/`since` rejected)        |
 //! | `dartq/compat`  | disk, always — it rebuilds one engine per axis   |
 //! |                 | over the on-disk base (`agent_id`/`since`         |
@@ -163,7 +166,7 @@ pub(crate) const SCHEMA_VERSION: u32 = dartq_commands::SCHEMA_VERSION;
 /// `pub` so the drift gate (tests/rpc_schema.rs) can pin the served request
 /// set itself, not a parallel copy: the schema test asserts this table IS
 /// the dispatchable request family, in both directions.
-pub const METHODS: [&str; 15] = [
+pub const METHODS: [&str; 16] = [
     "dartq/index",
     "dartq/analyze",
     "dartq/check",
@@ -176,6 +179,7 @@ pub const METHODS: [&str; 15] = [
     "dartq/assists",
     "dartq/compat",
     "dartq/explain",
+    "dartq/rename",
     "dartq/overlay.set",
     "dartq/overlay.commit",
     "dartq/overlay.clear",
@@ -228,6 +232,7 @@ pub(crate) enum Request {
     Query {
         name: String,
         kind: QueryKind,
+        format: Option<RenderFormat>,
         verbosity: Verbosity,
         agent: Option<String>,
         context: Option<String>,
@@ -239,6 +244,7 @@ pub(crate) enum Request {
     /// envelope (the schema crate's frozen batch convention).
     QueryBatch {
         queries: Vec<BatchQuery>,
+        format: Option<RenderFormat>,
         verbosity: Verbosity,
         agent: Option<String>,
         context: Option<String>,
@@ -248,10 +254,13 @@ pub(crate) enum Request {
     /// index rows hold under one file offset. An engine-view face
     /// (`agent_id`/`context` select the view); a point answer, so `since`
     /// is rejected — it has no rows for a cursor to filter (the
-    /// `dartq/index` rule).
+    /// `dartq/index` rule). The cursor spells either a 0-based UTF-16
+    /// `offset` or a 1-based `line`/`col` pair (the routed one-shot face's
+    /// spelling, #2629 — converted against the analyzed view's own text).
     ResolveAt {
         file: PathBuf,
-        offset: u32,
+        position: Position,
+        format: Option<RenderFormat>,
         verbosity: Verbosity,
         agent: Option<String>,
         context: Option<String>,
@@ -259,17 +268,24 @@ pub(crate) enum Request {
     /// The built-in completion face: the visible-name set at one cursor
     /// over the analyzed view's maintained index — no plugin escape (the
     /// charter has no `completions` extension point). An engine-view face
-    /// like [`Request::ResolveAt`]; a point answer, so `since` is
-    /// rejected (the `dartq/index` rule).
+    /// like [`Request::ResolveAt`]; a point answer, so `since`
+    /// is rejected (the `dartq/index` rule).
     Completion {
         file: PathBuf,
-        offset: u32,
+        position: Position,
+        format: Option<RenderFormat>,
         verbosity: Verbosity,
         agent: Option<String>,
         context: Option<String>,
     },
     Impact {
         target: PathBuf,
+        /// The `--symbol` narrowing list (#2666): empty is the file-level
+        /// posture (every library-face name seeds); a non-empty list seeds
+        /// only the resolved faces, an unresolved spelling answering the
+        /// face's own usage tier.
+        symbols: Vec<String>,
+        format: Option<RenderFormat>,
         verbosity: Verbosity,
         agent: Option<String>,
         context: Option<String>,
@@ -281,9 +297,20 @@ pub(crate) enum Request {
     /// defaults to the session's resolved SDK root.
     Explain {
         symbol: String,
+        format: Option<RenderFormat>,
         verbosity: Verbosity,
         since: Option<u64>,
         sdk: Option<PathBuf>,
+    },
+    /// The rename plan face (#2629): the edit set over the analyzed view —
+    /// the daemon answers the plan document, never a write (the applying
+    /// face stays the CLI's own). An engine-view face; a point answer, so
+    /// `since` is rejected (the `dartq/index` rule).
+    Rename {
+        target: PathBuf,
+        anchor: dartq_commands::rename::Anchor,
+        new_name: String,
+        format: Option<RenderFormat>,
     },
     Fix {
         paths: Vec<PathBuf>,
@@ -314,7 +341,9 @@ impl Request {
             | Self::ResolveAt { agent, .. }
             | Self::Completion { agent, .. }
             | Self::Impact { agent, .. } => agent.as_deref(),
-            Self::Explain { .. } | Self::Fix { .. } | Self::Compat { .. } => None,
+            Self::Explain { .. } | Self::Rename { .. } | Self::Fix { .. } | Self::Compat { .. } => {
+                None
+            }
         }
     }
 
@@ -330,7 +359,9 @@ impl Request {
             | Self::ResolveAt { context, .. }
             | Self::Completion { context, .. }
             | Self::Impact { context, .. } => context.as_deref(),
-            Self::Explain { .. } | Self::Fix { .. } | Self::Compat { .. } => None,
+            Self::Explain { .. } | Self::Rename { .. } | Self::Fix { .. } | Self::Compat { .. } => {
+                None
+            }
         }
     }
 
@@ -350,6 +381,9 @@ impl Request {
             | Self::Explain { verbosity, .. }
             | Self::Fix { verbosity, .. }
             | Self::Compat { verbosity, .. } => *verbosity,
+            // The rename plan has no tier axis (every field a locator or
+            // an edit row — the document's own law).
+            Self::Rename { .. } => Verbosity::Compact,
         }
     }
 }
@@ -405,6 +439,67 @@ pub(crate) enum RenderFormat {
     Text,
 }
 
+/// One position face's cursor as the request spelled it: a 0-based UTF-16
+/// `offset`, or a 1-based `line`/`col` pair converted against the analyzed
+/// view's own text at answer time (#2629 — the same conversion the cold
+/// one-shot faces run, so the routed and cold answers query the same
+/// offset over the same snapshot).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Position {
+    Offset(u32),
+    LineCol { line: u32, col: u32 },
+}
+
+impl Position {
+    /// Decodes the cursor fields: exactly one spelling may come — `offset`
+    /// alone, or `line` and `col` together.
+    fn decode(method: &str, offset: Option<u32>, line: Option<u32>, col: Option<u32>) -> Result<Self, String> {
+        match (offset, line, col) {
+            (Some(offset), None, None) => Ok(Self::Offset(offset)),
+            (None, Some(line), Some(col)) => Ok(Self::LineCol { line, col }),
+            _ => Err(format!(
+                "{method} takes one cursor spelling: `offset`, or `line` and `col` together"
+            )),
+        }
+    }
+}
+
+/// The rendered arm's view rules (the analyze face's own, #2627/#2629):
+/// the rendered bytes are the cold CLI face's — the base view, the whole
+/// answer — so a request pairing `format` with a view selector
+/// (`agent_id`/`context`) or a delta cursor (`since`) is refused at
+/// intake: the cold face can print none of those, so neither may the
+/// routed answer.
+fn reject_rendered_view(
+    method: &str,
+    format: Option<RenderFormat>,
+    agent: Option<String>,
+    context: Option<String>,
+    since: Option<u64>,
+) -> Result<(), String> {
+    if format.is_none() {
+        return Ok(());
+    }
+    if let Some(agent) = agent {
+        return Err(format!(
+            "the rendered {method} face answers the base view (agent_id `{agent}` has no CLI \
+             spelling)"
+        ));
+    }
+    if let Some(context) = context {
+        return Err(format!(
+            "the rendered {method} face answers the default context (context `{context}` has no \
+             CLI spelling)"
+        ));
+    }
+    if since.is_some() {
+        return Err(format!(
+            "the rendered {method} face answers the whole report; since has no CLI spelling"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct QueryParams {
     name: String,
@@ -412,6 +507,10 @@ struct QueryParams {
     /// the accepted set, surfaced as `INVALID_PARAMS`.
     #[serde(default)]
     kind: QueryKind,
+    /// The routed one-shot face's output switch (#2629) — see
+    /// [`RenderFormat`].
+    #[serde(default)]
+    format: Option<RenderFormat>,
     #[serde(default)]
     verbosity: Verbosity,
 }
@@ -419,6 +518,8 @@ struct QueryParams {
 #[derive(Deserialize)]
 struct BatchQueryParams {
     queries: Vec<BatchItemParams>,
+    #[serde(default)]
+    format: Option<RenderFormat>,
     #[serde(default)]
     verbosity: Verbosity,
 }
@@ -435,9 +536,19 @@ struct BatchItemParams {
 #[derive(Deserialize)]
 struct ResolveAtParams {
     file: PathBuf,
-    /// UTF-16 code units from the file's start — the engine's external
+    /// The cursor's 0-based UTF-16 offset — the engine's external
     /// convention, the same units the query rows' `offset` fields carry.
-    offset: u32,
+    /// Exactly one spelling of the position comes: `offset`, or the
+    /// 1-based `line`/`col` pair (the routed one-shot face's spelling,
+    /// #2629).
+    #[serde(default)]
+    offset: Option<u32>,
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    col: Option<u32>,
+    #[serde(default)]
+    format: Option<RenderFormat>,
     #[serde(default)]
     verbosity: Verbosity,
 }
@@ -445,9 +556,19 @@ struct ResolveAtParams {
 #[derive(Deserialize)]
 struct CompletionParams {
     file: PathBuf,
-    /// UTF-16 code units from the file's start — the engine's external
+    /// The cursor's 0-based UTF-16 offset — the engine's external
     /// convention, the same units the query rows' `offset` fields carry.
-    offset: u32,
+    /// Exactly one spelling of the position comes: `offset`, or the
+    /// 1-based `line`/`col` pair (the routed one-shot face's spelling,
+    /// #2629).
+    #[serde(default)]
+    offset: Option<u32>,
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    col: Option<u32>,
+    #[serde(default)]
+    format: Option<RenderFormat>,
     #[serde(default)]
     verbosity: Verbosity,
 }
@@ -455,6 +576,14 @@ struct CompletionParams {
 #[derive(Deserialize)]
 struct TargetParams {
     path: PathBuf,
+    /// The `--symbol` narrowing list (#2666): the snake_case plural array
+    /// the MCP face already forwards — absent is the file-level posture.
+    #[serde(default)]
+    symbols: Vec<String>,
+    /// The routed one-shot face's output switch (#2629) — see
+    /// [`RenderFormat`].
+    #[serde(default)]
+    format: Option<RenderFormat>,
     #[serde(default)]
     verbosity: Verbosity,
 }
@@ -463,10 +592,29 @@ struct TargetParams {
 struct ExplainParams {
     symbol: String,
     #[serde(default)]
+    format: Option<RenderFormat>,
+    #[serde(default)]
     verbosity: Verbosity,
     /// The per-query SDK root; absent defaults to the session's
     /// resolved SDK root (an explicit value wins).
     sdk: Option<PathBuf>,
+}
+
+/// The `dartq/rename` payload (#2629): the anchor file plus the position
+/// (the CLI face's two spellings — a 1-based `line`/`col` pair or a 0-based
+/// UTF-16 `offset`; exactly one comes) and the new identifier.
+#[derive(Deserialize)]
+struct RenameParams {
+    path: PathBuf,
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    col: Option<u32>,
+    #[serde(default)]
+    offset: Option<u64>,
+    new_name: String,
+    #[serde(default)]
+    format: Option<RenderFormat>,
 }
 
 #[derive(Deserialize)]
@@ -558,9 +706,11 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
             let (agent, since) = session_fields(params)?;
             let context = context_field(params)?;
             let decoded = serde_json::from_value::<QueryParams>(params.clone()).map_err(invalid)?;
+            reject_rendered_view("dartq/query", decoded.format, agent.clone(), context.clone(), since)?;
             Ok(Request::Query {
                 name: decoded.name,
                 kind: decoded.kind,
+                format: decoded.format,
                 verbosity: decoded.verbosity,
                 agent,
                 context,
@@ -582,9 +732,17 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
             let context = context_field(params)?;
             let decoded =
                 serde_json::from_value::<ResolveAtParams>(params.clone()).map_err(invalid)?;
+            reject_rendered_view("dartq/resolveAt", decoded.format, agent.clone(), context.clone(), None)?;
+            let position = Position::decode(
+                "dartq/resolveAt",
+                decoded.offset,
+                decoded.line,
+                decoded.col,
+            )?;
             Ok(Request::ResolveAt {
                 file: resolve(root, decoded.file),
-                offset: decoded.offset,
+                position,
+                format: decoded.format,
                 verbosity: decoded.verbosity,
                 agent,
                 context,
@@ -605,9 +763,23 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
             let context = context_field(params)?;
             let decoded =
                 serde_json::from_value::<CompletionParams>(params.clone()).map_err(invalid)?;
+            reject_rendered_view(
+                "dartq/completion",
+                decoded.format,
+                agent.clone(),
+                context.clone(),
+                None,
+            )?;
+            let position = Position::decode(
+                "dartq/completion",
+                decoded.offset,
+                decoded.line,
+                decoded.col,
+            )?;
             Ok(Request::Completion {
                 file: resolve(root, decoded.file),
-                offset: decoded.offset,
+                position,
+                format: decoded.format,
                 verbosity: decoded.verbosity,
                 agent,
                 context,
@@ -618,8 +790,11 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
             let context = context_field(params)?;
             let decoded =
                 serde_json::from_value::<TargetParams>(params.clone()).map_err(invalid)?;
+            reject_rendered_view("dartq/impact", decoded.format, agent.clone(), context.clone(), since)?;
             Ok(Request::Impact {
                 target: resolve(root, decoded.path),
+                symbols: decoded.symbols,
+                format: decoded.format,
                 verbosity: decoded.verbosity,
                 agent,
                 context,
@@ -627,6 +802,7 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
             })
         }
         "dartq/explain" => parse_explain(params),
+        "dartq/rename" => parse_rename(params, root),
         "dartq/compat" => {
             let decoded =
                 serde_json::from_value::<CompatParams>(params.clone()).map_err(invalid)?;
@@ -726,6 +902,13 @@ fn parse_query_batch(params: &Value) -> Result<Request, String> {
     let (agent, since) = session_fields(params)?;
     let context = context_field(params)?;
     let decoded = serde_json::from_value::<BatchQueryParams>(params.clone()).map_err(invalid)?;
+    reject_rendered_view(
+        "dartq/queryBatch",
+        decoded.format,
+        agent.clone(),
+        context.clone(),
+        since,
+    )?;
     let queries = decoded
         .queries
         .into_iter()
@@ -736,6 +919,7 @@ fn parse_query_batch(params: &Value) -> Result<Request, String> {
         .collect();
     Ok(Request::QueryBatch {
         queries,
+        format: decoded.format,
         verbosity: decoded.verbosity,
         agent,
         context,
@@ -765,14 +949,52 @@ fn parse_explain(params: &Value) -> Result<Request, String> {
         );
     }
     let decoded = serde_json::from_value::<ExplainParams>(params.clone()).map_err(invalid)?;
+    reject_rendered_view("dartq/explain", decoded.format, None, None, since)?;
     if decoded.symbol.is_empty() {
         return Err("symbol must be a non-empty string".into());
     }
     Ok(Request::Explain {
         symbol: decoded.symbol,
+        format: decoded.format,
         verbosity: decoded.verbosity,
         since,
         sdk: decoded.sdk,
+    })
+}
+
+/// Decodes `dartq/rename` (#2629): the routed one-shot dry run — the plan
+/// over the analyzed view, rendered as the CLI face prints it. A disk-view
+/// posture by contract (the write never routes), so every session field is
+/// rejected; the name gate runs here, before any analysis work, exactly
+/// where the CLI face runs it.
+///
+/// # Errors
+///
+/// A malformed cursor, an illegal new name, or any session view selector.
+fn parse_rename(params: &Value, root: &Path) -> Result<Request, String> {
+    let invalid = |error: serde_json::Error| error.to_string();
+    reject_disk_view_only(params, "dartq/rename")?;
+    let decoded = serde_json::from_value::<RenameParams>(params.clone()).map_err(invalid)?;
+    if !dartq_commands::rename::is_legal_new_name(&decoded.new_name) {
+        return Err(dartq_commands::rename::RenameError::IllegalName(decoded.new_name).to_string());
+    }
+    let anchor = match (decoded.line, decoded.col, decoded.offset) {
+        (Some(line), Some(col), None) => {
+            dartq_commands::rename::Anchor::LineCol { line, column: col }
+        }
+        (None, None, Some(offset)) => dartq_commands::rename::Anchor::Utf16Offset(offset),
+        _ => {
+            return Err(
+                "dartq/rename takes one anchor spelling: `line` and `col` together, or `offset`"
+                    .into(),
+            );
+        }
+    };
+    Ok(Request::Rename {
+        target: resolve(root, decoded.path),
+        anchor,
+        new_name: decoded.new_name,
+        format: decoded.format,
     })
 }
 
@@ -1297,30 +1519,45 @@ pub(crate) fn answer(drain: &Drain<'_>, request: &Request) -> Result<Value, Sess
         Request::Query {
             name,
             kind,
+            format,
             verbosity,
             since,
             ..
-        } => Ok(query_answer(drain, name, *kind, *verbosity, *since)),
+        } => Ok(query_answer(drain, name, *kind, *format, *verbosity, *since)),
         Request::QueryBatch {
             queries,
+            format,
             verbosity,
             since,
             ..
-        } => Ok(query_batch_answer(drain, queries, *verbosity, *since)),
-        Request::ResolveAt { file, offset, .. } => resolve_at_answer(drain, file, *offset),
-        Request::Completion { file, offset, .. } => completion_answer(drain, file, *offset),
+        } => Ok(query_batch_answer(drain, queries, *format, *verbosity, *since)),
+        Request::ResolveAt {
+            file, position, format, ..
+        } => resolve_at_answer(drain, file, *position, *format),
+        Request::Completion {
+            file, position, format, ..
+        } => completion_answer(drain, file, *position, *format),
         Request::Impact {
             target,
+            symbols,
+            format,
             verbosity,
             since,
             ..
-        } => impact_answer(drain, target, *verbosity, *since),
+        } => impact_answer(drain, target, symbols, *format, *verbosity, *since),
         Request::Explain {
             symbol,
+            format,
             verbosity,
             since,
             sdk,
-        } => explain_answer(drain, symbol, *verbosity, *since, sdk.as_deref()),
+        } => explain_answer(drain, symbol, *format, *verbosity, *since, sdk.as_deref()),
+        Request::Rename {
+            target,
+            anchor,
+            new_name,
+            format,
+        } => rename_answer(drain, target, *anchor, new_name, *format),
         Request::Fix {
             paths,
             verbosity,
@@ -1542,6 +1779,30 @@ fn rendered_answer(
     })
 }
 
+/// The routed one-shot answer over a value-shaped face (#2629): the
+/// rendered stdout bytes of the format's one writer — `lon` the canonical
+/// line, `json` the single-line value, `text` the indented value — beside
+/// the universe stamp the caller verifies against the disk (the same
+/// belt-and-braces gate the analyze answer carries; these faces read the
+/// session's analysis universe too). No `counts`: every value face exits
+/// 0 on a answered document, its usage errors being the caller's own cold
+/// path's. No session economics ride the rendered arm — the bytes are the
+/// cold face's, short ids and delta cursors included out.
+fn rendered_value(format: RenderFormat, value: &Value, package_stamp: Option<&PackageStamp>) -> Value {
+    let mut stdout = Vec::new();
+    let rendered = match format {
+        RenderFormat::Lon => dartq_commands::render::write_lon(&mut stdout, value),
+        RenderFormat::Json => dartq_commands::render::write_json_value(&mut stdout, value),
+        RenderFormat::Text => dartq_commands::render::write_text_value(&mut stdout, value),
+    };
+    rendered.expect("an in-memory writer never fails");
+    json!({
+        "v": SCHEMA_VERSION,
+        "stdout": String::from_utf8(stdout).expect("the writers emit UTF-8"),
+        "packages": package_stamp.map(PackageStamp::wire),
+    })
+}
+
 /// The analyze document's layout face: the engine's paths and positions
 /// with the workspace root as the locator's analysis root — the same
 /// projection the CLI's run carries (its provider answers the engine's
@@ -1696,15 +1957,22 @@ fn check_engine_view(
 
 /// The `dartq/query` answer: `kind` routes to the matching engine query
 /// face, then the shared shaper shapes the run — the one shaper the batch
-/// face reuses, so the two answers cannot drift.
+/// face reuses, so the two answers cannot drift. With `format` (#2629) the
+/// answer is the routed one-shot face instead: the same tier-shaped value
+/// the cold CLI face prints, rendered through the format's one writer.
 fn query_answer(
     drain: &Drain<'_>,
     name: &str,
     kind: QueryKind,
+    format: Option<RenderFormat>,
     verbosity: Verbosity,
     since: Option<u64>,
 ) -> Value {
     let run = query::kind_after_analysis(drain.engine, name, kind);
+    if let Some(format) = format {
+        let value = query::to_json_at_tier(&run, name, verbosity);
+        return rendered_value(format, &value, drain.package_stamp);
+    }
     query_answer_shaped(drain, name, run, verbosity, since)
 }
 
@@ -1714,16 +1982,39 @@ fn query_answer(
 /// the round trip's whole point (one graph build amortized across N
 /// answers). The array carries no aggregate envelope (the schema crate's
 /// frozen batch convention); each element is the single face's own answer,
-/// shaper-for-shaper.
+/// shaper-for-shaper. With `format` (#2629) the routed arm renders the
+/// answers as the cold batch face prints them — one writer-fed line per
+/// envelope, request order.
 fn query_batch_answer(
     drain: &Drain<'_>,
     queries: &[BatchQuery],
+    format: Option<RenderFormat>,
     verbosity: Verbosity,
     since: Option<u64>,
 ) -> Value {
+    let runs = query::batch_after_analysis(drain.engine, queries);
+    if let Some(format) = format {
+        let values: Vec<Value> = runs
+            .iter()
+            .map(|answer| query::to_json_at_tier(&answer.run, answer.name, verbosity))
+            .collect();
+        let mut stdout = Vec::new();
+        for value in &values {
+            let rendered = match format {
+                RenderFormat::Lon => dartq_commands::render::write_lon(&mut stdout, value),
+                RenderFormat::Json => dartq_commands::render::write_json_value(&mut stdout, value),
+                RenderFormat::Text => dartq_commands::render::write_text_value(&mut stdout, value),
+            };
+            rendered.expect("an in-memory writer never fails");
+        }
+        return json!({
+            "v": SCHEMA_VERSION,
+            "stdout": String::from_utf8(stdout).expect("the writers emit UTF-8"),
+            "packages": drain.package_stamp.map(PackageStamp::wire),
+        });
+    }
     Value::Array(
-        query::batch_after_analysis(drain.engine, queries)
-            .into_iter()
+        runs.into_iter()
             .map(|answer| query_answer_shaped(drain, answer.name, answer.run, verbosity, since))
             .collect(),
     )
@@ -1792,28 +2083,71 @@ fn query_answer_shaped(
 /// one-shot `resolve-at` face serves, so the two cannot drift; this layer
 /// maps the core's failure set onto the session's error tiers (the
 /// residency miss is the params tier, the prelude's own failures cannot
-/// arise on this path — the read task has just run the analysis pass).
-fn resolve_at_answer(drain: &Drain<'_>, file: &Path, offset: u32) -> Result<Value, SessionError> {
-    resolve_core::resolve_at_after_analysis(drain.engine, file, offset).map_err(|error| match error
-    {
-        ResolveError::NotResident(_) => SessionError::InvalidParams(error.to_string()),
-        ResolveError::Analyze(_) => SessionError::Internal(error.to_string()),
-    })
+/// arise on this path — the read task has just run the analysis pass). A
+/// `line`/`col` cursor converts against the analyzed view's own text —
+/// the very conversion the cold one-shot face runs, over the same
+/// snapshot. With `format` (#2629) the answer is the routed one-shot
+/// face: the same envelope rendered through the format's one writer.
+fn resolve_at_answer(
+    drain: &Drain<'_>,
+    file: &Path,
+    position: Position,
+    format: Option<RenderFormat>,
+) -> Result<Value, SessionError> {
+    let answer = resolve_core::resolve_at_after_analysis(drain.engine, file, offset_of(drain, file, position)?)
+        .map_err(|error| match error {
+            ResolveError::NotResident(_) => SessionError::InvalidParams(error.to_string()),
+            ResolveError::Analyze(_) => SessionError::Internal(error.to_string()),
+        })?;
+    Ok(render_position_answer(drain, format, answer))
 }
-
-// ---------------------------------------------------------------------------
-// dartq/completion — the built-in completion face (the visible-name set the
-// maintained index proves at one cursor; the charter has no plugin escape)
-// ---------------------------------------------------------------------------
 
 /// The `dartq/completion` answer over the analyzed view — the shared
 /// core's implementation (see [`resolve_at_answer`]'s layering notes).
-fn completion_answer(drain: &Drain<'_>, file: &Path, offset: u32) -> Result<Value, SessionError> {
-    resolve_core::completion_after_analysis(drain.engine, file, offset).map_err(|error| match error
-    {
-        ResolveError::NotResident(_) => SessionError::InvalidParams(error.to_string()),
-        ResolveError::Analyze(_) => SessionError::Internal(error.to_string()),
-    })
+/// With `format` (#2629) the answer is the routed one-shot face: the same
+/// visible-name set rendered through the format's one writer.
+fn completion_answer(
+    drain: &Drain<'_>,
+    file: &Path,
+    position: Position,
+    format: Option<RenderFormat>,
+) -> Result<Value, SessionError> {
+    let answer = resolve_core::completion_after_analysis(drain.engine, file, offset_of(drain, file, position)?)
+        .map_err(|error| match error {
+            ResolveError::NotResident(_) => SessionError::InvalidParams(error.to_string()),
+            ResolveError::Analyze(_) => SessionError::Internal(error.to_string()),
+        })?;
+    Ok(render_position_answer(drain, format, answer))
+}
+
+/// One position request's cursor as the 0-based UTF-16 offset the core
+/// answers over: an `offset` spelling passes through, a `line`/`col`
+/// spelling converts against the analyzed view's own text.
+fn offset_of(drain: &Drain<'_>, file: &Path, position: Position) -> Result<u32, SessionError> {
+    match position {
+        Position::Offset(offset) => Ok(offset),
+        Position::LineCol { line, col } => {
+            resolve_core::position_offset(drain.engine, file, line, col).map_err(|error| {
+                match error {
+                    ResolveError::NotResident(_) => SessionError::InvalidParams(error.to_string()),
+                    ResolveError::Analyze(_) => SessionError::Internal(error.to_string()),
+                }
+            })
+        }
+    }
+}
+
+/// The position face's answer under its two arms: the routed one-shot
+/// face's rendered bytes (#2629), or the envelope verbatim.
+fn render_position_answer(
+    drain: &Drain<'_>,
+    format: Option<RenderFormat>,
+    answer: Value,
+) -> Value {
+    match format {
+        Some(format) => rendered_value(format, &answer, drain.package_stamp),
+        None => answer,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,11 +2157,13 @@ fn completion_answer(drain: &Drain<'_>, file: &Path, offset: u32) -> Result<Valu
 fn impact_answer(
     drain: &Drain<'_>,
     target: &Path,
+    symbols: &[String],
+    format: Option<RenderFormat>,
     _verbosity: Verbosity,
     since: Option<u64>,
 ) -> Result<Value, SessionError> {
-    let mut report =
-        impact_core::impact_after_analysis(drain.engine, target).map_err(|error| match error {
+    let mut report = impact_core::impact_after_analysis_with_symbols(drain.engine, target, symbols)
+        .map_err(|error| match error {
             impact_core::ImpactError::Missing(path) => SessionError::InvalidParams(format!(
                 "Directory or file doesn't exist: {}",
                 path.display()
@@ -1839,7 +2175,10 @@ fn impact_answer(
             impact_core::ImpactError::Step(step) => step.into(),
             // The environments axis's tiers (the enum's contract): an
             // unusable context input is the caller's params, a failed axis
-            // run is internal.
+            // run is internal. The `--symbol` narrowing's own usage tier —
+            // `no such symbol in <target>: <spelling>` (#2666) — rides
+            // this arm verbatim, the wording the MCP face's isError pin
+            // and the CLI's cold face share.
             impact_core::ImpactError::Usage(message) => SessionError::InvalidParams(message),
             impact_core::ImpactError::Internal(message) => SessionError::Internal(message),
         })?;
@@ -1894,7 +2233,13 @@ fn impact_answer(
     if since.is_some() {
         value["since"] = json!(drain.cursor);
     }
-    Ok(value)
+    Ok(match format {
+        // The routed one-shot face (#2629): the same report value the cold
+        // CLI face prints, rendered through the format's one writer — no
+        // session economics, no cursor echo (the intake rejected both).
+        Some(format) => rendered_value(format, &value, drain.package_stamp),
+        None => value,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1935,6 +2280,7 @@ const EXPLAIN_SPOTS: &[(&str, &str)] = &[
 fn explain_answer(
     drain: &Drain<'_>,
     symbol: &str,
+    format: Option<RenderFormat>,
     verbosity: Verbosity,
     since: Option<u64>,
     sdk: Option<&Path>,
@@ -1947,6 +2293,13 @@ fn explain_answer(
             | ExplainError::NoSuchDiagnostic(_) => SessionError::InvalidParams(error.to_string()),
             ExplainError::Analyze(_) => SessionError::Internal(error.to_string()),
         })?;
+    if let Some(format) = format {
+        // The routed one-shot face (#2629): the report the cold CLI face
+        // prints, rendered through the format's one writer — the session
+        // economics (short ids, the cursor echo) ride out: the cold face's
+        // bytes are the contract.
+        return Ok(rendered_value(format, &report, None));
+    }
     if let Some(since) = since {
         // Delta mode (the impact face's mapping over the report's own
         // sections, under the producer's current section keys): a
@@ -1977,6 +2330,52 @@ fn explain_answer(
         drain,
         EXPLAIN_SPOTS,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// dartq/rename — the edit-set face (the plan over the analyzed view; the
+// write never routes — the applying face stays the CLI's own)
+// ---------------------------------------------------------------------------
+
+/// The `dartq/rename` answer (#2629): the plan over the session's analyzed
+/// view — the same [`dartq_commands::rename::plan`] the cold one-shot face
+/// runs after its own prelude, the same [`dartq_commands::rename::to_json`]
+/// document, and (with `format`) the rendered stdout bytes of the same
+/// writer the cold face prints through. The name gate ran at intake, where
+/// the CLI face runs it.
+///
+/// # Errors
+///
+/// The anchor refusals (a non-resident file, an out-of-range position) are
+/// the params tier — the CLI's own usage tier, re-derived by its cold
+/// fallback on a routed refusal.
+fn rename_answer(
+    drain: &Drain<'_>,
+    target: &Path,
+    anchor: dartq_commands::rename::Anchor,
+    new_name: &str,
+    format: Option<RenderFormat>,
+) -> Result<Value, SessionError> {
+    let plan = dartq_commands::rename::plan(drain.engine, target, anchor).map_err(
+        |error| match error {
+            dartq_commands::rename::RenameError::NotResident(_)
+            | dartq_commands::rename::RenameError::OutOfRange { .. }
+            | dartq_commands::rename::RenameError::IllegalName(_) => {
+                SessionError::InvalidParams(error.to_string())
+            }
+            // The read task has just run the analysis pass; the plan path
+            // runs no prelude, so the analyze arm cannot arise here.
+            dartq_commands::rename::RenameError::Stale(_)
+            | dartq_commands::rename::RenameError::Analyze(_) => {
+                SessionError::Internal(error.to_string())
+            }
+        },
+    )?;
+    let document = dartq_commands::rename::to_json(&plan, new_name);
+    Ok(match format {
+        Some(format) => rendered_value(format, &document, drain.package_stamp),
+        None => document,
+    })
 }
 
 // ---------------------------------------------------------------------------

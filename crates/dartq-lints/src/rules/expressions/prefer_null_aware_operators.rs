@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, slice};
+use super::{Check, NodeKind, RuleSpec, slice};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_null_aware_operators.dart:22-76`
 /// — `a == null ? null : a.b` (`!=` mirrors to the then arm) reports when
@@ -17,14 +17,11 @@ use super::{Check, Group, NodeKind, RuleSpec, slice};
 /// marker-filtered token-lexeme walk (the anchored `toString()` form).
 /// The bare `a == null ? null : a` form never matches (the comparison
 /// runs only after a peel).
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_null_aware_operators",
-    group: Group::Recommended,
-    problem: "Use the null-aware operator '?.' rather than an explicit 'null' comparison.",
-    correction: "Try using '?.'.",
-    kinds: &[NodeKind::Conditional],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_null_aware_operators",
+    &[NodeKind::Conditional],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

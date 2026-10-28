@@ -321,6 +321,32 @@ fn finally_break_reports() {
     assert_eq!(lints.len(), 1);
     assert_eq!(lints[0].message, "Use of 'break' in a 'finally' clause.");
     assert_eq!(lints[0].range.start, utf16_at(&f, 5));
+    // Upstream reports the whole statement, semicolon included
+    // (`test_break` marks `[!break;!]`); the hand-built span already
+    // carries it ([5, 7) — `break ;`).
+    assert_eq!(lints[0].range.end, utf16_at(&f, 6) + 1);
+}
+
+/// Production-bridge pin: the production rows anchor Break/Continue at
+/// the keyword alone, and the report still extends through the `;`
+/// (`test_break` / `test_continue` markup). ASCII sources — UTF-16
+/// offsets equal byte offsets, so `rfind` anchors read directly.
+#[test]
+fn finally_jump_reports_through_the_semicolon() {
+    let f = Fixture::parse("void f() {\n  for (;;) {\n    try {} finally { break; }\n  }\n}\n");
+    let lints = f.run(&one_rule("control_flow_in_finally"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let source = &f.source;
+    let semi = source.rfind(';').expect("statement semicolon");
+    let start = source.rfind("break").expect("break keyword");
+    assert_eq!(lints[0].range.end as usize, semi + 1);
+    assert_eq!(lints[0].range.start as usize, start);
+
+    let f = Fixture::parse("void f() {\n  for (;;) {\n    try {} finally { continue; }\n  }\n}\n");
+    let lints = f.run(&one_rule("control_flow_in_finally"));
+    assert_eq!(lints.len(), 1, "{lints:?}");
+    let semi = f.source.rfind(';').expect("statement semicolon");
+    assert_eq!(lints[0].range.end as usize, semi + 1);
 }
 
 /// A loop inside the finally keeps the break local (:79-91 shape).

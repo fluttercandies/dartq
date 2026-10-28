@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, slice};
+use super::{Check, NodeKind, RuleSpec, slice};
 use crate::rules::in_const_context;
 
 const USE_IS_EMPTY_PROBLEM: &str =
@@ -31,14 +31,11 @@ const ALWAYS_TRUE_PROBLEM: &str =
 /// const-constructor initializer face. Messages: `diagnostic.g.dart`
 /// `preferIsEmptyUseIsEmpty`/`preferIsEmptyUseIsNotEmpty`/
 /// `preferIsEmptyAlwaysFalse`/`preferIsEmptyAlwaysTrue`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_is_empty",
-    group: Group::Core,
-    problem: USE_IS_EMPTY_PROBLEM,
-    correction: USE_IS_EMPTY_CORRECTION,
-    kinds: &[NodeKind::BinaryExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_is_empty",
+    &[NodeKind::BinaryExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

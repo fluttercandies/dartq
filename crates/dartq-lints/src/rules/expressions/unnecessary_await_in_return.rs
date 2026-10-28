@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
+use super::{Check, NodeKind, RuleSpec, same_file, slice};
 use crate::rules::{type_before, type_face, utf16_token_span};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_await_in_return.dart`
@@ -21,14 +21,11 @@ use crate::rules::{type_before, type_face, utf16_token_span};
 /// member-access operands, inferred or omitted return types, and
 /// generic-type-argument mismatches stay silent.
 /// Message: `diagnostic.g.dart` `unnecessaryAwaitInReturn`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_await_in_return",
-    group: Group::Standalone,
-    problem: "Unnecessary 'await'.",
-    correction: "Try removing the 'await'.",
-    kinds: &[NodeKind::AwaitExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_await_in_return",
+    &[NodeKind::AwaitExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

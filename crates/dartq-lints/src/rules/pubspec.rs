@@ -988,16 +988,13 @@ pub(crate) mod secure_pubspec_urls {
     //! `kinds: &[]` — the verdict runs per pubspec value, not per AST node;
     //! the pubspec pass at the mounting face feeds the visited fields.
 
-    use super::{Group, RuleSpec, not_dispatched};
+    use super::{RuleSpec, not_dispatched};
 
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "secure_pubspec_urls",
-        group: Group::Core,
-        problem: "The '{0}' protocol shouldn't be used because it isn't secure.",
-        correction: "Try using a secure protocol, such as 'https'.",
-        kinds: &[],
-        check: not_dispatched,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "secure_pubspec_urls",
+    &[],
+    not_dispatched,
+);
 
     /// One insecure URL: the value's byte range in the pubspec text and the
     /// offending (lowercase) scheme — the message's `{0}`.
@@ -1456,16 +1453,13 @@ pub(crate) mod package_names {
     //! `kinds: &[]` — the verdict runs per pubspec value, not per AST node;
     //! the pubspec pass at the mounting face feeds the `name:` entry.
 
-    use super::{Group, RuleSpec, not_dispatched};
+    use super::{RuleSpec, not_dispatched};
 
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "package_names",
-        group: Group::Recommended,
-        problem: "The package name '{0}' isn't a lower_case_with_underscores identifier.",
-        correction: "Try changing the name to follow the lower_case_with_underscores style.",
-        kinds: &[],
-        check: not_dispatched,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "package_names",
+    &[],
+    not_dispatched,
+);
 
     /// One invalid name: the value's byte range in the pubspec text and the
     /// name itself — the message's `{0}`.
@@ -1667,16 +1661,13 @@ pub(crate) mod depend_on_referenced_packages {
     //! gate (:33-40), keeping the rule silent. Message:
     //! `diagnostic.g.dart` `dependOnReferencedPackages`.
 
-    use super::{Group, NodeKind, RuleSpec};
+    use super::{NodeKind, RuleSpec};
 
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "depend_on_referenced_packages",
-        group: Group::Core,
-        problem: "The imported package '{0}' isn't a dependency of the importing package.",
-        correction: "Try adding a dependency for '{0}' in the 'pubspec.yaml' file.",
-        kinds: &[NodeKind::Import, NodeKind::Export],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "depend_on_referenced_packages",
+    &[NodeKind::Import, NodeKind::Export],
+    check,
+);
 
     /// The virtual packages that never report (:68-72).
     const VIRTUAL_PACKAGES: [&str; 1] = ["flutter_gen"];
@@ -1840,16 +1831,13 @@ pub(crate) mod sort_pub_dependencies {
     //! node; the pubspec pass at the mounting face feeds each section's
     //! named entries in document order with their name spans.
 
-    use super::{Group, RuleSpec, not_dispatched};
+    use super::{RuleSpec, not_dispatched};
 
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "sort_pub_dependencies",
-        group: Group::Standalone,
-        problem: "Dependencies not sorted alphabetically.",
-        correction: "Try sorting the dependencies alphabetically (A to Z).",
-        kinds: &[],
-        check: not_dispatched,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "sort_pub_dependencies",
+    &[],
+    not_dispatched,
+);
 
     /// The official `_visitDeps` (:41-65) over one section's named entries
     /// in document order — `(name span, name text)` pairs as the pubspec

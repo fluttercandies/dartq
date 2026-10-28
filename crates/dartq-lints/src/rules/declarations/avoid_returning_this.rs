@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, member_name, type_before};
+use super::{Check, NodeKind, RuleSpec, member_name, type_before};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_returning_this.dart:68-106`
 /// — a class/enum/mixin method (never an extension member :91, never an
@@ -12,14 +12,11 @@ use super::{Check, Group, NodeKind, RuleSpec, member_name, type_before};
 /// skipped (:49-51 — their blocks are sibling rows, not the method
 /// body's block). The expression-body face reports at the method name
 /// (:100-104). Message: `diagnostic.g.dart` `avoidReturningThis`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_returning_this",
-    group: Group::Standalone,
-    problem: "Don't return 'this' from a method.",
-    correction: "Try changing the return type to 'void' and removing the return.",
-    kinds: &[NodeKind::Method],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_returning_this",
+    &[NodeKind::Method],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

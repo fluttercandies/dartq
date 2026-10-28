@@ -1,7 +1,5 @@
-use super::{Check, Group, NodeKind, RuleSpec};
-use crate::rules::{
-    byte_span_of_token, initialized_identifier_name, tail_token, utf16_token_span,
-};
+use super::{Check, NodeKind, RuleSpec};
+use crate::rules::{byte_span_of_token, initialized_identifier_name, tail_token, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/use_rethrow_when_possible.dart:36-46`
 /// — a `throw` of exactly the caught exception parameter, as a statement,
@@ -16,14 +14,11 @@ use crate::rules::{
 /// (documented): a sibling local-function declaration sharing the name
 /// shadows in the official scope but is not walked here. Message:
 /// `diagnostic.g.dart` `useRethrowWhenPossible`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "use_rethrow_when_possible",
-    group: Group::Recommended,
-    problem: "Use 'rethrow' to rethrow a caught exception.",
-    correction: "Try replacing the 'throw' with a 'rethrow'.",
-    kinds: &[NodeKind::ThrowExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_rethrow_when_possible",
+    &[NodeKind::ThrowExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // `node.parent is! ExpressionStatement` bails (:37). The production

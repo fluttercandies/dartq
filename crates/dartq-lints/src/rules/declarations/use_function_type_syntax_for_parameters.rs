@@ -1,18 +1,15 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/use_function_type_syntax_for_parameters.dart:34-49`
 /// — a formal parameter written with the old function syntax
 /// (`void f()`) reports at the parameter. The old syntax is its own AST
 /// shape: [`NodeKind::FunctionTypedFormalParameter`]. Message: `diagnostic.g.dart`
 /// `useFunctionTypeSyntaxForParameters`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "use_function_type_syntax_for_parameters",
-    group: Group::Recommended,
-    problem: "Use the generic function type syntax to declare the parameter '{0}'.",
-    correction: "Try using the generic function type syntax.",
-    kinds: &[NodeKind::FunctionTypedFormalParameter],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_function_type_syntax_for_parameters",
+    &[NodeKind::FunctionTypedFormalParameter],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

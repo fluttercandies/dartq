@@ -393,9 +393,7 @@ fn canonical_from_locator(
 ) -> Result<CanonicalDiag, String> {
     let table = line_table(source);
     if line == 0 || line as usize > table.starts.len() || col == 0 {
-        return Err(format!(
-            "diagnostic has out-of-range position {line}:{col}"
-        ));
+        return Err(format!("diagnostic has out-of-range position {line}:{col}"));
     }
     let start = table.starts[(line - 1) as usize] + (col - 1);
     let end = start
@@ -455,7 +453,11 @@ pub(crate) fn canonical_from_row(entry: &Value, source: &str) -> Result<Canonica
         "error" => 1,
         "warning" => 2,
         "info" => 3,
-        other => return Err(format!("analyze row sev `{other}` outside error|warning|info")),
+        other => {
+            return Err(format!(
+                "analyze row sev `{other}` outside error|warning|info"
+            ));
+        }
     };
     canonical_from_locator(
         &string_field("code")?,
@@ -758,7 +760,11 @@ mod tests {
             row_for(3, "warning", "Expected ';'.").key(),
             "severity drift"
         );
-        assert_ne!(base.key(), row_for(3, "error", "Other.").key(), "message drift");
+        assert_ne!(
+            base.key(),
+            row_for(3, "error", "Other.").key(),
+            "message drift"
+        );
         assert_eq!(
             base.key(),
             row_for(3, "error", "Expected ';'.").key(),

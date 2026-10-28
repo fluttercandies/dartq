@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, unused_futures};
+use super::{Check, NodeKind, RuleSpec, unused_futures};
 
 /// Official: `upstream Dart SDK source,
 /// pkg/linter/lib/src/rules/discarded_futures.dart` — a `Future`- or
@@ -26,14 +26,11 @@ use super::{Check, Group, NodeKind, RuleSpec, unused_futures};
 /// declared-return face and never reports. Message:
 /// `diagnostic.g.dart` `discardedFutures` (the `FutureOr` shape
 /// reports the paired `discarded_future_or` texts).
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "discarded_futures",
-    group: Group::Standalone,
-    problem: "'Future'-returning calls in a non-'async' function.",
-    correction: "Try either making the enclosing function 'async' and awaiting the expression or wrapping the expression in 'unawaited'.",
-    kinds: &[NodeKind::ExpressionStatement],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "discarded_futures",
+    &[NodeKind::ExpressionStatement],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     unused_futures::check(c, false);

@@ -1,0 +1,3 @@
+void f() {
+  await zz;
+}

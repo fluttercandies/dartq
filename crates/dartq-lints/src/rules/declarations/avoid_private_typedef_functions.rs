@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_private_typedef_functions.dart`
 /// — a private typedef used at most once reports at its name. Both
@@ -16,14 +16,11 @@ use super::{Check, Group, NodeKind, RuleSpec};
 /// run without the mounted face stays silent — no same-file fallback
 /// count is fabricated. Message: `diagnostic.g.dart`
 /// `avoidPrivateTypedefFunctions`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_private_typedef_functions",
-    group: Group::Standalone,
-    problem: "The typedef is unnecessary because it is only used in one place.",
-    correction: "Try inlining the type or using it in other places.",
-    kinds: &[NodeKind::Typedef],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_private_typedef_functions",
+    &[NodeKind::Typedef],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

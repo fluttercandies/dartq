@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, formal_parameter_rows, operator_name};
+use super::{Check, NodeKind, RuleSpec, formal_parameter_rows, operator_name};
 use crate::rules::class_declaration_name;
 
 /// Official: `pkg/linter/lib/src/rules/test_types_in_equals.dart:35-48`
@@ -8,14 +8,11 @@ use crate::rules::class_declaration_name;
 /// extension's `on` type source, or `unknown`). The enclosing face is
 /// `MethodDeclaration` — top-level functions never qualify. Message:
 /// `diagnostic.g.dart` `testTypesInEquals`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "test_types_in_equals",
-    group: Group::Standalone,
-    problem: "Missing type test for '{0}' in '=='.",
-    correction: "Try testing the type of '{0}'.",
-    kinds: &[NodeKind::AsExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "test_types_in_equals",
+    &[NodeKind::AsExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

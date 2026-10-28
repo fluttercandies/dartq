@@ -1,7 +1,4 @@
-use super::{
-    AUGMENT_MEMBER_BIT, Check, Group, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT,
-    formal_parameter_rows,
-};
+use super::{AUGMENT_MEMBER_BIT, Check, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, formal_parameter_rows};
 use crate::rules::{NONE_TOKEN, body_members, variables_declaration_keyword};
 use dartq_ast::mod_flags;
 
@@ -19,14 +16,11 @@ use dartq_ast::mod_flags;
 /// initializer expression against the constructor's (or the paired
 /// primary's) parameter names — a same-named non-parameter shadows
 /// toward silence (under-reports).
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_field_initializers_in_const_classes",
-    group: Group::Standalone,
-    problem: "Fields in 'const' classes should not have initializers.",
-    correction: "Try converting the field to a getter or initializing the field in the constructors.",
-    kinds: &[NodeKind::Fields, NodeKind::Initializer],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_field_initializers_in_const_classes",
+    &[NodeKind::Fields, NodeKind::Initializer],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     match c.kind(c.node()) {

@@ -12,8 +12,12 @@
 # wrong_number_of_type_arguments_method (analyzer-8.4.1 codes.g.dart:7934)
 # is not frozen -- the SDK-main oracle can never emit it.
 # undefined_annotation is the sole analyzer-8.4.1-only member retained,
-# carried as the frozen named const in the pin test
-# (m1_codes_file_matches_derivation, tests/harness/src/main.rs).
+# carried as the frozen pick in the derivation the harness pin
+# freeze_check_m1_codes (tests/harness/src/freeze.rs) runs over the
+# repo-internal analyzer registry table
+# (crates/dartq-diagnostics/data/analyzer-codes.tsv, the frozen mirror of
+# the SDK main registry); regenerate the entry block with
+#   cargo test -p harness regen_m1_codes -- --ignored
 # undefined_lint is excluded: it is an
 # analysis-options code (analyzer-8.4.1 lib/src/analysis_options/error/
 # option_codes.g.dart), not a Dart-language diagnostic. Trigger conditions:

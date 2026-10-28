@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, slice};
+use super::{Check, NodeKind, RuleSpec, slice};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_function_literals_in_foreach_calls.dart:31-105`
 /// — `x.forEach((e) { … })` reports at the method name.
@@ -16,14 +16,11 @@ use super::{Check, Group, NodeKind, RuleSpec, slice};
 /// marker word plus any null-aware access over the receiver run — the
 /// access-chain lookups farther out under-report on exotic chains.
 /// Message: `diagnostic.g.dart` `avoidFunctionLiteralsInForeachCalls`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_function_literals_in_foreach_calls",
-    group: Group::Recommended,
-    problem: "Function literals shouldn't be passed to 'forEach'.",
-    correction: "Try using a 'for' loop.",
-    kinds: &[NodeKind::Send],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_function_literals_in_foreach_calls",
+    &[NodeKind::Send],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let Some((kids, pos)) = slice::owner_slice(c) else {

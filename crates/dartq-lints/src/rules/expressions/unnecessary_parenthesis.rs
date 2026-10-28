@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 use crate::rules::{first_child, slice};
 
 /// The source-head row of the paren's inner expression (the outermost
@@ -66,14 +66,11 @@ fn inner_head(c: &Check<'_>, node: u32) -> Option<NodeKind> {
 /// subclass receiver misses a superclass-on-type extension. The
 /// null-aware-index-in-then-arm bail (:144-157) is not read.
 /// Message: `diagnostic.g.dart` `unnecessaryParenthesis`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_parenthesis",
-    group: Group::Standalone,
-    problem: "Unnecessary use of parentheses.",
-    correction: "Try removing the parentheses.",
-    kinds: &[NodeKind::ParenthesizedExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_parenthesis",
+    &[NodeKind::ParenthesizedExpression],
     check,
-};
+);
 
 #[expect(
     clippy::too_many_lines,

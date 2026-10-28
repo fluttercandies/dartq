@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice};
+use super::{Check, NodeKind, RuleSpec, query_site, slice};
 use crate::rules::{NONE_TOKEN, get_set_token, variables_declaration_keyword};
 use dartq_semantic::model::{ArgListId, Formal, Formals, Ty};
 use dartq_semantic::{Analysis, FnSig};
@@ -118,14 +118,11 @@ use dartq_semantic::{Analysis, FnSig};
 /// the context-inferred lambda type makes the tear-off stand (the
 /// #2095 lane's live probes on 3.13.1; #2109's resolved-callee
 /// channel). Message: `diagnostic.g.dart` `unnecessaryLambdas`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_lambdas",
-    group: Group::Standalone,
-    problem: "Closure should be a tearoff.",
-    correction: "Try using a tearoff rather than a closure.",
-    kinds: &[NodeKind::FunctionExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_lambdas",
+    &[NodeKind::FunctionExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the assignability gate (:208, :246) reads the

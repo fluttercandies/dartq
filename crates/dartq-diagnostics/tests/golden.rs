@@ -845,11 +845,47 @@ fn code_registry_looks_up_official_and_dartq_codes() {
         assert_eq!(code.machine, code.name.to_uppercase());
         count += 1;
     }
-    // 277 builtin codes: the R780 parity wave, the #1797 dialect extension's
-    // two dartq-own rows (`dartq/package_config_invalid`,
-    // `dartq/source_rejected`), plus `refutable_pattern_in_irrefutable_context`
-    // (276 + 1; an official compile-time code in the upstream Dart SDK
-    // registry, added with the parser's refutable-pattern reporting); the
-    // live iteration above is the authority.
-    assert_eq!(count, 277);
+    // The count is derived, never hand-copied: OFFICIAL_CODES comes from
+    // the generated registry table (tools/upstream-gen's
+    // analyzer-codes-gen + data/analyzer-codes.tsv and the
+    // oracle-locked syntax tier), and the own namespace is enumerated
+    // from the live registry — the complement of the official set.
+    assert_eq!(
+        count,
+        dartq_diagnostics::OFFICIAL_CODES.len() + own_codes(&registry).len()
+    );
+    assert_eq!(
+        own_codes(&registry),
+        [
+            "dartq/internal_error",
+            "dartq/memory_degraded",
+            "dartq/missing_generated_source",
+            "dartq/package_config_invalid",
+            "dartq/package_config_missing",
+            "dartq/package_config_out_of_date",
+            "dartq/plugin_crashed",
+            "dartq/plugin_timeout",
+            "dartq/source_rejected",
+            "prefer_single_quotes",
+        ]
+    );
+}
+
+/// The registry rows outside the official table, name-sorted — the
+/// hand-written own set: the dartq namespace plus the one lint (lint
+/// codes never enter the analyzer registry, so `prefer_single_quotes`
+/// cannot come from the generated table; the lint face's own generator
+/// is #2676).
+fn own_codes(registry: &dartq_diagnostics::CodeRegistry) -> Vec<&'static str> {
+    let official: std::collections::BTreeSet<&str> = dartq_diagnostics::OFFICIAL_CODES
+        .iter()
+        .map(|code| code.name)
+        .collect();
+    let mut own: Vec<&str> = registry
+        .iter()
+        .map(|code| code.name)
+        .filter(|name| !official.contains(name))
+        .collect();
+    own.sort_unstable();
+    own
 }

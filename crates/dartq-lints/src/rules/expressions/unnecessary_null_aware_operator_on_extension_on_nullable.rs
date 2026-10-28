@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
 use crate::rules::{MemberQuery, body_members, type_face, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -24,14 +24,11 @@ use crate::rules::{MemberQuery, body_members, type_face, utf16_token_span};
 /// cross-library extensions stay silent, as does a receiver whose
 /// static type does not resolve. Message: `diagnostic.g.dart`
 /// `unnecessaryNullAwareOperatorOnExtensionOnNullable`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_null_aware_operator_on_extension_on_nullable",
-    group: Group::Standalone,
-    problem: "Unnecessary use of a null-aware operator to invoke an extension method on a nullable type.",
-    correction: "Try removing the '?'.",
-    kinds: &[NodeKind::Send, NodeKind::DotAccess],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_null_aware_operator_on_extension_on_nullable",
+    &[NodeKind::Send, NodeKind::DotAccess],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let Some(analysis) = c.semantics() else {

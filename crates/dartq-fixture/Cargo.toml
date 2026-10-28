@@ -1,0 +1,17 @@
+[package]
+name = "dartq-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Behavioral lint-test fixture DSL: markup annotation extraction over the production lint pipeline, plus the upstream linter-test converter."
+repository.workspace = true
+categories = ["development-tools"]
+keywords = ["dart", "linter", "testing", "fixtures"]
+
+[dependencies]
+dartq-lints = { workspace = true, features = ["test-support"] }
+dartq-source = { workspace = true }
+
+[lints]
+workspace = true

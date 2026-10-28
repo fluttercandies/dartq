@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice};
+use super::{Check, NodeKind, RuleSpec, query_site, slice};
 use crate::rules::{type_face, utf16_token_span};
 
 /// `NodeHeader.flags` modifier-mask bit for the class-family
@@ -32,14 +32,11 @@ const CLASS_ABSTRACT_BIT: u16 = 1 << 2;
 /// reads the same-file declarations only, so core and cross-file
 /// `on` types skip. Message: `diagnostic.g.dart`
 /// `noRuntimetypeTostring`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "no_runtimetype_tostring",
-    group: Group::Standalone,
-    problem: "Using 'toString' on a 'Type' is not safe in production code.",
-    correction: "Try removing the usage of 'toString' or restructuring the code.",
-    kinds: &[NodeKind::Send],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "no_runtimetype_tostring",
+    &[NodeKind::Send],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

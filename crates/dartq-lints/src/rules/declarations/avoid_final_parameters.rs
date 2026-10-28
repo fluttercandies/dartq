@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_final_parameters.dart:41-84`
 /// — a parameter marked `final` reports at the keyword, except:
@@ -16,17 +16,14 @@ use super::{Check, Group, NodeKind, RuleSpec};
 /// function-typed child. The `final` keyword is recovered from the
 /// `ModSet` head (`VAR_FINAL_OR_CONST` bit, bridge `mod_bits`) by a
 /// bounded scan past `required` / `covariant`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_final_parameters",
-    group: Group::Standalone,
-    problem: "Parameters should not be marked as 'final'.",
-    correction: "Try removing the keyword 'final'.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_final_parameters",
+    &[
         NodeKind::FormalParameters,
         NodeKind::OptionalFormalParameters,
     ],
     check,
-};
+);
 
 /// The `varFinalOrConst` `ModSet` bit (bridge `mod_bits`).
 const VAR_FINAL_OR_CONST_BIT: u16 = 1 << 6;

@@ -1,6 +1,6 @@
 use dartq_semantic::model::{ArgListId, Ty};
 
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice};
+use super::{Check, NodeKind, RuleSpec, query_site, slice};
 
 const DART_IS_JS_PROBLEM: &str = "Runtime check between '{0}' and '{1}' checks whether a Dart value is a JS interop type, which might not be platform-consistent.";
 const DART_IS_JS_CORRECTION: &str =
@@ -30,14 +30,11 @@ const DART_AS_JS_CORRECTION: &str = "Try using conversion methods from 'dart:js_
 /// type)` (:400-437). The catch-clause face and the js-side variants
 /// stay silent. Message: `diagnostic.g.dart`
 /// `invalidRuntimeCheckWithJsInteropTypesDart{Is,As}Js`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "invalid_runtime_check_with_js_interop_types",
-    group: Group::Recommended,
-    problem: DART_IS_JS_PROBLEM,
-    correction: DART_IS_JS_CORRECTION,
-    kinds: &[NodeKind::IsExpression, NodeKind::AsExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "invalid_runtime_check_with_js_interop_types",
+    &[NodeKind::IsExpression, NodeKind::AsExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

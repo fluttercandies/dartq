@@ -1,5 +1,5 @@
 use super::{Check, NodeKind};
-use crate::registry::{Group, RuleSpec};
+use crate::registry::RuleSpec;
 use crate::rules::not_dispatched;
 
 /// Official: `pkg/linter/lib/src/rules/remove_deprecations_in_breaking_version.dart`
@@ -19,14 +19,11 @@ use crate::rules::not_dispatched;
 /// into `STRUCTURALLY_SILENT` (`tests/registry_pin.rs`) beside the
 /// freeze regen. Message: `diagnostic.g.dart`
 /// `removeDeprecationsInBreakingVersions`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "remove_deprecations_in_breaking_versions",
-    group: Group::Standalone,
-    problem: "Remove deprecated elements in breaking versions.",
-    correction: "Try removing the deprecated element.",
-    kinds: &[],
-    check: not_dispatched,
-};
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "remove_deprecations_in_breaking_versions",
+    &[],
+    not_dispatched,
+);
 
 /// The official `isBreakingVersion` (:22-26) over the pubspec
 /// `version:` value: the build metadata must be absent (a prerelease

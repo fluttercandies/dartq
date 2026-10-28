@@ -1,10 +1,5 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, annotation_names, container_members, fields_declare,
-    member_declaration_name,
-};
-use crate::rules::{
-    MemberQuery, member_annotations, member_matches, same_file_ancestors, utf16_token_span,
-};
+use super::{Check, NodeKind, RuleSpec, annotation_names, container_members, fields_declare, member_declaration_name};
+use crate::rules::{MemberQuery, member_annotations, member_matches, same_file_ancestors, utf16_token_span};
 
 const STATIC_BIT: u16 = 1 << 3;
 
@@ -27,14 +22,11 @@ const OBJECT_MEMBERS: [&str; 5] = ["==", "hashCode", "noSuchMethod", "runtimeTyp
 /// in the interface and never answers, matching the resolved face).
 /// A supertype name that leaves the file under-reports. Message:
 /// `diagnostic.g.dart` `annotateRedeclares`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "annotate_redeclares",
-    group: Group::Standalone,
-    problem: "The member '{0}' is redeclaring but isn't annotated with '@redeclare'.",
-    correction: "Try adding the '@redeclare' annotation.",
-    kinds: &[NodeKind::Method],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "annotate_redeclares",
+    &[NodeKind::Method],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

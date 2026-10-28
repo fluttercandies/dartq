@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
 use crate::rules::utf16_token_span;
 
 /// Official: `upstream Dart SDK source,
@@ -24,14 +24,11 @@ use crate::rules::utf16_token_span;
 /// a cross-library `Future` alias reads by its written name
 /// (over-report, the alias family). Message: `diagnostic.g.dart`
 /// `unnecessaryUnawaited`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_unawaited",
-    group: Group::Standalone,
-    problem: "Unnecessary use of 'unawaited'.",
-    correction: "Try removing the use of 'unawaited', as the unawaited element is annotated with '@awaitNotRequired'.",
-    kinds: &[NodeKind::Send],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_unawaited",
+    &[NodeKind::Send],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

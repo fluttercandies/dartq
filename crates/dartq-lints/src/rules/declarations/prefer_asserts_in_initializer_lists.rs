@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, formal_parameter_rows, modifier_keyword};
+use super::{Check, NodeKind, RuleSpec, formal_parameter_rows, modifier_keyword};
 use crate::rules::last_child;
 
 /// Official:
@@ -20,14 +20,11 @@ use crate::rules::last_child;
 /// and top-level references all silence the assert here; the
 /// class/super-chain membership face (:72-80/:103-125) folds into the
 /// same direction.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_asserts_in_initializer_lists",
-    group: Group::Standalone,
-    problem: "Assert should be in the initializer list.",
-    correction: "Try moving the assert to the initializer list.",
-    kinds: &[NodeKind::Constructor, NodeKind::PrimaryConstructorBody],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_asserts_in_initializer_lists",
+    &[NodeKind::Constructor, NodeKind::PrimaryConstructorBody],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

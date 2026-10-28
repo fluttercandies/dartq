@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, async_words, within_try_block};
+use super::{Check, NodeKind, RuleSpec, async_words, within_try_block};
 use crate::rules::{NONE_TOKEN, last_child};
 
 /// Official: `pkg/linter/lib/src/rules/async_return_with_no_await.dart`
@@ -19,14 +19,11 @@ use crate::rules::{NONE_TOKEN, last_child};
 /// (:49-53). Closures have no written return type here and
 /// under-report. Message: `diagnostic.g.dart`
 /// `asyncReturnWithNoAwait`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "async_return_with_no_await",
-    group: Group::Standalone,
-    problem: "Returning a 'Future' without 'await'.",
-    correction: "Try adding an 'await' or making the body non-async.",
-    kinds: &[NodeKind::ReturnStatement, NodeKind::ExpressionBody],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "async_return_with_no_await",
+    &[NodeKind::ReturnStatement, NodeKind::ExpressionBody],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     match c.kind(c.node()) {

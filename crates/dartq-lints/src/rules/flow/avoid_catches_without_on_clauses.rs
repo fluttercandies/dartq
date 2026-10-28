@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, last_child};
+use super::{Check, NodeKind, RuleSpec, last_child};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_catches_without_on_clauses.dart:30-104`
 /// — a bare `catch` clause (no `on`) reports at the `catch` keyword
@@ -20,14 +20,11 @@ use super::{Check, Group, NodeKind, RuleSpec, last_child};
 /// or a case pattern variable of the same lexeme re-binds every lexeme
 /// inside its extent, so those reads are the binder's, never the caught
 /// exception's.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_catches_without_on_clauses",
-    group: Group::Standalone,
-    problem: "Catch clause should use 'on' to specify the type of exception being caught.",
-    correction: "Try adding an 'on' clause before the 'catch'.",
-    kinds: &[NodeKind::CatchClause],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_catches_without_on_clauses",
+    &[NodeKind::CatchClause],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

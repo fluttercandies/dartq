@@ -14,7 +14,7 @@
 use dartq_ast::NodeKind;
 
 use crate::engine::Check;
-use crate::registry::{Group, RuleSpec};
+use crate::registry::RuleSpec;
 use crate::rules::TypeFace;
 use crate::rules::slice;
 
@@ -354,7 +354,7 @@ fn first_argument_list_literal(c: &Check<'_>, args: u32) -> bool {
 }
 
 pub(crate) mod prefer_inlined_adds {
-    use super::{Check, Group, NodeKind, RuleSpec, cascaded_add, first_argument_list_literal};
+    use super::{Check, NodeKind, RuleSpec, cascaded_add, first_argument_list_literal};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_inlined_adds.dart:22-58` —
     /// the first cascaded `add`/`addAll` on a list literal with one argument
@@ -362,14 +362,11 @@ pub(crate) mod prefer_inlined_adds {
     /// template (only when its argument is a list literal — a spread argument
     /// belongs to `prefer_spread_collections`, :53-55). Message templates:
     /// `diagnostic.g.dart` `preferInlinedAddsMultiple`/`preferInlinedAddsSingle`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_inlined_adds",
-        group: Group::Recommended,
-        problem: "The addition of multiple list items could be inlined.",
-        correction: "Try adding the items to the list literal directly.",
-        kinds: &[NodeKind::Send],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_inlined_adds",
+    &[NodeKind::Send],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let Some((method, args)) = cascaded_add(c, "add").or_else(|| cascaded_add(c, "addAll"))
@@ -402,24 +399,18 @@ pub(crate) mod prefer_inlined_adds {
 }
 
 pub(crate) mod prefer_spread_collections {
-    use super::{
-        Check, Group, NodeKind, RuleSpec, cascaded_add, first_argument_list_literal,
-        in_const_context,
-    };
+    use super::{Check, NodeKind, RuleSpec, cascaded_add, first_argument_list_literal, in_const_context};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_spread_collections.dart:22-55`
     /// — the first cascaded `addAll` on a non-constant list literal whose
     /// single argument is NOT a list literal (that form is
     /// `prefer_inlined_adds`'s) reports at the method name. Message:
     /// `diagnostic.g.dart` `preferSpreadCollections`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_spread_collections",
-        group: Group::Recommended,
-        problem: "The addition of multiple elements could be inlined.",
-        correction: "Try using the spread operator ('...') to inline the addition.",
-        kinds: &[NodeKind::Send],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_spread_collections",
+    &[NodeKind::Send],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let Some((method, args)) = cascaded_add(c, "addAll") else {
@@ -440,7 +431,7 @@ pub(crate) mod prefer_spread_collections {
 }
 
 pub(crate) mod prefer_collection_literals {
-    use super::{Check, Group, NodeKind, RuleSpec, slice};
+    use super::{Check, NodeKind, RuleSpec, slice};
     use crate::rules::expressions::same_file;
 
     const PROBLEM: &str = "Unnecessary constructor invocation.";
@@ -468,18 +459,15 @@ pub(crate) mod prefer_collection_literals {
     /// argument position bails — the context type is not derivable there
     /// (the conservative family). Prefixed callees (`core.Map()`) never
     /// match. Message: `diagnostic.g.dart` `preferCollectionLiterals`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_collection_literals",
-        group: Group::Recommended,
-        problem: PROBLEM,
-        correction: CORRECTION,
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_collection_literals",
+    &[
             NodeKind::Send,
             NodeKind::NewExpression,
             NodeKind::ImplicitCreation,
         ],
-        check,
-    };
+    check,
+);
 
     /// The unnamed faces (`isMap` :99-100, `isHashMap` :28-32, `isSet`,
     /// `isHashSet`): the written names whose static type is the pinned core
@@ -730,7 +718,7 @@ pub(crate) mod prefer_collection_literals {
 }
 
 pub(crate) mod unnecessary_to_list_in_spreads {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/unnecessary_to_list_in_spreads.dart:37-47`
     /// — a spread of `x.toList()` reports at the method name.
@@ -751,14 +739,11 @@ pub(crate) mod unnecessary_to_list_in_spreads {
     /// `...` token and the operand tiles flat beside it — receiver,
     /// selector, arguments, then the `Send` leaf and the trailing access
     /// marker (the production send tiling `send_parts` reads).
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "unnecessary_to_list_in_spreads",
-        group: Group::Recommended,
-        problem: "Unnecessary use of 'toList' in a spread.",
-        correction: "Try removing the invocation of 'toList'.",
-        kinds: &[NodeKind::Spread],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_to_list_in_spreads",
+    &[NodeKind::Spread],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -906,7 +891,7 @@ pub(crate) mod unnecessary_to_list_in_spreads {
 }
 
 pub(crate) mod prefer_iterable_where_type {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
     use crate::rules::{NONE_TOKEN, slice};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_iterable_whereType.dart:31-83`
@@ -927,14 +912,11 @@ pub(crate) mod prefer_iterable_where_type {
     /// unparenthesized expression is `e is T` (no `is!`) with the
     /// parameter as the tested expression. Message: `diagnostic.g.dart`
     /// `preferIterableWheretype`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_iterable_wheretype",
-        group: Group::Core,
-        problem: "Use 'whereType' to filter elements by type.",
-        correction: "Try using 'whereType' rather than 'where'.",
-        kinds: &[NodeKind::Send],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_iterable_wheretype",
+    &[NodeKind::Send],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let Some((kids, pos)) = slice::owner_slice(c) else {
@@ -1133,7 +1115,7 @@ pub(crate) mod prefer_iterable_where_type {
 }
 
 pub(crate) mod prefer_for_elements_to_map_from_iterable {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
     use crate::rules::{first_child, slice};
 
     /// Official: `pkg/linter/lib/src/rules/prefer_for_elements_to_map_fromIterable.dart:31-90`
@@ -1154,14 +1136,11 @@ pub(crate) mod prefer_for_elements_to_map_from_iterable {
     /// required, an optional/named group only when its member carries the
     /// `required` keyword — and a single expression body (or one return).
     /// Message: `diagnostic.g.dart` `preferForElementsToMapFromiterable`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_for_elements_to_map_fromiterable",
-        group: Group::Recommended,
-        problem: "Use 'for' elements when building maps from iterables.",
-        correction: "Try using a collection literal with a 'for' element.",
-        kinds: &[NodeKind::Send, NodeKind::ImplicitCreation],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_for_elements_to_map_fromiterable",
+    &[NodeKind::Send, NodeKind::ImplicitCreation],
+    check,
+);
 
     /// The `required` modifier bit of a `FormalParameter` row (bridge
     /// `mod_bits`; the parser lane owns the values).
@@ -1413,7 +1392,7 @@ pub(crate) mod prefer_for_elements_to_map_from_iterable {
 }
 
 pub(crate) mod collection_methods_unrelated_type {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
     use crate::rules::{TypeFace, slice, type_face_of_field, written_type_face};
 
     /// Official: `pkg/linter/lib/src/rules/collection_methods_unrelated_type.dart`
@@ -1483,14 +1462,11 @@ pub(crate) mod collection_methods_unrelated_type {
     /// the inferred element type of an untyped literal (the official's
     /// inference, `[]`'s `dynamic` included). Message:
     /// `diagnostic.g.dart` `collectionMethodsUnrelatedType`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "collection_methods_unrelated_type",
-        group: Group::Core,
-        problem: "The argument type '{0}' isn't related to '{1}'.",
-        correction: "Try changing the argument or element type to match.",
-        kinds: &[NodeKind::Send, NodeKind::Indexed],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "collection_methods_unrelated_type",
+    &[NodeKind::Send, NodeKind::Indexed],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         if c.kind(c.node()) == NodeKind::Indexed {
@@ -1932,7 +1908,7 @@ pub(crate) mod prefer_foreach {
     use dartq_ast::NodeKind;
 
     use crate::engine::Check;
-    use crate::registry::{Group, RuleSpec};
+    use crate::registry::RuleSpec;
     use crate::rules::slice;
     use crate::rules::{initialized_identifier_name, is_statement_row};
 
@@ -1965,15 +1941,11 @@ pub(crate) mod prefer_foreach {
     /// loop variable is that inner binder's own declaration — the extent
     /// carve-out reads its inner parameter list too. Message:
     /// `diagnostic.g.dart` `preferForeach`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_foreach",
-        group: Group::Standalone,
-        problem: "Use 'forEach' and a tear-off rather than a 'for' loop to apply \
-                  a function to every element.",
-        correction: "Try using 'forEach' and a tear-off rather than a 'for' loop.",
-        kinds: &[NodeKind::Send],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_foreach",
+    &[NodeKind::Send],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         // The body walk inverted: the statement-level invocation climbs to
@@ -2313,10 +2285,7 @@ mod tests {
 
     use dartq_language::{FeatureSet, LanguageVersion};
     use dartq_parser::ParserFeatures;
-    use dartq_resolution::{
-        Combinators, ImportEdge, LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder,
-        Namespaces,
-    };
+    use dartq_resolution::{Combinators, ImportEdge, LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces};
     use dartq_semantic::{ElementIndex, MicroKind, StrictModes, analyze_unit, collect};
     use dartq_source::{FileTable, StringTable};
 
@@ -2717,7 +2686,7 @@ mod tests {
         assert_eq!(lints.len(), 1);
         assert_eq!(
             lints[0].message,
-            "Use 'whereType' to filter elements by type."
+            "Use 'whereType' to select elements of a given type."
         );
         let name = tok(&f.source, &f.tokens, "where", 0);
         assert_eq!(lints[0].range.start, utf16_at(&f, name));
@@ -3525,7 +3494,7 @@ void f(x) {
 }
 
 pub(crate) mod prefer_if_elements_to_conditional_expressions {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/prefer_if_elements_to_conditional_expressions.dart`
@@ -3545,14 +3514,11 @@ pub(crate) mod prefer_if_elements_to_conditional_expressions {
     /// simple element's colon decides) in place of the resolver-computed
     /// `isSet`: the two agree on every valid literal, and diverge only on
     /// mixed entry/element literals, which are compile-time errors.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_if_elements_to_conditional_expressions",
-        group: Group::Standalone,
-        problem: "Use an 'if' element to conditionally add elements.",
-        correction: "Try using an 'if' element rather than a conditional expression.",
-        kinds: &[NodeKind::Conditional],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_if_elements_to_conditional_expressions",
+    &[NodeKind::Conditional],
+    check,
+);
 
     /// The innermost row strictly containing `row`'s span: post-order places
     /// enclosing rows after their contents, so the first later row whose
@@ -3788,7 +3754,7 @@ pub(crate) mod prefer_if_elements_to_conditional_expressions {
 pub(crate) mod use_null_aware_elements {
     use dartq_ast::NodeKind;
 
-    use super::{Check, Group, RuleSpec, slice};
+    use super::{Check, RuleSpec, slice};
     use crate::rules::{MemberQuery, utf16_token_span};
 
     /// Official: `upstream Dart SDK source,
@@ -3824,14 +3790,11 @@ pub(crate) mod use_null_aware_elements {
     /// b!]; }`) under-reports: resolving `a`'s type to C's member needs
     /// element identity the name-level face does not carry.
     /// Message: `diagnostic.g.dart` `useNullAwareElements`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "use_null_aware_elements",
-        group: Group::Standalone,
-        problem: "Use the null-aware marker '?' rather than a null check via an 'if'.",
-        correction: "Try using '?'.",
-        kinds: &[NodeKind::IfControlFlow],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_null_aware_elements",
+    &[NodeKind::IfControlFlow],
+    check,
+);
 
     /// The then-form the target's resolution demands.
     #[derive(Clone, Copy)]
@@ -4551,12 +4514,9 @@ pub(crate) mod use_null_aware_elements {
 }
 
 pub(crate) mod prefer_const_literals_to_create_immutables {
-    use super::{Check, Group, NodeKind, RuleSpec, slice};
+    use super::{Check, NodeKind, RuleSpec, slice};
     use crate::rules::declarations::{annotation_names, top_level_annotations};
-    use crate::rules::{
-        SupertypeClause, const_ability, const_keyword, in_const_context, same_file_declaration,
-        supertypes,
-    };
+    use crate::rules::{SupertypeClause, const_ability, const_keyword, in_const_context, same_file_declaration, supertypes};
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/prefer_const_literals_to_create_immutables.dart`
@@ -4588,14 +4548,11 @@ pub(crate) mod prefer_const_literals_to_create_immutables {
     /// silent (the live oracle's own face over a differential corpus).
     /// `canBeConst` is the syntactic `const_ability` face. Message:
     /// `diagnostic.g.dart` `preferConstLiteralsToCreateImmutables`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_const_literals_to_create_immutables",
-        group: Group::Standalone,
-        problem: "Use 'const' literals as arguments to constructors of '@immutable' classes.",
-        correction: "Try adding 'const' before the literal.",
-        kinds: &[NodeKind::ListLiteral, NodeKind::SetOrMapLiteral],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_const_literals_to_create_immutables",
+    &[NodeKind::ListLiteral, NodeKind::SetOrMapLiteral],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();

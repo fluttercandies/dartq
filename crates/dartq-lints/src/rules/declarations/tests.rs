@@ -796,7 +796,10 @@ fn hash_and_equals_reports_missing_hash_code() {
         lints[0].correction,
         Some("Try overriding 'hashCode' or removing '=='.".to_owned())
     );
+    // Upstream `reportAtToken(name)` spans the operator
+    // (`test_equalsEquals_noHashCode` marks `[!==!]`).
     assert_eq!(lints[0].range.start, utf16_at(&f, 5));
+    assert_eq!(lints[0].range.end, utf16_at(&f, 5) + 2);
 }
 
 /// `test_onlyHashCode` — the getter form reports at the name.
@@ -841,7 +844,10 @@ fn hash_and_equals_reports_missing_equals() {
         lints[0].message,
         "Missing a corresponding override of '=='."
     );
+    // The name spans whole (`test_hashCode_noEqualsEquals` marks
+    // `[!hashCode!]`).
     assert_eq!(lints[0].range.start, utf16_at(&f, 5));
+    assert_eq!(lints[0].range.end, utf16_at(&f, 5) + 8);
 }
 
 /// `test_onlyGetHashCodeDeclaration` — the field form reports at the

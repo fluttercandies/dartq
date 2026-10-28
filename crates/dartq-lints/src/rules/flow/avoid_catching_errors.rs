@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{Check, Group, RuleSpec};
+use super::{Check, RuleSpec};
 
 /// The dart:core `Error` family by name (sdk/lib/core/errors.dart):
 /// `Error` itself plus its public subtypes. The official asks the
@@ -42,14 +42,11 @@ const CORRECTION: &str = "Try removing the catch or catching an 'Exception' inst
 /// without implementing `Error` (pinned by test). Message:
 /// `diagnostic.g.dart` `avoidCatchingErrorsClass` /
 /// `avoidCatchingErrorsSubclass`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_catching_errors",
-    group: Group::Standalone,
-    problem: CLASS_PROBLEM,
-    correction: CORRECTION,
-    kinds: &[NodeKind::CatchClause],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_catching_errors",
+    &[NodeKind::CatchClause],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

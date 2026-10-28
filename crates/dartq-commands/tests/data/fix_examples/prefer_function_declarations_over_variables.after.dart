@@ -1,0 +1,1 @@
+void f(a) { print(a); }

@@ -1,9 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{
-    Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces,
-    value_run_end,
-};
+use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces, value_run_end};
 use crate::rules::utf16_token_span;
 
 /// Official: `upstream Dart SDK source,
@@ -32,12 +29,9 @@ use crate::rules::utf16_token_span;
 /// read-row face), and a member invocation on an unresolvable
 /// receiver keeps only the head-read verdict. Message:
 /// `diagnostic.g.dart` `avoidDynamicCalls`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_dynamic_calls",
-    group: Group::Standalone,
-    problem: "Method invocation or property access on a 'dynamic' target.",
-    correction: "Try giving the target a type.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_dynamic_calls",
+    &[
         NodeKind::Assignment,
         NodeKind::BinaryExpression,
         NodeKind::Send,
@@ -46,7 +40,7 @@ pub(crate) static SPEC: RuleSpec = RuleSpec {
         NodeKind::UnaryPostfix,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

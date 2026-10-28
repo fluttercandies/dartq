@@ -1,7 +1,4 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, container_members, is_deprecated_metadata, narrow_u32,
-    top_level_annotations,
-};
+use super::{Check, NodeKind, RuleSpec, container_members, is_deprecated_metadata, narrow_u32, top_level_annotations};
 use crate::rules::initialized_identifier_name;
 use std::path::{Path, PathBuf};
 
@@ -48,14 +45,11 @@ use std::path::{Path, PathBuf};
 /// Messages: `diagnostic.g.dart`
 /// `deprecatedMemberUseFromSamePackageWithMessage` and
 /// `…WithoutMessage`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "deprecated_member_use_from_same_package",
-    group: Group::Standalone,
-    problem: "'{0}' is deprecated and shouldn't be used.",
-    correction: "Try replacing the use of the deprecated member with the replacement, if a replacement is specified.",
-    kinds: &[NodeKind::CompilationUnit],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "deprecated_member_use_from_same_package",
+    &[NodeKind::CompilationUnit],
     check,
-};
+);
 
 const WITH_MESSAGE: &str = "'{0}' is deprecated and shouldn't be used. {1}";
 const WITHOUT_MESSAGE: &str = "'{0}' is deprecated and shouldn't be used.";

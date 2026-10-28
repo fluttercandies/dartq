@@ -1,0 +1,1 @@
+external enum E {}

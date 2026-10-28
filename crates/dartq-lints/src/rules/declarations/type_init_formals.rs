@@ -1,4 +1,4 @@
-use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec};
+use super::{Check, NONE_TOKEN, NodeKind, RuleSpec};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/type_init_formals.dart:37-64`
 /// — an initializing formal (`this.x` / `super.x`) written with a type
@@ -26,14 +26,11 @@ use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec};
 /// lexical report — the valid-code parity posture. `this.x`/`super.x`
 /// is the `FormalParameter` `receiver` payload word. Message:
 /// `diagnostic.g.dart` `typeInitFormals`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "type_init_formals",
-    group: Group::Recommended,
-    problem: "Don't needlessly type annotate initializing formals.",
-    correction: "Try removing the type.",
-    kinds: &[NodeKind::FormalParameter],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "type_init_formals",
+    &[NodeKind::FormalParameter],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

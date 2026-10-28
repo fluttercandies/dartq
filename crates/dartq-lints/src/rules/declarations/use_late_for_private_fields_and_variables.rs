@@ -1,7 +1,4 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, container_members, ctor_header_has_const,
-    fields_written_type, is_identifier_token, range_has_const,
-};
+use super::{Check, NodeKind, RuleSpec, container_members, ctor_header_has_const, fields_written_type, is_identifier_token, range_has_const};
 use crate::rules::{initialized_identifier_name, utf16_token_span};
 
 const STATIC_FIELD: u32 = dartq_parser::MemberKind::StaticField as u32;
@@ -27,14 +24,11 @@ const STATIC_FIELD: u32 = dartq_parser::MemberKind::StaticField as u32;
 /// const-constructor skip reads the member headers and the class
 /// header's `const` face. Message: `diagnostic.g.dart`
 /// `useLateForPrivateFieldsAndVariables`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "use_late_for_private_fields_and_variables",
-    group: Group::Standalone,
-    problem: "Use 'late' for private members with a non-nullable type.",
-    correction: "Try adding the 'late' modifier.",
-    kinds: &[NodeKind::Fields, NodeKind::TopLevelFields],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_late_for_private_fields_and_variables",
+    &[NodeKind::Fields, NodeKind::TopLevelFields],
     check,
-};
+);
 
 #[expect(
     clippy::too_many_lines,

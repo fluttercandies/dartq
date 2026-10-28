@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/empty_container_bodies.dart` —
 /// an empty `{}` class body reports its brace pair with the container
@@ -16,14 +16,11 @@ use super::{Check, Group, NodeKind, RuleSpec};
 /// dartq [`NodeKind::EnumBody`] is a different row kind, so it never
 /// fires here. Message: `diagnostic.g.dart` `emptyContainerBodies`
 /// (the `{0}` slot takes the container kind).
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "empty_container_bodies",
-    group: Group::Standalone,
-    problem: "Empty {0} bodies should be written using a ';' rather than '{}'.",
-    correction: "Try replacing the {0} body with ';'.",
-    kinds: &[NodeKind::DeclarationBody],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "empty_container_bodies",
+    &[NodeKind::DeclarationBody],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     if !c.unit.features.primary_constructors {

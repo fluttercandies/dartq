@@ -33,6 +33,15 @@
 # gate, so the list below is the full implemented set — one code per
 # fixture, no parked remainder.
 #
+# Both legs of the freeze are pinned: the registry leg
+# (m3_unused_codes_freeze_matches_the_usage_registry,
+# crates/dartq-semantic) against the implemented usage family, and the
+# fixture leg (freeze_check_m3_unused_codes, tests/harness/src/freeze.rs)
+# against the targeted fixture stems above (companion files carry the
+# `_other` suffix and are not codes). Either drift fails its pin; the
+# canonical re-freeze entry point is the registry-side regen
+#   cargo test -p dartq-semantic --test m3_codes_pin regen_m3_unused_codes -- --ignored
+#
 unused_catch_clause
 unused_catch_stack
 unused_element

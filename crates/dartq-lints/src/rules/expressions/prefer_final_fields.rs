@@ -1,7 +1,5 @@
-use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
-use crate::rules::{
-    MemberQuery, NONE_TOKEN, body_members, member_matches, same_file_ancestors,
-};
+use super::{Check, NodeKind, RuleSpec, same_file, slice};
+use crate::rules::{MemberQuery, NONE_TOKEN, body_members, member_matches, same_file_ancestors};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_final_fields.dart` — a
 /// private non-`final` field never mutated reports when it is
@@ -41,14 +39,11 @@ use crate::rules::{
 /// - The cross-unit half of the official library scan
 ///   (`_fieldsFromParameters` — primary-constructor declaring formals,
 ///   :114-131) is out of the substrate and under-reports.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_final_fields",
-    group: Group::Recommended,
-    problem: "The private field {0} could be 'final'.",
-    correction: "Try making the field 'final'.",
-    kinds: &[NodeKind::CompilationUnit],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_final_fields",
+    &[NodeKind::CompilationUnit],
     check,
-};
+);
 
 /// One candidate: the declaration node, its name, whether the
 /// declaration carries an initializer, and the enclosing class row (the

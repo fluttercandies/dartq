@@ -1,6 +1,6 @@
 use dartq_semantic::{BindingKind, model::Ty};
 
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
 use crate::rules::{body_members, type_face};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_int_literals.dart`
@@ -34,14 +34,11 @@ use crate::rules::{body_members, type_face};
 /// (`void g<T>(T x)` — the written `T` is not `double`) resolve to
 /// nothing and stay silent. Message: `diagnostic.g.dart`
 /// `preferIntLiterals`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_int_literals",
-    group: Group::Standalone,
-    problem: "Unnecessary use of a 'double' literal.",
-    correction: "Try using an 'int' literal.",
-    kinds: &[NodeKind::LiteralDouble],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_int_literals",
+    &[NodeKind::LiteralDouble],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

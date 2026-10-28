@@ -1,9 +1,6 @@
 use dartq_semantic::model::{ArgListId, Ty};
 
-use super::{
-    Check, Group, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces,
-    value_run_end,
-};
+use super::{Check, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces, value_run_end};
 use crate::rules::{TypeFace, type_face, type_face_of_field};
 /// Official: `pkg/linter/lib/src/rules/void_checks.dart` — a value
 /// written where `void` (or `FutureOr<void>`) is expected reports
@@ -38,12 +35,9 @@ use crate::rules::{TypeFace, type_face, type_face_of_field};
 /// pattern branch (:68-74, `matchedValueType`) needs the pattern's
 /// matched value type and stays unported. Message: `diagnostic.g.dart`
 /// `voidChecks`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "void_checks",
-    group: Group::Core,
-    problem: "Assignment to a variable of type 'void'.",
-    correction: "Try removing the assignment or changing the type of the variable.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "void_checks",
+    &[
         NodeKind::Assignment,
         NodeKind::ReturnStatement,
         NodeKind::Send,
@@ -51,7 +45,7 @@ pub(crate) static SPEC: RuleSpec = RuleSpec {
         NodeKind::ImplicitCreation,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     match c.kind(c.node()) {

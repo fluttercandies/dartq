@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 use crate::rules::expressions::{query_site, static_type_faces as faces};
 use crate::rules::first_child;
 use dartq_parser::MemberKind;
@@ -23,14 +23,11 @@ use dartq_semantic::model::Ty;
 /// precedent). Fields keep the official private-or-static gate
 /// (:83-88). Message: `diagnostic.g.dart`
 /// `unnecessaryNullableForFinalVariableDeclarations`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_nullable_for_final_variable_declarations",
-    group: Group::Recommended,
-    problem: "Type could be non-nullable.",
-    correction: "Try changing the type to be non-nullable.",
-    kinds: &[NodeKind::VariablesDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_nullable_for_final_variable_declarations",
+    &[NodeKind::VariablesDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

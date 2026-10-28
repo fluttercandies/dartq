@@ -76,18 +76,33 @@ pub(crate) fn completion_entry(args: &PositionArgs) -> u8 {
     code
 }
 
-fn resolve_at_run(args: &PositionArgs, out: &mut impl Write) -> u8 {
-    let (mut engine, dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
-        Ok(faces) => faces,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return exit::USAGE;
-        }
-    };
-    let (file, line, column) = match selector_position(&args.selector, &dir) {
+pub(crate) fn resolve_at_run(args: &PositionArgs, out: &mut impl Write) -> u8 {
+    // The selector parses first — its usage error is the face's own, and
+    // the routed call needs the resolved position (#2629). The resident
+    // consult answers the same envelope over the session's maintained
+    // view; the cursor converts daemon-side against the analyzed text,
+    // exactly where the cold pass below converts against its own.
+    let (file, line, column) = match selector_position(&args.selector, &args.dir) {
         Ok(position) => position,
         Err(message) => {
             eprintln!("error: {message}");
+            return exit::USAGE;
+        }
+    };
+    if let Some(code) = crate::resident::route_position(
+        args,
+        "dartq/resolveAt",
+        &file,
+        line,
+        column,
+        out,
+    ) {
+        return code;
+    }
+    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+        Ok(faces) => faces,
+        Err(error) => {
+            eprintln!("error: {error}");
             return exit::USAGE;
         }
     };
@@ -105,18 +120,30 @@ fn resolve_at_run(args: &PositionArgs, out: &mut impl Write) -> u8 {
     write_answer(out, &answer, args.format, "resolve-at")
 }
 
-fn completion_run(args: &PositionArgs, out: &mut impl Write) -> u8 {
-    let (mut engine, dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
-        Ok(faces) => faces,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return exit::USAGE;
-        }
-    };
-    let (file, line, column) = match selector_position(&args.selector, &dir) {
+pub(crate) fn completion_run(args: &PositionArgs, out: &mut impl Write) -> u8 {
+    // The selector parses first (the resolve face's order — its usage
+    // error is the face's own), then the resident consult (#2629).
+    let (file, line, column) = match selector_position(&args.selector, &args.dir) {
         Ok(position) => position,
         Err(message) => {
             eprintln!("error: {message}");
+            return exit::USAGE;
+        }
+    };
+    if let Some(code) = crate::resident::route_position(
+        args,
+        "dartq/completion",
+        &file,
+        line,
+        column,
+        out,
+    ) {
+        return code;
+    }
+    let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
+        Ok(faces) => faces,
+        Err(error) => {
+            eprintln!("error: {error}");
             return exit::USAGE;
         }
     };

@@ -1,6 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{Check, Group, NodeKind, RuleSpec, query_site, same_file};
+use super::{Check, NodeKind, RuleSpec, query_site, same_file};
 use crate::rules::{byte_span_of_token, slice};
 
 /// Official: `pkg/linter/lib/src/rules/no_literal_bool_comparisons.dart:44-62`
@@ -20,14 +20,11 @@ use crate::rules::{byte_span_of_token, slice};
 /// locals (`var x = true`) under-report — the fold publishes no
 /// inferred type (the documented inference family). Message:
 /// `diagnostic.g.dart` `noLiteralBoolComparisons`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "no_literal_bool_comparisons",
-    group: Group::Standalone,
-    problem: "Unnecessary comparison to a boolean literal.",
-    correction: "Remove the comparison and use the negation operator `!` if necessary.",
-    kinds: &[NodeKind::BinaryExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "no_literal_bool_comparisons",
+    &[NodeKind::BinaryExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

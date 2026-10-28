@@ -1,9 +1,6 @@
 use dartq_semantic::model::Ty;
 
-use super::{
-    Check, Group, NodeKind, RuleSpec, query_site, slice, switch_scrutinee_read,
-    written_type_sibling,
-};
+use super::{Check, NodeKind, RuleSpec, query_site, slice, switch_scrutinee_read, written_type_sibling};
 use crate::rules::utf16_token_span;
 
 /// Official: `pkg/linter/lib/src/rules/null_check_on_nullable_type_parameter.dart`
@@ -31,18 +28,15 @@ use crate::rules::utf16_token_span;
 /// field face, and the head must be an in-scope type parameter
 /// (class-like and method-like ancestors). Message: `diagnostic.g.dart`
 /// `nullCheckOnNullableTypeParameter`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "null_check_on_nullable_type_parameter",
-    group: Group::Core,
-    problem: "The null check operator shouldn't be used on a variable whose type is a potentially nullable type parameter.",
-    correction: "Try explicitly testing for 'null'.",
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "null_check_on_nullable_type_parameter",
     // The `!` tiles as the `NonNullAssert` token leaf (bridge
     // `handle_non_null_assert_expression`); `UnaryPostfix` is `++`/`--`.
     // The pattern `!` is the `NullAssertPattern` token leaf (bridge
     // `handle_null_assert_pattern`).
-    kinds: &[NodeKind::NonNullAssert, NodeKind::NullAssertPattern],
+    &[NodeKind::NonNullAssert, NodeKind::NullAssertPattern],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

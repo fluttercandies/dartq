@@ -1,7 +1,4 @@
-use super::{
-    Check, Group, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT,
-    modifier_keyword,
-};
+use super::{Check, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, modifier_keyword};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_const_in_enum_constructor.dart`
 /// — an explicit `const` on an enum constructor reports at the keyword
@@ -19,14 +16,11 @@ use super::{
 /// word 1 (bridge `end_primary_constructor`) and its declaration kind
 /// in word 0 (`DeclarationKind::Enum`). Message: `diagnostic.g.dart`
 /// `unnecessaryConstInEnumConstructor`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_const_in_enum_constructor",
-    group: Group::Standalone,
-    problem: "Unnecessary 'const' keyword in an enum constructor.",
-    correction: "Try removing the keyword.",
-    kinds: &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_const_in_enum_constructor",
+    &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     if !c.unit.features.primary_constructors {

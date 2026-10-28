@@ -45,7 +45,9 @@ echo "scratch root $E2E_WORK (isolated caches), evidence $EVIDENCE"
 echo
 
 # Each leg family sources in and runs; leg_begin/ok/bad above print the
-# live verdict stream and the trap aggregates at exit.
+# live verdict stream and the trap aggregates at exit. Leg selection: the
+# optional arguments name the legs to run (`run.sh 11` = the CI golden
+# leg alone, scripts/ci.sh's e2e step); the default runs the whole suite.
 source legs/01-packages.sh
 source legs/02-session.sh
 source legs/03-events.sh
@@ -56,17 +58,28 @@ source legs/07-mcp.sh
 source legs/08-cross.sh
 source legs/09-exit-codes.sh
 source legs/10-debug.sh
+source legs/11-routed-parity.sh
 
-legs_01_run
-legs_02_run
-legs_03_run
-legs_04_run
-legs_05_run
-legs_06_run
-legs_07_run
-legs_08_run
-legs_09_run
-legs_10_run
+ALL_LEGS="01 02 03 04 05 06 07 08 09 10 11"
+for leg in ${*:-$ALL_LEGS}; do
+  case $leg in
+    01) legs_01_run ;;
+    02) legs_02_run ;;
+    03) legs_03_run ;;
+    04) legs_04_run ;;
+    05) legs_05_run ;;
+    06) legs_06_run ;;
+    07) legs_07_run ;;
+    08) legs_08_run ;;
+    09) legs_09_run ;;
+    10) legs_10_run ;;
+    11) legs_11_run ;;
+    *)
+      echo "e2e: unknown leg '$leg' (expected one of: $ALL_LEGS)" >&2
+      exit 2
+      ;;
+  esac
+done
 
 # Zero-orphan gate: nothing the suite spawned may outlive it — any live
 # dartq process whose command line OR working directory belongs to this

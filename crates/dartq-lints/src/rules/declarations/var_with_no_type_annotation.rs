@@ -1,4 +1,4 @@
-use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT};
+use super::{Check, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT};
 
 /// Official: `pkg/linter/lib/src/rules/var_with_no_type_annotation.dart`
 /// — a parameter whose storage keyword is `var` with no type reports at
@@ -14,17 +14,14 @@ use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEM
 /// `ModSet` bit recovered by a bounded forward scan past
 /// `required`/`covariant`; the written type is a
 /// Type/FunctionType/RecordType child (`NoType` = unwritten). Message: `diagnostic.g.dart` `varWithNoTypeAnnotation`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "var_with_no_type_annotation",
-    group: Group::Standalone,
-    problem: "Avoid declaring parameters with `var` and no type annotation.",
-    correction: "Try giving the parameter a type annotation.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "var_with_no_type_annotation",
+    &[
         NodeKind::FormalParameters,
         NodeKind::OptionalFormalParameters,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     if c.unit.features.primary_constructors {

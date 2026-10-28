@@ -1,0 +1,100 @@
+// Ported by port_upstream from the upstream linter test file
+// (pkg/linter/test/rules, upstream Dart SDK source); regenerate
+// with the converter rather than editing. Case names are the
+// upstream test method names, verbatim. The first file block of
+// each case is the analyzed unit; later blocks are the test's
+// supporting files.
+//- lint: control_flow_in_finally
+
+//- case: test_break
+//- file: /lib/test.dart
+
+void f() {
+  for (var o in [1, 2]) {
+    try {
+    } catch (e) {
+    } finally {
+      if (1 > 0) {
+        [!break;!]
+      }
+    }
+  }
+}
+
+//- case: test_break_loopDeclaredWithinFinally
+//- file: /lib/test.dart
+
+void f() {
+  try {
+  } catch (e) {
+  } finally {
+    for (var o in [1, 2]) {
+      if (1 > 0) {
+        break;
+      }
+    }
+  }
+}
+
+//- case: test_continue
+//- file: /lib/test.dart
+
+void f() {
+  for (var o in [1, 2]) {
+    try {
+    } catch (e) {
+    } finally {
+      [!continue;!]
+    }
+  }
+}
+
+//- case: test_continue_deep
+//- file: /lib/test.dart
+
+void f() {
+  try {
+  } catch (e) {
+  } finally {
+    for (var o in [1, 2]) {
+      if (1 > 0) {
+        continue;
+      }
+    }
+  }
+}
+
+//- case: test_nonControlFlow
+//- file: /lib/test.dart
+
+void f(int i) {
+  try {
+  } catch (e) {
+  } finally {
+    i = i * i;
+  }
+}
+
+//- case: test_return
+//- file: /lib/test.dart
+
+void f() {
+  try {
+  } catch (e) {
+  } finally {
+    [!return;!]
+  }
+}
+
+//- case: test_returnInClosure
+//- file: /lib/test.dart
+
+void f() {
+  try {
+  } catch (e) {
+  } finally {
+    () {
+      return 1.0;
+    };
+  }
+}

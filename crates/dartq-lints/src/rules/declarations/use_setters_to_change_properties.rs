@@ -1,11 +1,5 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, container_members, fields_declare, is_identifier_token,
-    name_row_token, override_annotation, parameter_rows, sole_statement_tokens,
-};
-use crate::rules::{
-    MemberQuery, NONE_TOKEN, get_set_token, member_matches, member_name, same_file_ancestors,
-    type_before, utf16_token_span,
-};
+use super::{Check, NodeKind, RuleSpec, container_members, fields_declare, is_identifier_token, name_row_token, override_annotation, parameter_rows, sole_statement_tokens};
+use crate::rules::{MemberQuery, NONE_TOKEN, get_set_token, member_matches, member_name, same_file_ancestors, type_before, utf16_token_span};
 
 const STATIC_BIT: u16 = 1 << 3;
 
@@ -24,14 +18,11 @@ const STATIC_BIT: u16 = 1 << 3;
 /// target under-reports). `node.isOverride` (:47) answers on the
 /// `@override` annotation or a same-file ancestor's same-named method.
 /// Message: `diagnostic.g.dart` `useSettersToChangeProperties`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "use_setters_to_change_properties",
-    group: Group::Standalone,
-    problem: "The method is used to change a property.",
-    correction: "Try converting the method to a setter.",
-    kinds: &[NodeKind::Method],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_setters_to_change_properties",
+    &[NodeKind::Method],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

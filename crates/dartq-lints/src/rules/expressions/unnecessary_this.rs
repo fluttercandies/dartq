@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, same_file};
+use super::{Check, NodeKind, RuleSpec, same_file};
 use crate::rules::{NONE_TOKEN, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_this.dart` — a `this.`
@@ -27,14 +27,11 @@ use crate::rules::{NONE_TOKEN, utf16_token_span};
 /// possible shadow. A mount without semantics degrades to the no-bail
 /// face (the lexical import guess is gone). Message:
 /// `diagnostic.g.dart` `unnecessaryThis`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_this",
-    group: Group::Recommended,
-    problem: "Unnecessary 'this.' qualifier.",
-    correction: "Try removing 'this.'.",
-    kinds: &[NodeKind::ThisExpression, NodeKind::Initializer],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_this",
+    &[NodeKind::ThisExpression, NodeKind::Initializer],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     match c.kind(c.node()) {

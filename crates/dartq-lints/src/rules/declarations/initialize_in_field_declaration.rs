@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// The `late` `ModSet` bit (bridge `mod_bits`, member family).
 const LATE_BIT: u16 = 1 << 5;
@@ -11,14 +11,11 @@ const LATE_BIT: u16 = 1 << 5;
 /// the primary-constructors `isFeatureEnabled` bail (:35) — pinned on
 /// [`crate::engine::Features::primary_constructors`]. Message:
 /// `diagnostic.g.dart` `initializeInFieldDeclaration`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "initialize_in_field_declaration",
-    group: Group::Standalone,
-    problem: "Field should be initialized in the field declaration.",
-    correction: "Try initializing the field where it's declared.",
-    kinds: &[NodeKind::PrimaryConstructorBody],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "initialize_in_field_declaration",
+    &[NodeKind::PrimaryConstructorBody],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     if !c.unit.features.primary_constructors {

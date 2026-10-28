@@ -36,21 +36,15 @@
 use dartq_ast::{NodeKind, mod_flags};
 use dartq_scanner::{KeywordStyle, TokenKind};
 
-use super::{Group, NONE_TOKEN, RuleSpec, first_child};
+use super::{NONE_TOKEN, RuleSpec, first_child};
 use crate::engine::Check;
-use crate::rules::{
-    SupertypeClause, class_declaration_name, initialized_identifier_name, member_annotations,
-    rows_with_parent, supertypes, utf16_token_span, variables_declaration_keyword,
-};
+use crate::rules::{SupertypeClause, class_declaration_name, initialized_identifier_name, member_annotations, rows_with_parent, supertypes, utf16_token_span, variables_declaration_keyword};
 
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "exhaustive_cases",
-    group: Group::Recommended,
-    problem: "Missing case clauses for some constants in '{0}'.",
-    correction: "Try adding case clauses for the missing constants.",
-    kinds: &[NodeKind::SwitchStatement],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "exhaustive_cases",
+    &[NodeKind::SwitchStatement],
     check,
-};
+);
 
 /// The class-family `abstract` modifier bit (bridge `mod_bits`; the
 /// parser lane owns the values).

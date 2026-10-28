@@ -4,6 +4,7 @@ mod curly_recovery;
 mod dedup;
 mod errors;
 mod escapes;
+mod feature_fold;
 mod inserted;
 mod kinds;
 mod numbers_strings;

@@ -1,7 +1,4 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, every_initializer_obvious, fields_written_type,
-    utf16_token_run_span,
-};
+use super::{Check, NodeKind, RuleSpec, every_initializer_obvious, fields_written_type, utf16_token_run_span};
 
 /// Official: `pkg/linter/lib/src/rules/omit_obvious_property_types.dart:48-72`
 /// — a top-level or field variable list (:43-44) with a written type
@@ -11,14 +8,11 @@ use super::{
 /// written `Null`/`dynamic` skips; every initializer the matcher
 /// cannot name under-reports. Message: `diagnostic.g.dart`
 /// `omitObviousPropertyTypes`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "omit_obvious_property_types",
-    group: Group::Standalone,
-    problem: "The type annotation isn't needed because it is obvious.",
-    correction: "Try removing the type annotation.",
-    kinds: &[NodeKind::VariablesDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "omit_obvious_property_types",
+    &[NodeKind::VariablesDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

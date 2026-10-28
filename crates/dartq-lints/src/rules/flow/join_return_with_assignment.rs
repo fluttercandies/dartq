@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{Check, Group, RuleSpec};
+use super::{Check, RuleSpec};
 use core::ops::Range;
 
 /// Official: `upstream Dart SDK source,
@@ -25,14 +25,11 @@ use core::ops::Range;
 /// chain (`a . b` vs `a.b`) under-reports; same-file implicit-`this`
 /// fields join as bare names, matching the official `SimpleIdentifier`
 /// face. Message: `diagnostic.g.dart` `joinReturnWithAssignment`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "join_return_with_assignment",
-    group: Group::Standalone,
-    problem: "Assignment could be inlined in 'return' statement.",
-    correction: "Try inlining the assigned value in the 'return' statement.",
-    kinds: &[NodeKind::Block, NodeKind::BlockBody],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "join_return_with_assignment",
+    &[NodeKind::Block, NodeKind::BlockBody],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // Production bodies tile as `BlockBody` whose direct children

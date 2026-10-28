@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice};
+use super::{Check, NodeKind, RuleSpec, query_site, slice};
 use crate::rules::NONE_TOKEN;
 use dartq_semantic::{Binding, BindingKind};
 
@@ -49,14 +49,11 @@ use dartq_semantic::{Binding, BindingKind};
 /// the dominant typed-receiver corpus resolves — and a dead-check
 /// bare shape stays silent for the same reason. Message:
 /// `diagnostic.g.dart` `preferNullAwareMethodCalls`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_null_aware_method_calls",
-    group: Group::Standalone,
-    problem: "Use a null-aware invocation of the 'call' method rather than explicitly testing for 'null'.",
-    correction: "Try using '?.call()' to invoke the function.",
-    kinds: &[NodeKind::Conditional, NodeKind::IfStatement],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_null_aware_method_calls",
+    &[NodeKind::Conditional, NodeKind::IfStatement],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

@@ -1,8 +1,6 @@
 use dartq_semantic::model::MemberKind;
 
-use super::{
-    Check, Group, NodeKind, RuleSpec, query_site, value_run_end, written_type_sibling,
-};
+use super::{Check, NodeKind, RuleSpec, query_site, value_run_end, written_type_sibling};
 use crate::rules::{TypeFace, slice};
 
 /// Official: `pkg/linter/lib/src/rules/implicit_call_tearoffs.dart` —
@@ -37,12 +35,9 @@ use crate::rules::{TypeFace, slice};
 /// function-type `Ty` (the collector captures `Unknown`, rule 0c), so
 /// the written row is the only face there. Message: `diagnostic.g.dart`
 /// `implicitCallTearoffs`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "implicit_call_tearoffs",
-    group: Group::Core,
-    problem: "Implicit tear-off of the 'call' method.",
-    correction: "Try explicitly tearing off the 'call' method.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "implicit_call_tearoffs",
+    &[
         NodeKind::Assignment,
         NodeKind::VariableInitializer,
         NodeKind::ReturnStatement,
@@ -50,7 +45,7 @@ pub(crate) static SPEC: RuleSpec = RuleSpec {
         NodeKind::Send,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     match c.kind(c.node()) {

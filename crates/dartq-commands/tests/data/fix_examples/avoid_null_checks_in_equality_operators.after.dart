@@ -1,0 +1,1 @@
+class C { bool operator ==(Object? o) => o is C; }

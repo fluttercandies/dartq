@@ -1,0 +1,202 @@
+// Ported by port_upstream from the upstream linter test file
+// (pkg/linter/test/rules, upstream Dart SDK source); regenerate
+// with the converter rather than editing. Case names are the
+// upstream test method names, verbatim. The first file block of
+// each case is the analyzed unit; later blocks are the test's
+// supporting files.
+//- lint: curly_braces_in_flow_control_structures
+
+//- case: test_doWhile_block_sameLineAsDo
+//- file: /lib/test.dart
+
+void f() {
+  do { print(''); }
+  while (true);
+}
+
+//- case: test_doWhile_singeStatement_sameLineAsDo
+//- file: /lib/test.dart
+
+void f() {
+  do [!print('');!]
+  while (true);
+}
+
+//- case: test_doWhile_singleStatement_lineAfterDo
+//- file: /lib/test.dart
+
+void f() {
+  do
+    [!print('');!]
+  while (true);
+}
+
+//- case: test_doWhile_singleStatement_sameLineAsDoAndWhile
+//- file: /lib/test.dart
+
+void f() {
+  do [!print('');!] while (true);
+}
+
+//- case: test_forEachLoop_block_sameLine
+//- file: /lib/test.dart
+
+void f(List<int> l) {
+  for (var i in l) {}
+}
+
+//- case: test_forEachLoop_singleStatement_lineAfter
+//- file: /lib/test.dart
+
+void f(List<int> l) {
+  for (var i in l)
+    [!return;!]
+}
+
+//- case: test_forEachLoop_singleStatement_sameLine
+//- file: /lib/test.dart
+
+void f(List<int> l) {
+  for (var i in l) [!return;!]
+}
+
+//- case: test_forLoop_emptyBlock_sameLine
+//- file: /lib/test.dart
+
+void f() {
+  for (;;) {}
+}
+
+//- case: test_forLoop_singleStatement_lineAfter
+//- file: /lib/test.dart
+
+void f() {
+  for (;;)
+    [!return;!]
+}
+
+//- case: test_forLoop_singleStatement_sameLine
+//- file: /lib/test.dart
+
+void f() {
+  for (;;) [!return;!]
+}
+
+//- case: test_ifStatement_block_sameLine
+//- file: /lib/test.dart
+
+void f() {
+  if (1 == 2) {}
+}
+
+//- case: test_ifStatement_block_sameLine_multiLine
+//- file: /lib/test.dart
+
+void f() {
+  if (1 == 2) {
+  }
+}
+
+//- case: test_ifStatement_singleStatement_lineAfter
+//- file: /lib/test.dart
+
+void f() {
+  if (1 == 2)
+    [!return;!]
+}
+
+//- case: test_ifStatement_singleStatement_multiLine
+//- file: /lib/test.dart
+
+void f() {
+  if (1 == 2) [!print(
+    'First argument'
+    'Second argument');!]
+}
+
+//- case: test_ifStatement_singleStatement_sameLine
+//- file: /lib/test.dart
+
+void f() {
+  if (1 == 2) return;
+}
+
+//- case: test_ifStatement_singleStatement_sameLine_multiLineCondition
+//- file: /lib/test.dart
+
+void f() {
+  if (1 ==
+      2) [!return;!]
+}
+
+//- case: test_ifStatementElse_block_sameLine
+//- file: /lib/test.dart
+
+void f() {
+  if (1 == 2) {}
+  else {}
+}
+
+//- case: test_ifStatementElse_singleStatement_lineAfter
+//- file: /lib/test.dart
+
+void f() {
+  if (1 == 2) {}
+  else
+    [!return;!]
+}
+
+//- case: test_ifStatementElse_singleStatement_sameLine
+//- file: /lib/test.dart
+
+void f() {
+  if (1 == 2) {}
+  else [!return;!]
+}
+
+//- case: test_ifStatementElseIf_block_sameLine_multiLine
+//- file: /lib/test.dart
+
+void f() {
+  if (1 == 2) {} else if (2 == 3) {
+  }
+}
+
+//- case: test_ifStatementElseIf_singleStatement_lineAfter
+//- file: /lib/test.dart
+
+void f() {
+  if (1 == 2) {}
+  else if (1 == 2)
+    [!return;!]
+}
+
+//- case: test_ifStatementElseIf_singleStatement_sameLine_lineAfterIfCondition
+//- file: /lib/test.dart
+
+void f() {
+  if (1 == 2) {
+  } else if (1 == 3) [!return;!]
+}
+
+//- case: test_whileLoop_block_sameLine
+//- file: /lib/test.dart
+
+void f() {
+  while (true) {}
+}
+
+//- case: test_whileLoop_singleStatement_nextLine
+//- file: /lib/test.dart
+
+void f() {
+  while (true)
+    [!return;!]
+}
+
+//- case: test_whileLoop_singleStatement_sameLine
+//- file: /lib/test.dart
+
+void f() {
+  while (true) [!return;!]
+}

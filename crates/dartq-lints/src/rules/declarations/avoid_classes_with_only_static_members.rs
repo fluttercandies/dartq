@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, body_members, get_set_token};
+use super::{Check, NodeKind, RuleSpec, body_members, get_set_token};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_classes_with_only_static_members.dart:30-71`
 /// — a class whose members are all static (and whose fields are not all
@@ -22,14 +22,11 @@ use super::{Check, Group, NodeKind, RuleSpec, body_members, get_set_token};
 /// instance members) conservatively silences. Cross-file
 /// `implements`/`on` edges stay outside the bridge's name-level chain
 /// and under-report.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_classes_with_only_static_members",
-    group: Group::Standalone,
-    problem: "Classes should define instance members.",
-    correction: "Try adding instance behavior or moving the members out of the class.",
-    kinds: &[NodeKind::ClassDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_classes_with_only_static_members",
+    &[NodeKind::ClassDeclaration],
     check,
-};
+);
 
 /// The `static` (member) / `sealed` (class) `ModSet` bit (bridge
 /// `mod_bits`; `same_file::STATIC_BIT`).

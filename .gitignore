@@ -81,3 +81,7 @@ tests/plugin-validation/expectations/
 # glob the children so the negation can re-include them)
 tests/corpus/mega-x/*
 !tests/corpus/mega-x/slice/
+
+# pub build artifacts under tool packages — regenerated per run
+# (same posture as tests/plugin-validation/parity/*/.dart_tool/)
+tools/*/.dart_tool/

@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, slice};
+use super::{Check, NodeKind, RuleSpec, slice};
 use crate::rules::expressions::{query_site, static_type_faces as faces};
 use dartq_semantic::model::Ty;
 
@@ -20,14 +20,11 @@ use dartq_semantic::model::Ty;
 /// `VariableDeclarationList.type` arm, :500-502). Unresolvable
 /// contexts under-report (the documented posture). Message:
 /// `diagnostic.g.dart` `avoidTypesOnClosureParameters`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_types_on_closure_parameters",
-    group: Group::Standalone,
-    problem: "Unnecessary type annotation on a function expression parameter.",
-    correction: "Try removing the type annotation.",
-    kinds: &[NodeKind::FunctionExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_types_on_closure_parameters",
+    &[NodeKind::FunctionExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

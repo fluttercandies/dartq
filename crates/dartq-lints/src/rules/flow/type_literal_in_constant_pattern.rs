@@ -1,4 +1,4 @@
-use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec};
+use super::{Check, NONE_TOKEN, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/type_literal_in_constant_pattern.dart:40-63`
 /// — a constant pattern whose expression's static type is the `Type`
@@ -33,14 +33,11 @@ use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec};
 /// only (a getter, a prefixed container, a name-less field, and
 /// list/map element positions keep the name reading). Message:
 /// `diagnostic.g.dart` `typeLiteralInConstantPattern`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "type_literal_in_constant_pattern",
-    group: Group::Core,
-    problem: "Use 'TypeName _' instead of a type literal.",
-    correction: "Replace with 'TypeName _'.",
-    kinds: &[NodeKind::ConstantPattern],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "type_literal_in_constant_pattern",
+    &[NodeKind::ConstantPattern],
     check,
-};
+);
 
 /// The built-in type names a bare constant-pattern identifier can spell
 /// (`dynamic` included; `void` is a keyword and never reaches an

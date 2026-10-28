@@ -1,10 +1,5 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, container_members, fields_declare, name_row_token,
-};
-use crate::rules::{
-    MemberQuery, get_set_token, has_override_annotation, member_matches, member_name,
-    same_file_ancestors, utf16_token_span,
-};
+use super::{Check, NodeKind, RuleSpec, container_members, fields_declare, name_row_token};
+use crate::rules::{MemberQuery, get_set_token, has_override_annotation, member_matches, member_name, same_file_ancestors, utf16_token_span};
 
 const STATIC_BIT: u16 = 1 << 3;
 
@@ -24,18 +19,15 @@ const STATIC_BIT: u16 = 1 << 3;
 /// ancestor's instance getter or field. Cross-file ancestors
 /// under-report. Message: `diagnostic.g.dart`
 /// `avoidSettersWithoutGetters`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_setters_without_getters",
-    group: Group::Standalone,
-    problem: "Setter has no corresponding getter.",
-    correction: "Try adding a corresponding getter or removing the setter.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_setters_without_getters",
+    &[
         NodeKind::ClassDeclaration,
         NodeKind::EnumDeclaration,
         NodeKind::ExtensionTypeDeclaration,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

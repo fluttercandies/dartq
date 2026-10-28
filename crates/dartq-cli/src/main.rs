@@ -1853,9 +1853,13 @@ fn query_references(args: &SymbolArgs) -> u8 {
     }
 }
 
-/// The references face's runner: the symbol runner verbatim (the seam where
-/// the faces' rows diverge).
+/// the references face's runner: the routed consult with the references
+/// kind, then the symbol runner verbatim (the seam where the faces'
+/// rows diverge).
 fn query_references_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    if let Some(code) = resident::route_query(args, QueryKind::References, out) {
+        return code;
+    }
     query_symbol_run(args, out)
 }
 
@@ -1872,10 +1876,15 @@ fn query_callers(args: &SymbolArgs) -> u8 {
     }
 }
 
-/// One callers run: the symbol query's runner with the invocation-shaped
-/// filter applied (`dartq_commands::query::callers`); exit 0 on success,
-/// zero results included.
+/// One callers run: the routed consult with the callers kind, then the
+/// symbol query's runner with the invocation-shaped filter applied
+/// (`dartq_commands::query::callers`); exit 0 on success, zero results
+/// included.
 fn query_callers_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    if let Some(code) = resident::route_query(args, QueryKind::Callers, out)
+    {
+        return code;
+    }
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {
@@ -1920,8 +1929,13 @@ fn query_implementations(args: &SymbolArgs) -> u8 {
 
 /// `dartq query implementations` — callers of the name's reverse supertype walk
 /// (`dartq_commands::query::implementations`); exit 0 on success, zero
-/// results included.
+/// results included. The routed consult leads (#2629).
 fn query_implementations_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    if let Some(code) =
+        resident::route_query(args, QueryKind::Implementations, out)
+    {
+        return code;
+    }
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {
@@ -1966,8 +1980,14 @@ fn query_dependencies(args: &SymbolArgs) -> u8 {
 
 /// One dependencies run: the declaring library's own import edges and
 /// consumed dependency symbols (`dartq_commands::query::dependencies`);
-/// exit 0 on success, zero results included.
+/// exit 0 on success, zero results included. The routed consult leads
+/// (#2629).
 fn query_dependencies_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    if let Some(code) =
+        resident::route_query(args, QueryKind::Dependencies, out)
+    {
+        return code;
+    }
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {
@@ -2016,10 +2036,15 @@ fn query_batch(args: &BatchArgs) -> u8 {
     }
 }
 
-/// One batch run: the request items (`--symbol` order, each carrying the
-/// full `--kind` set, the symbol face when no kind came), the shared
-/// `dartq_commands::query::batch` execution, then one JSON line per answer.
+/// One batch run: the resident consult first (#2629 — the session's one
+/// graph answers every item in one round trip), then the request items
+/// (`--symbol` order, each carrying the full `--kind` set, the symbol face
+/// when no kind came), the shared `dartq_commands::query::batch`
+/// execution, then one JSON line per answer.
 fn query_batch_run(args: &BatchArgs, out: &mut impl Write) -> u8 {
+    if let Some(code) = resident::route_query_batch(args, out) {
+        return code;
+    }
     let kinds = if args.kinds.is_empty() {
         vec![QueryKind::Symbol]
     } else {
@@ -2087,11 +2112,16 @@ fn write_query_out(
     }
 }
 
-/// One query run: the analyze workspace assembly, one analyze pass (the
-/// read-after-write — the query reflects and never re-drives it), then the
+/// One query run: the resident consult first (#2629 — the session's
+/// maintained index answers the same envelope the cold pass below prints),
+/// then the analyze workspace assembly, one analyze pass (the
+/// read-after-write — the query reflects and never re-drives it), and the
 /// engine's symbol answer on `out`. Exit 0 on success, zero results
 /// included.
 fn query_symbol_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
+    if let Some(code) = resident::route_query(args, QueryKind::Symbol, out) {
+        return code;
+    }
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
         Ok(faces) => faces,
         Err(error) => {
@@ -2195,22 +2225,31 @@ fn explain_run(args: &ExplainArgs, out: &mut impl Write) -> u8 {
                 }
             }
         }
-        (Some(symbol), None) => match dartq_commands::explain::explain(
-            &args.dir,
-            args.sdk.as_deref(),
-            symbol,
-            args.verbosity.into_commands(),
-        ) {
-            Ok(report) => report,
-            Err(error @ (ExplainError::Workspace(_) | ExplainError::Engine(_))) => {
-                eprintln!("error: {error}");
-                return exit::USAGE;
+        (Some(symbol), None) => {
+            // The resident consult (#2629), attach-only: the daemon's
+            // explain rebuilds the same per-query disk engine and renders
+            // through the same writers; no live session falls straight
+            // through to the cold report below.
+            if let Some(code) = resident::route_explain(args, symbol, out) {
+                return code;
             }
-            Err(error) => {
-                eprintln!("dartq: internal error: {error}");
-                return exit::INTERNAL_ERROR;
+            match dartq_commands::explain::explain(
+                &args.dir,
+                args.sdk.as_deref(),
+                symbol,
+                args.verbosity.into_commands(),
+            ) {
+                Ok(report) => report,
+                Err(error @ (ExplainError::Workspace(_) | ExplainError::Engine(_))) => {
+                    eprintln!("error: {error}");
+                    return exit::USAGE;
+                }
+                Err(error) => {
+                    eprintln!("dartq: internal error: {error}");
+                    return exit::INTERNAL_ERROR;
+                }
             }
-        },
+        }
         _ => {
             eprintln!("error: give a symbol name or --diagnostic CODE");
             return exit::USAGE;

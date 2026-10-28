@@ -1,6 +1,6 @@
 use dartq_ast::NodeKind;
 
-use super::{Check, Group, RuleSpec};
+use super::{Check, RuleSpec};
 use crate::rules::utf16_token_span;
 
 /// Official: `upstream Dart SDK source,
@@ -25,14 +25,11 @@ use crate::rules::utf16_token_span;
 /// (collectReferences' `documentationComment`, :76-94); comment
 /// references of other declarations are invisible to it. Message:
 /// `diagnostic.g.dart` `unnecessaryUnderscores`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_underscores",
-    group: Group::Standalone,
-    problem: "Unnecessary use of multiple underscores.",
-    correction: "Try using '_'.",
-    kinds: &[NodeKind::FormalParameters, NodeKind::VariablesDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_underscores",
+    &[NodeKind::FormalParameters, NodeKind::VariablesDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The registration bail (:33): the feature is what turns the

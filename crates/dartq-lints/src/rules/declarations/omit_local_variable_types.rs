@@ -1,7 +1,4 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, angle_arguments, expanded_lexemes, is_identifier_token,
-    local_written_type, type_arguments_open,
-};
+use super::{Check, NodeKind, RuleSpec, angle_arguments, expanded_lexemes, is_identifier_token, local_written_type, type_arguments_open};
 use crate::rules::last_child;
 
 /// Official: `pkg/linter/lib/src/rules/omit_local_variable_types.dart:43-97`
@@ -22,14 +19,11 @@ use crate::rules::last_child;
 /// type argument is the written type; a variable or call iterable
 /// under-reports. Message: `diagnostic.g.dart`
 /// `omitLocalVariableTypes`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "omit_local_variable_types",
-    group: Group::Standalone,
-    problem: "Unnecessary type annotation on a local variable.",
-    correction: "Try removing the type annotation.",
-    kinds: &[NodeKind::VariablesDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "omit_local_variable_types",
+    &[NodeKind::VariablesDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

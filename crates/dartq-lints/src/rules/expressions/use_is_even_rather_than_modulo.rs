@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, same_file, slice, value_run_end};
+use super::{Check, NodeKind, RuleSpec, same_file, slice, value_run_end};
 use crate::rules::in_const_context;
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/use_is_even_rather_than_modulo.dart`
@@ -18,14 +18,11 @@ use crate::rules::in_const_context;
 /// and compound modulo operands (`v.length % 2`, `a.b % 2`), a
 /// non-bare-name left operand, and a hexadecimal `0x2` stay silent.
 /// Message: `diagnostic.g.dart` `useIsEvenRatherThanModulo`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "use_is_even_rather_than_modulo",
-    group: Group::Standalone,
-    problem: "Use '{0}' rather than '% 2'.",
-    correction: "Try using '{0}'.",
-    kinds: &[NodeKind::BinaryExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_is_even_rather_than_modulo",
+    &[NodeKind::BinaryExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

@@ -26,7 +26,7 @@ use dartq_ast::NodeKind;
 use dartq_parser::IdentifierContext;
 
 use crate::engine::Check;
-use crate::registry::{Group, RuleSpec};
+use crate::registry::RuleSpec;
 use crate::rules::slice;
 use crate::rules::{SupertypeClause, same_file_declaration, supertypes};
 
@@ -536,9 +536,7 @@ fn ctor_defines_key(c: &Check<'_>, ctor: u32) -> bool {
 }
 
 pub(crate) mod avoid_unnecessary_containers {
-    use super::{
-        Check, Group, NodeKind, RuleSpec, creation_parts, spells_framework, value_is_creation,
-    };
+    use super::{Check, NodeKind, RuleSpec, creation_parts, spells_framework, value_is_creation};
     use crate::rules::slice;
 
     /// Official: `upstream Dart SDK source,
@@ -564,20 +562,17 @@ pub(crate) mod avoid_unnecessary_containers {
     /// under-reports, dispatch or value; the const faces dispatch on the
     /// `ConstExpression`/`ConstLiteral` wrapper rows and match the bare
     /// callee spelling inside.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "avoid_unnecessary_containers",
-        group: Group::Standalone,
-        problem: "Unnecessary instance of 'Container'.",
-        correction: "Try removing the 'Container' (but not its children) from the widget tree.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_unnecessary_containers",
+    &[
             NodeKind::Send,
             NodeKind::NewExpression,
             NodeKind::ImplicitCreation,
             NodeKind::ConstExpression,
             NodeKind::ConstLiteral,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let Some((callee, name, args)) = creation_parts(c) else {
@@ -659,10 +654,7 @@ pub(crate) mod avoid_unnecessary_containers {
 }
 
 pub(crate) mod sort_child_properties_last {
-    use super::{
-        Check, Group, NodeKind, RuleSpec, creation_parts, named_argument_groups, spells_framework,
-        value_root,
-    };
+    use super::{Check, NodeKind, RuleSpec, creation_parts, named_argument_groups, spells_framework, value_root};
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/sort_child_properties_last.dart` — an
@@ -682,18 +674,15 @@ pub(crate) mod sort_child_properties_last {
     /// creation or primitive value carries no identifier read row; what
     /// the full static-type face would close). A prefixed callee
     /// under-reports (no library-URI face, GAP-4/5).
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "sort_child_properties_last",
-        group: Group::Standalone,
-        problem: "The '{0}' argument should be last in widget constructor invocations.",
-        correction: "Try moving the argument to the end of the argument list.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "sort_child_properties_last",
+    &[
             NodeKind::Send,
             NodeKind::NewExpression,
             NodeKind::ImplicitCreation,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let Some((callee, name, args)) = creation_parts(c) else {
@@ -831,10 +820,7 @@ pub(crate) mod sort_child_properties_last {
 }
 
 pub(crate) mod use_colored_box {
-    use super::{
-        Check, Group, NodeKind, RuleSpec, argument_groups, creation_parts, query_span,
-        spells_framework, value_root,
-    };
+    use super::{Check, NodeKind, RuleSpec, argument_groups, creation_parts, query_span, spells_framework, value_root};
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/use_colored_box.dart` — a `Container`
@@ -854,18 +840,15 @@ pub(crate) mod use_colored_box {
     /// and a shape without a read row (a literal, a member chain, a
     /// creation) keeps the counting posture. A prefixed `p.Container(...)`
     /// under-reports.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "use_colored_box",
-        group: Group::Standalone,
-        problem: "Use a 'ColoredBox' rather than a 'Container' with only a 'Color'.",
-        correction: "Try replacing the 'Container' with a 'ColoredBox'.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_colored_box",
+    &[
             NodeKind::Send,
             NodeKind::NewExpression,
             NodeKind::ImplicitCreation,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let Some((callee, name, args)) = creation_parts(c) else {
@@ -996,9 +979,7 @@ pub(crate) mod use_colored_box {
 }
 
 pub(crate) mod use_decorated_box {
-    use super::{
-        Check, Group, NodeKind, RuleSpec, argument_groups, creation_parts, spells_framework,
-    };
+    use super::{Check, NodeKind, RuleSpec, argument_groups, creation_parts, spells_framework};
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/use_decorated_box.dart` — a `Container`
@@ -1013,18 +994,15 @@ pub(crate) mod use_decorated_box {
     /// containers refuting; a user class inside an unindexed dependency
     /// still matches (what dependency indexing would close). A prefixed
     /// `p.Container(...)` under-reports.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "use_decorated_box",
-        group: Group::Standalone,
-        problem: "Use 'DecoratedBox' rather than a 'Container' with only a 'Decoration'.",
-        correction: "Try replacing the 'Container' with a 'DecoratedBox'.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_decorated_box",
+    &[
             NodeKind::Send,
             NodeKind::NewExpression,
             NodeKind::ImplicitCreation,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let Some((callee, name, args)) = creation_parts(c) else {
@@ -1102,9 +1080,7 @@ pub(crate) mod use_decorated_box {
 }
 
 pub(crate) mod sized_box_for_whitespace {
-    use super::{
-        Check, Group, NodeKind, RuleSpec, argument_groups, creation_parts, spells_framework,
-    };
+    use super::{Check, NodeKind, RuleSpec, argument_groups, creation_parts, spells_framework};
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/sized_box_for_whitespace.dart` — a
@@ -1120,18 +1096,15 @@ pub(crate) mod sized_box_for_whitespace {
     /// containers refuting; a user class inside an unindexed dependency
     /// still matches (what dependency indexing would close). A prefixed
     /// `p.Container(...)` under-reports.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "sized_box_for_whitespace",
-        group: Group::Standalone,
-        problem: "Use a 'SizedBox' to add whitespace to a layout.",
-        correction: "Try using a 'SizedBox' rather than a 'Container'.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "sized_box_for_whitespace",
+    &[
             NodeKind::Send,
             NodeKind::NewExpression,
             NodeKind::ImplicitCreation,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let Some((callee, name, args)) = creation_parts(c) else {
@@ -1226,10 +1199,7 @@ pub(crate) mod sized_box_for_whitespace {
 }
 
 pub(crate) mod sized_box_shrink_expand {
-    use super::{
-        Check, Group, NodeKind, RuleSpec, argument_groups, creation_parts, spells_framework,
-        value_root,
-    };
+    use super::{Check, NodeKind, RuleSpec, argument_groups, creation_parts, spells_framework, value_root};
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/sized_box_shrink_expand.dart` — a default
@@ -1248,18 +1218,15 @@ pub(crate) mod sized_box_shrink_expand {
     /// (`SizedBox.shrink()` never reaches the face — a member-chain
     /// callee carries the trailing access marker); a prefixed
     /// `p.SizedBox(...)` under-reports.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "sized_box_shrink_expand",
-        group: Group::Standalone,
-        problem: "Use 'SizedBox.{0}' to avoid needing to specify the 'height' and 'width'.",
-        correction: "Try using 'SizedBox.{0}' and removing the 'height' and 'width' arguments.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "sized_box_shrink_expand",
+    &[
             NodeKind::Send,
             NodeKind::NewExpression,
             NodeKind::ImplicitCreation,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let Some((callee, name, args)) = creation_parts(c) else {
@@ -1465,7 +1432,7 @@ pub(crate) mod sized_box_shrink_expand {
 }
 
 pub(crate) mod use_full_hex_values_for_flutter_colors {
-    use super::{Check, Group, NodeKind, RuleSpec, creation_parts, spells_framework};
+    use super::{Check, NodeKind, RuleSpec, creation_parts, spells_framework};
     use crate::rules::slice;
 
     /// Official: `upstream Dart SDK source,
@@ -1483,18 +1450,15 @@ pub(crate) mod use_full_hex_values_for_flutter_colors {
     /// posture's reachable half); a user class inside an unindexed
     /// dependency still matches (what dependency indexing would close).
     /// A prefixed `p.Color(...)` under-reports.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "use_full_hex_values_for_flutter_colors",
-        group: Group::Standalone,
-        problem: "Instances of 'Color' should be created using an 8-digit hexadecimal integer (such as '0xFFFFFFFF').",
-        correction: "",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_full_hex_values_for_flutter_colors",
+    &[
             NodeKind::Send,
             NodeKind::NewExpression,
             NodeKind::ImplicitCreation,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let Some((callee, name, args)) = creation_parts(c) else {
@@ -1600,15 +1564,8 @@ pub(crate) mod use_full_hex_values_for_flutter_colors {
 pub(crate) mod use_key_in_widget_constructors {
     use dartq_ast::mod_flags;
 
-    use super::{
-        Check, Group, NodeKind, RuleSpec, SupertypeClause, carries_annotation, chain_spells_root,
-        class_name_row, ctor_defines_key, extends_only, formal_rows, member_name_row, named_ctor,
-        param_name, parameter_list, subclassed_same_file, unnamed_ctor,
-    };
-    use crate::rules::{
-        body_members, class_declaration_name, same_file_declaration, supertypes, tail_token,
-        utf16_token_span,
-    };
+    use super::{Check, NodeKind, RuleSpec, SupertypeClause, carries_annotation, chain_spells_root, class_name_row, ctor_defines_key, extends_only, formal_rows, member_name_row, named_ctor, param_name, parameter_list, subclassed_same_file, unnamed_ctor};
+    use crate::rules::{body_members, class_declaration_name, same_file_declaration, supertypes, tail_token, utf16_token_span};
 
     /// The `augment` `ModSet` bit (bridge `mod_bits`).
     const AUGMENT_BIT: u16 = 1 << 1;
@@ -1643,14 +1600,11 @@ pub(crate) mod use_key_in_widget_constructors {
     /// posture. `@visibleForTesting` reads by annotation spelling. The
     /// primary-constructor face (:70-78) is not mounted —
     /// primary-constructor shapes under-report.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "use_key_in_widget_constructors",
-        group: Group::Standalone,
-        problem: "Constructors for public widgets should have a named 'key' parameter.",
-        correction: "Try adding a named parameter to the constructor.",
-        kinds: &[NodeKind::ClassDeclaration, NodeKind::Constructor],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_key_in_widget_constructors",
+    &[NodeKind::ClassDeclaration, NodeKind::Constructor],
+    check,
+);
 
     /// The framework widget roots the `extendsWidget` chain matches by
     /// spelling (`flutter_utils` `_nameWidget`/`_nameStatefulWidget` plus
@@ -2179,9 +2133,7 @@ pub(crate) mod use_key_in_widget_constructors {
 }
 
 pub(crate) mod no_logic_in_create_state {
-    use super::{
-        Check, Group, NodeKind, RuleSpec, chain_spells_root, extends_only, member_name_row,
-    };
+    use super::{Check, NodeKind, RuleSpec, chain_spells_root, extends_only, member_name_row};
     use crate::rules::{is_statement_row, slice};
 
     /// Official: `upstream Dart SDK source,
@@ -2202,14 +2154,11 @@ pub(crate) mod no_logic_in_create_state {
     /// still matches — what dependency indexing would close). The
     /// instance-creation face reads the creation shapes (a dot-shorthand
     /// constructor invocation under-reports its silent face).
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "no_logic_in_create_state",
-        group: Group::Standalone,
-        problem: "Don't put any logic in 'createState'.",
-        correction: "Try moving the logic out of 'createState'.",
-        kinds: &[NodeKind::Method],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "no_logic_in_create_state",
+    &[NodeKind::Method],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let method = c.node();
@@ -2451,13 +2400,8 @@ pub(crate) mod diagnostic_describe_all_properties {
     use dartq_ast::mod_flags;
     use dartq_parser::MemberKind;
 
-    use super::{
-        Check, Group, NodeKind, RuleSpec, any_clause, chain_spells_root, member_name_row,
-        member_named,
-    };
-    use crate::rules::{
-        body_members, get_set_token, initialized_identifier_name, utf16_token_span,
-    };
+    use super::{Check, NodeKind, RuleSpec, any_clause, chain_spells_root, member_name_row, member_named};
+    use crate::rules::{body_members, get_set_token, initialized_identifier_name, utf16_token_span};
 
     /// The `static` `ModSet` bit (bridge `mod_bits`, member family).
     const STATIC_BIT: u16 = 1 << 3;
@@ -2480,14 +2424,11 @@ pub(crate) mod diagnostic_describe_all_properties {
     /// under-report. The debug-method reference scan reads the body's
     /// identifier spellings (a shadowing declaration over-credits, the
     /// documented user-shadow family).
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "diagnostic_describe_all_properties",
-        group: Group::Standalone,
-        problem: "The public property isn't described by either 'debugFillProperties' or 'debugDescribeChildren'.",
-        correction: "Try describing the property.",
-        kinds: &[NodeKind::ClassDeclaration],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "diagnostic_describe_all_properties",
+    &[NodeKind::ClassDeclaration],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let class = c.node();
@@ -2699,10 +2640,7 @@ pub(crate) mod diagnostic_describe_all_properties {
 mod semantic_identity {
     use dartq_language::{FeatureSet, LanguageVersion};
     use dartq_parser::ParserFeatures;
-    use dartq_resolution::{
-        Combinators, ImportEdge, LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder,
-        Namespaces,
-    };
+    use dartq_resolution::{Combinators, ImportEdge, LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces};
     use dartq_semantic::{ElementIndex, MicroKind, StrictModes, analyze_unit, collect};
     use dartq_source::{FileTable, StringTable};
 

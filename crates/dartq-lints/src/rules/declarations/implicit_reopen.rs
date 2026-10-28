@@ -1,4 +1,4 @@
-use super::{Check, Group, RuleSpec, class_bits};
+use super::{Check, RuleSpec, class_bits};
 use crate::rules::{SupertypeClause, supertypes, utf16_token_span};
 use dartq_ast::NodeKind;
 
@@ -26,14 +26,11 @@ use dartq_ast::NodeKind;
 /// experimental `RuleState` is registry metadata, not a gate: upstream
 /// registers the rule unconditionally and enablement is name-only.
 /// Message: `diagnostic.g.dart` `implicitReopen` (:1525-1540).
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "implicit_reopen",
-    group: Group::Standalone,
-    problem: "The {0} '{1}' reopens '{2}' because it is not marked '{3}'.",
-    correction: "Try marking '{1}' '{3}' or annotating it with '@reopen'.",
-    kinds: &[NodeKind::ClassDeclaration, NodeKind::NamedMixinApplication],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "implicit_reopen",
+    &[NodeKind::ClassDeclaration, NodeKind::NamedMixinApplication],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

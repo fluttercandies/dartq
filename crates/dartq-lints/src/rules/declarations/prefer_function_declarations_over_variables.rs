@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 use crate::rules::last_child;
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_function_declarations_over_variables.dart:40-58`
@@ -19,14 +19,11 @@ use crate::rules::last_child;
 /// official's declaration face. An initializer-inferred write type
 /// keeps the documented conservative family. Message:
 /// `diagnostic.g.dart` `preferFunctionDeclarationsOverVariables`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_function_declarations_over_variables",
-    group: Group::Recommended,
-    problem: "Use a function declaration rather than a variable assignment to bind a function to a name.",
-    correction: "Try rewriting the closure assignment as a function declaration.",
-    kinds: &[NodeKind::InitializedIdentifier],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_function_declarations_over_variables",
+    &[NodeKind::InitializedIdentifier],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let Some(initializer) = c

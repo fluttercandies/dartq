@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
+use super::{Check, NodeKind, RuleSpec, query_site, slice, static_type_faces as faces};
 use dartq_semantic::model::Ty;
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/avoid_bool_literals_in_conditional_expressions.dart`
@@ -33,14 +33,11 @@ use dartq_semantic::model::Ty;
 ///
 /// Message: `diagnostic.g.dart`
 /// `avoidBoolLiteralsInConditionalExpressions`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_bool_literals_in_conditional_expressions",
-    group: Group::Standalone,
-    problem: "Conditional expressions with a 'bool' literal can be simplified.",
-    correction: "Try rewriting the expression to use either '&&' or '||'.",
-    kinds: &[NodeKind::Conditional],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_bool_literals_in_conditional_expressions",
+    &[NodeKind::Conditional],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

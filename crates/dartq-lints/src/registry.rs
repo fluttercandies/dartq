@@ -3,18 +3,19 @@
 //!
 //! Every rule pins its behavior to the official implementation in upstream
 //! Dart SDK source, `pkg/linter/lib/src/rules/<rule>.dart` (cited per
-//! module) and its message templates to the generated codes in
-//! `pkg/linter/lib/src/diagnostic.g.dart` (cited in each spec). Group
-//! membership follows the pinned `package:lints` snapshot (`core.yaml` /
-//! `recommended.yaml`, upstream dart-lang/lints; recommended includes
-//! core); the removed rules
+//! module); its message templates, group, state, and docs flag resolve
+//! through the generated metadata table
+//! ([`crate::generated::rule_meta`], #2676 — `pkg/linter/messages.yaml`
+//! of the pinned SDK tree is the source). Group membership follows the
+//! pinned `package:lints` snapshot (`core.yaml` / `recommended.yaml`,
+//! upstream dart-lang/lints; recommended includes core); the removed rules
 //! follow the SDK's `RemovedAnalysisRule` registrations (the rules.json
 //! `removed` state).
 
 use std::sync::LazyLock;
 
 use dartq_ast::NodeKind;
-use dartq_language::LanguageVersion;
+use dartq_language::{Feature, LanguageVersion};
 
 use crate::engine::Check;
 
@@ -101,6 +102,41 @@ impl core::fmt::Debug for RuleSpec {
             .finish_non_exhaustive()
     }
 }
+
+/// A `static SPEC` literal whose metadata (group, message templates) the
+/// generated table resolves at compile time (#2676): every rule file
+/// writes only its name, dispatch kinds, and check here — the
+/// hand-copied metadata fields are gone. A name the table does not carry
+/// fails the build at the `static` initializer (the const-fn panic in
+/// [`crate::generated::rule_meta`]); the four diagnostic mirrors and the
+/// removed no-ops keep hand-written literals (see [`META_EXEMPT`] and
+/// `rules/removed.rs`).
+macro_rules! spec {
+    ($name:literal, $kinds:expr, $check:expr $(,)?) => {
+        RuleSpec {
+            name: $name,
+            group: $crate::generated::rule_meta::meta_group($name),
+            problem: $crate::generated::rule_meta::meta_problem($name),
+            correction: $crate::generated::rule_meta::meta_correction($name),
+            kinds: $kinds,
+            check: $check,
+        }
+    };
+}
+pub(crate) use spec;
+
+/// The registered names the generated metadata table deliberately does
+/// not carry: the analyzer-diagnostic mirrors — pubspec `path:` validator
+/// codes and the `unnecessary_type_check` pair — which are analyzer
+/// codes, not `LinterLintCode` entries of `pkg/linter/messages.yaml`
+/// (their specs hand-write the analyzer messages; the pin test's
+/// `OFFICIAL_DIAGNOSTIC_MIRRORS` holds the same four).
+const META_EXEMPT: &[&str] = &[
+    "path_does_not_exist",
+    "path_not_posix",
+    "path_pubspec_does_not_exist",
+    "unnecessary_type_check",
+];
 
 /// The frozen registry skeleton: all rules through the #586 standard-set
 /// completion (the full `package:lints` union: 34 core + 55
@@ -500,7 +536,7 @@ pub static RULES: LazyLock<Vec<&'static RuleSpec>> = LazyLock::new(|| {
 /// The one-time registry startup check (runs at [`RULES`] init, the first
 /// registry touch of any process): duplicate machine names break the name
 /// order and `rule_by_name`'s first-match lookup, and every name-keyed
-/// wiring table — [`SEMANTIC_RULES`], [`VERSION_GATES`],
+/// wiring table — [`SEMANTIC_RULES`], [`REGISTRATION_GATES`],
 /// [`INCOMPATIBLE_RULES`] (keys and peers), [`PUBSPEC_PASS_SEAM`],
 /// [`RUN_EPILOGUE_SEAM`], [`LATE_JOIN_RULES`] — must resolve against the
 /// registry, case-insensitively like [`rule_by_name`]. A miss fails fast
@@ -533,9 +569,9 @@ fn assert_startup_consistency(rules: &[&'static RuleSpec]) {
     if !semantic.is_empty() {
         drift.push(format!("SEMANTIC_RULES unregistered names {semantic:?}"));
     }
-    let gated = unresolved(rules, VERSION_GATES.iter().map(|(name, _)| *name));
+    let gated = unresolved(rules, REGISTRATION_GATES.iter().map(|(name, _)| *name));
     if !gated.is_empty() {
-        drift.push(format!("VERSION_GATES unregistered names {gated:?}"));
+        drift.push(format!("REGISTRATION_GATES unregistered names {gated:?}"));
     }
     let incompatible_keys = unresolved(rules, INCOMPATIBLE_RULES.iter().map(|(name, _)| *name));
     if !incompatible_keys.is_empty() {
@@ -559,6 +595,38 @@ fn assert_startup_consistency(rules: &[&'static RuleSpec]) {
     let late_join = unresolved(rules, LATE_JOIN_RULES.iter().copied());
     if !late_join.is_empty() {
         drift.push(format!("LATE_JOIN_RULES unregistered names {late_join:?}"));
+    }
+    // The generated-metadata arm (#2676): every registered name resolves
+    // in the table (the mirrors exempt) and — for the rules whose spec
+    // resolves through it — the spec's group agrees with the row's. A
+    // hand-written spec that drifts from the table (a stale removed
+    // classification, a regenerated group) fails here in release too,
+    // the same silent-wrong-run protection the wiring tables get.
+    let mut missing_meta: Vec<&str> = rules
+        .iter()
+        .map(|spec| spec.name)
+        .filter(|name| !META_EXEMPT.contains(name))
+        .filter(|name| crate::generated::rule_meta::rule_meta(name).is_none())
+        .collect();
+    missing_meta.sort_unstable();
+    if !missing_meta.is_empty() {
+        drift.push(format!(
+            "names without generated metadata rows {missing_meta:?} — regenerate \
+             the table or extend META_EXEMPT with a justification"
+        ));
+    }
+    let group_drift: Vec<&str> = rules
+        .iter()
+        .filter(|spec| !META_EXEMPT.contains(&spec.name))
+        .filter_map(|spec| {
+            let meta = crate::generated::rule_meta::rule_meta(spec.name)?;
+            (meta.group != spec.group).then_some(spec.name)
+        })
+        .collect();
+    if !group_drift.is_empty() {
+        drift.push(format!(
+            "specs whose group disagrees with the generated table {group_drift:?}"
+        ));
     }
 
     assert!(
@@ -821,8 +889,9 @@ impl EnableSet {
 /// A registration's language-version predicate: the upstream registration
 /// consults the library's settled language version and joins the run only
 /// when the predicate admits it (`registerNodeProcessors`' version guard).
-/// The default is no constraint — a rule absent from `VERSION_GATES`
-/// registers unconditionally, so existing rules never carry the face.
+/// The default is no constraint — a rule absent from
+/// [`REGISTRATION_GATES`] registers unconditionally, so existing rules
+/// never carry the face.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VersionGate {
     /// Registers at/above the version — the feature-`enabledIn`-milestone
@@ -849,14 +918,115 @@ impl VersionGate {
     }
 }
 
-/// The version-gated registrations, keyed by machine name. Consulted once
-/// per run when [`crate::engine::Unit::version`] carries a settled version;
-/// a gate whose predicate rejects the version clears the rule from the
-/// run's enable set (the official silent-at-that-version posture).
-static VERSION_GATES: &[(&str, VersionGate)] = &[(
-    "require_trailing_commas",
-    VersionGate::Below(LanguageVersion::new(3, 7)),
-)];
+/// A registration's feature or version predicate: the upstream
+/// `isFeatureEnabled`/version bails that decide whether a rule registers
+/// for a library (the rule-constructor guards, upstream Dart SDK source,
+/// `pkg/linter/lib/src/rules/<name>.dart`). The default is no constraint —
+/// a rule absent from [`REGISTRATION_GATES`] registers unconditionally, so
+/// existing rules never carry the face.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    /// Registers only with the feature enabled — the plain
+    /// `isFeatureEnabled` registration bail.
+    Feature(Feature),
+    /// Registers only with the feature disabled — the inverted bail: a
+    /// superseding form took the feature's release over (e.g. the
+    /// declaring-parameter rules supersede the `final`/`var` parameter
+    /// ones once primary constructors ship).
+    NotFeature(Feature),
+    /// Registers under a language-version predicate ([`VersionGate`]); a
+    /// run without a settled version face (the latest-default posture)
+    /// admits.
+    Version(VersionGate),
+}
+
+impl Gate {
+    /// Whether a unit carrying `features` and `version` admits this gate.
+    fn admits(
+        self,
+        features: &crate::engine::Features,
+        version: Option<LanguageVersion>,
+    ) -> bool {
+        match self {
+            Self::Feature(feature) => features.is_enabled(feature),
+            Self::NotFeature(feature) => !features.is_enabled(feature),
+            Self::Version(gate) => match version {
+                Some(version) => gate.admits(version),
+                None => true,
+            },
+        }
+    }
+}
+
+/// The feature- and version-gated registrations, keyed by machine name —
+/// every upstream `isFeatureEnabled`/version registration bail the engine
+/// honors, one row per gated rule with its rule-file citation (the same
+/// citations the gated rules' own early returns carry; those in-rule
+/// mirrors predate the table and stay as defense-in-depth). Consulted once
+/// per run ([`registration_gated`]); a gate the unit's faces reject clears
+/// the rule from the run's enable set (the official silent-at-that-version
+/// / feature-off posture).
+///
+/// Linkage is forced twice: every `Feature` here is a variant of the
+/// generated registry enum (an unknown feature cannot compile) and
+/// resolves through [`crate::engine::Features::is_enabled`]'s exhaustive
+/// stance match (a feature without a lints stance fails compilation), and
+/// every rule name is held against the merged registry at [`RULES`] init
+/// by [`assert_startup_consistency`] — in release builds too, so a
+/// drifted name is a fast named failure, never a silent no-op.
+pub(crate) static REGISTRATION_GATES: &[(&str, Gate)] = &[
+    // `patterns` (shipped 3.0, `experimental_features.yaml:387-389`): the
+    // pattern-era rules register only with it; the legacy-case rules only
+    // without it.
+    ("switch_on_type", Gate::Feature(Feature::Patterns)), // registration bail (:34)
+    ("simplify_variable_pattern", Gate::Feature(Feature::Patterns)), // registration bail (:32)
+    ("unnecessary_breaks", Gate::Feature(Feature::Patterns)), // registers only with patterns on
+    ("no_duplicate_case_values", Gate::NotFeature(Feature::Patterns)), // `member is SwitchCase` gate (:41)
+    ("invalid_case_patterns", Gate::NotFeature(Feature::Patterns)), // registration bail (:41)
+    // `wildcard_variables` (shipped 3.7): the multi-underscore face
+    // registers only with it; the lone-use rule only without it.
+    ("no_wildcard_variable_uses", Gate::NotFeature(Feature::WildcardVariables)), // (:36-38)
+    ("unnecessary_underscores", Gate::Feature(Feature::WildcardVariables)), // registration bail (:33)
+    // `primary_constructors` (shipped 3.13, `enabledIn: 3.13.0`): the
+    // primary-form family registers only with it; the superseded
+    // parameter rules only without it. (`unnecessary_final` is NOT here:
+    // only its parameter-visitor faces skip under the feature
+    // (unnecessary_final.dart:66-68) — an in-rule body check, not a
+    // registration bail; the rule registers unconditionally.)
+    ("use_primary_constructors", Gate::Feature(Feature::PrimaryConstructors)), // registration bail (:35)
+    ("use_declaring_parameters", Gate::Feature(Feature::PrimaryConstructors)), // registration bail (:35)
+    ("initialize_in_field_declaration", Gate::Feature(Feature::PrimaryConstructors)), // registration bail (:35)
+    ("empty_container_bodies", Gate::Feature(Feature::PrimaryConstructors)), // registration bail (:35)
+    ("unnecessary_const_in_enum_constructor", Gate::Feature(Feature::PrimaryConstructors)), // registration bail (:36-40)
+    ("unnecessary_type_name_in_constructor", Gate::Feature(Feature::PrimaryConstructors)), // registration bail (:36-38)
+    ("avoid_final_parameters", Gate::NotFeature(Feature::PrimaryConstructors)), // inverted bail (:56-59)
+    ("prefer_final_parameters", Gate::NotFeature(Feature::PrimaryConstructors)), // inverted bail (:48-52)
+    ("var_with_no_type_annotation", Gate::NotFeature(Feature::PrimaryConstructors)), // inverted bail (:34-36)
+    // `unnamed_libraries` (shipped 2.19, `experimental_features.yaml:397-400`).
+    ("unnecessary_library_name", Gate::Feature(Feature::UnnamedLibraries)), // registration bail (:32-34)
+    // `enhanced_parts` (experimental — no `enabledIn`,
+    // `tools/experimental_features.yaml:150-152`).
+    ("use_string_in_part_of_directives", Gate::NotFeature(Feature::EnhancedParts)), // registration bail (:32-34)
+    // `super_parameters` (shipped 2.17, `enabledIn: 2.17.0`).
+    ("use_super_parameters", Gate::Feature(Feature::SuperParameters)), // registration bail (:43)
+    // `null_aware_elements` (shipped 3.8, `enabledIn: 3.8.0`).
+    ("use_null_aware_elements", Gate::Feature(Feature::NullAwareElements)), // registration bail (:35)
+    // The settled-version face: `require_trailing_commas` registers below
+    // 3.7 and stays silent from 3.7, where `dart format` enforces the
+    // commas itself (require_trailing_commas.dart:52-56).
+    ("require_trailing_commas", Gate::Version(VersionGate::Below(LanguageVersion::new(3, 7)))),
+];
+
+/// Doc-link anchor for the frozen `rules/flow/require_trailing_commas.rs`
+/// module docs, which still cite the table by its pre-unification name
+/// (`crate::registry::VERSION_GATES`) — the table itself is the unified
+/// [`REGISTRATION_GATES`] above.
+#[expect(
+    unused_imports,
+    reason = "doc-link anchor for the frozen `require_trailing_commas.rs` module \
+              docs; rustdoc resolution is its only consumer"
+)]
+pub(crate) use REGISTRATION_GATES as VERSION_GATES;
 
 /// The registered rules whose run consumes the per-file semantic fold: every
 /// rule whose check call-graph reads [`crate::engine::Check::semantics`] —
@@ -959,14 +1129,18 @@ pub fn mounts_semantics(set: &EnableSet) -> bool {
     set.intersects(&SEMANTIC_SET)
 }
 
-/// `enabled` without the gated rules `version` rejects — the registration
-/// consult of one run. One pass over `VERSION_GATES` (a two-entry-scale
-/// slice); the per-node dispatch keeps testing the filtered bits, so the
-/// gate costs nothing on the hot path.
-pub(crate) fn version_gated(enabled: &EnableSet, version: LanguageVersion) -> EnableSet {
+/// `enabled` without the gated rules the unit's faces reject — the
+/// registration consult of one run, over [`REGISTRATION_GATES`]
+/// (a 21-entry-scale slice); the per-node dispatch keeps testing the
+/// filtered bits, so the gates cost nothing on the hot path.
+pub(crate) fn registration_gated(
+    enabled: &EnableSet,
+    features: &crate::engine::Features,
+    version: Option<LanguageVersion>,
+) -> EnableSet {
     let mut gated = *enabled;
-    for &(name, gate) in VERSION_GATES {
-        if !gate.admits(version)
+    for &(name, gate) in REGISTRATION_GATES {
+        if !gate.admits(features, version)
             && let Some(id) = rule_by_name(name)
         {
             gated.clear(id);
@@ -986,4 +1160,91 @@ pub(crate) fn render(template: &str, args: &[&str]) -> String {
         out = out.replace(&format!("{{{i}}}"), arg);
     }
     out
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::engine::Features;
+
+    /// Every gate row names a registered rule — the startup consistency
+    /// arm's mirror as a direct test (the assert itself fires at `RULES`
+    /// init in every process; this names the contract in test form).
+    #[test]
+    fn every_gate_names_a_registered_rule() {
+        for &(name, _) in REGISTRATION_GATES {
+            assert!(
+                rule_by_name(name).is_some(),
+                "REGISTRATION_GATES names unregistered rule `{name}`"
+            );
+        }
+    }
+
+    /// Every gated feature resolves through the lints stance fold: a set
+    /// carrying exactly that feature folds its bit on, so a `Gate::Feature`
+    /// entry can never ride a feature the [`Features`] projection silently
+    /// drops (the fold and the gate lookup agree by construction — pinned
+    /// here because they are two matches).
+    #[test]
+    fn every_gated_feature_has_a_stance_bit() {
+        for &(_, gate) in REGISTRATION_GATES {
+            let feature = match gate {
+                Gate::Feature(feature) | Gate::NotFeature(feature) => feature,
+                Gate::Version(_) => continue,
+            };
+            let set = dartq_language::FeatureSet::latest().with_experiment(feature);
+            assert!(
+                Features::from_feature_set(set).is_enabled(feature),
+                "gate rides `{}`, which the Features fold drops",
+                feature.meta().name
+            );
+        }
+    }
+
+    /// The registration consult: the default (latest) features clear the
+    /// inverted-bail rules and keep the plain ones; the all-off fold
+    /// clears the plain ones and keeps the inverted; a version gate
+    /// consults only a settled version face.
+    #[test]
+    fn registration_gated_filters_by_polarity() {
+        let all = EnableSet::resolve(REGISTRATION_GATES.iter().map(|(name, _)| *name)).0;
+        let enabled = |set: &EnableSet, name: &str| {
+            rule_by_name(name).is_some_and(|id| set.is_enabled(id))
+        };
+
+        let latest = registration_gated(&all, &Features::default(), None);
+        assert!(enabled(&latest, "use_primary_constructors"));
+        assert!(enabled(&latest, "use_super_parameters"));
+        assert!(!enabled(&latest, "var_with_no_type_annotation"));
+        assert!(!enabled(&latest, "no_wildcard_variable_uses"));
+        // No settled version face: the version gate admits (the official
+        // latest-default posture); a settled 3.7 face clears it.
+        assert!(enabled(&latest, "require_trailing_commas"));
+        let gated_37 = registration_gated(
+            &all,
+            &Features::default(),
+            Some(LanguageVersion::new(3, 7)),
+        );
+        assert!(!enabled(&gated_37, "require_trailing_commas"));
+
+        // The 2.12 floor predates every shipped milestone among the seven
+        // stances (the earliest is `super-parameters` at 2.17), so its
+        // fold is all-off: the plain-bail rules clear, the inverted ones
+        // register.
+        let pre_patterns = registration_gated(
+            &all,
+            &Features::from_feature_set(dartq_language::FeatureSet::for_language_version(
+                LanguageVersion::new(2, 12),
+            )),
+            None,
+        );
+        assert!(!enabled(&pre_patterns, "use_primary_constructors"));
+        assert!(!enabled(&pre_patterns, "unnecessary_underscores"));
+        assert!(!enabled(&pre_patterns, "use_null_aware_elements"));
+        assert!(!enabled(&pre_patterns, "use_super_parameters"));
+        assert!(!enabled(&pre_patterns, "unnecessary_library_name"));
+        assert!(enabled(&pre_patterns, "var_with_no_type_annotation"));
+        assert!(enabled(&pre_patterns, "no_wildcard_variable_uses"));
+        assert!(enabled(&pre_patterns, "no_duplicate_case_values"));
+    }
 }

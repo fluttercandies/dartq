@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `upstream Dart SDK source,
 /// pkg/linter/lib/src/rules/use_named_constants.dart` — a const-written
@@ -30,12 +30,9 @@ use super::{Check, Group, NodeKind, RuleSpec};
 /// are outside the proxy's same-file resolution. Message:
 /// `diagnostic.g.dart` `useNamedConstants` (the `{0}` slot carries
 /// `Type.field`).
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "use_named_constants",
-    group: Group::Standalone,
-    problem: "Use the constant '{0}' rather than a constructor returning the same object.",
-    correction: "Try using '{0}'.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_named_constants",
+    &[
         NodeKind::ConstExpression,
         NodeKind::ConstLiteral,
         NodeKind::ConstantPattern,
@@ -45,7 +42,7 @@ pub(crate) static SPEC: RuleSpec = RuleSpec {
         NodeKind::NewExpression,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

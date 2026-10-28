@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, utf16_token_span};
+use super::{Check, NodeKind, RuleSpec, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/no_duplicate_case_values.dart:37-58`
 /// — a `case` whose constant value equals an earlier `case` of the same
@@ -30,14 +30,11 @@ use super::{Check, Group, NodeKind, RuleSpec, utf16_token_span};
 /// doubles, interpolation, adjacent strings, const constructors),
 /// mirroring the official `hasKnownValue` skip (:47-49). Message:
 /// `diagnostic.g.dart` `noDuplicateCaseValues`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "no_duplicate_case_values",
-    group: Group::Core,
-    problem: "The value of the case clause ('{0}') is equal to the value of an earlier case clause ('{1}').",
-    correction: "Try removing or changing the value.",
-    kinds: &[NodeKind::SwitchStatement],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "no_duplicate_case_values",
+    &[NodeKind::SwitchStatement],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The official `member is SwitchCase` gate (:41): with `Feature.

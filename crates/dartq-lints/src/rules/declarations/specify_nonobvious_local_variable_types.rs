@@ -1,6 +1,4 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, for_each_iterable, local_written_type, obvious_spelling,
-};
+use super::{Check, NodeKind, RuleSpec, for_each_iterable, local_written_type, obvious_spelling};
 use crate::rules::last_child;
 
 /// Official: `pkg/linter/lib/src/rules/specify_nonobvious_local_variable_types.dart:68-145`
@@ -18,14 +16,11 @@ use crate::rules::last_child;
 /// under-reports; the pattern, switch and cast-declaration faces
 /// (:89-110) are out of the substrate. Message: `diagnostic.g.dart`
 /// `specifyNonobviousLocalVariableTypes`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "specify_nonobvious_local_variable_types",
-    group: Group::Standalone,
-    problem: "Specify the type of a local variable when the type is non-obvious.",
-    correction: "Try adding a type annotation.",
-    kinds: &[NodeKind::VariablesDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "specify_nonobvious_local_variable_types",
+    &[NodeKind::VariablesDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

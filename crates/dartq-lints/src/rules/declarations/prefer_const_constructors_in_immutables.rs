@@ -1,12 +1,5 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, annotation_names, constructor_name_part,
-    container_members, ctor_header_has_const, is_identifier_token, range_has_const,
-    top_level_annotations,
-};
-use crate::rules::{
-    NONE_TOKEN, SupertypeClause, last_child, same_file_ancestors, same_file_declaration,
-    supertypes, utf16_token_span, variables_declaration_keyword,
-};
+use super::{Check, NodeKind, RuleSpec, annotation_names, constructor_name_part, container_members, ctor_header_has_const, is_identifier_token, range_has_const, top_level_annotations};
+use crate::rules::{NONE_TOKEN, SupertypeClause, last_child, same_file_ancestors, same_file_declaration, supertypes, utf16_token_span, variables_declaration_keyword};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_const_constructors_in_immutables.dart:41-133`
 /// — a non-const constructor (:43-67), redirecting factory or primary
@@ -32,18 +25,15 @@ use crate::rules::{
 /// constructors take the same shape as an empty-bodied constructor and
 /// report at the container name (the `errorRange` face). Message:
 /// `diagnostic.g.dart` `preferConstConstructorsInImmutables`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_const_constructors_in_immutables",
-    group: Group::Standalone,
-    problem: "Constructors in '@immutable' classes should be declared as 'const'.",
-    correction: "Try adding 'const' to the constructor declaration.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_const_constructors_in_immutables",
+    &[
         NodeKind::Constructor,
         NodeKind::Factory,
         NodeKind::PrimaryConstructor,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

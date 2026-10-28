@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_expression_function_bodies.dart`
 /// — a block function body whose statements are exactly one
@@ -14,14 +14,11 @@ use super::{Check, Group, NodeKind, RuleSpec};
 /// function-like owner reports — the upstream registers the body kind
 /// with no owner gate, lambdas included. Message: `diagnostic.g.dart`
 /// `preferExpressionFunctionBodies`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_expression_function_bodies",
-    group: Group::Standalone,
-    problem: "Unnecessary use of a block function body.",
-    correction: "Try using an expression function body.",
-    kinds: &[NodeKind::BlockBody],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_expression_function_bodies",
+    &[NodeKind::BlockBody],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let body = c.node();

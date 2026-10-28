@@ -1,0 +1,25 @@
+[package]
+name = "upstream-gen"
+description = "Generators over the pinned upstream Dart SDK tree: checked-in tables derived from the official registries."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "analyzer-codes-gen"
+path = "src/main.rs"
+
+[[bin]]
+name = "linter-meta-gen"
+path = "src/linter_meta_gen.rs"
+
+[dependencies]
+# messages.yaml class-group cross-checks (analyzer-codes-gen) and the linter
+# metadata fold (linter-meta-gen); the .g.dart / rule-file scans are plain
+# text parses.
+serde_yaml = { workspace = true }
+
+[lints]
+workspace = true

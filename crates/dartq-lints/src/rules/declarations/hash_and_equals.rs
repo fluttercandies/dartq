@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, member_declaration_name, operator_name};
+use super::{Check, NodeKind, RuleSpec, member_declaration_name, operator_name};
 
 /// Official: `pkg/linter/lib/src/rules/hash_and_equals.dart:45-80` — a
 /// class defining exactly one of `==` / `hashCode` reports at the
@@ -9,14 +9,11 @@ use super::{Check, Group, NodeKind, RuleSpec, member_declaration_name, operator_
 /// (`node.hasMethod('==')` etc.) collapse into the same scan — the blind
 /// spot is members the syntax shape misclassifies (none today). Message:
 /// `diagnostic.g.dart` `hashAndEquals`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "hash_and_equals",
-    group: Group::Core,
-    problem: "Missing a corresponding override of '{0}'.",
-    correction: "Try overriding '{0}' or removing '{1}'.",
-    kinds: &[NodeKind::ClassDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "hash_and_equals",
+    &[NodeKind::ClassDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
@@ -100,6 +97,9 @@ fn member_or_field_name(c: &Check<'_>, member: u32) -> Option<u32> {
 /// The report position token: an `OperatorName` names through its
 /// payload token (the `==` itself — `head_token` would hit the
 /// `operator` keyword), an `Identifier`/variable through its span head.
+/// The official `reportAtToken(name)` spans the token
+/// (hash_and_equals.dart:67/73 — the markup marks `==` / `hashCode`
+/// whole).
 fn report_at(c: &mut Check<'_>, name: u32, args: &[&str]) {
     let token = if c.kind(name) == NodeKind::OperatorName {
         let Some(token) = c.payload_word(name, 0) else {
@@ -112,7 +112,8 @@ fn report_at(c: &mut Check<'_>, name: u32, args: &[&str]) {
     let Some(start) = c.utf16_of_token(token) else {
         return;
     };
-    c.report(start..start, args);
+    let end = c.utf16_end_of_token(token).unwrap_or(start);
+    c.report(start..end, args);
 }
 
 /// The name child of a `Method`: an operator names through its

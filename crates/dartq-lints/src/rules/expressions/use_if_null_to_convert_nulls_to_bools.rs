@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, same_file, slice, value_run_end};
+use super::{Check, NodeKind, RuleSpec, same_file, slice, value_run_end};
 use crate::rules::type_face;
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/use_if_null_to_convert_nulls_to_bools.dart`
@@ -12,14 +12,11 @@ use crate::rules::type_face;
 /// under-report): member-access and invocation operands, and
 /// parenthesized left operands, stay silent.
 /// Message: `diagnostic.g.dart` `useIfNullToConvertNullsToBools`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "use_if_null_to_convert_nulls_to_bools",
-    group: Group::Standalone,
-    problem: "Use an if-null operator to convert a 'null' to a 'bool'.",
-    correction: "Try using an if-null operator.",
-    kinds: &[NodeKind::BinaryExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_if_null_to_convert_nulls_to_bools",
+    &[NodeKind::BinaryExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

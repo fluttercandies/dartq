@@ -1,0 +1,4 @@
+/// Doc.
+library;
+
+void f() {}

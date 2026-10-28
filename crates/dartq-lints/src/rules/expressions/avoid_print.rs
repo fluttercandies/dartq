@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, query_site, slice};
+use super::{Check, NodeKind, RuleSpec, query_site, slice};
 use crate::rules::utf16_token_span;
 
 /// Official: `upstream Dart SDK source,
@@ -39,14 +39,11 @@ use crate::rules::utf16_token_span;
 /// face resolves package:flutter's foundation getter, which no
 /// imported model carries — so a shadowing `kDebugMode` value
 /// under-reports. Message: `diagnostic.g.dart` `avoidPrint`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_print",
-    group: Group::Standalone,
-    problem: "Don't invoke 'print' in production code.",
-    correction: "Try using a logging framework.",
-    kinds: &[NodeKind::Send],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_print",
+    &[NodeKind::Send],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, written_type_sibling};
+use super::{Check, NodeKind, RuleSpec, written_type_sibling};
 use crate::rules::{TypeFace, type_face, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -26,14 +26,11 @@ use crate::rules::{TypeFace, type_face, utf16_token_span};
 /// await wrappers, and arguments under-report (the promotable-LHS
 /// guard and the formal-table availability make them undecidable at
 /// M1). Message: `diagnostic.g.dart` `unnecessaryNullChecks`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_null_checks",
-    group: Group::Standalone,
-    problem: "Unnecessary use of a null check ('!').",
-    correction: "Try removing the null check.",
-    kinds: &[NodeKind::NonNullAssert],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_null_checks",
+    &[NodeKind::NonNullAssert],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

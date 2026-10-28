@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 use crate::rules::{const_ability, utf16_token_span, variables_declaration_keyword};
 use dartq_parser::MemberKind;
 
@@ -22,14 +22,11 @@ use dartq_parser::MemberKind;
 /// constant-reference faces resolve same-file only — tear-offs
 /// (`C.new`, `C.m`, a bare function name) under-report. Message:
 /// `diagnostic.g.dart` `preferConstDeclarations`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_const_declarations",
-    group: Group::Standalone,
-    problem: "Use 'const' for final variables initialized to a constant value.",
-    correction: "Try replacing 'final' with 'const'.",
-    kinds: &[NodeKind::VariablesDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_const_declarations",
+    &[NodeKind::VariablesDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

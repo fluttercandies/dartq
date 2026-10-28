@@ -11,7 +11,7 @@
 use dartq_ast::{NodeKind, PayloadField};
 
 use crate::engine::Check;
-use crate::registry::{Group, RuleSpec};
+use crate::registry::RuleSpec;
 
 /// The domain's incoming registrations: a new standalone rule appends its
 /// `SPEC` reference here (name order) and joins the registry through the
@@ -301,7 +301,7 @@ fn written_display(c: &Check<'_>, row: u32) -> String {
 pub(crate) mod avoid_shadowing_type_parameters {
     use dartq_parser::MemberKind;
 
-    use super::{PayloadField, Check, Group, NodeKind, RuleSpec};
+    use super::{PayloadField, Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/avoid_shadowing_type_parameters.dart:38-152`
     /// — a type parameter whose name equals a type parameter of an enclosing
@@ -317,20 +317,17 @@ pub(crate) mod avoid_shadowing_type_parameters {
     /// feature gate skips `_` parameters (:143-145) through the step-0
     /// feature face. Message: `diagnostic.g.dart`
     /// `avoidShadowingTypeParameters`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "avoid_shadowing_type_parameters",
-        group: Group::Core,
-        problem: "The type parameter '{0}' shadows a type parameter from the enclosing {1}.",
-        correction: "Try renaming one of the type parameters.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_shadowing_type_parameters",
+    &[
             NodeKind::LocalFunctionDeclaration,
             NodeKind::FunctionExpression,
             NodeKind::Method,
             NodeKind::FunctionType,
             NodeKind::FunctionTypedFormalParameter,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -434,10 +431,7 @@ pub(crate) mod avoid_shadowing_type_parameters {
 pub(crate) mod library_private_types_in_public_api {
     use crate::rules::type_before;
 
-    use super::{PayloadField, 
-        Check, Group, NodeKind, RuleSpec, first_type_child, member_name_typed, record_type_fields,
-        type_argument_rows, type_arguments_row,
-    };
+    use super::{PayloadField, Check, NodeKind, RuleSpec, first_type_child, member_name_typed, record_type_fields, type_argument_rows, type_arguments_row};
 
     /// Official: `pkg/linter/lib/src/rules/library_private_types_in_public_api.dart:41-246`
     /// — a `_`-private named type used in a public API signature reports at
@@ -457,14 +451,11 @@ pub(crate) mod library_private_types_in_public_api {
     /// that is no field, and a superclass chain beyond the direct step
     /// under-report). Message: `diagnostic.g.dart`
     /// `libraryPrivateTypesInPublicApi`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "library_private_types_in_public_api",
-        group: Group::Recommended,
-        problem: "Invalid use of a private type in a public API.",
-        correction: "Try making the private type public, or making the API that uses the private type also be private.",
-        kinds: &[NodeKind::CompilationUnit],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "library_private_types_in_public_api",
+    &[NodeKind::CompilationUnit],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -1089,7 +1080,7 @@ pub(crate) mod library_private_types_in_public_api {
 }
 
 pub(crate) mod avoid_annotating_with_dynamic {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// The `augment` `ModSet` bit (bridge `mod_bits`).
     const AUGMENT_BIT: u16 = 1 << 1;
@@ -1103,14 +1094,11 @@ pub(crate) mod avoid_annotating_with_dynamic {
     /// prefixed spelling resolves elsewhere and stays silent — the
     /// documented face); the augmentation guard walks to the first
     /// declaration-family ancestor, false at a block boundary (:66-76).
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "avoid_annotating_with_dynamic",
-        group: Group::Standalone,
-        problem: "Unnecessary 'dynamic' type annotation.",
-        correction: "Try removing the type 'dynamic'.",
-        kinds: &[NodeKind::FormalParameter],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_annotating_with_dynamic",
+    &[NodeKind::FormalParameter],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -1172,9 +1160,7 @@ mod tests {
     fn run_semantic(source: &str, rule: &str) -> Vec<crate::engine::Lint> {
         use dartq_language::{FeatureSet, LanguageVersion};
         use dartq_parser::ParserFeatures;
-        use dartq_resolution::{
-            LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces,
-        };
+        use dartq_resolution::{LibraryClassModifiers, LibraryGraph, LibraryGraphBuilder, Namespaces};
         use dartq_semantic::{ElementIndex, MicroKind, StrictModes, analyze_unit, collect};
         use dartq_source::{FileTable, StringTable};
 
@@ -2449,7 +2435,7 @@ pub(crate) mod prefer_constructors_over_static_methods {
     use dartq_ast::{NodeKind, PayloadField};
 
     use crate::engine::Check;
-    use crate::registry::{Group, RuleSpec};
+    use crate::registry::RuleSpec;
     use crate::rules::{class_declaration_name, type_before, type_face};
 
     use super::member_name_typed;
@@ -2474,14 +2460,11 @@ pub(crate) mod prefer_constructors_over_static_methods {
     /// prefixed (`p.A()`), cascaded (`..A()`) and annotated (`@A()`) names
     /// are not creations of the class. Message: `diagnostic.g.dart`
     /// `preferConstructorsOverStaticMethods`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_constructors_over_static_methods",
-        group: Group::Standalone,
-        problem: "Static method should be a constructor.",
-        correction: "Try converting the method into a constructor.",
-        kinds: &[NodeKind::Method],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_constructors_over_static_methods",
+    &[NodeKind::Method],
+    check,
+);
 
     /// The static `ModSet` bit (bridge `mod_bits`).
     const STATIC_BIT: u16 = 1 << 3;
@@ -2691,11 +2674,8 @@ pub(crate) mod strict_top_level_inference {
     use dartq_ast::{NodeKind, PayloadField};
 
     use crate::engine::Check;
-    use crate::registry::{Group, RuleSpec};
-    use crate::rules::{
-        MemberQuery, get_set_token, initialized_identifier_name, member_annotations,
-        same_file_ancestors, utf16_token_span, variables_declaration_keyword,
-    };
+    use crate::registry::RuleSpec;
+    use crate::rules::{MemberQuery, get_set_token, initialized_identifier_name, member_annotations, same_file_ancestors, utf16_token_span, variables_declaration_keyword};
 
     const PROBLEM: &str = "Missing type annotation.";
     const ADD_TYPE_CORRECTION: &str = "Try adding a type annotation.";
@@ -2736,20 +2716,17 @@ pub(crate) mod strict_top_level_inference {
     /// annotation on the enclosing class-like. The verbatim abort
     /// polarity ports: a function-typed formal (:176-186) or a formal
     /// with a written type (:183) stops the whole parameter list.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "strict_top_level_inference",
-        group: Group::Standalone,
-        problem: PROBLEM,
-        correction: ADD_TYPE_CORRECTION,
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "strict_top_level_inference",
+    &[
             NodeKind::TopLevelMethod,
             NodeKind::Method,
             NodeKind::Constructor,
             NodeKind::Factory,
             NodeKind::VariablesDeclaration,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -3652,12 +3629,9 @@ pub(crate) mod type_annotate_public_apis {
     use dartq_semantic::model::Ty;
 
     use crate::engine::Check;
-    use crate::registry::{Group, RuleSpec};
+    use crate::registry::RuleSpec;
     use crate::rules::expressions::{query_site, static_type_faces as faces};
-    use crate::rules::{
-        first_child, get_set_token, initialized_identifier_name, is_just_underscores, type_before,
-        variables_declaration_keyword,
-    };
+    use crate::rules::{first_child, get_set_token, initialized_identifier_name, is_just_underscores, type_before, variables_declaration_keyword};
 
     use super::member_name_typed;
 
@@ -3696,12 +3670,9 @@ pub(crate) mod type_annotate_public_apis {
     /// answers the return type). The generalized typedef (the `=` payload
     /// word) is not a `FunctionTypeAlias` and never enters the face.
     /// Message: `diagnostic.g.dart` `typeAnnotatePublicApis`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "type_annotate_public_apis",
-        group: Group::Standalone,
-        problem: "Missing type annotation on a public API.",
-        correction: "Try adding a type annotation.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "type_annotate_public_apis",
+    &[
             NodeKind::TopLevelFields,
             NodeKind::Fields,
             NodeKind::TopLevelMethod,
@@ -3710,8 +3681,8 @@ pub(crate) mod type_annotate_public_apis {
             NodeKind::Constructor,
             NodeKind::PrimaryConstructor,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         match c.kind(c.node()) {
@@ -4118,10 +4089,8 @@ pub(crate) mod type_annotate_public_apis {
 }
 
 pub(crate) mod prefer_void_to_null {
-    use super::{Check, Group, NodeKind, RuleSpec, member_name_typed, prefixed_type};
-    use crate::rules::{
-        MemberQuery, body_members, member_matches, same_file_ancestors, type_before,
-    };
+    use super::{Check, NodeKind, RuleSpec, member_name_typed, prefixed_type};
+    use crate::rules::{MemberQuery, body_members, member_matches, same_file_ancestors, type_before};
 
     /// The `augment` `ModSet` bit (bridge `mod_bits`).
     const AUGMENT_BIT: u16 = 1 << 1;
@@ -4148,14 +4117,11 @@ pub(crate) mod prefer_void_to_null {
     /// resolves through the prefix upstream and stays silent here (the
     /// documented under-report face). Message: `diagnostic.g.dart`
     /// `preferVoidToNull`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_void_to_null",
-        group: Group::Standalone,
-        problem: "Unnecessary use of the type 'Null'.",
-        correction: "Try using 'void' instead.",
-        kinds: &[NodeKind::Type],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_void_to_null",
+    &[NodeKind::Type],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let row = c.node();
@@ -4352,7 +4318,7 @@ pub(crate) mod prefer_void_to_null {
 }
 
 pub(crate) mod no_raw_types {
-    use super::{Check, Group, NodeKind, RuleSpec, raw_generic_face, type_arguments_row};
+    use super::{Check, NodeKind, RuleSpec, raw_generic_face, type_arguments_row};
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/no_raw_types.dart`
     /// — a written generic type without type arguments whose instantiation
@@ -4376,14 +4342,11 @@ pub(crate) mod no_raw_types {
     /// (`List<dynamic>`); a function/record bound renders as a
     /// `Function`/`(...)` placeholder. Message: `diagnostic.g.dart`
     /// `noRawTypes`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "no_raw_types",
-        group: Group::Standalone,
-        problem: "The generic type '{0}' should have explicit type arguments but doesn't.",
-        correction: "Use explicit type arguments for '{0}'.",
-        kinds: &[NodeKind::Type],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "no_raw_types",
+    &[NodeKind::Type],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let row = c.node();
@@ -4436,10 +4399,7 @@ pub(crate) mod no_raw_types {
 }
 
 pub(crate) mod always_specify_types {
-    use super::{PayloadField, 
-        Check, Group, NodeKind, RuleSpec, TYPE_FAMILY, first_type_child, raw_generic_face,
-        type_arguments_row,
-    };
+    use super::{PayloadField, Check, NodeKind, RuleSpec, TYPE_FAMILY, first_type_child, raw_generic_face, type_arguments_row};
     use crate::rules::{is_just_underscores, variables_declaration_keyword};
 
     const PROBLEM: &str = "Missing type annotation.";
@@ -4473,19 +4433,16 @@ pub(crate) mod always_specify_types {
     /// ([`super::raw_generic_face`]; under-report: imported user generics
     /// and prefixed spellings); the `@optionalTypeArgs` and `is`-parent
     /// exemptions follow the upstream faces.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "always_specify_types",
-        group: Group::Standalone,
-        problem: PROBLEM,
-        correction: ADD_TYPE,
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "always_specify_types",
+    &[
             NodeKind::Type,
             NodeKind::VariablesDeclaration,
             NodeKind::FormalParameter,
             NodeKind::DeclaredVariablePattern,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         match c.kind(c.node()) {
@@ -4679,10 +4636,7 @@ pub(crate) mod always_specify_types {
 }
 
 pub(crate) mod avoid_futureor_void {
-    use super::{PayloadField, 
-        Check, Group, NodeKind, RuleSpec, TYPE_FAMILY, first_type_child, type_argument_rows,
-        type_arguments_row, type_sibling_before,
-    };
+    use super::{PayloadField, Check, NodeKind, RuleSpec, TYPE_FAMILY, first_type_child, type_argument_rows, type_arguments_row, type_sibling_before};
     use crate::rules::NONE_TOKEN;
 
     /// The variance of a type position (the upstream `VarianceChecker`
@@ -4726,12 +4680,9 @@ pub(crate) mod avoid_futureor_void {
     /// (`p.FutureOr`) and `FutureOr<void>?`-with-nested-non-void spellings
     /// keep the documented under-report face. Message: `diagnostic.g.dart`
     /// `avoidFutureorVoid`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "avoid_futureor_void",
-        group: Group::Standalone,
-        problem: "Don't use the type 'FutureOr<void>'.",
-        correction: "Try using 'Future<void>?' or 'void'.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_futureor_void",
+    &[
             NodeKind::TopLevelMethod,
             NodeKind::Method,
             NodeKind::VariablesDeclaration,
@@ -4746,8 +4697,8 @@ pub(crate) mod avoid_futureor_void {
             NodeKind::ExtensionDeclaration,
             NodeKind::NamedMixinApplication,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         match c.kind(c.node()) {
@@ -5046,7 +4997,7 @@ pub(crate) mod avoid_futureor_void {
 }
 
 pub(crate) mod erase_dart_type_extension_types {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/erase_dart_type_extension_types.dart` — an
@@ -5065,14 +5016,11 @@ pub(crate) mod erase_dart_type_extension_types {
     /// (under-report); a user class named `Type` over-reports. The node
     /// anchors at the `is` operator, so the report span opens at the
     /// operand to keep the official's whole-expression shape.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "erase_dart_type_extension_types",
-        group: Group::Standalone,
-        problem: "Unsafe use of 'DartType' in an 'is' check.",
-        correction: "Ensure DartType extension types are erased by using a helper method.",
-        kinds: &[NodeKind::IsExpression],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "erase_dart_type_extension_types",
+    &[NodeKind::IsExpression],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -5100,10 +5048,7 @@ pub(crate) mod erase_dart_type_extension_types {
 // ports it once and the two rules carry only their predicate tables and
 // message templates. All name-level approximations are registered here once.
 
-use crate::rules::{
-    NONE_TOKEN, initialized_identifier_name, same_file_declaration, slice,
-    variables_declaration_keyword,
-};
+use crate::rules::{NONE_TOKEN, initialized_identifier_name, same_file_declaration, slice, variables_declaration_keyword};
 
 /// The library-type spellings one leak rule watches and the calls that
 /// count as a release. Upstream the predicates are interface questions
@@ -5833,7 +5778,7 @@ fn is_identifier_token(c: &Check<'_>, token: u32) -> bool {
 }
 
 pub(crate) mod cancel_subscriptions {
-    use super::{CANCEL_PREDICATES, Check, Group, NodeKind, RuleSpec, leak_detector_check};
+    use super::{CANCEL_PREDICATES, Check, NodeKind, RuleSpec, leak_detector_check};
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/cancel_subscriptions.dart` — a
@@ -5848,18 +5793,15 @@ pub(crate) mod cancel_subscriptions {
     /// shadow gate; an extension type conforming through its `implements`
     /// clause is watched (the header spells the interface). Message:
     /// `diagnostic.g.dart` `cancelSubscriptions`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "cancel_subscriptions",
-        group: Group::Standalone,
-        problem: "Uncancelled instance of 'StreamSubscription'.",
-        correction: "Try invoking 'cancel' in the function in which the 'StreamSubscription' was created.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "cancel_subscriptions",
+    &[
             NodeKind::Fields,
             NodeKind::VariablesDeclaration,
             NodeKind::PrimaryConstructor,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         leak_detector_check(c, &CANCEL_PREDICATES);
@@ -5867,7 +5809,7 @@ pub(crate) mod cancel_subscriptions {
 }
 
 pub(crate) mod close_sinks {
-    use super::{CLOSE_PREDICATES, Check, Group, NodeKind, RuleSpec, leak_detector_check};
+    use super::{CLOSE_PREDICATES, Check, NodeKind, RuleSpec, leak_detector_check};
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/close_sinks.dart` — a `Sink`-typed (or
@@ -5879,18 +5821,15 @@ pub(crate) mod close_sinks {
     /// gate): the differential gate's live oracle (fvm 3.13.1) answers
     /// this rule local-only there, the documented version drift the
     /// lints-new corpus pins. Message: `diagnostic.g.dart` `closeSinks`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "close_sinks",
-        group: Group::Standalone,
-        problem: "Unclosed instance of 'Sink'.",
-        correction: "Try invoking 'close' in the function in which the 'Sink' was created.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "close_sinks",
+    &[
             NodeKind::Fields,
             NodeKind::VariablesDeclaration,
             NodeKind::PrimaryConstructor,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         leak_detector_check(c, &CLOSE_PREDICATES);
@@ -5898,11 +5837,8 @@ pub(crate) mod close_sinks {
 }
 
 pub(crate) mod tighten_type_of_initializing_formals {
-    use super::{PayloadField, Check, Group, NodeKind, RuleSpec, leak_formal_rows};
-    use crate::rules::{
-        NONE_TOKEN, TypeFace, body_members, initialized_identifier_name, same_file_ancestors,
-        slice, type_face, variables_declaration_keyword,
-    };
+    use super::{PayloadField, Check, NodeKind, RuleSpec, leak_formal_rows};
+    use crate::rules::{NONE_TOKEN, TypeFace, body_members, initialized_identifier_name, same_file_ancestors, slice, type_face, variables_declaration_keyword};
 
     /// Official: `upstream Dart SDK source,
     /// pkg/linter/lib/src/rules/tighten_type_of_initializing_formals.dart`
@@ -5930,14 +5866,11 @@ pub(crate) mod tighten_type_of_initializing_formals {
     /// The condition must be a bare binary (`condition is!
     /// BinaryExpression`, :77 — a parenthesized condition skips).
     /// Message: `diagnostic.g.dart` `tightenTypeOfInitializingFormals`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "tighten_type_of_initializing_formals",
-        group: Group::Standalone,
-        problem: "Use a type annotation rather than 'assert' to enforce non-nullability.",
-        correction: "Try adding a type annotation and removing the 'assert'.",
-        kinds: &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "tighten_type_of_initializing_formals",
+    &[NodeKind::Constructor, NodeKind::PrimaryConstructor],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -7407,7 +7340,7 @@ fn enclosing_type_parameter(c: &Check<'_>, from: u32, name: &str) -> Option<(u32
 }
 
 pub(crate) mod unsafe_variance {
-    use super::{Check, Group, NodeKind, RuleSpec, first_type_child, type_sibling_before};
+    use super::{Check, NodeKind, RuleSpec, first_type_child, type_sibling_before};
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unsafe_variance.dart`
     /// — a type parameter of a class, mixin, or enum occurring in a
@@ -7433,14 +7366,11 @@ pub(crate) mod unsafe_variance {
     /// `RuleState.experimental()` is registry metadata, not an enable gate —
     /// so the port registers unconditionally and enables by name only.
     /// Message: `diagnostic.g.dart` `unsafeVariance`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "unsafe_variance",
-        group: Group::Standalone,
-        problem: "This type is unsafe: a type parameter occurs in a non-covariant position.",
-        correction: "Try using a more general type that doesn't contain any type parameters in such a position.",
-        kinds: &[NodeKind::Method, NodeKind::VariablesDeclaration],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unsafe_variance",
+    &[NodeKind::Method, NodeKind::VariablesDeclaration],
+    check,
+);
 
     /// The static `ModSet` bit (bridge `mod_bits`; the member flags share the
     /// `STATIC` position with the field face).

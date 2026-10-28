@@ -1,0 +1,135 @@
+// Ported by port_upstream from the upstream linter test file
+// (pkg/linter/test/rules, upstream Dart SDK source); regenerate
+// with the converter rather than editing. Case names are the
+// upstream test method names, verbatim. The first file block of
+// each case is the analyzed unit; later blocks are the test's
+// supporting files.
+//- lint: constant_identifier_names
+
+//- case: test_augmentationEnum
+//- file: /lib/test.dart
+
+part of 'a.dart';
+
+augment enum E {
+  [!Xy!];
+}
+//- file: /liba.dart
+
+part 'test.dart';
+
+enum E {
+  a;
+}
+
+//- case: test_augmentationTopLevelVariable
+//- file: /lib/test.dart
+
+part of 'a.dart';
+
+const [!PI!] = 3.14;
+//- file: /liba.dart
+
+part 'test.dart';
+
+//- case: test_destructuredConstField
+//- file: /lib/test.dart
+
+class A {
+  static const [!AA!] = (1, );
+}
+
+//- case: test_destructuredConstVariable
+//- file: /lib/test.dart
+
+const [!AA!] = (1, );
+
+//- case: test_destructuredFinalVariable
+//- file: /lib/test.dart
+
+void f() {
+  final ([!AA!], ) = (1, );
+}
+
+//- case: test_destructuredObjectField_switch
+//- file: /lib/test.dart
+
+class A {
+  var a;
+}
+
+f(A a) {
+  switch (a) {
+    case A(a: int /*[0*/a_b/*0]*/):
+  }
+  switch (a) {
+    case A(a: int /*[1*/a_b/*1]*/?):
+    case A(a: int /*[2*/a_b/*2]*/!):
+  }
+}
+
+//- case: test_destructuredObjectField_switch_ok
+//- file: /lib/test.dart
+
+class A {
+  var a_b;
+}
+
+f(A a) {
+  switch (a) {
+    case A(:var a_b):
+  }
+  switch (a) {
+    case A(:var a_b?):
+    case A(:var a_b!):
+  }
+}
+
+//- case: test_enumValue_upperFirstLetter
+//- file: /lib/test.dart
+
+enum Foo {
+  bar,
+  [!Baz!],
+}
+
+//- case: test_recordFieldDestructured
+//- file: /lib/test.dart
+
+f(Object o) {
+  if (o case (x: int [!x_x!], z: int z)) { }
+}
+
+//- case: test_recordFieldDestructured_ok
+//- file: /lib/test.dart
+
+f(Object o) {
+  if (o case (x_y: int x, z: int z)) { }
+}
+
+//- case: test_recordTypeDeclarations
+//- file: /lib/test.dart
+
+const [!RR!] = (x: 1);
+
+//- case: test_recordTypeDeclarations_ok
+//- file: /lib/test.dart
+
+const r = (x: 1);
+
+//- case: test_staticField_allCaps
+//- file: /lib/test.dart
+
+class C {
+  static const [!DEBUG!] = false;
+}
+
+//- case: test_topLevel_allCaps
+//- file: /lib/test.dart
+
+const [!PI!] = 3.14;
+
+//- case: test_topLevel_screamingSnake
+//- file: /lib/test.dart
+
+const [!CCC_CCC!] = 1000;

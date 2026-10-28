@@ -1,8 +1,5 @@
-use super::{Check, Group, NodeKind, RuleSpec, member_declaration_name, operator_name};
-use crate::rules::{
-    MemberQuery, has_doc_comment, member_annotations, member_is_concrete, member_matches,
-    same_file_ancestors, token_seq_equal, type_before,
-};
+use super::{Check, NodeKind, RuleSpec, member_declaration_name, operator_name};
+use crate::rules::{MemberQuery, has_doc_comment, member_annotations, member_is_concrete, member_matches, same_file_ancestors, token_seq_equal, type_before};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_overrides.dart`
 /// — an override whose body is exactly a super forward with the same
@@ -38,14 +35,11 @@ use crate::rules::{
 /// annotation names (the element-face posture). The noSuchMethod and
 /// doc-comment skips (:76-79) port directly. Message:
 /// `diagnostic.g.dart` `unnecessaryOverrides`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_overrides",
-    group: Group::Core,
-    problem: "Unnecessary override.",
-    correction: "Try adding behavior in the overriding member or removing the override.",
-    kinds: &[NodeKind::Method],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_overrides",
+    &[NodeKind::Method],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // Static skip (:56) — header ModSet bit (static is bit 3).

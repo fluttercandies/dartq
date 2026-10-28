@@ -1,4 +1,4 @@
-use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec, last_child};
+use super::{Check, NONE_TOKEN, NodeKind, RuleSpec, last_child};
 
 /// Official: `pkg/linter/lib/src/rules/control_flow_in_finally.dart:24-107`
 /// — `break`/`continue`/`return` inside a `finally` block reports, unless
@@ -20,18 +20,15 @@ use super::{Check, Group, NONE_TOKEN, NodeKind, RuleSpec, last_child};
 /// reads the members over the production tiling (the same rows the
 /// `exhaustive_cases` member walk collects); a label declared inside a
 /// case BODY (a labeled statement within a member) scopes normally.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "control_flow_in_finally",
-    group: Group::Recommended,
-    problem: "Use of '{0}' in a 'finally' clause.",
-    correction: "Try restructuring the code.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "control_flow_in_finally",
+    &[
         NodeKind::Break,
         NodeKind::Continue,
         NodeKind::ReturnStatement,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();
@@ -92,9 +89,31 @@ fn check(c: &mut Check<'_>) {
         _ => !closure_wraps(c, try_idx + 1, node_idx),
     };
     if report {
-        let range = c.utf16_span(node);
-        c.report(range, &[kind]);
+        // The official reports the whole statement (`reportAtNode`) —
+        // analyzer statement spans carry their `;`. The production rows
+        // anchor Break/Continue at the keyword alone (the label and `;`
+        // are derivable), so the end extends through the statement's `;`
+        // when one follows; hand-built tables already span it (the probe
+        // token then is not a `;` and the node span stands).
+        let span = c.utf16_span(node);
+        let end = semicolon_end(c, node).unwrap_or(span.end);
+        c.report(span.start..end, &[kind]);
     }
+}
+
+/// The UTF-16 end of the statement's `;` when the token follows the
+/// node's span (past a targeted jump's label, the payload `has_target`
+/// bit), `None` otherwise.
+fn semicolon_end(c: &Check<'_>, node: u32) -> Option<u32> {
+    let mut probe = c.unit.ast.token_range(node).end;
+    if c.payload(node).first().copied().unwrap_or(0) != 0 {
+        probe += 1;
+    }
+    let token = c.unit.tokens.get(probe as usize)?;
+    if token.kind != dartq_scanner::TokenKind::Semicolon {
+        return None;
+    }
+    c.utf16_end_of_token(probe)
 }
 
 /// The resolved jump target's row, `None` for the official

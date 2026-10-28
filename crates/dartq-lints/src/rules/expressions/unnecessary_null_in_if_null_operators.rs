@@ -1,18 +1,15 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_null_in_if_null_operators.dart:34-49`
 /// — `a ?? null` (or `null ?? a`) reports at the `null` literal, right
 /// operand first. The operator is payload word 0, operands the two
 /// children (the `BinaryExpression` payload). Message:
 /// `diagnostic.g.dart` `unnecessaryNullInIfNullOperators`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_null_in_if_null_operators",
-    group: Group::Recommended,
-    problem: "Unnecessary use of '??' with 'null'.",
-    correction: "Try removing the '??' operator and the 'null' operand.",
-    kinds: &[NodeKind::BinaryExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_null_in_if_null_operators",
+    &[NodeKind::BinaryExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

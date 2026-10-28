@@ -1,14 +1,18 @@
-//! The analyze/check faces' cross-process renderers: the one writer per
-//! output format that BOTH the CLI's cold path and the daemon's routed
-//! face (`dartq/analyze`/`dartq/check` with a `format` parameter, #2627)
-//! render through — one renderer per format, by relocation rather than
+//! The cross-process renderers: the one writer per output format that
+//! BOTH the CLI's cold path and the daemon's routed faces (the
+//! `dartq/*` requests carrying a `format` parameter, #2627/#2629) render
+//! through — one renderer per format, by relocation rather than
 //! duplication, so the routed bytes are the cold bytes structurally.
 //!
 //! * [`lon_line`]/[`write_lon`] — one canonical LON line of a document
-//!   value (the `lon` crate's encoder; the document itself comes from the
-//!   shared [`crate::analyze::diags_document`] builder, #2657);
+//!   value (the `lon` crate's encoder; the analyze document itself comes
+//!   from the shared [`crate::analyze::diags_document`] builder, #2657);
 //! * [`write_human`] (+[`text_diag_row`]) — the analyze/check `text`
 //!   face: the `root:` line, per-file groups, the count tail;
+//! * [`write_json_value`]/[`write_text_value`] — the generic value
+//!   faces: the single-line JSON spelling and the indented text spelling
+//!   every answer-valued face (query, explain, impact, rename, resolve,
+//!   completion) prints through on both paths (#2629);
 //! * the `json` face's oracle envelope writer stays in `dartq-diagnostics`
 //!   (`write_json`) — it was already the one implementation.
 //!
@@ -102,4 +106,25 @@ pub fn write_human(
         1 => writeln!(out, "1 issue found."),
         n => writeln!(out, "{n} issues found."),
     }
+}
+
+/// The generic `json` face over one answer value: the value's single-line
+/// JSON spelling plus the newline. The one writer the answer-valued faces
+/// (query, explain, impact, rename, resolve, completion) print through on
+/// both the cold CLI path and the daemon's routed arm (#2629) — the
+/// `Display` of a `Value` is its `to_string`, so every face's bespoke
+/// "write the value plus a newline" reduces to this.
+pub fn write_json_value(out: &mut impl Write, value: &Value) -> io::Result<()> {
+    writeln!(out, "{value}")
+}
+
+/// The generic `text` face over one answer value: the indented pretty
+/// spelling plus the newline (the read verbs without a bespoke human
+/// renderer — the same face the CLI's `--format text` prints).
+pub fn write_text_value(out: &mut impl Write, value: &Value) -> io::Result<()> {
+    writeln!(
+        out,
+        "{}",
+        serde_json::to_string_pretty(value).expect("the value pretty-prints")
+    )
 }

@@ -1,6 +1,6 @@
 use dartq_semantic::model::MemberKind;
 
-use super::{Check, Group, NodeKind, RuleSpec, query_site, same_file};
+use super::{Check, NodeKind, RuleSpec, query_site, same_file};
 use crate::rules::{body_members, get_set_token, same_file_declaration, slice, type_face};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_statements.dart`
@@ -57,18 +57,15 @@ use crate::rules::{body_members, get_set_token, same_file_declaration, slice, ty
 /// structurally dead over the statement tiling (an `ExpressionStatement`
 /// row always sits in a block-family owner). Message: `diagnostic.g.dart`
 /// `unnecessaryStatements`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_statements",
-    group: Group::Standalone,
-    problem: "Unnecessary statement.",
-    correction: "Try completing the statement or breaking it up.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_statements",
+    &[
         NodeKind::ExpressionStatement,
         NodeKind::ForStatement,
         NodeKind::Cascade,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // The wave posture: the rule reads the semantic face; face absent

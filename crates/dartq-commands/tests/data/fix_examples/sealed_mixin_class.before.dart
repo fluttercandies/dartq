@@ -1,0 +1,1 @@
+sealed mixin class C {}

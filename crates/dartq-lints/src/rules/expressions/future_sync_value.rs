@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, slice, static_type_faces};
+use super::{Check, NodeKind, RuleSpec, slice, static_type_faces};
 use crate::rules::{same_file_declaration, utf16_token_span};
 
 /// Official: `upstream Dart SDK source,
@@ -30,18 +30,15 @@ use crate::rules::{same_file_declaration, utf16_token_span};
 /// implicit-creation face; cross-file callee types the faces cannot
 /// read report through the null-type posture. Message:
 /// `diagnostic.g.dart` `futureSyncValue`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "future_sync_value",
-    group: Group::Standalone,
-    problem: "For synchronous values, `Future.syncValue` is more performant.",
-    correction: "Try replacing `Future.value` with `Future.syncValue`.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "future_sync_value",
+    &[
         NodeKind::NewExpression,
         NodeKind::ImplicitCreation,
         NodeKind::Send,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // `constructorSince = Version(3, 10, 0)`: the effective library

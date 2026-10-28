@@ -1,0 +1,58 @@
+// Ported by port_upstream from the upstream linter test file
+// (pkg/linter/test/rules, upstream Dart SDK source); regenerate
+// with the converter rather than editing. Case names are the
+// upstream test method names, verbatim. The first file block of
+// each case is the analyzed unit; later blocks are the test's
+// supporting files.
+//- lint: avoid_empty_else
+
+//- case: test_else_emptyStatement_hasElseIf
+//- file: /lib/test.dart
+
+void f() {
+  var x = 0;
+  var y = 1;
+  if (x > y)
+    print('');
+  else if (x < y)
+    print('');
+  else [!;!]
+    print('');
+}
+
+//- case: test_else_emptyStatement_noElseIf
+//- file: /lib/test.dart
+
+void f() {
+  var x = 0;
+  var y = 1;
+  if (x > y)
+    print('');
+  else [!;!]
+    print('');
+}
+
+//- case: test_else_noEmptyStatement_enclosed
+//- file: /lib/test.dart
+
+void f() {
+  var x = 0;
+  var y = 1;
+  if (x > y) {
+    print('');
+  } else {
+    print('');
+  }
+}
+
+//- case: test_else_noEmptyStatement_notEnclosed
+//- file: /lib/test.dart
+
+void f() {
+  var x = 0;
+  var y = 1;
+  if (x > y)
+    print('');
+  else
+    print('');
+}

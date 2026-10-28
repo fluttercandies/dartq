@@ -1,12 +1,5 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, constructor_name_part, container_members,
-    container_name_node, initializer_expression, modifier_keyword, parameter_name,
-    parameter_rows,
-};
-use crate::rules::{
-    NONE_TOKEN, SupertypeClause, initialized_identifier_name, supertypes, utf16_token_span,
-    variables_declaration_keyword,
-};
+use super::{Check, NodeKind, RuleSpec, constructor_name_part, container_members, container_name_node, initializer_expression, modifier_keyword, parameter_name, parameter_rows};
+use crate::rules::{NONE_TOKEN, SupertypeClause, initialized_identifier_name, supertypes, utf16_token_span, variables_declaration_keyword};
 use dartq_ast::mod_flags;
 use dartq_language::LanguageVersion;
 use dartq_parser::{IdentifierContext, MemberKind};
@@ -41,14 +34,11 @@ const ABSTRACT_BIT: u16 = 1 << 2;
 /// (upstream `isFeatureEnabled` at registration; the per-dispatch
 /// consult is observationally identical). Message: `diagnostic.g.dart`
 /// `useEnums`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "use_enums",
-    group: Group::Standalone,
-    problem: "Class should be an enum.",
-    correction: "Try using an enum rather than a class.",
-    kinds: &[NodeKind::ClassDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_enums",
+    &[NodeKind::ClassDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // `context.isFeatureEnabled(Feature.enhanced_enums)` (:32).

@@ -1,7 +1,4 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, get_set_token, is_identifier_token, parameter_name,
-    parameters_bind,
-};
+use super::{Check, NodeKind, RuleSpec, get_set_token, is_identifier_token, parameter_name, parameters_bind};
 use crate::rules::expressions::static_type_faces as faces;
 use dartq_semantic::model::Ty;
 
@@ -31,17 +28,14 @@ use dartq_semantic::model::Ty;
 /// direction (`writeType` is a resolved product — collection literals,
 /// chains and unknowns stay silent). Message: `diagnostic.g.dart`
 /// `unnecessaryGettersSetters`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_getters_setters",
-    group: Group::Recommended,
-    problem: "Unnecessary use of getter and setter to wrap a field.",
-    correction: "Try removing the getter and setter and renaming the field.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_getters_setters",
+    &[
         NodeKind::ClassDeclaration,
         NodeKind::ExtensionTypeDeclaration,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

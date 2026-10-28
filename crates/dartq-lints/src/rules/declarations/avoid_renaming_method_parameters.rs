@@ -1,8 +1,5 @@
-use super::{Check, Group, NodeKind, RuleSpec};
-use crate::rules::{
-    MemberQuery, class_declaration_name, has_doc_comment, member_is_concrete, member_matches,
-    same_file_ancestors, utf16_token_span,
-};
+use super::{Check, NodeKind, RuleSpec};
+use crate::rules::{MemberQuery, class_declaration_name, has_doc_comment, member_is_concrete, member_matches, same_file_ancestors, utf16_token_span};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/avoid_renaming_method_parameters.dart`
 /// — an overriding method whose positional parameter names differ from
@@ -30,14 +27,11 @@ use crate::rules::{
 /// shipped default). The augmentation branch (:82-88) stays unported
 /// (augmentations are scanner-gated off).
 /// Message: `diagnostic.g.dart` `avoidRenamingMethodParameters`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_renaming_method_parameters",
-    group: Group::Recommended,
-    problem: "The parameter name '{0}' doesn't match the name '{1}' in the overridden method.",
-    correction: "Try changing the name to '{1}'.",
-    kinds: &[NodeKind::Method],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_renaming_method_parameters",
+    &[NodeKind::Method],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     // Static skip (:56) — header ModSet bit (static is bit 3).

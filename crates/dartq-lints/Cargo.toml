@@ -20,6 +20,12 @@ dartq-source = { workspace = true }
 memchr = { workspace = true }
 rustc-hash = { workspace = true }
 
+# The `test-support` feature's bridge deps (see below): same two crates the
+# dev-dependencies carry, optional on the regular edge so a feature-off
+# build links neither.
+dartq-engine = { workspace = true, optional = true }
+dartq-resolution = { workspace = true, optional = true }
+
 # The semantic-rule tests build the library context the #1049 face takes
 # (graph, namespaces) — a test-only edge; the production crate never
 # walks the resolution layer. The engine joins for the same reason: the
@@ -27,7 +33,17 @@ rustc-hash = { workspace = true }
 # table.
 [dev-dependencies]
 dartq-engine = { workspace = true }
+dartq-fixture = { workspace = true }
 dartq-resolution = { workspace = true }
+
+[features]
+# Exposes the in-crate test bridge (`testsupport`) to out-of-crate fixture
+# harnesses (the dartq-fixture crate's behavioral port runner): the
+# production parse/run/semantic-fold entry points that plain builds keep
+# `cfg(test)`-private. Feature-off builds are byte-identical to before the
+# feature existed — the module compiles under `cfg(test)` exactly as it
+# always has.
+test-support = ["dep:dartq-engine", "dep:dartq-resolution"]
 
 [lints]
 workspace = true

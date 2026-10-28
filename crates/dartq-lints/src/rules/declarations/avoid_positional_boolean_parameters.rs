@@ -1,12 +1,6 @@
 use super::constructor_name_part;
-use super::{
-    AUGMENT_MEMBER_BIT, Check, Group, NodeKind, RuleSpec, formal_parameter_rows,
-    member_declaration_name, same_class_field_type,
-};
-use crate::rules::{
-    MemberQuery, NONE_TOKEN, body_members, get_set_token, member_matches, member_name,
-    same_file_ancestors,
-};
+use super::{AUGMENT_MEMBER_BIT, Check, NodeKind, RuleSpec, formal_parameter_rows, member_declaration_name, same_class_field_type};
+use crate::rules::{MemberQuery, NONE_TOKEN, body_members, get_set_token, member_matches, member_name, same_file_ancestors};
 use dartq_ast::mod_flags;
 
 /// Official:
@@ -25,12 +19,9 @@ use dartq_ast::mod_flags;
 /// same-class field's written type. The override face folds to the
 /// same-file concrete ancestor scan (cross-file overrides
 /// under-report); augmentations read the member `ModSet` augment bit.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_positional_boolean_parameters",
-    group: Group::Standalone,
-    problem: "'bool' parameters should be named parameters.",
-    correction: "Try converting the parameter to a named parameter.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_positional_boolean_parameters",
+    &[
         NodeKind::Constructor,
         NodeKind::TopLevelMethod,
         NodeKind::Method,
@@ -39,7 +30,7 @@ pub(crate) static SPEC: RuleSpec = RuleSpec {
         NodeKind::FunctionType,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

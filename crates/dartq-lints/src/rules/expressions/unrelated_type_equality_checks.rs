@@ -1,9 +1,6 @@
 use dartq_semantic::model::{ArgListId, Ty};
 
-use super::{
-    Check, Group, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces,
-    switch_scrutinee_read,
-};
+use super::{Check, NodeKind, RuleSpec, query_site, same_file, slice, static_type_faces, switch_scrutinee_read};
 use crate::rules::utf16_token_span;
 
 /// The pattern-face problem text (`unrelatedTypeEqualityChecksInPattern`,
@@ -39,14 +36,11 @@ const PATTERN_PROBLEM: &str = "The type of the operand ('{0}') isn't a subtype o
 /// the switch scrutinee read's own span (an if-case carries no switch
 /// ancestor and stays silent). Message: `diagnostic.g.dart`
 /// `unrelatedTypeEqualityChecksInExpression`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unrelated_type_equality_checks",
-    group: Group::Core,
-    problem: "The type of the right operand ('{0}') isn't a subtype or a supertype of the left operand ('{1}').",
-    correction: "Try changing one or both of the operands.",
-    kinds: &[NodeKind::BinaryExpression, NodeKind::RelationalPattern],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unrelated_type_equality_checks",
+    &[NodeKind::BinaryExpression, NodeKind::RelationalPattern],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     if c.kind(c.node()) == NodeKind::RelationalPattern {

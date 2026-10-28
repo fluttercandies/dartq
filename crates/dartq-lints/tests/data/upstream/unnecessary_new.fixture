@@ -1,0 +1,84 @@
+// Ported by port_upstream from the upstream linter test file
+// (pkg/linter/test/rules, upstream Dart SDK source); regenerate
+// with the converter rather than editing. Case names are the
+// upstream test method names, verbatim. The first file block of
+// each case is the analyzed unit; later blocks are the test's
+// supporting files.
+//- lint: unnecessary_new
+
+//- case: test_named_new
+//- file: /lib/test.dart
+
+class A {
+  A.named();
+}
+
+void f() {
+  [!new!] A.named();
+}
+
+//- case: test_named_noNew
+//- file: /lib/test.dart
+
+class A {
+  A.named();
+}
+
+void f() {
+  A.named();
+}
+
+//- case: test_unnamed_const
+//- file: /lib/test.dart
+
+class A {
+  const A();
+}
+
+void f() {
+  const A();
+}
+
+//- case: test_unnamed_new
+//- file: /lib/test.dart
+
+class A {
+  const A();
+}
+
+void f() {
+  [!new!] A();
+}
+
+//- case: test_unnamed_newName_const
+//- file: /lib/test.dart
+
+class A {
+  const A();
+}
+
+void f() {
+  const A.new();
+}
+
+//- case: test_unnamed_newName_new
+//- file: /lib/test.dart
+
+class A {
+  const A();
+}
+
+void f() {
+  [!new!] A.new();
+}
+
+//- case: test_unnamed_noNew
+//- file: /lib/test.dart
+
+class A {
+  const A();
+}
+
+void f() {
+  A();
+}

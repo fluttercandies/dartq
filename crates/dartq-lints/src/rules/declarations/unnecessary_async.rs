@@ -1,6 +1,4 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, async_words, member_declaration_name, override_annotation,
-};
+use super::{Check, NodeKind, RuleSpec, async_words, member_declaration_name, override_annotation};
 use crate::rules::{NONE_TOKEN, is_statement_row, last_child, type_before, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_async.dart:100-203`
@@ -26,18 +24,15 @@ use crate::rules::{NONE_TOKEN, is_statement_row, last_child, type_before, utf16_
 /// same-file ancestor declares the name (the resolved overridden
 /// return type may be `Future`). Message: `diagnostic.g.dart`
 /// `unnecessaryAsync`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_async",
-    group: Group::Standalone,
-    problem: "Don't make a function 'async' if it doesn't use 'await'.",
-    correction: "Try removing the 'async' modifier.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_async",
+    &[
         NodeKind::TopLevelMethod,
         NodeKind::Method,
         NodeKind::LocalFunctionDeclaration,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

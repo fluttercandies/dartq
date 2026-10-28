@@ -17,6 +17,7 @@ members = [
     "crates/dartq-flow",
     "crates/dartq-index",
     "crates/dartq-diagnostics",
+    "crates/dartq-fixture",
     "crates/dartq-lints",
     "crates/dartq-snapshot",
     "crates/dartq-plugin",
@@ -33,6 +34,7 @@ members = [
     "tools/bench-corpus-gen",
     "tools/corpus-gen",
     "tools/sdk-faces-gen",
+    "tools/upstream-gen",
 ]
 
 [workspace.package]
@@ -89,6 +91,7 @@ dartq-daemon = { path = "crates/dartq-daemon", version = "0.1.0" }
 dartq-debug = { path = "crates/dartq-debug", version = "0.1.0" }
 dartq-diagnostics = { path = "crates/dartq-diagnostics", version = "0.1.0" }
 dartq-engine = { path = "crates/dartq-engine", version = "0.1.0" }
+dartq-fixture = { path = "crates/dartq-fixture", version = "0.1.0" }
 dartq-flow = { path = "crates/dartq-flow", version = "0.1.0" }
 dartq-index = { path = "crates/dartq-index", version = "0.1.0" }
 dartq-language = { path = "crates/dartq-language", version = "0.1.0" }

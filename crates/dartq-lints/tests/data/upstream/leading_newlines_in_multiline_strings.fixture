@@ -1,0 +1,60 @@
+// Ported by port_upstream from the upstream linter test file
+// (pkg/linter/test/rules, upstream Dart SDK source); regenerate
+// with the converter rather than editing. Case names are the
+// upstream test method names, verbatim. The first file block of
+// each case is the analyzed unit; later blocks are the test's
+// supporting files.
+//- lint: leading_newlines_in_multiline_strings
+
+//- case: test_emptyString
+//- file: /lib/test.dart
+
+var x = '''''';
+
+//- case: test_leadingNewline
+//- file: /lib/test.dart
+
+var x = '''
+this is a multiline string''';
+
+//- case: test_leadingNewline_withInterpolation
+//- file: /lib/test.dart
+
+var a = 'a';
+var x = '''
+this is a multiline string $a''';
+
+//- case: test_noNewline
+//- file: /lib/test.dart
+
+var x = '''this is a multiline string''';
+
+//- case: test_noNewline_doubleQuotes
+//- file: /lib/test.dart
+
+var x = """uses double quotes""";
+
+//- case: test_noNewline_interpolation
+//- file: /lib/test.dart
+
+var a = 'a';
+var x = '''$a''';
+
+//- case: test_noNewline_withInterpolation
+//- file: /lib/test.dart
+
+var a = 'a';
+var x = '''this is a multiline string $a''';
+
+//- case: test_textBeforeNewline
+//- file: /lib/test.dart
+
+var x = [!'''this
+ is a multiline string'''!];
+
+//- case: test_textBeforeNewline_withInterpolation
+//- file: /lib/test.dart
+
+var a = 'a';
+var x = [!'''this
+ is a multiline string$a'''!];

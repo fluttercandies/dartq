@@ -2655,6 +2655,17 @@ pub fn spec_for(code: &str) -> Option<&'static FixSpec> {
         .map(|index| &FIX_TABLE[index])
 }
 
+/// The whole table in row order — the generated example suite's
+/// completeness gate (`tests/fix_examples.rs`): every row must own a
+/// checked-in before/after example pair or a named allow-list entry, so a
+/// row added without either fails that test. Test-facing only; the
+/// production lookups stay on [`spec_for`].
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn all_specs() -> &'static [FixSpec] {
+    FIX_TABLE
+}
+
 /// Whether `code` is one of the engine-sourced codes [`crate::fix::from_semantic`]
 /// or [`crate::fix::from_parser`] materializes — the engine pass's early
 /// filter (the table's semantic and parser rows are the set).

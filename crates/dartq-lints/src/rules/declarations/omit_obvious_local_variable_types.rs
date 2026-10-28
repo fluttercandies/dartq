@@ -1,7 +1,4 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, every_initializer_obvious, for_each_iterable,
-    local_written_type, obvious_spelling, utf16_token_run_span,
-};
+use super::{Check, NodeKind, RuleSpec, every_initializer_obvious, for_each_iterable, local_written_type, obvious_spelling, utf16_token_run_span};
 
 /// Official: `pkg/linter/lib/src/rules/omit_obvious_local_variable_types.dart:46-90`
 /// — a local variable declaration (statement or C-style for
@@ -16,14 +13,11 @@ use super::{
 /// written `Null` skips (:76); a bare identifier, `dynamic` and every
 /// face the matcher cannot name under-report. Message:
 /// `diagnostic.g.dart` `omitObviousLocalVariableTypes`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "omit_obvious_local_variable_types",
-    group: Group::Standalone,
-    problem: "Omit the type annotation on a local variable when the type is obvious.",
-    correction: "Try removing the type annotation.",
-    kinds: &[NodeKind::VariablesDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "omit_obvious_local_variable_types",
+    &[NodeKind::VariablesDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

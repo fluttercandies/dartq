@@ -413,25 +413,46 @@ pub(crate) fn is_just_underscores(name: &str) -> bool {
 }
 
 /// Whether `pattern` (a [`NodeKind::DeclaredVariablePattern`]) is the
-/// right-hand side of an object-pattern field-name shortcut, `Foo(:name)` —
-/// the official `isFieldNameShortcut` guard: the parent `PatternField`
-/// carries a `NamedRecordField` whose name equals the bound variable's name
-/// (constant_identifier_names.dart:49-52, no_leading_underscores...dart:70-73).
+/// right-hand side of an object-pattern field-name shortcut, `Foo(:name)`
+/// — the official `isFieldNameShortcut` guard
+/// (constant_identifier_names.dart:49-52,
+/// no_leading_underscores...dart:70-73): the enclosing
+/// [`NodeKind::PatternField`] carries no explicit label
+/// (`handleNoName`, extensions.dart:226-231), which covers `:name`,
+/// `:var name`, and the null-check/assert-wrapped `:var name?` alike
+/// (the wrapper unwraps before the field test).
+///
+/// Production tiling: the field seals childless AFTER its sub-pattern
+/// (`handle_pattern_field` is one atomic begin+end), so the pattern's
+/// arena parent is the record/object container, not the field — the
+/// enclosing field is the first FOLLOWING `PatternField` row that
+/// touches the pattern's span (fields seal in order, so a later field
+/// starts past this pattern's end; a null-check/assert wrapper shifts
+/// the field's begin anchor onto the `?`/`!`, hence touching rather
+/// than covering). A hand-built tree keeps the field as the direct
+/// parent. The field's colon word IS the `:` token for the name-less
+/// form and the label identifier when named (the
+/// `simplify_variable_pattern` word-0 face).
 pub(crate) fn is_field_name_shortcut(c: &Check<'_>, pattern: u32) -> bool {
-    let Some(name) = c.field(pattern, PayloadField::Variable) else {
-        return false;
-    };
-    let Some(parent) = c.ancestor(1) else {
-        return false;
-    };
-    if c.kind(parent) != NodeKind::PatternField {
-        return false;
-    }
-    c.collect_direct(parent).into_iter().any(|field| {
-        c.kind(field) == NodeKind::NamedRecordField
-            && c.collect_direct(field).into_iter().any(|id| {
-                c.kind(id) == NodeKind::Identifier && c.lexeme(c.head_token(id)) == c.lexeme(name)
+    let field = c
+        .ancestor(1)
+        .filter(|&parent| c.kind(parent) == NodeKind::PatternField)
+        .or_else(|| {
+            let span = c.byte_span(pattern);
+            (pattern + 1..c.unit.ast.len() as u32).find(|&row| {
+                c.kind(row) == NodeKind::PatternField && {
+                    let field = c.byte_span(row);
+                    field.start <= span.end && span.start <= field.end
+                }
             })
+        });
+    field.is_some_and(|field| {
+        // NONE marks a positional field, a label identifier names the
+        // field — only the `:` token itself is the shortcut face.
+        c.payload(field)
+            .first()
+            .copied()
+            .is_some_and(|colon| colon != NONE_TOKEN && c.lexeme(colon) == ":")
     })
 }
 

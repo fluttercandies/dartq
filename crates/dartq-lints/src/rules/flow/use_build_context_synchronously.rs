@@ -1,6 +1,6 @@
 use std::path::Component;
 
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: upstream Dart SDK source,
 /// `pkg/linter/lib/src/rules/use_build_context_synchronously.dart` —
@@ -32,14 +32,11 @@ use super::{Check, Group, NodeKind, RuleSpec};
 /// closure-internal uses emit no rows and so never report here. The
 /// closure face is the substrate's to add — the shell never re-walks
 /// flow or guesses verdicts.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "use_build_context_synchronously",
-    group: Group::Standalone,
-    problem: ASYNC_USE_PROBLEM,
-    correction: ASYNC_USE_CORRECTION,
-    kinds: &[NodeKind::CompilationUnit],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_build_context_synchronously",
+    &[NodeKind::CompilationUnit],
     check,
-};
+);
 
 const ASYNC_USE_PROBLEM: &str = "Don't use 'BuildContext's across async gaps.";
 const ASYNC_USE_CORRECTION: &str = "Try rewriting the code to not use the 'BuildContext', or guard the use with a 'mounted' check.";

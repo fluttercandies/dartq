@@ -3,8 +3,12 @@
 //! contract directly against hand-built trees; [`Fixture::parse`] builds
 //! through the production bridge ([`crate::parse_unit`]) for the tests
 //! that exercise the real parser→AST shape.
+//!
+//! Hand-built arena fixtures ([`Fixture::build`]) remain the tool for
+//! payload-contract pins; behavioral case suites (the upstream port) live
+//! in the dartq-fixture DSL.
 
-#![cfg(test)]
+#![cfg(any(test, feature = "test-support"))]
 
 use std::path::{Path, PathBuf};
 
@@ -16,10 +20,38 @@ use dartq_source::{FileTable, LineIndex};
 use crate::engine::{Features, Lint, Unit, narrow_u32, run};
 use crate::registry::EnableSet;
 
+/// The scan posture every fixture scans under: the latest feature set
+/// with the `augmentations` experiment opted in under the official decode
+/// contract — the production bridge's posture. A `const` (the frozen
+/// call sites pass it by name), so the two bits are pinned — not derived —
+/// to `ScanConfig::from_feature_set` over that exact set by the
+/// `config_pins::config_matches_the_feature_fold` test: drift fails the
+/// pin, never a fixture silently.
 pub const CONFIG: ScanConfig = ScanConfig {
     enable_triple_shift: true,
     enable_augmentations: true,
 };
+
+#[cfg(test)]
+mod config_pins {
+    use super::*;
+
+    /// The const bits must equal the keyed fold over the latest set with
+    /// the `augmentations` opt-in: `triple-shift` (shipped 2.14) folds on
+    /// by version, `augmentations` (unshipped) only through the explicit
+    /// flag. A re-vendor that changes either posture breaks this pin, not
+    /// the fixtures.
+    #[test]
+    fn config_matches_the_feature_fold() {
+        let folded = ScanConfig::from_feature_set(
+            dartq_language::FeatureSet::latest().with_experiment_for_version(
+                dartq_language::DEFAULT_LANGUAGE_VERSION,
+                dartq_language::Feature::Augmentations,
+            ),
+        );
+        assert_eq!(CONFIG, folded);
+    }
+}
 
 /// One parsed unit: everything a [`crate::Unit`] needs, kept alive together.
 pub struct Fixture {

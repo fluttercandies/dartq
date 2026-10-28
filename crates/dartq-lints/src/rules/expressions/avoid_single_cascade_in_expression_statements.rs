@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_single_cascade_in_expression_statements.dart:39-61`
 /// — an expression statement consisting of a single-section cascade
@@ -16,14 +16,11 @@ use super::{Check, Group, NodeKind, RuleSpec};
 /// cascade's. The official reports at the cascade expression — the
 /// production row opens at the `..`, so the statement head (the
 /// target) bounds the start.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_single_cascade_in_expression_statements",
-    group: Group::Recommended,
-    problem: "Unnecessary cascade expression.",
-    correction: "Try using the operator '{0}'.",
-    kinds: &[NodeKind::Cascade],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_single_cascade_in_expression_statements",
+    &[NodeKind::Cascade],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

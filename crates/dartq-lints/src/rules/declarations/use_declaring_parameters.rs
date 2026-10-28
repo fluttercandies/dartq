@@ -1,7 +1,4 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, formal_parameter_rows,
-    same_class_field_type,
-};
+use super::{Check, NodeKind, RuleSpec, VAR_FINAL_OR_CONST_MEMBER_BIT, formal_parameter_rows, same_class_field_type};
 use crate::rules::{NONE_TOKEN, body_members, initialized_identifier_name};
 use dartq_ast::mod_flags;
 
@@ -26,14 +23,11 @@ use dartq_ast::mod_flags;
 /// of a different type is a compile error on valid input; the field
 /// existence gate folds to the same-file field scan (cross-file
 /// under-reports).
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "use_declaring_parameters",
-    group: Group::Standalone,
-    problem: "Use a declaring parameter.",
-    correction: "Try using a declaring parameter.",
-    kinds: &[NodeKind::PrimaryConstructor],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_declaring_parameters",
+    &[NodeKind::PrimaryConstructor],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     if !c.unit.features.primary_constructors {

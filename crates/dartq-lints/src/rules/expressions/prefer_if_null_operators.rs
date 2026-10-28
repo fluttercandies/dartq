@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, slice, token_seq_equal};
+use super::{Check, NodeKind, RuleSpec, slice, token_seq_equal};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_if_null_operators.dart:22-63`
 /// — `x == null ? a : x` (or the `!=`/then mirror) reports at the
@@ -16,14 +16,11 @@ use super::{Check, Group, NodeKind, RuleSpec, slice, token_seq_equal};
 /// pieces below it — with the bare-name group's marker rows dropped
 /// for the comparison. Message: `diagnostic.g.dart`
 /// `preferIfNullOperators`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_if_null_operators",
-    group: Group::Recommended,
-    problem: "Use the '??' operator rather than '?:' when testing for 'null'.",
-    correction: "Try rewriting the code to use '??'.",
-    kinds: &[NodeKind::Conditional],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_if_null_operators",
+    &[NodeKind::Conditional],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

@@ -1,7 +1,5 @@
-use super::{Check, Group, NodeKind, RuleSpec, container_members, operator_name};
-use crate::rules::{
-    SupertypeClause, same_file_ancestors, same_file_declaration, supertypes, utf16_token_span,
-};
+use super::{Check, NodeKind, RuleSpec, container_members, operator_name};
+use crate::rules::{SupertypeClause, same_file_ancestors, same_file_declaration, supertypes, utf16_token_span};
 
 /// Official: `pkg/linter/lib/src/rules/avoid_implementing_value_types.dart:36-60`
 /// — a class (:32, `addClassDeclaration`) whose `implements` clause
@@ -17,14 +15,11 @@ use crate::rules::{
 /// interface name (the written type arguments under-span the
 /// upstream's full `TypeName` node). Message: `diagnostic.g.dart`
 /// `avoidImplementingValueTypes`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_implementing_value_types",
-    group: Group::Standalone,
-    problem: "Classes that override '==' should not be implemented.",
-    correction: "Try removing the class from the 'implements' clause.",
-    kinds: &[NodeKind::ClassDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_implementing_value_types",
+    &[NodeKind::ClassDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

@@ -1,9 +1,5 @@
-use super::{
-    Check, Group, NodeKind, RuleSpec, closure_windows, name_captured, name_written_in_window,
-};
-use crate::rules::{
-    initialized_identifier_name, utf16_token_span, variables_declaration_keyword,
-};
+use super::{Check, NodeKind, RuleSpec, closure_windows, name_captured, name_written_in_window};
+use crate::rules::{initialized_identifier_name, utf16_token_span, variables_declaration_keyword};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_final_in_for_each.dart:44-60`
 /// — a for-each loop variable (:45) not declared `final` (:46) and
@@ -17,14 +13,11 @@ use crate::rules::{
 /// nested function bails (a capture is judged unreadable; the resolved
 /// mutation walk would answer only true writes). Message:
 /// `diagnostic.g.dart` `preferFinalInForEachVariable`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_final_in_for_each",
-    group: Group::Standalone,
-    problem: "The variable '{0}' should be final.",
-    correction: "Try making the variable final.",
-    kinds: &[NodeKind::VariablesDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_final_in_for_each",
+    &[NodeKind::VariablesDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

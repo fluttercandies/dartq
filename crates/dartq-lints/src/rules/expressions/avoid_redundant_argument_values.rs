@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, narrow_u32, slice, static_type_faces};
+use super::{Check, NodeKind, RuleSpec, narrow_u32, slice, static_type_faces};
 use crate::rules::{body_members, same_file_declaration};
 
 /// Official: `upstream Dart SDK source,
@@ -59,14 +59,11 @@ use crate::rules::{body_members, same_file_declaration};
 /// The upstream options face (`ignoredParameters`) does not exist in
 /// the current rule source. Message: `diagnostic.g.dart`
 /// `avoidRedundantArgumentValues`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "avoid_redundant_argument_values",
-    group: Group::Standalone,
-    problem: "The value of the argument is redundant because it matches the default value.",
-    correction: "Try removing the argument.",
-    kinds: &[NodeKind::Arguments],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_redundant_argument_values",
+    &[NodeKind::Arguments],
     check,
-};
+);
 
 /// The callee's resolved formal rows: positional in declaration order
 /// (required group first, then the optional-positional group), named

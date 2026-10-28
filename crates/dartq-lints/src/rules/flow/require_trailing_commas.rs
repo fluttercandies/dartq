@@ -1,6 +1,6 @@
 use dartq_parser::AssertKind;
 
-use super::{Check, Group, NodeKind, RuleSpec, last_child, narrow_u32};
+use super::{Check, NodeKind, RuleSpec, last_child, narrow_u32};
 
 /// Official: `pkg/linter/lib/src/rules/require_trailing_commas.dart` —
 /// every multi-line argument, parameter, assert, and collection-literal
@@ -23,12 +23,9 @@ use super::{Check, Group, NodeKind, RuleSpec, last_child, narrow_u32};
 /// share a line, or a collection literal. The upstream `isNamed`
 /// formal-parameter gate (:135) is subsumed: no exception class is a
 /// formal parameter, so a named parameter never qualifies either way.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "require_trailing_commas",
-    group: Group::Standalone,
-    problem: "Missing a required trailing comma.",
-    correction: "Try adding a trailing comma.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "require_trailing_commas",
+    &[
         NodeKind::Arguments,
         NodeKind::Assert,
         NodeKind::FormalParameters,
@@ -36,7 +33,7 @@ pub(crate) static SPEC: RuleSpec = RuleSpec {
         NodeKind::SetOrMapLiteral,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

@@ -1,0 +1,1 @@
+var x = a == null ? null : a!.b;

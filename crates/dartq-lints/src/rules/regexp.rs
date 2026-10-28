@@ -47,21 +47,18 @@ pub(crate) static INCOMING_RULES: &[&RuleSpec] = &[];
 pub(crate) mod valid_regexps {
     use super::{creation_parts, is_valid, slice, string_value};
     use crate::engine::Check;
-    use crate::registry::{Group, RuleSpec};
+    use crate::registry::RuleSpec;
     use dartq_ast::NodeKind;
 
     /// Official: `pkg/linter/lib/src/rules/valid_regexps.dart:40-71` — the
     /// first positional argument of a `RegExp(...)` creation, when it is a
     /// plain string literal, must parse as a regex under the `unicode:`
     /// flag's value. Message: `diagnostic.g.dart` `validRegexps`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "valid_regexps",
-        group: Group::Core,
-        problem: "Invalid regular expression syntax.",
-        correction: "Try correcting the regular expression.",
-        kinds: &[NodeKind::Send, NodeKind::NewExpression],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "valid_regexps",
+    &[NodeKind::Send, NodeKind::NewExpression],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();

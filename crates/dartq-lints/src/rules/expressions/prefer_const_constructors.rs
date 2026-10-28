@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, slice, static_type_faces};
+use super::{Check, NodeKind, RuleSpec, slice, static_type_faces};
 use crate::rules::{body_members, in_const_context, member_annotations, same_file_declaration};
 
 /// Official: `upstream Dart SDK source,
@@ -42,18 +42,15 @@ use crate::rules::{body_members, in_const_context, member_annotations, same_file
 /// — a type variable in `C<T>()` — lives in the shared const-ability
 /// face). Message: `diagnostic.g.dart`
 /// `preferConstConstructors`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_const_constructors",
-    group: Group::Standalone,
-    problem: "Use 'const' with the constructor to improve performance.",
-    correction: "Try adding the 'const' keyword to the constructor invocation.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_const_constructors",
+    &[
         NodeKind::NewExpression,
         NodeKind::ImplicitCreation,
         NodeKind::Send,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

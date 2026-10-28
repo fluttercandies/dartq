@@ -823,9 +823,8 @@ fn run_steps(
                 let new_text = match texts.get(&edit.file) {
                     Some(current) => replay_edit::apply_edit(current, edit),
                     None => {
-                        let on_disk = std::fs::read_to_string(&path).map_err(|e| {
-                            format!("reading {}: {e}", path.display())
-                        })?;
+                        let on_disk = std::fs::read_to_string(&path)
+                            .map_err(|e| format!("reading {}: {e}", path.display()))?;
                         replay_edit::apply_edit(&on_disk, edit)
                     }
                 }
@@ -1075,8 +1074,7 @@ mod tests {
         // The row face reads each row's file for position normalization, so
         // both rows address real files (the daemon emits canonical paths).
         let root = std::env::temp_dir().join(format!("dq_rows_{}", std::process::id()));
-        let outside =
-            std::env::temp_dir().join(format!("dq_rows_out_{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("dq_rows_out_{}", std::process::id()));
         std::fs::create_dir_all(root.join("lib")).expect("mkdir");
         std::fs::create_dir_all(&outside).expect("mkdir");
         std::fs::write(root.join("lib/a.dart"), "int a = 1;\nint b = 2;\n").expect("a");

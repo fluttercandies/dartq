@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official:
 /// `pkg/linter/lib/src/rules/unnecessary_primary_constructor_body.dart:42-53`
@@ -7,14 +7,11 @@ use super::{Check, Group, NodeKind, RuleSpec};
 /// reports at the `this`. The rule registers unconditionally — no
 /// feature gate. Message: `diagnostic.g.dart`
 /// `unnecessaryPrimaryConstructorBody`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_primary_constructor_body",
-    group: Group::Standalone,
-    problem: "Unnecessary primary constructor body.",
-    correction: "Try removing the body.",
-    kinds: &[NodeKind::PrimaryConstructorBody],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_primary_constructor_body",
+    &[NodeKind::PrimaryConstructorBody],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

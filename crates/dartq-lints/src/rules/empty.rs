@@ -4,8 +4,8 @@
 use dartq_ast::NodeKind;
 
 use crate::engine::Check;
-use crate::registry::{Group, RuleSpec};
-use crate::rules::{first_child, is_just_underscores, last_child};
+use crate::registry::RuleSpec;
+use crate::rules::{is_just_underscores, last_child};
 
 /// The domain's incoming registrations: a new standalone rule appends its
 /// `SPEC` reference here (name order) and joins the registry through the
@@ -20,21 +20,18 @@ fn last_token_of(c: &Check<'_>, node: u32) -> u32 {
 }
 
 pub(crate) mod empty_statements {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/empty_statements.dart:33-53` —
     /// report every `EmptyStatement` except one that "defines semantics":
     /// the last statement of a switch pattern case whose statements are all
     /// empty (the `case _: ;` idiom, `empty_statements.dart:34-46`).
     /// Message: `diagnostic.g.dart` `emptyStatements`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "empty_statements",
-        group: Group::Recommended,
-        problem: "Unnecessary empty statement.",
-        correction: "Try removing the empty statement or restructuring the code.",
-        kinds: &[NodeKind::EmptyStatement],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "empty_statements",
+    &[NodeKind::EmptyStatement],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -75,7 +72,7 @@ pub(crate) mod empty_statements {
 }
 
 pub(crate) mod empty_constructor_bodies {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/empty_constructor_bodies.dart:34-61`
     /// — a constructor (or primary constructor body) whose block body is
@@ -92,14 +89,11 @@ pub(crate) mod empty_constructor_bodies {
     /// [`NodeKind::BlockBody`] IS the block face: its span covers the braces
     /// and its completion window holds the statement rows. Emptiness is the
     /// empty window; the `}` is the body's last token.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "empty_constructor_bodies",
-        group: Group::Recommended,
-        problem: "Empty constructor bodies should be written using a ';' rather than '{}'.",
-        correction: "Try replacing the constructor body with ';'.",
-        kinds: &[NodeKind::Constructor, NodeKind::PrimaryConstructorBody],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "empty_constructor_bodies",
+    &[NodeKind::Constructor, NodeKind::PrimaryConstructorBody],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -128,28 +122,37 @@ pub(crate) mod empty_constructor_bodies {
 }
 
 pub(crate) mod empty_catches {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/empty_catches.dart:31-45` — an
     /// empty catch block with no comments before `}` reports at the block,
     /// unless the exception parameter is named with bare underscores
     /// (`catch (_)` is a deliberate discard, empty_catches.dart:33-38).
     /// Message: `diagnostic.g.dart` `emptyCatches`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "empty_catches",
-        group: Group::Core,
-        problem: "Empty catch block.",
-        correction: "Try adding statements to the block, adding a comment to the block, or removing the 'catch' clause.",
-        kinds: &[NodeKind::CatchClause],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "empty_catches",
+    &[NodeKind::CatchClause],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
-        // The exception formal is the first child; its name token is payload
-        // word 1 (the `FormalParameter` layout).
-        if let Some(exception) = super::first_child(c, node)
-            && c.kind(exception) == NodeKind::FormalParameter
+        // The exception formal: production wraps the catch parameters in
+        // a `FormalParameters` row (bridge `end_formal_parameters`), so
+        // the formal is the first `FormalParameter` inside that wrapper;
+        // hand-built tables carry it as a direct child. The name is
+        // payload word 1 (the `FormalParameterEnd` layout).
+        let exception = c.collect_direct(node).into_iter().find_map(|kid| {
+            match c.kind(kid) {
+                NodeKind::FormalParameter => Some(kid),
+                NodeKind::FormalParameters => c
+                    .collect_direct(kid)
+                    .into_iter()
+                    .find(|&formal| c.kind(formal) == NodeKind::FormalParameter),
+                _ => None,
+            }
+        });
+        if let Some(exception) = exception
             && let Some(&name) = c.payload(exception).get(1)
             && super::is_just_underscores(c.lexeme(name))
         {
@@ -176,19 +179,16 @@ pub(crate) mod empty_catches {
 }
 
 pub(crate) mod avoid_empty_else {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `pkg/linter/lib/src/rules/avoid_empty_else.dart:32-41` — an
     /// `else` branch that is a non-synthetic empty statement reports at the
     /// empty statement. Message: `diagnostic.g.dart` `avoidEmptyElse`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "avoid_empty_else",
-        group: Group::Core,
-        problem: "Empty statements are not allowed in an 'else' clause.",
-        correction: "Try removing the empty statement or removing the else clause.",
-        kinds: &[NodeKind::IfStatement],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "avoid_empty_else",
+    &[NodeKind::IfStatement],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -457,6 +457,30 @@ mod tests {
         assert!(f.run(&one_rule("empty_catches")).is_empty());
     }
 
+    /// Production-bridge pins: the catch parameters wrap in a
+    /// `FormalParameters` row, so the wildcard exemption must read the
+    /// formal through the wrapper — `catch (_)` passes (`test_underscore`),
+    /// `catch (e)` still reports.
+    #[test]
+    fn empty_catches_production_wildcard_passes() {
+        assert!(Fixture::parse("void f() { try {} catch (_) {} }")
+            .run(&one_rule("empty_catches"))
+            .is_empty());
+        assert!(Fixture::parse("void f() { try {} catch (___) {} }")
+            .run(&one_rule("empty_catches"))
+            .is_empty());
+        assert_eq!(
+            Fixture::parse("void f() { try {} catch (e) {} }")
+                .run(&one_rule("empty_catches"))
+                .len(),
+            1
+        );
+        // An `on T catch (_)` clause reads the formal past the type.
+        assert!(Fixture::parse("void f() { try {} on Exception catch (_) {} }")
+            .run(&one_rule("empty_catches"))
+            .is_empty());
+    }
+
     /// A comment before `}` keeps the block (empty_catches.dart:39-44).
     #[test]
     fn empty_catches_comment_keeps_the_block() {
@@ -488,7 +512,7 @@ mod tests {
 }
 
 pub(crate) mod prefer_asserts_with_message {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
     use crate::rules::NONE_TOKEN;
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/prefer_asserts_with_message.dart`
@@ -501,14 +525,11 @@ pub(crate) mod prefer_asserts_with_message {
     /// payload word 0 discriminates the official's two registered faces
     /// (initializer / statement) from the expression-position assert the
     /// official never visits.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "prefer_asserts_with_message",
-        group: Group::Standalone,
-        problem: "Missing a message in an assert.",
-        correction: "Try adding a message to the assert.",
-        kinds: &[NodeKind::Assert],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_asserts_with_message",
+    &[NodeKind::Assert],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -547,7 +568,7 @@ pub(crate) mod prefer_asserts_with_message {
 }
 
 pub(crate) mod throw_in_finally {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
     use crate::rules::NONE_TOKEN;
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/throw_in_finally.dart`
@@ -563,14 +584,11 @@ pub(crate) mod throw_in_finally {
     /// payload word 0 (`TOKEN_NONE` when absent) and the finally block
     /// tiles as the node's last child, so the chain test is the
     /// try-statement child on the path being that last child.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "throw_in_finally",
-        group: Group::Standalone,
-        problem: "Use of '{0}' in a 'finally' block.",
-        correction: "Try moving the '{0}' outside the 'finally' block.",
-        kinds: &[NodeKind::ThrowExpression],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "throw_in_finally",
+    &[NodeKind::ThrowExpression],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -642,7 +660,7 @@ pub(crate) mod throw_in_finally {
 }
 
 pub(crate) mod unnecessary_breaks {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/unnecessary_breaks.dart`
     /// — a labeled-`break`-free `break` that is the last of more than one
@@ -657,14 +675,11 @@ pub(crate) mod unnecessary_breaks {
     /// `when` clause, so the last-statement test is a direct-child walk. A
     /// labeled break carries its label identifier as a child and is
     /// exempted by the label scan.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "unnecessary_breaks",
-        group: Group::Standalone,
-        problem: "Unnecessary 'break' statement.",
-        correction: "Try removing the 'break'.",
-        kinds: &[NodeKind::Break],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_breaks",
+    &[NodeKind::Break],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         if !c.unit.features.patterns {
@@ -733,7 +748,7 @@ pub(crate) mod unnecessary_breaks {
 }
 
 pub(crate) mod unnecessary_final {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
     use crate::rules::{NONE_TOKEN, utf16_token_span};
 
     /// The two official message variants under one name
@@ -767,20 +782,17 @@ pub(crate) mod unnecessary_final {
     /// - declared variable patterns (own keyword, else the nearest
     ///   [`NodeKind::PatternVarDeclStatement`] keyword — the official
     ///   `thisOrAncestorOfType` walk).
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "unnecessary_final",
-        group: Group::Standalone,
-        problem: PROBLEM,
-        correction: WITHOUT_TYPE,
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_final",
+    &[
             NodeKind::VariablesDeclaration,
             NodeKind::FormalParameter,
             NodeKind::FunctionTypedFormalParameter,
             NodeKind::ForInParts,
             NodeKind::DeclaredVariablePattern,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -1068,7 +1080,7 @@ pub(crate) mod unnecessary_final {
 }
 
 pub(crate) mod one_member_abstracts {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
     use crate::rules::NONE_TOKEN;
 
     /// `NodeHeader.flags` modifier-mask bit for the class-family `abstract`
@@ -1092,14 +1104,11 @@ pub(crate) mod one_member_abstracts {
     /// gates are wave-inert: `augment` is gated off at the scanner. The
     /// rule is `deprecated` upstream since 3.13 but stays registered and
     /// fires. Message: `diagnostic.g.dart` `oneMemberAbstracts`.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "one_member_abstracts",
-        group: Group::Standalone,
-        problem: "Unnecessary use of an abstract class.",
-        correction: "Try making '{0}' a top-level function and removing the class.",
-        kinds: &[NodeKind::ClassDeclaration],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "one_member_abstracts",
+    &[NodeKind::ClassDeclaration],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();

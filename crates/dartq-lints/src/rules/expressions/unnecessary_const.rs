@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 use crate::rules::{const_keyword, in_const_context};
 
 /// Official: `pkg/linter/lib/src/rules/unnecessary_const.dart:38-77` — a
@@ -14,12 +14,9 @@ use crate::rules::{const_keyword, in_const_context};
 /// carries none and never dispatches. Dot-shorthand const invocations
 /// (`case const .new()`) are likewise pattern-owned and skip. Message:
 /// `diagnostic.g.dart` `unnecessaryConst`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "unnecessary_const",
-    group: Group::Recommended,
-    problem: "Unnecessary 'const' keyword.",
-    correction: "Try removing the keyword.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "unnecessary_const",
+    &[
         NodeKind::ConstExpression,
         NodeKind::ConstLiteral,
         NodeKind::ListLiteral,
@@ -27,7 +24,7 @@ pub(crate) static SPEC: RuleSpec = RuleSpec {
         NodeKind::RecordLiteral,
     ],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

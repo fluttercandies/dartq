@@ -26,7 +26,7 @@
 use dartq_ast::NodeKind;
 
 use crate::engine::Check;
-use crate::registry::{Group, RuleSpec};
+use crate::registry::RuleSpec;
 
 /// The domain's incoming registrations: a new standalone rule appends its
 /// `SPEC` reference here (name order) and joins the registry through the
@@ -659,7 +659,7 @@ pub(crate) fn arguments(c: &Check<'_>, pieces: &[u32]) -> Vec<core::ops::Range<u
 }
 
 pub(crate) mod no_self_assignments {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
 
     /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/no_self_assignments.dart`
     /// — an `=` assignment whose both sides are identifiers with the same
@@ -681,14 +681,11 @@ pub(crate) mod no_self_assignments {
     /// the production tiling does materialize under the
     /// [`NodeKind::FieldInitializer`] wrapper bail on the ancestor — the
     /// official's node-kind gate.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "no_self_assignments",
-        group: Group::Standalone,
-        problem: "The variable or property is being assigned to itself.",
-        correction: "Try removing the assignment that has no direct effect.",
-        kinds: &[NodeKind::Assignment],
-        check,
-    };
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "no_self_assignments",
+    &[NodeKind::Assignment],
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         let node = c.node();
@@ -851,7 +848,7 @@ pub(crate) mod no_self_assignments {
 }
 
 pub(crate) mod parameter_assignments {
-    use super::{Check, Group, NodeKind, RuleSpec};
+    use super::{Check, NodeKind, RuleSpec};
     use crate::rules::{NONE_TOKEN, initialized_identifier_name};
     use dartq_scanner::TokenKind;
 
@@ -898,20 +895,17 @@ pub(crate) mod parameter_assignments {
     /// recovery path for any arm shape whose peel still answers nothing.
     /// The leaf's token face answers the bare-identifier `=` write — the
     /// shapes the row covers never double-report.
-    pub(crate) static SPEC: RuleSpec = RuleSpec {
-        name: "parameter_assignments",
-        group: Group::Standalone,
-        problem: "Invalid assignment to the parameter '{0}'.",
-        correction: "Try using a local variable in place of the parameter.",
-        kinds: &[
+    pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "parameter_assignments",
+    &[
             NodeKind::Assignment,
             NodeKind::PatternAssignment,
             NodeKind::UnaryPrefix,
             NodeKind::UnaryPostfix,
             NodeKind::ExpressionStatement,
         ],
-        check,
-    };
+    check,
+);
 
     fn check(c: &mut Check<'_>) {
         match c.kind(c.node()) {

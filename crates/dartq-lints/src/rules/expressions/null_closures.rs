@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, query_site, same_file, slice};
+use super::{Check, NodeKind, RuleSpec, query_site, same_file, slice};
 
 /// Official: `pkg/linter/lib/src/rules/null_closures.dart` — a `null`
 /// passed in a closure position of a known core API reports at the
@@ -30,18 +30,15 @@ use super::{Check, Group, NodeKind, RuleSpec, query_site, same_file, slice};
 /// `scheduleMicrotask` stays out: its table entry can never fire in the
 /// official either (`element.name == null`, :229-231). Message:
 /// `diagnostic.g.dart` `nullClosures`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "null_closures",
-    group: Group::Recommended,
-    problem: "Closure can't be 'null' because it might be invoked.",
-    correction: "Try providing a non-null closure.",
-    kinds: &[
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "null_closures",
+    &[
         NodeKind::Send,
         NodeKind::ImplicitCreation,
         NodeKind::NewExpression,
     ],
     check,
-};
+);
 
 /// The closure slots of one table entry: raw argument indexes (named
 /// arguments come last in legal Dart, so the raw index of a non-named

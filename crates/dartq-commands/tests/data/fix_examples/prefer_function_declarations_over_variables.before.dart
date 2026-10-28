@@ -1,0 +1,1 @@
+final f = (a) { print(a); };

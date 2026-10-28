@@ -1,17 +1,14 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 
 /// Official: `pkg/linter/lib/src/rules/prefer_adjacent_string_concatenation.dart:37-46`
 /// — `+` whose two operands are both string literals reports at the
 /// `+` (adjacent strings need no operator). Message: `diagnostic.g.dart`
 /// `preferAdjacentStringConcatenation`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_adjacent_string_concatenation",
-    group: Group::Recommended,
-    problem: "String literals shouldn't be concatenated by the '+' operator.",
-    correction: "Try removing the operator to use adjacent strings.",
-    kinds: &[NodeKind::BinaryExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_adjacent_string_concatenation",
+    &[NodeKind::BinaryExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

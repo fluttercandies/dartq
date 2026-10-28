@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, get_set_token, path_shadowed};
+use super::{Check, NodeKind, RuleSpec, get_set_token, path_shadowed};
 
 /// Official: `upstream Dart SDK source, pkg/linter/lib/src/rules/recursive_getters.dart:31-95`
 /// — a getter (no parameter list) whose body references itself reports
@@ -13,14 +13,11 @@ use super::{Check, Group, NodeKind, RuleSpec, get_set_token, path_shadowed};
 /// else-branch read still reports. The const-literal subtree skip
 /// (:61-70) covers erroneous code only and is dropped. Message:
 /// `diagnostic.g.dart` `recursiveGetters`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "recursive_getters",
-    group: Group::Recommended,
-    problem: "The getter '{0}' recursively returns itself.",
-    correction: "Try changing the value being returned.",
-    kinds: &[NodeKind::Identifier],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "recursive_getters",
+    &[NodeKind::Identifier],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

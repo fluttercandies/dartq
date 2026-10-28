@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec, same_file, slice};
+use super::{Check, NodeKind, RuleSpec, same_file, slice};
 
 const USE_CONTAINS_PROBLEM: &str = "Unnecessary use of 'indexOf' to test for containment.";
 const USE_CONTAINS_CORRECTION: &str = "Try using 'contains'.";
@@ -26,14 +26,11 @@ const ALWAYS_TRUE_PROBLEM: &str =
 /// ([`const_int_value`]); constants outside the file under-report.
 /// Message: `diagnostic.g.dart`
 /// `preferContainsUseContains`/`preferContainsAlwaysFalse`/`preferContainsAlwaysTrue`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_contains",
-    group: Group::Recommended,
-    problem: USE_CONTAINS_PROBLEM,
-    correction: USE_CONTAINS_CORRECTION,
-    kinds: &[NodeKind::BinaryExpression],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_contains",
+    &[NodeKind::BinaryExpression],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

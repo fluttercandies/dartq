@@ -1,4 +1,4 @@
-use super::{Check, Group, NodeKind, RuleSpec};
+use super::{Check, NodeKind, RuleSpec};
 use crate::rules::{NONE_TOKEN, same_file_declaration};
 use dartq_ast::mod_flags;
 use dartq_parser::IdentifierContext;
@@ -23,14 +23,11 @@ const MIXIN_CLASS_BIT: u16 = 1 << 7;
 /// cross-file plain class loses its report. Enum and extension types
 /// in a with clause stay silent (neither element kind reports
 /// upstream). Message: `diagnostic.g.dart` `preferMixin`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "prefer_mixin",
-    group: Group::Standalone,
-    problem: "Only mixins should be mixed in.",
-    correction: "Try converting '{0}' to a mixin.",
-    kinds: &[NodeKind::ClassDeclaration, NodeKind::NamedMixinApplication],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "prefer_mixin",
+    &[NodeKind::ClassDeclaration, NodeKind::NamedMixinApplication],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     let node = c.node();

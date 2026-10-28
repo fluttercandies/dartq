@@ -1,7 +1,4 @@
-use super::{
-    Check, EXTERNAL_MEMBER_BIT, Group, NodeKind, RuleSpec, constructor_name_part,
-    container_name_node, modifier_keyword, type_name_echo,
-};
+use super::{Check, EXTERNAL_MEMBER_BIT, NodeKind, RuleSpec, constructor_name_part, container_name_node, modifier_keyword, type_name_echo};
 
 /// Official: `pkg/linter/lib/src/rules/use_primary_constructors.dart` —
 /// a class or enum without any constructor reports at the container
@@ -25,14 +22,11 @@ use super::{
 /// row anchors at the declared name). Enum members live under the
 /// [`NodeKind::EnumBody`] wrapper. Message: `diagnostic.g.dart`
 /// `usePrimaryConstructors`.
-pub(crate) static SPEC: RuleSpec = RuleSpec {
-    name: "use_primary_constructors",
-    group: Group::Standalone,
-    problem: "Use a primary constructor.",
-    correction: "Try using a primary constructor.",
-    kinds: &[NodeKind::ClassDeclaration, NodeKind::EnumDeclaration],
+pub(crate) static SPEC: RuleSpec = crate::spec!(
+    "use_primary_constructors",
+    &[NodeKind::ClassDeclaration, NodeKind::EnumDeclaration],
     check,
-};
+);
 
 fn check(c: &mut Check<'_>) {
     if !c.unit.features.primary_constructors {

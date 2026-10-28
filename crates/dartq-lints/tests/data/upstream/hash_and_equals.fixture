@@ -1,0 +1,89 @@
+// Ported by port_upstream from the upstream linter test file
+// (pkg/linter/test/rules, upstream Dart SDK source); regenerate
+// with the converter rather than editing. Case names are the
+// upstream test method names, verbatim. The first file block of
+// each case is the analyzed unit; later blocks are the test's
+// supporting files.
+//- lint: hash_and_equals
+
+//- case: test_augmentedClass_augmentation
+//- diverge: cross-file augment merge: upstream suppresses through the element model (hash_and_equals.dart:63-77, hasMethod/hasField over the merged declaredFragment); the harness lint-runs only the analyzed unit so the original's hashCode in the supporting file is invisible — needs resolution-layer cross-file augmentation merging (out of scope for the rules lane)
+//- file: /lib/test.dart
+
+part of 'a.dart';
+
+augment class A {
+  bool operator ==(Object other) => false;
+}
+//- file: /liba.dart
+
+part 'test.dart';
+
+class A {
+  int get hashCode => 0;
+}
+
+//- case: test_augmentedClass_augmentation_missingHash
+//- file: /lib/test.dart
+
+part of 'a.dart';
+
+augment class A {
+  bool operator [!==!](Object other) => false;
+}
+//- file: /liba.dart
+
+part 'test.dart';
+
+class A { }
+
+//- case: test_equalsEquals_andHashCode
+//- file: /lib/test.dart
+
+class C {
+  @override
+  bool operator ==(Object other) => false;
+
+  @override
+  int get hashCode => 7;
+}
+
+//- case: test_equalsEquals_andHashCodeField
+//- file: /lib/test.dart
+
+class C {
+  @override
+  bool operator ==(Object other) => false;
+
+  @override
+  int hashCode = 7;
+}
+
+//- case: test_equalsEquals_noHashCode
+//- file: /lib/test.dart
+
+class C {
+  @override
+  bool operator [!==!](Object other) => false;
+}
+
+//- case: test_hashCode_noEqualsEquals
+//- file: /lib/test.dart
+
+class C {
+  @override
+  int get [!hashCode!] => 7;
+}
+
+//- case: test_hashCodeField_missingEqualsEquals
+//- file: /lib/test.dart
+
+class C {
+  @override
+  final int [!hashCode!] = 7;
+}
+
+//- case: test_neither
+//- file: /lib/test.dart
+
+class C {}
