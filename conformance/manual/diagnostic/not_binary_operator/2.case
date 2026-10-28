@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/not_binary_operator/2
+//- source: upstream analyzer messages.yaml#notBinaryOperator documentation "Common fixes" example (machine-verified upstream); negative: valid binary operator
+//- file: lib/test.dart
+//+ var a = 5 - 3;

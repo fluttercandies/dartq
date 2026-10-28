@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/const_eval_assertion_failure_with_message/1
+//- source: hand-derived from upstream analyzer emission site pkg/analyzer/lib/src/dart/constant/evaluation.dart const-evaluator AssertInitializer branch (message present and evaluable -> constEvalAssertionFailureWithMessage); no doc example, no upstream per-code test
+//- file: lib/test.dart
+//+ class C {
+//+   final int x;
+//+   const C(int v) : assert(v > 0, 'v must be positive'), x = v;
+//+ }
+//+ const c = C(-1);

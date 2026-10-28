@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/todo/1
+//- source: hand-derived from upstream emission site pkg/analyzer/lib/src/error/todo_finder.dart (_TodoFinder matches uppercase TODO followed by end/colon/(name), wired via library_analyzer.dart TodoFinder.findIn)
+//- file: lib/test.dart
+//+ // TODO(mike): Implement this.
+//+ void f() {}

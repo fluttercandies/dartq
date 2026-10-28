@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/undone/1
+//- source: hand-derived from upstream emission site pkg/analyzer/lib/src/error/todo_finder.dart (_TodoFinder matches uppercase UNDONE followed by end/colon/(name), wired via library_analyzer.dart TodoFinder.findIn)
+//- file: lib/test.dart
+//+ // UNDONE: Revert this change.
+//+ void f() {}

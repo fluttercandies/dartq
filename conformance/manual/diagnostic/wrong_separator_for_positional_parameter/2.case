@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/wrong_separator_for_positional_parameter/2
+//- source: control case for upstream test_wrongSeparatorForPositionalParameter; negative: '=' separator on the optional positional parameter
+//- file: lib/test.dart
+//+ void f(a, [b = 0]) {}

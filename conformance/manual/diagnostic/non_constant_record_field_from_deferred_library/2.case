@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/non_constant_record_field_from_deferred_library/2
+//- source: lifted from upstream analyzer test pkg/analyzer/test/src/diagnostics/non_constant_record_field_from_deferred_library_test.dart test_const_notDeferred; negative: non-deferred import
+//- file: lib/test.dart
+//+ import 'lib1.dart' as a;
+//+ var v = const (a.c, d: a.d);
+//- file: lib/lib1.dart
+//+ const int c = 1;
+//+ const int d = 2;

@@ -1,0 +1,11 @@
+//- id: manual/diagnostic/missing_dependency/2
+//- source: control case for messages.yaml#missingDependency; negative: the imported package is declared under dependencies
+//- file: lib/test.dart
+//+ import 'package:aaa/a.dart';
+//+ void f() {}
+//- file: package:aaa/lib/a.dart
+//+ int a = 0;
+//- file: pubspec.yaml
+//+ name: test
+//+ dependencies:
+//+   aaa: any

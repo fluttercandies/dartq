@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/invalid_literal_in_configuration/2
+//- source: control case for upstream test_invalidLiteralInConfiguration; negative: configuration literal without interpolation
+//- file: lib/test.dart
+//+ import 'a.dart' if (a == 'x y z') 'a.dart';
+//- file: lib/a.dart
+//+ void a() {}

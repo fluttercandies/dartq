@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/external_typedef/1
+//- source: upstream pkg/_fe_analyzer_shared/messages.yaml#externalTypedef script snippet (machine-verified upstream trigger)
+//- file: lib/test.dart
+//+ external typedef F();

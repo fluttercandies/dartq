@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/invalid_unicode_escape_u_started/2
+//- source: control case for pkg/_fe_analyzer_shared/messages.yaml#invalidUnicodeEscapeUStarted; negative: well-formed 4-hex-digit escape
+//- file: lib/test.dart
+//+ var s = '\u0041';

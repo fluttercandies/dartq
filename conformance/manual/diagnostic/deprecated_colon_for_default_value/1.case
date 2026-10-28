@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/deprecated_colon_for_default_value/1
+//- source: upstream analyzer messages.yaml#deprecatedColonForDefaultValue documentation example (machine-verified upstream); pre-3.0 only per the messages.yaml comment, so the case pins language 2.19
+//- language: 2.19
+//- file: lib/test.dart
+//+ void f({int i : 0}) {}

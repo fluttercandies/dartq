@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/parse_error/2
+//- source: upstream analyzer messages.yaml#parseError documentation "Common fixes" example (machine-verified upstream); negative: valid analysis_options.yaml
+//- file: lib/test.dart
+//+ void f() {}
+//- file: analysis_options.yaml
+//+ analyzer:
+//+   enable-experiment:
+//+     - augmentations
+//+     - dot-shorthands

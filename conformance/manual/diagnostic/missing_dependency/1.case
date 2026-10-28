@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/missing_dependency/1
+//- source: upstream analyzer messages.yaml#missingDependency documentation example (machine-verified upstream), adapted to the harness with an inline aux package so 'package:aaa/a.dart' resolves while pubspec.yaml declares no dependencies
+//- file: lib/test.dart
+//+ import 'package:aaa/a.dart';
+//+ void f() {}
+//- file: package:aaa/lib/a.dart
+//+ int a = 0;
+//- file: pubspec.yaml
+//+ name: test

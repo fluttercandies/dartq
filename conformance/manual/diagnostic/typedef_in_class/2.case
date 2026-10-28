@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/typedef_in_class/2
+//- source: control case for pkg/_fe_analyzer_shared/messages.yaml#typedefInClass; negative: typedef at top level
+//- file: lib/test.dart
+//+ typedef int F(int x);
+//+ class C {}

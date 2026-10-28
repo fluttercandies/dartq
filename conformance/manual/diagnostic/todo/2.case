@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/todo/2
+//- source: control case for todo_finder.dart marker scan; negative: lowercase 'todo' is not matched (scanner only matches [A-Z])
+//- file: lib/test.dart
+//+ // todo(mike): implement this.
+//+ void f() {}

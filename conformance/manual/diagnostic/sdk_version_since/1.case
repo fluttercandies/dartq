@@ -1,0 +1,11 @@
+//- id: manual/diagnostic/sdk_version_since/1
+//- source: hand-derived from upstream emission site pkg/analyzer/lib/src/hint/sdk_constraint_verifier.dart _checkSinceSdkVersion (dart:async 'unawaited' is @Since("2.15") in the pinned SDK sdk/lib/async/future.dart; pubspec constraint below 2.15); shape mirrors pkg/analyzer/test/src/diagnostics/sdk_version_since_test.dart
+//- file: lib/test.dart
+//+ import 'dart:async';
+//+ void f(Future<void>? x) {
+//+   unawaited(x);
+//+ }
+//- file: pubspec.yaml
+//+ name: test
+//+ environment:
+//+   sdk: '>=2.14.0 <4.0.0'

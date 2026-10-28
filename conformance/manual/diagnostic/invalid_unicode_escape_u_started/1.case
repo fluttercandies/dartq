@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/invalid_unicode_escape_u_started/1
+//- source: upstream pkg/_fe_analyzer_shared/messages.yaml#invalidUnicodeEscapeUStarted expression snippet '\u' (machine-verified upstream trigger)
+//- file: lib/test.dart
+//+ var s = '\u';

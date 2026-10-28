@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/unexpected_dollar_in_string/2
+//- source: control case for scanner_cfe_test.dart test_string_simple_interpolation_missingIdentifier; negative: interpolation with an identifier after '$'
+//- file: lib/test.dart
+//+ var x = 0;
+//+ var s = '$x';

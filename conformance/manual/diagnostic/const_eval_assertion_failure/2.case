@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/const_eval_assertion_failure/2
+//- source: hand-derived from upstream analyzer emission site pkg/analyzer/lib/src/dart/constant/evaluation.dart const-evaluator AssertInitializer branch; negative: assertion holds
+//- file: lib/test.dart
+//+ class C {
+//+   final int x;
+//+   const C(int v) : assert(v > 0), x = v;
+//+ }
+//+ const c = C(1);

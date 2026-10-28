@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/external_class/2
+//- source: control case for pkg/_fe_analyzer_shared/messages.yaml#externalClass; negative: class without external keyword
+//- file: lib/test.dart
+//+ class C {}

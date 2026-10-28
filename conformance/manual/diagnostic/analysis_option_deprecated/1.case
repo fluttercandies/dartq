@@ -1,0 +1,7 @@
+//- id: manual/diagnostic/analysis_option_deprecated/1
+//- source: upstream analyzer messages.yaml#analysisOptionDeprecated documentation example (machine-verified upstream; top-level 'errors' key is deprecated)
+//- file: lib/test.dart
+//+ void f() {}
+//- file: analysis_options.yaml
+//+ errors:
+//+   dead_code: ignore

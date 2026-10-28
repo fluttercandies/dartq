@@ -1,0 +1,7 @@
+//- id: manual/diagnostic/type_before_factory/2
+//- source: control case for pkg/_fe_analyzer_shared/messages.yaml#typeBeforeFactory; negative: factory constructor without a return type
+//- file: lib/test.dart
+//+ class C {
+//+   factory C.n() => C._();
+//+   C._();
+//+ }

@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/fixme/2
+//- source: control case for todo_finder.dart marker scan; negative: 'FIXMES' is rejected because the marker may not be followed by a letter
+//- file: lib/test.dart
+//+ // FIXMES: none open.
+//+ void f() {}

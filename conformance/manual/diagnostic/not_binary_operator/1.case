@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/not_binary_operator/1
+//- source: upstream analyzer messages.yaml#notBinaryOperator documentation example (machine-verified upstream)
+//- file: lib/test.dart
+//+ var a = 5 ~ 3;

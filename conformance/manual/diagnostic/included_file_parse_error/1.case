@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/included_file_parse_error/1
+//- source: hand-derived from upstream analyzer messages.yaml#includedFileParseError description (included file is not valid YAML); the doc example's duplicate-key shape is accepted by the pinned 3.13.7 yaml parser, so shared.yaml carries an unterminated flow sequence instead
+//- file: lib/test.dart
+//+ void f() {}
+//- file: analysis_options.yaml
+//+ include: shared.yaml
+//- file: shared.yaml
+//+ analyzer:
+//+   enable-experiment: [augmentations

@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/positional_after_named_argument/2
+//- source: control case for upstream test_positionalAfterNamedArgument; negative: positional arguments before named ones
+//- language: 2.16
+//- file: lib/test.dart
+//+ void g(int a, {int? x}) {}
+//+ void h() {
+//+   g(1, x: 2);
+//+ }

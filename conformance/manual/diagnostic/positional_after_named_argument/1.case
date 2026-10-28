@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/positional_after_named_argument/1
+//- source: lifted from upstream analyzer test pkg/analyzer/test/generated/error_parser_test.dart test_positionalAfterNamedArgument (upstream pins FeatureSets.language_2_16; language pin mirrored)
+//- language: 2.16
+//- file: lib/test.dart
+//+ void g(int a, {int? x}) {}
+//+ void h() {
+//+   g(x: 1, 2);
+//+ }

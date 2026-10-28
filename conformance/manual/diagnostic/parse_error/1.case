@@ -1,0 +1,7 @@
+//- id: manual/diagnostic/parse_error/1
+//- source: hand-derived from upstream analyzer messages.yaml#parseError description (analysis_options.yaml is not valid YAML); the doc example's duplicate-key shape is accepted by the pinned 3.13.7 yaml parser, so the case uses an unterminated flow sequence instead
+//- file: lib/test.dart
+//+ void f() {}
+//- file: analysis_options.yaml
+//+ analyzer:
+//+   enable-experiment: [augmentations

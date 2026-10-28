@@ -1,0 +1,11 @@
+//- id: manual/diagnostic/included_file_parse_error/2
+//- source: upstream analyzer messages.yaml#includedFileParseError documentation "Common fixes" example (machine-verified upstream); negative: included file is valid YAML
+//- file: lib/test.dart
+//+ void f() {}
+//- file: analysis_options.yaml
+//+ include: shared.yaml
+//- file: shared.yaml
+//+ analyzer:
+//+   enable-experiment:
+//+     - augmentations
+//+     - dot-shorthands

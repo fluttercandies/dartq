@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/non_const_map_as_expression_statement/2
+//- source: hand-derived negative from the emission-site guard (constKeyword != null returns early) in pkg/analyzer/lib/src/generated/error_verifier.dart _checkForNonConstMapAsExpressionStatement3; negative: const map literal as expression statement
+//- file: lib/test.dart
+//+ void f() {
+//+   const {'a': 0, 'b': 1}.length;
+//+ }

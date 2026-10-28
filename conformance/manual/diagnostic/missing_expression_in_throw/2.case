@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/missing_expression_in_throw/2
+//- source: control case for pkg/_fe_analyzer_shared/messages.yaml#missingExpressionInThrow; negative: throw with expression
+//- file: lib/test.dart
+//+ void f() {
+//+   throw 0;
+//+ }

@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/non_const_map_as_expression_statement/1
+//- source: lifted from upstream analyzer test pkg/analyzer/test/src/diagnostics/non_const_map_as_expression_statement_test.dart test_expressionStatementOnly (upstream marks it FailingTest; emission site pkg/analyzer/lib/src/generated/error_verifier.dart _checkForNonConstMapAsExpressionStatement3 is live - oracle may stay silent)
+//- file: lib/test.dart
+//+ void f() {
+//+   {'a': 0, 'b': 1};
+//+ }

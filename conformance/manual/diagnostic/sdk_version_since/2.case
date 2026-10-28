@@ -1,0 +1,11 @@
+//- id: manual/diagnostic/sdk_version_since/2
+//- source: control case for sdk_constraint_verifier.dart _checkSinceSdkVersion; negative: constraint requires 2.15 so @Since("2.15") API is guaranteed
+//- file: lib/test.dart
+//+ import 'dart:async';
+//+ void f(Future<void>? x) {
+//+   unawaited(x);
+//+ }
+//- file: pubspec.yaml
+//+ name: test
+//+ environment:
+//+   sdk: '>=2.15.0 <4.0.0'

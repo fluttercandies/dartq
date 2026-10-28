@@ -181,6 +181,11 @@ fn warn(message: &str) {
 /// A case that cannot be materialized (missing mock package, file path
 /// escaping its package root). The case is recorded like a crash on the
 /// oracle side, never silently skipped.
+///
+/// `chunk_dir` may be relative (the runner's `target/conformance/chunks`
+/// spelling); it is canonicalized here so every registered package rootUri
+/// is an absolute `file:` URI — a relative one is unresolvable for the
+/// analyzer, which is also the shape the official harness writes.
 pub fn materialize(
     cases: &[LoadedCase],
     indices: &[usize],
@@ -189,11 +194,12 @@ pub fn materialize(
 ) -> BTreeMap<usize, String> {
     let _ = std::fs::remove_dir_all(chunk_dir);
     std::fs::create_dir_all(chunk_dir).expect("creates chunk dir");
+    let chunk_dir = std::fs::canonicalize(chunk_dir).expect("chunk dir was just created");
     let mocks_abs = std::fs::canonicalize(mocks_root).unwrap_or_else(|_| mocks_root.to_path_buf());
     let mut errors = BTreeMap::new();
     for &i in indices {
         let loaded = &cases[i];
-        if let Err(e) = materialize_one(loaded, i, chunk_dir, &mocks_abs) {
+        if let Err(e) = materialize_one(loaded, i, &chunk_dir, &mocks_abs) {
             errors.insert(i, e);
         }
     }
@@ -582,6 +588,39 @@ mod tests {
         );
         assert!(config.contains(&meta_uri), "{config}");
         let _ = std::fs::remove_dir_all(&chunk);
+        let _ = std::fs::remove_dir_all(&mocks);
+    }
+
+    #[test]
+    fn relative_chunk_dir_still_writes_absolute_aux_root_uris() {
+        let mut case = loaded(
+            "diagnostics/x/t#rel",
+            &[
+                ("lib/test.dart", "import 'package:aaa/a.dart';\nvar x = f;\n"),
+                ("package:aaa/lib/a.dart", "var a = 1;\n"),
+            ],
+        );
+        case.case.packages = vec!["aaa".into()];
+        let mocks = std::env::temp_dir().join(format!("conf-rel-mocks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&mocks);
+        std::fs::create_dir_all(&mocks).expect("creates mocks");
+        // A relative chunk dir, the shape the runner passes for the tracked
+        // `target/conformance/chunks` work root: the aux rootUri must still
+        // come out absolute (and symlink-resolved), or the analyzer cannot
+        // resolve the package.
+        let rel = Path::new("target").join(format!("conf-rel-chunk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rel);
+        let errors = materialize(&[case], &[0], &rel, &mocks);
+        assert!(errors.is_empty(), "{errors:?}");
+        let config = std::fs::read_to_string(rel.join("0/.dart_tool/package_config.json"))
+            .expect("reads config");
+        let aux_root =
+            std::fs::canonicalize(&rel).expect("canonical chunk").join("0/.aux/aaa");
+        assert!(
+            config.contains(&format!("\"rootUri\":\"{}\"", path_to_file_uri(&aux_root))),
+            "{config}"
+        );
+        let _ = std::fs::remove_dir_all(&rel);
         let _ = std::fs::remove_dir_all(&mocks);
     }
 

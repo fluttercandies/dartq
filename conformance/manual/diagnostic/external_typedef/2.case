@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/external_typedef/2
+//- source: control case for pkg/_fe_analyzer_shared/messages.yaml#externalTypedef; negative: non-external typedef
+//- file: lib/test.dart
+//+ typedef F = void Function();

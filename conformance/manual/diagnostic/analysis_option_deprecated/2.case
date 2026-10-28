@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/analysis_option_deprecated/2
+//- source: upstream analyzer messages.yaml#analysisOptionDeprecated documentation "Common fixes" example (machine-verified upstream); negative: errors nested under analyzer
+//- file: lib/test.dart
+//+ void f() {}
+//- file: analysis_options.yaml
+//+ analyzer:
+//+   errors:
+//+     dead_code: ignore

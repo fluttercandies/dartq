@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/deprecated_colon_for_default_value/2
+//- source: upstream analyzer messages.yaml#deprecatedColonForDefaultValue documentation "Common fixes" example (machine-verified upstream); negative: '=' separator
+//- language: 2.19
+//- file: lib/test.dart
+//+ void f({int i = 0}) {}

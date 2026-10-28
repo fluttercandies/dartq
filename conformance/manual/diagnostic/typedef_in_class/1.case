@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/typedef_in_class/1
+//- source: upstream pkg/_fe_analyzer_shared/messages.yaml#typedefInClass script snippet (machine-verified upstream trigger)
+//- file: lib/test.dart
+//+ class C {
+//+   typedef int F(int x);
+//+ }

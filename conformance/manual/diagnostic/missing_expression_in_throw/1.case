@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/missing_expression_in_throw/1
+//- source: upstream pkg/_fe_analyzer_shared/messages.yaml#missingExpressionInThrow statement snippet 'throw;' (machine-verified upstream trigger)
+//- file: lib/test.dart
+//+ void f() {
+//+   throw;
+//+ }

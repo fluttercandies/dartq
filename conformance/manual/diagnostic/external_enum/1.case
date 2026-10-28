@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/external_enum/1
+//- source: upstream pkg/_fe_analyzer_shared/messages.yaml#externalEnum script snippet (machine-verified upstream trigger)
+//- file: lib/test.dart
+//+ external enum E { one }

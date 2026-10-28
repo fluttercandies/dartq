@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/hack/1
+//- source: hand-derived from upstream emission site pkg/analyzer/lib/src/error/todo_finder.dart (_TodoFinder matches uppercase HACK followed by end/colon/(name), wired via library_analyzer.dart TodoFinder.findIn)
+//- file: lib/test.dart
+//+ // HACK: Workaround for the upstream bug.
+//+ void f() {}

@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/external_enum/2
+//- source: control case for pkg/_fe_analyzer_shared/messages.yaml#externalEnum; negative: enum without external keyword
+//- file: lib/test.dart
+//+ enum E { one }
