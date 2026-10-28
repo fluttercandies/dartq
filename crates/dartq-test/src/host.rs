@@ -138,21 +138,33 @@ impl Profile {
     pub const GROUPED: Self = Self { base: 2, per_worker: 1 };
 
     /// The grouped Flutter pass: one runner VM and one resident
-    /// `frontend_server` (~1.4 GB together on a 3000-suite package), plus
-    /// one reused `flutter_tester` per concurrent suite (0.24–0.40 GB each,
-    /// one compiled chunk loaded). Measured: five testers 2.4 GB peak.
-    pub const FLUTTER_GROUPED: Self = Self { base: 3, per_worker: 1 };
+    /// `frontend_server` (1.0–1.4 GB together at the base-side peak), plus
+    /// one reused `flutter_tester` per concurrent suite. A tester's peak
+    /// depends on its suite (0.3–0.65 GB measured across packages), and
+    /// workers are reused across suites, so the per-worker share covers the
+    /// heaviest measured tester, not the average: two units.
+    pub const FLUTTER_GROUPED: Self = Self { base: 3, per_worker: 2 };
 
-    /// `self` with the per-worker share recorded for `kind` by earlier runs
-    /// on this host ([`Self::observe`]), or unchanged when none is recorded.
+    /// `self` with the per-worker share raised to any larger value recorded
+    /// for `kind` by earlier runs on this host ([`Self::observe`]); the
+    /// built-in seed is the floor. A record folds one run's whole-tree peak
+    /// across every worker, so it measures the average worker at one
+    /// instant — below the seed it is under-measurement, not a lighter
+    /// host, and booking under the seed would break the lease's bound where
+    /// booking over it only costs parallelism.
     #[must_use]
     pub fn calibrated(self, kind: &str) -> Self {
         let recorded = cache_dir()
             .and_then(|dir| std::fs::read_to_string(dir.join("test").join(format!("profile-{kind}"))).ok())
-            .and_then(|text| text.trim().parse::<usize>().ok())
-            .filter(|&units| units >= 1);
+            .and_then(|text| text.trim().parse::<usize>().ok());
+        self.refine(recorded)
+    }
+
+    /// [`Self::calibrated`]'s fold: the record applies only above the seed.
+    #[must_use]
+    fn refine(self, recorded: Option<usize>) -> Self {
         Self {
-            per_worker: recorded.unwrap_or(self.per_worker),
+            per_worker: recorded.map_or(self.per_worker, |units| units.max(self.per_worker)),
             ..self
         }
     }
@@ -531,5 +543,34 @@ mod tests {
         let third = Lease::acquire(tmp.path(), 6, 1, 8, far).expect("io").expect("granted");
         assert_eq!(third.units(), 6, "released slots return to the pool");
         drop(second);
+    }
+
+    /// The grouped Flutter booking covers the measured peaks: the base
+    /// holds the runner VM and the resident compiler at their coincident
+    /// peak, and one worker's share holds the heaviest measured tester.
+    #[test]
+    fn flutter_grouped_booking_covers_measured_peaks() {
+        let profile = Profile::FLUTTER_GROUPED;
+        // Round-1 captures, 92-suite widget-test package: runner VM +
+        // frontend_server together at 1.0 GB coincident; the heaviest
+        // flutter_tester at 647 MB.
+        assert!(profile.base as u64 * UNIT >= 1024 * 1024 * 1024);
+        assert!(profile.per_worker as u64 * UNIT >= 647 * 1024 * 1024);
+    }
+
+    /// A recorded per-worker share refines the booking above its built-in
+    /// seed, never below it: the record is a tree-wide average, the seed
+    /// the heaviest measured worker.
+    #[test]
+    fn calibration_refines_upward_only() {
+        let grouped = Profile::FLUTTER_GROUPED;
+        assert_eq!(grouped.refine(None).per_worker, grouped.per_worker);
+        assert_eq!(grouped.refine(Some(0)).per_worker, grouped.per_worker);
+        assert_eq!(grouped.refine(Some(1)).per_worker, grouped.per_worker);
+        assert_eq!(grouped.refine(Some(4)).per_worker, 4);
+        // Every profile keeps its own seed as the floor.
+        assert_eq!(Profile::STOCK.refine(Some(1)).per_worker, Profile::STOCK.per_worker);
+        assert_eq!(Profile::FLUTTER.refine(Some(3)).per_worker, 3);
+        assert_eq!(Profile::GROUPED.refine(Some(1)).per_worker, Profile::GROUPED.per_worker);
     }
 }
