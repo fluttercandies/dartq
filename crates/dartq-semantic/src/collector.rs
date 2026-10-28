@@ -78,9 +78,9 @@
 
 use crate::capture::{TreeSink, TypeTree};
 use crate::model::{
-    Annotation, ArgListId, ArgPool, ArityDecl, ArityViolation, Container, ContainerKind,
-    DuplicateDecl, Entry, ExtensionFace, FileElements, Formal, Formals, MemberEntry, MemberKind,
-    MicroKind, NameMapBuilder, RepFormal, TopDecl, Ty,
+    Annotation, ArgListId, ArgPool, ArityDecl, ArityViolation, ConstCreationFace, Container,
+    ContainerKind, DuplicateDecl, Entry, ExtensionFace, FileElements, Formal, Formals, MemberEntry,
+    MemberKind, MicroKind, NameMapBuilder, RepFormal, TopDecl, Ty,
 };
 use dartq_parser::{
     DeclarationKind, FormalParameterKind, IdentifierContext, Parser, ParserFeatures, ParserListener,
@@ -269,6 +269,13 @@ struct Builder<'src, 'tab> {
     /// Top-level declarations captured so far; sealed into the model's
     /// `FileElements::decls` at [`Builder::finish`].
     decls: NameMapBuilder<TopDecl>,
+    /// Top-level const variables whose initializer is one bare const
+    /// creation; sealed into `FileElements::const_creations` at
+    /// [`Builder::finish`] (the cross-library instance-equality face).
+    const_creations: NameMapBuilder<ConstCreationFace>,
+    /// A top-level `const` field group is open (the face capture's gate —
+    /// member and local groups never latch it).
+    top_const_group: bool,
     /// Named containers closed so far; sealed into the model's
     /// `FileElements::containers` at [`Builder::finish`] (the open
     /// containers live on [`Builder::containers`]).
@@ -456,6 +463,8 @@ impl<'src, 'tab> Builder<'src, 'tab> {
             strings,
             type_args: ArgPool::default(),
             decls: NameMapBuilder::default(),
+            const_creations: NameMapBuilder::default(),
+            top_const_group: false,
             named_containers: NameMapBuilder::default(),
             containers: Vec::new(),
             container_order: Vec::new(),
@@ -948,6 +957,153 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         while *i < bytes.len() && bytes[*i].is_ascii_whitespace() {
             *i += 1;
         }
+    }
+
+    /// The const-creation face of the top-level declarator whose name ends
+    /// at `name_end`: the initializer must be exactly one bare creation
+    /// `C(name: value, ...)` — a single capitalized head, no explicit type
+    /// arguments, no selector, every argument named, and the call the
+    /// whole initializer (`,`/`;` right after the closing paren; a `new`
+    /// head never captures — that initializer is not constant). Any other
+    /// shape captures no face and the use site defers. Byte-level walk
+    /// beside [`Builder::creation_initializer_ty`], bounded by the
+    /// initializer's own extent.
+    fn const_creation_face(&mut self, name_end: u32) -> Option<ConstCreationFace> {
+        let bytes = self.source.as_bytes();
+        let mut i = name_end as usize;
+        Self::skip_literal_ws(bytes, &mut i);
+        if bytes.get(i) != Some(&b'=') || bytes.get(i + 1) == Some(&b'=') {
+            return None;
+        }
+        i += 1;
+        Self::skip_literal_ws(bytes, &mut i);
+        if bytes.get(i..i + 5) == Some(b"const")
+            && bytes
+                .get(i + 5)
+                .is_some_and(|b| b.is_ascii_whitespace())
+        {
+            i += 5;
+            Self::skip_literal_ws(bytes, &mut i);
+        }
+        let head_start = i;
+        let lead = usize::from(bytes.get(i) == Some(&b'$'));
+        if !bytes.get(i + lead).is_some_and(u8::is_ascii_uppercase) {
+            return None;
+        }
+        while bytes
+            .get(i)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$')
+        {
+            i += 1;
+        }
+        let head = std::str::from_utf8(&bytes[head_start..i]).ok()?;
+        if bytes.get(i) != Some(&b'(') {
+            return None;
+        }
+        // The group's extent — bracket-balanced, string contents skipped
+        // (the `creation_initializer_ty` walk).
+        let group_open = i;
+        let mut depth = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                b'\'' | b'"' => {
+                    let quote = bytes[i];
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != quote {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if depth != 0 || bytes.get(i) != Some(&b')') {
+            return None;
+        }
+        let group_close = i;
+        let mut after = group_close + 1;
+        Self::skip_literal_ws(bytes, &mut after);
+        if !matches!(bytes.get(after), Some(b';' | b',')) {
+            return None;
+        }
+        // Split the group into top-level segments (a trailing comma leaves
+        // one empty tail), then read each as `label: value`.
+        let mut segments: Vec<(usize, usize)> = Vec::new();
+        let mut at = group_open + 1;
+        let mut start = at;
+        let mut inner = 0usize;
+        while at < group_close {
+            match bytes[at] {
+                b'(' | b'[' | b'{' => inner += 1,
+                b')' | b']' | b'}' => inner = inner.checked_sub(1)?,
+                b'\'' | b'"' => {
+                    let quote = bytes[at];
+                    at += 1;
+                    while at < group_close && bytes[at] != quote {
+                        at += if bytes[at] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                b',' if inner == 0 => {
+                    segments.push((start, at));
+                    start = at + 1;
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        segments.push((start, group_close));
+        let mut named: Vec<(StringId, StringId)> = Vec::new();
+        for (start, end) in segments {
+            let mut at = start;
+            Self::skip_literal_ws(bytes, &mut at);
+            let label_start = at;
+            if !bytes
+                .get(at)
+                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_' || *b == b'$')
+            {
+                // An empty segment (the trailing comma) or a positional
+                // argument: only the empty tail is admissible.
+                if bytes[label_start..end].iter().all(|b| b.is_ascii_whitespace()) {
+                    continue;
+                }
+                return None;
+            }
+            while bytes
+                .get(at)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$')
+            {
+                at += 1;
+            }
+            let label = std::str::from_utf8(&bytes[label_start..at]).ok()?;
+            Self::skip_literal_ws(bytes, &mut at);
+            if bytes.get(at) != Some(&b':') {
+                return None;
+            }
+            at += 1;
+            while at < end && bytes[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            let mut value_end = end;
+            while value_end > at && bytes[value_end - 1].is_ascii_whitespace() {
+                value_end -= 1;
+            }
+            if value_end <= at {
+                return None;
+            }
+            let value = std::str::from_utf8(&bytes[at..value_end]).ok()?;
+            named.push((self.strings.intern(label), self.strings.intern(value)));
+        }
+        Some(ConstCreationFace {
+            container: self.strings.intern(head),
+            named: named.into(),
+        })
     }
 
     /// Parses `<t1, t2, ...>` (the opening `<` at `*i`) into its
@@ -1681,6 +1837,7 @@ impl<'src, 'tab> Builder<'src, 'tab> {
         // Vecs' growth slack must not survive into residency (#2246).
         FileElements {
             decls: self.decls.finish(),
+            const_creations: self.const_creations.finish(),
             containers: self.named_containers.finish(),
             container_order: self.container_order.into_boxed_slice(),
             extension_faces: self.extension_faces.into_boxed_slice(),
@@ -2443,6 +2600,22 @@ impl ParserListener for DeclarationCollector<'_, '_> {
                     let is_external = builder.field_external;
                     let is_final = builder.field_final;
                     if context == IdentifierContext::TopLevelVariableDeclaration {
+                        // The const-creation face capture rides the same
+                        // UTF-16 → byte conversion the inference scanners
+                        // use (the name span is UTF-16).
+                        if builder.top_const_group {
+                            let name_end = if builder.source.is_ascii() {
+                                range.end()
+                            } else {
+                                dartq_source::utf16_offset_to_byte(
+                                    builder.source,
+                                    range.end(),
+                                ) as u32
+                            };
+                            if let Some(face) = builder.const_creation_face(name_end) {
+                                builder.const_creations.insert(name, face);
+                            }
+                        }
                         builder.declare_top(
                             name,
                             range,
@@ -2680,6 +2853,12 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_final = _var_final_or_const
             .and_then(|t| builder.tokens.get(t.id as usize))
             .is_some_and(|tok| &builder.source[tok.byte_range()] == "final");
+        // A top-level `const` group opens the const-creation face's
+        // capture window (member and local groups never latch it).
+        builder.top_const_group = builder.containers.is_empty()
+            && _var_final_or_const
+                .and_then(|t| builder.tokens.get(t.id as usize))
+                .is_some_and(|tok| &builder.source[tok.byte_range()] == "const");
     }
 
     fn end_fields(
@@ -2704,6 +2883,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
+        builder.top_const_group = false;
         // The group closed: its star latch clears with it, and anything a
         // closure initializer buffered (local-declaration metadata) binds
         // to nothing.
@@ -2732,6 +2912,7 @@ impl ParserListener for DeclarationCollector<'_, '_> {
         builder.field_abstract = false;
         builder.field_external = false;
         builder.field_final = false;
+        builder.top_const_group = false;
         builder.field_annotations.clear();
         builder.drop_pending_annotations();
     }

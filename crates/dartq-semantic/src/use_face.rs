@@ -63,6 +63,15 @@ pub struct UnitUseFace {
     /// re-export face (a name this library re-exports observably flows
     /// through it).
     pub exports: Vec<ExportUseFace>,
+    /// The member spellings an extension import may be credited by: the
+    /// used names minus the spellings only non-demonstrating member
+    /// accesses contributed — an access over a receiver this unit could
+    /// not type (`Unknown`, or a typed head that resolves nowhere — the
+    /// oracle's `InvalidType`) never shows an extension application, so
+    /// it lends no import credit at the library close (the receiver
+    /// classification lives in the per-unit pass; see
+    /// `Engine::extension_credit_names`).
+    pub extension_credit: FxHashSet<StringId>,
 }
 
 /// One import directive's written combinator face (prefix + shown names;
@@ -121,6 +130,10 @@ pub struct LibraryUseSet {
     /// implicit application to (the element-keyed `usedElements.members`
     /// merge — the library-close counterpart of the name pool).
     pub extension_members: FxHashSet<(FileId, u32, StringId)>,
+    /// The merged extension-credit pool (see [`UnitUseFace::
+    /// extension_credit`]): a use in any file of the library credits the
+    /// import the same way the raw pool does.
+    pub extension_credit: FxHashSet<StringId>,
 }
 
 impl LibraryUseSet {
@@ -144,6 +157,13 @@ impl LibraryUseSet {
     #[must_use]
     pub fn extension_member_used(&self, key: (FileId, u32, StringId)) -> bool {
         self.extension_members.contains(&key)
+    }
+
+    /// Whether `name` may credit an extension import (the demonstrating
+    /// member-access pool — the `notifyExtensionUsed` leg's gate).
+    #[must_use]
+    pub fn extension_credit(&self, name: StringId) -> bool {
+        self.extension_credit.contains(&name)
     }
 }
 
@@ -180,6 +200,7 @@ impl LibraryUsages {
                 set.reads.extend(&face.reads);
                 set.used.extend(&face.annotations);
                 set.extension_members.extend(&face.extension_members);
+                set.extension_credit.extend(&face.extension_credit);
             }
         }
         set

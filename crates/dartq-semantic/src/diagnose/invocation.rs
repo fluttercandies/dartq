@@ -1179,6 +1179,18 @@ impl<'a> Engine<'a> {
                     recv_span,
                 },
             );
+            // The invalid-receiver witness must be taken HERE, while the
+            // enclosing scopes still live: a typed head that names a
+            // method type parameter (`DB extends …`, an extension's `on
+            // DB` receiver) is a valid static type now but answers
+            // "invalid" to the finalization-time re-ask, whose scope walk
+            // no longer sees the parameter. Only a head that is invalid
+            // NOW is recorded.
+            if let Receiver::Typed { type_name, .. } = recv
+                && self.is_invalid_ty(Ty::named(type_name))
+            {
+                self.invalid_typed_member_rows.insert(member.range.offset);
+            }
         }
         if is_null_aware {
             self.null_aware_members.insert(member.range.offset);
@@ -2361,7 +2373,13 @@ impl<'a> Engine<'a> {
             && let Some(Some(callee)) = self.invokes.last().copied()
             && let Some(row) = self.rows.get(callee).cloned()
         {
-            self.solve_call_params(callee, &row, &level.args);
+            let mut closure_spans: Vec<(u32, u32)> = level
+                .closures
+                .iter()
+                .map(|(start, end, _)| (*start, *end))
+                .collect();
+            closure_spans.extend(self.invalid_closure_spans.iter().copied());
+            self.solve_call_params(callee, &row, &level.args, &closure_spans);
             self.refine_numeric_call_return(callee, &row, &level.args);
         }
         // Re-arm this level's own creation head: the engine slot is single,
@@ -6360,8 +6378,14 @@ impl<'a> Engine<'a> {
         // `pending_send_ty` and lands on the merged row at the fold
         // (`UnboundedArg<int> v = UnboundedArg<num>(0);` — the assignment
         // check reads the instantiation, not the unknown). A partially
-        // solved instantiation keeps the prior unknown face: an
-        // ungrounded slot has no type the oracle would print either.
+        // solved instantiation keeps the prior unknown face: an ungrounded
+        // slot's oracle answer is the bound (probed 3.47.1:
+        // `Box<S>(S s)`'s `Box(dynamic x)` answers `Box<dynamic>`), but
+        // the contexts that decide it (the declaration annotation, the
+        // parameter type) are exactly the faces this model under-seeds —
+        // a `dynamic` guess over an under-seeded solve reported rows the
+        // oracle never wrote (flat_buffers.dart's context-solved
+        // `Offset(_tail)`), so only the fully solved instantiation lands.
         if let Some(container) = creation_container
             && unnamed_creation
             && let Some(params) = &exec_params
@@ -6370,7 +6394,7 @@ impl<'a> Engine<'a> {
             let args: Box<[Ty]> = params
                 .iter()
                 .zip(solutions.iter())
-                .map(|(param, slot)| slot.unwrap_or_else(|| Ty::named(param.0)))
+                .map(|((_param, _bound), slot)| (*slot).unwrap_or(Ty::Dynamic))
                 .collect();
             let ty = self
                 .boundary

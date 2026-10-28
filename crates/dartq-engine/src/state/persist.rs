@@ -856,7 +856,8 @@ mod tests {
         r#""code":"UriDoesNotExistInDocImport"},{"uri":null,"uri_span":{"offset":80,"length":9},"#,
         r#""code":"UriWithInterpolation"}],"#,
         r#""elements":{"strings":[],"decls":[],"containers":[],"container_order":[],"#,
-        r#""extension_faces":[],"duplicates":[],"arity_violations":[]},"diagnostics":["#,
+        r#""extension_faces":[],"duplicates":[],"arity_violations":[],"const_creations":[]},"#,
+        r#""diagnostics":["#,
         r#"{"severity":"Error","code_name":"uri_does_not_exist","code_machine":"URI_DOES_NOT_EXIST","#,
         r#""code_dtype":"CompileTimeError","code_published":false,"message":"Target of URI "#,
         r#"doesn't exist: 'package:a/a.dart'.","file":0,"range":{"offset":0,"length":18},"#,
@@ -1062,7 +1063,7 @@ mod tests {
         r#""is_final":false,"type_params":0,"type_param_names":[],"type_param_bounds":[],"#,
         r#""var_ty":"Unknown","#,
         r#""return_ty":{"Named":{"name":4,"nullable":false,"args":[]}},"formals":null,"annotations":[],"#,
-        r#""name_range":null}]]}],"duplicates":[],"arity_violations":[]}"#,
+        r#""name_range":null}]]}],"duplicates":[],"arity_violations":[],"const_creations":[]}"#,
     );
 
     /// The element rows the main probe rides past empty, modeled on the
@@ -1260,6 +1261,7 @@ mod tests {
             }],
             duplicates: Vec::new(),
             arity_violations: Vec::new(),
+            const_creations: Vec::new(),
         }
     }
 

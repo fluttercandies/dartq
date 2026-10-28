@@ -63,6 +63,20 @@ pub struct PersistedElements {
     pub extension_faces: Vec<PersistedExtensionFace>,
     pub duplicates: Vec<PersistedDuplicate>,
     pub arity_violations: Vec<PersistedArity>,
+    /// The top-level const-creation faces (the cross-library
+    /// instance-equality face). Additive after the format shipped:
+    /// `default` so payloads persisted before the column existed decode
+    /// with no faces (the #539 additive-field discipline — the equality
+    /// defers exactly as a pre-column binary did).
+    #[serde(default)]
+    pub const_creations: Vec<(u32, PersistedConstCreation)>,
+}
+
+/// One [`crate::model::ConstCreationFace`] in payload form.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedConstCreation {
+    pub container: u32,
+    pub named: Vec<(u32, u32)>,
 }
 
 /// The declared-type column. The `Named` arguments ride as nested content
@@ -613,6 +627,23 @@ impl PersistedElements {
                 range: PersistedRange::of(arity.range),
             })
             .collect();
+        let const_creations = elements
+            .const_creations
+            .iter()
+            .map(|(name, face)| {
+                (
+                    s.id(*name),
+                    PersistedConstCreation {
+                        container: s.id(face.container),
+                        named: face
+                            .named
+                            .iter()
+                            .map(|(label, value)| (s.id(*label), s.id(*value)))
+                            .collect(),
+                    },
+                )
+            })
+            .collect();
         Self {
             strings: s.values,
             decls,
@@ -621,6 +652,7 @@ impl PersistedElements {
             extension_faces,
             duplicates,
             arity_violations,
+            const_creations,
         }
     }
 
@@ -642,6 +674,23 @@ impl PersistedElements {
                 .decls
                 .into_iter()
                 .map(|(at, decl)| (at_name(at), decl.into_top_decl(&ids, &mut type_args)))
+                .collect(),
+            const_creations: self
+                .const_creations
+                .into_iter()
+                .map(|(at, face)| {
+                    (
+                        at_name(at),
+                        crate::model::ConstCreationFace {
+                            container: at_name(face.container),
+                            named: face
+                                .named
+                                .into_iter()
+                                .map(|(label, value)| (at_name(label), at_name(value)))
+                                .collect(),
+                        },
+                    )
+                })
                 .collect(),
             containers: self
                 .containers

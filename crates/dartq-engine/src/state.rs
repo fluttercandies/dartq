@@ -151,6 +151,13 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// whose initializer is an explicitly instantiated creation (`final o =
 /// Obs<N>();`) captures `Obs<N>`; both change the capture output an old
 /// payload holds, so the version moves (and `SIGNATURE_VERSION` to 12).
+/// v19: element models carry the top-level const-creation faces
+/// (`PersistedElements::const_creations`, `serde(default)`) — a v18
+/// payload decodes face-less, so a warm start would keep deferring every
+/// cross-library const-instance equality the faces decide; the bump forks
+/// the generation header and forces re-capture (and
+/// `dartq_semantic::SIGNATURE_VERSION` to 13 — the faces hash into the
+/// element face).
 ///
 /// # Bump contract (structural guard)
 ///
@@ -169,7 +176,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 /// version too.) The bump lane also forks on capture-behavior changes with
 /// no layout delta: a payload the old producer wrote must not be served to
 /// a producer whose capture output diverges from it.
-const FACTS_SHAPE_VERSION: u32 = 18;
+const FACTS_SHAPE_VERSION: u32 = 19;
 
 /// The facts-cache-key version (the `AstKey.parser_version` component of
 /// `EngineSemanticVersion`): the engine facts shape folded with

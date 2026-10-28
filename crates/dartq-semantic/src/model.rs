@@ -1623,6 +1623,25 @@ impl TopDecl {
     }
 }
 
+/// A top-level `const` variable whose initializer is exactly one bare
+/// const creation `C(name: expr, ...)` — the cross-library
+/// instance-equality face (the oracle's `GenericState` field map,
+/// value.dart:1528: two const instances are equal when their types and
+/// surviving field values are). Argument values ride as verbatim source
+/// texts: a text compares only against a text of the SAME declaring file
+/// (identical spellings share the library scope, so they denote identical
+/// values; cross-file texts never reach the comparison — the caller's key
+/// carries the declaring file).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstCreationFace {
+    /// The creation's single-segment head (`DiagnosticWithoutArgumentsImpl`
+    /// — a dotted or generic head captures no face).
+    pub container: StringId,
+    /// The written named arguments in source order: formal name and the
+    /// verbatim argument text. Any positional argument captures no face.
+    pub named: Box<[(StringId, StringId)]>,
+}
+
 /// A declaration-arity violation captured at the declaration site: the
 /// `wrong_number_of_parameters_for_operator` / `_setter` fold log (the
 /// [`DuplicateDecl`] pattern — hash-map order must not reach the report).
@@ -1693,6 +1712,10 @@ pub struct FileElements {
     pub(crate) extension_faces: Box<[ExtensionFace]>,
     pub(crate) duplicates: Box<[DuplicateDecl]>,
     pub(crate) arity_violations: Box<[ArityDecl]>,
+    /// The top-level const variables whose initializer is one bare const
+    /// creation, by name (the cross-library instance-equality face,
+    /// [`ConstCreationFace`]).
+    pub(crate) const_creations: NameMap<ConstCreationFace>,
     /// The unit's canonical argument pool: every [`Ty::Named`] slot of
     /// this model indexes into it. One pool per model universe — ids from
     /// another unit's pool are meaningless here.
@@ -1711,6 +1734,14 @@ impl FileElements {
     #[must_use]
     pub fn container(&self, name: StringId) -> Option<&Container> {
         self.containers.get(&name)
+    }
+
+    /// The const-creation face of the top-level const variable `name`
+    /// ([`ConstCreationFace`]); `None` when the initializer is not one
+    /// bare named-argument creation.
+    #[must_use]
+    pub fn const_creation(&self, name: StringId) -> Option<&ConstCreationFace> {
+        self.const_creations.get(&name)
     }
 
     /// The container names in declaration order (`containers` itself is a

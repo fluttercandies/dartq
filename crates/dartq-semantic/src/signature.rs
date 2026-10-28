@@ -93,8 +93,12 @@ use crate::model::{
 /// JSAny?>` reads a bare `JSArray` as `JSArray<JSAny?>`) and so the
 /// extension faces that apply to it. v12: a member's own type-parameter
 /// bounds — a bound-only edit moves every dependent member send whose
-/// unconstrained parameter settles to it.
-pub const SIGNATURE_VERSION: u32 = 12;
+/// unconstrained parameter settles to it. v13: the top-level
+/// const-creation faces — an initializer-only edit of a `const` variable
+/// (same name, same declared type) moves the cross-library const-instance
+/// equality of every dependent's const-set faces, so it must flip the L2
+/// gate.
+pub const SIGNATURE_VERSION: u32 = 13;
 
 /// The 128-bit blake3 digest of a file's canonical element face — the same
 /// width family as [`dartq_source::ContentId`].
@@ -143,6 +147,7 @@ impl FileElements {
         face.top_decls(self);
         face.containers(self);
         face.extension_faces(self);
+        face.const_creations(self);
         ApiSignature::truncate(&blake3::hash(&face.buf))
     }
 
@@ -439,6 +444,29 @@ impl<'a> Face<'a> {
         for i in 0..self.names.len() {
             let name = self.names[i];
             self.top_decl(name, &elements.decls[&name]);
+        }
+    }
+
+    /// The top-level const-creation faces, ascending by name: the head,
+    /// then every written argument's label and verbatim value text — an
+    /// initializer-only edit of a const variable flips the gate.
+    fn const_creations(&mut self, elements: &FileElements) {
+        Self::sorted(
+            self.strings,
+            &mut self.names,
+            elements.const_creations.keys().copied(),
+        );
+        for i in 0..self.names.len() {
+            let name = self.names[i];
+            let face = &elements.const_creations[&name];
+            self.field("const-creation");
+            self.name(name);
+            self.name(face.container);
+            self.uint(face.named.len() as u64);
+            for (label, value) in face.named.iter() {
+                self.name(*label);
+                self.field(self.strings.resolve(*value));
+            }
         }
     }
 

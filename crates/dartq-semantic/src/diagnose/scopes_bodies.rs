@@ -1621,6 +1621,72 @@ impl<'a> Engine<'a> {
 (out != ty && self.schema_type_is_decidable(out)).then_some(out)
     }
 
+    /// The closure-return tally's recording half (the listener's return
+    /// handlers call it with the return expression's row index): when the
+    /// innermost open function literal owns the current frame, the
+    /// expression's resolved type joins the literal's per-offset tally.
+    /// Only NAMED heads count — `Null` (absorbed by the LUB's
+    /// nullability) and unresolved shapes stay neutral. Validity is asked
+    /// WHERE the head was written: locally resolvable heads are real, and
+    /// a head spelled through a member's declared return type resolves in
+    /// the DECLARING file's scope (the spelling need not be visible here —
+    /// `on Hidden` behind a `show` combinator still names a real type,
+    /// while the broken-re-export `Source` resolves nowhere).
+    pub(crate) fn note_closure_return(&mut self, mark: usize) {
+        let Some(capture) = self.closure_caps.last() else {
+            return;
+        };
+        // The literal owns the return when no further EXECUTABLE frame
+        // opened inside it (a nested literal or local function takes the
+        // return over): block frames of the body sit above the literal's
+        // own executable frame without claiming it.
+        if self.frames[capture.frame_depth.min(self.frames.len())..]
+            .iter()
+            .any(|frame| matches!(frame.kind, FrameKind::Executable { .. }))
+        {
+            return;
+        }
+        let offset = capture.offset;
+        let Some(row) = self.rows.get(mark) else {
+            return;
+        };
+        let row = row.clone();
+        let ty = self.expression_row_ty(&row);
+        let Ty::Named { name, .. } = ty else {
+            return;
+        };
+        if self.is_scope_param(name)
+            || self.name_world().is_known_head(name)
+            || !matches!(self.type_resolution(name).0, TypeResolution::Missing)
+        {
+            self.closure_return_valid.insert(offset);
+            return;
+        }
+        // The origin file: a member send's declared return resolves where
+        // the member was declared.
+        if let RowShape::Member { recv } = &row.shape {
+            let container = match recv {
+                Receiver::Typed { type_name, .. } => Some(*type_name),
+                Receiver::This { container, .. } | Receiver::Container { name: container, .. } => {
+                    Some(*container)
+                }
+                _ => None,
+            };
+            let valid = container.is_some_and(|container| {
+                matches!(self.walk_members(container, row.name), Walk::Found(_))
+                    && self
+                        .member_faces
+                        .last_found_file()
+                        .is_some_and(|file| self.named_type_is_type_in(file, name))
+            });
+            if valid {
+                self.closure_return_valid.insert(offset);
+            } else if container.is_some() {
+                self.closure_return_counted.insert(offset);
+            }
+        }
+    }
+
     /// The send-close upward face: unify the call's typed arguments
     /// against the callee's formals, solving the callee's inference
     /// parameters (`math.max(0, n - 1)` binds `T := int`) for the return
@@ -1638,6 +1704,7 @@ impl<'a> Engine<'a> {
         callee: usize,
         row: &Row,
         args: &[(Option<StringId>, Ty, bool, SourceRange)],
+        closures: &[(u32, u32)],
     ) {
         let recv = match &row.shape {
             RowShape::Member { recv } => *recv,
@@ -1755,6 +1822,35 @@ impl<'a> Engine<'a> {
             .zip(solutions.iter())
             .filter_map(|((param, _), solution)| solution.map(|ty| (*param, ty)))
             .collect();
+        // The invalid-result probe (the resolve_file corpus face): an
+        // all-invalid closure argument over a generic send whose solve
+        // left every parameter open makes the oracle's own result
+        // `InvalidType` (the closure was the only constraint source) —
+        // the send's inferred return is invalid, and member accesses over
+        // it never apply an extension. When the send is itself a
+        // `var`-inferred initializer's outer expression, the declarator's
+        // static type is that invalid face: latch it by name here, at the
+        // close — the rows window cannot carry it (a closure argument
+        // drains the window's rows below the initializer mark before the
+        // initializer ends). The closure-caps guard keeps a send inside a
+        // closure body from latching an outer pending declarator: that
+        // send folds while the enclosing closure's capture is still open,
+        // while the argument closure of the send itself has completed its
+        // capture before the argument list closes (`in_initializer` and
+        // the frame depth are not nesting-safe here — the closure body's
+        // own variable initializers clobber the flag and unwind frames
+        // below the initializer's arming depth).
+        if !self.closure_invalid_returns.is_empty()
+            && !params.is_empty()
+            && solutions.iter().all(|slot| slot.is_none())
+            && closures
+                .iter()
+                .any(|&(start, _)| self.closure_invalid_returns.contains(&start))
+            && self.closure_caps.is_empty()
+            && let Some(Some((name, _))) = self.init_declarators.last()
+        {
+            self.invalid_typed_locals.insert(*name);
+        }
         if !map.is_empty() {
             self.solved_call_params.insert(row.range.offset, map);
         }

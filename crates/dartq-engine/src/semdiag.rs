@@ -389,7 +389,11 @@ fn extension_member_credit(
             {
                 continue;
             }
-            if face.members.keys().any(|member| consumed.used(*member)) {
+            if face
+                .members
+                .keys()
+                .any(|member| consumed.extension_credit(*member))
+            {
                 return true;
             }
         }
@@ -754,6 +758,7 @@ struct CompactUseFace {
     used: Box<[StringId]>,
     reads: Box<[StringId]>,
     annotations: Box<[StringId]>,
+    extension_credit: Box<[StringId]>,
     extension_members: Box<[(FileId, u32, StringId)]>,
     imports: Box<[(Option<StringId>, Box<[StringId]>)]>,
     exports: Box<[Box<[StringId]>]>,
@@ -770,6 +775,7 @@ impl CompactUseFace {
             used: sorted(&face.used),
             reads: sorted(&face.reads),
             annotations: sorted(&face.annotations),
+            extension_credit: sorted(&face.extension_credit),
             extension_members: {
                 let mut members: Vec<(FileId, u32, StringId)> =
                     face.extension_members.iter().copied().collect();
@@ -797,6 +803,7 @@ impl CompactUseFace {
             used: self.used.iter().copied().collect(),
             reads: self.reads.iter().copied().collect(),
             annotations: self.annotations.iter().copied().collect(),
+            extension_credit: self.extension_credit.iter().copied().collect(),
             extension_members: self.extension_members.iter().copied().collect(),
             imports: self
                 .imports
@@ -819,6 +826,7 @@ impl CompactUseFace {
 
     fn heap_bytes(&self) -> usize {
         (self.used.len() + self.reads.len() + self.annotations.len()) * size_of::<StringId>()
+            + self.extension_credit.len() * size_of::<StringId>()
             + self.extension_members.len() * size_of::<(FileId, u32, StringId)>()
             + self
                 .imports
@@ -1212,6 +1220,7 @@ mod compact_face_tests {
             used: [id("a"), id("b"), id("c")].into_iter().collect(),
             reads: [id("b")].into_iter().collect(),
             annotations: [id("override")].into_iter().collect(),
+            extension_credit: [id("e")].into_iter().collect(),
             extension_members: [(owner, 1, id("m"))].into_iter().collect(),
             imports: vec![
                 ImportUseFace {
@@ -1233,6 +1242,7 @@ mod compact_face_tests {
         assert_eq!(back.used, face.used);
         assert_eq!(back.reads, face.reads);
         assert_eq!(back.annotations, face.annotations);
+        assert_eq!(back.extension_credit, face.extension_credit);
         assert_eq!(back.extension_members, face.extension_members);
         assert_eq!(back.imports.len(), 2);
         assert_eq!(back.imports[0].prefix, Some(id("p")));
@@ -1246,6 +1256,7 @@ mod compact_face_tests {
         assert_eq!(
             compact.heap_bytes(),
             5 * ids
+                + ids // extension_credit
                 + size_of::<(FileId, u32, StringId)>()
                 + 2 * size_of::<(Option<StringId>, Box<[StringId]>)>()
                 + 2 * ids

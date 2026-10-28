@@ -1110,6 +1110,18 @@ impl<'a> Engine<'a> {
         let Some(capture) = self.closure_caps.pop() else {
             return;
         };
+        // The closure-return tally closes with the literal: a counted
+        // return set with no valid entry marks the closure all-invalid —
+        // its `T Function(...)` consumers infer an `InvalidType` result.
+        if self.closure_return_counted.contains(&capture.offset)
+            && !self.closure_return_valid.contains(&capture.offset)
+        {
+            self.closure_invalid_returns.insert(capture.offset);
+            // The span joins even when the signature capture poisoned (an
+            // untyped `_` formal): the invalid-result probe matches
+            // arguments by span, not by the captured signature.
+            self.invalid_closure_spans.push((capture.offset, end));
+        }
         let suspends = self.frames.last().is_some_and(|frame| {
             matches!(
                 frame.kind,

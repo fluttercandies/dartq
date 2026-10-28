@@ -1714,7 +1714,8 @@ impl ParserListener for DiagnoseListener<'_> {
             // fallback below reads it, and a let-chain's own bindings never
             // reach an else arm.
             let init_declarator_range = engine.init_declarators.last().copied().flatten();
-            if let Some((name, decl_range)) = engine.init_declarators.pop().flatten()
+            let popped = engine.init_declarators.pop().flatten();
+            if let Some((name, decl_range)) = popped
                 && let Some(mark) = engine.init_mark
                 && let Some((expr, ifnull_ty)) = {
                     // The `??` pair's own face folds here (this slice): the
@@ -4990,6 +4991,7 @@ impl ParserListener for DiagnoseListener<'_> {
             && let Some((ty, literal, range)) = engine.single_row_since(mark)
         {
             engine.check_return(ty, range, literal);
+            engine.note_closure_return(mark);
         }
     }
 
@@ -5027,6 +5029,7 @@ impl ParserListener for DiagnoseListener<'_> {
             .unwrap_or(false);
         if !void_return && let Some((ty, literal, range)) = engine.single_row_since(mark) {
             engine.check_return(ty, range, literal);
+            engine.note_closure_return(mark);
         }
     }
 

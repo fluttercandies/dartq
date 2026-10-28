@@ -3108,6 +3108,37 @@ pub(crate) struct Engine<'a> {
     /// closure-formal-chain arm reads them — the chains the merged-read
     /// record never captured (`sub.impl` after an untyped-call local).
     pub(crate) unresolved_member_rows: Vec<(u32, StringId)>,
+    /// The closure-return invalidity probe (the resolve_file corpus face):
+    /// per closure offset, whether any counted return expression typed a
+    /// named head ([`Self::closure_return_counted`]) and whether any
+    /// counted return was VALID at its origin
+    /// ([`Self::closure_return_valid`]). A closure whose counted returns
+    /// are all invalid-at-origin ([`Self::closure_invalid_returns`]) makes
+    /// the oracle infer an `InvalidType` type argument — the send whose
+    /// `T Function(...)` formal rode it answers an invalid-typed result.
+    pub(crate) closure_return_counted: FxHashSet<u32>,
+    pub(crate) closure_return_valid: FxHashSet<u32>,
+    pub(crate) closure_invalid_returns: FxHashSet<u32>,
+    /// The spans (start, end) of the all-invalid closures — available for
+    /// argument matching even when the signature capture poisoned.
+    pub(crate) invalid_closure_spans: Vec<(u32, u32)>,
+    /// Local names whose initializer send the closure probe proved
+    /// invalid-typed (an unsolved inference parameter constrained only by
+    /// an all-invalid closure) — the oracle's static type for the local is
+    /// `InvalidType`, so no extension applies over it and the
+    /// extension-import credit denies. Keyed by name: the locals stack is
+    /// consumed before the usage pass, and the receiver span match
+    /// re-interns the spelling.
+    pub(crate) invalid_typed_locals: FxHashSet<StringId>,
+    /// Member-row offsets whose merged receiver is a typed head the
+    /// resolver PROVED invalid at merge time — the only moment the proof
+    /// is honest: a method's type-parameter receiver (`DB extends
+    /// GeneratedDatabase`, an extension's `on DB` target) is a valid
+    /// static type while its scope lives, and the finalization-time
+    /// `is_invalid_ty` re-ask cannot see scope parameters anymore (the
+    /// scope stack is consumed before the usage pass). The
+    /// extension-credit Typed arm reads this witness instead of re-asking.
+    pub(crate) invalid_typed_member_rows: FxHashSet<u32>,
     /// Member rows that resolved through a nullable-applicable extension
     /// face on a nullable receiver ([`Engine::member_defined`]'s safe
     /// `Single` verdict): the access needs no null check and the member's

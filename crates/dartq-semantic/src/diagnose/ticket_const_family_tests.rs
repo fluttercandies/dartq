@@ -741,3 +741,139 @@ fn valid_annotation_arguments_stay_silent() {
     }
 }
 
+
+/// The const-creation face captures the declaring model's facts: head
+/// container and the written named arguments' verbatim texts (the
+/// cross-library instance-equality substrate, `ConstCreationFace`).
+#[test]
+fn const_creation_face_captures_head_and_named_texts() {
+    let source = "class Base extends Missing {\n  const Base({required super.name});\n}\n\nclass Impl extends Base {\n  const Impl({required super.name, this.tag = 't'});\n}\n\nconst Impl a = Impl(name: 'a');\nconst Impl b = Impl(\n  name: 'b',\n);\n";
+    let strings = StringTable::new();
+    let mut files = FileTable::new();
+    let file = files.intern(std::path::Path::new("g.dart"));
+    let (scanned, features, _) = scan(source, file);
+    let elements = collect(source, &scanned.tokens, features, &strings);
+    let face = |name: &str| {
+        elements
+            .const_creation(strings.intern(name))
+            .map(|f| {
+                (
+                    strings.resolve(f.container).to_owned(),
+                    f.named
+                        .iter()
+                        .map(|(l, v)| (strings.resolve(*l), strings.resolve(*v)))
+                        .collect::<Vec<_>>(),
+                )
+            })
+    };
+    assert_eq!(
+        face("a"),
+        Some(("Impl".to_owned(), vec![("name", "'a'")]))
+    );
+    assert_eq!(
+        face("b"),
+        Some(("Impl".to_owned(), vec![("name", "'b'")]))
+    );
+    assert_eq!(face("missing"), None);
+}
+
+
+/// [`report`] with the unit registered into the graph
+/// (`LibraryGraphBuilder::unit`): the faces that read
+/// `library_of_file` (the const-creation key walk) answer only for
+/// registered units — the plain harness never registers one.
+fn report_registered(source: &str) -> FileReport {
+    let strings = StringTable::new();
+    let mut files = FileTable::new();
+    let file = files.intern(std::path::Path::new("main.dart"));
+    let (scanned, features, set) = scan(source, file);
+    let elements = collect(source, &scanned.tokens, features, &strings);
+    let mut builder = LibraryGraphBuilder::new(&strings);
+    let lib = builder.intern("package:t/main.dart");
+    let mut index = ElementIndex::default();
+    index.insert(file, elements.clone());
+    builder.unit(lib, file);
+    for (name, decl) in elements.declarations() {
+        if decl.kind == MicroKind::TypeParam {
+            continue;
+        }
+        builder.declare(lib, name, file);
+    }
+    let graph = builder.finish();
+    let namespaces = Namespaces::build(&graph);
+    let fold = fold_unit(
+        source,
+        &scanned.tokens,
+        features,
+        &strings,
+        file,
+        lib,
+        &graph,
+        &namespaces,
+        &index,
+        StrictModes::default(),
+        &LibraryClassModifiers::default(),
+        set.is_enabled(dartq_language::Feature::InferenceUpdate2),
+    );
+    let mut report = fold.report;
+    report.diagnostics = merge_source_ordered(fold.parse_diagnostics, report.diagnostics);
+    report
+}
+
+/// Two const instances of one container whose SUPER-formal arguments
+/// evaporate (the super chain ends at an unresolvable superclass — the
+/// oracle's `_checkSuperConstructorCall` writes nothing, so the
+/// `GenericState` field maps are equal) report the duplicate: the key
+/// world's equal-texts row, bare references and prefixed references
+/// alike. A `this` formal's differing text keeps the pair silent.
+#[test]
+fn super_formal_evaporation_reports_equal_const_instances() {
+    let chain = "class Base extends Missing {\n  const Base({required super.name});\n}\nclass Impl extends Base {\n  const Impl({required super.name, this.tag = 't'});\n}\n";
+    // name (a super formal) evaporates; both instances' surviving maps are
+    // empty — equal instances, one row at the later element.
+    let source = format!("{chain}const Impl a = Impl(name: 'x');\nconst Impl b = Impl(name: 'x');\nvar s = {{a, b}};");
+    let rep = report_registered(&source);
+    assert_eq!(count(&rows(&rep, &source), "equal_elements_in_set"), 1);
+    // A differing surviving `this` field text (tag) keeps the pair silent.
+    let source = format!("{chain}const Impl a = Impl(name: 'x', tag: '1');\nconst Impl b = Impl(name: 'x', tag: '2');\nvar s = {{a, b}};");
+    let rep = report_registered(&source);
+    assert_eq!(count(&rows(&rep, &source), "equal_elements_in_set"), 0);
+    // An equal surviving `this` field text still reports.
+    let source = format!("{chain}const Impl a = Impl(name: 'x', tag: 'k');\nconst Impl b = Impl(name: 'y', tag: 'k');\nvar s = {{a, b}};");
+    let rep = report_registered(&source);
+    assert_eq!(count(&rows(&rep, &source), "equal_elements_in_set"), 1);
+    // Direct creations in a NON-const literal never compare (the
+    // oracle's `computeConstantValue` answers nothing for a bare
+    // invocation outside a const context); in a const literal,
+    // identical spellings report (the same-text face) and differing
+    // spellings defer.
+    let source = format!("{chain}var s = {{Impl(name: 'x'), Impl(name: 'x')}};");
+    let rep = report_registered(&source);
+    assert_eq!(count(&rows(&rep, &source), "equal_elements_in_set"), 0);
+    let source = format!("{chain}const s = {{Impl(name: 'x'), Impl(name: 'x')}};");
+    let rep = report_registered(&source);
+    assert_eq!(
+        count(&rows(&rep, &source), "equal_elements_in_const_set"),
+        1
+    );
+    let source = format!("{chain}const s = {{Impl(name: 'x'), Impl(name: 'y')}};");
+    let rep = report_registered(&source);
+    assert_eq!(
+        count(&rows(&rep, &source), "equal_elements_in_const_set"),
+        0
+    );
+    // The ERROR-tier const literal reports the same face.
+    let source = format!("{chain}const Impl a = Impl(name: 'x');\nconst Impl b = Impl(name: 'x');\nconst s = {{a, b}};");
+    let rep = report_registered(&source);
+    assert_eq!(
+        count(&rows(&rep, &source), "equal_elements_in_const_set"),
+        1
+    );
+    // An evaluable super chain (the superclass resolves and carries a
+    // const constructor) forwards the super-formal value down; two
+    // differing forwarded texts keep the instances distinct.
+    let resolvable = "class Base {\n  const Base({required this.name});\n}\nclass Impl extends Base {\n  const Impl({required super.name});\n}\n";
+    let source = format!("{resolvable}const Impl a = Impl(name: 'x');\nconst Impl b = Impl(name: 'y');\nvar s = {{a, b}};");
+    let rep = report_registered(&source);
+    assert_eq!(count(&rows(&rep, &source), "equal_elements_in_set"), 0);
+}

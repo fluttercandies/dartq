@@ -1,6 +1,38 @@
 use super::*;
 use crate::const_eval::CreatedState;
 
+/// One const-variable reference's instance key (the equality face of a
+/// const set/map element spelled `name` / `p.name` whose instance value
+/// this unit cannot fold): the declaring file, the creation's container,
+/// the variable's declared type, and the surviving argument texts. Equal
+/// keys ⇒ the oracle's instances are equal (`DartObjectImpl ==` over the
+/// `GenericState` field map, value.dart:1528 — two instances of one
+/// container whose surviving written fields hold identical same-file
+/// spellings, which denote identical values). The declaring file rides
+/// the key so argument texts — and [`Ty`] argument slots, which index the
+/// declaring file's pool — never compare across files.
+#[derive(PartialEq)]
+struct InstanceRefKey {
+    file: FileId,
+    container: StringId,
+    var_ty: Ty,
+    fields: Box<[(StringId, StringId)]>,
+}
+
+/// The const-variable reference shape of a set element: a bare `name`, or
+/// `p.name` whose receiver is a plain identifier (an import prefix the
+/// key walk resolves, or anything else it defers on).
+fn const_var_ref(part: &crate::const_eval::Node) -> Option<(Option<StringId>, StringId)> {
+    match &part.expr {
+        Expr::Ident(name) => Some((None, *name)),
+        Expr::Member { recv, name } => match &recv.expr {
+            Expr::Ident(prefix) => Some((Some(*prefix), *name)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 impl ConstLookup for CtorScope<'_, '_> {
     fn ident(&self, name: StringId) -> IdentVerdict {
         match self.env.get(&name) {
@@ -2194,25 +2226,7 @@ impl<'a> Engine<'a> {
                 entries.into_iter().map(|(key, _)| key).collect(),
             ),
         };
-        let mut seen: Vec<ConstantValue> = Vec::new();
-        for part in &parts {
-            if let Verdict::Value(v) = eval(part, self) {
-                // The Instance sentinel is a value UNKNOWN to this subset
-                // (a deferred field — a cross-file const the in-file index
-                // cannot fold): equality over unknowns proves nothing, and
-                // two distinct records `(N.x, 'ol')`/`(N.x, 'ul')` both
-                // collapsing to it would report a duplicate the oracle's
-                // resolved values never equal.
-                if matches!(v, ConstantValue::Instance(_)) {
-                    continue;
-                }
-                if seen.contains(&v) {
-                    self.emit_with_correction(code, part.span);
-                } else {
-                    seen.push(v);
-                }
-            }
-        }
+        self.report_duplicate_elements(code, &parts);
     }
 
     /// The `_checkForDuplications` face (`best_practices_verifier.dart`
@@ -2245,22 +2259,225 @@ impl<'a> Engine<'a> {
                 entries.into_iter().map(|(key, _)| key).collect(),
             ),
         };
+        self.report_duplicate_elements(code, &parts);
+    }
+
+    /// The shared duplicate walk behind
+    /// [`Self::check_const_duplicates`] and [`Self::check_equal_duplicates`]
+    /// — one row per later element an earlier element already produced,
+    /// at the later element's span, in element order. Three value worlds:
+    ///
+    /// * structural [`ConstantValue`] equality (the oracle's
+    ///   `DartObjectImpl ==` over the states the kernel folds);
+    /// * [`InstanceRefKey`] equality for const-variable references whose
+    ///   instance value this unit cannot fold (a foreign library's const —
+    ///   the declaring model's [`crate::model::ConstCreationFace`] answers
+    ///   through the survivor walk below);
+    /// * same-text equality for opaque [`ConstantValue::Created`] elements
+    ///   that carry no key (a direct creation): identical spellings in one
+    ///   file denote one value, so the repeat is certain — different
+    ///   spellings defer (under-report: `P(1)` beside `P(0+1)` stays
+    ///   silent where the oracle's equal field maps would report).
+    fn report_duplicate_elements(
+        &mut self,
+        code: SemanticCode,
+        parts: &[crate::const_eval::Node],
+    ) {
         let mut seen: Vec<ConstantValue> = Vec::new();
-        for part in &parts {
-            if let Verdict::Value(v) = eval(part, self) {
-                // The Instance sentinel's value is unknown to this subset
-                // (a deferred field): it proves no equality (see
-                // [`Self::check_const_duplicates`]).
-                if matches!(v, ConstantValue::Instance(_)) {
-                    continue;
-                }
-                if seen.contains(&v) {
+        let mut seen_keys: Vec<InstanceRefKey> = Vec::new();
+        let mut seen_created: Vec<SourceRange> = Vec::new();
+        for part in parts {
+            // The Instance sentinel is a value UNKNOWN to this subset
+            // (a deferred field — a cross-file const the in-file index
+            // cannot fold): equality over unknowns proves nothing, and
+            // two distinct records `(N.x, 'ol')`/`(N.x, 'ul')` both
+            // collapsing to it would report a duplicate the oracle's
+            // resolved values never equal.
+            let value = match eval(part, self) {
+                Verdict::Value(v) if matches!(v, ConstantValue::Instance(_)) => continue,
+                Verdict::Value(v) => Some(v),
+                Verdict::Constant => None,
+                _ => continue,
+            };
+            // A const-variable reference (bare or prefixed) folds no
+            // instance value here — the key world answers for it.
+            if let Some((prefix, name)) = const_var_ref(part)
+                && let Some(key) = self.const_ref_key(prefix, name)
+            {
+                if seen_keys.contains(&key) {
                     self.emit_with_correction(code, part.span);
                 } else {
-                    seen.push(v);
+                    seen_keys.push(key);
+                }
+                continue;
+            }
+            match value {
+                Some(v) if !matches!(v, ConstantValue::Created(_)) => {
+                    if seen.contains(&v) {
+                        self.emit_with_correction(code, part.span);
+                    } else {
+                        seen.push(v);
+                    }
+                }
+                // A creation this unit cannot see into, or a constant of
+                // unknown value: only an identical spelling proves the
+                // repeat — different spellings defer.
+                _ => {
+                    let text = self.source_slice(part.span);
+                    if seen_created
+                        .iter()
+                        .any(|span| self.source_slice(*span) == text)
+                    {
+                        self.emit_with_correction(code, part.span);
+                    } else {
+                        seen_created.push(part.span);
+                    }
                 }
             }
         }
+    }
+
+    /// The source text under a (UTF-16) span — the same-text equality
+    /// face of [`Self::report_duplicate_elements`]'s deferred world.
+    fn source_slice(&self, span: SourceRange) -> &str {
+        let start = self.byte_of(span.offset).min(self.source.len());
+        let end = self.byte_of(span.end()).max(start).min(self.source.len());
+        &self.source[start..end]
+    }
+
+    /// The written named arguments of a const creation that survive into
+    /// the oracle's `GenericState` field map (value.dart:1528): a
+    /// non-`super` formal's argument survives at its own field name; a
+    /// bare `super.x` formal (the [`Ty::Never`] sentinel) forwards to the
+    /// superclass constructor's same-named parameter
+    /// (`evaluation.dart`'s implicit super-formal arguments) and recurses
+    /// one hop up. Forwarded arguments evaporate wherever the chain stops
+    /// evaluating — the superclass is absent (implicit `Object`:
+    /// `_checkSuperConstructorCall` skips the whole block,
+    /// evaluation.dart:3400-3414), unresolvable (a broken import:
+    /// `lookUpConstructor` answers nothing), or declares no const
+    /// constructor (the `isConst` gate); a forwarded label with no
+    /// associated super parameter drops the same way. `None` defers: a
+    /// written label the creation's own constructor cannot answer, or a
+    /// chain past the depth cap.
+    fn surviving_arg_labels(
+        &self,
+        hop_name: StringId,
+        container: &Container,
+        container_file: FileId,
+        labels: &[StringId],
+    ) -> Option<Vec<StringId>> {
+        let mut pending: Vec<StringId> = labels.to_vec();
+        let mut survivors: Vec<StringId> = Vec::new();
+        let mut hop = (hop_name, container, container_file);
+        let mut depth = 0;
+        loop {
+            if pending.is_empty() {
+                break;
+            }
+            if depth == 8 {
+                return None;
+            }
+            let formals = hop.1.ctor_formals.get(&hop.0)?;
+            let mut forwarded: Vec<StringId> = Vec::new();
+            for label in &pending {
+                match formals.named_formal(*label) {
+                    // A written label the CREATION's own constructor cannot
+                    // answer is an invalid argument — defer (the oracle's
+                    // evaluation stops on it). A FORWARDED label the super
+                    // constructor cannot answer has no associated super
+                    // parameter (the `super_formal_parameter_without_
+                    // associated_named` drop): the argument evaporates.
+                    None => {
+                        if depth == 0 {
+                            return None;
+                        }
+                    }
+                    Some(formal) => {
+                        if formal.ty == Ty::Never {
+                            forwarded.push(*label);
+                        } else {
+                            survivors.push(*label);
+                        }
+                    }
+                }
+            }
+            if forwarded.is_empty() {
+                break;
+            }
+            // The super hop decides the forwarded set's fate. Where the
+            // chain stops evaluating — an implicit `Object` superclass,
+            // an unresolvable superclass name, or no const constructor —
+            // every forwarded argument evaporates (`_checkSuperConstructorCall`
+            // writes nothing), which ends the walk successfully.
+            let Some(sup_name) = hop.1.superclass else {
+                pending.clear();
+                break;
+            };
+            let sup_lib = self.graph.library_of_file(hop.2)?;
+            let Some((sup_container, sup_file)) =
+                resolve_container(self.graph, self.namespaces, self.index, sup_lib, hop.2, sup_name)
+            else {
+                pending.clear();
+                break;
+            };
+            if !sup_container.has_const_constructor {
+                pending.clear();
+                break;
+            }
+            pending = forwarded;
+            hop = (sup_name, sup_container, sup_file);
+            depth += 1;
+        }
+        (pending.is_empty()).then_some(survivors)
+    }
+
+    /// The instance key of a const-variable reference element (`name`
+    /// bare, `p.name` prefixed): the declaring file (the texts compare
+    /// only within one file — identical spellings share that file's
+    /// library scope, so they denote identical values), the creation's
+    /// container, the variable's declared type, and the surviving
+    /// argument texts. `None` defers — not a top-level const variable,
+    /// no captured face, or an undecided survivor walk.
+    fn const_ref_key(&self, prefix: Option<StringId>, name: StringId) -> Option<InstanceRefKey> {
+        let decl_file = match prefix {
+            Some(prefix) => {
+                match self
+                    .namespaces
+                    .lookup_prefixed(self.graph, self.lib, prefix, name)
+                {
+                    Lookup::Found(NamespaceEntry::Decl(file)) => file,
+                    _ => return None,
+                }
+            }
+            None => match self.namespaces.lookup(self.graph, self.lib, name) {
+                Lookup::Found(NamespaceEntry::Decl(file)) => file,
+                _ => return None,
+            },
+        };
+        let elements = self.index.get(decl_file)?;
+        let face = elements.const_creation(name)?;
+        let var_ty = elements.decl(name)?.var_ty;
+        let decl_lib = self.graph.library_of_file(decl_file)?;
+        let (container, cont_file) =
+            resolve_container(self.graph, self.namespaces, self.index, decl_lib, decl_file, face.container)?;
+        if !container.has_const_constructor {
+            return None;
+        }
+        let labels: Vec<StringId> = face.named.iter().map(|(label, _)| *label).collect();
+        let survivors = self.surviving_arg_labels(face.container, container, cont_file, &labels)?;
+        let fields: Box<[(StringId, StringId)]> = face
+            .named
+            .iter()
+            .filter(|(label, _)| survivors.contains(label))
+            .copied()
+            .collect();
+        Some(InstanceRefKey {
+            file: decl_file,
+            container: face.container,
+            var_ty,
+            fields,
+        })
     }
 
     /// The annotation-argument faces (#2261): a RESOLVED const

@@ -318,6 +318,85 @@ impl<'a> Engine<'a> {
         resolved
     }
 
+    /// The member spellings an extension import can be credited by: the
+    /// oracle credits an import only when the resolver applied one of
+    /// its extensions (`notifyExtensionUsed` after
+    /// `applicable_extensions.dart`' `applicableTo` accepts the
+    /// receiver's static type), and an invalid-typed receiver — the
+    /// unresolved `Source` behind a broken re-export — applies nothing.
+    /// The name-level model cannot re-run applicability at the directive
+    /// gate, so a deny needs PROOF the receiver was invalid: a typed
+    /// head that resolves nowhere in this unit and in no import target's
+    /// export scope, or an `Unknown` receiver whose local the
+    /// closure-return probe marked. Everything else keeps the credit
+    /// (the oracle's receiver may be a perfectly valid type this model
+    /// never saw). A spelling no member access carries at all
+    /// (bare/type uses) keeps the raw posture.
+    fn extension_credit_names(&self, used: &[StringId]) -> Vec<StringId> {
+        let mut accessed: FxHashSet<StringId> = FxHashSet::default();
+        let mut demonstrating: FxHashSet<StringId> = FxHashSet::default();
+        // The reachability fallback's edge set: a typed head that resolves
+        // nowhere in this unit still names a REAL type when an import
+        // target exports it (the oracle resolves applicability where the
+        // type was written; a `show`-hidden spelling is inaccessible, not
+        // invalid).
+        let edges = self.graph.import_edges(self.lib);
+        for read in &self.member_reads {
+            accessed.insert(read.name);
+            let recv = self.promoted_receiver(read.offset, read.recv);
+            let demonstrates = match recv {
+                Receiver::Unknown => !self.read_roots_at_invalid_local(read.offset),
+                Receiver::Typed { type_name, .. } => {
+                    // The merge-time witness, not a finalization re-ask:
+                    // the scope stack is gone here, so a method type
+                    // parameter receiver (`DB extends …`) would read as
+                    // invalid and deny a credit the oracle's applicability
+                    // granted (the extension's own `on DB` face).
+                    !self.invalid_typed_member_rows.contains(&read.offset)
+                        || edges.iter().any(|edge| {
+                            edge.target
+                                .is_some_and(|t| self.graph.exported(t, type_name).is_some())
+                        })
+                }
+                _ => true,
+            };
+            if demonstrates {
+                demonstrating.insert(read.name);
+            }
+        }
+        // Standing `Unknown`-receiver rows deny the same provable way —
+        // an unproven access keeps the credit (the receiver the oracle
+        // typed may be perfectly valid; only the closure probe's marked
+        // locals are known `InvalidType`).
+        for &(offset, name) in &self.unresolved_member_rows {
+            accessed.insert(name);
+            if !self.read_roots_at_invalid_local(offset) {
+                demonstrating.insert(name);
+            }
+        }
+        used.iter()
+            .copied()
+            .filter(|&name| demonstrating.contains(&name) || !accessed.contains(&name))
+            .collect()
+    }
+
+    /// Whether the bare identifier a `.`-selection's receiver ends with
+    /// names a local the closure-return probe marked (`InvalidType`
+    /// static type in the oracle): the extension-import credit's deny
+    /// proof for an `Unknown` receiver (`var source = run('…', (…) { …
+    /// return forUri(uri); … }); source.tryCast(…)` — the inferred
+    /// receiver is invalid, no extension ever applies).
+    fn read_roots_at_invalid_local(&self, member_offset: u32) -> bool {
+        let Some((start, end)) = self.ident_span_before_dot(member_offset) else {
+            return false;
+        };
+        let span = &self.source.as_bytes()[self.byte_of(start)..self.byte_of(end)];
+        !span.is_empty()
+            && self
+                .invalid_typed_locals
+                .contains(&self.intern(std::str::from_utf8(span).unwrap_or("")))
+    }
+
     /// The creation/metadata selector credit (`const C._x()`,
     /// `new C._x()`, `@C._x`): the parser routes a constructor
     /// reference's selector through the creation-head events instead of a
@@ -1667,6 +1746,10 @@ impl<'a> Engine<'a> {
             .chain(&self.import_used)
             .copied()
             .collect();
+        // The extension-credit pool: `used` minus the spellings only
+        // non-demonstrating member accesses contributed (see
+        // [`Self::extension_credit_names`]).
+        let credit: Vec<StringId> = self.extension_credit_names(&used);
         for (index, edge) in edges.iter().enumerate() {
             // Copied first: the emit below mutates the report.
             let (uri_text, uri_range, prefix, shown) = {
@@ -1693,9 +1776,9 @@ impl<'a> Engine<'a> {
                         edge.combinators.allows(n) && self.graph.exported(target, n).is_some()
                     });
                     if let Some(n) = hit {
-                        
                     }
-                    hit.is_some() || self.import_credits_extension_member(edge, target, &used)
+                    let credited = self.import_credits_extension_member(edge, target, &credit);
+                    hit.is_some() || credited
                 }
             };
             if !is_used {
@@ -1905,6 +1988,20 @@ impl<'a> Engine<'a> {
 
     /// Moves the pass's accumulated use sets into the unit's use-face
     pub(crate) fn take_use_face(&mut self) -> UnitUseFace {
+        // The demonstrating pool computes before the drains: the receiver
+        // facts (`member_reads`) stay live here, and the input set is the
+        // same `used_names` ∪ `import_used` union the directive pass
+        // credits by.
+        let credit_pool: Vec<StringId> = self
+            .used_names
+            .iter()
+            .chain(&self.import_used)
+            .copied()
+            .collect();
+        let extension_credit = self
+            .extension_credit_names(&credit_pool)
+            .into_iter()
+            .collect();
         UnitUseFace {
             used: std::mem::take(&mut self.used_names),
             reads: std::mem::take(&mut self.read_names),
@@ -1919,6 +2016,7 @@ impl<'a> Engine<'a> {
                 })
                 .collect(),
             exports: std::mem::take(&mut self.exports),
+            extension_credit,
         }
     }
 
