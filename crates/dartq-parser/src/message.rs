@@ -393,11 +393,13 @@ pub(crate) mod msg {
     // Texts follow the shared-parser templates (`diagnostic.g.dart`,
     // `messages.yaml`); `{0}`-style substitutions are formatted here.
 
-    pub(crate) fn expected_class_member(lexeme: &str) -> Message {
-        Message::new(
-            EXPECTED_CLASS_MEMBER,
-            format!("Expected a class member, but got '{lexeme}'."),
-        )
+    pub(crate) fn expected_class_member() -> Message {
+        // The registry template carries no lexeme placeholder
+        // (`messages.yaml` expectedClassMember, `PseudoSharedCode
+        // .expectedClassMember` re-rendered by the analyzer converter,
+        // error_converter.dart:74-76): the oracle surface is the fixed
+        // text — 39 corpus rows, never the interpolated fasta wording.
+        Message::new(EXPECTED_CLASS_MEMBER, "Expected a class member.")
     }
 
     pub(crate) fn unexpected_token(lexeme: &str) -> Message {
@@ -430,12 +432,13 @@ pub(crate) mod msg {
     // —— directive family (#300) —————————————————————————————————————————
 
     /// `expectedString` (`ensureLiteralString`, `parser_impl.dart:5075`;
-    /// pseudoSharedCode `expectedStringLiteral`, withArguments text).
-    pub(crate) fn expected_string(lexeme: &str) -> Message {
-        Message::new(
-            EXPECTED_STRING_LITERAL,
-            format!("Expected a String, but got '{lexeme}'."),
-        )
+    /// pseudoSharedCode `expectedStringLiteral`): the analyzer converter
+    /// re-renders every such message with the registry template
+    /// ("Expected a string literal." — 165 corpus rows, never the
+    /// interpolated fasta wording), so the shared "Expected a String, but
+    /// got …" text is never dart-analyze-observable.
+    pub(crate) fn expected_string() -> Message {
+        Message::new(EXPECTED_STRING_LITERAL, "Expected a string literal.")
     }
 
     pub(crate) fn directive_after_declaration() -> Message {
@@ -700,7 +703,11 @@ pub(crate) mod msg {
         Message::new(code, text)
     }
 
-    /// `expectedBody` (analyzer registry code `missing_function_body`).
+    /// `ExpectedFunctionBody` (pseudo-shared `missingFunctionBody`;
+    /// the analyzer converter re-renders it with the registry
+    /// `MISSING_FUNCTION_BODY` template — "A function body must be
+    /// provided.", 574 corpus rows, never the interpolated fasta wording —
+    /// so the text is [`Self::expected_body`] verbatim).
     pub(crate) fn expected_body() -> Message {
         Message::new(MISSING_FUNCTION_BODY, "A function body must be provided.")
     }
@@ -1728,12 +1735,15 @@ pub(crate) mod msg {
     }
 
     pub(crate) fn invalid_inline_function_type() -> Message {
+        // Registry template (`messages.yaml` invalidInlineFunctionType,
+        // converter re-render at error_converter.dart:120-122 — the pinned
+        // corpus row carries this exact text).
         Message::new(
             local_code(
                 "invalid_inline_function_type",
                 "INVALID_INLINE_FUNCTION_TYPE",
             ),
-            "Function-typed parameters aren't allowed.",
+            "Inline function types can't be used for parameters in a generic function type.",
         )
     }
 
@@ -1745,15 +1755,6 @@ pub(crate) mod msg {
     }
 
     // —— statements (#19) ————————————————————————————————————————————————
-
-    /// `ExpectedFunctionBody` template (pseudo-shared `missingFunctionBody`;
-    /// the analyzer surfaces the registry `MISSING_FUNCTION_BODY` code).
-    pub(crate) fn expected_function_body(lexeme: &str) -> Message {
-        Message::new(
-            MISSING_FUNCTION_BODY,
-            format!("Expected a function body, but got '{lexeme}'."),
-        )
-    }
 
     pub(crate) fn only_try() -> Message {
         Message::new(

@@ -196,6 +196,24 @@ extension JSFunctionUnsafeUtilExtension on JSFunction {
 }
 "#,
     ),
+    (
+        // Upstream Dart SDK source, sdk/lib/ffi/ffi.dart:343-368 — the
+        // `NativeFunctionPointer` extension surface verbatim. The
+        // `@DartRepresentationOf` metadata plays no part in the resolution
+        // surfaces the faces carry and is dropped; the concrete body
+        // declares `external` (the name-level model is identical and no
+        // body is captured either way). Without this face a
+        // `p.asFunction<DF>()` read over a `Pointer<NativeFunction<NF>>`
+        // receiver reports `undefined_method` instead of resolving — the
+        // `leaf_call_must_not_*` / `non_native_function_type_argument_to_
+        // pointer` corpus rows hang off exactly that send.
+        "ffi",
+        r#"extension NativeFunctionPointer<NF extends Function>
+    on Pointer<NativeFunction<NF>> {
+  external DF asFunction<DF extends Function>({bool isLeaf = false});
+}
+"#,
+    ),
 ];
 
 /// Indexes every bundled excerpt's element model under its library's
@@ -268,5 +286,35 @@ mod tests {
             );
             assert!(!source.is_empty(), "extension face `{library}` is empty");
         }
+    }
+
+    /// The `dart:ffi` excerpt carries the `NativeFunctionPointer`
+    /// extension's `asFunction` accessor (upstream Dart SDK source,
+    /// `sdk/lib/ffi/ffi.dart`): the member resolution for
+    /// `p.asFunction<...>()` runs through the generated `ffi` face list,
+    /// so both the extension name there and the excerpt's member spelling
+    /// must stand — a dropped face resurfaces as `undefined_method`.
+    #[test]
+    fn ffi_face_carries_native_function_pointer_as_function() {
+        let (_, source) = SDK_EXTENSION_FACE_SOURCES
+            .iter()
+            .find(|(library, _)| *library == "ffi")
+            .expect("dart:ffi extension face present");
+        assert!(
+            source.contains("extension NativeFunctionPointer"),
+            "excerpt lost the NativeFunctionPointer extension: {source}"
+        );
+        assert!(
+            source.contains("asFunction"),
+            "excerpt lost the asFunction accessor: {source}"
+        );
+        let (_, faces) = crate::sdk_faces_gen::SDK_LIBRARY_FACES
+            .iter()
+            .find(|(name, _)| *name == "ffi")
+            .expect("generated ffi face list");
+        assert!(
+            faces.contains(&"NativeFunctionPointer"),
+            "generated ffi face list lost NativeFunctionPointer"
+        );
     }
 }

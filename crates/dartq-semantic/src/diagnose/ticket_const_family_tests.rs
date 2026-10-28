@@ -345,8 +345,15 @@ fn annotation_set_element_reports_at_unresolved_prefix() {
     let source = "@Target({TargetKind.classType})\nclass C {}";
     let rep = report(source);
     let rows = rows(&rep, source);
+    // The undefined_annotation row spans the whole Annotation node
+    // (`annotation_resolver.dart` `.at(node)`; the frozen manual face
+    // annotation_space_before_parenthesis/1 measures `@metadata (x, y)` at
+    // 1:1|16 — `@` through the arguments' closing paren).
     assert!(
-        rows.contains(&("undefined_annotation", "@Target")),
+        rows.contains(&(
+            "undefined_annotation",
+            "@Target({TargetKind.classType})"
+        )),
         "{rows:?}"
     );
     assert!(

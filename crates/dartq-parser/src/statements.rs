@@ -2021,8 +2021,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             return (open, self.span_of(close_id));
         }
         let at = self.peek_span();
-        let lexeme = self.cursor.lexeme(at.id);
-        self.report(msg::expected_function_body(lexeme), at);
+        self.report(msg::expected_body(), at);
         let offset = at.range.offset;
         let open = self.synthetic(TokenKind::OpenCurly, offset);
         let close = self.synthetic(TokenKind::CloseCurly, offset);

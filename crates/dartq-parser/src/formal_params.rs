@@ -26,9 +26,20 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     /// missing `(` is recovered with a synthetic empty list.
     pub(crate) fn parse_formal_parameters_required_opt(&mut self, kind: MemberKind) -> TokenSpan {
         if self.peek_kind() != TokenKind::OpenParen {
-            // Recovery: synthesize an empty parameter list.
+            // Recovery: synthesize an empty parameter list. The report
+            // anchor applies the official `findNonZeroLengthToken` walk
+            // (parser/util.dart:56 — upstream `reportRecoverableError`
+            // skips forward over zero-width synthetics): a real follower
+            // anchors on itself, a queued synthetic advances to the first
+            // real token.
+            let mut anchor = self.peek_span();
+            let mut n = 0usize;
+            while anchor.range.length == 0 && self.cursor.look_kind(n) != TokenKind::Eof {
+                n += 1;
+                anchor = self.look_span_at(n);
+            }
+            self.report(msg::missing_parameters(kind), anchor);
             let at = self.peek_span();
-            self.report(msg::missing_parameters(kind), at);
             let open = self.synthetic(TokenKind::OpenParen, at.range.offset);
             let close = self.synthetic(TokenKind::CloseParen, at.range.offset);
             self.listener.begin_formal_parameters(open, kind);
@@ -643,6 +654,10 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         // the post-walk probe did).
         let mut before_inline_function_type: Option<TokenSpan> = None;
         let mut inline_name: Option<TokenSpan> = None;
+        // The token opening the parameter's own suffix (`<`/`(`) — upstream's
+        // `invalid_inline_function_type` anchor is `beforeInlineFunctionType
+        // .next!` (parser_impl.dart:2326), the suffix opener, not the name.
+        let mut inline_anchor: Option<TokenSpan> = None;
         let mut type_param = TypeParamOrArg::None;
         let before_probe = self.cursor.mark();
         if this_keyword.is_none() {
@@ -653,6 +668,9 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 let name = self.peek_span();
                 if follower == TokenKind::Lt {
                     self.cursor.advance();
+                    // The suffix opener doubles as the upstream report
+                    // anchor (`beforeInlineFunctionType.next!`).
+                    inline_anchor = Some(self.peek_span());
                     type_param = self.compute_type_param_or_arg_on_lt(false);
                     // The shape follower is read after the group (official
                     // `closer.next!`), computed from the `<` offset so a
@@ -664,6 +682,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                         shape_matched = true;
                     }
                 } else if follower == TokenKind::OpenParen {
+                    inline_anchor = Some(self.look_span_at(1));
                     shape_matched = true;
                 }
                 if shape_matched {
@@ -691,7 +710,11 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     // walk-end gate owns the `extraneous_modifier` half.
                     self.report(msg::function_typed_parameter_var(), t);
                 }
-                before_inline_function_type = Some(self.peek_span());
+                // Untyped shape: `before` is the `(` itself, which is also
+                // the upstream anchor (`beforeType.next!`).
+                let at = self.peek_span();
+                before_inline_function_type = Some(at);
+                inline_anchor = Some(at);
             }
             // The unified parse below re-walks from the type start (official
             // `parseType(beforeType)`). An untyped walked formal re-walks
@@ -772,7 +795,13 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 .end_function_typed_formal_parameter(before, question);
             let _ = after_params;
             if in_function_type {
-                self.report(msg::invalid_inline_function_type(), before);
+                // Upstream reports at `beforeInlineFunctionType.next!`
+                // (parser_impl.dart:2326): the token opening the parameter's
+                // own suffix (`<`/`(`), never the name (pinned oracle rows:
+                // `int f(String s)` → the inner `(` at 1:31|1; manual face
+                // named_function_type/1 → 1:32|1).
+                let at = inline_anchor.unwrap_or(before);
+                self.report(msg::invalid_inline_function_type(), at);
             }
         } else if in_function_type {
             type_info.ensure_type_or_void(self);

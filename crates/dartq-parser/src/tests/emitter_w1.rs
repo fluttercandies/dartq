@@ -125,6 +125,134 @@ fn native_body_without_semicolon_degrades_like_oracle() {
     );
 }
 
+// —— manual-face reporting conventions (2026-10-29 wave) —————————————————
+
+/// `(code, start, end)` rows for one whole-unit parse (UTF-16 units; the
+/// ASCII fixtures make them byte-exact with the oracle rows).
+fn rows(source: &'static str) -> Vec<(String, u32, u32)> {
+    let (table, text) = scan_ok(source);
+    let mut collector = Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
+    p.parse_unit();
+    p.listener.errors.clone()
+}
+
+/// Manual face `literal_with_class_and_new/1` (oracle
+/// `parser-fe/error_recovery/issue_45251_list_new.dart` 3:32|8): the row
+/// spans `new` through the class identifier's end (`new List`), never the
+/// bare keyword.
+#[test]
+fn literal_with_class_and_new_span_matches_oracle_row() {
+    let (code, start, end) = first_span("void f() { var x = new List<int>[1]; }\n");
+    assert_eq!(code, "literal_with_class_and_new");
+    assert_eq!((start, end), (19, 27));
+}
+
+/// Manual face `type_parameter_on_constructor/1` (upstream
+/// `outline_builder.dart` anchors at the type-parameter LIST node:
+/// `typeParameters.charOffset` + `.spanLength`): `<T>` in full at 2:4|3.
+#[test]
+fn type_parameter_on_constructor_span_matches_oracle_row() {
+    let source = "class C {\n  C<T>() {}\n}\n";
+    let rows = rows(source);
+    assert_eq!(
+        rows,
+        vec![("type_parameter_on_constructor".to_string(), 13, 16)],
+        "{rows:?}"
+    );
+}
+
+/// Manual face `type_parameter_on_operator/1`: `<T>` at 2:14|3.
+#[test]
+fn type_parameter_on_operator_span_matches_oracle_row() {
+    let source = "class C {\n  operator []<T>(T t) => null;\n}\n";
+    let rows = rows(source);
+    assert_eq!(
+        rows,
+        vec![("type_parameter_on_operator".to_string(), 23, 26)],
+        "{rows:?}"
+    );
+}
+
+/// Manual face `factory_with_initializers/1`, message+span convention
+/// halves: the registry texts carry no "but got" suffix
+/// (`expectedClassMember`/`missingFunctionBody` are pseudo-shared codes the
+/// analyzer converter re-renders with the fixed registry templates) and the
+/// class-member/function-body rows anchor on the offending `:` (3:15|1).
+/// The `missing_method_parameters` span half (oracle 3:23|1 through the
+/// `findNonZeroLengthToken` walk, pinned live at the emit site) is owned by
+/// the member-recovery shape: the in-flight recovery rework currently hands
+/// that site a real `return` name with a three-row cascade, a
+/// recovery-ordering divergence outside this conventions wave — the walk
+/// fires the moment the recovery hands it a zero-width synthetic name
+/// again.
+#[test]
+fn factory_with_initializers_rows_match_the_oracle() {
+    let source = "class C {\n  int x = 0;\n  factory C() : x = 1 {\n    return C._();\n  }\n  C._();\n}\n";
+    let rows = rows(source);
+    let (_, cm_start, cm_end) = rows
+        .iter()
+        .find(|(c, _, _)| c == "expected_class_member")
+        .expect("expected_class_member row");
+    assert_eq!((*cm_start, *cm_end), (37, 38), "{rows:?}");
+    let (_, fb_start, fb_end) = rows
+        .iter()
+        .find(|(c, _, _)| c == "missing_function_body")
+        .expect("missing_function_body row");
+    assert_eq!((*fb_start, *fb_end), (37, 38), "{rows:?}");
+    assert!(
+        rows.iter()
+            .any(|(c, _, _)| c == "missing_method_parameters"),
+        "{rows:?}"
+    );
+}
+
+/// The registry texts behind the same face (message halves of the
+/// factory_with_initializers/1 pairs and the expected-string pair).
+#[test]
+fn registry_templates_carry_no_but_got_suffix() {
+    let source = "class C {\n  int x = 0;\n  factory C() : x = 1 {\n    return C._();\n  }\n  C._();\n}\n";
+    let (table, text) = scan_ok(source);
+    let mut collector = Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
+    p.parse_unit();
+    assert!(
+        p.listener.texts.contains(&"Expected a class member.".to_string()),
+        "{:?}",
+        p.listener.texts
+    );
+    assert!(
+        p.listener
+            .texts
+            .contains(&"A function body must be provided.".to_string()),
+        "{:?}",
+        p.listener.texts
+    );
+    let (table, text) = scan_ok("part of;\n");
+    let mut collector = Collector::default();
+    let mut p = Parser::new(text, table, latest_features(), &mut collector);
+    p.parse_unit();
+    assert_eq!(p.listener.texts, ["Expected a string literal."]);
+}
+
+/// Manual face `named_function_type/1` (pinned oracle row
+/// `diagnostics/invalid_inline_function_type/doc_0`: `int f(String s)` →
+/// the inner `(` at 1:31|1): the anchor is the token opening the
+/// parameter's own suffix (`beforeInlineFunctionType.next!`,
+/// parser_impl.dart:2326), never the name, and the registry text names the
+/// generic-function-type position.
+#[test]
+fn invalid_inline_function_type_anchors_on_the_suffix_opener() {
+    let source = "typedef F = void Function(int g(int x));\n";
+    let mut rows: Vec<_> = rows(source)
+        .into_iter()
+        .filter(|(c, _, _)| c == "invalid_inline_function_type")
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let (_, start, end) = rows.remove(0);
+    assert_eq!((start, end), (31, 32));
+}
+
 // —— representation_field_trailing_comma: recorded dead at 3.13 ——————————
 
 /// Probed silent (`extension type E(int x,) {}` and the corpus shape both

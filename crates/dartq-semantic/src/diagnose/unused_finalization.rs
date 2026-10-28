@@ -2226,7 +2226,17 @@ impl<'a> Engine<'a> {
             const_ctor: self.in_const_ctor,
             is_factory: false,
         });
-        self.decl_sites.len() - 1
+        let site = self.decl_sites.len() - 1;
+        // The FFI-named annotations latch onto the declaration they
+        // annotate (the `dart:ffi` verifier's post-parse pass reads them
+        // by site). Anything still pending at the next site is the next
+        // declaration's own metadata — the latch never crosses a
+        // declaration.
+        let ffi_annos = std::mem::take(&mut self.ffi_pending_annos);
+        if !ffi_annos.is_empty() {
+            self.ffi_decl_annos.insert(site, ffi_annos);
+        }
+        site
     }
 
     /// Whether one of the pending annotations carries the spelling (the

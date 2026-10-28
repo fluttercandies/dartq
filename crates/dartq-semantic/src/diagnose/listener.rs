@@ -3379,6 +3379,18 @@ impl ParserListener for DiagnoseListener<'_> {
     fn end_metadata(&mut self, begin: Token, _period_before_name: Option<Token>, end: Token) {
         let engine = &mut self.engine;
         engine.note_metadata_args(begin, end);
+        engine.note_ffi_annotation(begin, end);
+        // The annotation-node span exists only at the metadata end:
+        // upstream reports `undefined_annotation` `.at(node)` on the whole
+        // Annotation (`annotation_resolver.dart:245`), `@` through the
+        // arguments' closing paren when present (manual face
+        // annotation_space_before_parenthesis/1: 1:1|16 over
+        // `@metadata (x, y)`).
+        let node = SourceRange {
+            offset: begin.range.offset,
+            length: end.range.end() - begin.range.offset,
+        };
+        engine.emit_undefined_annotation(node);
         engine.const_capture.close_annotation();
         engine.annotation_at = None;
     }
@@ -8965,14 +8977,25 @@ impl ParserListener for DiagnoseListener<'_> {
 
     fn handle_recoverable_error(&mut self, p0: Message, p1: Token, p2: Token) {
         // The row joins the fold's parse face (a SYNTACTIC_ERROR, always
-        // ERROR-severity, anchored at the reported token) beside the flow
-        // forward below.
+        // ERROR-severity) beside the flow forward below. The span follows
+        // the official `handleRecoverableError` formula (analyzer
+        // `fasta/ast_builder.dart`: offset = start token's offset, length =
+        // end token's end − offset): single-token reports pass one token
+        // twice and keep the token span, while with-end reports
+        // (`reportRecoverableErrorWithEnd`) span begin..end — the native
+        // clause row covers `native "x"` (manual face
+        // native_clause_should_be_annotation/1: 1:9|10) and the
+        // literal-with-`new` row covers `new List` (1:20|8).
+        let range = SourceRange {
+            offset: p1.range.offset,
+            length: p2.range.end() - p1.range.offset,
+        };
         self.parse_diagnostics.push(Diagnostic::new(
             Severity::Error,
             p0.code.clone(),
             p0.text.clone(),
             self.file,
-            p1.range,
+            range,
             p0.correction.clone(),
         ));
         self.flow().handle_recoverable_error(p0, p1, p2);

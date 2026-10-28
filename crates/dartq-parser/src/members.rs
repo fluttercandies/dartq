@@ -402,7 +402,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
 
         let is_getter = get_or_set.is_some_and(|t| self.cursor.lexeme(t.id) == "get");
         if get_or_set.is_none() {
-            self.parse_method_type_var(name);
+            let _ = self.parse_method_type_var(name);
         } else {
             self.listener.handle_no_type_variables(self.peek_span());
         }
@@ -1302,14 +1302,17 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             } else {
                 None
             };
-            let has_type_vars = self.parse_method_type_var(name);
-            if has_type_vars && let Some(lt) = lt {
-                // AstBuilder `endClassConstructor`/`endClassMethod`
-                // (ast_builder.dart:6152/6396): the anchors are the `<`.
+            let type_vars = self.parse_method_type_var(name);
+            if let (Some(lt), Some(closer)) = (lt, type_vars) {
+                // Upstream anchors at the type-parameter LIST node
+                // (`outline_builder.dart:2492/2626/4551`: `addProblem` with
+                // `typeParameters.charOffset` + `typeParameters.spanLength`)
+                // — `<T>` in full, not the bare `<` (manual face
+                // type_parameter_on_constructor/1: 2:4|3).
                 if is_constructor {
-                    self.report(msg::type_parameter_on_constructor(), lt);
+                    self.report_with_end(msg::type_parameter_on_constructor(), lt, closer);
                 } else if is_operator {
-                    self.report(msg::type_parameter_on_operator(), lt);
+                    self.report_with_end(msg::type_parameter_on_operator(), lt, closer);
                 }
             }
         }
@@ -1516,7 +1519,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.parse_qualified_rest_opt(IdentifierContext::MethodDeclarationContinuation);
         }
         let name_end = self.peek_span();
-        self.parse_method_type_var(name_end);
+        let _ = self.parse_method_type_var(name_end);
         self.parse_formal_parameters_required_opt(MemberKind::Factory);
         let async_kw = self.parse_async_modifier_opt();
         if self.async_state != AsyncModifier::Sync {
@@ -1664,19 +1667,13 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         } else if self.cursor.progress() == crate::cursor::TokenCursor::progress_at(member_start)
             && !matches!(next_kind, TokenKind::CloseCurly)
         {
-            self.report(
-                msg::expected_class_member(self.cursor.lexeme(next_span.id)),
-                next_span,
-            );
+            self.report(msg::expected_class_member(), next_span);
             self.listener.handle_invalid_member(next_span);
             self.cursor.advance();
         } else if !matches!(next_kind, TokenKind::CloseCurly | TokenKind::Eof) {
             self.parse_fields(kind, before_type, mods, before_type, type_info, None, false);
         } else {
-            self.report(
-                msg::expected_class_member(self.cursor.lexeme(next_span.id)),
-                next_span,
-            );
+            self.report(msg::expected_class_member(), next_span);
             self.listener.handle_invalid_member(next_span);
         }
     }
@@ -1965,7 +1962,10 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
     }
 
     /// Official `parseMethodTypeVar` (`<...>` after a method name).
-    fn parse_method_type_var(&mut self, name: TokenSpan) -> bool {
+    /// Official `parseMethodTypeVar`; returns the type-parameter list's
+    /// closer span when type variables were present (`Some`), `None`
+    /// otherwise.
+    fn parse_method_type_var(&mut self, name: TokenSpan) -> Option<TokenSpan> {
         if self.peek_kind() == TokenKind::Bang {
             let at = self.peek_span();
             self.report(msg::unexpected_token(self.cursor.lexeme(at.id)), at);
@@ -1973,11 +1973,14 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
         }
         if self.peek_kind() != TokenKind::Lt {
             let _ = name;
-            return false;
+            return None;
         }
+        let lt = self.peek_span();
         let type_param = self.compute_type_param_or_arg_on_lt(true);
+        let mut closer = lt;
         if !matches!(type_param, TypeParamOrArg::None) {
             type_param.parse_variables(self, false);
+            closer = self.last_consumed_span();
         }
         if self.peek_kind() == TokenKind::Eq {
             let at = self.peek_span();
@@ -1985,7 +1988,7 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             self.cursor.advance();
         }
         let _ = name;
-        true
+        Some(closer)
     }
 
     /// Official `parseQualifiedRestOpt`: `. identifier` suffix.
@@ -2025,7 +2028,19 @@ impl<'s, L: ParserListener> Parser<'s, '_, '_, L> {
             // counts as empty (not a stale predecessor's count) and carries
             // the synthetic-`(` marker the official setter check keys on
             // (`ast_builder.dart:6475`).
-            self.report(msg::missing_parameters(kind), name);
+            // Official `reportRecoverableError` anchor walk
+            // (`findNonZeroLengthToken`, parser/util.dart:56): a zero-width
+            // synthetic name — the class-body recovery's inserted identifier
+            // parked at the real follower — anchors on the first real
+            // follower token (manual face factory_with_initializers/1: the
+            // oracle's `missing_method_parameters` spans the `{`, 3:23|1).
+            let mut anchor = name;
+            let mut n = 0usize;
+            while anchor.range.length == 0 && self.cursor.look_kind(n) != TokenKind::Eof {
+                n += 1;
+                anchor = self.look_span_at(n);
+            }
+            self.report(msg::missing_parameters(kind), anchor);
             self.last_parameter_count = 0;
             self.synthetic_formals = true;
             let at = self.peek_span();

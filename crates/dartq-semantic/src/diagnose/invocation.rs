@@ -1,4 +1,17 @@
+use super::ffi::matching_close;
+use dartq_source::byte_offset_to_utf16;
 use super::*;
+
+/// The chain-root static type behind a receiver classification: the
+/// declared type of a `Typed` receiver's head (`data` of `data.address`,
+/// `struct` of `struct.y.address`'s chain), [`Ty::UNKNOWN`] for every
+/// other shape.
+fn recv_head_ty(recv: &Receiver) -> Ty {
+    match recv {
+        Receiver::Typed { ty, .. } => *ty,
+        _ => Ty::UNKNOWN,
+    }
+}
 
 /// Which associated parameter one parked `super.name` sentinel reads: the
 /// forward's own index among the constructor's super formals, or the named
@@ -1246,6 +1259,34 @@ impl<'a> Engine<'a> {
         } else {
             ty
         };
+        // The `dart:ffi` verifier's address-read capture ([`super::ffi`]):
+        // the `.address` getters whose receiver wears an FFI value shape —
+        // a `Pointer`/`Array`/native-primitive receiver, a typed-data
+        // receiver, or a compound-subtype chain root. Other spellings
+        // (`userObject.address`) are the user's own getters, never
+        // captured.
+        // An unresolved receiver face keeps the capture too: the
+        // extension-resolution the oracle decides from the static type
+        // cannot be replayed here, and the receiver face decides on the
+        // same facts at finalize (an unresolved receiver reports).
+        if member.name == self.intern("address")
+            && (self.ffi_value_shape(merged_receiver_ty)
+                || self.ffi_value_shape(recv_head_ty(&recv))
+                || merged_receiver_ty == Ty::UNKNOWN
+                || recv_head_ty(&recv) == Ty::UNKNOWN)
+        {
+            let recv_is_index = {
+                let end = self.byte_of(recv_span.end());
+                self.source.as_bytes().get(end.saturating_sub(1)) == Some(&b']')
+            };
+            self.ffi_address_reads.push(FfiAddressRead {
+                selector: member.range,
+                recv_span,
+                recv_ty: merged_receiver_ty,
+                head_ty: recv_head_ty(&recv),
+                recv_is_index,
+            });
+        }
         self.push_row(Row {
             name: member.name,
             range: member.range,
@@ -2396,6 +2437,10 @@ impl<'a> Engine<'a> {
             .and_then(|level| level.named_head)
             .or(self.pending_bare_creation)
             .or_else(|| levels.as_ref().and_then(|level| level.unnamed_head));
+        if let Some(level) = &levels {
+            self.capture_ffi_invocation(level, close);
+        } else {
+        }
         self.check_arguments(levels, positional, close);
         self.pending_send = self
             .invokes
@@ -2507,6 +2552,352 @@ impl<'a> Engine<'a> {
                 self.fold_unnamed_creation_row(prefix_offset, head_range, close.end(), head, resolved.kind);
             }
         }
+    }
+
+    /// The `dart:ffi` verifier's invocation capture ([`super::ffi`]): the
+    /// group's facts ride out to the post-parse pass when the send wears
+    /// one of the verifier's callee spellings (`Pointer.fromFunction`,
+    /// `sizeOf`, `Native.addressOf`, `Struct.create`, `asFunction`,
+    /// `elementAt`) or the head is a creation whose target may be an FFI
+    /// class (`C()`, `NativeCallable<T>.listener(f)`). Every other group
+    /// drops — the capture stays proportional to the file's FFI use, never
+    /// to its call count.
+    pub(crate) fn capture_ffi_invocation(&mut self, level: &ArgLevel, close: SourceRange) {
+        let mut captured: Option<FfiInvocation> = None;
+        // The send arm: a linked callee row whose selector spelling is one
+        // of the verifier's own. The receiver's static type rides from the
+        // row below the callee (past the written type arguments).
+        // A `@Native`-annotated declaration's calls ride along too: the
+        // `.address` position face needs every native call's argument
+        // spans to decide leaf containment.
+        if let Some(index) = self.invokes.last().and_then(|slot| *slot)
+            && let Some(row) = self.rows.get(index)
+            && (self.ffi_callee_spelling(row.name)
+                || self.decl_sites.iter().any(|site| {
+                    site.name == row.name
+                        && site.annotations.contains(&self.intern("Native"))
+                }))
+        {
+            let mut recv_ty = Ty::UNKNOWN;
+            let mut recv_found = false;
+            let mut head_use: Option<StringId> = None;
+            let mut back = index;
+            while back > 0 {
+                back -= 1;
+                let below = &self.rows[back];
+                if below.range.end() > row.range.offset {
+                    continue;
+                }
+                // A class-qualified send (`Native.addressOf`, the static
+                // factory shapes) keeps the named type use as the receiver
+                // face when no value row sits below.
+                if matches!(below.shape, RowShape::TypeUse(..)) {
+                    if head_use.is_none() {
+                        head_use = Some(below.name);
+                    }
+                    continue;
+                }
+                // The class-qualified send's merged receiver row keeps
+                // the bare class spelling with an unresolved face
+                // (`Native.addressOf`): the receiver IS the named type
+                // the row spells.
+                if matches!(below.shape, RowShape::Bare(..))
+                    && matches!(self.type_resolution(below.name).0, TypeResolution::Type)
+                {
+                    recv_ty = Ty::named(below.name);
+                    recv_found = true;
+                    break;
+                }
+                recv_ty = below.ty;
+                recv_found = true;
+                break;
+            }
+            if !recv_found && let Some(name) = head_use {
+                recv_ty = Ty::named(name);
+            }
+            captured = Some(FfiInvocation {
+                callee: row.name,
+                selector: None,
+                head: row.range,
+                type_arg: self.ffi_written_type_arg(row.range),
+                args: Vec::new(),
+                recv_ty,
+                whole: SourceRange {
+                    offset: row.range.offset,
+                    length: close.end().saturating_sub(row.range.offset),
+                },
+                is_creation: false,
+            });
+        }
+        // The creation arm: a bare head (`C(`, `const C(`, the
+        // named-selector `NativeCallable<T>.listener(`). The target must
+        // resolve to an FFI compound or `NativeCallable` — a plain user
+        // class's creations are never captured. The fold latches the
+        // named-selector creation's SELECTOR (`listener`), so the class
+        // rides the source walk before the `.` when the latch itself is
+        // no FFI target.
+        if captured.is_none()
+            && let Some((head_name, head_range)) = level
+                .named_head
+                .or(self.pending_bare_creation)
+                .or(level.unnamed_head)
+        {
+            let direct = self.ffi_creation_target(head_name);
+            let (class_name, head) = if direct {
+                (head_name, head_range)
+            } else {
+                match self
+                    .creation_class_before(head_range)
+                    .filter(|(class, _)| self.ffi_creation_target(*class))
+                {
+                    Some((class, offset)) => {
+                        // The head span is the CLASS NAME only: the
+                        // written type-argument walk starts right after
+                        // it (`NativeCallable<T>.listener`).
+                        let bytes = self.source.as_bytes();
+                        let mut end_byte = self.byte_of(offset);
+                        while bytes
+                            .get(end_byte)
+                            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'$')
+                        {
+                            end_byte += 1;
+                        }
+                        (
+                            class,
+                            SourceRange {
+                                offset,
+                                length: self.utf16_of(end_byte).saturating_sub(offset),
+                            },
+                        )
+                    }
+                    None => return,
+                }
+            };
+            captured = Some(FfiInvocation {
+                callee: class_name,
+                selector: if direct {
+                    self.selector_after_head(head)
+                } else {
+                    Some(head_name)
+                },
+                head,
+                type_arg: self.ffi_written_type_arg(head),
+                args: Vec::new(),
+                recv_ty: Ty::UNKNOWN,
+                whole: SourceRange {
+                    offset: head.offset,
+                    length: close.end().saturating_sub(head.offset),
+                },
+                is_creation: true,
+            });
+        }
+        // The bare-send fallback: a creation the fold carried as a bare
+        // send (`C(...)` closing with no creation latch) whose name
+        // resolves to an FFI compound — the struct/union creation faces'
+        // subject. The send arm's callee-spelling gate has already
+        // rejected the row as a verifier callee by the time this runs.
+        if captured.is_none()
+            && let Some(index) = self.invokes.last().copied().flatten()
+            && let Some(row) = self.rows.get(index)
+            && matches!(row.shape, RowShape::Bare(..))
+            && self.ffi_creation_target(row.name)
+        {
+            let head = row.range;
+            captured = Some(FfiInvocation {
+                callee: row.name,
+                selector: None,
+                head,
+                type_arg: self.ffi_written_type_arg(head),
+                args: Vec::new(),
+                recv_ty: Ty::UNKNOWN,
+                whole: SourceRange {
+                    offset: head.offset,
+                    length: close.end().saturating_sub(head.offset),
+                },
+                is_creation: true,
+            });
+        }
+        let Some(mut invocation) = captured else {
+            return;
+        };
+        invocation.args = level
+            .args
+            .iter()
+            .map(|(name, ty, _literal, range)| {
+                let (invocation_shaped, head) = self.arg_invocation_head(*range);
+                (
+                    *name,
+                    FfiArgShape {
+                        range: *range,
+                        ty: *ty,
+                        invocation_shaped,
+                        head,
+                    },
+                )
+            })
+            .collect();
+        self.ffi_invocations.push(invocation);
+    }
+
+    /// The named-selector creation's selector segment: between the head's
+    /// span end and the argument list's `(` sit an optional `<...>` type
+    /// group and `.name` — that name is the selector. Any other shape
+    /// (a direct `(`, a comment) answers `None`.
+    fn selector_after_head(&self, head: SourceRange) -> Option<StringId> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(head.end());
+        let mut depth = 0i32;
+        while let Some(&b) = bytes.get(cursor) {
+            match b {
+                b'<' => depth += 1,
+                b'>' => depth = (depth - 1).max(0),
+                b'.' if depth == 0 => {
+                    let mut end = cursor + 1;
+                    while bytes
+                        .get(end)
+                        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                    {
+                        end += 1;
+                    }
+                    return (end > cursor + 1)
+                        .then(|| self.strings.intern(&self.source[cursor + 1..end]));
+                }
+                _ if b.is_ascii_whitespace() || depth > 0 => {}
+                _ => return None,
+            }
+            cursor += 1;
+        }
+        None
+    }
+
+    /// The written `<...>` type argument after an invocation head
+    /// (`fromFunction<Int8 Function(Int8)>`,
+    /// `NativeCallable<T>.listener`), source-parsed — see
+    /// [`FfiTypeArg`]. `None` when no group follows the head.
+    fn ffi_written_type_arg(&self, head: SourceRange) -> Option<FfiTypeArg> {
+        let bytes = self.source.as_bytes();
+        let mut cursor = self.byte_of(head.end());
+        while bytes.get(cursor).is_some_and(|b| b.is_ascii_whitespace()) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'<') {
+            return None;
+        }
+        let Some(close) = matching_close(bytes, cursor, b'<', b'>') else {
+            return None;
+        };
+        let inner = &self.source[cursor + 1..close];
+        let trimmed = inner.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let head_len: usize = trimmed
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+            .map(char::len_utf8)
+            .sum();
+        if head_len == 0 {
+            return None;
+        }
+        let start = cursor + 1 + (inner.len() - inner.trim_start().len());
+        let end = start + trimmed.len();
+        Some(FfiTypeArg {
+            display: trimmed.into(),
+            span: SourceRange {
+                offset: byte_offset_to_utf16(self.source, start),
+                length: byte_offset_to_utf16(self.source, end)
+                    .saturating_sub(byte_offset_to_utf16(self.source, start)),
+            },
+            head: self.strings.intern(&trimmed[..head_len]),
+            fn_sig: self.ffi_written_fn_sig(trimmed),
+        })
+    }
+
+    /// The written `R Function(P...)` form: the last top-level `Function`
+    /// word (a return type never nests a bare `Function` outside groups)
+    /// whose group closes at the text's end. Each parameter contributes
+    /// its first identifier.
+    fn ffi_written_fn_sig(&self, text: &str) -> Option<(StringId, Box<[StringId]>)> {
+        let bytes = text.as_bytes();
+        let mut depth_angle = 0i32;
+        let mut depth_paren = 0i32;
+        let mut best: Option<(usize, usize)> = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'<' => depth_angle += 1,
+                b'>' => depth_angle -= 1,
+                b'(' => depth_paren += 1,
+                b')' => depth_paren -= 1,
+                b'F' if depth_angle == 0 && depth_paren == 0 => {
+                    let word_end = i + "Function".len();
+                    let word_before = i == 0
+                        || bytes
+                            .get(i - 1)
+                            .is_some_and(|b| b.is_ascii_whitespace());
+                    if word_before
+                        && text[i..].starts_with("Function")
+                        && bytes.get(word_end) == Some(&b'(')
+                        && let Some(close) = matching_close(bytes, word_end, b'(', b')')
+                    {
+                        best = Some((i, close));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (ret_end, group_close) = best?;
+        let ret = text[..ret_end].trim();
+        let params_text = &text[ret_end + "Function".len() + 1..group_close];
+        let ret_head: String = ret
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+            .collect();
+        if ret_head.is_empty() {
+            return None;
+        }
+        let params: Vec<StringId> = params_text
+            .split(',')
+            .filter_map(|param| {
+                let head: String = param
+                    .trim()
+                    .chars()
+                    .take_while(|c| {
+                        c.is_ascii_alphanumeric() || *c == '_' || *c == '$'
+                    })
+                    .collect();
+                (!head.is_empty()).then(|| self.strings.intern(&head))
+            })
+            .collect();
+        Some((self.strings.intern(&ret_head), params.into_boxed_slice()))
+    }
+
+    /// Whether the argument expression at `range` reads as an invocation
+    /// (its last source byte is the call's `)`), and the invocation head's
+    /// spelling (the first identifier of the span) — the
+    /// `argument_must_be_a_constant` face's source facts.
+    fn arg_invocation_head(&self, range: SourceRange) -> (bool, StringId) {
+        let start = self.byte_of(range.offset);
+        let end = self.byte_of(range.end()).min(self.source.len());
+        let text = self.source.get(start..end).unwrap_or_default();
+        // The fold's argument span may carry the callee head only (the
+        // `(` sits just past the span's end) or the whole call; both read
+        // as an invocation.
+        let trimmed_end = text.trim_end();
+        let after = self.source[self.byte_of(range.end()).min(self.source.len())..]
+            .trim_start();
+        let invocation_shaped =
+            trimmed_end.ends_with(')') || after.starts_with('(');
+        let head: String =
+            text.trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+        let head = if head.is_empty() {
+            StringId::NONE
+        } else {
+            self.strings.intern(&head)
+        };
+        (invocation_shaped, head)
     }
 
     /// Whether a latched creation head names the unnamed creation
@@ -7984,7 +8375,16 @@ impl<'a> Engine<'a> {
         // The #612 capture: the header's group closed into its frame.
         self.var_end_group();
         if let Some((head, head_range)) = head {
-            self.check_prefixed_annotation_arity(head, head_range, count, range);
+            // Upstream anchors the NamedType arity face at the type node
+            // (`named_type_resolver.dart` `_buildTypeArguments`:
+            // `.at(node)`): the head name through the group's `>`, not the
+            // bare `<...>` group (manual face
+            // type_arguments_on_type_variable/1: `S<int>` at 1:11|6).
+            let span = SourceRange {
+                offset: head_range.offset,
+                length: end.range.end() - head_range.offset,
+            };
+            self.check_prefixed_annotation_arity(head, head_range, count, span);
             return;
         }
         // An enum constant's constructor type arguments (`a<int>()`,
@@ -9032,5 +9432,23 @@ mod tests {
             .collect();
         assert_eq!(rows.len(), 1, "{:?}", code_names(&report));
         assert!(rows[0].contains("for the type 'Frozen'"), "{rows:?}");
+    }
+
+    /// The NamedType arity face anchors at the type node, head name
+    /// through the group's `>` (`named_type_resolver.dart` `.at(node)`) —
+    /// manual face `type_arguments_on_type_variable/1`: `S<int>` at
+    /// 1:11|6, never the bare `<int>` group at 1:12|5.
+    #[test]
+    fn type_arguments_on_type_variable_anchor_at_the_type_name() {
+        let source = "void f<S>(S<int> a) {}";
+        let report = report(source);
+        let rows: Vec<(u32, u32)> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.name == "wrong_number_of_type_arguments")
+            .map(|d| (d.range.offset, d.range.length))
+            .collect();
+        let at = source.find("S<int>").unwrap() as u32;
+        assert_eq!(rows, vec![(at, "S<int>".len() as u32)], "{rows:?}");
     }
 }

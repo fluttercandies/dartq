@@ -1271,6 +1271,223 @@ pub enum SemanticCode {
     /// (`ambiguous_set_or_map_literal_both`, diagnostic.g.dart:414; the
     /// same `_inferSetOrMapLiteralType` decision).
     AmbiguousSetOrMapLiteralBoth,
+    // —— The `dart:ffi` verifier family (`ffi_verifier.dart`) ————————————
+    /// `Classes extending 'AbiSpecificInteger' must have exactly one const
+    /// constructor, no other members, and no type parameters.` —
+    /// `_validateAbiSpecificIntegerAnnotation`, at the declaring name.
+    AbiSpecificIntegerInvalid,
+    /// `Classes extending 'AbiSpecificInteger' must have exactly one
+    /// 'AbiSpecificIntegerMapping' annotation specifying the mapping from
+    /// ABI to a 'NativeType' integer with a fixed size.` — every
+    /// `AbiSpecificIntegerMapping` annotation after the first, at the
+    /// annotation's name.
+    AbiSpecificIntegerMappingExtra,
+    /// `Classes extending 'AbiSpecificInteger' must have exactly one
+    /// 'AbiSpecificIntegerMapping' annotation specifying the mapping from
+    /// ABI to a 'NativeType' integer with a fixed size.` — no mapping
+    /// annotation on an `AbiSpecificInteger` subclass, at the declaring
+    /// name.
+    AbiSpecificIntegerMappingMissing,
+    /// `Invalid mapping to '{0}'; only mappings to 'Int8', 'Int16',
+    /// 'Int32', 'Int64', 'Uint8', 'Uint16', 'UInt32', and 'Uint64' are
+    /// supported.` — a mapping value whose type is not a fixed-size
+    /// integer, at the value node.
+    AbiSpecificIntegerMappingUnsupported,
+    /// `Fields in a struct class whose type is 'Pointer' shouldn't have
+    /// any annotations.` — an ffi annotation on a `Pointer`-typed field,
+    /// at the annotation.
+    AnnotationOnPointerField,
+    /// `The class '{0}' can't implement Finalizable.` — a compound
+    /// subtype with a `Finalizable` interface edge, at the declaring
+    /// name.
+    CompoundImplementsFinalizable,
+    /// `The class '{0}' can't be empty because it's a subclass of '{1}'.`
+    /// — a `Struct`/`Union` direct subclass with no sized field, at the
+    /// declaring name.
+    EmptyStruct,
+    /// `Fields in a struct class must have exactly one annotation
+    /// indicating the native type.` — a second ffi annotation on a
+    /// primitive-typed field, at the extra annotation.
+    ExtraAnnotationOnStructField,
+    /// `'Array's must have exactly one 'Array' annotation.` — every
+    /// `Array` annotation after the first on an `Array` field, at the
+    /// extra annotation.
+    ExtraSizeAnnotationCarray,
+    /// `Fields of 'Struct' and 'Union' subclasses must be marked
+    /// external.` — a non-static, non-external field in a compound, at
+    /// the field's first name.
+    FieldMustBeExternalInStruct,
+    /// `The class '{0}' can't extend 'Struct' or 'Union' because '{0}' is
+    /// generic.` — a compound subtype declaring type parameters, at the
+    /// declaring name.
+    GenericStructSubclass,
+    /// `Fields in struct classes can't have the type '{0}'. They can only
+    /// be declared as 'int', 'double', 'Array', 'Pointer', or subtype of
+    /// 'Struct' or 'Union'.` — a field whose declared type is none of the
+    /// legal faces, at the field's type annotation.
+    InvalidFieldTypeInStruct,
+    /// `The annotation doesn't match the declared type of the field.` —
+    /// the first ffi annotation whose primitive class differs from the
+    /// field's required primitive, at the annotation.
+    MismatchedAnnotationOnStructField,
+    /// `Fields of type '{0}' in a subclass of '{1}' must have an
+    /// annotation indicating the native type.` — a primitive-typed field
+    /// with no matching ffi annotation, at the field's type annotation.
+    MissingAnnotationOnStructField,
+    /// `Fields in struct classes must have an explicitly declared type
+    /// of 'int', 'double' or 'Pointer'.` — a type-less field group in a
+    /// compound, at the first variable's name.
+    MissingFieldTypeInStruct,
+    /// `Fields of type 'Array' must have exactly one 'Array'
+    /// annotation.` — an `Array`-typed field with no `Array` annotation,
+    /// at the field's type annotation.
+    MissingSizeAnnotationCarray,
+    /// `The variable dimension of a variable-length array must be
+    /// non-negative.` — a negative first dimension on a variable-length
+    /// `Array` annotation, at the dimension node.
+    NegativeVariableDimension,
+    /// `Array dimensions must be positive numbers.` — a non-positive
+    /// dimension on an `Array` annotation, at the dimension node.
+    NonPositiveArrayDimension,
+    /// `The type '{0}' isn't a valid type argument for '{1}'. The type
+    /// argument must be a native integer, 'Float', 'Double', 'Pointer',
+    /// or subtype of 'Struct', 'Union', or 'AbiSpecificInteger'.` — an
+    /// `Array` type argument that is not sized, at the type's first
+    /// argument node.
+    NonSizedTypeArgument,
+    /// `Structs must have at most one 'Packed' annotation.` — every
+    /// `Packed` annotation after the first on a `Struct` subclass, at
+    /// the annotation.
+    PackedAnnotation,
+    /// `Only packing to 1, 2, 4, 8, and 16 bytes is supported.` — a
+    /// `Packed` annotation whose alignment is not a supported byte
+    /// count, at the annotation's first argument.
+    PackedAnnotationAlignment,
+    /// `Variable length 'Array's must only occur as the last field of
+    /// Structs.` — a variable-length `Array` annotation on a field that
+    /// is not the compound's last external instance field, at the
+    /// annotation.
+    VariableLengthArrayNotLast,
+    /// `'Array's must have an 'Array' annotation that matches the
+    /// dimensions.` — an `Array` annotation whose dimension count
+    /// differs from the field type's `Array` nesting depth, at the
+    /// annotation.
+    SizeAnnotationDimensions,
+    /// `The class '{0}' can't extend '{1}' because '{1}' is a subtype of
+    /// 'Struct', 'Union', or 'AbiSpecificInteger'.` — the extends head
+    /// resolving to a compound or abi-specific-integer subtype, at the
+    /// written superclass entry.
+    SubtypeOfStructClassInExtends,
+    /// `The class '{0}' can't implement '{1}' because '{1}' is a subtype
+    /// of 'Struct', 'Union', or 'AbiSpecificInteger'.` — an implements
+    /// entry resolving likewise, at the written entry.
+    SubtypeOfStructClassInImplements,
+    /// `The class '{0}' can't mix in '{1}' because '{1}' is a subtype of
+    /// 'Struct', 'Union', or 'AbiSpecificInteger'.` — a `with` entry
+    /// resolving likewise, at the written entry.
+    SubtypeOfStructClassInWith,
+    /// `The '.address' expression can only be used as argument to a leaf
+    /// native external call.` — an `.address` access outside a leaf-call
+    /// argument list, at the `address` selector.
+    AddressPosition,
+    /// `The receiver of '.address' must be a concrete 'TypedData', a
+    /// concrete 'TypedData' '[]', an 'Array', an 'Array' '[]', a Struct
+    /// field, or a Union field.` — an `.address` receiver that is none of
+    /// the legal shapes, at the `address` selector.
+    AddressReceiver,
+    /// `Argument '{0}' must be a constant.` — a non-constant second
+    /// argument to `Pointer.fromFunction` or a non-const `isLeaf:` value,
+    /// at the argument expression.
+    ArgumentMustBeAConstant,
+    /// `Argument to 'Native.addressOf' must be annotated with @Native` —
+    /// the `Native.addressOf` argument names no `@Native`-annotated
+    /// declaration, at the argument.
+    ArgumentMustBeNative,
+    /// `Subclasses of 'Struct' and 'Union' are backed by native memory,
+    /// and can't be instantiated by a generative constructor.` — a
+    /// generative creation of a compound subtype, at the constructor name.
+    CreationOfStructOrUnion,
+    /// `There may be at most one @DefaultAsset annotation on a library.` —
+    /// a second `@DefaultAsset` on the library directive, at the
+    /// annotation's name.
+    FfiNativeInvalidDuplicateDefaultAsset,
+    /// `Native functions and fields must have exactly one `@Native`
+    /// annotation.` — a second `@Native` on a declaration, at the extra
+    /// annotation's name.
+    FfiNativeInvalidMultipleAnnotations,
+    /// `Native functions must be declared external.` — a `@Native`
+    /// declaration without `external`, at the declaring name.
+    FfiNativeMustBeExternal,
+    /// `Only classes extending NativeFieldWrapperClass1 can be passed as
+    /// Pointer.` — a `Pointer` ffi parameter paired with a non-Pointer,
+    /// non-NativeFieldWrapperClass1 Dart parameter, at the declaring name.
+    FfiNativeOnlyClassesExtendingNativefieldwrapperclass1CanBePointer,
+    /// `Unexpected number of Native annotation parameters. Expected {0}
+    /// but has {1}.` — the `@Native<T>` signature's parameter count
+    /// disagrees with the annotated top-level or static declaration, at
+    /// the declaring name.
+    FfiNativeUnexpectedNumberOfParameters,
+    /// `Unexpected number of Native annotation parameters. Expected {0}
+    /// but has {1}. Native instance method annotation must have receiver
+    /// as first argument.` — the same mismatch on an instance member,
+    /// whose signature must carry the receiver, at the declaring name.
+    FfiNativeUnexpectedNumberOfParametersWithReceiver,
+    /// `The method {0} can't have an exceptional return value (the second
+    /// argument) when the return type of the function is either 'void',
+    /// 'Handle' or 'Pointer'.` — a second argument where the signature's
+    /// return admits none, at the second argument.
+    InvalidExceptionValue,
+    /// `FFI leaf call can't return a 'Handle'.` — a leaf signature whose
+    /// return type is `Handle`, at the error entity.
+    LeafCallMustNotReturnHandle,
+    /// `FFI leaf call can't take arguments of type 'Handle'.` — a leaf
+    /// signature with a `Handle` parameter, at the error entity.
+    LeafCallMustNotTakeHandle,
+    /// `The method {0} must have an exceptional return value (the second
+    /// argument) when the return type of the function is neither 'void',
+    /// 'Handle', nor 'Pointer'.` — a missing second argument where the
+    /// signature's return requires one, at the method name.
+    MissingExceptionValue,
+    /// `The type '{0}' given to '{1}' must be a valid 'dart:ffi' native
+    /// function type.` — a type argument that is not a valid native
+    /// function signature, at the type argument (or error node).
+    MustBeANativeFunctionType,
+    /// `The type '{0}' must be a subtype of '{1}' for '{2}'.` — the
+    /// generic native/dart compatibility failure (three placeholders, the
+    /// `emit3`/`message3` face), at the error node.
+    MustBeASubtype,
+    /// `The return type of the function passed to
+    /// 'NativeCallable.listener' must be 'void' rather than '{0}'.` — a
+    /// listener argument whose signature's return is not `Void`, at the
+    /// argument.
+    MustReturnVoid,
+    /// `'{0}' is an unsupported type for native fields. Native fields
+    /// only support pointers, arrays or numeric and compound types.` — a
+    /// `@Native` field whose signature is a function type, `Handle`, or
+    /// `NativeFunction`, at the declaring name.
+    NativeFieldInvalidType,
+    /// `The native type of this field could not be inferred and must be
+    /// specified in the annotation.` — a type-less `@Native` field whose
+    /// Dart type is not a canonical ffi type, at the declaring name.
+    NativeFieldMissingType,
+    /// `Native fields must be static.` — a `@Native` instance field, at
+    /// the declaring name.
+    NativeFieldNotStatic,
+    /// `The native type of this function couldn't be inferred so it must
+    /// be specified in the annotation.` — a type-less `@Native` function
+    /// whose signature is not a valid native function type, at the
+    /// declaring name.
+    NativeFunctionMissingType,
+    /// `The type arguments to '{0}' must be known at compile time, so
+    /// they can't be type parameters.` — a type parameter used as the
+    /// type argument of `sizeOf`/`asFunction`/etc., at the type argument
+    /// (or invocation).
+    NonConstantTypeArgument,
+    /// `Can't invoke 'asFunction' because the function signature '{0}'
+    /// for the pointer isn't a valid C function signature.` — a
+    /// `Pointer<NativeFunction<T>>` whose `T` is not a valid native
+    /// function type, at the type argument or invocation.
+    NonNativeFunctionTypeArgumentToPointer,
 }
 
 /// The message face of [`SemanticCode::NotEnoughPositionalArguments`]: the
@@ -1712,6 +1929,174 @@ impl SemanticCode {
             // and :15857-15870).
             Self::MixinOnSealedClass => ("mixin_on_sealed_class", "MIXIN_ON_SEALED_CLASS"),
             Self::SubtypeOfSealedClass => ("subtype_of_sealed_class", "SUBTYPE_OF_SEALED_CLASS"),
+            // The `dart:ffi` verifier family (ffi_verifier.dart): the three
+            // subtype codes share the registry's `subtypeOfStructClass`
+            // sharedName — like the super-member family, the uniqueName
+            // differs and the analyzerCode folds.
+            Self::AbiSpecificIntegerInvalid => {
+                ("abi_specific_integer_invalid", "ABI_SPECIFIC_INTEGER_INVALID")
+            }
+            Self::AbiSpecificIntegerMappingExtra => (
+                "abi_specific_integer_mapping_extra",
+                "ABI_SPECIFIC_INTEGER_MAPPING_EXTRA",
+            ),
+            Self::AbiSpecificIntegerMappingMissing => (
+                "abi_specific_integer_mapping_missing",
+                "ABI_SPECIFIC_INTEGER_MAPPING_MISSING",
+            ),
+            Self::AbiSpecificIntegerMappingUnsupported => (
+                "abi_specific_integer_mapping_unsupported",
+                "ABI_SPECIFIC_INTEGER_MAPPING_UNSUPPORTED",
+            ),
+            Self::AnnotationOnPointerField => {
+                ("annotation_on_pointer_field", "ANNOTATION_ON_POINTER_FIELD")
+            }
+            Self::CompoundImplementsFinalizable => (
+                "compound_implements_finalizable",
+                "COMPOUND_IMPLEMENTS_FINALIZABLE",
+            ),
+            Self::EmptyStruct => ("empty_struct", "EMPTY_STRUCT"),
+            Self::ExtraAnnotationOnStructField => (
+                "extra_annotation_on_struct_field",
+                "EXTRA_ANNOTATION_ON_STRUCT_FIELD",
+            ),
+            Self::ExtraSizeAnnotationCarray => (
+                "extra_size_annotation_carray",
+                "EXTRA_SIZE_ANNOTATION_CARRAY",
+            ),
+            Self::FieldMustBeExternalInStruct => (
+                "field_must_be_external_in_struct",
+                "FIELD_MUST_BE_EXTERNAL_IN_STRUCT",
+            ),
+            Self::GenericStructSubclass => {
+                ("generic_struct_subclass", "GENERIC_STRUCT_SUBCLASS")
+            }
+            Self::InvalidFieldTypeInStruct => (
+                "invalid_field_type_in_struct",
+                "INVALID_FIELD_TYPE_IN_STRUCT",
+            ),
+            Self::MismatchedAnnotationOnStructField => (
+                "mismatched_annotation_on_struct_field",
+                "MISMATCHED_ANNOTATION_ON_STRUCT_FIELD",
+            ),
+            Self::MissingAnnotationOnStructField => (
+                "missing_annotation_on_struct_field",
+                "MISSING_ANNOTATION_ON_STRUCT_FIELD",
+            ),
+            Self::MissingFieldTypeInStruct => (
+                "missing_field_type_in_struct",
+                "MISSING_FIELD_TYPE_IN_STRUCT",
+            ),
+            Self::MissingSizeAnnotationCarray => (
+                "missing_size_annotation_carray",
+                "MISSING_SIZE_ANNOTATION_CARRAY",
+            ),
+            Self::NegativeVariableDimension => (
+                "negative_variable_dimension",
+                "NEGATIVE_VARIABLE_DIMENSION",
+            ),
+            Self::NonPositiveArrayDimension => (
+                "non_positive_array_dimension",
+                "NON_POSITIVE_ARRAY_DIMENSION",
+            ),
+            Self::NonSizedTypeArgument => {
+                ("non_sized_type_argument", "NON_SIZED_TYPE_ARGUMENT")
+            }
+            Self::PackedAnnotation => ("packed_annotation", "PACKED_ANNOTATION"),
+            Self::PackedAnnotationAlignment => (
+                "packed_annotation_alignment",
+                "PACKED_ANNOTATION_ALIGNMENT",
+            ),
+            Self::VariableLengthArrayNotLast => (
+                "variable_length_array_not_last",
+                "VARIABLE_LENGTH_ARRAY_NOT_LAST",
+            ),
+            Self::SizeAnnotationDimensions => (
+                "size_annotation_dimensions",
+                "SIZE_ANNOTATION_DIMENSIONS",
+            ),
+            Self::SubtypeOfStructClassInExtends
+            | Self::SubtypeOfStructClassInImplements
+            | Self::SubtypeOfStructClassInWith => {
+                ("subtype_of_struct_class", "SUBTYPE_OF_STRUCT_CLASS")
+            }
+            Self::AddressPosition => ("address_position", "ADDRESS_POSITION"),
+            Self::AddressReceiver => ("address_receiver", "ADDRESS_RECEIVER"),
+            Self::ArgumentMustBeAConstant => (
+                "argument_must_be_a_constant",
+                "ARGUMENT_MUST_BE_A_CONSTANT",
+            ),
+            Self::ArgumentMustBeNative => {
+                ("argument_must_be_native", "ARGUMENT_MUST_BE_NATIVE")
+            }
+            Self::CreationOfStructOrUnion => (
+                "creation_of_struct_or_union",
+                "CREATION_OF_STRUCT_OR_UNION",
+            ),
+            Self::FfiNativeInvalidDuplicateDefaultAsset => (
+                "ffi_native_invalid_duplicate_default_asset",
+                "FFI_NATIVE_INVALID_DUPLICATE_DEFAULT_ASSET",
+            ),
+            Self::FfiNativeInvalidMultipleAnnotations => (
+                "ffi_native_invalid_multiple_annotations",
+                "FFI_NATIVE_INVALID_MULTIPLE_ANNOTATIONS",
+            ),
+            Self::FfiNativeMustBeExternal => {
+                ("ffi_native_must_be_external", "FFI_NATIVE_MUST_BE_EXTERNAL")
+            }
+            Self::FfiNativeOnlyClassesExtendingNativefieldwrapperclass1CanBePointer => (
+                "ffi_native_only_classes_extending_nativefieldwrapperclass1_can_be_pointer",
+                "FFI_NATIVE_ONLY_CLASSES_EXTENDING_NATIVEFIELDWRAPPERCLASS1_CAN_BE_POINTER",
+            ),
+            Self::FfiNativeUnexpectedNumberOfParameters => (
+                "ffi_native_unexpected_number_of_parameters",
+                "FFI_NATIVE_UNEXPECTED_NUMBER_OF_PARAMETERS",
+            ),
+            Self::FfiNativeUnexpectedNumberOfParametersWithReceiver => (
+                "ffi_native_unexpected_number_of_parameters_with_receiver",
+                "FFI_NATIVE_UNEXPECTED_NUMBER_OF_PARAMETERS_WITH_RECEIVER",
+            ),
+            Self::InvalidExceptionValue => {
+                ("invalid_exception_value", "INVALID_EXCEPTION_VALUE")
+            }
+            Self::LeafCallMustNotReturnHandle => (
+                "leaf_call_must_not_return_handle",
+                "LEAF_CALL_MUST_NOT_RETURN_HANDLE",
+            ),
+            Self::LeafCallMustNotTakeHandle => (
+                "leaf_call_must_not_take_handle",
+                "LEAF_CALL_MUST_NOT_TAKE_HANDLE",
+            ),
+            Self::MissingExceptionValue => {
+                ("missing_exception_value", "MISSING_EXCEPTION_VALUE")
+            }
+            Self::MustBeANativeFunctionType => (
+                "must_be_a_native_function_type",
+                "MUST_BE_A_NATIVE_FUNCTION_TYPE",
+            ),
+            Self::MustBeASubtype => ("must_be_a_subtype", "MUST_BE_A_SUBTYPE"),
+            Self::MustReturnVoid => ("must_return_void", "MUST_RETURN_VOID"),
+            Self::NativeFieldInvalidType => {
+                ("native_field_invalid_type", "NATIVE_FIELD_INVALID_TYPE")
+            }
+            Self::NativeFieldMissingType => {
+                ("native_field_missing_type", "NATIVE_FIELD_MISSING_TYPE")
+            }
+            Self::NativeFieldNotStatic => {
+                ("native_field_not_static", "NATIVE_FIELD_NOT_STATIC")
+            }
+            Self::NativeFunctionMissingType => (
+                "native_function_missing_type",
+                "NATIVE_FUNCTION_MISSING_TYPE",
+            ),
+            Self::NonConstantTypeArgument => (
+                "non_constant_type_argument",
+                "NON_CONSTANT_TYPE_ARGUMENT",
+            ),
+            Self::NonNativeFunctionTypeArgumentToPointer => (
+                "non_native_function_type_argument_to_pointer",
+                "NON_NATIVE_FUNCTION_TYPE_ARGUMENT_TO_POINTER",
+            ),
             // The #743 W1-micro cluster. The NaN pair keeps one registry
             // name (sharedName `unnecessaryNanComparison`; the polarity
             // lives in the message shape), like the null-comparison pair.
@@ -2537,6 +2922,165 @@ impl SemanticCode {
             Self::SubtypeOfSealedClass => format!(
                 "The class '{a0}' shouldn't be extended, mixed in, or implemented because it's sealed."
             ),
+            // The `dart:ffi` verifier family (ffi_verifier.dart +
+            // messages.yaml, the registry lines cited per variant). The
+            // parameterless codes take no message argument; the three
+            // subtype codes render through `message` (`{0}` subclass,
+            // `{1}` supertype — `withArguments(subclassName:…,
+            // superclassName:…)`).
+            Self::AbiSpecificIntegerInvalid => {
+                "Classes extending 'AbiSpecificInteger' must have exactly one const constructor, no other members, and no type parameters."
+                    .to_string()
+            }
+            Self::AbiSpecificIntegerMappingExtra
+            | Self::AbiSpecificIntegerMappingMissing => {
+                "Classes extending 'AbiSpecificInteger' must have exactly one 'AbiSpecificIntegerMapping' annotation specifying the mapping from ABI to a 'NativeType' integer with a fixed size."
+                    .to_string()
+            }
+            Self::AbiSpecificIntegerMappingUnsupported => format!(
+                "Invalid mapping to '{a0}'; only mappings to 'Int8', 'Int16', 'Int32', 'Int64', 'Uint8', 'Uint16', 'UInt32', and 'Uint64' are supported."
+            ),
+            Self::AnnotationOnPointerField => {
+                "Fields in a struct class whose type is 'Pointer' shouldn't have any annotations."
+                    .to_string()
+            }
+            Self::CompoundImplementsFinalizable => {
+                format!("The class '{a0}' can't implement Finalizable.")
+            }
+            Self::EmptyStruct => format!(
+                "The class '{a0}' can't be empty because it's a subclass of '{a1}'."
+            ),
+            Self::ExtraAnnotationOnStructField => {
+                "Fields in a struct class must have exactly one annotation indicating the native type."
+                    .to_string()
+            }
+            Self::ExtraSizeAnnotationCarray => {
+                "'Array's must have exactly one 'Array' annotation.".to_string()
+            }
+            Self::FieldMustBeExternalInStruct => {
+                "Fields of 'Struct' and 'Union' subclasses must be marked external."
+                    .to_string()
+            }
+            Self::GenericStructSubclass => format!(
+                "The class '{a0}' can't extend 'Struct' or 'Union' because '{a0}' is generic."
+            ),
+            Self::InvalidFieldTypeInStruct => format!(
+                "Fields in struct classes can't have the type '{a0}'. They can only be declared as 'int', 'double', 'Array', 'Pointer', or subtype of 'Struct' or 'Union'."
+            ),
+            Self::MismatchedAnnotationOnStructField => {
+                "The annotation doesn't match the declared type of the field.".to_string()
+            }
+            Self::MissingAnnotationOnStructField => format!(
+                "Fields of type '{a0}' in a subclass of '{a1}' must have an annotation indicating the native type."
+            ),
+            Self::MissingFieldTypeInStruct => {
+                "Fields in struct classes must have an explicitly declared type of 'int', 'double' or 'Pointer'."
+                    .to_string()
+            }
+            Self::MissingSizeAnnotationCarray => {
+                "Fields of type 'Array' must have exactly one 'Array' annotation.".to_string()
+            }
+            Self::NegativeVariableDimension => {
+                "The variable dimension of a variable-length array must be non-negative.".to_string()
+            }
+            Self::NonPositiveArrayDimension => {
+                "Array dimensions must be positive numbers.".to_string()
+            }
+            Self::NonSizedTypeArgument => format!(
+                "The type '{a0}' isn't a valid type argument for '{a1}'. The type argument must be a native integer, 'Float', 'Double', 'Pointer', or subtype of 'Struct', 'Union', or 'AbiSpecificInteger'."
+            ),
+            Self::PackedAnnotation => {
+                "Structs must have at most one 'Packed' annotation.".to_string()
+            }
+            Self::PackedAnnotationAlignment => {
+                "Only packing to 1, 2, 4, 8, and 16 bytes is supported.".to_string()
+            }
+            Self::VariableLengthArrayNotLast => {
+                "Variable length 'Array's must only occur as the last field of Structs."
+                    .to_string()
+            }
+            Self::SizeAnnotationDimensions => {
+                "'Array's must have an 'Array' annotation that matches the dimensions."
+                    .to_string()
+            }
+            Self::SubtypeOfStructClassInExtends => format!(
+                "The class '{a0}' can't extend '{a1}' because '{a1}' is a subtype of 'Struct', 'Union', or 'AbiSpecificInteger'."
+            ),
+            Self::SubtypeOfStructClassInImplements => format!(
+                "The class '{a0}' can't implement '{a1}' because '{a1}' is a subtype of 'Struct', 'Union', or 'AbiSpecificInteger'."
+            ),
+            Self::SubtypeOfStructClassInWith => format!(
+                "The class '{a0}' can't mix in '{a1}' because '{a1}' is a subtype of 'Struct', 'Union', or 'AbiSpecificInteger'."
+            ),
+            Self::AddressPosition => {
+                "The '.address' expression can only be used as argument to a leaf native external call."
+                    .to_string()
+            }
+            Self::AddressReceiver => {
+                "The receiver of '.address' must be a concrete 'TypedData', a concrete 'TypedData' '[]', an 'Array', an 'Array' '[]', a Struct field, or a Union field."
+                    .to_string()
+            }
+            Self::ArgumentMustBeAConstant => {
+                format!("Argument '{a0}' must be a constant.")
+            }
+            Self::ArgumentMustBeNative => {
+                "Argument to 'Native.addressOf' must be annotated with @Native"
+                    .to_string()
+            }
+            Self::CreationOfStructOrUnion => {
+                "Subclasses of 'Struct' and 'Union' are backed by native memory, and can't be instantiated by a generative constructor."
+                    .to_string()
+            }
+            Self::FfiNativeInvalidDuplicateDefaultAsset => {
+                "There may be at most one @DefaultAsset annotation on a library."
+                    .to_string()
+            }
+            Self::FfiNativeInvalidMultipleAnnotations => {
+                "Native functions and fields must have exactly one `@Native` annotation."
+                    .to_string()
+            }
+            Self::FfiNativeMustBeExternal => {
+                "Native functions must be declared external.".to_string()
+            }
+            Self::FfiNativeOnlyClassesExtendingNativefieldwrapperclass1CanBePointer => {
+                "Only classes extending NativeFieldWrapperClass1 can be passed as Pointer."
+                    .to_string()
+            }
+            Self::FfiNativeUnexpectedNumberOfParameters
+            | Self::FfiNativeUnexpectedNumberOfParametersWithReceiver
+            | Self::InvalidExceptionValue
+            | Self::MissingExceptionValue
+            | Self::MustBeANativeFunctionType
+            | Self::MustBeASubtype => self.message3(a0, a1, ""),
+            Self::LeafCallMustNotReturnHandle => {
+                "FFI leaf call can't return a 'Handle'.".to_string()
+            }
+            Self::LeafCallMustNotTakeHandle => {
+                "FFI leaf call can't take arguments of type 'Handle'.".to_string()
+            }
+            Self::MustReturnVoid => format!(
+                "The return type of the function passed to 'NativeCallable.listener' must be 'void' rather than '{a0}'."
+            ),
+            Self::NativeFieldInvalidType => format!(
+                "'{a0}' is an unsupported type for native fields. Native fields only support pointers, arrays or numeric and compound types."
+            ),
+            Self::NativeFieldMissingType => {
+                "The native type of this field could not be inferred and must be specified in the annotation."
+                    .to_string()
+            }
+            Self::NativeFieldNotStatic => {
+                "Native fields must be static.".to_string()
+            }
+            Self::NativeFunctionMissingType => {
+                "The native type of this function couldn't be inferred so it must be specified in the annotation."
+                    .to_string()
+            }
+            Self::NonConstantTypeArgument => format!(
+                "The type arguments to '{a0}' must be known at compile time, so they can't be type parameters."
+            ),
+            Self::NonNativeFunctionTypeArgumentToPointer => format!(
+                "Can't invoke 'asFunction' because the function signature '{a0}' for the pointer isn't a valid C function signature."
+            ),
             // The #743 W1-micro cluster: verbatim oracle problemMessages
             // (messages.yaml, the registry lines cited in the variant docs).
             Self::DeadCodeOnCatchSubtype => {
@@ -2862,6 +3406,29 @@ impl SemanticCode {
             Self::WrongNumberOfParametersForOperatorMinus => {
                 format!("Operator '-' should declare 0 or 1 parameter, but {a0} found.")
             }
+            // The `dart:ffi` verifier's multi-placeholder rows
+            // (diagnostic.g.dart, the registry lines cited per variant):
+            // the parameter-count pair renders `expected`/`actual` ints;
+            // the exception-value pair renders the method name; the
+            // native-function-type and subtype rows render type displays.
+            Self::FfiNativeUnexpectedNumberOfParameters => format!(
+                "Unexpected number of Native annotation parameters. Expected {a0} but has {a1}."
+            ),
+            Self::FfiNativeUnexpectedNumberOfParametersWithReceiver => format!(
+                "Unexpected number of Native annotation parameters. Expected {a0} but has {a1}. Native instance method annotation must have receiver as first argument."
+            ),
+            Self::InvalidExceptionValue => format!(
+                "The method {a0} can't have an exceptional return value (the second argument) when the return type of the function is either 'void', 'Handle' or 'Pointer'."
+            ),
+            Self::MissingExceptionValue => format!(
+                "The method {a0} must have an exceptional return value (the second argument) when the return type of the function is neither 'void', 'Handle', nor 'Pointer'."
+            ),
+            Self::MustBeANativeFunctionType => format!(
+                "The type '{a0}' given to '{a1}' must be a valid 'dart:ffi' native function type."
+            ),
+            Self::MustBeASubtype => format!(
+                "The type '{a0}' must be a subtype of '{a1}' for '{a2}'."
+            ),
             Self::WrongNumberOfTypeArguments => {
                 format!(
                     "The type '{a0}' is declared with {a1} type parameters, but {a2} type arguments were given."
@@ -4572,7 +5139,58 @@ mod tests {
             | SemanticCode::YieldOfInvalidType
             | SemanticCode::YieldEachOfInvalidType
             | SemanticCode::AmbiguousSetOrMapLiteralEither
-            | SemanticCode::AmbiguousSetOrMapLiteralBoth => code.code_info(),
+            | SemanticCode::AmbiguousSetOrMapLiteralBoth
+            | SemanticCode::AbiSpecificIntegerInvalid
+            | SemanticCode::AbiSpecificIntegerMappingExtra
+            | SemanticCode::AbiSpecificIntegerMappingMissing
+            | SemanticCode::AbiSpecificIntegerMappingUnsupported
+            | SemanticCode::AnnotationOnPointerField
+            | SemanticCode::CompoundImplementsFinalizable
+            | SemanticCode::EmptyStruct
+            | SemanticCode::ExtraAnnotationOnStructField
+            | SemanticCode::ExtraSizeAnnotationCarray
+            | SemanticCode::FieldMustBeExternalInStruct
+            | SemanticCode::GenericStructSubclass
+            | SemanticCode::InvalidFieldTypeInStruct
+            | SemanticCode::MismatchedAnnotationOnStructField
+            | SemanticCode::MissingAnnotationOnStructField
+            | SemanticCode::MissingFieldTypeInStruct
+            | SemanticCode::MissingSizeAnnotationCarray
+            | SemanticCode::NegativeVariableDimension
+            | SemanticCode::NonPositiveArrayDimension
+            | SemanticCode::NonSizedTypeArgument
+            | SemanticCode::PackedAnnotation
+            | SemanticCode::PackedAnnotationAlignment
+            | SemanticCode::VariableLengthArrayNotLast
+            | SemanticCode::SizeAnnotationDimensions
+            | SemanticCode::SubtypeOfStructClassInExtends
+            | SemanticCode::SubtypeOfStructClassInImplements
+            | SemanticCode::SubtypeOfStructClassInWith
+            | SemanticCode::AddressPosition
+            | SemanticCode::AddressReceiver
+            | SemanticCode::ArgumentMustBeAConstant
+            | SemanticCode::ArgumentMustBeNative
+            | SemanticCode::CreationOfStructOrUnion
+            | SemanticCode::FfiNativeInvalidDuplicateDefaultAsset
+            | SemanticCode::FfiNativeInvalidMultipleAnnotations
+            | SemanticCode::FfiNativeOnlyClassesExtendingNativefieldwrapperclass1CanBePointer
+            | SemanticCode::FfiNativeMustBeExternal
+            | SemanticCode::FfiNativeUnexpectedNumberOfParameters
+            | SemanticCode::FfiNativeUnexpectedNumberOfParametersWithReceiver
+            | SemanticCode::InvalidExceptionValue
+            | SemanticCode::LeafCallMustNotReturnHandle
+            | SemanticCode::LeafCallMustNotTakeHandle
+            | SemanticCode::MissingExceptionValue
+            | SemanticCode::MustBeANativeFunctionType
+            | SemanticCode::MustBeASubtype
+            | SemanticCode::MustReturnVoid
+            | SemanticCode::NativeFieldInvalidType
+            | SemanticCode::NativeFieldMissingType
+            | SemanticCode::NativeFieldNotStatic
+            | SemanticCode::NativeFunctionMissingType
+            | SemanticCode::NonConstantTypeArgument
+            | SemanticCode::NonNativeFunctionTypeArgumentToPointer
+            => code.code_info(),
         }
     }
 
@@ -4768,6 +5386,56 @@ mod tests {
             SemanticCode::YieldEachOfInvalidType,
             SemanticCode::AmbiguousSetOrMapLiteralEither,
             SemanticCode::AmbiguousSetOrMapLiteralBoth,
+            SemanticCode::AbiSpecificIntegerInvalid,
+            SemanticCode::AbiSpecificIntegerMappingExtra,
+            SemanticCode::AbiSpecificIntegerMappingMissing,
+            SemanticCode::AbiSpecificIntegerMappingUnsupported,
+            SemanticCode::AnnotationOnPointerField,
+            SemanticCode::CompoundImplementsFinalizable,
+            SemanticCode::EmptyStruct,
+            SemanticCode::ExtraAnnotationOnStructField,
+            SemanticCode::ExtraSizeAnnotationCarray,
+            SemanticCode::FieldMustBeExternalInStruct,
+            SemanticCode::GenericStructSubclass,
+            SemanticCode::InvalidFieldTypeInStruct,
+            SemanticCode::MismatchedAnnotationOnStructField,
+            SemanticCode::MissingAnnotationOnStructField,
+            SemanticCode::MissingFieldTypeInStruct,
+            SemanticCode::MissingSizeAnnotationCarray,
+            SemanticCode::NegativeVariableDimension,
+            SemanticCode::NonPositiveArrayDimension,
+            SemanticCode::NonSizedTypeArgument,
+            SemanticCode::PackedAnnotation,
+            SemanticCode::PackedAnnotationAlignment,
+            SemanticCode::VariableLengthArrayNotLast,
+            SemanticCode::SizeAnnotationDimensions,
+            SemanticCode::SubtypeOfStructClassInExtends,
+            SemanticCode::SubtypeOfStructClassInImplements,
+            SemanticCode::SubtypeOfStructClassInWith,
+            SemanticCode::AddressPosition,
+            SemanticCode::AddressReceiver,
+            SemanticCode::ArgumentMustBeAConstant,
+            SemanticCode::ArgumentMustBeNative,
+            SemanticCode::CreationOfStructOrUnion,
+            SemanticCode::FfiNativeInvalidDuplicateDefaultAsset,
+            SemanticCode::FfiNativeInvalidMultipleAnnotations,
+            SemanticCode::FfiNativeOnlyClassesExtendingNativefieldwrapperclass1CanBePointer,
+            SemanticCode::FfiNativeMustBeExternal,
+            SemanticCode::FfiNativeUnexpectedNumberOfParameters,
+            SemanticCode::FfiNativeUnexpectedNumberOfParametersWithReceiver,
+            SemanticCode::InvalidExceptionValue,
+            SemanticCode::LeafCallMustNotReturnHandle,
+            SemanticCode::LeafCallMustNotTakeHandle,
+            SemanticCode::MissingExceptionValue,
+            SemanticCode::MustBeANativeFunctionType,
+            SemanticCode::MustBeASubtype,
+            SemanticCode::MustReturnVoid,
+            SemanticCode::NativeFieldInvalidType,
+            SemanticCode::NativeFieldMissingType,
+            SemanticCode::NativeFieldNotStatic,
+            SemanticCode::NativeFunctionMissingType,
+            SemanticCode::NonConstantTypeArgument,
+            SemanticCode::NonNativeFunctionTypeArgumentToPointer,
         ]
     }
 

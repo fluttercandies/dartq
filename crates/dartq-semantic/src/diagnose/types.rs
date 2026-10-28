@@ -2465,6 +2465,29 @@ pub(crate) struct Engine<'a> {
     /// close). Capture state and finalize halves on
     /// [`DeferredModifierChecks`].
     pub(crate) deferred_modifier: Option<DeferredModifierChecks>,
+    /// The clause-entry spans of every completed container header, keyed by
+    /// the container's name — the `dart:ffi` verifier's post-parse pass
+    /// ([`super::ffi`]) anchors its `subtype_of_struct_class` rows on the
+    /// written extends/implements/with entries, which the element model
+    /// keeps name-only. Captured at the use-site drain
+    /// ([`Engine::check_modifier_use_sites`]) where the spans are complete.
+    pub(crate) ffi_clause_spans: FxHashMap<StringId, FfiClauseSpans>,
+    /// The FFI invocation candidates captured at each argument-list close
+    /// ([`super::ffi`]'s invocation pass input).
+    pub(crate) ffi_invocations: Vec<FfiInvocation>,
+    /// The `.address` member reads in source order (the
+    /// `address_position`/`address_receiver` input).
+    pub(crate) ffi_address_reads: Vec<FfiAddressRead>,
+    /// The FFI-named metadata annotations of the annotation currently
+    /// being closed, awaiting the declaration they annotate (drained at
+    /// [`Engine::note_decl_site`]).
+    pub(crate) ffi_pending_annos: Vec<FfiDeclAnno>,
+    /// The FFI-named metadata annotations by declaration site (the
+    /// `note_decl_site` index): the `@Native`/`@Array`/`@Packed`/
+    /// `@AbiSpecificIntegerMapping`/`@DefaultAsset` faces the `dart:ffi`
+    /// verifier's post-parse pass reads, source-parsed once at the
+    /// annotation's close.
+    pub(crate) ffi_decl_annos: FxHashMap<usize, Vec<FfiDeclAnno>>,
     /// The #279 constant-evaluation capture: expression folding while a
     /// const context is open ([`crate::const_eval`]).
     pub(crate) const_capture: ConstCapture,
@@ -4509,6 +4532,176 @@ pub(crate) struct DeferredModifierChecks {
     pub(crate) decl_start: SourceRange,
     pub(crate) use_sites_done: bool,
     pub(crate) spans: HeaderClauseSpans,
+}
+
+/// The `dart:ffi` verifier's clause-entry anchors ([`super::ffi`]): the
+/// written `extends` head, the `implements` entries, and the `with`
+/// entries — recovered from [`HeaderClauseSpans`] at the use-site drain
+/// (the with faces sit in `buffered`'s tail, claimed by nothing).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FfiClauseSpans {
+    /// The `extends` entry (`None` when the header has no extends clause).
+    pub(crate) extends: Option<SourceRange>,
+    /// The `implements` entries in written order.
+    pub(crate) implements: Vec<SourceRange>,
+    /// The `with` entries in written order.
+    pub(crate) withs: Vec<SourceRange>,
+}
+
+/// One invocation the `dart:ffi` verifier's post-parse pass
+/// ([`super::ffi`]) may own, captured at the argument-list close: the
+/// head's spelling (and the named-selector creation's selector segment,
+/// resolved from the source at capture), the spans, the written type
+/// arguments, and the arguments' types and shapes.
+#[derive(Clone, Debug)]
+pub(crate) struct FfiInvocation {
+    /// The head spelling: the member-send selector (`fromFunction`,
+    /// `asFunction`, `addressOf`, `sizeOf`, `create`, `elementAt`) or the
+    /// bare creation head (`C()`'s `C`, `NativeCallable<...>.listener`'s
+    /// `NativeCallable`).
+    pub(crate) callee: StringId,
+    /// A named-selector creation's selector segment (`listener` of
+    /// `NativeCallable<T>.listener(f)`); `None` for plain sends and
+    /// unnamed creations.
+    pub(crate) selector: Option<StringId>,
+    /// The span the oracle anchors whole-invocation rows at (the send
+    /// head for a member send, the constructor name for a creation).
+    pub(crate) head: SourceRange,
+    /// The written `<...>` type argument after the head, source-parsed.
+    pub(crate) type_arg: Option<FfiTypeArg>,
+    /// `(name, shape)` per argument — positional arguments carry `None`
+    /// names.
+    pub(crate) args: Vec<(Option<StringId>, FfiArgShape)>,
+    /// The receiver's static type for member sends (`p` of
+    /// `p.asFunction`); [`Ty::Unknown`] when the row carried none.
+    pub(crate) recv_ty: Ty,
+    /// The invocation's own span (head through `)`), the
+    /// whole-expression anchor.
+    pub(crate) whole: SourceRange,
+    /// The head is a bare creation head (no callee row linked the group).
+    pub(crate) is_creation: bool,
+}
+
+/// The written type argument of a captured invocation (`<...>` after the
+/// head), source-parsed: the send-side type-argument application pushes
+/// no `TypeUse` rows, so the capture reads the bytes. The checks consume
+/// the head spelling, the written display/span, and — when the text
+/// reads `R Function(P...)` — the signature's head shapes; a bare
+/// spelling's function-form answer (the alias-expanded face) re-derives
+/// through the element model.
+#[derive(Clone, Debug)]
+pub(crate) struct FfiTypeArg {
+    /// The written text, trimmed (the message display).
+    pub(crate) display: Box<str>,
+    /// The written span (inside the `<...>`).
+    pub(crate) span: SourceRange,
+    /// The written text's first identifier.
+    pub(crate) head: StringId,
+    /// `Some((return head, parameter heads))` when the text parses as
+    /// `R Function(P...)`.
+    pub(crate) fn_sig: Option<(StringId, Box<[StringId]>)>,
+}
+
+/// One argument's decided shape at the capture: the static type plus the
+/// source facts the constant-argument faces read (`_isConst`'s
+/// name-level stand-in — a literal or a const-constructor creation is
+/// const; an invoked non-const head is not).
+#[derive(Clone, Debug)]
+pub(crate) struct FfiArgShape {
+    /// The argument expression's own span.
+    pub(crate) range: SourceRange,
+    /// The argument's static type at the capture.
+    pub(crate) ty: Ty,
+    /// The argument reads as an invocation (`head(`…) — the shape the
+    /// `argument_must_be_a_constant` face re-decides against the head's
+    /// const-constructor bit.
+    pub(crate) invocation_shaped: bool,
+    /// The invocation-shaped argument's head spelling (a creation head or
+    /// callee name); empty otherwise.
+    pub(crate) head: StringId,
+}
+
+/// One `.address` member read, captured at the merge: the selector's
+/// span plus the receiver facts the `address_position`/`address_receiver`
+/// faces decide on — the receiver expression's own span, its static type,
+/// its classification head's type (the chain root's declared type), and
+/// whether the receiver is an index expression.
+#[derive(Clone, Debug)]
+pub(crate) struct FfiAddressRead {
+    /// The `address` selector's span (the row anchor).
+    pub(crate) selector: SourceRange,
+    /// The receiver expression's own span (the leaf-invocation containment
+    /// probe's subject).
+    pub(crate) recv_span: SourceRange,
+    /// The receiver's static type (the whole receiver expression).
+    pub(crate) recv_ty: Ty,
+    /// The receiver classification's head type: the declared type behind a
+    /// `Typed` receiver (`data` of `data.address`, `struct` of
+    /// `struct.y.address`'s chain root); [`Ty::Unknown`] elsewhere.
+    pub(crate) head_ty: Ty,
+    /// The receiver expression is an index (`data[0].address`).
+    pub(crate) recv_is_index: bool,
+}
+
+/// One FFI-named metadata annotation (`@Native`, `@Array`, `@Packed`,
+/// `@AbiSpecificIntegerMapping`, `@DefaultAsset`), source-parsed at its
+/// close: the spans the verifier's rows anchor at plus the argument
+/// faces its checks read.
+#[derive(Clone, Debug)]
+pub(crate) struct FfiDeclAnno {
+    /// The annotation's whole span, `@` through the argument group's `)`
+    /// (or through the name when argument-less).
+    pub(crate) at: SourceRange,
+    /// The annotation's written name (dot-joined for qualified spellings).
+    pub(crate) name: StringId,
+    /// The parsed argument face.
+    pub(crate) face: FfiAnnoFace,
+}
+
+/// The source-parsed face of one FFI annotation's arguments: only the
+/// shapes the owning code name reads are filled; every field defaults to
+/// its absent form.
+#[derive(Clone, Debug)]
+pub(crate) struct FfiAnnoFace {
+    /// The annotation name's own span (`@` excluded) — the
+    /// `abi_specific_integer_mapping_extra`/`ffi_native_invalid_multiple_
+    /// annotations`/duplicate-`@DefaultAsset` anchors.
+    pub(crate) name_span: SourceRange,
+    /// The argument group's span, `(` through `)`, when present.
+    pub(crate) args: Option<SourceRange>,
+    /// `@Native`/`@Packed`/`@Array`: the written `<T>` type argument
+    /// (display text plus the parsed head shapes).
+    pub(crate) sig: Option<FfiSigFace>,
+    /// `@Native(isLeaf: true)`: the flag's written truth.
+    pub(crate) is_leaf: bool,
+    /// `@Array`: the dimension constants with their written spans (the
+    /// variable dimension first, `0` standing in for `@Array.variable()`'s
+    /// preset).
+    pub(crate) dims: Vec<(i64, SourceRange)>,
+    /// `@Array.variable*`: the variable-length posture.
+    pub(crate) variable_length: bool,
+    /// `@Packed`: the alignment literal and its span.
+    pub(crate) alignment: Option<(i64, SourceRange)>,
+    /// `@AbiSpecificIntegerMapping`: each map value's head type spelling
+    /// with its written span.
+    pub(crate) mapping_values: Vec<(String, SourceRange)>,
+}
+
+/// The written `<T>` of an `@Native` annotation: the display text plus the
+/// parsed function-type shape (return head, per-parameter heads) when the
+/// written form is `R Function(P...)`; a bare type keeps its head in
+/// [`Self::ret_head`] with no parameters.
+#[derive(Clone, Debug)]
+pub(crate) struct FfiSigFace {
+    /// The written type argument's own span (inside the `<...>`).
+    pub(crate) range: SourceRange,
+    /// The written text (the message display).
+    pub(crate) display: Box<str>,
+    /// The return type's head spelling (`Void`, `Int8`, `Pointer`,
+    /// `Handle`).
+    pub(crate) ret_head: StringId,
+    /// Each normal parameter's head spelling, in order.
+    pub(crate) param_heads: Box<[StringId]>,
 }
 
 /// The `_isLibraryInWorkspacePackage` face at the graph's uri level: a

@@ -401,6 +401,7 @@ mod invocation;
 mod index_result;
 mod listener;
 mod never_send;
+mod ffi;
 mod pattern_scope;
 mod primitive_lattice;
 mod receiver_face;
@@ -470,6 +471,11 @@ mod ticket_2313_tests;
 #[cfg(test)]
 mod ticket_2316_tests;
 
+/// The `dart:ffi` verifier's `/1` trigger pins (48 codes + the F4 noise
+/// gate) — one test per oracle row.
+#[cfg(test)]
+mod ffi_verifier_tests;
+
 /// The dead/unused-family differential pins: the `InvalidType` checked
 /// type's `factor` remainder (the losing `is`/`is!` arm's `dead_code`),
 /// `unused_field`'s `unresolvedReadMembers` spelling fallback and the
@@ -515,6 +521,14 @@ mod ticket_2245_tests;
 /// else-branch, and unguarded cells keep the report.
 #[cfg(test)]
 mod ticket_2241_tests;
+
+/// The #2765 chained promoted-property receiver pins: `c._p.isEven` under
+/// `if (c._p != null)` resolves on the promoted face (the chained latch's
+/// zero-length marker joins the staging by read offset), the guarded
+/// read stays silent, and the read after a receiver reassignment keeps
+/// the oracle's single row.
+#[cfg(test)]
+mod ticket_2765_tests;
 
 
 /// The #2326 differential pins: the with-clause override producer wired
@@ -1534,6 +1548,11 @@ pub fn fold_unit_with_ops<'t>(
     engine.finalize_ext_faces();
     engine.finalize_pattern_getters();
     engine.finalize_mixin_uses();
+    // The `dart:ffi` verifier's post-parse pass: the compound/`@Native`
+    // declaration shapes, the captured invocation faces, and the
+    // `.address` reads (upstream ffi_verifier.dart, run after the parse so
+    // same-file later declarations resolve).
+    engine.finalize_ffi();
     // The F-C redirect cycle walk needs every constructor's initializer
     // edges (a later declaration can close a cycle an earlier one opened).
     engine.finalize_redirects();

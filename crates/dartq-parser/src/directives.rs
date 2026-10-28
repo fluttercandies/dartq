@@ -648,8 +648,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
     ) -> (TokenSpan, Option<(TokenSpan, TokenSpan)>) {
         if self.peek_kind() != TokenKind::String {
             let at = self.peek_span();
-            let lexeme = self.cursor.lexeme(at.id).to_owned();
-            self.report(msg::expected_string(&lexeme), at);
+            self.report(msg::expected_string(), at);
             let _ = self
                 .cursor
                 .insert_synthetic(TokenKind::String, at.range.offset);

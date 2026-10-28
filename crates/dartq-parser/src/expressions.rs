@@ -1520,12 +1520,18 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                     || (opens_square
                         && matches!(follower, TokenKind::OpenSquare | TokenKind::Index));
                 if literal {
-                    self.report(
+                    // Official `reportRecoverableErrorWithEnd(newKeyword,
+                    // identifier, …)` (parser_impl.dart:8901/8922): the row
+                    // spans `new` through the class identifier's end
+                    // (`new List` — manual face
+                    // literal_with_class_and_new/1: 1:20|8).
+                    self.report_with_end(
                         msg::literal_with_class_and_new(
                             &value.to_lowercase(),
                             self.cursor.lexeme(identifier.id),
                         ),
                         new_kw,
+                        identifier,
                     );
                     self.cursor.advance();
                     return self.parse_primary(IdentifierContext::Expression);

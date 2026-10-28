@@ -4643,12 +4643,12 @@ impl<'a> Engine<'a> {
 
     /// A simple annotation name (`@foo`): the name resolves through the
     /// annotation scope order ([`Engine::annotation_name_missing`]); a fully
-    /// missing name is `undefined_annotation` anchored over the `@` (3.13.1
-    /// caliber — the diagnostic was removed upstream in 3.14, `m1_codes.txt`
-    /// freezes the measured form). A [`CORE_TOP_LEVEL_ANNOTATIONS`] name is
-    /// defined by the implicit dart:core import, never missing. Defined
-    /// names stay silent: the class/constructor second-part checks sit
-    /// outside the M1 model (under-report). The metadata path skips the
+    /// missing name is `undefined_annotation`, emitted at `end_metadata`
+    /// ([`Engine::emit_undefined_annotation`]) because the upstream row
+    /// anchors on the whole Annotation node. A [`CORE_TOP_LEVEL_ANNOTATIONS`]
+    /// name is defined by the implicit dart:core import, never missing.
+    /// Defined names stay silent: the class/constructor second-part checks
+    /// sit outside the M1 model (under-report). The metadata path skips the
     /// broken-import shown-name guard — the oracle's scope lookup reports
     /// the missing annotation regardless of `show` clauses
     /// (element.dart:8217-8250 suppresses the identifier face only;
@@ -4656,15 +4656,6 @@ impl<'a> Engine<'a> {
     pub(crate) fn check_annotation(&mut self, name: StringId, range: SourceRange) {
         let missing = self.annotation_name_missing(name)
             && !CORE_TOP_LEVEL_ANNOTATIONS.contains(&self.strings.resolve(name));
-        let at = self.annotation_at.take();
-        if missing {
-            let span = SourceRange {
-                offset: at.map_or(range.offset, |at| at.offset),
-                length: range.end() - at.map_or(range.offset, |at| at.offset),
-            };
-            let name_text = self.strings.resolve(name).to_string();
-            self.emit(SemanticCode::UndefinedAnnotation, span, &name_text, "");
-        }
         if missing {
             self.record_miss(name, range, false, NameUse::Annotation);
         } else {
@@ -4676,6 +4667,38 @@ impl<'a> Engine<'a> {
             self.used_names.insert(name);
             self.annotation_uses.insert(name);
         }
+    }
+
+    /// The `undefined_annotation` row for the metadata entry that just
+    /// closed. Upstream reports it `.at(node)` on the whole Annotation
+    /// (`annotation_resolver.dart:245`) — `@` through the arguments'
+    /// closing paren when present, else through the name — a span only the
+    /// metadata end knows, so the emit lives here instead of
+    /// [`Engine::check_annotation`]. The missing-name decision recomputes
+    /// on the HEAD segment: the continuation arm rewrites the pending
+    /// entry's name to the joined spelling (`A._ann`, `UseResult.unless`),
+    /// while the check at the name event — and upstream's scope lookup —
+    /// read the unqualified head.
+    pub(crate) fn emit_undefined_annotation(&mut self, node: SourceRange) {
+        let Some(pending) = self.pending_annotations.last() else {
+            return;
+        };
+        let joined = self.strings.resolve(pending.name);
+        let head = joined.split('.').next().unwrap_or(joined);
+        if !(self.annotation_name_missing(self.strings.intern(head))
+            && !CORE_TOP_LEVEL_ANNOTATIONS.contains(&head))
+        {
+            return;
+        }
+        // The oracle names the head identifier, never the joined spelling
+        // (corpus rows: zero dotted names — `Undefined name 'p' used as an
+        // annotation.` for `@p.C()` shapes).
+        self.emit(
+            SemanticCode::UndefinedAnnotation,
+            node,
+            head,
+            "",
+        );
     }
 
     /// A value row with a resolved static type — the typed list literal's

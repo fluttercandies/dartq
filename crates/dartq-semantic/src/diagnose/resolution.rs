@@ -816,7 +816,24 @@ impl<'a> Engine<'a> {
         range: SourceRange,
         from: Ty,
     ) -> Option<Ty> {
-        if !props.staged(range) {
+        // The join key is the read's token OFFSET, not the full span: the
+        // head latch (#1465) carries the receiver read's own span, but a
+        // chained receiver (`c._p.isEven` under `if (c._p != null)`) rides
+        // the #2283 chained latch's zero-length marker, whose offset is the
+        // receiver read's member token without its length — an exact-span
+        // compare drops every chained receiver's promotion, and the member
+        // row over-reports `unchecked_use_of_nullable_value` where the
+        // official resolves it on the promoted static type
+        // (property_element_resolver.dart:2158-2166). Read offsets are
+        // unique (one read event folds one row, one fact per read event),
+        // so an offset hit is the same read; eligibility below still gates
+        // the substitution on the promotable-field verdict.
+        if !props.staged(range)
+            && props
+                .rows
+                .binary_search_by(|row| row.offset.cmp(&range.offset))
+                .is_err()
+        {
             return None;
         }
         let (entry, name, _origin) = self.member_read_resolution(range.offset)?;

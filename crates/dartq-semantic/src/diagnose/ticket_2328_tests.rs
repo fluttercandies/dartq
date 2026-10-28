@@ -207,6 +207,25 @@ fn class_annotation_over_broken_superclass_reports() {
     );
 }
 
+/// The anchor is the whole Annotation node (`annotation_resolver.dart:245`
+/// `.at(node)`): spaced arguments are recovered as arguments when the
+/// follower is a reserved `class` head, so the node spans `@` through the
+/// closing paren — the manual-face row
+/// `annotation_space_before_parenthesis/1` measures `@metadata (x, y)` at
+/// 1:1|16. Argument-less annotations keep the `@name` span.
+#[test]
+fn undefined_annotation_spans_the_annotation_node() {
+    let source = "@metadata (a, b)\nclass C {}";
+    let report = report(source, &[]);
+    let at = source.find("@metadata").unwrap() as u32;
+    assert_eq!(
+        codes(&report, "undefined_annotation"),
+        vec![(at, "@metadata (a, b)".len() as u32)],
+        "{:?}",
+        report.diagnostics
+    );
+}
+
 /// The drift corpus face: a bare top-level creation send inside a
 /// broken-chain class. The undecided member question falls through to the
 /// scoped lookup, which answers with the imported class — the send is the

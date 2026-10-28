@@ -72,6 +72,21 @@ impl<'a> Engine<'a> {
             if check.initialized {
                 continue;
             }
+            // The member-model exemption (`checkElement`'s `abstract` /
+            // `external` bits) reaches the static arm too: an
+            // `external static` field (`@Native` family) is implemented
+            // outside the class body and stays silent.
+            if let Some(container) = check.container {
+                let exempt = self
+                    .index
+                    .get(self.file)
+                    .and_then(|elements| elements.container(container))
+                    .and_then(|decl| decl.members.get(&check.name))
+                    .is_some_and(|entry| entry.is_abstract || entry.is_external);
+                if exempt {
+                    continue;
+                }
+            }
             // The top-level final face is the parser's (the shared CFE
             // `finalNotInitialized` rider on the field parse).
             if check.is_final && !check.is_static {

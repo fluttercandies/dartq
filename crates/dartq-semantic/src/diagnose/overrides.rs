@@ -2230,6 +2230,31 @@ impl<'a> Engine<'a> {
         if !self.reported_modifier_checks.insert(container) {
             return;
         }
+        // The `dart:ffi` verifier's post-parse pass reads the same written
+        // clause spans (`subtype_of_struct_class` anchors each row on its
+        // written entry). The `with` faces sit in `buffered`'s tail — the
+        // implements claim consumed the implements entries ahead of them,
+        // and nothing claims the with window, so the last `with_clause`
+        // entries are the with faces in application order (the
+        // `check_mixin_application_overrides` tail-slice precedent).
+        let with_count = self
+            .index
+            .get(self.file)
+            .and_then(|elements| elements.container(container))
+            .map_or(0, |decl| decl.with_clause.len());
+        let withs = if spans.buffered.len() >= with_count {
+            spans.buffered[spans.buffered.len() - with_count..].to_vec()
+        } else {
+            Vec::new()
+        };
+        self.ffi_clause_spans.insert(
+            container,
+            crate::diagnose::types::FfiClauseSpans {
+                extends: spans.extends,
+                implements: spans.implements.clone(),
+                withs,
+            },
+        );
         for finding in self.plan_modifier_use_sites(container, name_range, spans) {
             self.emit_modifier(finding.code, finding.anchor, &finding.a0, &finding.a1);
         }
