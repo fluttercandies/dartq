@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/dead_code/2
+//- source: hand-written flow-face case (flow coverage audit family F3, the nullable-LHS ?? control: both arms stay live, expected output is empty)
+//- file: lib/test.dart
+//+ void f(int? x) {
+//+   x ?? 1;
+//+ }

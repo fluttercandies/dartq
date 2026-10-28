@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/wrong_number_of_type_arguments_function/2
+//- source: hand-written from upstream analyzer messages.yaml#wrongNumberOfTypeArgumentsFunction, trigger verified in pkg/analyzer/lib/src/dart/type_instantiation_target.dart (InvocationTargetFunctionTypedExpression)
+//- file: lib/test.dart
+//+ void f(T Function<T>(T) g) {
+//+   g<int>(0);
+//+ }

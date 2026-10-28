@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/annotation_on_pointer_field/1
+//- source: hand-written from upstream analyzer messages.yaml#annotationOnPointerField, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ final class S extends Struct {
+//+   @Int8()
+//+   external Pointer<Int8> p;
+//+ }

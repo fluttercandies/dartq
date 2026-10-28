@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/non_constructor_factory/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode#nonConstructorFactory; factory on a name that is not the class name; registry-only in the pinned 3.13.7 oracle, the case pins the recovery face
+//- file: lib/test.dart
+//+ class C {
+//+   factory m() => C();
+//+ }

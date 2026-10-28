@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/non_constant_type_argument/2
+//- source: hand-written from upstream analyzer messages.yaml#nonConstantTypeArgument, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ void f() {
+//+   sizeOf<Int8>();
+//+ }

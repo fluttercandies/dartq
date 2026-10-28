@@ -1,0 +1,10 @@
+//- id: manual/diagnostic/workspace_value_not_string/2
+//- source: hand-written from upstream analyzer messages.yaml#workspaceValueNotString, trigger verified in pkg/analyzer/lib/src/pubspec/validators/workspace_validator.dart: negative: string entry
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ workspace:
+//+   - pkg
+//- file: pkg/keep.txt
+//+ x

@@ -1,0 +1,10 @@
+//- id: manual/diagnostic/must_return_void/1
+//- source: hand-written from upstream analyzer messages.yaml#mustReturnVoid, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ int f(int i) => i * 2;
+//+
+//+ void g() {
+//+   NativeCallable<Int32 Function(Int32)>.listener(f);
+//+ }

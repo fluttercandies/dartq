@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/compound_implements_finalizable/1
+//- source: hand-written from upstream analyzer messages.yaml#compoundImplementsFinalizable, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ final class S extends Struct implements Finalizable {
+//+   external Pointer<Int8> p;
+//+ }

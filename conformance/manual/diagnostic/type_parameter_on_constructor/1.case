@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/type_parameter_on_constructor/1
+//- source: hand-written from upstream _fe_analyzer_shared messages.yaml#constructorWithTypeParameters (analyzerCode typeParameterOnConstructor), official example verbatim
+//- file: lib/test.dart
+//+ class C {
+//+   C<T>() {}
+//+ }

@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/invalid_constant_pattern_unary/1
+//- source: gate pin dark_syntax_exposure_only_invalid_constant_pattern_unary in the dartq parser test tree (oracle-validated repro); unary negation of a non-numeric-literal operand
+//- file: lib/test.dart
+//+ void f(x) { switch (x) { case !false: break; } }

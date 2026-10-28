@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/text_direction_code_point_in_literal/1
+//- source: hand-written from upstream analyzer messages.yaml#textDirectionCodePointInLiteral, trigger verified in pkg/analyzer/lib/src/error/unicode_text_verifier.dart (U+202A..U+202E, U+2066..U+2069)
+//- file: lib/test.dart
+//+ var s = 'a‮b';
+//+
+//+ void f() {
+//+   print(s);
+//+ }

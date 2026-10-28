@@ -1,0 +1,14 @@
+//- id: manual/diagnostic/unchecked_use_of_nullable_value/3
+//- source: hand-written flow-face case (flow coverage audit family F13, the guard form inside a sync* generator plus the plain-function ??= control — both keep the promotion, expected output is empty), trigger pinned against upstream Dart SDK source pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart (type-test promotion across a generator-body yield)
+//- file: lib/test.dart
+//+ Iterable<int> f(int? x) sync* {
+//+   if (x != null) {
+//+     yield x;
+//+     x.isEven;
+//+   }
+//+ }
+//+
+//+ void g(int? x) {
+//+   x ??= 1;
+//+   x.isEven;
+//+ }

@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/path_does_not_exist/1
+//- source: hand-written from upstream analyzer messages.yaml#pathDoesNotExist, trigger verified in pkg/analyzer/lib/src/pubspec/validators/dependency_validator.dart: path dependency to a missing directory
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ dependencies:
+//+   foo:
+//+     path: missing_pkg

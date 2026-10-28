@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/name_not_string/2
+//- source: hand-written from upstream analyzer messages.yaml#nameNotString, trigger verified in pkg/analyzer/lib/src/pubspec/validators/name_validator.dart: negative: string name
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test

@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/invalid_unicode_escape_started/2
+//- source: hand-written escaped-backslash control for the same pin (valid escape: silent)
+//- file: lib/test.dart
+//+ var s = 'a\\';

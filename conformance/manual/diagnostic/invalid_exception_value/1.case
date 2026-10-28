@@ -1,0 +1,12 @@
+//- id: manual/diagnostic/invalid_exception_value/1
+//- source: hand-written from upstream analyzer messages.yaml#invalidExceptionValue, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ typedef T = Void Function(Int8);
+//+
+//+ void f(int i) {}
+//+
+//+ void g() {
+//+   Pointer.fromFunction<T>(f, 42);
+//+ }

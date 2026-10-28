@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/asset_does_not_exist/1
+//- source: hand-written from upstream analyzer messages.yaml#assetDoesNotExist, trigger verified in pkg/analyzer/lib/src/pubspec/validators/flutter_validator.dart: file entry without trailing slash that has no file
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ flutter:
+//+   assets:
+//+     - missing.png

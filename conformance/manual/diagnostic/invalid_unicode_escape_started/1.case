@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/invalid_unicode_escape_started/1
+//- source: gate pin dark_syntax_exposure_only_invalid_unicode_escape_started in the dartq parser test tree (oracle-validated repro); string part ends with a lone backslash before the newline
+//- file: lib/test.dart
+//+ var s = 'a\
+//+ ;

@@ -1,0 +1,17 @@
+//- id: manual/diagnostic/setting_orientation_on_activity/1
+//- source: hand-written from upstream analyzer messages.yaml#settingOrientationOnActivity, trigger verified in pkg/analyzer/lib/src/manifest/manifest_validator.dart (gated by analyzer.optional-checks.chrome-os-manifest-checks): fixed portrait orientation
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//- file: analysis_options.yaml
+//+ analyzer:
+//+   optional-checks:
+//+     chrome-os-manifest-checks: true
+//- file: android/AndroidManifest.xml
+//+ <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+//+     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+//+     <application>
+//+         <activity android:name="com.example.MainActivity" android:screenOrientation="portrait" />
+//+     </application>
+//+ </manifest>

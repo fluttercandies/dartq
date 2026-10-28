@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/workspace_value_not_string/1
+//- source: hand-written from upstream analyzer messages.yaml#workspaceValueNotString, trigger verified in pkg/analyzer/lib/src/pubspec/validators/workspace_validator.dart: workspace entry is a non-string scalar
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ workspace:
+//+   - 42

@@ -1,0 +1,10 @@
+//- id: manual/diagnostic/workspace_value_not_subdirectory/2
+//- source: hand-written from upstream analyzer messages.yaml#workspaceValueNotSubdirectory, trigger verified in pkg/analyzer/lib/src/pubspec/validators/workspace_validator.dart: negative: entry inside the package root
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ workspace:
+//+   - pkg
+//- file: pkg/keep.txt
+//+ x

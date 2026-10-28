@@ -1,0 +1,42 @@
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/widgets.dart';
+
+class AppBar extends StatefulWidget implements PreferredSizeWidget {
+  AppBar({
+    super.key,
+    Widget? leading,
+    bool automaticallyImplyLeading = true,
+    Widget? title,
+    List<Widget>? actions,
+    Widget? flexibleSpace,
+    PreferredSizeWidget? bottom,
+    double? elevation,
+    double? scrolledUnderElevation,
+    ScrollNotificationPredicate notificationPredicate = defaultScrollNotificationPredicate,
+    Color? shadowColor,
+    Color? surfaceTintColor,
+    ShapeBorder? shape,
+    Color? backgroundColor,
+    Color? foregroundColor,
+    IconThemeData? iconTheme,
+    IconThemeData? actionsIconTheme,
+    bool primary = true,
+    bool? centerTitle,
+    bool excludeHeaderSemantics = false,
+    double? titleSpacing,
+    double toolbarOpacity = 1.0,
+    double bottomOpacity = 1.0,
+    double? toolbarHeight,
+    double? leadingWidth,
+    TextStyle? toolbarTextStyle,
+    TextStyle? titleTextStyle,
+    SystemUiOverlayStyle? systemOverlayStyle,
+    bool forceMaterialTransparency = false,
+    bool useDefaultSemanticsOrder = true,
+    Clip? clipBehavior,
+    EdgeInsetsGeometry? actionsPadding,
+    bool animateColor = false,
+  });
+}

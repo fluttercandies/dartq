@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/abi_specific_integer_mapping_unsupported/1
+//- source: hand-written from upstream analyzer messages.yaml#abiSpecificIntegerMappingUnsupported, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ @AbiSpecificIntegerMapping({Abi.macosX64: Array<Uint8>(4)})
+//+ final class C extends AbiSpecificInteger {
+//+   const C();
+//+ }

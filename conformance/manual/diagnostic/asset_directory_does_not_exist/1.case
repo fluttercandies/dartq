@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/asset_directory_does_not_exist/1
+//- source: hand-written from upstream analyzer messages.yaml#assetDirectoryDoesNotExist, trigger verified in pkg/analyzer/lib/src/pubspec/validators/flutter_validator.dart: directory entry with trailing slash that has no folder
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ flutter:
+//+   assets:
+//+     - missing_dir/

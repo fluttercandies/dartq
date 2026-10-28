@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/missing_quote/1
+//- source: gate pin blindspot_library_directives in the dartq parser test fixtures; the fixture file documents this code as a never-fires face (no emit site upstream or in dartq), the unterminated literal closes with the scanner's unterminated_string_literal row; the companion file keeps the recovered URI resolvable
+//- file: lib/test.dart
+//+ import 'a.dart
+//- file: lib/a.dart
+//+ class A {}

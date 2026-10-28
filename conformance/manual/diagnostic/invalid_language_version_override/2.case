@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/invalid_language_version_override/2
+//- source: hand-written valid-override control for the same verifier (lower case dart with '=' and a well-formed version: silent)
+//- file: lib/test.dart
+//+ // @dart = 2.13
+//+
+//+ void f() {}

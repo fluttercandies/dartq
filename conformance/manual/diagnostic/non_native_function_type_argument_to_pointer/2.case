@@ -1,0 +1,13 @@
+//- id: manual/diagnostic/non_native_function_type_argument_to_pointer/2
+//- source: hand-written from upstream analyzer messages.yaml#nonNativeFunctionTypeArgumentToPointer, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ typedef FNative = Int8 Function(Int8);
+//+ typedef F = int Function(int);
+//+
+//+ class C {
+//+   void f(Pointer<NativeFunction<FNative>> p) {
+//+     p.asFunction<F>();
+//+   }
+//+ }

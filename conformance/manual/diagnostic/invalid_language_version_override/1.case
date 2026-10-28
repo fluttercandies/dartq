@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/invalid_language_version_override/1
+//- source: hand-written from upstream analyzer messages.yaml invalidLanguageVersionOverrideLowerCase (sharedName invalidLanguageVersionOverride), trigger per pkg/analyzer/lib/src/error/language_version_override_verifier.dart: dart must be all lower case
+//- file: lib/test.dart
+//+ // @Dart = 2.13
+//+
+//+ void f() {}

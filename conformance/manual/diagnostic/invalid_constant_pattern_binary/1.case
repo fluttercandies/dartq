@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/invalid_constant_pattern_binary/1
+//- source: gate pin dark_syntax_exposure_only_invalid_constant_pattern_binary in the dartq parser test tree (oracle-validated repro); binary operator below selector precedence in a constant pattern
+//- file: lib/test.dart
+//+ void f(x) { switch (x) { case 1 + 2: break; } }

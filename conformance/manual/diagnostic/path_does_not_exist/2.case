@@ -1,0 +1,11 @@
+//- id: manual/diagnostic/path_does_not_exist/2
+//- source: hand-written from upstream analyzer messages.yaml#pathDoesNotExist, trigger verified in pkg/analyzer/lib/src/pubspec/validators/dependency_validator.dart: negative: path dependency to an existing package
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ dependencies:
+//+   foo:
+//+     path: real_dep
+//- file: real_dep/pubspec.yaml
+//+ name: real_dep

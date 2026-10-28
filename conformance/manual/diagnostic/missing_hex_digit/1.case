@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/missing_hex_digit/1
+//- source: hand-written from upstream analyzer messages.yaml ScannerErrorCode#missingHexDigit (Hexadecimal digit expected); 0x with no digits, the scanner's synthetic-digit recovery
+//- file: lib/test.dart
+//+ void f() {
+//+   var x = 0x;
+//+ }

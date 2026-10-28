@@ -1,0 +1,10 @@
+//- id: manual/diagnostic/included_file_warning/1
+//- source: hand-written from upstream analyzer messages.yaml#includedFileWarning, trigger verified in pkg/analyzer/lib/src/analysis_options/analysis_options_parse_model.dart
+//- file: lib/test.dart
+//+ void f() {}
+//- file: analysis_options.yaml
+//+ include: child.yaml
+//- file: child.yaml
+//+ linter:
+//+   rules:
+//+     - definitely_not_a_real_rule

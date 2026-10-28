@@ -1,0 +1,12 @@
+//- id: manual/diagnostic/dead_code/6
+//- source: hand-written flow-face case (flow coverage audit family F16, infinite-loop exit unreachability: the statement after a break-free while(true)/for(;;) is dead), trigger pinned against upstream Dart SDK source pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart (loop exit reachability)
+//- file: lib/test.dart
+//+ void f() {
+//+   while (true) {}
+//+   print('dead');
+//+ }
+//+
+//+ void g() {
+//+   for (;;) {}
+//+   print('dead');
+//+ }

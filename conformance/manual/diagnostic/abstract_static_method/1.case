@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/abstract_static_method/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode#abstractStaticMethod; registry-only in the pinned 3.13.7 oracle (no CFE emission), the case pins the recovery face
+//- file: lib/test.dart
+//+ class C {
+//+   abstract static void m();
+//+ }

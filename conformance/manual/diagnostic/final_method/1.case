@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/final_method/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode#finalMethod; registry-only in the pinned 3.13.7 oracle (no CFE emission), the case pins the recovery face
+//- file: lib/test.dart
+//+ class C {
+//+   final void m() {}
+//+ }

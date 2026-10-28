@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/non_identifier_library_name/1
+//- source: gate pin blindspot_library_directives in the dartq parser test fixtures (oracle-validated repro); the pinned oracle emits missing_identifier at the digit, this registry-only code never fires
+//- file: lib/test.dart
+//+ library 1;

@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/asset_field_not_list/1
+//- source: hand-written from upstream analyzer messages.yaml#assetFieldNotList, trigger verified in pkg/analyzer/lib/src/pubspec/validators/flutter_validator.dart: assets value is a scalar
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ flutter:
+//+   assets: not_a_list

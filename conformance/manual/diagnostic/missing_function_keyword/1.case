@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/missing_function_keyword/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode#missingFunctionKeyword; parameter list without the Function keyword in a function type; registry-only in the pinned 3.13.7 oracle, the case pins the recovery face
+//- file: lib/test.dart
+//+ typedef F = int (int x);

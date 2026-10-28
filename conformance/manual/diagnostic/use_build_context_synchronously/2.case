@@ -1,0 +1,22 @@
+//- id: manual/diagnostic/use_build_context_synchronously/2
+//- source: hand-written flow-face case (flow coverage audit family F14, guard reopens gap after a second await: the not-mounted exit guard covers only the first gap, the use after the second await reports), trigger pinned against upstream Dart SDK source pkg/linter/lib/src/rules/use_build_context_synchronously.dart (guard verdict does not survive a later await)
+//- packages: meta, ffi, flutter, angular_meta
+//- options:
+//+ analyzer:
+//+   optional-checks:
+//+     propagate-linter-exceptions: true
+//+ linter:
+//+   rules:
+//+     - use_build_context_synchronously
+//+
+//- file: lib/test.dart
+//+ import 'package:flutter/material.dart';
+//+
+//+ class MyWidget extends Widget {
+//+   void onButtonTapped(BuildContext context) async {
+//+     await Future<void>.delayed(const Duration(seconds: 1));
+//+     if (!context.mounted) return;
+//+     await Future<void>.delayed(const Duration(seconds: 1));
+//+     Navigator.of(context);
+//+   }
+//+ }

@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/name_not_string/1
+//- source: hand-written from upstream analyzer messages.yaml#nameNotString, trigger verified in pkg/analyzer/lib/src/pubspec/validators/name_validator.dart: name value is a non-string scalar
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: 42

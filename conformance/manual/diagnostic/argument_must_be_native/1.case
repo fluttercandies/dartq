@@ -1,0 +1,10 @@
+//- id: manual/diagnostic/argument_must_be_native/1
+//- source: hand-written from upstream analyzer messages.yaml#argumentMustBeNative, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ void h() {}
+//+
+//+ void g() {
+//+   Native.addressOf<NativeFunction<Void Function()>>(h);
+//+ }

@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/var_as_type_name/1
+//- source: hand-written from upstream _fe_analyzer_shared messages.yaml#varAsTypeName, official example verbatim; the dartq fix-table tests pin the same face on the parenthesized shape
+//- file: lib/test.dart
+//+ class A {
+//+   Map<String, var> m;
+//+ }

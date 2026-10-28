@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/named_function_type/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode#namedFunctionType; nested named function-typed parameter inside a Function type, the case documents the boundary against this registry-only code
+//- file: lib/test.dart
+//+ typedef F = void Function(int g(int x));

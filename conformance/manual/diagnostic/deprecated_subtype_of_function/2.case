@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/deprecated_subtype_of_function/2
+//- source: hand-written from upstream analyzer messages.yaml#deprecatedImplementsFunction (sharedName deprecatedSubtypeOfFunction), trigger verified in pkg/analyzer/lib/src/error/best_practices_verifier.dart
+//- file: lib/test.dart
+//+ class C implements Function {}

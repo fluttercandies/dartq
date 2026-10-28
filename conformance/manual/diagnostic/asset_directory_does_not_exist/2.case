@@ -1,0 +1,11 @@
+//- id: manual/diagnostic/asset_directory_does_not_exist/2
+//- source: hand-written from upstream analyzer messages.yaml#assetDirectoryDoesNotExist, trigger verified in pkg/analyzer/lib/src/pubspec/validators/flutter_validator.dart: negative: the directory exists
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ flutter:
+//+   assets:
+//+     - assets/
+//- file: assets/keep.txt
+//+ x

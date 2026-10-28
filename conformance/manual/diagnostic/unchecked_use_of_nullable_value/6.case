@@ -1,0 +1,18 @@
+//- id: manual/diagnostic/unchecked_use_of_nullable_value/6
+//- source: hand-written flow-face case (flow coverage audit family F19, staged if-null assignment: a resolved non-null RHS — constructor or call — promotes the receiver through the write, so both reads are clean and the expected output is empty), trigger pinned against upstream Dart SDK source pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver.dart (if-null write type LUB)
+//- file: lib/test.dart
+//+ class Node {
+//+   int field = 0;
+//+ }
+//+
+//+ Node fetchNonNull() => Node();
+//+
+//+ void f(Node? n) {
+//+   n ??= Node();
+//+   n.field;
+//+ }
+//+
+//+ void g(Node? n) {
+//+   n ??= fetchNonNull();
+//+   n.field;
+//+ }

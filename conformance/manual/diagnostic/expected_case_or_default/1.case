@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/expected_case_or_default/1
+//- source: gate pin expected_case_or_default (group A dead-code table) in the dartq parser test tree; the pinned oracle emits the generic switch-body recovery family instead of this registry-only code
+//- file: lib/test.dart
+//+ void f() { switch (x) { + } }

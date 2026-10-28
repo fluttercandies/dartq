@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/duplicate_deferred/2
+//- source: hand-written single-deferred control for the same pin (silent)
+//- file: lib/test.dart
+//+ import 'a.dart' deferred as m;
+//- file: lib/a.dart
+//+ class A {}

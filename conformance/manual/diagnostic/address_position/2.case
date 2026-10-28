@@ -1,0 +1,13 @@
+//- id: manual/diagnostic/address_position/2
+//- source: hand-written from upstream analyzer messages.yaml#addressPosition, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+ import 'dart:typed_data';
+//+
+//+ @Native<Void Function(Pointer<Uint8>)>(isLeaf: true)
+//+ external void leafCall(Pointer<Uint8> ptr);
+//+
+//+ void main() {
+//+   final data = Uint8List(10);
+//+   leafCall(data.address);
+//+ }

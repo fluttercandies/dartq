@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/missing_size_annotation_carray/2
+//- source: hand-written from upstream analyzer messages.yaml#missingSizeAnnotationCarray, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ final class C extends Struct {
+//+   @Array(8)
+//+   external Array<Uint8> a0;
+//+ }

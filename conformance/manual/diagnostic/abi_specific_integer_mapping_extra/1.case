@@ -1,0 +1,10 @@
+//- id: manual/diagnostic/abi_specific_integer_mapping_extra/1
+//- source: hand-written from upstream analyzer messages.yaml#abiSpecificIntegerMappingExtra, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ @AbiSpecificIntegerMapping({Abi.macosX64: Int8()})
+//+ @AbiSpecificIntegerMapping({Abi.macosX64: Int16()})
+//+ final class C extends AbiSpecificInteger {
+//+   const C();
+//+ }

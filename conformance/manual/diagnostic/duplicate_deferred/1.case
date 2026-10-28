@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/duplicate_deferred/1
+//- source: gate pin duplicate_deferred (deferred recovery trio) in the dartq parser test tree (oracle-validated repro)
+//- file: lib/test.dart
+//+ import 'a.dart' deferred deferred as m;
+//- file: lib/a.dart
+//+ class A {}

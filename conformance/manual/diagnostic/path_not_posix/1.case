@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/path_not_posix/1
+//- source: hand-written from upstream analyzer messages.yaml#pathNotPosix, trigger verified in pkg/analyzer/lib/src/pubspec/validators/dependency_validator.dart: path containing a Windows separator
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ dependencies:
+//+   foo:
+//+     path: 'sub\dir'

@@ -1,0 +1,10 @@
+//- id: manual/diagnostic/annotation_with_type_arguments/1
+//- source: hand-written from upstream _fe_analyzer_shared messages.yaml#metadataTypeArguments, official example verbatim including the @dart=2.12 pin (generic metadata is on by default in current Dart)
+//- file: lib/test.dart
+//+ // @dart=2.12
+//+ class C<T> {
+//+   const C();
+//+ }
+//+
+//+ @C<int>()
+//+ void foo() {}

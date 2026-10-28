@@ -1,0 +1,8 @@
+# The conformance pin: the exact Dart SDK every generated registry and
+# every conformance case mirrors. Following a new SDK means editing these
+# two values, fetching that revision, and regenerating; nothing else.
+#
+# The local checkout path is never recorded here; it is given per-run via
+# the DARTQ_SDK_SRC environment variable (see tools/upstream-gen).
+sdk_version = "3.13.7"
+sdk_revision = "416e33b0ffaef062a60ec966bb8c82ed2b83f128"

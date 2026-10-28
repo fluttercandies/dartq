@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/incompatible_lint/1
+//- source: hand-written from upstream analyzer messages.yaml#incompatibleLint, trigger verified in pkg/analyzer/lib/src/analysis_options/analysis_options_parse_model.dart
+//- file: lib/test.dart
+//+ void f() {}
+//- file: analysis_options.yaml
+//+ linter:
+//+   rules:
+//+     - always_use_package_imports
+//+     - prefer_relative_imports

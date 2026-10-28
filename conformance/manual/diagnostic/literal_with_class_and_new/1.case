@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/literal_with_class_and_new/1
+//- source: gate pin dark_syntax_never_nailed_literal_with_class_and_new in the dartq parser test tree (oracle-validated repro); typed list literal must not keep the new keyword
+//- file: lib/test.dart
+//+ void f() { var x = new List<int>[1]; }

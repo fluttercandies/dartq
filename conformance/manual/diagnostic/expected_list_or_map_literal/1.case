@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/expected_list_or_map_literal/1
+//- source: hand-written from the const-typed-literal shape in the dartq parser test tree (expressions lane); the pinned oracle recovers through expected_token, this registry-only code never fires
+//- file: lib/test.dart
+//+ void f() {
+//+   var x = const <int>5;
+//+ }

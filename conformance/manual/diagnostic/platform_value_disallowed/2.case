@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/platform_value_disallowed/2
+//- source: hand-written from upstream analyzer messages.yaml#platformValueDisallowed, trigger verified in pkg/analyzer/lib/src/pubspec/validators/platforms_validator.dart: negative: null platform value
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ platforms:
+//+   android:

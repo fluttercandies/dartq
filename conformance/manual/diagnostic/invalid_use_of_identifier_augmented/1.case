@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/invalid_use_of_identifier_augmented/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode#invalidUseOfIdentifierAugmented; registry-only in the pinned 3.13.7 oracle (no CFE emission), the case pins the plain-library augmented-reference face
+//- file: lib/test.dart
+//+ void f() {
+//+   print(augmented);
+//+ }

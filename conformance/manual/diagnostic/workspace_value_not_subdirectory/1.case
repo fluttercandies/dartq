@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/workspace_value_not_subdirectory/1
+//- source: hand-written from upstream analyzer messages.yaml#workspaceValueNotSubdirectory, trigger verified in pkg/analyzer/lib/src/pubspec/validators/workspace_validator.dart: entry escaping the package root
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ workspace:
+//+   - '../escape'

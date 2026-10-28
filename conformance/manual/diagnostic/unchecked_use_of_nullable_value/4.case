@@ -1,0 +1,18 @@
+//- id: manual/diagnostic/unchecked_use_of_nullable_value/4
+//- source: hand-written flow-face case (flow coverage audit family F13, the await-demotion twins: an await in a plain async method body demotes nothing while an await inside a local closure demotes the captured written read — only the closure's post-await read reports), trigger pinned against upstream Dart SDK source pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart (suspension demotes reads intersecting the anywhere-written set only inside a local function)
+//- file: lib/test.dart
+//+ Future<void> h(int? x, Future<void> g()) async {
+//+   if (x != null) {
+//+     await g();
+//+     x.isEven;
+//+   }
+//+ }
+//+
+//+ void k(int? x) {
+//+   [0].forEach((_) async {
+//+     x ??= 1;
+//+     x.isEven;
+//+     await null;
+//+     x.isEven;
+//+   });
+//+ }

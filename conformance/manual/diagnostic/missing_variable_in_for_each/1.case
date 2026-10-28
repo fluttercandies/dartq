@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/missing_variable_in_for_each/1
+//- source: gate pin missing_variable_in_for_each (group A dead-code table) in the dartq parser test tree; the pinned oracle emits the generic for-in recovery family instead of this registry-only code
+//- file: lib/test.dart
+//+ void f() { for (in xs) {} }

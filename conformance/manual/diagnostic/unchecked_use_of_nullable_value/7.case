@@ -1,0 +1,16 @@
+//- id: manual/diagnostic/unchecked_use_of_nullable_value/7
+//- source: hand-written flow-face case (flow coverage audit family F11, property-slot invalidation sweep: a receiver reassignment drops the field promotion, so the guarded read before the write is clean and the read after it reports), trigger pinned against upstream Dart SDK source pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart (property promotion keyed on the receiver version)
+//- file: lib/test.dart
+//+ class C {
+//+   final int? _p;
+//+
+//+   C(this._p);
+//+ }
+//+
+//+ void f(C c) {
+//+   if (c._p != null) {
+//+     c._p.isEven;
+//+   }
+//+   c = C(1);
+//+   c._p.isEven;
+//+ }

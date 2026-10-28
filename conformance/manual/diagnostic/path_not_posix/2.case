@@ -1,0 +1,11 @@
+//- id: manual/diagnostic/path_not_posix/2
+//- source: hand-written from upstream analyzer messages.yaml#pathNotPosix, trigger verified in pkg/analyzer/lib/src/pubspec/validators/dependency_validator.dart: negative: posix path
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ dependencies:
+//+   foo:
+//+     path: real_dep
+//- file: real_dep/pubspec.yaml
+//+ name: real_dep

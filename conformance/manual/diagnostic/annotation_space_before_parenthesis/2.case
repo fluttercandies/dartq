@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/annotation_space_before_parenthesis/2
+//- source: hand-written adjacent-paren control for the same pin (arguments hug the name: silent)
+//- file: lib/test.dart
+//+ @metadata(x, y)
+//+ class C {}

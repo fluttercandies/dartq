@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/type_parameter_on_operator/1
+//- source: hand-written from upstream _fe_analyzer_shared messages.yaml#operatorWithTypeParameters (analyzerCode typeParameterOnOperator), official example verbatim
+//- file: lib/test.dart
+//+ class C {
+//+   operator []<T>(T t) => null;
+//+ }

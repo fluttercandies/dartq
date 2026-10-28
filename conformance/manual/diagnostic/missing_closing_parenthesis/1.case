@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/missing_closing_parenthesis/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode#missingClosingParenthesis; unclosed formal-parameter group; registry-only in the pinned 3.13.7 oracle, the case pins the recovery face
+//- file: lib/test.dart
+//+ void f(String s {
+//+ }

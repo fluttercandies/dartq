@@ -1,0 +1,16 @@
+//- id: manual/diagnostic/invalid_use_of_visible_for_template_member/1
+//- source: hand-written from upstream analyzer messages.yaml#invalidUseOfVisibleForTemplateMember, trigger verified in pkg/analyzer/lib/src/error/best_practices_verifier.dart (_checkForOtherInvalidAccess)
+//- packages: angular_meta
+//- file: lib/test.dart
+//+ import 'other.dart';
+//+
+//+ void f(Component c) {
+//+   c.render();
+//+ }
+//- file: lib/other.dart
+//+ import 'package:angular_meta/angular_meta.dart';
+//+
+//+ class Component {
+//+   @visibleForTemplate
+//+   int render() => 0;
+//+ }

@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/negative_variable_dimension/1
+//- source: hand-written from upstream analyzer messages.yaml#negativeVariableDimension, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ final class MyStruct extends Struct {
+//+   @Array.variableWithVariableDimension(-1)
+//+   external Array<Uint8> a0;
+//+ }

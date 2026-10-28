@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/native_clause_should_be_annotation/1
+//- source: hand-written from upstream _fe_analyzer_shared messages.yaml#nativeClauseShouldBeAnnotation; the dartq parser test tree probes this face retired (silent on both formats), the native clause surfaces through the non-SDK native face instead
+//- file: lib/test.dart
+//+ class A native "x" {}

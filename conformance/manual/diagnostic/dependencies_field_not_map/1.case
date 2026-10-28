@@ -1,0 +1,7 @@
+//- id: manual/diagnostic/dependencies_field_not_map/1
+//- source: hand-written from upstream analyzer messages.yaml#dependenciesFieldNotMap, trigger verified in pkg/analyzer/lib/src/pubspec/validators/dependency_validator.dart: dependencies value is a scalar
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ dependencies: not_a_map

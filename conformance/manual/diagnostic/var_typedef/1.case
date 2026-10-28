@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/var_typedef/1
+//- source: gate pin var_typedef_missing_name_reparse in the dartq parser test tree (oracle-validated); the pinned oracle emits missing_identifier + expected_token, this registry-only code never fires
+//- file: lib/test.dart
+//+ var typedef VarTypedef = void Function();

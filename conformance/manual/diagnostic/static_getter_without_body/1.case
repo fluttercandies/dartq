@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/static_getter_without_body/1
+//- source: gate pin blindspot_accessors in the dartq parser test fixtures (oracle-validated repro); the pinned oracle emits missing_function_body, this registry-only code never fires
+//- file: lib/test.dart
+//+ class StaticGetterWithoutBody {
+//+   static int get x;
+//+ }

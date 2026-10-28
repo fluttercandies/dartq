@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/non_string_literal_as_uri/1
+//- source: gate pin blindspot_library_directives in the dartq parser test fixtures (oracle-validated repro); the pinned oracle recovers through the expected_string_literal family, this registry-only code never fires
+//- file: lib/test.dart
+//+ import dart:core;

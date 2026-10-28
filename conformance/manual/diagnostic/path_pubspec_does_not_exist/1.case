@@ -1,0 +1,11 @@
+//- id: manual/diagnostic/path_pubspec_does_not_exist/1
+//- source: hand-written from upstream analyzer messages.yaml#pathPubspecDoesNotExist, trigger verified in pkg/analyzer/lib/src/pubspec/validators/dependency_validator.dart: existing directory without a pubspec.yaml
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ dependencies:
+//+   foo:
+//+     path: bare_dir
+//- file: bare_dir/readme.md
+//+ x

@@ -1,0 +1,10 @@
+//- id: manual/diagnostic/argument_must_be_a_constant/2
+//- source: hand-written from upstream analyzer messages.yaml#argumentMustBeAConstant, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ int f(int i) => i * 2;
+//+
+//+ void g() {
+//+   Pointer.fromFunction<Int8 Function(Int8)>(f, 0);
+//+ }

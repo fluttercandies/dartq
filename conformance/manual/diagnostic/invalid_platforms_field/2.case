@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/invalid_platforms_field/2
+//- source: hand-written from upstream analyzer messages.yaml#invalidPlatformsField, trigger verified in pkg/analyzer/lib/src/pubspec/validators/platforms_validator.dart: negative: map with null values
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ platforms:
+//+   android:

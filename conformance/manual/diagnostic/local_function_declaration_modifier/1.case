@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/local_function_declaration_modifier/1
+//- source: gate pin local_function_declaration_modifier (group A dead-code table) in the dartq parser test tree; the pinned oracle emits extraneous_modifier instead of this registry-only code
+//- file: lib/test.dart
+//+ void main() { static f() {} }

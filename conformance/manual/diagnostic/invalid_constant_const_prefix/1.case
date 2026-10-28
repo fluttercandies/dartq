@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/invalid_constant_const_prefix/1
+//- source: gate pin dark_syntax_exposure_only_invalid_constant_const_prefix in the dartq parser test tree (oracle-validated repro); explicit const prefix on a literal constant pattern
+//- file: lib/test.dart
+//+ void f(x) { switch (x) { case const 1: break; } }

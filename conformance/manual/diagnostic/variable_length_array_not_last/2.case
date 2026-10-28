@@ -1,0 +1,12 @@
+//- id: manual/diagnostic/variable_length_array_not_last/2
+//- source: hand-written from upstream analyzer messages.yaml#variableLengthArrayNotLast, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ final class C extends Struct {
+//+   @Uint8()
+//+   external int a1;
+//+
+//+   @Array.variable()
+//+   external Array<Uint8> a0;
+//+ }

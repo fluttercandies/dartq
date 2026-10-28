@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/var_enum/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode#varEnum; sibling of the var_class/var_typedef reparse faces; registry-only in the pinned 3.13.7 oracle, the case pins the recovery face
+//- file: lib/test.dart
+//+ var enum E { v }

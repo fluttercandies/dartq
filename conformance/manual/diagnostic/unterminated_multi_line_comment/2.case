@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/unterminated_multi_line_comment/2
+//- source: hand-written closed-comment control for the same face (silent)
+//- file: lib/test.dart
+//+ /* ok */
+//+ void f() {}

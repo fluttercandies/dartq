@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/invalid_star_after_async/1
+//- source: gate pin invalid_star_after_async (group A dead-code table) in the dartq parser test tree; the pinned oracle emits the generic recovery family instead of this registry-only code
+//- file: lib/test.dart
+//+ f() async* => 1;

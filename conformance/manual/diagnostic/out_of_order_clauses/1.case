@@ -1,0 +1,10 @@
+//- id: manual/diagnostic/out_of_order_clauses/1
+//- source: gate pin dark_syntax_exposure_only_out_of_order_clauses in the dartq parser test tree (oracle-validated repro); with clause before implements on an enum
+//- file: lib/test.dart
+//+ class Foo {}
+//+
+//+ class Bar {}
+//+
+//+ enum E implements Foo with Bar {
+//+   v
+//+ }

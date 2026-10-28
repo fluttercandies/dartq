@@ -1,0 +1,10 @@
+//- id: manual/diagnostic/multiple_clauses/1
+//- source: gate pin dark_syntax_exposure_only_multiple_clauses in the dartq parser test tree (oracle-validated repro); duplicate implements clause on an enum
+//- file: lib/test.dart
+//+ class Foo {}
+//+
+//+ class Bar {}
+//+
+//+ enum E implements Foo implements Bar {
+//+   v
+//+ }

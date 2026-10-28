@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/use_of_native_extension/2
+//- source: hand-written from upstream analyzer messages.yaml#useOfNativeExtension, trigger verified in pkg/analyzer/lib/src/dart/analysis/library_analyzer.dart (dart-ext: export)
+//- file: lib/test.dart
+//+ export 'dart-ext:x';

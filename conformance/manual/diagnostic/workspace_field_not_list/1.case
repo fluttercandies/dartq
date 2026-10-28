@@ -1,0 +1,7 @@
+//- id: manual/diagnostic/workspace_field_not_list/1
+//- source: hand-written from upstream analyzer messages.yaml#workspaceFieldNotList, trigger verified in pkg/analyzer/lib/src/pubspec/validators/workspace_validator.dart: workspace value is a scalar
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ workspace: not_a_list

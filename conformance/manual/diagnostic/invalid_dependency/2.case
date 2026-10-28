@@ -1,0 +1,10 @@
+//- id: manual/diagnostic/invalid_dependency/2
+//- source: hand-written from upstream analyzer messages.yaml#invalidDependency, trigger verified in pkg/analyzer/lib/src/pubspec/validators/dependency_validator.dart: negative: no version, so not publishable
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ dependencies:
+//+   foo:
+//+     git:
+//+       url: https://github.com/example/foo

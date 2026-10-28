@@ -1,0 +1,12 @@
+//- id: manual/diagnostic/subtype_of_struct_class/1
+//- source: hand-written from upstream analyzer messages.yaml#subtypeOfStructClassInExtends, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ final class S extends Struct {
+//+   external Pointer f;
+//+ }
+//+
+//+ final class C extends S {
+//+   external Pointer g;
+//+ }

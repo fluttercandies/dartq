@@ -1,0 +1,14 @@
+//- id: manual/diagnostic/subtype_of_struct_class/3
+//- source: hand-written from upstream analyzer messages.yaml#subtypeOfStructClassInWith, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ final class S extends Struct {
+//+   external Pointer f;
+//+ }
+//+
+//+ final class C with S2 {}
+//+
+//+ mixin class S2 implements S {
+//+   external Pointer f;
+//+ }

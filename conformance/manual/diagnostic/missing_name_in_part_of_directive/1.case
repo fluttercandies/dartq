@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/missing_name_in_part_of_directive/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode#missingNameInPartOfDirective; registry-only in the pinned 3.13.7 oracle, the case pins the part-of recovery face
+//- file: lib/test.dart
+//+ part of;

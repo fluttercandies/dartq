@@ -1,0 +1,18 @@
+//- id: manual/diagnostic/creation_of_struct_or_union/2
+//- source: hand-written from upstream analyzer messages.yaml#creationOfStructOrUnion, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- packages: ffi
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+ import 'package:ffi/ffi.dart';
+//+
+//+ final class C extends Struct {
+//+   @Int32()
+//+   external int a;
+//+ }
+//+
+//+ void f() {
+//+   final pointer = calloc.allocate<C>(4);
+//+   final c = pointer.ref;
+//+   print(c);
+//+   calloc.free(pointer);
+//+ }

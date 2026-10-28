@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/empty_enum_body/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode#emptyEnumBody; the pinned oracle routes the empty enum body through the expected_body shared-name family (expectedEnumBody), so this registry-only code never fires
+//- file: lib/test.dart
+//+ enum E {}

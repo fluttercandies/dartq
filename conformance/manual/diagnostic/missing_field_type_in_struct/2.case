@@ -1,0 +1,11 @@
+//- id: manual/diagnostic/missing_field_type_in_struct/2
+//- source: hand-written from upstream analyzer messages.yaml#missingFieldTypeInStruct, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ final class C extends Struct {
+//+   external Pointer<Uint8> str;
+//+
+//+   @Int32()
+//+   external int i;
+//+ }

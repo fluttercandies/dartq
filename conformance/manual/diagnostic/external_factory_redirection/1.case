@@ -1,0 +1,7 @@
+//- id: manual/diagnostic/external_factory_redirection/1
+//- source: hand-written from upstream _fe_analyzer_shared messages.yaml#externalFactoryRedirection, official example verbatim (external redirecting factory)
+//- file: lib/test.dart
+//+ class Foo {
+//+   Foo._(int i);
+//+   external factory Foo.x(int i) = Foo._;
+//+ }

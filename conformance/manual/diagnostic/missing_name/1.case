@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/missing_name/1
+//- source: hand-written from upstream analyzer messages.yaml#missingName, trigger verified in pkg/analyzer/lib/src/pubspec/validators/name_validator.dart: no name field
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ description: A test package.

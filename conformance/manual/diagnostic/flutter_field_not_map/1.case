@@ -1,0 +1,7 @@
+//- id: manual/diagnostic/flutter_field_not_map/1
+//- source: hand-written from upstream analyzer messages.yaml#flutterFieldNotMap, trigger verified in pkg/analyzer/lib/src/pubspec/validators/flutter_validator.dart: non-empty non-map flutter value
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ flutter: not_a_map

@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/unnecessary_dev_dependency/2
+//- source: hand-written from upstream analyzer messages.yaml#unnecessaryDevDependency, trigger verified in pkg/analyzer/lib/src/pubspec/validators/dependency_validator.dart: negative: dev dependency alone
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ dev_dependencies:
+//+   aaa: any

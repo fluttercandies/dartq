@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/asset_missing_path/1
+//- source: hand-written from upstream analyzer messages.yaml#assetMissingPath, trigger verified in pkg/analyzer/lib/src/pubspec/validators/flutter_validator.dart: asset map without a path field
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ flutter:
+//+   assets:
+//+     - source: images/x.png

@@ -1,0 +1,13 @@
+//- id: manual/diagnostic/unchecked_use_of_nullable_value/5
+//- source: hand-written flow-face case (flow coverage audit family F19, staged if-null assignment: a resolved nullable call RHS joins back to the nullable type, so the receiver read after the ??= write stays unpromoted and reports), trigger pinned against upstream Dart SDK source pkg/analyzer/lib/src/dart/resolver/assignment_expression_resolver.dart (if-null write type LUB)
+//- file: lib/test.dart
+//+ class Node {
+//+   int field = 0;
+//+ }
+//+
+//+ Node? fetchNode() => null;
+//+
+//+ void f(Node? n) {
+//+   n ??= fetchNode();
+//+   n.field;
+//+ }

@@ -1,0 +1,21 @@
+//- id: manual/diagnostic/address_receiver/1
+//- source: hand-written from upstream analyzer messages.yaml#addressReceiver, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ @Native<Void Function(Pointer)>(isLeaf: true)
+//+ external void nativeLeafCall(Pointer ptr);
+//+
+//+ final class MyStruct extends Struct {
+//+   @Uint8()
+//+   external int x;
+//+
+//+   @Uint8()
+//+   external int y;
+//+ }
+//+
+//+ void main() {
+//+   final struct = Struct.create<MyStruct>();
+//+   final y = struct.y;
+//+   nativeLeafCall(y.address);
+//+ }

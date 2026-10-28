@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/unchecked_use_of_nullable_value/2
+//- source: hand-written flow-face case (flow coverage audit family F13, the async* twin of case /1: an async* body's own yield demotes nothing — expected output is empty), trigger pinned against upstream Dart SDK source pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart (suspension demotes only inside a local function)
+//- file: lib/test.dart
+//+ Stream<int> f(int? x) async* {
+//+   x ??= 1;
+//+   yield x;
+//+   x.isEven;
+//+ }

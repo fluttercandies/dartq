@@ -1,0 +1,23 @@
+//- id: manual/diagnostic/use_build_context_synchronously/1
+//- source: hand-written flow-face case (flow coverage audit family F14, an await inside a try body leaves the async gap open into the finally block, so the context use there reports), trigger pinned against upstream Dart SDK source pkg/linter/lib/src/rules/use_build_context_synchronously.dart (async-gap tracking through try/finally)
+//- packages: meta, ffi, flutter, angular_meta
+//- options:
+//+ analyzer:
+//+   optional-checks:
+//+     propagate-linter-exceptions: true
+//+ linter:
+//+   rules:
+//+     - use_build_context_synchronously
+//+
+//- file: lib/test.dart
+//+ import 'package:flutter/material.dart';
+//+
+//+ class MyWidget extends Widget {
+//+   void onButtonTapped(BuildContext context) async {
+//+     try {
+//+       await Future<void>.delayed(const Duration(seconds: 1));
+//+     } finally {
+//+       Navigator.of(context);
+//+     }
+//+   }
+//+ }

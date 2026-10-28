@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/annotation_space_before_parenthesis/1
+//- source: gate pin annotation_space_before_parenthesis in the dartq parser test tree (oracle-validated repro); official parseArgumentsOptMetadata spaced-argument face
+//- file: lib/test.dart
+//+ @metadata (x, y)
+//+ class C {}

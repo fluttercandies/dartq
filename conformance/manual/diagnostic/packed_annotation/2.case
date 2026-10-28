@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/packed_annotation/2
+//- source: hand-written from upstream analyzer messages.yaml#packedAnnotation, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ @Packed(1)
+//+ final class C extends Struct {
+//+   external Pointer<Uint8> notEmpty;
+//+ }

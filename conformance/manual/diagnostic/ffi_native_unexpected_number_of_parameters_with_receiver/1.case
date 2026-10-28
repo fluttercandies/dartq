@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/ffi_native_unexpected_number_of_parameters_with_receiver/1
+//- source: hand-written from upstream analyzer messages.yaml#ffiNativeUnexpectedNumberOfParametersWithReceiver, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ class C {
+//+   @Native<Void Function()>()
+//+   external void m();
+//+ }

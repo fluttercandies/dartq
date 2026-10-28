@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/asset_path_not_string/1
+//- source: hand-written from upstream analyzer messages.yaml#assetPathNotString, trigger verified in pkg/analyzer/lib/src/pubspec/validators/flutter_validator.dart: path field is a list
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ flutter:
+//+   assets:
+//+     - path: [a]

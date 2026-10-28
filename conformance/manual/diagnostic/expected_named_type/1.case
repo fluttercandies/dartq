@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/expected_named_type/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode sharedName expectedNamedType (extends variant); registry-only in the pinned 3.13.7 oracle (no CFE analyzerCode crosswalk), the case pins the extends-slot recovery face
+//- file: lib/test.dart
+//+ class C extends (int, int) {}

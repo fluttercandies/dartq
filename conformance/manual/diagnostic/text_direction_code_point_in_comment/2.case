@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/text_direction_code_point_in_comment/2
+//- source: hand-written from upstream analyzer messages.yaml#textDirectionCodePointInComment, trigger verified in pkg/analyzer/lib/src/error/unicode_text_verifier.dart (U+202A..U+202E, U+2066..U+2069)
+//- file: lib/test.dart
+//+ // The text direction is unchanged here.
+//+ void f() {
+//+ }

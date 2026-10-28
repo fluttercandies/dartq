@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/asset_not_string_or_map/1
+//- source: hand-written from upstream analyzer messages.yaml#assetNotStringOrMap, trigger verified in pkg/analyzer/lib/src/pubspec/validators/flutter_validator.dart: asset entry is a non-string scalar
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ flutter:
+//+   assets:
+//+     - 42

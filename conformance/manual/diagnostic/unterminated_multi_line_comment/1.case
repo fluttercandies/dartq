@@ -1,0 +1,5 @@
+//- id: manual/diagnostic/unterminated_multi_line_comment/1
+//- source: hand-written from upstream analyzer messages.yaml ScannerErrorCode#unterminatedMultiLineComment; comment closed by end of file, scanner row anchored before EOF
+//- file: lib/test.dart
+//+ /* oops
+//+ void f() {}

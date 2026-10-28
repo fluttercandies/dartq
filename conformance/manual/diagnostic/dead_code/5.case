@@ -1,0 +1,12 @@
+//- id: manual/diagnostic/dead_code/5
+//- source: hand-written flow-face case (flow coverage audit family F4, switch member order: a default head stacked after a case head shares the body, later members stay dead), trigger pinned against upstream Dart SDK source pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart (switch statement member reachability)
+//- file: lib/test.dart
+//+ void f(int x) {
+//+   switch (x) {
+//+     case 1:
+//+     default:
+//+       break;
+//+     case 2:
+//+       break;
+//+   }
+//+ }

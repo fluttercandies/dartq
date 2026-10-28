@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/ffi_native_only_classes_extending_nativefieldwrapperclass1_can_be_pointer/1
+//- source: hand-written from upstream analyzer messages.yaml#ffiNativeOnlyClassesExtendingNativefieldwrapperclass1CanBePointer, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ class C {
+//+   @Native<Void Function(Pointer<Int8>, Pointer<Int8>)>()
+//+   external void m(Pointer<Int8> p);
+//+ }

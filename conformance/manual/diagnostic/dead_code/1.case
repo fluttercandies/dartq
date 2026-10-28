@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/dead_code/1
+//- source: hand-written flow-face case (flow coverage audit family F3, the ?? provably-dead-RHS face), trigger pinned against upstream Dart SDK source pkg/_fe_analyzer_shared/lib/src/flow_analysis/flow_analysis.dart (ifNull right path unreachable when the left operand is guaranteed non-null)
+//- file: lib/test.dart
+//+ void f(int x) {
+//+   x ?? 1;
+//+ }

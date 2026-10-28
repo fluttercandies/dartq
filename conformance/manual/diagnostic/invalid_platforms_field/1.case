@@ -1,0 +1,7 @@
+//- id: manual/diagnostic/invalid_platforms_field/1
+//- source: hand-written from upstream analyzer messages.yaml#invalidPlatformsField, trigger verified in pkg/analyzer/lib/src/pubspec/validators/platforms_validator.dart: platforms value is a scalar
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ platforms: not_a_map

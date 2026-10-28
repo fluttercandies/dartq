@@ -1,0 +1,7 @@
+//- id: manual/diagnostic/deprecated_field/1
+//- source: hand-written from upstream analyzer messages.yaml#deprecatedField, trigger verified in pkg/analyzer/lib/src/pubspec/validators/field_validator.dart: top-level author key
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ author: someone

@@ -1,0 +1,8 @@
+//- id: manual/diagnostic/unknown_platform/1
+//- source: hand-written from upstream analyzer messages.yaml#unknownPlatform, trigger verified in pkg/analyzer/lib/src/pubspec/validators/platforms_validator.dart: misspelled platform key
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ platforms:
+//+   brower:

@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/missing_name_for_named_parameter/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode#missingNameForNamedParameter; named group parameter without a name; registry-only in the pinned 3.13.7 oracle, the case pins the recovery face
+//- file: lib/test.dart
+//+ void f({int}) {}

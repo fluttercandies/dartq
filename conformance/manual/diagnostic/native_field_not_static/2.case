@@ -1,0 +1,9 @@
+//- id: manual/diagnostic/native_field_not_static/2
+//- source: hand-written from upstream analyzer messages.yaml#nativeFieldNotStatic, trigger verified in pkg/analyzer/lib/src/generated/ffi_verifier.dart
+//- file: lib/test.dart
+//+ import 'dart:ffi';
+//+
+//+ class C {
+//+   @Native<Int>()
+//+   external static int f;
+//+ }

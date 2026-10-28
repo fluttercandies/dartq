@@ -1,0 +1,10 @@
+//- id: manual/diagnostic/out_of_order_clauses/2
+//- source: hand-written canonical-order control for the same pin (with before implements is legal: silent)
+//- file: lib/test.dart
+//+ class Foo {}
+//+
+//+ class Bar {}
+//+
+//+ enum E with Foo implements Bar {
+//+   v
+//+ }

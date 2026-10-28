@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/type_arguments_on_type_variable/1
+//- source: hand-written from upstream _fe_analyzer_shared messages.yaml#typeArgumentsOnTypeVariable, official example verbatim
+//- file: lib/test.dart
+//+ void f<S>(S<int> a) {}

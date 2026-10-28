@@ -1,0 +1,6 @@
+//- id: manual/diagnostic/getter_in_function/1
+//- source: gate pin getter_in_function_body_recovers_with_the_oracle_pair in the dartq parser test tree (oracle-validated); the pinned oracle emits the expected_token + missing_function_parameters pair, this registry-only code never fires
+//- file: lib/test.dart
+//+ void getterInFunction() {
+//+   int get g => 1;
+//+ }

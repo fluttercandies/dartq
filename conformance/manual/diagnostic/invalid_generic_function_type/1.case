@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/invalid_generic_function_type/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode#invalidGenericFunctionType; generic function type without the parameter list; registry-only in the pinned 3.13.7 oracle, the case pins the recovery face
+//- file: lib/test.dart
+//+ typedef F = void Function<T>;

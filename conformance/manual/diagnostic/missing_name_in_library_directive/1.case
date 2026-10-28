@@ -1,0 +1,4 @@
+//- id: manual/diagnostic/missing_name_in_library_directive/1
+//- source: hand-written from upstream analyzer messages.yaml ParserErrorCode#missingNameInLibraryDirective; bare library directive (legal in current Dart via unnamed libraries), the case documents the boundary against this registry-only code
+//- file: lib/test.dart
+//+ library;

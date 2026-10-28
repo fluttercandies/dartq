@@ -1,0 +1,7 @@
+//- id: manual/diagnostic/flutter_field_not_map/2
+//- source: hand-written from upstream analyzer messages.yaml#flutterFieldNotMap, trigger verified in pkg/analyzer/lib/src/pubspec/validators/flutter_validator.dart: negative: empty flutter section is allowed
+//- file: lib/test.dart
+//+ void f() {}
+//- file: pubspec.yaml
+//+ name: test
+//+ flutter:
