@@ -217,6 +217,13 @@ pub enum SemanticCode {
     EnumWithoutConstants,
     /// `A value of type '{0}' can't be assigned to a variable of type '{1}'.`
     InvalidAssignment,
+    /// `The member '{0}' can only be used within '{1}' or a template
+    /// library.` — a member annotated `@visibleForTemplate`
+    /// (package:angular_meta) referenced from another library
+    /// (`invalidUseOfVisibleForTemplateMember`, diagnostic.g.dart
+    /// :9811-9819; `{1}` is the declaring library's URI, the report at
+    /// the member-name token — `best_practices_verifier.dart:1940-1946`).
+    InvalidUseOfVisibleForTemplateMember,
     /// `The argument type '{0}' can't be assigned to the parameter type
     /// '{1}'. {2}` — `{2}` is the record-shape appendix, empty at M1
     /// (records are M2), rendered as the template does.
@@ -1674,6 +1681,10 @@ impl SemanticCode {
             ),
             Self::EnumWithoutConstants => ("enum_without_constants", "ENUM_WITHOUT_CONSTANTS"),
             Self::InvalidAssignment => ("invalid_assignment", "INVALID_ASSIGNMENT"),
+            Self::InvalidUseOfVisibleForTemplateMember => (
+                "invalid_use_of_visible_for_template_member",
+                "INVALID_USE_OF_VISIBLE_FOR_TEMPLATE_MEMBER",
+            ),
             Self::ArgumentTypeNotAssignable => (
                 "argument_type_not_assignable",
                 "ARGUMENT_TYPE_NOT_ASSIGNABLE",
@@ -2509,6 +2520,9 @@ impl SemanticCode {
             // The #749 W7 face (`type: DiagnosticType.STATIC_WARNING`,
             // diagnostic.g.dart:12918).
             | Self::NonConstCallToLiteralConstructor
+            // The #2777 template-access face (`type:
+            // DiagnosticType.STATIC_WARNING`, diagnostic.g.dart:9815).
+            | Self::InvalidUseOfVisibleForTemplateMember
             | Self::UnusedFieldFromPrimaryConstructor => DiagnosticType::StaticWarning,
             _ => DiagnosticType::CompileTimeError,
         }
@@ -2872,6 +2886,7 @@ impl SemanticCode {
             Self::WrongNumberOfTypeArgumentsConstructor
             | Self::WrongNumberOfTypeArgumentsEnum
             | Self::InvalidAssignment
+            | Self::InvalidUseOfVisibleForTemplateMember
             | Self::ArgumentTypeNotAssignable
             | Self::ExtensionOverrideArgumentNotAssignable
             | Self::ReturnOfInvalidType(_)
@@ -3460,6 +3475,11 @@ impl SemanticCode {
             }
             Self::InvalidAssignment => {
                 format!("A value of type '{a0}' can't be assigned to a variable of type '{a1}'.")
+            }
+            // `{0}` is the member name, `{1}` the declaring library's URI
+            // (diagnostic.g.dart:9814).
+            Self::InvalidUseOfVisibleForTemplateMember => {
+                format!("The member '{a0}' can only be used within '{a1}' or a template library.")
             }
             // The trailing space is the template's: `{2}` is the record
             // appendix, empty at M1 (`error_detection_helpers.dart`).
@@ -4150,6 +4170,7 @@ mod tests {
             SemanticCode::EnumInstantiatedToBoundsIsNotWellBounded,
             SemanticCode::EnumWithoutConstants,
             SemanticCode::InvalidAssignment,
+            SemanticCode::InvalidUseOfVisibleForTemplateMember,
             SemanticCode::ArgumentTypeNotAssignable,
             SemanticCode::ExtensionOverrideArgumentNotAssignable,
             SemanticCode::ReturnOfInvalidType(ExecKind::Function),
@@ -4593,6 +4614,13 @@ mod tests {
             SemanticCode::WrongNumberOfParametersForSetter.message("", ""),
             "Setters must declare exactly one required positional parameter."
         );
+        // The #2777 template-access face: `{0}` the member name, `{1}` the
+        // declaring library's URI (diagnostic.g.dart:9814).
+        assert_eq!(
+            SemanticCode::InvalidUseOfVisibleForTemplateMember
+                .message("render", "package:test/other.dart"),
+            "The member 'render' can only be used within 'package:test/other.dart' or a template library."
+        );
         assert_eq!(
             SemanticCode::MemberWithClassName.message("", ""),
             "A class member can't have the same name as the enclosing class."
@@ -4985,6 +5013,7 @@ mod tests {
             | SemanticCode::InheritsAbstractMemberThree
             | SemanticCode::InheritsAbstractMemberTwo
             | SemanticCode::InvalidAssignment
+            | SemanticCode::InvalidUseOfVisibleForTemplateMember
             | SemanticCode::InvalidConstant
             | SemanticCode::InvalidImplementationOverride
             | SemanticCode::InvalidImplementationOverrideSetter

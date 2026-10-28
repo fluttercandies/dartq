@@ -392,6 +392,7 @@ macro_rules! dq_probe {
 }
 
 mod assignability;
+mod best_practices_verifier;
 mod const_eval_faces;
 mod call_result;
 mod collection_literal;
@@ -5019,6 +5020,17 @@ mod ticket_2536_tests;
 /// shapes keep their rows.
 #[cfg(test)]
 mod ticket_2769_tests;
+
+/// The #2777 pins: the `invalid_use_of_visible_for_template_member`
+/// face — a cross-library reference to an `@visibleForTemplate`
+/// (package:angular_meta) member emits the oracle row at the
+/// member-name token with the declaring library's URI, while a
+/// same-library use and a template-source use stay silent. Kept as a
+/// standalone module: the three-library rig (use site, declaring
+/// library, the angular-meta stand-in with its declared
+/// `library angular.meta;` name) exceeds the shared rig's shape.
+#[cfg(test)]
+mod ticket_2777_tests;
 
 /// The shared single-file rig with the resolved-type snapshot mounted
 /// (`report_ops`), the shape the per-ticket modules each carried.

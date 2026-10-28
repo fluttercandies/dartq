@@ -5098,6 +5098,10 @@ impl<'a> Engine<'a> {
                 let landing = self.last_landing();
                 let kind = Self::member_ref_kind(&row.intent, entry.kind);
                 self.note_member_ref(row, kind, landing.map(|(file, origin)| (file, row.name, origin)));
+                // The best-practices access face (#2777): the
+                // `_checkForOtherInvalidAccess` template leg over the
+                // resolved declaration.
+                self.check_visible_for_template_member(row, entry, landing);
             }
             matches!(walk, Walk::Found(_))
         };
