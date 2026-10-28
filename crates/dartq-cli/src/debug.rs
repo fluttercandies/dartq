@@ -143,7 +143,11 @@ struct LaunchArgs {
     #[arg(long = "no-pause-on-start", overrides_with = "pause_on_start")]
     no_pause_on_start: bool,
     /// The positive spelling — see `no_pause_on_start`.
-    #[arg(long = "pause-on-start", hide = true, overrides_with = "no_pause_on_start")]
+    #[arg(
+        long = "pause-on-start",
+        hide = true,
+        overrides_with = "no_pause_on_start"
+    )]
     pause_on_start: bool,
     /// Working directory for the launched program; relative resolves
     /// against the worktree root.
@@ -510,17 +514,21 @@ impl DebugArgs {
                 }
                 (&args.worktree, "dartq/debug/launch", params)
             }
-            DebugCommand::Attach(args) => {
-                (&args.worktree, "dartq/debug/attach", json!({"ws_uri": &args.ws_uri}))
-            }
+            DebugCommand::Attach(args) => (
+                &args.worktree,
+                "dartq/debug/attach",
+                json!({"ws_uri": &args.ws_uri}),
+            ),
             DebugCommand::Detach(args) => (
                 &args.worktree,
                 "dartq/debug/detach",
                 json!({"session_id": args.session}),
             ),
-            DebugCommand::Stop(args) => {
-                (&args.worktree, "dartq/debug/stop", json!({"session_id": args.session}))
-            }
+            DebugCommand::Stop(args) => (
+                &args.worktree,
+                "dartq/debug/stop",
+                json!({"session_id": args.session}),
+            ),
             DebugCommand::Status(args) => {
                 let mut params = json!({});
                 if let Some(id) = args.session {
@@ -625,9 +633,11 @@ impl DebugArgs {
                 }
                 (&args.worktree, "dartq/debug/reload", params)
             }
-            DebugCommand::Restart(args) => {
-                (&args.worktree, "dartq/debug/restart", json!({"session_id": args.session}))
-            }
+            DebugCommand::Restart(args) => (
+                &args.worktree,
+                "dartq/debug/restart",
+                json!({"session_id": args.session}),
+            ),
             DebugCommand::Events(args) => {
                 let mut params = json!({
                     "session_id": args.session,
@@ -654,7 +664,10 @@ impl DebugArgs {
         // An absent `-s` rides the daemon's sole-session default: the
         // selector is omitted from the wire, never sent as null.
         if params.get("session_id").is_some_and(Value::is_null) {
-            params.as_object_mut().expect("params are an object").remove("session_id");
+            params
+                .as_object_mut()
+                .expect("params are an object")
+                .remove("session_id");
         }
         Request {
             dir: &worktree.dir,
@@ -682,7 +695,11 @@ pub fn run_entry(args: &DebugArgs) -> u8 {
     let format = request.format;
     let face_is_status = request.method == "dartq/debug/status";
     let mcp = Mcp::attach(root, request.sdk);
-    answer_tier(daemon_call(request.method, &request.params, &mcp), format, face_is_status)
+    answer_tier(
+        daemon_call(request.method, &request.params, &mcp),
+        format,
+        face_is_status,
+    )
 }
 
 /// Prints one proxy outcome per the output contract and maps it to its
@@ -750,10 +767,25 @@ mod tests {
             ),
             (
                 &[
-                    "launch", "--kind", "flutter", "--device", "macos", "--flavor", "dev",
-                    "--dart-defines", "A=1", "--dart-defines", "B=2", "--flutter-args",
-                    "--no-devtools", "--vm-flags", "--enable-asserts", "--cwd", "bin",
-                    "--no-pause-on-start", "lib/main.dart",
+                    "launch",
+                    "--kind",
+                    "flutter",
+                    "--device",
+                    "macos",
+                    "--flavor",
+                    "dev",
+                    "--dart-defines",
+                    "A=1",
+                    "--dart-defines",
+                    "B=2",
+                    "--flutter-args",
+                    "--no-devtools",
+                    "--vm-flags",
+                    "--enable-asserts",
+                    "--cwd",
+                    "bin",
+                    "--no-pause-on-start",
+                    "lib/main.dart",
                 ],
                 "dartq/debug/launch",
                 json!({
@@ -777,10 +809,22 @@ mod tests {
                 "dartq/debug/attach",
                 json!({"ws_uri": "ws://127.0.0.1:8181/ws"}),
             ),
-            (&["detach", "-s", "3"], "dartq/debug/detach", json!({"session_id": 3})),
-            (&["stop", "--session", "3"], "dartq/debug/stop", json!({"session_id": 3})),
+            (
+                &["detach", "-s", "3"],
+                "dartq/debug/detach",
+                json!({"session_id": 3}),
+            ),
+            (
+                &["stop", "--session", "3"],
+                "dartq/debug/stop",
+                json!({"session_id": 3}),
+            ),
             (&["status"], "dartq/debug/status", json!({})),
-            (&["status", "-s", "2"], "dartq/debug/status", json!({"session_id": 2})),
+            (
+                &["status", "-s", "2"],
+                "dartq/debug/status",
+                json!({"session_id": 2}),
+            ),
             (
                 &["snapshot", "--session", "1", "--isolate", "isolates/7"],
                 "dartq/debug/snapshot",
@@ -788,8 +832,14 @@ mod tests {
             ),
             (
                 &[
-                    "evaluate", "-s", "1", "--frame-index", "0", "--isolate",
-                    "isolates/7", "count + 1",
+                    "evaluate",
+                    "-s",
+                    "1",
+                    "--frame-index",
+                    "0",
+                    "--isolate",
+                    "isolates/7",
+                    "count + 1",
                 ],
                 "dartq/debug/evaluate",
                 json!({"session_id": 1, "expression": "count + 1", "frame_index": 0, "isolate": "isolates/7"}),
@@ -811,9 +861,18 @@ mod tests {
             ),
             (
                 &[
-                    "breakpoint", "add", "-s", "1", "--script",
-                    "package:app/main.dart", "--line", "12", "--column", "5",
-                    "--condition", "x > 3",
+                    "breakpoint",
+                    "add",
+                    "-s",
+                    "1",
+                    "--script",
+                    "package:app/main.dart",
+                    "--line",
+                    "12",
+                    "--column",
+                    "5",
+                    "--condition",
+                    "x > 3",
                 ],
                 "dartq/debug/breakpointAdd",
                 json!({
@@ -823,12 +882,26 @@ mod tests {
                 }),
             ),
             (
-                &["breakpoint", "add", "--session", "1", "--function-id", "functions/42"],
+                &[
+                    "breakpoint",
+                    "add",
+                    "--session",
+                    "1",
+                    "--function-id",
+                    "functions/42",
+                ],
                 "dartq/debug/breakpointAdd",
                 json!({"session_id": 1, "location": {"function_id": "functions/42"}}),
             ),
             (
-                &["breakpoint", "rm", "-s", "1", "--breakpoint-id", "breakpoints/3"],
+                &[
+                    "breakpoint",
+                    "rm",
+                    "-s",
+                    "1",
+                    "--breakpoint-id",
+                    "breakpoints/3",
+                ],
                 "dartq/debug/breakpointRemove",
                 json!({"session_id": 1, "breakpoint_id": "breakpoints/3"}),
             ),
@@ -842,7 +915,11 @@ mod tests {
                 "dartq/debug/reload",
                 json!({"session_id": 1, "force": true}),
             ),
-            (&["restart", "--session", "1"], "dartq/debug/restart", json!({"session_id": 1})),
+            (
+                &["restart", "--session", "1"],
+                "dartq/debug/restart",
+                json!({"session_id": 1}),
+            ),
             (
                 &["events", "-s", "1", "--since", "41", "--limit", "8"],
                 "dartq/debug/events",
@@ -855,8 +932,15 @@ mod tests {
             ),
             (
                 &[
-                    "output", "-s", "1", "--stream", "stderr", "--since", "9",
-                    "--max-bytes", "512",
+                    "output",
+                    "-s",
+                    "1",
+                    "--stream",
+                    "stderr",
+                    "--since",
+                    "9",
+                    "--max-bytes",
+                    "512",
                 ],
                 "dartq/debug/output",
                 json!({"session_id": 1, "stream": "stderr", "max_bytes": 512, "cursor": 9}),
@@ -872,7 +956,11 @@ mod tests {
             let request = parsed.request();
             assert_eq!(request.method, method, "{argv:?}");
             assert_eq!(request.params, params, "{argv:?}");
-            assert_eq!(request.dir, Path::new("."), "the worktree defaults to the cwd: {argv:?}");
+            assert_eq!(
+                request.dir,
+                Path::new("."),
+                "the worktree defaults to the cwd: {argv:?}"
+            );
         }
         // An explicit worktree rides every subcommand (spot checks) —
         // including after a launch's trailing-arg positional, the
@@ -885,12 +973,20 @@ mod tests {
             let parsed = parse(argv).expect("parse");
             let request = parsed.request();
             assert_eq!(request.dir, Path::new("/w"), "{argv:?}");
-            assert_eq!(request.sdk, argv[0].eq("launch").then_some(Path::new("/s")), "{argv:?}");
+            assert_eq!(
+                request.sdk,
+                argv[0].eq("launch").then_some(Path::new("/s")),
+                "{argv:?}"
+            );
         }
         let launch = parse(&["launch", "bin/main.dart", "--dir", "/w"]).expect("parse");
         match &launch.command {
             DebugCommand::Launch(args) => {
-                assert!(args.args.is_empty(), "flags after the script stay flags: {:?}", args.args);
+                assert!(
+                    args.args.is_empty(),
+                    "flags after the script stay flags: {:?}",
+                    args.args
+                );
             }
             _ => panic!("expected launch"),
         }
@@ -911,20 +1007,41 @@ mod tests {
             &["step", "--session", "1", "into"],
             &["pause", "-s", "1"],
             &["resume", "--session", "1"],
-            &["breakpoint", "add", "-s", "1", "--script", "s.dart", "--line", "1"],
-            &["breakpoint", "rm", "--session", "1", "--breakpoint-id", "b/1"],
+            &[
+                "breakpoint",
+                "add",
+                "-s",
+                "1",
+                "--script",
+                "s.dart",
+                "--line",
+                "1",
+            ],
+            &[
+                "breakpoint",
+                "rm",
+                "--session",
+                "1",
+                "--breakpoint-id",
+                "b/1",
+            ],
             &["exception-pause", "-s", "1", "all"],
             &["reload", "--session", "1"],
             &["restart", "-s", "1"],
             &["events", "--session", "1"],
             &["output", "-s", "1"],
         ];
-        let mut emitted: Vec<&str> =
-            argvs.iter().map(|argv| parse(argv).expect("parse").request().method).collect();
+        let mut emitted: Vec<&str> = argvs
+            .iter()
+            .map(|argv| parse(argv).expect("parse").request().method)
+            .collect();
         emitted.sort_unstable();
         let mut served = dartq_daemon::DEBUG_REQUESTS.to_vec();
         served.sort_unstable();
-        assert_eq!(emitted, served, "the CLI family mirrors the daemon family 1:1");
+        assert_eq!(
+            emitted, served,
+            "the CLI family mirrors the daemon family 1:1"
+        );
     }
 
     /// The sole-session default: with no `-s`, every driving verb parses
@@ -955,8 +1072,14 @@ mod tests {
             assert!(params.get("session_id").is_none(), "{argv:?}: {params}");
         }
         // Both explicit spellings land on the same wire key.
-        for argv in [&["resume", "-s", "4"][..], &["resume", "--session", "4"][..]] {
-            assert_eq!(parse(argv).expect("parse").request().params, json!({"session_id": 4}));
+        for argv in [
+            &["resume", "-s", "4"][..],
+            &["resume", "--session", "4"][..],
+        ] {
+            assert_eq!(
+                parse(argv).expect("parse").request().params,
+                json!({"session_id": 4})
+            );
         }
     }
 
@@ -978,7 +1101,16 @@ mod tests {
             &["breakpoint", "add", "--session", "1", "--script", "s.dart"][..],
             &["breakpoint", "add", "-s", "1", "--line", "5"][..],
             &["breakpoint", "add", "--session", "1", "--column", "3"][..],
-            &["breakpoint", "add", "-s", "1", "--function-id", "f/1", "--line", "5"][..],
+            &[
+                "breakpoint",
+                "add",
+                "-s",
+                "1",
+                "--function-id",
+                "f/1",
+                "--line",
+                "5",
+            ][..],
             &["breakpoint", "rm", "--session", "1"][..],
             &["bogus"][..],
         ] {

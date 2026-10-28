@@ -1548,7 +1548,8 @@ mod tests {
             "the narrowing rides as the CLI's repeatable-flag list"
         );
         assert_eq!(
-            impact["inputSchema"]["properties"]["symbols"]["items"]["type"], "string"
+            impact["inputSchema"]["properties"]["symbols"]["items"]["type"],
+            "string"
         );
         assert!(
             !impact["inputSchema"]["required"]
@@ -1696,10 +1697,10 @@ mod tests {
         serve(
             Cursor::new(
                 json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                       "params": {"name": "dartq_impact", "arguments": {
-                           "path": "lib/a.dart",
-                           "symbols": ["TodoAppService.editDraft", "TodoList", "lib/a.dart:12"],
-                       }}})
+                "params": {"name": "dartq_impact", "arguments": {
+                    "path": "lib/a.dart",
+                    "symbols": ["TodoAppService.editDraft", "TodoList", "lib/a.dart:12"],
+                }}})
                 .to_string()
                 .into_bytes(),
             ),

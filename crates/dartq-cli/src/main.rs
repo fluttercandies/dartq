@@ -91,9 +91,9 @@ mod compat;
 mod debug;
 mod events;
 mod fix;
-mod mcp;
 mod impact;
 mod index;
+mod mcp;
 mod output;
 mod packages;
 mod rename;
@@ -103,9 +103,7 @@ mod session;
 mod test;
 
 pub(crate) use output::OutputFormat;
-use output::{
-    diags_document, write_human, write_json_value, write_lon, write_text_value,
-};
+use output::{diags_document, write_human, write_json_value, write_lon, write_text_value};
 
 /// Process exit codes, pinned to the dartdev oracle (analyze.dart:719–731;
 /// usage exit dartdev.dart:209–210) plus the sysexits-style tiers the
@@ -119,7 +117,10 @@ mod exit {
     pub const USAGE: u8 = 64;
     /// EX_DATAERR — a request payload the consumer could not parse
     /// (reserved for the session/events protocol faces).
-    #[expect(dead_code, reason = "reserved contract tier; the first consumer wires it")]
+    #[expect(
+        dead_code,
+        reason = "reserved contract tier; the first consumer wires it"
+    )]
     pub const DATA_ERROR: u8 = 65;
     /// EX_SOFTWARE — an internal defect reported through a protocol
     /// channel (the one-shot faces keep exit 4).
@@ -131,7 +132,10 @@ mod exit {
     pub const DEBUG_DOMAIN: u8 = 1;
     /// The resident session is unavailable and could not be started
     /// (the standalone fallback refused — the session-layer faces).
-    #[expect(dead_code, reason = "reserved contract tier; the first consumer wires it")]
+    #[expect(
+        dead_code,
+        reason = "reserved contract tier; the first consumer wires it"
+    )]
     pub const SESSION: u8 = 79;
 }
 
@@ -472,6 +476,15 @@ struct AnalyzeArgs {
     /// the output is byte-identical to an unbudgeted run.
     #[arg(long, value_name = "MiB")]
     memory_limit: Option<u64>,
+    /// Print each workspace engine's memory posture to stderr after the
+    /// run — one `dartq-memory` line per engine carrying the budget
+    /// ladder's state (the armed limit, descended tiers, deepest tier
+    /// key), its last phase-boundary RSS sample, and the warm lane's
+    /// counters. The 5-instance product budget's observability face; the
+    /// resident session's own posture is the daemon's `dartq/memory`
+    /// face, so the flag always runs in-process.
+    #[arg(long)]
+    memory_report: bool,
     /// JSONL trace sink: the engine appends one JSON object per
     /// engine event — stable event names, stable field order, flushed per
     /// event so a killed CI run keeps its tail. Unset = no sink and zero
@@ -826,7 +839,13 @@ fn severity_exit(diags: &[Diagnostic], fatal_warnings: bool, fatal_infos: bool) 
             Severity::Info => has_info = true,
         }
     }
-    severity_tier(has_error, has_warning, has_info, fatal_warnings, fatal_infos)
+    severity_tier(
+        has_error,
+        has_warning,
+        has_info,
+        fatal_warnings,
+        fatal_infos,
+    )
 }
 
 /// The severity ladder over presence flags (see [`severity_exit`]).
@@ -1197,18 +1216,17 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
         // set launches off `pub_config`/`config_dir` before `Engine::new`
         // consumes the config. The phased spelling carries the SDK-load
         // clock for the metrics split.
-        let (config, dir, stale_advisory, phases) =
-            match engine_config_with_overrides_phased(
-                &root,
-                args.sdk_path.as_deref(),
-                &analyze_overrides(args),
-            ) {
-                Ok(faces) => faces,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    return exit::USAGE;
-                }
-            };
+        let (config, dir, stale_advisory, phases) = match engine_config_with_overrides_phased(
+            &root,
+            args.sdk_path.as_deref(),
+            &analyze_overrides(args),
+        ) {
+            Ok(faces) => faces,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return exit::USAGE;
+            }
+        };
         sdk += phases.sdk;
         // The launch is lazy (no sidecar starts): a plugin-free workspace
         // pays the two absence probes and nothing more.
@@ -1315,7 +1333,16 @@ fn analyze_targets(args: &AnalyzeArgs, targets: &[TargetKind], out: &mut impl Wr
         runs.push(run);
     }
     let merged = dartq_commands::analyze::merge_runs(runs);
-    let code = analyze_finish(args, &merged, started, out, &advisories, sdk_ms, assembly_ms);
+    let code = analyze_finish(
+        args,
+        &merged,
+        started,
+        out,
+        &advisories,
+        sdk_ms,
+        assembly_ms,
+        &merged.memory,
+    );
     // The graceful teardown: each live plugin handshake-completes before the
     // process exits (a bare drop is kill-only).
     for set in plugin_sets {
@@ -1387,9 +1414,7 @@ pub(crate) fn crash_tier<T>(pass: impl FnOnce() -> T) -> std::thread::Result<T> 
     // Arm under the lock, run unlocked, disarm under the lock — the guard
     // scope is the swap only, so a nested tier inside `pass` never waits on
     // it (the `ARMED` flag above is the re-entrancy answer).
-    let previous: std::sync::Arc<
-        dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static,
-    > = {
+    let previous: std::sync::Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static> = {
         let _guard = CRASH_TIER_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1473,6 +1498,7 @@ fn analyze_finish(
     advisories: &[WorkspaceAdvisory],
     sdk_ms: u64,
     assembly_ms: u64,
+    memory: &[(dartq_engine::MemoryStatus, dartq_engine::WarmStats)],
 ) -> u8 {
     let discovery_ms = elapsed_ms(run.discovery);
     let analyze_ms = elapsed_ms(run.analysis);
@@ -1561,7 +1587,37 @@ fn analyze_finish(
             return exit::INTERNAL_ERROR;
         }
     }
+    if args.memory_report {
+        for (status, warm) in memory {
+            eprintln!("{}", memory_report_line(status, warm));
+        }
+    }
     severity_exit(&run.diagnostics, !args.no_fatal_warnings, args.fatal_infos)
+}
+
+/// The `--memory-report` stderr line over one engine's posture — the
+/// deterministic shape the flag pins: the `dartq-memory` prefix, the
+/// budget ladder's state (the armed limit in MiB, the descended-tier
+/// count, the deepest tier's machine key), the ladder's last
+/// phase-boundary RSS sample in bytes, and the warm lane's
+/// produced/skipped counters. An engine that holds no reading spells
+/// `none` — an unbudgeted engine samples nothing, so its face reports
+/// nothing rather than inventing a reading.
+fn memory_report_line(
+    status: &dartq_engine::MemoryStatus,
+    warm: &dartq_engine::WarmStats,
+) -> String {
+    let read =
+        |value: Option<u64>| value.map_or_else(|| "none".to_owned(), |bytes| bytes.to_string());
+    format!(
+        "dartq-memory rss={} limit_mib={} tiers={} tier={} warm={}/{}",
+        read(status.rss_bytes),
+        read(status.limit_mib),
+        status.degraded_tiers,
+        status.degraded_tier.unwrap_or("none"),
+        warm.completed,
+        warm.skipped,
+    )
 }
 
 /// The `--memory` JSON face (the oracle's `usageInfo.memoryKB` key,
@@ -1844,10 +1900,8 @@ fn assemble_contexts(
                 &base.pub_config,
                 &base.config_dir,
             ) {
-                Some(lib_dir) => {
-                    SdkSnapshot::load(&root, Some(&lib_dir))
-                        .or_else(|_| SdkSnapshot::load(&root, None))
-                }
+                Some(lib_dir) => SdkSnapshot::load(&root, Some(&lib_dir))
+                    .or_else(|_| SdkSnapshot::load(&root, None)),
                 None => SdkSnapshot::load(&root, None),
             };
             let sdk = loaded.map_err(|error| {
@@ -1974,8 +2028,7 @@ fn query_callers_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = refuse_fuzzy(args) {
         return code;
     }
-    if let Some(code) = resident::route_query(args, QueryKind::Callers, out)
-    {
+    if let Some(code) = resident::route_query(args, QueryKind::Callers, out) {
         return code;
     }
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
@@ -2027,9 +2080,7 @@ fn query_implementations_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = refuse_fuzzy(args) {
         return code;
     }
-    if let Some(code) =
-        resident::route_query(args, QueryKind::Implementations, out)
-    {
+    if let Some(code) = resident::route_query(args, QueryKind::Implementations, out) {
         return code;
     }
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
@@ -2082,9 +2133,7 @@ fn query_dependencies_run(args: &SymbolArgs, out: &mut impl Write) -> u8 {
     if let Some(code) = refuse_fuzzy(args) {
         return code;
     }
-    if let Some(code) =
-        resident::route_query(args, QueryKind::Dependencies, out)
-    {
+    if let Some(code) = resident::route_query(args, QueryKind::Dependencies, out) {
         return code;
     }
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
@@ -2175,8 +2224,7 @@ fn query_batch_run(args: &BatchArgs, out: &mut impl Write) -> u8 {
     let written = answers
         .iter()
         .try_for_each(|answer| {
-            let value =
-                to_json_at_tier(&answer.run, answer.name, args.verbosity.into_commands());
+            let value = to_json_at_tier(&answer.run, answer.name, args.verbosity.into_commands());
             match args.format {
                 OutputFormat::Json => write_json_value(out, &value),
                 OutputFormat::Lon => write_lon(out, &value),
@@ -2293,9 +2341,7 @@ fn explain_run(args: &ExplainArgs, out: &mut impl Write) -> u8 {
         (dir_pos @ (None | Some(_)), Some(code)) => {
             let dir = match dir_pos {
                 None => args.dir.clone(),
-                Some(positional) if args.dir == PathBuf::from(".") => {
-                    PathBuf::from(positional)
-                }
+                Some(positional) if args.dir == PathBuf::from(".") => PathBuf::from(positional),
                 Some(_) => {
                     eprintln!("error: two positionals on --diagnostic; give CODE [dir]");
                     return exit::USAGE;
@@ -2393,16 +2439,10 @@ fn parse_file_selector(text: &str) -> Result<dartq_commands::explain::FileSelect
                 let before = &text[..right];
                 match before.rfind(':') {
                     Some(left)
-                        if before[left + 1..]
-                            .chars()
-                            .all(|c| c.is_ascii_digit())
+                        if before[left + 1..].chars().all(|c| c.is_ascii_digit())
                             && !before[left + 1..].is_empty() =>
                     {
-                        (
-                            &before[..left],
-                            Some(&before[left + 1..]),
-                            Some(tail),
-                        )
+                        (&before[..left], Some(&before[left + 1..]), Some(tail))
                     }
                     _ => (before, Some(tail), None),
                 }
@@ -2541,6 +2581,77 @@ mod tests {
         );
         assert!(!check.fatal_infos, "fatal-infos default off");
         assert_eq!(check.paths, vec![PathBuf::from(".")], "default target cwd");
+    }
+
+    /// The `--memory-report` line is the pinned deterministic shape: the
+    /// `dartq-memory` prefix, the ladder state (limit MiB, descended-tier
+    /// count, deepest tier key), the last RSS sample in bytes, and the
+    /// warm counters — a descended budget surfaces its exact tier.
+    #[test]
+    fn the_memory_report_line_pins_the_posture_shape() {
+        let status = dartq_engine::MemoryStatus {
+            rss_bytes: Some(52_428_800),
+            limit_mib: Some(2048),
+            degraded_tiers: 2,
+            degraded_tier: Some("semantic_slices"),
+        };
+        let warm = dartq_engine::WarmStats {
+            completed: 3,
+            skipped: 17,
+        };
+        assert_eq!(
+            memory_report_line(&status, &warm),
+            "dartq-memory rss=52428800 limit_mib=2048 tiers=2 tier=semantic_slices warm=3/17"
+        );
+
+        // The no-pressure posture stays at tier 0 with no tier key.
+        let status = dartq_engine::MemoryStatus {
+            rss_bytes: Some(4_194_304),
+            limit_mib: Some(64),
+            degraded_tiers: 0,
+            degraded_tier: None,
+        };
+        assert_eq!(
+            memory_report_line(&status, &warm),
+            "dartq-memory rss=4194304 limit_mib=64 tiers=0 tier=none warm=3/17"
+        );
+    }
+
+    /// An engine that holds no reading spells `none` — an unbudgeted
+    /// engine samples nothing, so the face reports nothing rather than
+    /// inventing a reading.
+    #[test]
+    fn the_memory_report_line_spells_none_for_an_unbudgeted_engine() {
+        let warm = dartq_engine::WarmStats::default();
+        assert_eq!(
+            memory_report_line(&dartq_engine::MemoryStatus::default(), &warm),
+            "dartq-memory rss=none limit_mib=none tiers=0 tier=none warm=0/0"
+        );
+    }
+
+    /// `--memory-report` parses on the analyze face, and the resident
+    /// consult declines it — the flag reads the in-process engine's own
+    /// budget ladder, so the run goes cold (a plain run stays routable).
+    #[test]
+    fn memory_report_parses_and_stays_in_process() {
+        match parse_args_of(&["analyze", "--memory-report", "/pkg"]).expect("parse") {
+            Some(Command::Analyze(args)) => {
+                assert!(args.memory_report);
+                assert!(
+                    !resident::analyze_routable(&args),
+                    "--memory-report reads the in-process engine: the consult declines"
+                );
+            }
+            _ => panic!("expected analyze command"),
+        }
+        let args = match parse_args_of(&["analyze", "/pkg"]).expect("parse") {
+            Some(Command::Analyze(args)) => args,
+            _ => panic!("expected analyze command"),
+        };
+        assert!(
+            resident::analyze_routable(&args),
+            "the plain run keeps the resident consult"
+        );
     }
 
     #[test]
@@ -2832,15 +2943,31 @@ mod tests {
         for hidden in ["check", "index", "assists", "daemon"] {
             assert!(subcommand(hidden).is_hide_set(), "`{hidden}` stays hidden");
         }
-        for visible in ["analyze", "packages", "session", "events", "mcp", "query", "compat", "resolve", "complete"] {
-            assert!(!subcommand(visible).is_hide_set(), "`{visible}` stays visible");
+        for visible in [
+            "analyze", "packages", "session", "events", "mcp", "query", "compat", "resolve",
+            "complete",
+        ] {
+            assert!(
+                !subcommand(visible).is_hide_set(),
+                "`{visible}` stays visible"
+            );
         }
         assert!(
-            subcommand("compat").get_aliases().any(|alias| alias == "compatibility"),
+            subcommand("compat")
+                .get_aliases()
+                .any(|alias| alias == "compatibility"),
             "`compatibility` rides as an alias"
         );
-        assert!(subcommand("resolve").get_aliases().any(|alias| alias == "resolve-at"));
-        assert!(subcommand("complete").get_aliases().any(|alias| alias == "completion"));
+        assert!(
+            subcommand("resolve")
+                .get_aliases()
+                .any(|alias| alias == "resolve-at")
+        );
+        assert!(
+            subcommand("complete")
+                .get_aliases()
+                .any(|alias| alias == "completion")
+        );
     }
 
     /// The format axis: the default is the constant `lon` on every
@@ -2856,14 +2983,18 @@ mod tests {
             "analyze defaults to lon"
         );
         let symbol = |args: &[&str]| match parse_args_of(args) {
-            Ok(Some(Command::Query(QueryArgs { face: QueryFace::Symbol(args) }))) => args,
+            Ok(Some(Command::Query(QueryArgs {
+                face: QueryFace::Symbol(args),
+            }))) => args,
             _ => panic!("expected query symbol"),
         };
         assert!(
             matches!(symbol(&["query", "symbol", "X"]).format, OutputFormat::Lon),
             "query defaults to lon"
         );
-        let explain = match parse_args_of(&["explain", "Dog"]).expect("parse").expect("subcommand")
+        let explain = match parse_args_of(&["explain", "Dog"])
+            .expect("parse")
+            .expect("subcommand")
         {
             Command::Explain(args) => args,
             _ => panic!("expected explain"),
@@ -2875,8 +3006,7 @@ mod tests {
     /// reader for the analyze faces).
     fn diag_files(out: &[u8]) -> Vec<String> {
         let text = std::str::from_utf8(out).expect("UTF-8");
-        let document: serde_json::Value =
-            lon::from_str(text.trim_end()).expect("one lon document");
+        let document: serde_json::Value = lon::from_str(text.trim_end()).expect("one lon document");
         document["diags"]
             .as_array()
             .expect("diags")
@@ -3457,6 +3587,7 @@ mod tests {
             fatal_infos: false,
             cold: true,
             memory_limit: None,
+            memory_report: false,
             trace_events: None,
             cache_size_limit: None,
             cache: None,
@@ -3493,8 +3624,7 @@ mod tests {
         );
 
         let text = String::from_utf8(out).expect("stdout is UTF-8");
-        let document: serde_json::Value =
-            lon::from_str(text.trim_end()).expect("one lon document");
+        let document: serde_json::Value = lon::from_str(text.trim_end()).expect("one lon document");
         assert_eq!(document["v"], 1, "the vocabulary envelope key");
         assert_eq!(
             document["root"],
@@ -3871,8 +4001,7 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Lon, None), &mut out);
         let text = String::from_utf8(out).expect("stdout is UTF-8");
-        let document: serde_json::Value =
-            lon::from_str(text.trim_end()).expect("one lon document");
+        let document: serde_json::Value = lon::from_str(text.trim_end()).expect("one lon document");
         assert_eq!(
             document["diags"].as_array().expect("diags").len(),
             2,
@@ -4090,7 +4219,9 @@ mod tests {
 
         let mut out: Vec<u8> = Vec::new();
         let code = analyze_run(&analyze_args(&root, AnalyzeFormat::Lon, None), &mut out);
-        let text = std::str::from_utf8(&out).expect("stdout is UTF-8").to_owned();
+        let text = std::str::from_utf8(&out)
+            .expect("stdout is UTF-8")
+            .to_owned();
         assert!(
             !text.contains("DARTQ/"),
             "the advisory never joins the lon stdout: {text}"
@@ -4143,8 +4274,7 @@ mod tests {
         let code = analyze_run(&args, &mut out);
         assert_eq!(code, exit::ERRORS, "the file's own ERROR rows → 3");
         let text = String::from_utf8(out).expect("UTF-8");
-        let document: serde_json::Value =
-            lon::from_str(text.trim_end()).expect("one lon document");
+        let document: serde_json::Value = lon::from_str(text.trim_end()).expect("one lon document");
         let rows = document["diags"].as_array().expect("diags");
         assert!(
             !rows.is_empty()
@@ -4677,7 +4807,10 @@ mod tests {
         // name-keyed and already kinded).
         let mut symbol_out: Vec<u8> = Vec::new();
         assert_eq!(
-            query_symbol_run(&symbol_args(&root, OutputFormat::Lon, "Foo"), &mut symbol_out),
+            query_symbol_run(
+                &symbol_args(&root, OutputFormat::Lon, "Foo"),
+                &mut symbol_out
+            ),
             exit::CLEAN
         );
         let mut references_out: Vec<u8> = Vec::new();
@@ -5334,8 +5467,7 @@ mod tests {
             "library dart.core;",
         )
         .expect("embedder core");
-        fs::write(root.join("sky_engine/lib/ui/ui.dart"), "library dart.ui;")
-            .expect("embedder ui");
+        fs::write(root.join("sky_engine/lib/ui/ui.dart"), "library dart.ui;").expect("embedder ui");
     }
 
     /// The fixture's package config plus one `sky_engine` entry (an
@@ -5366,8 +5498,8 @@ mod tests {
         write_sky_engine(&root);
         rewrite_config_with_sky_engine(&root);
         write_daemon_context_config(&root);
-        let (base, _, _) = engine_config_with_advisory(&root, Some(&root.join("sdk")))
-            .expect("assembly");
+        let (base, _, _) =
+            engine_config_with_advisory(&root, Some(&root.join("sdk"))).expect("assembly");
         let extras = assemble_contexts(&base, &[]).expect("the declared contexts load");
         assert_eq!(extras.len(), 2, "plain and web");
         for (_, engine) in &extras {
@@ -5375,10 +5507,20 @@ mod tests {
                 .sdk
                 .flat_library_to_path("ui", "")
                 .expect("dart:ui resolves through the embedder");
-            assert_eq!(ui, root.join("sky_engine").join("lib").join("ui").join("ui.dart"));
+            assert_eq!(
+                ui,
+                root.join("sky_engine")
+                    .join("lib")
+                    .join("ui")
+                    .join("ui.dart")
+            );
             assert_eq!(
                 engine.sdk.flat_library_to_path("core", ""),
-                Some(root.join("sky_engine").join("lib").join("embedder_core.dart")),
+                Some(
+                    root.join("sky_engine")
+                        .join("lib")
+                        .join("embedder_core.dart")
+                ),
                 "full replacement: core comes from the embedder file"
             );
         }
@@ -5388,8 +5530,8 @@ mod tests {
         let plain = analyze_fixture("daemon_embedder_plain", &[]);
         write_daemon_context_config(&plain);
         let plain = plain.canonicalize().expect("root");
-        let (base, _, _) = engine_config_with_advisory(&plain, Some(&plain.join("sdk")))
-            .expect("assembly");
+        let (base, _, _) =
+            engine_config_with_advisory(&plain, Some(&plain.join("sdk"))).expect("assembly");
         let extras = assemble_contexts(&base, &[]).expect("the declared contexts load");
         assert_eq!(extras.len(), 2);
         for (_, engine) in &extras {
@@ -5447,8 +5589,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("crash-tier selftest"),
+            String::from_utf8_lossy(&output.stderr).contains("crash-tier selftest"),
             "the default hook's panic message still prints"
         );
     }

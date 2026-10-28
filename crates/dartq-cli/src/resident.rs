@@ -102,7 +102,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use dartq_session::{Ensured, Layout, SessionState, SessionTriple, STALE_HEARTBEAT, ensure};
+use dartq_session::{Ensured, Layout, STALE_HEARTBEAT, SessionState, SessionTriple, ensure};
 
 use crate::exit;
 use crate::session::resolved_sdk_root;
@@ -147,8 +147,8 @@ pub(crate) fn session_call(
     params: &Value,
     timeout: Duration,
 ) -> Result<Value, ProxyError> {
-    let mut stream = UnixStream::connect(socket)
-        .map_err(|error| ProxyError::Transport(error.to_string()))?;
+    let mut stream =
+        UnixStream::connect(socket).map_err(|error| ProxyError::Transport(error.to_string()))?;
     // The bound covers the whole round trip: a wedged engine (or a
     // wedged serve between clients) answers the timeout error, never a
     // hang.
@@ -269,17 +269,21 @@ pub(crate) fn read_frame(stream: &mut UnixStream) -> Result<Value, ReadError> {
 /// Whether `dartq analyze`'s invocation may consult the resident engine:
 /// the plain face only — the per-run engine posture flags
 /// (`--overlay`, `--packages`, `--enable-experiment`, `--no-plugins`,
-/// `--memory-limit`, `--trace-events`, `--cache-size-limit`) re-shape
-/// the engine or its arming in ways a shared resident cannot honor per
-/// request, so those run in-process. `--fast` is the check pipeline and
-/// takes the check face's attach-only route instead.
-fn analyze_routable(args: &crate::AnalyzeArgs) -> bool {
+/// `--memory-limit`, `--memory-report`, `--trace-events`,
+/// `--cache-size-limit`) re-shape the engine or its arming in ways a
+/// shared resident cannot honor per request, so those run in-process
+/// (`--memory-report` reads the in-process engine's own budget ladder;
+/// the resident session's posture is the daemon's `dartq/memory` face).
+/// `--fast` is the check pipeline and takes the check face's
+/// attach-only route instead.
+pub(crate) fn analyze_routable(args: &crate::AnalyzeArgs) -> bool {
     !args.fast
         && args.overlays.is_empty()
         && args.packages.is_none()
         && args.enable_experiments.is_empty()
         && !args.no_plugins
         && args.memory_limit.is_none()
+        && !args.memory_report
         && args.trace_events.is_none()
         && args.cache_size_limit.is_none()
 }
@@ -307,9 +311,9 @@ pub(crate) fn route_analyze(
         .iter()
         .map(|target| match target {
             crate::TargetKind::Dir(dir) => crate::workspace_root_of(dir),
-            crate::TargetKind::File(file) => crate::workspace_root_of(
-                &file.parent().map(Path::to_path_buf).unwrap_or_default(),
-            ),
+            crate::TargetKind::File(file) => {
+                crate::workspace_root_of(&file.parent().map(Path::to_path_buf).unwrap_or_default())
+            }
         })
         .collect();
     let root = roots.first()?.clone();
@@ -383,7 +387,11 @@ fn universe_matches_disk(root: &Path, answer: &Value) -> bool {
         /// No config anywhere at assembly (the BasicWorkspace floor).
         None,
         /// The named path, with the (mtime_ns, size) it was read at.
-        Stamped { path: PathBuf, mtime_ns: u64, size: u64 },
+        Stamped {
+            path: PathBuf,
+            mtime_ns: u64,
+            size: u64,
+        },
     }
     let named = match answer.get("packages") {
         // An absent member is no signal (the check face's rendered
@@ -427,10 +435,9 @@ fn universe_matches_disk(root: &Path, answer: &Value) -> bool {
         (Wire::None, None) => true,
         // One side holds a config the other lacks: stale.
         (Wire::None, Some(_)) | (Wire::Stamped { .. }, None) => false,
-        (
-            Wire::Stamped { mtime_ns, size, .. },
-            Some((disk_mtime_ns, disk_size)),
-        ) => mtime_ns == disk_mtime_ns && size == disk_size,
+        (Wire::Stamped { mtime_ns, size, .. }, Some((disk_mtime_ns, disk_size))) => {
+            mtime_ns == disk_mtime_ns && size == disk_size
+        }
     }
 }
 
@@ -440,10 +447,7 @@ fn universe_matches_disk(root: &Path, answer: &Value) -> bool {
 /// must not). `Some(code)` finishes the run; `None` falls to the
 /// in-process pipeline (the fallback advisory on stderr when a session
 /// was found but lost).
-pub(crate) fn route_check(
-    args: &crate::CheckArgs,
-    out: &mut impl Write,
-) -> Option<u8> {
+pub(crate) fn route_check(args: &crate::CheckArgs, out: &mut impl Write) -> Option<u8> {
     // Every path must resolve — the cold face owns the missing-target
     // usage error, so a path that cannot canonicalize here routes never.
     let paths: Vec<PathBuf> = args
@@ -533,12 +537,7 @@ fn route_answer(
 /// The attach-only route over an already-probed socket (explain's shape —
 /// no SDK triple, no universe stamp: the per-query engine reads the disk
 /// fresh).
-fn route_attached(
-    socket: &Path,
-    method: &str,
-    params: &Value,
-    out: &mut impl Write,
-) -> Option<u8> {
+fn route_attached(socket: &Path, method: &str, params: &Value, out: &mut impl Write) -> Option<u8> {
     match session_call(socket, method, params, CALL_TIMEOUT) {
         Ok(answer) if answer["stdout"].is_string() => print_answer(out, &answer),
         Ok(_) => {
@@ -587,19 +586,25 @@ fn face_root(dir: &Path) -> Option<(PathBuf, PathBuf)> {
 }
 
 /// `dartq query <face> NAME` over one kind: the daemon's `dartq/query`
-/// answers the same tier-shaped envelope the cold face prints.
+/// answers the same tier-shaped envelope the cold face prints. The
+/// `fuzzy` opt-in rides only when set — the standing request params stay
+/// byte-identical, and the CLI refuses the flag on the reference-family
+/// faces before this route runs.
 pub(crate) fn route_query(
     args: &crate::SymbolArgs,
     kind: crate::QueryKind,
     out: &mut impl Write,
 ) -> Option<u8> {
     let (root, _dir) = face_root(&args.dir)?;
-    let params = json!({
+    let mut params = json!({
         "name": args.name,
         "kind": query_kind_word(kind),
         "format": output_word(args.format),
         "verbosity": verbosity_word(args.verbosity),
     });
+    if args.fuzzy {
+        params["fuzzy"] = json!(true);
+    }
     route_answer(&root, args.sdk.as_deref(), "dartq/query", &params, out)
 }
 
@@ -611,7 +616,10 @@ pub(crate) fn route_query_batch(args: &crate::BatchArgs, out: &mut impl Write) -
     let kinds: Vec<&str> = if args.kinds.is_empty() {
         vec!["symbol"]
     } else {
-        args.kinds.iter().map(|kind| query_kind_word(*kind)).collect()
+        args.kinds
+            .iter()
+            .map(|kind| query_kind_word(*kind))
+            .collect()
     };
     let queries: Vec<Value> = args
         .symbols
@@ -771,7 +779,11 @@ fn ladder(
             Ok(answer) => Ok(answer),
             Err(first) => match ensure(root, sdk_root, spawn) {
                 Ensured::Attached(_) => call(&layout).map_err(|second| {
-                    format!("{}, then re-election failed: {}", first.reason(), second.reason())
+                    format!(
+                        "{}, then re-election failed: {}",
+                        first.reason(),
+                        second.reason()
+                    )
                 }),
                 Ensured::Standalone(reason) => {
                     Err(format!("{}, then re-election: {reason}", first.reason()))
@@ -792,8 +804,8 @@ fn ladder(
 fn attached_socket(root: &Path) -> Option<PathBuf> {
     let layout = Layout::new(root);
     let state = SessionState::read(&layout)?;
-    let fresh = SessionState::now_ms().saturating_sub(state.heartbeat_ms)
-        <= STALE_HEARTBEAT.as_millis();
+    let fresh =
+        SessionState::now_ms().saturating_sub(state.heartbeat_ms) <= STALE_HEARTBEAT.as_millis();
     // The dummy SDK root never touches the comparison: only the triple's
     // root and binary hash are read (the hash is the current exe's own).
     let here = SessionTriple::compute(root, root);
@@ -815,8 +827,8 @@ fn attached_socket(root: &Path) -> Option<PathBuf> {
 fn attached_socket_for(root: &Path, sdk_root: &Path) -> Option<PathBuf> {
     let layout = Layout::new(root);
     let state = SessionState::read(&layout)?;
-    let fresh = SessionState::now_ms().saturating_sub(state.heartbeat_ms)
-        <= STALE_HEARTBEAT.as_millis();
+    let fresh =
+        SessionState::now_ms().saturating_sub(state.heartbeat_ms) <= STALE_HEARTBEAT.as_millis();
     let here = SessionTriple::compute(root, sdk_root);
     (state.triple == here
         && state.pid != 0
@@ -944,7 +956,13 @@ fn print_routed(
 /// infos under `--fatal-infos` (the cold path's own ladder).
 fn counts_exit(counts: &Value, fatal_warnings: bool, fatal_infos: bool) -> u8 {
     let count = |word: &str| counts[word].as_u64().unwrap_or(0) > 0;
-    crate::severity_tier(count("error"), count("warning"), count("info"), fatal_warnings, fatal_infos)
+    crate::severity_tier(
+        count("error"),
+        count("warning"),
+        count("info"),
+        fatal_warnings,
+        fatal_infos,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,13 +1045,31 @@ mod tests {
         assert!(analyze_routable(&plain), "the plain face routes");
         let skews: [(&str, Box<dyn Fn(&mut crate::AnalyzeArgs)>); 8] = [
             ("--fast", Box::new(|args| args.fast = true)),
-            ("--overlay", Box::new(|args| args.overlays = vec!["a=b".into()])),
-            ("--packages", Box::new(|args| args.packages = Some(PathBuf::from("p")))),
-            ("--enable-experiment", Box::new(|args| args.enable_experiments = vec!["x".into()])),
+            (
+                "--overlay",
+                Box::new(|args| args.overlays = vec!["a=b".into()]),
+            ),
+            (
+                "--packages",
+                Box::new(|args| args.packages = Some(PathBuf::from("p"))),
+            ),
+            (
+                "--enable-experiment",
+                Box::new(|args| args.enable_experiments = vec!["x".into()]),
+            ),
             ("--no-plugins", Box::new(|args| args.no_plugins = true)),
-            ("--memory-limit", Box::new(|args| args.memory_limit = Some(64))),
-            ("--trace-events", Box::new(|args| args.trace_events = Some(PathBuf::from("t")))),
-            ("--cache-size-limit", Box::new(|args| args.cache_size_limit = Some(1024))),
+            (
+                "--memory-limit",
+                Box::new(|args| args.memory_limit = Some(64)),
+            ),
+            (
+                "--trace-events",
+                Box::new(|args| args.trace_events = Some(PathBuf::from("t"))),
+            ),
+            (
+                "--cache-size-limit",
+                Box::new(|args| args.cache_size_limit = Some(1024)),
+            ),
         ];
         for (flag, skew) in skews {
             let mut args = routed_args(Path::new("/w"), AnalyzeFormat::Lon);
@@ -1048,7 +1084,9 @@ mod tests {
     /// tier matches.
     #[test]
     fn routed_analyze_matches_the_cold_bytes_on_every_format() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         for format in [AnalyzeFormat::Lon, AnalyzeFormat::Json, AnalyzeFormat::Text] {
             let root = broken_fixture("route-bytes");
             serve(&root);
@@ -1066,14 +1104,22 @@ mod tests {
                 &refused_spawn(),
             )
             .expect("the live session answers");
-            assert_eq!(code, cold_code, "the exit tier matches ({})", format_word(format));
+            assert_eq!(
+                code,
+                cold_code,
+                "the exit tier matches ({})",
+                format_word(format)
+            );
             assert_eq!(
                 String::from_utf8_lossy(&routed),
                 String::from_utf8_lossy(&cold),
                 "routed stdout == cold stdout, byte for byte ({})",
                 format_word(format)
             );
-            assert!(!routed.is_empty(), "the broken fixture keeps the bytes honest");
+            assert!(
+                !routed.is_empty(),
+                "the broken fixture keeps the bytes honest"
+            );
             teardown(&root);
         }
     }
@@ -1083,7 +1129,9 @@ mod tests {
     /// heartbeat, and the answer is still the cold bytes.
     #[test]
     fn the_ladder_spawns_and_waits_when_nothing_is_live() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = broken_fixture("route-spawn");
         let spawn_root = root.clone();
         let spawn = move |_: &Layout, _: &SessionTriple| {
@@ -1137,14 +1185,15 @@ mod tests {
     /// lands after it.
     #[test]
     fn a_routed_call_reconciles_out_of_band_edits() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = broken_fixture("route-fresh");
         serve(&root);
         let targets = [TargetKind::Dir(root.clone())];
         let args = routed_args(&root, AnalyzeFormat::Lon);
         let call = |out: &mut Vec<u8>| {
-            route_analyze(&args, &targets, out, &refused_spawn())
-                .expect("the live session answers")
+            route_analyze(&args, &targets, out, &refused_spawn()).expect("the live session answers")
         };
 
         let mut before: Vec<u8> = Vec::new();
@@ -1187,7 +1236,9 @@ mod tests {
     /// never restarting.
     #[test]
     fn a_routed_call_answers_over_a_changed_package_universe() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = crate::tests::analyze_fixture(
             "route-universe",
             &[(
@@ -1265,9 +1316,7 @@ mod tests {
             .expect("post-epoch")
             .as_nanos() as u64;
         let path = config.display().to_string();
-        let stamped = |mtime_ns: u64, size: u64| {
-            json!({"packages": {"path": path, "mtime_ns": mtime_ns, "size": size}})
-        };
+        let stamped = |mtime_ns: u64, size: u64| json!({"packages": {"path": path, "mtime_ns": mtime_ns, "size": size}});
         assert!(
             universe_matches_disk(&root, &stamped(mtime_ns, meta.len())),
             "the exact stamp is current"
@@ -1309,15 +1358,19 @@ mod tests {
     /// spawns an engine.
     #[test]
     fn check_consults_an_attached_session_with_the_cold_bytes() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         // A parse-broken library: the M0 pipeline's own rows keep the
         // byte identity honest (a tree that parses clean would pin only
         // the empty shape).
-        let root = crate::tests::analyze_fixture("route-check", &[("lib/broken.dart", "void f( {\n")]);
+        let root =
+            crate::tests::analyze_fixture("route-check", &[("lib/broken.dart", "void f( {\n")]);
         serve(&root);
         let path = root.display().to_string();
         for word in ["lon", "json", "text"] {
-            let mut cold_args = crate::tests::check_args(&["check", "--format", word, path.as_str()]);
+            let mut cold_args =
+                crate::tests::check_args(&["check", "--format", word, path.as_str()]);
             cold_args.cold = true;
             let mut cold: Vec<u8> = Vec::new();
             let cold_code = crate::check_run(&cold_args, &mut cold);
@@ -1339,8 +1392,11 @@ mod tests {
         let bare = broken_fixture("route-check-bare");
         let bare_path = bare.display().to_string();
         assert!(
-            route_check(&crate::tests::check_args(&["check", bare_path.as_str()]), &mut Vec::new())
-                .is_none(),
+            route_check(
+                &crate::tests::check_args(&["check", bare_path.as_str()]),
+                &mut Vec::new()
+            )
+            .is_none(),
             "no live session routes never"
         );
         teardown(&root);
@@ -1364,11 +1420,21 @@ mod tests {
     /// benchmark owns.
     #[test]
     fn a_warm_routed_call_answers_within_the_bound() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let mut libraries: Vec<(String, String)> = (0..80)
-            .map(|i| (format!("lib/src/g_{i:03}.dart"), format!("int g_{i:03}() => {i};\n")))
+            .map(|i| {
+                (
+                    format!("lib/src/g_{i:03}.dart"),
+                    format!("int g_{i:03}() => {i};\n"),
+                )
+            })
             .collect();
-        libraries.push((String::from("lib/broken.dart"), String::from("void f() { x }\n")));
+        libraries.push((
+            String::from("lib/broken.dart"),
+            String::from("void f() { x }\n"),
+        ));
         let refs: Vec<(&str, &str)> = libraries
             .iter()
             .map(|(path, body)| (path.as_str(), body.as_str()))
@@ -1386,12 +1452,14 @@ mod tests {
 
         let warm_at = Instant::now();
         let mut warm: Vec<u8> = Vec::new();
-        route_analyze(&args, &targets, &mut warm, &refused_spawn())
-            .expect("the warm call answers");
+        route_analyze(&args, &targets, &mut warm, &refused_spawn()).expect("the warm call answers");
         let warm_ms = warm_at.elapsed().as_millis();
 
         let mut cold: Vec<u8> = Vec::new();
-        crate::analyze_run(&crate::tests::analyze_args(&root, AnalyzeFormat::Lon, None), &mut cold);
+        crate::analyze_run(
+            &crate::tests::analyze_args(&root, AnalyzeFormat::Lon, None),
+            &mut cold,
+        );
         assert_eq!(
             String::from_utf8_lossy(&warm),
             String::from_utf8_lossy(&cold),
@@ -1413,7 +1481,9 @@ mod tests {
     /// pipeline) over the same bytes.
     #[test]
     fn a_killed_daemon_falls_back_to_the_cold_answer() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = broken_fixture("route-kill");
         // The killed-mid-work residue: a just-exited child's pid under a
         // fresh heartbeat and the matching generation, and a plain file
@@ -1429,7 +1499,10 @@ mod tests {
             .expect("the short-lived child");
         let residue_pid = child.id();
         let _ = child.wait();
-        assert!(!dartq_session::pid_alive(residue_pid), "the modeled pid is dead");
+        assert!(
+            !dartq_session::pid_alive(residue_pid),
+            "the modeled pid is dead"
+        );
         SessionState {
             pid: residue_pid,
             heartbeat_ms: SessionState::now_ms(),
@@ -1443,8 +1516,10 @@ mod tests {
         // The analyze face: the route falls back (never an error, never
         // a hang), and the cold answer stands behind it.
         let mut cold: Vec<u8> = Vec::new();
-        let cold_code =
-            crate::analyze_run(&crate::tests::analyze_args(&root, AnalyzeFormat::Lon, None), &mut cold);
+        let cold_code = crate::analyze_run(
+            &crate::tests::analyze_args(&root, AnalyzeFormat::Lon, None),
+            &mut cold,
+        );
         let outcome = route_analyze(
             &routed_args(&root, AnalyzeFormat::Lon),
             &[TargetKind::Dir(root.clone())],
@@ -1462,15 +1537,22 @@ mod tests {
         let mut cold_check: Vec<u8> = Vec::new();
         crate::check_run(&cold_check_args, &mut cold_check);
         let mut answer: Vec<u8> = Vec::new();
-        crate::check_run(&crate::tests::check_args(&["check", path.as_str()]), &mut answer);
+        crate::check_run(
+            &crate::tests::check_args(&["check", path.as_str()]),
+            &mut answer,
+        );
         assert_eq!(
             String::from_utf8_lossy(&answer),
             String::from_utf8_lossy(&cold_check),
             "the CLI still answers via the fallback"
         );
-        assert!(!cold.is_empty(), "the broken fixture keeps the bytes honest");
+        assert!(
+            !cold.is_empty(),
+            "the broken fixture keeps the bytes honest"
+        );
         assert_ne!(
-            cold_code, crate::exit::CLEAN,
+            cold_code,
+            crate::exit::CLEAN,
             "the dirty tree's exit tier rides the fallback unchanged"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1482,7 +1564,9 @@ mod tests {
     /// taken-over session is still the cold bytes.
     #[test]
     fn a_stale_binary_hash_is_taken_over_not_hung_on() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = broken_fixture("route-stale");
         // The stale generation's state: a live pid (the harness's own —
         // the reaper's self-guard skips it), a fresh heartbeat, and a
@@ -1511,8 +1595,10 @@ mod tests {
         };
 
         let mut cold: Vec<u8> = Vec::new();
-        let cold_code =
-            crate::analyze_run(&crate::tests::analyze_args(&root, AnalyzeFormat::Json, None), &mut cold);
+        let cold_code = crate::analyze_run(
+            &crate::tests::analyze_args(&root, AnalyzeFormat::Json, None),
+            &mut cold,
+        );
         let started = Instant::now();
         let mut routed: Vec<u8> = Vec::new();
         let code = route_analyze(
@@ -1544,10 +1630,12 @@ mod tests {
     #[test]
     fn cold_bypasses_the_consult() {
         use std::os::unix::net::UnixListener;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = broken_fixture("route-coldflag");
         // The live-looking session over a sentinel socket: same root,
         // same binary hash, live pid, fresh heartbeat — every consult
@@ -1558,9 +1646,8 @@ mod tests {
         std::fs::create_dir_all(&layout.dir).expect("the state dir");
         std::fs::create_dir_all(layout.socket.parent().expect("socket dir")).expect("dir");
         let _ = std::fs::remove_file(&layout.socket);
-        let sentinel = Arc::new(
-            UnixListener::bind(&layout.socket).expect("the sentinel socket binds"),
-        );
+        let sentinel =
+            Arc::new(UnixListener::bind(&layout.socket).expect("the sentinel socket binds"));
         sentinel.set_nonblocking(true).expect("the sentinel polls");
         let hits = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
@@ -1603,7 +1690,10 @@ mod tests {
         assert!(outcome.is_none(), "the sentinel's refusal falls back cold");
         std::thread::sleep(Duration::from_millis(100));
         let consulted = hits.load(Ordering::Relaxed);
-        assert!(consulted >= 1, "the default run consults the session ({consulted} hits)");
+        assert!(
+            consulted >= 1,
+            "the default run consults the session ({consulted} hits)"
+        );
 
         // The `--cold` run never consults: zero new connections over
         // the same live-looking state, the same bytes (`analyze_args`
@@ -1618,8 +1708,15 @@ mod tests {
             consulted,
             "--cold never consults the session"
         );
-        assert!(!cold.is_empty(), "the broken fixture keeps the bytes honest");
-        assert_ne!(cold_code, crate::exit::CLEAN, "the dirty tree answers dirty");
+        assert!(
+            !cold.is_empty(),
+            "the broken fixture keeps the bytes honest"
+        );
+        assert_ne!(
+            cold_code,
+            crate::exit::CLEAN,
+            "the dirty tree answers dirty"
+        );
 
         stop.store(true, Ordering::Relaxed);
         drop(sentinel);
@@ -1641,8 +1738,14 @@ mod tests {
         crate::tests::analyze_fixture(
             tag,
             &[
-                ("lib/a.dart", "class Foo {\n  void meth() {}\n}\nvoid foo() {}\n"),
-                ("lib/b.dart", "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  foo();\n}\n"),
+                (
+                    "lib/a.dart",
+                    "class Foo {\n  void meth() {}\n}\nvoid foo() {}\n",
+                ),
+                (
+                    "lib/b.dart",
+                    "import 'a.dart';\nvoid main() {\n  Foo? f = Foo();\n  foo();\n}\n",
+                ),
             ],
         )
     }
@@ -1654,6 +1757,7 @@ mod tests {
             format,
             verbosity: crate::Verbosity::Compact,
             sdk: Some(root.join("sdk")),
+            fuzzy: false,
         }
     }
 
@@ -1710,7 +1814,11 @@ mod tests {
         }
     }
 
-    fn position_args(root: &Path, selector: &str, format: crate::OutputFormat) -> crate::resolve::PositionArgs {
+    fn position_args(
+        root: &Path,
+        selector: &str,
+        format: crate::OutputFormat,
+    ) -> crate::resolve::PositionArgs {
         crate::resolve::PositionArgs {
             selector: selector.to_owned(),
             dir: root.to_path_buf(),
@@ -1726,7 +1834,9 @@ mod tests {
     /// consult declines silently), then the serve loop answers.
     #[test]
     fn routed_query_matches_the_cold_bytes_on_every_format() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = answer_fixture("route-q");
         let formats = [
             (crate::OutputFormat::Lon, "lon"),
@@ -1759,7 +1869,9 @@ mod tests {
     /// the session graph, the same per-line envelopes, byte for byte.
     #[test]
     fn routed_batch_matches_the_cold_bytes() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = answer_fixture("route-qb");
         let mut cold: Vec<u8> = Vec::new();
         let code = crate::query_batch_run(&batch_args(&root, crate::OutputFormat::Lon), &mut cold);
@@ -1767,7 +1879,8 @@ mod tests {
         assert!(cold.len() > 1, "two items answer two lines");
         serve(&root);
         let mut routed: Vec<u8> = Vec::new();
-        let code = crate::query_batch_run(&batch_args(&root, crate::OutputFormat::Lon), &mut routed);
+        let code =
+            crate::query_batch_run(&batch_args(&root, crate::OutputFormat::Lon), &mut routed);
         assert_eq!(code, exit::CLEAN);
         assert_eq!(
             String::from_utf8_lossy(&routed),
@@ -1781,7 +1894,9 @@ mod tests {
     /// same per-query disk engine and renders the same report.
     #[test]
     fn routed_explain_matches_the_cold_bytes() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = answer_fixture("route-ex");
         let mut cold: Vec<u8> = Vec::new();
         let code = crate::explain_run(&explain_args(&root, crate::OutputFormat::Lon), &mut cold);
@@ -1803,7 +1918,9 @@ mod tests {
     /// the routed report is the cold report, byte for byte, both postures.
     #[test]
     fn routed_impact_matches_the_cold_bytes() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = answer_fixture("route-im");
         let postures: [(Vec<String>, &str); 2] = [
             (Vec::new(), "file-level"),
@@ -1812,14 +1929,20 @@ mod tests {
         let mut cold: Vec<(Vec<String>, Vec<u8>)> = Vec::new();
         for (symbols, _) in &postures {
             let mut bytes: Vec<u8> = Vec::new();
-            let code = crate::impact::run(&impact_args(&root, crate::OutputFormat::Lon, symbols.clone()), &mut bytes);
+            let code = crate::impact::run(
+                &impact_args(&root, crate::OutputFormat::Lon, symbols.clone()),
+                &mut bytes,
+            );
             assert_eq!(code, exit::CLEAN, "the cold face answers ({symbols:?})");
             cold.push((symbols.clone(), bytes));
         }
         serve(&root);
         for (symbols, cold) in cold {
             let mut routed: Vec<u8> = Vec::new();
-            let code = crate::impact::run(&impact_args(&root, crate::OutputFormat::Lon, symbols.clone()), &mut routed);
+            let code = crate::impact::run(
+                &impact_args(&root, crate::OutputFormat::Lon, symbols.clone()),
+                &mut routed,
+            );
             assert_eq!(code, exit::CLEAN);
             assert_eq!(
                 String::from_utf8_lossy(&routed),
@@ -1834,12 +1957,17 @@ mod tests {
     /// document, the same bytes the cold plan prints.
     #[test]
     fn routed_rename_matches_the_cold_bytes() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = answer_fixture("route-rn");
         let mut cold: Vec<u8> = Vec::new();
         let code = crate::rename::run(&rename_args(&root, crate::OutputFormat::Lon), &mut cold);
         assert_eq!(code, exit::CLEAN);
-        assert!(String::from_utf8_lossy(&cold).contains("new_name:gb"), "{cold:?}");
+        assert!(
+            String::from_utf8_lossy(&cold).contains("new_name:gb"),
+            "{cold:?}"
+        );
         serve(&root);
         let mut routed: Vec<u8> = Vec::new();
         let code = crate::rename::run(&rename_args(&root, crate::OutputFormat::Lon), &mut routed);
@@ -1858,7 +1986,9 @@ mod tests {
     /// face converts against its own.
     #[test]
     fn routed_resolve_and_complete_match_the_cold_bytes() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = answer_fixture("route-pos");
         let resolve = position_args(&root, "lib/b.dart:4:3", crate::OutputFormat::Lon);
         let complete = position_args(&root, "lib/b.dart:4:5", crate::OutputFormat::Lon);
@@ -1907,30 +2037,33 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = answer_fixture("route-consult");
         let layout = Layout::new(&root);
         std::fs::create_dir_all(&layout.dir).expect("the state dir");
         std::fs::create_dir_all(layout.socket.parent().expect("socket dir")).expect("dir");
         let _ = std::fs::remove_file(&layout.socket);
-        let sentinel = Arc::new(
-            UnixListener::bind(&layout.socket).expect("the sentinel socket binds"),
-        );
+        let sentinel =
+            Arc::new(UnixListener::bind(&layout.socket).expect("the sentinel socket binds"));
         sentinel.set_nonblocking(true).expect("the sentinel polls");
         let hits = Arc::new(AtomicUsize::new(0));
         {
             let listener = Arc::clone(&sentinel);
             let hits = Arc::clone(&hits);
-            std::thread::spawn(move || loop {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        drop(stream);
-                        hits.fetch_add(1, Ordering::Relaxed);
+            std::thread::spawn(move || {
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            drop(stream);
+                            hits.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
                     }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break,
                 }
             });
         }
@@ -1948,7 +2081,10 @@ mod tests {
             let face_call: Box<dyn FnOnce() -> u8> = match face {
                 "query" => Box::new(|| {
                     let mut out = Vec::new();
-                    crate::query_symbol_run(&symbol_args(&root, "foo", crate::OutputFormat::Lon), &mut out);
+                    crate::query_symbol_run(
+                        &symbol_args(&root, "foo", crate::OutputFormat::Lon),
+                        &mut out,
+                    );
                     exit::CLEAN
                 }),
                 "batch" => Box::new(|| {
@@ -1971,10 +2107,7 @@ mod tests {
                 }),
                 "rename" => Box::new(|| {
                     let mut out = Vec::new();
-                    crate::rename::run(
-                        &rename_args(&root, crate::OutputFormat::Lon),
-                        &mut out,
-                    );
+                    crate::rename::run(&rename_args(&root, crate::OutputFormat::Lon), &mut out);
                     exit::CLEAN
                 }),
                 "resolve" => Box::new(|| {
@@ -2001,13 +2134,7 @@ mod tests {
             assert!(gained >= 1, "{face} consults the session ({gained} hits)");
         };
         for face in [
-            "query",
-            "batch",
-            "explain",
-            "impact",
-            "rename",
-            "resolve",
-            "complete",
+            "query", "batch", "explain", "impact", "rename", "resolve", "complete",
         ] {
             consulted(face);
         }
@@ -2026,18 +2153,26 @@ mod tests {
     /// the cold bytes.
     #[test]
     fn a_killed_daemon_falls_back_cold_on_the_answer_faces() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = answer_fixture("route-kill2");
         // The cold bytes first, over a quiet tree.
         let mut cold_query: Vec<u8> = Vec::new();
-        crate::query_symbol_run(&symbol_args(&root, "foo", crate::OutputFormat::Lon), &mut cold_query);
+        crate::query_symbol_run(
+            &symbol_args(&root, "foo", crate::OutputFormat::Lon),
+            &mut cold_query,
+        );
         let mut cold_impact: Vec<u8> = Vec::new();
         crate::impact::run(
             &impact_args(&root, crate::OutputFormat::Lon, Vec::new()),
             &mut cold_impact,
         );
         let mut cold_rename: Vec<u8> = Vec::new();
-        crate::rename::run(&rename_args(&root, crate::OutputFormat::Lon), &mut cold_rename);
+        crate::rename::run(
+            &rename_args(&root, crate::OutputFormat::Lon),
+            &mut cold_rename,
+        );
 
         // The killed-mid-work residue (the analyze test's shape): a dead
         // child's pid under a fresh heartbeat, a plain file where the
@@ -2045,7 +2180,10 @@ mod tests {
         let layout = Layout::new(&root);
         std::fs::create_dir_all(&layout.dir).expect("the state dir");
         std::fs::create_dir_all(layout.socket.parent().expect("socket dir")).expect("dir");
-        let mut child = std::process::Command::new("sleep").arg("0").spawn().expect("child");
+        let mut child = std::process::Command::new("sleep")
+            .arg("0")
+            .spawn()
+            .expect("child");
         let residue_pid = child.id();
         let _ = child.wait();
         SessionState {
@@ -2059,7 +2197,10 @@ mod tests {
         std::fs::write(&layout.socket, b"").expect("the dead socket file");
 
         let mut query: Vec<u8> = Vec::new();
-        crate::query_symbol_run(&symbol_args(&root, "foo", crate::OutputFormat::Lon), &mut query);
+        crate::query_symbol_run(
+            &symbol_args(&root, "foo", crate::OutputFormat::Lon),
+            &mut query,
+        );
         assert_eq!(
             String::from_utf8_lossy(&query),
             String::from_utf8_lossy(&cold_query),
@@ -2091,7 +2232,9 @@ mod tests {
     /// the very next routed call.
     #[test]
     fn a_routed_query_reconciles_out_of_band_edits() {
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|p| p.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let root = answer_fixture("route-fresh2");
         serve(&root);
         let args = symbol_args(&root, "bar", crate::OutputFormat::Lon);
@@ -2105,8 +2248,11 @@ mod tests {
 
         // The edit adds the declaration; no notification rides — the next
         // plain request must reconcile against the disk.
-        std::fs::write(root.join("lib/a.dart"), "class Foo {\n  void meth() {}\n}\nvoid foo() {}\nvoid bar() {}\n")
-            .expect("edit");
+        std::fs::write(
+            root.join("lib/a.dart"),
+            "class Foo {\n  void meth() {}\n}\nvoid foo() {}\nvoid bar() {}\n",
+        )
+        .expect("edit");
         let mut after: Vec<u8> = Vec::new();
         let code = crate::query_symbol_run(&args, &mut after);
         assert_eq!(code, exit::CLEAN);

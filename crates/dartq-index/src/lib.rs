@@ -19,7 +19,9 @@
 //! * **Query faces** ([`SymbolIndex`]): declarations by name across the
 //!   workspace and references of a declaration — the `query symbol` CLI
 //!   pair (#123), answered through the name-keyed postings directories
-//!   (the `postings` module) instead of workspace scans.
+//!   (the `postings` module) instead of workspace scans — plus the fuzzy
+//!   discovery face ([`SymbolIndex::search_fuzzy`], the [`fuzzy`] module)
+//!   over the same declaration directory, opt-in and exact-path neutral.
 //! * **Test graph** ([`TestGraph`]): the inverted `test_of` edges from test
 //!   files to the libraries they test — the `AffectedTests` join
 //!   of the impact query, in the same CSR posture over the caller's library
@@ -62,9 +64,10 @@
 use std::collections::BTreeMap;
 
 use dartq_resolution::LibraryId;
-use dartq_source::{FileId, StringId};
+use dartq_source::{FileId, StringId, StringTable};
 
 mod capture;
+mod fuzzy;
 mod library;
 mod postings;
 mod test_graph;
@@ -72,6 +75,7 @@ mod test_graph;
 pub use capture::{
     Capturer, DeclKind, DeclRow, FileCapture, FileIndex, SuperClause, SuperEdge, capture,
 };
+pub use fuzzy::{Candidate, MatchClass, RESULT_CAP, classify, fold_query, rank};
 pub use library::{
     LibraryBuilder, LibraryIndex, NameRow, RefKind, RefRow, SubtypeEdge, TargetRef,
 };
@@ -191,6 +195,46 @@ impl SymbolIndex {
                 Some(rows.iter().map(move |decl| SymbolDecl { file, decl }))
             })
             .flatten()
+    }
+
+    /// The fuzzy discovery face: every indexed declaration whose name
+    /// fuzzy-matches `query`, best-first (the [`fuzzy`] module's ranking
+    /// spec — exact prefix, then word-boundary humps, then contiguous
+    /// substring, then sparse subsequence; ties by name length, then name
+    /// bytes), capped at [`fuzzy::RESULT_CAP`] rows.
+    ///
+    /// The candidate scan walks the decl directory's distinct names (one
+    /// linear subsequence pass per name — the module's cost posture) and
+    /// the winners' rows come off their files' equal-name runs exactly
+    /// like [`Self::symbols`] serves them, so a matched name's rows keep
+    /// the file-ascending order. This face never touches the exact
+    /// lookup's path: [`Self::symbols`] and the directories are unchanged.
+    #[must_use]
+    pub fn search_fuzzy(&self, strings: &StringTable, query: &str) -> Vec<SymbolDecl<'_>> {
+        let folded = fuzzy::fold_query(query);
+        let mut candidates: Vec<fuzzy::Candidate> = self
+            .decl_dir
+            .names()
+            .filter_map(|(name, _)| {
+                let class = fuzzy::classify(&folded, strings.resolve(name))?;
+                Some(fuzzy::Candidate { class, name })
+            })
+            .collect();
+        fuzzy::rank(&mut candidates, strings);
+        candidates
+            .into_iter()
+            .flat_map(move |candidate| {
+                self.decl_dir
+                    .units(candidate.name)
+                    .iter()
+                    .copied()
+                    .filter_map(move |file| {
+                        let rows = self.files.get(&file)?.by_name(candidate.name)?;
+                        Some(rows.iter().map(move |decl| SymbolDecl { file, decl }))
+                    })
+                    .flatten()
+            })
+            .collect()
     }
 
     /// Reverse query: every recorded reference to the declaration

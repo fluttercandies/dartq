@@ -92,7 +92,11 @@ fn run_checked(args: &IndexArgs, out: &mut impl Write) -> u8 {
     let report = built.to_json();
     let written = match args.format {
         crate::OutputFormat::Json => out
-            .write_all(serde_json::to_string(&report).expect("IndexRun serializes").as_bytes())
+            .write_all(
+                serde_json::to_string(&report)
+                    .expect("IndexRun serializes")
+                    .as_bytes(),
+            )
             .and_then(|()| out.write_all(b"\n")),
         crate::OutputFormat::Lon => crate::output::write_lon(out, &report),
         crate::OutputFormat::Text => crate::output::write_text_value(out, &report),

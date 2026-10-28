@@ -46,8 +46,8 @@ use dartq_test::report::{self, Kind};
 use dartq_test::{ExecConfig, Settled, SuiteBlock};
 
 use super::{
-    Invocation, NO_TESTS, Outputs, Sink, Tally, complete, delegate_requested, delegate_with, idle_timeout, tally,
-    terminal_width,
+    Invocation, NO_TESTS, Outputs, Sink, Tally, complete, delegate_requested, delegate_with,
+    idle_timeout, tally, terminal_width,
 };
 use crate::exit;
 
@@ -88,14 +88,18 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
     let Some(suites) = discover(&root, &inv.paths) else {
         return delegate_with(args, true, "no test suites discovered");
     };
-    if suites.iter().any(|suite| suite.abs.starts_with(root.join(INTEGRATION_TEST_DIR))) {
+    if suites
+        .iter()
+        .any(|suite| suite.abs.starts_with(root.join(INTEGRATION_TEST_DIR)))
+    {
         return delegate_with(args, true, "integration_test suites present");
     }
     let mut suites = suites;
     if let Some(base) = &inv.impacted {
         match dartq_commands::impact::impacted_tests(&root, None, base) {
             Ok(reached) => {
-                let reached: FxHashSet<PathBuf> = reached.iter().map(|rel| root.join(rel)).collect();
+                let reached: FxHashSet<PathBuf> =
+                    reached.iter().map(|rel| root.join(rel)).collect();
                 suites.retain(|suite| reached.contains(&suite.abs));
                 if suites.is_empty() {
                     eprintln!("dartq test: no suite is reachable from the changes since {base}");
@@ -111,14 +115,22 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
     // tester platform fails) report nothing. The JSON reporter announces
     // the suite count before it knows, so a JSON run whose filtering is
     // uncertain belongs to the tool.
-    let Some(filter) = dartq_test::select::TagFilter::new(&inv.include_tags, &inv.exclude_tags) else {
+    let Some(filter) = dartq_test::select::TagFilter::new(&inv.include_tags, &inv.exclude_tags)
+    else {
         return delegate_requested(args, true, inv.stats, "invalid tag selector");
     };
     let files: Vec<PathBuf> = suites.iter().map(|suite| suite.abs.clone()).collect();
     let selections = dartq_test::select::select_all(&files, &filter);
-    let json = inv.machine || inv.reporter == Some(Kind::Json) || matches!(inv.file_reporter, Some((Kind::Json, _)));
+    let json = inv.machine
+        || inv.reporter == Some(Kind::Json)
+        || matches!(inv.file_reporter, Some((Kind::Json, _)));
     if json && selections.contains(&dartq_test::select::Selection::Unknown) {
-        return delegate_requested(args, true, inv.stats, "json reporter with an uncertain selection");
+        return delegate_requested(
+            args,
+            true,
+            inv.stats,
+            "json reporter with an uncertain selection",
+        );
     }
     let selected = suites.len();
     let mut selections = selections.into_iter();
@@ -146,7 +158,14 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
         // stops improving.
         std::thread::available_parallelism().map_or(1, |cores| (cores.get() * 3 / 4).max(1))
     });
-    let plan = Plan { root, flutter, inv, suites, selected, workers };
+    let plan = Plan {
+        root,
+        flutter,
+        inv,
+        suites,
+        selected,
+        workers,
+    };
     match execute(&plan) {
         Ok(code) => code,
         Err(error) => {
@@ -217,7 +236,11 @@ fn discover(root: &Path, selections: &[String]) -> Option<Vec<Suite>> {
         if selection.contains(['?', '#', '%']) {
             return None;
         }
-        let path = if Path::new(selection).is_absolute() { PathBuf::from(selection) } else { root.join(selection) };
+        let path = if Path::new(selection).is_absolute() {
+            PathBuf::from(selection)
+        } else {
+            root.join(selection)
+        };
         let path = dartq_source::normalize_lexical(&path);
         if path.is_dir() {
             let mut found = Vec::new();
@@ -246,7 +269,9 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
         let path = entry.path();
         if kind.is_dir() {
             walk(&path, out)?;
-        } else if path.to_string_lossy().ends_with("_test.dart") && std::fs::metadata(&path).is_ok_and(|meta| meta.is_file()) {
+        } else if path.to_string_lossy().ends_with("_test.dart")
+            && std::fs::metadata(&path).is_ok_and(|meta| meta.is_file())
+        {
             out.push(path);
         }
     }
@@ -261,7 +286,6 @@ struct Stats {
     ran: usize,
 }
 
-
 /// Run the plan: replay what the cache proves, run the rest in leased
 /// `flutter test` shards, and emit every suite's events in selection order
 /// as soon as every suite before it settled.
@@ -274,7 +298,11 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     let special = report::color_default();
     let color = special && tool_supports_color();
     let args = plan.inv.pass.clone();
-    let runner = dartq_test::Runner { bin: &plan.flutter, args: &args, flutter: true };
+    let runner = dartq_test::Runner {
+        bin: &plan.flutter,
+        args: &args,
+        flutter: true,
+    };
 
     let mut cache = (!plan.inv.no_cache).then(|| dartq_test::Cache::open(root));
     let abs: Vec<PathBuf> = plan.suites.iter().map(|suite| suite.abs.clone()).collect();
@@ -287,8 +315,10 @@ fn execute(plan: &Plan) -> io::Result<u8> {
         }
         None => vec![None; abs.len()],
     };
-    let refusals: Vec<Option<dartq_test::Refusal>> =
-        cache.as_ref().map(|cache| cache.refusals().to_vec()).unwrap_or_default();
+    let refusals: Vec<Option<dartq_test::Refusal>> = cache
+        .as_ref()
+        .map(|cache| cache.refusals().to_vec())
+        .unwrap_or_default();
 
     // Every suite path is absolute, so the tool always prints it.
     let opts = report::Options {
@@ -302,7 +332,9 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     let kind = if plan.inv.machine {
         Kind::Json
     } else {
-        plan.inv.reporter.unwrap_or_else(|| Kind::default_for(special))
+        plan.inv
+            .reporter
+            .unwrap_or_else(|| Kind::default_for(special))
     };
     let stdout: Box<dyn Write> = Box::new(BufWriter::new(io::stdout()));
     let mut outputs = Outputs {
@@ -314,8 +346,18 @@ fn execute(plan: &Plan) -> io::Result<u8> {
                     std::fs::create_dir_all(dir)?;
                 }
                 let file: Box<dyn Write> = Box::new(BufWriter::new(std::fs::File::create(&path)?));
-                let file_opts = report::Options { color: false, ..opts.clone() };
-                Some(Sink::file(*kind, &file_opts, file, None, started, plan.suites.len())?)
+                let file_opts = report::Options {
+                    color: false,
+                    ..opts.clone()
+                };
+                Some(Sink::file(
+                    *kind,
+                    &file_opts,
+                    file,
+                    None,
+                    started,
+                    plan.suites.len(),
+                )?)
             }
             None => None,
         },
@@ -341,7 +383,10 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     // each parsed on its own core.
     let replayed: Vec<Option<Vec<Json>>> = keys
         .par_iter()
-        .map(|key| key.as_deref().and_then(|key| cache.as_ref().and_then(|cache| cache.lookup(key))))
+        .map(|key| {
+            key.as_deref()
+                .and_then(|key| cache.as_ref().and_then(|cache| cache.lookup(key)))
+        })
         .collect();
     for (index, events) in replayed.into_iter().enumerate() {
         match events {
@@ -352,17 +397,32 @@ fn execute(plan: &Plan) -> io::Result<u8> {
             None => to_run.push(index),
         }
     }
-    let mut emit = |slots: &mut Vec<Option<Vec<Json>>>, outputs: &mut Outputs, totals: &mut Tally| -> io::Result<()> {
+    let mut emit = |slots: &mut Vec<Option<Vec<Json>>>,
+                    outputs: &mut Outputs,
+                    totals: &mut Tally|
+     -> io::Result<()> {
         while emitted < slots.len() {
-            let Some(mut events) = slots[emitted].take() else { break };
+            let Some(mut events) = slots[emitted].take() else {
+                break;
+            };
             if events.is_empty() {
                 emitted += 1;
                 continue;
             }
-            let first = events.iter().find_map(|event| event.u64_at(&["time"])).unwrap_or(0);
-            let now = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX).max(clock);
+            let first = events
+                .iter()
+                .find_map(|event| event.u64_at(&["time"]))
+                .unwrap_or(0);
+            let now = u64::try_from(started.elapsed().as_millis())
+                .unwrap_or(u64::MAX)
+                .max(clock);
             report::rebase(&mut events, &mut next_id, now.saturating_sub(first));
-            clock = events.iter().filter_map(|event| event.u64_at(&["time"])).max().unwrap_or(clock).max(clock);
+            clock = events
+                .iter()
+                .filter_map(|event| event.u64_at(&["time"]))
+                .max()
+                .unwrap_or(clock)
+                .max(clock);
             let tally = tally(&events);
             totals.passed += tally.passed;
             totals.skipped += tally.skipped;
@@ -395,8 +455,12 @@ fn execute(plan: &Plan) -> io::Result<u8> {
         }
     }
     if !to_run.is_empty() {
-        let index_of: FxHashMap<&Path, usize> =
-            plan.suites.iter().enumerate().map(|(index, suite)| (suite.abs.as_path(), index)).collect();
+        let index_of: FxHashMap<&Path, usize> = plan
+            .suites
+            .iter()
+            .enumerate()
+            .map(|(index, suite)| (suite.abs.as_path(), index))
+            .collect();
         let outcome = run_shards(plan, &args, &to_run, &index_of, &mut |index, block| {
             stats.ran += 1;
             if complete(&block) && tally(&block.events).green {
@@ -424,7 +488,10 @@ fn execute(plan: &Plan) -> io::Result<u8> {
 
     if let Some(cache) = cache.as_mut() {
         let indices: Vec<usize> = staged.keys().copied().collect();
-        let files: Vec<PathBuf> = indices.iter().map(|&index| plan.suites[index].abs.clone()).collect();
+        let files: Vec<PathBuf> = indices
+            .iter()
+            .map(|&index| plan.suites[index].abs.clone())
+            .collect();
         let mut verified: FxHashSet<String> = FxHashSet::default();
         match cache.rekey(&files, runner) {
             Ok(after) => {
@@ -448,7 +515,11 @@ fn execute(plan: &Plan) -> io::Result<u8> {
     eprint!("{tool_stderr}");
     if plan.inv.stats {
         let refusals = super::refusal_summary(&refusals);
-        let refusals = if refusals.is_empty() { String::new() } else { format!(" ({refusals})") };
+        let refusals = if refusals.is_empty() {
+            String::new()
+        } else {
+            format!(" ({refusals})")
+        };
         eprintln!(
             "dartq test: {} suites — {} replayed, {} grouped, {} stock{} ({:.1}s)",
             plan.suites.len(),
@@ -488,10 +559,13 @@ fn tool_supports_color() -> bool {
 /// The VM the tool's `Platform.executable` names (the compact reporter's
 /// rerun hint): the Dart SDK inside the Flutter SDK's cache.
 fn flutter_dart(flutter: &Path) -> PathBuf {
-    let resolved = flutter.canonicalize().unwrap_or_else(|_| flutter.to_path_buf());
-    resolved
-        .parent()
-        .map_or_else(|| PathBuf::from("dart"), |bin| bin.join("cache").join("dart-sdk").join("bin").join("dart"))
+    let resolved = flutter
+        .canonicalize()
+        .unwrap_or_else(|_| flutter.to_path_buf());
+    resolved.parent().map_or_else(
+        || PathBuf::from("dart"),
+        |bin| bin.join("cache").join("dart-sdk").join("bin").join("dart"),
+    )
 }
 
 /// Why the tool would resolve packages before running (`Pub.get`), when it
@@ -510,15 +584,28 @@ fn stale_resolution(root: &Path, flutter: &Path) -> Option<&'static str> {
     let generator = std::fs::read_to_string(&config)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|value| value.get("generator").and_then(|generator| generator.as_str().map(str::to_owned)));
-    if generator.as_deref().is_some_and(|generator| generator != "pub") {
+        .and_then(|value| {
+            value
+                .get("generator")
+                .and_then(|generator| generator.as_str().map(str::to_owned))
+        });
+    if generator
+        .as_deref()
+        .is_some_and(|generator| generator != "pub")
+    {
         // Another generator's configuration is left alone: current.
         return None;
     }
-    let modified = |path: &Path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok();
-    let (Some(pubspec), Some(lock), Some(config_time)) =
-        (modified(&root.join("pubspec.yaml")), modified(&workspace.join("pubspec.lock")), modified(&config))
-    else {
+    let modified = |path: &Path| {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+    };
+    let (Some(pubspec), Some(lock), Some(config_time)) = (
+        modified(&root.join("pubspec.yaml")),
+        modified(&workspace.join("pubspec.lock")),
+        modified(&config),
+    ) else {
         return Some("resolution inputs missing — run flutter pub get");
     };
     let recorded = std::fs::read_to_string(workspace.join(".dart_tool").join("version")).ok();
@@ -538,7 +625,13 @@ fn stale_resolution(root: &Path, flutter: &Path) -> Option<&'static str> {
 /// The Flutter SDK's framework version (`bin/cache/flutter.version.json`).
 fn framework_version(flutter: &Path) -> Option<String> {
     let resolved = flutter.canonicalize().ok()?;
-    let text = std::fs::read_to_string(resolved.parent()?.join("cache").join("flutter.version.json")).ok()?;
+    let text = std::fs::read_to_string(
+        resolved
+            .parent()?
+            .join("cache")
+            .join("flutter.version.json"),
+    )
+    .ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     Some(value.get("frameworkVersion")?.as_str()?.to_owned())
 }
@@ -572,17 +665,25 @@ fn run_shards(
     let wanted = target.div_ceil(SUITES_PER_SHARD);
     let deadline = Instant::now() + idle_timeout();
     let (lease, workers) = dartq_test::lease_processes(profile, target, wanted, deadline)?
-        .ok_or_else(|| io::Error::other("timed out waiting for host memory held by other dartq runs"))?;
+        .ok_or_else(|| {
+            io::Error::other("timed out waiting for host memory held by other dartq runs")
+        })?;
     let (shards, workers) = match &lease {
         Some(lease) => dartq_test::split(profile, lease.units(), target, wanted),
         None => (wanted.min(workers).max(1), workers),
     };
     let per_shard = workers.div_ceil(shards).max(1);
     let durations = dartq_test::group::Durations::load(root);
-    let files: Vec<PathBuf> = indices.iter().map(|&index| plan.suites[index].abs.clone()).collect();
+    let files: Vec<PathBuf> = indices
+        .iter()
+        .map(|&index| plan.suites[index].abs.clone())
+        .collect();
     let parts = dartq_test::group::shard(&files, shards, |suite| durations.get(root, suite));
-    let shard_of: FxHashMap<&Path, usize> =
-        parts.iter().enumerate().flat_map(|(shard, part)| part.iter().map(move |abs| (abs.as_path(), shard))).collect();
+    let shard_of: FxHashMap<&Path, usize> = parts
+        .iter()
+        .enumerate()
+        .flat_map(|(shard, part)| part.iter().map(move |abs| (abs.as_path(), shard)))
+        .collect();
 
     let (sender, receiver) = std::sync::mpsc::channel::<dartq_test::Streamed>();
     let mut settled: FxHashSet<usize> = FxHashSet::default();
@@ -632,26 +733,53 @@ fn run_shards(
             if failure.is_some() {
                 continue;
             }
-            let Some(index) = index_of.get(Path::new(&block.path)).copied() else { continue };
+            let Some(index) = index_of.get(Path::new(&block.path)).copied() else {
+                continue;
+            };
             if let Some(ms) = block_duration(&block.events) {
-                recorded.push((plan.suites[index].abs.strip_prefix(root).unwrap_or(&plan.suites[index].abs).to_path_buf(), ms));
+                recorded.push((
+                    plan.suites[index]
+                        .abs
+                        .strip_prefix(root)
+                        .unwrap_or(&plan.suites[index].abs)
+                        .to_path_buf(),
+                    ms,
+                ));
             }
             settled.insert(index);
             if let Err(error) = on_block(index, block) {
                 failure = Some(error);
             }
         }
-        results = handles.into_iter().map(|handle| handle.join().ok()).collect();
+        results = handles
+            .into_iter()
+            .map(|handle| handle.join().ok())
+            .collect();
     });
     drop(lease);
-    let peak: u64 = results.iter().flatten().flatten().map(|execution| execution.peak_rss).sum();
-    let tester: u64 = results.iter().flatten().flatten().map(|execution| execution.peak_tester_rss).max().unwrap_or(0);
+    let peak: u64 = results
+        .iter()
+        .flatten()
+        .flatten()
+        .map(|execution| execution.peak_rss)
+        .sum();
+    let tester: u64 = results
+        .iter()
+        .flatten()
+        .flatten()
+        .map(|execution| execution.peak_tester_rss)
+        .max()
+        .unwrap_or(0);
     profile.observe("flutter", peak, tester, workers, parts.len());
     durations.record(root, &recorded);
     if let Some(error) = failure {
         return Err(error);
     }
-    let mut leftover = Leftover { lost: Vec::new(), loose: Vec::new(), stderr: String::new() };
+    let mut leftover = Leftover {
+        lost: Vec::new(),
+        loose: Vec::new(),
+        stderr: String::new(),
+    };
     let mut finished = vec![false; parts.len()];
     for (shard, result) in results.into_iter().enumerate() {
         match result {
@@ -679,7 +807,11 @@ fn run_shards(
     }
     for &index in indices.iter().filter(|index| !settled.contains(index)) {
         let abs = plan.suites[index].abs.as_path();
-        let events = if finished[shard_of[abs]] { Vec::new() } else { super::lost_suite(&abs.to_string_lossy()) };
+        let events = if finished[shard_of[abs]] {
+            Vec::new()
+        } else {
+            super::lost_suite(&abs.to_string_lossy())
+        };
         leftover.lost.push((index, events));
     }
     Ok(leftover)
@@ -697,7 +829,9 @@ fn runner_args(pass: &[String], color: bool) -> Option<Vec<String>> {
     }
     let value = |name: &str| -> Vec<String> {
         let prefix = format!("--{name}=");
-        pass.iter().filter_map(|token| token.strip_prefix(&prefix).map(str::to_owned)).collect()
+        pass.iter()
+            .filter_map(|token| token.strip_prefix(&prefix).map(str::to_owned))
+            .collect()
     };
     let flag = |name: &str| pass.iter().any(|token| token == &format!("--{name}"));
     if let Some(timeout) = value("timeout").pop() {
@@ -752,7 +886,10 @@ fn build_args(pass: &[String]) -> Vec<String> {
         "--enable-hcpp",
         "--no-enable-hcpp",
     ];
-    pass.iter().filter(|token| SHAPING.iter().any(|shape| token.starts_with(shape))).cloned().collect()
+    pass.iter()
+        .filter(|token| SHAPING.iter().any(|shape| token.starts_with(shape)))
+        .cloned()
+        .collect()
 }
 
 /// Run `indices` through the grouped pass. Each suite proven green with
@@ -771,20 +908,37 @@ fn grouped_pass(
     if std::env::var_os("DARTQ_TEST_NO_GROUP").is_some() {
         return Ok(false);
     }
-    let Some(runner_args) = runner_args(args, tool_supports_color() && report::color_default()) else {
+    let Some(runner_args) = runner_args(args, tool_supports_color() && report::color_default())
+    else {
         return Ok(false);
     };
-    let Ok(flutter) = plan.flutter.canonicalize() else { return Ok(false) };
-    let Some(sdk) = flutter.parent().and_then(Path::parent) else { return Ok(false) };
-    let vm = sdk.join("bin").join("cache").join("dart-sdk").join("bin").join("dart");
-    let tool_packages = sdk.join("packages").join("flutter_tools").join(".dart_tool").join("package_config.json");
+    let Ok(flutter) = plan.flutter.canonicalize() else {
+        return Ok(false);
+    };
+    let Some(sdk) = flutter.parent().and_then(Path::parent) else {
+        return Ok(false);
+    };
+    let vm = sdk
+        .join("bin")
+        .join("cache")
+        .join("dart-sdk")
+        .join("bin")
+        .join("dart");
+    let tool_packages = sdk
+        .join("packages")
+        .join("flutter_tools")
+        .join(".dart_tool")
+        .join("package_config.json");
     if !vm.is_file() || !tool_packages.is_file() {
         return Ok(false);
     }
     let Some(recipe) = dartq_test::flutter::Recipe::load(&flutter, root, &build_args(args))? else {
         return Ok(false);
     };
-    let files: Vec<PathBuf> = indices.iter().map(|&index| plan.suites[index].abs.clone()).collect();
+    let files: Vec<PathBuf> = indices
+        .iter()
+        .map(|&index| plan.suites[index].abs.clone())
+        .collect();
     let placements = dartq_test::flutter::place(root, &files)?;
     let mut hosted: Vec<Hosted> = Vec::new();
     let mut hosted_index: Vec<usize> = Vec::new();
@@ -794,7 +948,11 @@ fn grouped_pass(
             continue;
         }
         let (configs, _) = dartq_test::cache::flutter_inputs(root, file);
-        hosted.push(Hosted { path: file.clone(), config: configs.into_iter().next(), fresh: *placement == Placement::Fresh });
+        hosted.push(Hosted {
+            path: file.clone(),
+            config: configs.into_iter().next(),
+            fresh: *placement == Placement::Fresh,
+        });
         hosted_index.push(index);
     }
     if hosted.len() < 2 {
@@ -811,10 +969,14 @@ fn grouped_pass(
     let profile = dartq_test::Profile::FLUTTER_GROUPED.calibrated("flutter-grouped");
     let deadline = Instant::now() + idle_timeout();
     let target = plan.workers.min(hosted.len()).max(1);
-    let (lease, workers) = dartq_test::lease(profile, target, deadline)?
-        .ok_or_else(|| io::Error::other("timed out waiting for host memory held by other dartq runs"))?;
-    let index_of: FxHashMap<&Path, usize> =
-        hosted.iter().zip(&hosted_index).map(|(suite, &index)| (suite.path.as_path(), index)).collect();
+    let (lease, workers) = dartq_test::lease(profile, target, deadline)?.ok_or_else(|| {
+        io::Error::other("timed out waiting for host memory held by other dartq runs")
+    })?;
+    let index_of: FxHashMap<&Path, usize> = hosted
+        .iter()
+        .zip(&hosted_index)
+        .map(|(suite, &index)| (suite.path.as_path(), index))
+        .collect();
     let (sender, receiver) = std::sync::mpsc::channel::<dartq_test::Streamed>();
     let cfg = ExecConfig {
         dart_bin: PathBuf::new(),
@@ -854,7 +1016,9 @@ fn grouped_pass(
             if failure.is_some() {
                 continue;
             }
-            let Some(&index) = index_of.get(Path::new(&block.path)) else { continue };
+            let Some(&index) = index_of.get(Path::new(&block.path)) else {
+                continue;
+            };
             if !(block.clean && complete(&block) && tally(&block.events).green) {
                 continue;
             }
@@ -883,7 +1047,12 @@ fn grouped_pass(
         );
     }
     dartq_test::group::Durations::load(root).record(root, &recorded);
-    stock.extend(hosted_index.iter().copied().filter(|index| !settled.contains(index)));
+    stock.extend(
+        hosted_index
+            .iter()
+            .copied()
+            .filter(|index| !settled.contains(index)),
+    );
     stock.sort_unstable();
     Ok(true)
 }
@@ -900,7 +1069,10 @@ const SUITES_PER_SHARD: usize = 2;
 /// The span between a block's first and last `time` stamp.
 fn block_duration(events: &[Json]) -> Option<u64> {
     let first = events.iter().find_map(|event| event.u64_at(&["time"]))?;
-    let last = events.iter().rev().find_map(|event| event.u64_at(&["time"]))?;
+    let last = events
+        .iter()
+        .rev()
+        .find_map(|event| event.u64_at(&["time"]))?;
     Some(last.saturating_sub(first))
 }
 
@@ -913,26 +1085,55 @@ mod tests {
     fn discovery_matches_the_tool() {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = tmp.path().canonicalize().expect("canonical");
-        for rel in ["test/a_test.dart", "test/sub/b_test.dart", "test/helper.dart", "test/.hidden/c_test.dart", "other/d_test.dart"] {
+        for rel in [
+            "test/a_test.dart",
+            "test/sub/b_test.dart",
+            "test/helper.dart",
+            "test/.hidden/c_test.dart",
+            "other/d_test.dart",
+        ] {
             let path = root.join(rel);
             fs::create_dir_all(path.parent().expect("parent")).expect("dir");
             fs::write(&path, "void main() {}").expect("write");
         }
         // No selection: everything under `test/`, hidden directories
         // included, absolute.
-        let mut all: Vec<PathBuf> = discover(&root, &[]).expect("found").into_iter().map(|suite| suite.abs).collect();
-        all.sort();
-        assert_eq!(
-            all,
-            ["test/.hidden/c_test.dart", "test/a_test.dart", "test/sub/b_test.dart"].map(|rel| root.join(rel)).to_vec()
-        );
-        // Selections: directories and files, normalized, each file once.
-        let picked: Vec<PathBuf> = discover(&root, &["./test/sub/../a_test.dart".to_owned(), "other".to_owned(), "test/a_test.dart".to_owned()])
+        let mut all: Vec<PathBuf> = discover(&root, &[])
             .expect("found")
             .into_iter()
             .map(|suite| suite.abs)
             .collect();
-        assert_eq!(picked, [root.join("test/a_test.dart"), root.join("other/d_test.dart")]);
+        all.sort();
+        assert_eq!(
+            all,
+            [
+                "test/.hidden/c_test.dart",
+                "test/a_test.dart",
+                "test/sub/b_test.dart"
+            ]
+            .map(|rel| root.join(rel))
+            .to_vec()
+        );
+        // Selections: directories and files, normalized, each file once.
+        let picked: Vec<PathBuf> = discover(
+            &root,
+            &[
+                "./test/sub/../a_test.dart".to_owned(),
+                "other".to_owned(),
+                "test/a_test.dart".to_owned(),
+            ],
+        )
+        .expect("found")
+        .into_iter()
+        .map(|suite| suite.abs)
+        .collect();
+        assert_eq!(
+            picked,
+            [
+                root.join("test/a_test.dart"),
+                root.join("other/d_test.dart")
+            ]
+        );
         // The tool's own errors: a missing file, a selector query, an
         // empty test directory.
         assert!(discover(&root, &["test/missing_test.dart".to_owned()]).is_none());
@@ -949,16 +1150,28 @@ mod tests {
         let sdk = root.join("sdk");
         fs::create_dir_all(sdk.join("bin/cache")).expect("sdk");
         fs::write(sdk.join("bin/flutter"), "").expect("flutter");
-        fs::write(sdk.join("bin/cache/flutter.version.json"), r#"{"frameworkVersion":"3.0.0"}"#).expect("version");
+        fs::write(
+            sdk.join("bin/cache/flutter.version.json"),
+            r#"{"frameworkVersion":"3.0.0"}"#,
+        )
+        .expect("version");
         let flutter = sdk.join("bin/flutter");
         let pkg = root.join("pkg");
         fs::create_dir_all(pkg.join(".dart_tool")).expect("pkg");
         let at = |path: &Path, secs: u64| {
-            filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(i64::try_from(secs).expect("small"), 0)).expect("mtime");
+            filetime::set_file_mtime(
+                path,
+                filetime::FileTime::from_unix_time(i64::try_from(secs).expect("small"), 0),
+            )
+            .expect("mtime");
         };
         fs::write(pkg.join("pubspec.yaml"), "name: p").expect("pubspec");
         fs::write(pkg.join("pubspec.lock"), "packages: {}").expect("lock");
-        fs::write(pkg.join(".dart_tool/package_config.json"), r#"{"configVersion":2,"packages":[],"generator":"pub"}"#).expect("config");
+        fs::write(
+            pkg.join(".dart_tool/package_config.json"),
+            r#"{"configVersion":2,"packages":[],"generator":"pub"}"#,
+        )
+        .expect("config");
         fs::write(pkg.join(".dart_tool/version"), "3.0.0").expect("stamp");
         at(&pkg.join("pubspec.yaml"), 100);
         at(&pkg.join("pubspec.lock"), 200);
@@ -973,9 +1186,16 @@ mod tests {
         );
         at(&pkg.join("pubspec.yaml"), 100);
         fs::write(pkg.join(".dart_tool/version"), "2.9.0").expect("stamp");
-        assert_eq!(stale_resolution(&pkg, &flutter), Some("the resolution is from another Flutter — run flutter pub get"));
+        assert_eq!(
+            stale_resolution(&pkg, &flutter),
+            Some("the resolution is from another Flutter — run flutter pub get")
+        );
         // A configuration another generator wrote is left alone.
-        fs::write(pkg.join(".dart_tool/package_config.json"), r#"{"configVersion":2,"packages":[],"generator":"bazel"}"#).expect("config");
+        fs::write(
+            pkg.join(".dart_tool/package_config.json"),
+            r#"{"configVersion":2,"packages":[],"generator":"bazel"}"#,
+        )
+        .expect("config");
         assert_eq!(stale_resolution(&pkg, &flutter), None);
     }
 
@@ -986,18 +1206,35 @@ mod tests {
     fn state_reasons_name_the_missing_precondition() {
         let tmp = tempfile::tempdir().expect("tmp");
         let root = tmp.path();
-        assert_eq!(state_reason(root, false).as_deref(), Some("no pubspec.yaml here"));
+        assert_eq!(
+            state_reason(root, false).as_deref(),
+            Some("no pubspec.yaml here")
+        );
         fs::write(root.join("pubspec.yaml"), "name: p\n").expect("write");
         let reason = state_reason(root, false).expect("stale");
         assert!(reason.contains("package_config.json"), "{reason}");
         assert!(reason.contains("run flutter pub get"), "{reason}");
         fs::create_dir_all(root.join(".dart_tool")).expect("dir");
-        fs::write(root.join(".dart_tool/package_config.json"), r#"{"configVersion":2,"packages":[]}"#).expect("write");
-        assert_eq!(state_reason(root, false), None, "a resolved, config-less package runs here");
+        fs::write(
+            root.join(".dart_tool/package_config.json"),
+            r#"{"configVersion":2,"packages":[]}"#,
+        )
+        .expect("write");
+        assert_eq!(
+            state_reason(root, false),
+            None,
+            "a resolved, config-less package runs here"
+        );
         fs::write(root.join("dart_test.yaml"), "concurrency: 2\n").expect("write");
-        assert_eq!(state_reason(root, false).as_deref(), Some("dart_test.yaml present"));
+        assert_eq!(
+            state_reason(root, false).as_deref(),
+            Some("dart_test.yaml present")
+        );
         fs::remove_file(root.join("dart_test.yaml")).expect("remove");
-        assert_eq!(state_reason(root, true).as_deref(), Some("global dart_test config present"));
+        assert_eq!(
+            state_reason(root, true).as_deref(),
+            Some("global dart_test config present")
+        );
     }
 
     /// The `package:test` arguments the tool hands its runner: no color by

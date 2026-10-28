@@ -74,7 +74,10 @@ fn display_dir(root: &Path, dir: &Path) -> String {
     }
 }
 
-fn write_human(out: &mut impl Write, listing: &dartq_commands::packages::PackageInventory) -> io::Result<()> {
+fn write_human(
+    out: &mut impl Write,
+    listing: &dartq_commands::packages::PackageInventory,
+) -> io::Result<()> {
     let root = &listing.universe.root;
     writeln!(out, "universe: {}", root.display())?;
     if listing.universe.layout.is_none() {
@@ -85,8 +88,16 @@ fn write_human(out: &mut impl Write, listing: &dartq_commands::packages::Package
     }
     for entry in &listing.report.packages {
         let dir = display_dir(root, &entry.dir);
-        let resolved = if entry.resolved { "resolved" } else { "unresolved" };
-        let note = entry.note.as_deref().map(|note| format!("  [{note}]")).unwrap_or_default();
+        let resolved = if entry.resolved {
+            "resolved"
+        } else {
+            "unresolved"
+        };
+        let note = entry
+            .note
+            .as_deref()
+            .map(|note| format!("  [{note}]"))
+            .unwrap_or_default();
         writeln!(
             out,
             "{:<18} {:<24} {:<10} {:<14} {}{}",
@@ -104,7 +115,11 @@ fn write_human(out: &mut impl Write, listing: &dartq_commands::packages::Package
             "{:<18} {}{}",
             boundary.reason.as_str(),
             display_dir(root, &boundary.dir),
-            boundary.detail.as_deref().map(|d| format!(" ({d})")).unwrap_or_default()
+            boundary
+                .detail
+                .as_deref()
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default()
         )?;
     }
     let unresolved: Vec<_> = listing
@@ -179,7 +194,10 @@ fn boundary_row(boundary: &dartq_pub::universe::BoundaryEntry) -> serde_json::Va
     })
 }
 
-fn write_json(out: &mut impl Write, listing: &dartq_commands::packages::PackageInventory) -> io::Result<()> {
+fn write_json(
+    out: &mut impl Write,
+    listing: &dartq_commands::packages::PackageInventory,
+) -> io::Result<()> {
     let line = serde_json::json!({
         "v": dartq_commands::SCHEMA_VERSION,
         "type": "universe",
@@ -245,14 +263,19 @@ mod tests {
     fn renderers_shape_every_face() {
         let root = Path::new("/w/uni");
         let listing = PackageInventory {
-            universe: Universe { root: root.to_path_buf(), layout: None },
+            universe: Universe {
+                root: root.to_path_buf(),
+                layout: None,
+            },
             report: ScanReport {
                 root: root.to_path_buf(),
                 packages: vec![
                     PackageEntry {
                         dir: root.join("pkgs").join("a"),
                         name: Some("a".to_owned()),
-                        kind: PackageKind::WorkspaceMember { root: root.to_path_buf() },
+                        kind: PackageKind::WorkspaceMember {
+                            root: root.to_path_buf(),
+                        },
                         sdk: Some("^3.5.0".to_owned()),
                         resolved: true,
                         note: None,
@@ -296,18 +319,41 @@ mod tests {
         let human = String::from_utf8(human).expect("utf-8");
         assert!(human.contains("universe: /w/uni"), "{human}");
         assert!(human.contains("no pubspec inside this checkout"), "{human}");
-        assert!(human.contains("pkgs/a") && !human.contains("/w/uni/pkgs/a"), "inside dirs are relative: {human}");
-        let member_row = human.lines().find(|line| line.contains("pkgs/a")).expect("member row");
         assert!(
-            member_row.contains("workspace-member") && member_row.contains("a") && member_row.contains("resolved"),
+            human.contains("pkgs/a") && !human.contains("/w/uni/pkgs/a"),
+            "inside dirs are relative: {human}"
+        );
+        let member_row = human
+            .lines()
+            .find(|line| line.contains("pkgs/a"))
+            .expect("member row");
+        assert!(
+            member_row.contains("workspace-member")
+                && member_row.contains("a")
+                && member_row.contains("resolved"),
             "{member_row}"
         );
-        let vendor_row = human.lines().find(|line| line.contains("vendor/x")).expect("vendor row");
-        assert!(vendor_row.contains("independent") && vendor_row.contains("unresolved"), "{vendor_row}");
-        let hidden = human.lines().find(|line| line.contains(".stash")).expect("hidden boundary");
+        let vendor_row = human
+            .lines()
+            .find(|line| line.contains("vendor/x"))
+            .expect("vendor row");
+        assert!(
+            vendor_row.contains("independent") && vendor_row.contains("unresolved"),
+            "{vendor_row}"
+        );
+        let hidden = human
+            .lines()
+            .find(|line| line.contains(".stash"))
+            .expect("hidden boundary");
         assert!(hidden.contains("hidden-tree"), "{hidden}");
-        let built = human.lines().find(|line| line.contains("build-tree")).expect("build boundary");
-        assert!(built.contains("build (contains build/pkg/pubspec.yaml)"), "{built}");
+        let built = human
+            .lines()
+            .find(|line| line.contains("build-tree"))
+            .expect("build boundary");
+        assert!(
+            built.contains("build (contains build/pkg/pubspec.yaml)"),
+            "{built}"
+        );
         assert!(
             human.contains("run `dart pub get` in /w/uni/solo (needs SDK ^3.6.0)"),
             "the unresolved hint: {human}"
@@ -360,7 +406,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("dqs-pkgs-ok-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("lib")).expect("dir");
-        std::fs::write(root.join("pubspec.yaml"), "name: fx\nenvironment:\n  sdk: ^3.5.0\n").expect("pubspec");
+        std::fs::write(
+            root.join("pubspec.yaml"),
+            "name: fx\nenvironment:\n  sdk: ^3.5.0\n",
+        )
+        .expect("pubspec");
         let ok = root.display().to_string();
         assert_eq!(run_entry(&parse(&[&ok]).expect("parse")), exit::CLEAN);
 

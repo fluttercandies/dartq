@@ -141,6 +141,14 @@ impl<U: Copy + Ord> Postings<U> {
         self.dir.get(&name).map_or(&[], Vec::as_slice)
     }
 
+    /// Every distinct listed name with its unit list, in the map's
+    /// iteration order (nondeterministic — the discovery face's consumers
+    /// rank by a total order before any output, so the order never
+    /// reaches an answer).
+    pub fn names(&self) -> impl Iterator<Item = (StringId, &[U])> + '_ {
+        self.dir.iter().map(|(&name, units)| (name, units.as_slice()))
+    }
+
     /// Whether nothing is listed — the update law's no-dead-entries
     /// invariant, asserted by the tests.
     #[cfg(test)]

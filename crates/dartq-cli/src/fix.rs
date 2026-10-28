@@ -78,8 +78,9 @@ pub(crate) struct FixArgs {
 /// The `--role` parser: the exact spellings, a usage-tier message on
 /// anything else.
 fn parse_role(text: &str) -> Result<fix::FixRole, String> {
-    fix::FixRole::parse(text)
-        .ok_or_else(|| format!("invalid role '{text}': one of primary, ignore_line, ignore_file, suppress"))
+    fix::FixRole::parse(text).ok_or_else(|| {
+        format!("invalid role '{text}': one of primary, ignore_line, ignore_file, suppress")
+    })
 }
 
 #[derive(Args)]
@@ -166,14 +167,22 @@ fn write_human(
             // The cross-file row names the file it creates, at the head
             // the content lands at — never the hit file's coordinates.
             let (file, line, column) = match &fix_row.target {
-                Some(target) => (target.as_str(), fix_row.edit.anchor.line, fix_row.edit.anchor.column),
+                Some(target) => (
+                    target.as_str(),
+                    fix_row.edit.anchor.line,
+                    fix_row.edit.anchor.column,
+                ),
                 None => (
                     set.path.as_str(),
                     fix_row.edit.anchor.line,
                     fix_row.edit.anchor.column,
                 ),
             };
-            write!(out, "{file}:{line}:{column} • {} • {}", fix_row.rule, fix_row.message)?;
+            write!(
+                out,
+                "{file}:{line}:{column} • {} • {}",
+                fix_row.rule, fix_row.message
+            )?;
             consumed += write_status(out, status.get(consumed), &mut applied, &mut stale)?;
         }
         for plugin_row in &set.plugin {
@@ -242,9 +251,7 @@ fn write_status(
 /// Crash tier like the other faces: a panic aborts with exit 4 and stdout
 /// kept empty, because [`run`] writes only after the run succeeded.
 pub(crate) fn run_entry(args: &FixArgs) -> u8 {
-    let outcome = crate::crash_tier(|| {
-        run(args, &mut io::BufWriter::new(io::stdout().lock()))
-    });
+    let outcome = crate::crash_tier(|| run(args, &mut io::BufWriter::new(io::stdout().lock())));
     let Ok(code) = outcome else {
         eprintln!("dartq: internal error: analysis panicked");
         return exit::INTERNAL_ERROR;
@@ -254,9 +261,8 @@ pub(crate) fn run_entry(args: &FixArgs) -> u8 {
 
 /// Crash tier for the assists face (same contract as [`run_entry`]).
 pub(crate) fn run_assists_entry(args: &AssistsArgs) -> u8 {
-    let outcome = crate::crash_tier(|| {
-        run_assists(args, &mut io::BufWriter::new(io::stdout().lock()))
-    });
+    let outcome =
+        crate::crash_tier(|| run_assists(args, &mut io::BufWriter::new(io::stdout().lock())));
     let Ok(code) = outcome else {
         eprintln!("dartq: internal error: analysis panicked");
         return exit::INTERNAL_ERROR;
@@ -498,7 +504,12 @@ fn apply_and_report(
             for (row_index, fix_row) in set.fixes.iter().enumerate() {
                 match &fix_row.target {
                     Some(target) => {
-                        created.push((target, fix_row.edit.replacement.as_str(), set_index, row_index));
+                        created.push((
+                            target,
+                            fix_row.edit.replacement.as_str(),
+                            set_index,
+                            row_index,
+                        ));
                         statuses.push(EditOutcome::Applied);
                     }
                     None => statuses.push(same_file.next().unwrap_or(EditOutcome::Stale)),
@@ -599,7 +610,11 @@ mod tests {
         let args = parse(&["fix", "--dry-run", "--format=json", "/tmp/w"]);
         assert!(args.dry_run);
         assert!(matches!(args.format, crate::OutputFormat::Json));
-        assert_eq!(args.paths, vec![PathBuf::from("/tmp/w")], "default target cwd");
+        assert_eq!(
+            args.paths,
+            vec![PathBuf::from("/tmp/w")],
+            "default target cwd"
+        );
 
         // The role axis: primary is the default; the three suppression
         // spellings parse; anything else is clap's usage tier.
@@ -821,8 +836,7 @@ mod tests {
         };
         let line_comment =
             fix::ignore_line_fix("unused_import", 7..20, source, &lines).expect("line fix");
-        let file_comment = fix::ignore_file_fix("unused_import", source, &lines)
-            .expect("file fix");
+        let file_comment = fix::ignore_file_fix("unused_import", source, &lines).expect("file fix");
         let options_text = "linter:\n  rules: []\n";
         let options_lines = LineIndex::new(options_text);
         let (off, len, replacement) =
@@ -890,8 +904,7 @@ mod tests {
         // The ignore_line selection: only the comment lands, the import
         // survives.
         fs::write(&path, source).expect("reset");
-        let selected =
-            fix::select_by_role(quartet.clone(), fix::FixRole::IgnoreLine);
+        let selected = fix::select_by_role(quartet.clone(), fix::FixRole::IgnoreLine);
         let mut out = Vec::new();
         assert_eq!(
             apply_and_report(&selected, false, crate::OutputFormat::Text, &mut out),
@@ -927,8 +940,7 @@ mod tests {
             exit::CLEAN
         );
         let line = String::from_utf8(out).expect("utf-8");
-        let document: serde_json::Value =
-            lon::from_str(line.trim_end()).expect("one lon document");
+        let document: serde_json::Value = lon::from_str(line.trim_end()).expect("one lon document");
         let edits = document["edits"].as_array().expect("edits");
         assert_eq!(edits.len(), 1, "one proposal document: {line}");
         assert_eq!(edits[0]["off"], 19, "offset → off");
@@ -951,8 +963,7 @@ mod tests {
             exit::CLEAN
         );
         let line = String::from_utf8(out).expect("utf-8");
-        let document: serde_json::Value =
-            lon::from_str(line.trim_end()).expect("one lon document");
+        let document: serde_json::Value = lon::from_str(line.trim_end()).expect("one lon document");
         assert_eq!(document["edits"][0]["outcome"], "applied", "{line}");
         assert_eq!(
             document["summary"],
@@ -974,8 +985,7 @@ mod tests {
             exit::CLEAN
         );
         let line = String::from_utf8(out).expect("utf-8");
-        let document: serde_json::Value =
-            lon::from_str(line.trim_end()).expect("one lon document");
+        let document: serde_json::Value = lon::from_str(line.trim_end()).expect("one lon document");
         assert_eq!(document["edits"][0]["outcome"], "stale", "{line}");
         assert_eq!(
             document["summary"],

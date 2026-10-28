@@ -54,9 +54,8 @@ pub(crate) struct PositionArgs {
 /// stdout kept empty, because the runners write only after the query fully
 /// succeeded.
 pub(crate) fn resolve_at_entry(args: &PositionArgs) -> u8 {
-    let outcome = crate::crash_tier(|| {
-        resolve_at_run(args, &mut BufWriter::new(io::stdout().lock()))
-    });
+    let outcome =
+        crate::crash_tier(|| resolve_at_run(args, &mut BufWriter::new(io::stdout().lock())));
     let Ok(code) = outcome else {
         eprintln!("dartq: internal error: analysis panicked");
         return exit::INTERNAL_ERROR;
@@ -66,9 +65,8 @@ pub(crate) fn resolve_at_entry(args: &PositionArgs) -> u8 {
 
 /// Crash tier like [`resolve_at_entry`].
 pub(crate) fn completion_entry(args: &PositionArgs) -> u8 {
-    let outcome = crate::crash_tier(|| {
-        completion_run(args, &mut BufWriter::new(io::stdout().lock()))
-    });
+    let outcome =
+        crate::crash_tier(|| completion_run(args, &mut BufWriter::new(io::stdout().lock())));
     let Ok(code) = outcome else {
         eprintln!("dartq: internal error: analysis panicked");
         return exit::INTERNAL_ERROR;
@@ -89,14 +87,9 @@ pub(crate) fn resolve_at_run(args: &PositionArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
-    if let Some(code) = crate::resident::route_position(
-        args,
-        "dartq/resolveAt",
-        &file,
-        line,
-        column,
-        out,
-    ) {
+    if let Some(code) =
+        crate::resident::route_position(args, "dartq/resolveAt", &file, line, column, out)
+    {
         return code;
     }
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
@@ -130,14 +123,9 @@ pub(crate) fn completion_run(args: &PositionArgs, out: &mut impl Write) -> u8 {
             return exit::USAGE;
         }
     };
-    if let Some(code) = crate::resident::route_position(
-        args,
-        "dartq/completion",
-        &file,
-        line,
-        column,
-        out,
-    ) {
+    if let Some(code) =
+        crate::resident::route_position(args, "dartq/completion", &file, line, column, out)
+    {
         return code;
     }
     let (mut engine, _dir) = match open_engine(&args.dir, args.sdk.as_deref()) {
@@ -358,7 +346,8 @@ mod tests {
         assert_eq!(answer["hit"]["range"]["off"], 32);
         assert_eq!(answer["hit"]["range"]["len"], 3);
         assert_eq!(
-            answer["hit"]["file"], a.display().to_string(),
+            answer["hit"]["file"],
+            a.display().to_string(),
             "the hit's target columns point at the declaration file"
         );
 
@@ -457,7 +446,8 @@ mod tests {
 
         let (code, out) = run_with("lib/missing.dart:1:1");
         assert_eq!(
-            code, exit::USAGE,
+            code,
+            exit::USAGE,
             "a file outside the analyzed view is usage"
         );
         assert!(out.is_empty());

@@ -108,9 +108,9 @@ pub fn run_entry(args: &SessionArgs) -> u8 {
 /// engine assembly's own resolution order, surfaced here because the
 /// triple needs the concrete root.
 pub(crate) fn resolved_sdk_root(sdk: Option<&Path>) -> Result<PathBuf, String> {
-    sdk.map(Path::to_path_buf).or_else(|| std::env::var_os("DART_SDK").map(PathBuf::from)).ok_or_else(
-        || "no Dart SDK root (pass --sdk PATH or set DART_SDK)".to_owned(),
-    )
+    sdk.map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("DART_SDK").map(PathBuf::from))
+        .ok_or_else(|| "no Dart SDK root (pass --sdk PATH or set DART_SDK)".to_owned())
 }
 
 /// The detached serve spawn: the current binary, `session serve`, quiet
@@ -137,14 +137,12 @@ pub(crate) fn spawn_server(layout: &Layout, triple: &SessionTriple) -> io::Resul
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    command
-        .spawn()
-        .map(|child| {
-            // Reaped by init when the serve loop exits; the starter does
-            // not wait.
-            drop(child);
-            let _ = layout;
-        })
+    command.spawn().map(|child| {
+        // Reaped by init when the serve loop exits; the starter does
+        // not wait.
+        drop(child);
+        let _ = layout;
+    })
 }
 
 /// One row through the format axis. The rows are already vocabulary
@@ -169,7 +167,11 @@ fn session_text(row: &Value) -> String {
         row["pid"],
         row["root"].as_str().unwrap_or_default(),
         row.get("age_s").and_then(Value::as_u64).unwrap_or(0),
-        if row.get("stale_binary").and_then(Value::as_bool).unwrap_or(false) {
+        if row
+            .get("stale_binary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             ", stale binary"
         } else {
             ""
@@ -254,10 +256,7 @@ fn session_status(args: &StatusArgs) -> u8 {
                 "files_scanned": progress.files_scanned,
                 "current_package": progress.current_package,
             });
-            let package = progress
-                .current_package
-                .as_deref()
-                .unwrap_or("analyzing");
+            let package = progress.current_package.as_deref().unwrap_or("analyzing");
             print_row(
                 args.format,
                 &row,
@@ -391,7 +390,10 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     let root = match std::fs::canonicalize(&args.dir) {
         Ok(root) => root,
         Err(error) => {
-            eprintln!("dartq: session serve: cannot resolve {}: {error}", args.dir.display());
+            eprintln!(
+                "dartq: session serve: cannot resolve {}: {error}",
+                args.dir.display()
+            );
             return exit::SOFTWARE;
         }
     };
@@ -400,15 +402,15 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
         eprintln!("dartq: session serve: {reason}");
         return exit::SOFTWARE;
     }
-    let (config, _dir, advisory) =
-        match crate::engine_config_with_advisory(&root, Some(&args.sdk)) {
-            Ok(faces) => faces,
-            Err(error) => {
-                eprintln!("dartq: session serve: {error}");
-                cleanup(&layout, &root);
-                return exit::USAGE;
-            }
-        };
+    let (config, _dir, advisory) = match crate::engine_config_with_advisory(&root, Some(&args.sdk))
+    {
+        Ok(faces) => faces,
+        Err(error) => {
+            eprintln!("dartq: session serve: {error}");
+            cleanup(&layout, &root);
+            return exit::USAGE;
+        }
+    };
     // The engine trace — the cold-analysis progress substrate
     // (`dartq events progress` reads it; the file truncates per serve, so
     // each resident generation's sweep starts at zero).
@@ -418,20 +420,15 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
         Ok(sink) => runtime.trace = Some(sink),
         Err(error) => eprintln!("dartq: session serve: trace sink disabled: {error}"),
     }
-    let mut session = match dartq_daemon::Session::with_runtime(
-        config,
-        Vec::new(),
-        None,
-        advisory,
-        runtime,
-    ) {
-        Ok(session) => session,
-        Err(error) => {
-            eprintln!("dartq: internal error: session unusable: {error}");
-            cleanup(&layout, &root);
-            return exit::SOFTWARE;
-        }
-    };
+    let mut session =
+        match dartq_daemon::Session::with_runtime(config, Vec::new(), None, advisory, runtime) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("dartq: internal error: session unusable: {error}");
+                cleanup(&layout, &root);
+                return exit::SOFTWARE;
+            }
+        };
     let triple = SessionTriple::compute(&root, &args.sdk);
     let events = EventLog::new(&layout);
     let _ = events.append(
@@ -442,7 +439,10 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     let listener = match bind_takeover(&layout) {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("dartq: session serve: binding {}: {error}", layout.socket.display());
+            eprintln!(
+                "dartq: session serve: binding {}: {error}",
+                layout.socket.display()
+            );
             cleanup(&layout, &root);
             return exit::SOFTWARE;
         }
@@ -457,7 +457,12 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     // reaper's SIGTERM grace scales by it); the counter's shareable
     // handle feeds the beat thread, which cannot borrow the session.
     let held_sessions = session.debug_sessions_counter();
-    heartbeat(&layout, &registry, &triple, held_sessions.load(std::sync::atomic::Ordering::Relaxed));
+    heartbeat(
+        &layout,
+        &registry,
+        &triple,
+        held_sessions.load(std::sync::atomic::Ordering::Relaxed),
+    );
 
     // #2591: the heartbeat owns its own thread. Beating between accepts
     // tied liveness to client service — a long client connection (a
@@ -514,6 +519,12 @@ fn serve_loop(args: &ServeArgs, idle_timeout: Duration) -> u8 {
     // degrades to the default disposition (an immediate death, the
     // pre-#2619 behavior), never a failed serve.
     let signalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // #2729: the session's analyses ride a token bound to the SAME
+    // cell — a mid-turn SIGTERM stops the in-flight engine run at its
+    // next checkpoint (~the token's stride) instead of waiting out the
+    // turn for the reaper's grace. No watcher thread: the signal write
+    // is already asynchronous to this loop.
+    session.bind_quit_flag(std::sync::Arc::clone(&signalled));
     let signals_ready = {
         use signal_hook::consts::{SIGINT, SIGTERM};
         signal_hook::flag::register(SIGTERM, std::sync::Arc::clone(&signalled))
@@ -632,6 +643,11 @@ fn serve_shutdown(
     reason: &str,
     code: u8,
 ) -> u8 {
+    // #2729: every ladder entry kills the session's analysis token —
+    // the signal arms already share the cell (idempotent here), and
+    // the flag-less exits (idle reap, unrecoverable listener) leave
+    // no live analyzer behind before the detach walk and cleanup run.
+    session.cancel_analysis();
     let released = session.debug_shutdown().unwrap_or(0);
     let _ = events.append(
         "session",
@@ -687,7 +703,10 @@ fn heartbeat(layout: &Layout, registry: &Registry, triple: &SessionTriple, held:
         debug_sessions: held,
     };
     if state.write(layout).is_ok() {
-        let _ = registry.upsert(&Record { id: triple.identity(), state });
+        let _ = registry.upsert(&Record {
+            id: triple.identity(),
+            state,
+        });
     }
 }
 
@@ -703,7 +722,10 @@ fn cleanup(layout: &Layout, root: &Path) {
 #[cfg(all(test, unix))]
 pub(crate) fn serve_loop_for_tests(dir: &Path, sdk: &Path) -> u8 {
     serve_loop(
-        &ServeArgs { dir: dir.to_path_buf(), sdk: sdk.to_path_buf() },
+        &ServeArgs {
+            dir: dir.to_path_buf(),
+            sdk: sdk.to_path_buf(),
+        },
         Duration::from_secs(1),
     )
 }
@@ -714,7 +736,10 @@ pub(crate) fn serve_loop_for_tests(dir: &Path, sdk: &Path) -> u8 {
 #[cfg(all(test, unix))]
 pub(crate) fn serve_loop_for_tests_with(dir: &Path, sdk: &Path, idle: Duration) -> u8 {
     serve_loop(
-        &ServeArgs { dir: dir.to_path_buf(), sdk: sdk.to_path_buf() },
+        &ServeArgs {
+            dir: dir.to_path_buf(),
+            sdk: sdk.to_path_buf(),
+        },
         idle,
     )
 }
@@ -768,12 +793,7 @@ pub(crate) mod tests {
     fn roundtrip(socket: &Path, request: &str) -> String {
         let mut stream = UnixStream::connect(socket).expect("connect");
         let body = request.as_bytes();
-        write!(
-            stream,
-            "Content-Length: {}\r\n\r\n",
-            body.len()
-        )
-        .expect("write frame");
+        write!(stream, "Content-Length: {}\r\n\r\n", body.len()).expect("write frame");
         stream.write_all(body).expect("write body");
         stream.flush().expect("flush");
         let mut text = String::new();
@@ -789,10 +809,12 @@ pub(crate) mod tests {
         }
         let length: usize = header
             .lines()
-            .find_map(|line| line.split_once(':').and_then(|(name, value)| {
-                (name.trim().eq_ignore_ascii_case("content-length"))
-                    .then(|| value.trim().parse().expect("length"))
-            }))
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    (name.trim().eq_ignore_ascii_case("content-length"))
+                        .then(|| value.trim().parse().expect("length"))
+                })
+            })
             .expect("content-length");
         let mut body = vec![0u8; length];
         stream.read_exact(&mut body).expect("body");
@@ -808,12 +830,20 @@ pub(crate) mod tests {
         // In-process serve loop: collateral of the real signal test (see
         // SIGNAL_SERIALIZATION) — a stray SIGTERM would tear the socket
         // and state down mid-roundtrip.
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_fixture("events");
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
         let server = std::thread::spawn(move || {
-            serve_loop(&ServeArgs { dir: serve_dir, sdk: serve_sdk }, Duration::from_secs(1))
+            serve_loop(
+                &ServeArgs {
+                    dir: serve_dir,
+                    sdk: serve_sdk,
+                },
+                Duration::from_secs(1),
+            )
         });
         let layout = Layout::new(&root);
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -828,9 +858,15 @@ pub(crate) mod tests {
         // The cold-analysis progress: the sweep analyzed at least the
         // fixture's one library, and names its package.
         let progress = dartq_session::Progress::from_trace(&layout.dir.join("trace.jsonl"));
-        assert!(progress.files_scanned >= 1, "the trace captured the sweep: {progress:?}");
+        assert!(
+            progress.files_scanned >= 1,
+            "the trace captured the sweep: {progress:?}"
+        );
         // The package signal: the fixture's root dir carries `lib/`.
-        let package_root = root.file_name().and_then(|n| n.to_str()).expect("root name");
+        let package_root = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("root name");
         assert_eq!(progress.current_package.as_deref(), Some(package_root));
 
         // The event log: serving → client_attached → client_detached,
@@ -859,7 +895,9 @@ pub(crate) mod tests {
     fn serve_loop_serves_a_client_then_reaps_itself() {
         // This pin asserts the shutdown's reason; a stray signal from the
         // parallel signal test would rewrite it (see SIGNAL_SERIALIZATION).
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_fixture("loop");
         // #2661: an earlier daemon's orphan manifest sits in the trail
         // — this daemon holds nothing, so its shutdown must release
@@ -874,7 +912,13 @@ pub(crate) mod tests {
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
         let server = std::thread::spawn(move || {
-            serve_loop(&ServeArgs { dir: serve_dir, sdk: serve_sdk }, Duration::from_secs(1))
+            serve_loop(
+                &ServeArgs {
+                    dir: serve_dir,
+                    sdk: serve_sdk,
+                },
+                Duration::from_secs(1),
+            )
         });
         let layout = Layout::new(&root);
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -958,12 +1002,20 @@ pub(crate) mod tests {
         // The real SIGTERM this pin delivers sets every registered
         // serve-loop flag in the process; the serial lock keeps the other
         // reason-asserting serve pins out of its window.
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_fixture("signal-held");
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
         let server = std::thread::spawn(move || {
-            serve_loop(&ServeArgs { dir: serve_dir, sdk: serve_sdk }, Duration::from_secs(1))
+            serve_loop(
+                &ServeArgs {
+                    dir: serve_dir,
+                    sdk: serve_sdk,
+                },
+                Duration::from_secs(1),
+            )
         });
         let layout = Layout::new(&root);
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1007,7 +1059,10 @@ pub(crate) mod tests {
             .expect("the shutdown event landed");
         assert_eq!(shutdown["data"]["reason"], "signal");
         assert_eq!(shutdown["data"]["sessions_released"], 0);
-        assert!(!layout.socket.exists(), "the socket was removed at shutdown");
+        assert!(
+            !layout.socket.exists(),
+            "the socket was removed at shutdown"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1022,12 +1077,20 @@ pub(crate) mod tests {
         // SIGNAL_SERIALIZATION) — a stray SIGTERM would run this loop's
         // shutdown ladder and strip the state file mid-hold (the observed
         // full-suite failure: "state while held").
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = test_fixture("beat-held");
         let serve_dir = root.clone();
         let serve_sdk = root.join("sdk");
         let server = std::thread::spawn(move || {
-            serve_loop(&ServeArgs { dir: serve_dir, sdk: serve_sdk }, Duration::from_secs(1))
+            serve_loop(
+                &ServeArgs {
+                    dir: serve_dir,
+                    sdk: serve_sdk,
+                },
+                Duration::from_secs(1),
+            )
         });
         let layout = Layout::new(&root);
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1048,7 +1111,10 @@ pub(crate) mod tests {
             match SessionState::read(&layout) {
                 Some(state) => break state.heartbeat_ms,
                 None => {
-                    assert!(Instant::now() < deadline, "the initial heartbeat never landed");
+                    assert!(
+                        Instant::now() < deadline,
+                        "the initial heartbeat never landed"
+                    );
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
@@ -1078,7 +1144,9 @@ pub(crate) mod tests {
     fn a_long_checkout_path_still_listens_on_the_relocated_socket() {
         // In-process serve loop: collateral of the real signal test (see
         // SIGNAL_SERIALIZATION).
-        let _serial = SIGNAL_SERIALIZATION.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serial = SIGNAL_SERIALIZATION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // A root deep enough that `<root>/.dart_tool/dartq/session.sock`
         // blows the 104-byte sun_path: one long directory name under /tmp.
         let segment = "w".repeat(72);
@@ -1086,7 +1154,11 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("lib")).expect("dir");
         std::fs::create_dir_all(root.join(".dart_tool")).expect("dot dir");
-        std::fs::write(root.join("pubspec.yaml"), "name: fx\nenvironment:\n  sdk: ^3.5.0\n").expect("pubspec");
+        std::fs::write(
+            root.join("pubspec.yaml"),
+            "name: fx\nenvironment:\n  sdk: ^3.5.0\n",
+        )
+        .expect("pubspec");
         std::fs::write(
             root.join(".dart_tool/package_config.json"),
             r#"{"configVersion":2,"packages":[{"name":"fx","rootUri":"../","packageUri":"lib/","languageVersion":"3.5"}],"generator":"pub"}"#,
@@ -1095,7 +1167,10 @@ pub(crate) mod tests {
         let sdk = root.join("sdk");
         for (rel, body) in [
             ("version", "3.13.1\n"),
-            ("lib/libraries.json", r#"{"vm":{"libraries":{"core":{"uri":"core/core.dart"}}}}"#),
+            (
+                "lib/libraries.json",
+                r#"{"vm":{"libraries":{"core":{"uri":"core/core.dart"}}}}"#,
+            ),
             (
                 "lib/_internal/allowed_experiments.json",
                 r#"{"version":1,"experimentSets":{"sdkExperiments":[]},"sdk":{"default":{"experimentSet":"sdkExperiments"}},"packages":{}}"#,
@@ -1125,11 +1200,20 @@ pub(crate) mod tests {
         let serve_dir = root.clone();
         let serve_sdk = sdk.clone();
         let server = std::thread::spawn(move || {
-            serve_loop(&ServeArgs { dir: serve_dir, sdk: serve_sdk }, Duration::from_secs(1))
+            serve_loop(
+                &ServeArgs {
+                    dir: serve_dir,
+                    sdk: serve_sdk,
+                },
+                Duration::from_secs(1),
+            )
         });
         let deadline = Instant::now() + Duration::from_secs(20);
         while !dartq_session::socket_open(&layout) {
-            assert!(Instant::now() < deadline, "the long-path session never listened");
+            assert!(
+                Instant::now() < deadline,
+                "the long-path session never listened"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
         // The pointer file names the real socket; the protocol answers
@@ -1145,11 +1229,17 @@ pub(crate) mod tests {
             &layout.socket,
             r#"{"jsonrpc":"2.0","id":1,"method":"dartq/test/status","params":{}}"#,
         );
-        assert!(answer.contains("\"id\":1"), "answered over the relocated socket: {answer}");
+        assert!(
+            answer.contains("\"id\":1"),
+            "answered over the relocated socket: {answer}"
+        );
         assert!(!local.exists(), "no socket was attempted at the long path");
 
         let _ = server.join();
-        assert!(!layout.socket.exists(), "the reap removed the relocated socket");
+        assert!(
+            !layout.socket.exists(),
+            "the reap removed the relocated socket"
+        );
         std::fs::remove_dir_all(&root).ok();
         let _ = std::fs::remove_file(&layout.socket);
     }
@@ -1217,7 +1307,10 @@ pub(crate) mod tests {
             &layout.socket,
             r#"{"jsonrpc":"2.0","id":1,"method":"dartq/test/status","params":{}}"#,
         );
-        assert!(answer.contains("\"id\":1"), "the engine still answers: {answer}");
+        assert!(
+            answer.contains("\"id\":1"),
+            "the engine still answers: {answer}"
+        );
         assert!(answer.contains("runs"), "the status envelope: {answer}");
 
         // Teardown: stop the engine and clear the tree.
@@ -1294,18 +1387,24 @@ pub(crate) mod tests {
         let flag = resolved_sdk_root(Some(Path::new("/flag")));
         assert_eq!(flag, Ok(PathBuf::from("/flag")));
         let saved = std::env::var_os("DART_SDK");
-        unsafe { std::env::set_var("DART_SDK", "/env/sdk"); }
+        unsafe {
+            std::env::set_var("DART_SDK", "/env/sdk");
+        }
         assert_eq!(resolved_sdk_root(None), Ok(PathBuf::from("/env/sdk")));
         assert_eq!(
             resolved_sdk_root(Some(Path::new("/flag"))),
             Ok(PathBuf::from("/flag")),
             "the flag still wins over the environment"
         );
-        unsafe { std::env::remove_var("DART_SDK"); }
+        unsafe {
+            std::env::remove_var("DART_SDK");
+        }
         let error = resolved_sdk_root(None).expect_err("no sdk source");
         assert!(error.contains("DART_SDK"), "{error}");
         if let Some(saved) = saved {
-            unsafe { std::env::set_var("DART_SDK", saved); }
+            unsafe {
+                std::env::set_var("DART_SDK", saved);
+            }
         }
     }
 
@@ -1330,7 +1429,10 @@ pub(crate) mod tests {
                 }
             }
         });
-        let child = std::process::Command::new("sleep").arg("30").spawn().expect("sleep child");
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep child");
         let state = SessionState {
             pid: child.id(),
             heartbeat_ms: SessionState::now_ms(),
@@ -1338,7 +1440,10 @@ pub(crate) mod tests {
             debug_sessions: 0,
         };
         state.write(&layout).expect("state");
-        let record = Record { id: triple.identity(), state };
+        let record = Record {
+            id: triple.identity(),
+            state,
+        };
         registry.upsert(&record).expect("upsert");
         assert!(layout.socket.exists() && layout.state.exists());
         // In production the serve process's parent is init (detached), so
@@ -1347,7 +1452,10 @@ pub(crate) mod tests {
         // boolean is therefore not asserted here, the delivery is.
         let _ = stop_one(&registry, &record);
         let mut child = child;
-        let exited = child.try_wait().expect("waitable").expect("the SIGTERM reached the server");
+        let exited = child
+            .try_wait()
+            .expect("waitable")
+            .expect("the SIGTERM reached the server");
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt as _;

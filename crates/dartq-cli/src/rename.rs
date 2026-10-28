@@ -90,9 +90,7 @@ fn parse_target(spec: &str) -> Result<(PathBuf, Anchor), String> {
 /// Crash tier like the other faces: a panic aborts with exit 4 and stdout
 /// kept empty, because [`run`] writes only after the run succeeded.
 pub(crate) fn run_entry(args: &RenameArgs) -> u8 {
-    let outcome = crate::crash_tier(|| {
-        run(args, &mut io::BufWriter::new(io::stdout().lock()))
-    });
+    let outcome = crate::crash_tier(|| run(args, &mut io::BufWriter::new(io::stdout().lock())));
     if let Ok(code) = outcome {
         code
     } else {
@@ -129,8 +127,7 @@ pub(crate) fn run(args: &RenameArgs, out: &mut impl Write) -> u8 {
     // machinery (the drift gates read the analyzed view), which cannot be
     // remoted.
     if !args.write
-        && let Some(code) =
-            crate::resident::route_rename(args, &path, anchor, out)
+        && let Some(code) = crate::resident::route_rename(args, &path, anchor, out)
     {
         return code;
     }
@@ -182,7 +179,10 @@ pub(crate) fn run(args: &RenameArgs, out: &mut impl Write) -> u8 {
 /// The lon/json refusal document (#2618): `error`, the workspace bound,
 /// and EVERY out-of-boundary file under one `files` key — the atomic
 /// rule's full-list answer, never a first-reason only.
-fn refusal_document(workspace: &std::path::Path, outside: &[&std::path::Path]) -> serde_json::Value {
+fn refusal_document(
+    workspace: &std::path::Path,
+    outside: &[&std::path::Path],
+) -> serde_json::Value {
     serde_json::json!({
         "error": "outside_workspace",
         "workspace": workspace.display().to_string(),
@@ -491,10 +491,7 @@ mod tests {
         assert_eq!(document["error"], "outside_workspace");
         assert_eq!(
             document["files"],
-            serde_json::json!([
-                a.display().to_string(),
-                b.display().to_string()
-            ]),
+            serde_json::json!([a.display().to_string(), b.display().to_string()]),
             "every out-of-boundary file, in row order"
         );
 
@@ -508,10 +505,10 @@ mod tests {
                 "import 'package:dep/extra.dart';\n\nint main() => extra();\n",
             )],
         );
-        let dep = root.parent().expect("temp parent").join(format!(
-            "dq_cli_rename_boundary_dep_{}",
-            std::process::id()
-        ));
+        let dep = root
+            .parent()
+            .expect("temp parent")
+            .join(format!("dq_cli_rename_boundary_dep_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dep);
         fs::create_dir_all(dep.join("lib")).expect("dep lib");
         fs::write(dep.join("pubspec.yaml"), "name: dep\n").expect("dep pubspec");
@@ -538,14 +535,25 @@ mod tests {
         for format in ["json", "text"] {
             let args = args_of(
                 &root,
-                &[&target, "--new-name", "zulu", "--sdk", &sdk, "--write", "--format", format],
+                &[
+                    &target,
+                    "--new-name",
+                    "zulu",
+                    "--sdk",
+                    &sdk,
+                    "--write",
+                    "--format",
+                    format,
+                ],
             );
             let mut out = Vec::new();
             assert_eq!(run(&args, &mut out), exit::USAGE, "the write refuses");
             assert!(out.is_empty(), "stdout stays empty on the refusal");
         }
         assert!(
-            fs::read_to_string(&main).expect("main unchanged").contains("extra()"),
+            fs::read_to_string(&main)
+                .expect("main unchanged")
+                .contains("extra()"),
             "the workspace file was not written"
         );
         assert!(
