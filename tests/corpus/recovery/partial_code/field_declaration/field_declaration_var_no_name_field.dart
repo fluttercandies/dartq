@@ -1,2 +1,0 @@
-// recovery: partial_code/field_declaration_test.dart/test_field_declaration_var_noName_field
-class C { var var f; }

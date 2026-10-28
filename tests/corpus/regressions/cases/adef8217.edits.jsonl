@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/targeted/redirecting_constructor_with_body.dart","length":144,"line":1,"new_text":"// Targets redirecting_constructor_with_body: redirecting constructors\n// cannot have a body.\nclass C {\n  C() : this.other() {}\n\n  C.other();\n}\n"}

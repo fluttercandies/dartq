@@ -1,9 +1,0 @@
-name: stock_policy
-description: >-
-  Nested dependency package of the complex corpus: restock policy rules and
-  thresholds consumed by the main corpus package over a package: import edge.
-version: 1.0.0
-publish_to: none
-
-environment:
-  sdk: ^3.13.0

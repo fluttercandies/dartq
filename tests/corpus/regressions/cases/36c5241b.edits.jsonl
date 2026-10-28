@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/src/inline_class/inline_class.dart","length":61,"line":1,"new_text":"inline class Class {}\ninline class Class = Object with Mixin;"}

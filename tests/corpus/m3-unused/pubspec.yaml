@@ -1,8 +1,0 @@
-name: corpus_m3_unused
-description: >-
-  M3 unused-family differential corpus for the m3 gate: dart-verify fixtures
-  covering the unused_* codes, implementation-independent.
-environment:
-  sdk: ^3.13.0
-dependencies:
-  meta: ^1.19.0

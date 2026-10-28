@@ -51,12 +51,14 @@ digest() {
 sha_macos_arm64="$(digest macos-arm64)"
 sha_macos_x86_64="$(digest macos-x86_64)"
 sha_linux_x86_64="$(digest linux-x86_64)"
+sha_linux_arm64="$(digest linux-arm64)"
 
 sed \
   -e "s#@VERSION@#$ver#g" \
   -e "s#@SHA_MACOS_ARM64@#$sha_macos_arm64#g" \
   -e "s#@SHA_MACOS_X86_64@#$sha_macos_x86_64#g" \
   -e "s#@SHA_LINUX_X86_64@#$sha_linux_x86_64#g" \
+  -e "s#@SHA_LINUX_ARM64@#$sha_linux_arm64#g" \
   "$template" > "$out_file"
 
 leftover="$(grep -n '@[A-Z_0-9]*@' "$out_file" || true)"

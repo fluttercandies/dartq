@@ -1,2 +1,0 @@
-// recovery: missing_code_test.dart/test_extraComma_positional_noLast
-f([a, , b]) {}

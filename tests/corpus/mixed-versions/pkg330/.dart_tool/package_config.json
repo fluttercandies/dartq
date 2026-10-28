@@ -1,6 +1,0 @@
-{
-  "configVersion": 2,
-  "packages": [
-    {"name": "pkg330", "rootUri": "..", "packageUri": "lib/", "languageVersion": "3.3"}
-  ]
-}

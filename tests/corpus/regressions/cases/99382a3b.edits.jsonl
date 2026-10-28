@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/src/macros/augment_class.dart","length":145,"line":1,"new_text":"augment class Class {}\nabstract augment class Class {}\naugment class Class = Object with Mixin;\nabstract augment class Class = Object with Mixin;"}

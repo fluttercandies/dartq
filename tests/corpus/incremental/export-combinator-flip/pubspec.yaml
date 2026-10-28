@@ -1,4 +1,0 @@
-name: export_flip
-version: 0.1.0
-environment:
-  sdk: ^3.5.0

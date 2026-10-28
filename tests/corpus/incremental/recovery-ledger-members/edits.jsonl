@@ -1,6 +1,0 @@
-{"file":"lib/src/broken/broken_undefined_member.dart","line":3,"column":1,"length":35,"new_text":"class Ledger {\n  int balance = 0;\n\n  void auditAll() {}\n}"}
-{"file":"lib/src/broken/broken_undefined_member.dart","line":6,"column":1,"length":22,"new_text":"  void auditAll() {}\n\n  int get balanceInCents => balance;\n}"}
-{"file":"lib/src/broken/broken_undefined_member.dart","line":8,"column":1,"length":38,"new_text":"  int get balanceInCents => balance;\n\n  set balanceInEuros(int cents) => balance = cents ~/ 2;\n}"}
-{"file":"lib/src/broken/broken_undefined_member.dart","line":8,"column":1,"length":96,"new_text":"  int get balanceInCents => balance;\n}"}
-{"file":"lib/src/broken/broken_undefined_member.dart","line":6,"column":1,"length":60,"new_text":"  void auditAll() {}\n}"}
-{"file":"lib/src/broken/broken_undefined_member.dart","line":3,"column":1,"length":57,"new_text":"class Ledger {\n  int balance = 0;\n}"}

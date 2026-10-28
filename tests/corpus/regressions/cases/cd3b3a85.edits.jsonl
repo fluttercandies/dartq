@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/targeted/undefined_constructor_in_initializer.dart","length":202,"line":1,"new_text":"// Targets undefined_constructor_in_initializer: the initializer list invokes\n// a named super constructor that the superclass does not declare.\nclass A {}\n\nclass B extends A {\n  B() : super.named();\n}\n"}

@@ -1,6 +1,0 @@
-{"file":"lib/src/broken/broken_duplicate.dart","line":8,"column":1,"length":43,"new_text":"class ReceivingDockAnnex {\n  int capacity = 4;\n}"}
-{"file":"lib/src/broken/broken_duplicate.dart","line":8,"column":1,"length":48,"new_text":"class ReceivingDockAnnex {\n  int capacity = 6;\n}"}
-{"file":"lib/src/broken/broken_duplicate.dart","line":13,"column":1,"length":34,"new_text":"  print(ReceivingDock().capacity);\n  print(ReceivingDockAnnex().capacity);"}
-{"file":"lib/src/broken/broken_duplicate.dart","line":8,"column":1,"length":48,"new_text":"class ReceivingDockAnnex {\n  int capacity = 4;\n}"}
-{"file":"lib/src/broken/broken_duplicate.dart","line":13,"column":1,"length":74,"new_text":"  print(ReceivingDock().capacity);"}
-{"file":"lib/src/broken/broken_duplicate.dart","line":8,"column":1,"length":26,"new_text":"class ReceivingDock {"}

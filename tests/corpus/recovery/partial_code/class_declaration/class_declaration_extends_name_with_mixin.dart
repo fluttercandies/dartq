@@ -1,2 +1,0 @@
-// recovery: partial_code/class_declaration_test.dart/test_class_declaration_extendsNameWith_mixin
-class A extends B with mixin M {}

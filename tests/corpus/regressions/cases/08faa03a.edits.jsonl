@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/src/error_recovery/issue_49477.dart","length":179,"line":1,"new_text":"import 'dart:io';\n\nvoid main(List<String> args) async {\n  final proc = await Process.start('', []);\n  proc.stdout. // we're typing here!\n\n  void writeMessage(String message) {}\n}\n"}

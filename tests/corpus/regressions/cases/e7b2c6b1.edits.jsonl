@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/targeted/implements_before_with.dart","length":133,"line":1,"new_text":"// Targets implements_before_with: the with clause must be before the\n// implements clause.\nclass A extends B implements C with D {}\n"}

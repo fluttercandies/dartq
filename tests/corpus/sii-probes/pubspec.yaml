@@ -1,9 +1,0 @@
-name: corpus_sii_probes
-description: >-
-  Scanner string-interpolation probe corpus: fixtures captured verbatim from
-  the persisted regression cases (tests/corpus/regressions/cases) whose
-  divergences were isolated by the 2026-10-12 scanner-interrogation probe
-  session. Read-only replay target; each fixture is the captured `source`
-  of exactly one regression case.
-environment:
-  sdk: ^3.13.0

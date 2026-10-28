@@ -1,8 +1,0 @@
-{"file":"packages/errprobe/lib/probe/e14_return_type.dart","line":3,"column":1,"length":48,"new_text":"Future<String> fourteen() async {\n  return '42';\n}"}
-{"file":"packages/errprobe/lib/probe/e14_return_type.dart","line":7,"column":1,"length":35,"new_text":"String fourteenB() {\n  return '42';\n}"}
-{"file":"packages/errprobe/lib/probe/e12_switch_nonexhaustive.dart","line":6,"column":1,"length":29,"new_text":"      Circle() => 'c',\n      Square() => 's',\n    };"}
-{"file":"packages/errprobe/lib/probe/e12_switch_nonexhaustive.dart","line":7,"column":1,"length":29,"new_text":"      Square() => 's',\n      Rect() => 'r',\n    };"}
-{"file":"packages/errprobe/lib/probe/e14_return_type.dart","line":7,"column":1,"length":37,"new_text":"String fourteenB() {\n  return 42;\n}"}
-{"file":"packages/errprobe/lib/probe/e12_switch_nonexhaustive.dart","line":7,"column":23,"length":21,"new_text":""}
-{"file":"packages/errprobe/lib/probe/e14_return_type.dart","line":3,"column":1,"length":50,"new_text":"Future<String> fourteen() async {\n  return 42;\n}"}
-{"file":"packages/errprobe/lib/probe/e12_switch_nonexhaustive.dart","line":6,"column":23,"length":23,"new_text":""}

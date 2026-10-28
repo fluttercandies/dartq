@@ -1,6 +1,0 @@
-{"file":"lib/src/core/identifiers.dart","line":13,"column":3,"length":18,"new_text":"String brief()"}
-{"file":"lib/src/domain/events.dart","line":51,"column":19,"length":35,"new_text":"${sku.brief()} x${amount.units}"}
-{"file":"lib/src/domain/events.dart","line":53,"column":30,"length":31,"new_text":"of ${sku.brief()} ($reason)"}
-{"file":"lib/src/core/identifiers.dart","line":13,"column":3,"length":14,"new_text":"String shortForm()"}
-{"file":"lib/src/domain/events.dart","line":51,"column":19,"length":31,"new_text":"${sku.shortForm()} x${amount.units}"}
-{"file":"lib/src/domain/events.dart","line":53,"column":30,"length":27,"new_text":"of ${sku.shortForm()} ($reason)"}

@@ -1,8 +1,0 @@
-name: corpus_m2_warning
-description: >-
-  M2 WARNING-tier targeted corpus (goal #666): one fixture per implemented
-  frozen code in tests/harness/m2_warning_codes.txt, dart-verify caliber,
-  implementation-independent. Codes with no dartq emission path get no
-  fixture: a fixture would only mint permanent oracle-only rows.
-environment:
-  sdk: ^3.13.0

@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/src/extension_named_type.dart","length":88,"line":1,"new_text":"class A {}\n\nextension type on A {\n  method() {}\n}\n\ntest(A a) => type(new A()).method();\n"}

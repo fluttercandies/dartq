@@ -1,8 +1,0 @@
-{"file":"packages/chain_00/lib/wire.dart","line":3,"column":1,"length":33,"new_text":""}
-{"file":"packages/chain_00/lib/wire.dart","line":3,"column":1,"length":32,"new_text":"import 'chain_a/level_000.dart';\nimport 'chain_b/level_000.dart';"}
-{"file":"packages/chain_00/lib/wire.dart","line":8,"column":1,"length":42,"new_text":""}
-{"file":"packages/chain_00/lib/wire.dart","line":8,"column":1,"length":25,"new_text":"final ChainAL000 kAnchorA = ChainAL000();\nfinal ChainBL000 kAnchorB"}
-{"file":"packages/chain_00/lib/wire.dart","line":9,"column":1,"length":49,"new_text":""}
-{"file":"packages/chain_00/lib/wire.dart","line":4,"column":1,"length":33,"new_text":""}
-{"file":"packages/chain_00/lib/wire.dart","line":8,"column":1,"length":25,"new_text":"final ChainBL000 kAnchorB = const ChainBL000(7);\nfinal ChainCL000 kAnchorC"}
-{"file":"packages/chain_00/lib/wire.dart","line":4,"column":1,"length":32,"new_text":"import 'chain_b/level_000.dart';\nimport 'chain_c/level_000.dart';"}

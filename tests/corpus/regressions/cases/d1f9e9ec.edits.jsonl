@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/src/primary_constructors/new_dot_name.dart","length":163,"line":1,"new_text":"class C {\n  new.named();\n  factory.named();\n}\n\nenum E {\n  a;\n\n  new.named();\n  factory.named();\n}\n\nextension type ET(int i) {\n  new.named();\n  factory.named();\n}\n\n"}

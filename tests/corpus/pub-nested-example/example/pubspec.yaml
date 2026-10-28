@@ -1,8 +1,0 @@
-name: example
-description: >-
-  The example subpackage of pub_nested_example: its own pubspec (sdk
-  ^3.2.0) and its own .dart_tool/package_config.json make it a package
-  root in its own right — the self-resolution boundary under test
-  (#1339). The config names only this package.
-environment:
-  sdk: ^3.2.0

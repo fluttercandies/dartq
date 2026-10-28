@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/targeted/non_void_return_for_setter.dart","length":217,"line":1,"new_text":"// Targets non_void_return_for_setter: a setter with a non-void declared\n// return type. Oracle message (nail-pinned): \"The return type of the\n// setter must be 'void' or absent.\"\nclass C {\n  int set s(int v) => 1;\n}\n"}

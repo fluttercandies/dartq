@@ -1,2 +1,0 @@
-// recovery: partial_code/import_directive_test.dart/test_import_directive_ifId_import
-import 'a.dart' if (b import 'a.dart';

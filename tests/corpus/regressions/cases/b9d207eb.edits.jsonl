@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/targeted/const_with_non_constant_argument.dart","length":217,"line":1,"new_text":"// Targets const_with_non_constant_argument: a constant creation whose\n// argument is not a constant expression (the non-const variable 'n').\nclass C {\n  final int x;\n  const C(this.x);\n}\n\nvar n = 1;\n\nconst z = C(n);\n"}

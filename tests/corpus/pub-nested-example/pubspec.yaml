@@ -1,9 +1,0 @@
-name: pub_nested_example
-description: >-
-  Self-resolution boundary face (#1347): an example/ subpackage with its
-  own pubspec and its own hand-written package_config resolves ITSELF.
-  The root config does not list example/ and the example config does not
-  list the root — each package root self-resolves across the boundary
-  (#1339).
-environment:
-  sdk: ^3.5.0

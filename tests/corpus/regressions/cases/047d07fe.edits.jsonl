@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/targeted/field_initialized_outside_declaring_class.dart","length":212,"line":1,"new_text":"// Targets field_initialized_outside_declaring_class: a field can only be\n// initialized in its declaring class (super.field in an initializer list).\nclass A {}\n\nclass C extends A {\n  C() : super.toString = 1;\n}\n"}

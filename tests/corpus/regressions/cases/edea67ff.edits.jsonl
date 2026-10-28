@@ -1,1 +1,0 @@
-{"column":1,"file":"lib/src/dot_shorthands/const_no_identifier_recovery.dart","length":95,"line":1,"new_text":"class Color {\n  final int x;\n  const Color.red(this.x);\n}\nvoid main() {\n  Color c = const .;\n}\n"}

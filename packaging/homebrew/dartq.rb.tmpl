@@ -5,8 +5,7 @@
 class Dartq < Formula
   desc "Fast static analysis engine for Dart and Flutter"
   homepage "https://github.com/fluttercandies/dartq"
-  license "Apache-2.0 OR MIT"
-  version "@VERSION@"
+  license any_of: ["Apache-2.0", "MIT"]
 
   on_macos do
     on_arm do
@@ -20,6 +19,10 @@ class Dartq < Formula
   end
 
   on_linux do
+    on_arm do
+      url "https://github.com/fluttercandies/dartq/releases/download/v@VERSION@/dartq-@VERSION@-linux-arm64.tar.gz"
+      sha256 "@SHA_LINUX_ARM64@"
+    end
     on_intel do
       url "https://github.com/fluttercandies/dartq/releases/download/v@VERSION@/dartq-@VERSION@-linux-x86_64.tar.gz"
       sha256 "@SHA_LINUX_X86_64@"

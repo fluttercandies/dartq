@@ -1,5 +1,0 @@
-{"file":"packages/chain_00/lib/chain_a/level_000.dart","line":4,"column":3,"length":41,"new_text":"String describe([String prefix = '']) => '$prefix chain a level 000';"}
-{"file":"packages/chain_01/lib/chain_a/level_001.dart","line":7,"column":3,"length":41,"new_text":"String describe([String prefix = '']) => '$prefix chain a level 001';"}
-{"file":"packages/chain_00/lib/chain_a/level_000.dart","line":4,"column":3,"length":69,"new_text":"String describe(String prefix) => '$prefix chain a level 000';"}
-{"file":"packages/chain_00/lib/chain_a/level_000.dart","line":4,"column":3,"length":62,"new_text":"String describe() => 'chain a level 000';"}
-{"file":"packages/chain_01/lib/chain_a/level_001.dart","line":7,"column":3,"length":69,"new_text":"String describe() => 'chain a level 001';"}

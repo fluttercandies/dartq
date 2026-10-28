@@ -1,8 +1,0 @@
-{"file":"lib/src/domain/product.dart","line":57,"column":1,"length":80,"new_text":"  }) : super(category: ProductCategory.household);\n}\n\n/// Digital-only gift variant exercised by the sealed exhaustiveness face.\nfinal class ServiceVariant extends ProductVariant {\n  const ServiceVariant({required super.sku, required super.listPrice})\n      : super(category: ProductCategory.personalCare);\n}\n\n/// The catalog aggregate:"}
-{"file":"lib/src/domain/product_views.dart","line":14,"column":1,"length":56,"new_text":"      HouseholdItemVariant() => 'household item',\n      ServiceVariant() => 'service item',\n    };"}
-{"file":"lib/src/domain/product.dart","line":30,"column":1,"length":28,"new_text":""}
-{"file":"lib/src/domain/product_views.dart","line":8,"column":1,"length":146,"new_text":"      BeverageVariant(:final volumeMilliliters) =>\n        'beverage ${volumeMilliliters}ml',"}
-{"file":"lib/src/domain/product.dart","line":29,"column":1,"length":56,"new_text":"  final int volumeMilliliters;\n  final bool isCarbonated;\n\n  const BeverageVariant({"}
-{"file":"lib/src/domain/product_views.dart","line":8,"column":1,"length":93,"new_text":"      BeverageVariant(:final volumeMilliliters, isCarbonated: final fizzy) =>\n        'beverage ${volumeMilliliters}ml${fizzy ? ' (fizzy)' : ''}',"}
-{"file":"lib/src/domain/product_views.dart","line":14,"column":1,"length":98,"new_text":"      HouseholdItemVariant() => 'household item',\n    };"}
-{"file":"lib/src/domain/product.dart","line":60,"column":1,"length":282,"new_text":"/// The catalog aggregate:"}

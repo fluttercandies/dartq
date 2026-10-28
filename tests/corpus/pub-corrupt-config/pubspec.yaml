@@ -1,8 +1,0 @@
-name: pub_corrupt_config
-description: >-
-  Corrupt-resolution degrade face (#1347): the hand-written
-  .dart_tool/package_config.json is truncated mid-entry, so resolution
-  fails to parse. Both analyzers must degrade the same way (#1340) —
-  bounded diagnostics, no crash — over the trivial lib file.
-environment:
-  sdk: ^3.13.0

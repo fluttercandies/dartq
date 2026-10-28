@@ -1,7 +1,0 @@
-{
-  "configVersion": 2,
-  "packages": [
-    {"name": "pkg300", "rootUri": "..", "packageUri": "lib/", "languageVersion": "3.0"},
-    {"name": "pkg219", "rootUri": "../../pkg219", "packageUri": "lib/", "languageVersion": "2.19"}
-  ]
-}

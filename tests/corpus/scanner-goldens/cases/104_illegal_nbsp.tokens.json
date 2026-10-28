@@ -1,8 +1,0 @@
-{
-  "case": "104_illegal_nbsp",
-  "origin": "pkg/front_end/test/scanner_test.dart:408 (U+00A0 -> illegalCharacter@0 args[0xa0]; skipped, no token)",
-  "config": {"triple_shift": true, "augment": true},
-  "language_version": null,
-  "tokens": [],
-  "diagnostics": [["illegal_character", 0, [160]]]
-}

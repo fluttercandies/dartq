@@ -1,8 +1,0 @@
-name: sibling
-description: >-
-  The sibling_b face of the shadowed name: same package NAME as sibling_a,
-  different directory — this one is what `package:sibling` means inside
-  pkgs/tool's config. Exposes siblingBOnly() and a differently-valued
-  `shared` so the two faces are distinguishable.
-environment:
-  sdk: ^3.5.0

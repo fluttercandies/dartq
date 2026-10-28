@@ -1,6 +1,0 @@
-name: pkg300
-environment:
-  sdk: ^3.0.0
-dependencies:
-  pkg219:
-    path: ../pkg219
