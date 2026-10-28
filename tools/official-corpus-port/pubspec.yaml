@@ -1,0 +1,9 @@
+name: official_corpus_port
+description: >-
+  Ports the analyzer package's inline-diagnostic tests into standalone Dart
+  packages for differential testing against `dart analyze`.
+environment:
+  sdk: ^3.9.0
+dependencies:
+  analyzer: 14.6.0
+  pub_semver: ^2.1.4
