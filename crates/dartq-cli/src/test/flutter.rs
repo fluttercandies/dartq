@@ -33,6 +33,7 @@
 //! order, `--fail-fast`, `--experimental-faster-testing`, and malformed
 //! arguments.
 
+use std::borrow::Cow;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -44,7 +45,10 @@ use dartq_test::event::Json;
 use dartq_test::report::{self, Kind};
 use dartq_test::{ExecConfig, Settled, SuiteBlock};
 
-use super::{Invocation, NO_TESTS, Outputs, Sink, Tally, complete, delegate, idle_timeout, tally, terminal_width};
+use super::{
+    Invocation, NO_TESTS, Outputs, Sink, Tally, complete, delegate_requested, delegate_with, idle_timeout, tally,
+    terminal_width,
+};
 use crate::exit;
 
 /// The tool's directory for widget-test suites run as integration tests:
@@ -66,26 +70,26 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
         }
     };
     let Some(flutter) = dartq_test::host::find("flutter") else {
-        return delegate(args, true);
+        return delegate_with(args, true, "no flutter on PATH");
     };
     // The tool's own preconditions (and their error text) are its to
     // report, as are setups only it can run.
+    if inv.delegate {
+        return delegate_requested(args, true, inv.stats, "tool-only options requested");
+    }
     // Color is the tool's global option: its effect on the runner depends
     // on the tool's terminal, which only the tool reproduces.
-    if inv.delegate
-        || inv.color.is_some()
-        || !root.join("pubspec.yaml").is_file()
-        || !dartq_test::cache::package_config_path(&root).is_file()
-        || root.join("dart_test.yaml").is_file()
-        || super::global_config_exists()
-    {
-        return delegate(args, true);
+    if inv.color.is_some() {
+        return delegate_requested(args, true, inv.stats, "color option requested");
+    }
+    if let Some(reason) = state_reason(&root, super::global_config_exists()) {
+        return delegate_with(args, true, &reason);
     }
     let Some(suites) = discover(&root, &inv.paths) else {
-        return delegate(args, true);
+        return delegate_with(args, true, "no test suites discovered");
     };
     if suites.iter().any(|suite| suite.abs.starts_with(root.join(INTEGRATION_TEST_DIR))) {
-        return delegate(args, true);
+        return delegate_with(args, true, "integration_test suites present");
     }
     let mut suites = suites;
     if let Some(base) = &inv.impacted {
@@ -108,13 +112,13 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
     // the suite count before it knows, so a JSON run whose filtering is
     // uncertain belongs to the tool.
     let Some(filter) = dartq_test::select::TagFilter::new(&inv.include_tags, &inv.exclude_tags) else {
-        return delegate(args, true);
+        return delegate_requested(args, true, inv.stats, "invalid tag selector");
     };
     let files: Vec<PathBuf> = suites.iter().map(|suite| suite.abs.clone()).collect();
     let selections = dartq_test::select::select_all(&files, &filter);
     let json = inv.machine || inv.reporter == Some(Kind::Json) || matches!(inv.file_reporter, Some((Kind::Json, _)));
     if json && selections.contains(&dartq_test::select::Selection::Unknown) {
-        return delegate(args, true);
+        return delegate_requested(args, true, inv.stats, "json reporter with an uncertain selection");
     }
     let selected = suites.len();
     let mut selections = selections.into_iter();
@@ -122,8 +126,10 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
     // The tool resolves packages before running unless they are up to date
     // (and prints what it did); only an up-to-date resolution is
     // reproduced here, so no shard ever resolves.
-    if !inv.no_pub && !pub_up_to_date(&root, &flutter) {
-        return delegate(args, true);
+    if !inv.no_pub {
+        if let Some(reason) = stale_resolution(&root, &flutter) {
+            return delegate_with(args, true, reason);
+        }
     }
     let workers = inv.concurrency.unwrap_or_else(|| {
         // The tool's default: half the cores, at least one.
@@ -137,6 +143,23 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
             exit::INTERNAL_ERROR
         }
     }
+}
+
+/// Why the package's state sends the run to the tool, when it does: the
+/// tool's own preconditions, named in the gate's own order. `global_config`
+/// is `super::global_config_exists()`, passed in so the mapping stays pure.
+fn state_reason(root: &Path, global_config: bool) -> Option<Cow<'static, str>> {
+    if !root.join("pubspec.yaml").is_file() {
+        return Some("no pubspec.yaml here".into());
+    }
+    let config = dartq_test::cache::package_config_path(root);
+    if !config.is_file() {
+        return Some(format!("no resolved {} — run flutter pub get", config.display()).into());
+    }
+    if root.join("dart_test.yaml").is_file() {
+        return Some("dart_test.yaml present".into());
+    }
+    global_config.then(|| "global dart_test config present".into())
 }
 
 struct Plan {
@@ -455,31 +478,45 @@ fn flutter_dart(flutter: &Path) -> PathBuf {
         .map_or_else(|| PathBuf::from("dart"), |bin| bin.join("cache").join("dart-sdk").join("bin").join("dart"))
 }
 
-/// The tool's "skip pub get" test (`Pub.get(checkUpToDate: true)`): a
-/// package configuration not written by pub is left alone; otherwise the
-/// pubspec is older than both the lock and the package configuration, and
-/// the configuration was written by this Flutter version
-/// (`.dart_tool/version`). Workspace members resolve at the workspace root.
-fn pub_up_to_date(root: &Path, flutter: &Path) -> bool {
+/// Why the tool would resolve packages before running (`Pub.get`), when it
+/// would: `None` when the resolution is current, `Some` naming the
+/// conjunct that failed. The tool's own test
+/// (`Pub.get(checkUpToDate: true)`): a package configuration not written
+/// by pub is left alone; otherwise the pubspec is older than both the lock
+/// and the package configuration, and the configuration was written by
+/// this Flutter version (`.dart_tool/version`). Workspace members resolve
+/// at the workspace root.
+fn stale_resolution(root: &Path, flutter: &Path) -> Option<&'static str> {
     let config = dartq_test::cache::package_config_path(root);
     let Some(workspace) = config.parent().and_then(Path::parent) else {
-        return false;
+        return Some("no package configuration — run flutter pub get");
     };
     let generator = std::fs::read_to_string(&config)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|value| value.get("generator").and_then(|generator| generator.as_str().map(str::to_owned)));
     if generator.as_deref().is_some_and(|generator| generator != "pub") {
-        return true;
+        // Another generator's configuration is left alone: current.
+        return None;
     }
     let modified = |path: &Path| std::fs::metadata(path).and_then(|meta| meta.modified()).ok();
     let (Some(pubspec), Some(lock), Some(config_time)) =
         (modified(&root.join("pubspec.yaml")), modified(&workspace.join("pubspec.lock")), modified(&config))
     else {
-        return false;
+        return Some("resolution inputs missing — run flutter pub get");
     };
     let recorded = std::fs::read_to_string(workspace.join(".dart_tool").join("version")).ok();
-    pubspec < lock && pubspec < config_time && recorded.is_some() && recorded == framework_version(flutter)
+    let Some(recorded) = recorded else {
+        return Some("no Flutter resolution stamp — run flutter pub get");
+    };
+    if !framework_version(flutter).is_some_and(|version| version == recorded) {
+        return Some("the resolution is from another Flutter — run flutter pub get");
+    }
+    if pubspec < lock && pubspec < config_time {
+        None
+    } else {
+        Some("pubspec newer than lock/config — resolution stale (run flutter pub get)")
+    }
 }
 
 /// The Flutter SDK's framework version (`bin/cache/flutter.version.json`).
@@ -903,17 +940,41 @@ mod tests {
         at(&pkg.join("pubspec.yaml"), 100);
         at(&pkg.join("pubspec.lock"), 200);
         at(&pkg.join(".dart_tool/package_config.json"), 200);
-        assert!(pub_up_to_date(&pkg, &flutter));
+        assert_eq!(stale_resolution(&pkg, &flutter), None);
         // A newer pubspec, or another Flutter version, means the tool
-        // would resolve.
+        // would resolve — and the reason names which conjunct failed.
         at(&pkg.join("pubspec.yaml"), 300);
-        assert!(!pub_up_to_date(&pkg, &flutter));
+        assert_eq!(
+            stale_resolution(&pkg, &flutter),
+            Some("pubspec newer than lock/config — resolution stale (run flutter pub get)")
+        );
         at(&pkg.join("pubspec.yaml"), 100);
         fs::write(pkg.join(".dart_tool/version"), "2.9.0").expect("stamp");
-        assert!(!pub_up_to_date(&pkg, &flutter));
+        assert_eq!(stale_resolution(&pkg, &flutter), Some("the resolution is from another Flutter — run flutter pub get"));
         // A configuration another generator wrote is left alone.
         fs::write(pkg.join(".dart_tool/package_config.json"), r#"{"configVersion":2,"packages":[],"generator":"bazel"}"#).expect("config");
-        assert!(pub_up_to_date(&pkg, &flutter));
+        assert_eq!(stale_resolution(&pkg, &flutter), None);
+    }
+
+    /// State delegations name the missing precondition, in the gate's own
+    /// order: the pubspec, the resolved package configuration, the local
+    /// `dart_test.yaml`, the global one.
+    #[test]
+    fn state_reasons_name_the_missing_precondition() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path();
+        assert_eq!(state_reason(root, false).as_deref(), Some("no pubspec.yaml here"));
+        fs::write(root.join("pubspec.yaml"), "name: p\n").expect("write");
+        let reason = state_reason(root, false).expect("stale");
+        assert!(reason.contains("package_config.json"), "{reason}");
+        assert!(reason.contains("run flutter pub get"), "{reason}");
+        fs::create_dir_all(root.join(".dart_tool")).expect("dir");
+        fs::write(root.join(".dart_tool/package_config.json"), r#"{"configVersion":2,"packages":[]}"#).expect("write");
+        assert_eq!(state_reason(root, false), None, "a resolved, config-less package runs here");
+        fs::write(root.join("dart_test.yaml"), "concurrency: 2\n").expect("write");
+        assert_eq!(state_reason(root, false).as_deref(), Some("dart_test.yaml present"));
+        fs::remove_file(root.join("dart_test.yaml")).expect("remove");
+        assert_eq!(state_reason(root, true).as_deref(), Some("global dart_test config present"));
     }
 
     /// The `package:test` arguments the tool hands its runner: no color by

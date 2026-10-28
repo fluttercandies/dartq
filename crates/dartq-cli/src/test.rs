@@ -34,6 +34,7 @@
 //! `--impacted[=REF]` (run only the suites the changes since REF can reach;
 //! default `HEAD`), `--stats` (one line on stderr saying where suites ran).
 
+use std::borrow::Cow;
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -471,6 +472,44 @@ fn runner_args(args: &[String]) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Delegation
 // ---------------------------------------------------------------------------
+
+/// The one line a delegation prints: where the run went, and why.
+fn delegation_line(flutter: bool, reason: &str) -> String {
+    format!("dartq: delegating to {} — {reason}", if flutter { "flutter test" } else { "dart test" })
+}
+
+/// `delegate`, after naming the reason on stderr: the line a delegation
+/// the repository's state forced always prints, so a quiet hand-off is
+/// never a mystery.
+fn delegate_with(args: &[String], flutter: bool, reason: &str) -> u8 {
+    eprintln!("{}", delegation_line(flutter, reason));
+    delegate(args, flutter)
+}
+
+/// A delegation the invocation itself asked for (`--help`, coverage, a
+/// platform only the runner hosts): the line prints only when `--stats`
+/// asked where suites ran.
+fn delegate_requested(args: &[String], flutter: bool, stats: bool, reason: &str) -> u8 {
+    if stats {
+        eprintln!("{}", delegation_line(flutter, reason));
+    }
+    delegate(args, flutter)
+}
+
+/// Why the repository's state sends the run to the stock runner, when it
+/// does: preconditions only a resolved environment gives back, named in
+/// the gate's own order. `global_config` is `global_config_exists()`,
+/// passed in so the mapping stays pure.
+fn state_reason(root: &Path, global_config: bool) -> Option<Cow<'static, str>> {
+    if !root.join("pubspec.yaml").is_file() {
+        return Some("no pubspec.yaml here".into());
+    }
+    let config = dartq_test::cache::package_config_path(root);
+    if !config.is_file() {
+        return Some(format!("no resolved {} — run dart pub get", config.display()).into());
+    }
+    global_config.then(|| "global dart_test config present".into())
+}
 
 /// Run plain `dart test` (or `flutter test`) with `args` and the terminal
 /// attached, returning its exit status.
@@ -972,13 +1011,15 @@ struct Plan {
 
 fn run(args: &[String]) -> u8 {
     let Ok(inv) = parse(args) else {
-        return delegate(args, false);
+        // No `Invocation`, so `--stats` is read off the line itself.
+        let stats = args.iter().take_while(|arg| *arg != "--").any(|arg| arg == "--stats");
+        return delegate_requested(args, false, stats, "unrecognized arguments");
     };
     if inv.flutter {
         return flutter::run(args, inv);
     }
     if inv.delegate {
-        return delegate(args, false);
+        return delegate_requested(args, false, inv.stats, "tool-only options requested");
     }
     let root = match std::env::current_dir().and_then(|dir| dir.canonicalize()) {
         Ok(root) => root,
@@ -989,14 +1030,11 @@ fn run(args: &[String]) -> u8 {
     };
     // The runner's own preconditions and configuration errors are its to
     // report.
-    if !root.join("pubspec.yaml").is_file()
-        || !dartq_test::cache::package_config_path(&root).is_file()
-        || global_config_exists()
-    {
-        return delegate(args, false);
+    if let Some(reason) = state_reason(&root, global_config_exists()) {
+        return delegate_with(args, false, &reason);
     }
     let Ok(config) = file_config(&root) else {
-        return delegate(args, false);
+        return delegate_with(args, false, "dart_test.yaml present");
     };
     let explicit = !inv.paths.is_empty();
     let selections: Vec<String> = if explicit {
@@ -1005,10 +1043,10 @@ fn run(args: &[String]) -> u8 {
         config.paths.clone().unwrap_or_else(|| vec!["test".to_owned()])
     };
     if !explicit && config.paths.is_none() && !root.join("test").is_dir() {
-        return delegate(args, false);
+        return delegate_with(args, false, "no test/ directory here");
     }
     let Some(mut suites) = discover(&root, &selections, config.filename.as_deref()) else {
-        return delegate(args, false);
+        return delegate_with(args, false, "no test suites discovered");
     };
     let print_path = selections.len() > 1 || root.join(spell(&selections[0]).unwrap_or_default()).is_dir();
     if let Some(base) = &inv.impacted {
@@ -1040,22 +1078,22 @@ fn run(args: &[String]) -> u8 {
     let json = inv.reporter == Some(Kind::Json) || matches!(inv.file_reporter, Some((Kind::Json, _)));
     if config.selects {
         if json {
-            return delegate(args, false);
+            return delegate_requested(args, false, inv.stats, "json reporter with an uncertain selection");
         }
     } else {
         let Some(filter) = dartq_test::select::TagFilter::new(&inv.include_tags, &inv.exclude_tags) else {
-            return delegate(args, false);
+            return delegate_requested(args, false, inv.stats, "invalid tag selector");
         };
         let files: Vec<PathBuf> = suites.iter().map(|suite| suite.abs.clone()).collect();
         let selections = dartq_test::select::select_all(&files, &filter);
         if json && selections.contains(&dartq_test::select::Selection::Unknown) {
-            return delegate(args, false);
+            return delegate_requested(args, false, inv.stats, "json reporter with an uncertain selection");
         }
         let mut selections = selections.into_iter();
         suites.retain(|_| selections.next() != Some(dartq_test::select::Selection::Dropped));
     }
     let Some(dart) = dartq_test::host::find("dart") else {
-        return delegate(args, false);
+        return delegate_with(args, false, "no dart on PATH");
     };
     let workers = inv.concurrency.or(config.concurrency).unwrap_or_else(|| {
         // The runner's default: half the cores, at least one.
@@ -1880,6 +1918,38 @@ mod tests {
         assert!(file_config(root).is_err());
         fs::write(root.join("dart_test.yaml"), "presets: {ci: {}}\n").expect("write");
         assert!(file_config(root).is_err());
+    }
+
+    /// A delegation names the runner it hands the run to and the reason on
+    /// one line.
+    #[test]
+    fn delegations_name_the_runner_and_reason() {
+        assert_eq!(
+            delegation_line(false, "no pubspec.yaml here"),
+            "dartq: delegating to dart test — no pubspec.yaml here"
+        );
+        assert_eq!(
+            delegation_line(true, "no flutter on PATH"),
+            "dartq: delegating to flutter test — no flutter on PATH"
+        );
+    }
+
+    /// State delegations name the missing precondition, in the gate's own
+    /// order: the pubspec, the resolved package configuration, the global
+    /// test configuration.
+    #[test]
+    fn state_reasons_name_the_missing_precondition() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path();
+        assert_eq!(state_reason(root, false).as_deref(), Some("no pubspec.yaml here"));
+        fs::write(root.join("pubspec.yaml"), "name: p\n").expect("write");
+        let reason = state_reason(root, false).expect("stale");
+        assert!(reason.contains("package_config.json"), "{reason}");
+        assert!(reason.contains("run dart pub get"), "{reason}");
+        fs::create_dir_all(root.join(".dart_tool")).expect("dir");
+        fs::write(root.join(".dart_tool/package_config.json"), r#"{"configVersion":2,"packages":[]}"#).expect("write");
+        assert_eq!(state_reason(root, false), None, "a resolved, config-less package runs here");
+        assert_eq!(state_reason(root, true).as_deref(), Some("global dart_test config present"));
     }
 
     /// A suite is green only when nothing errored, the load included, and
