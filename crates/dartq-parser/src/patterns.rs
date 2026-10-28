@@ -152,8 +152,18 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         self.parse_pattern_at(context, 1)
     }
 
+    /// The precedence loop of official `parsePattern` (3.13.7 checkout:
+    /// `parser_impl.dart:11549`). Guarded by
+    /// [`crate::parser::TYPE_DEPTH_CRASH_GUARD`], not
+    /// [`crate::parser::MAX_DEPTH`]: the pattern-structure recursion
+    /// (`parsePattern` → `parsePrimaryPattern` :11658 → the container
+    /// suffixes :11971/:12054/:12143/:12223 → `parsePattern`) carries NO
+    /// counter in the official parser — only constant-pattern operands ride
+    /// `parseExpression` (:6915 `expressionDepth`), which stays on
+    /// `MAX_DEPTH` here. The crash guard only keeps the Rust recursion
+    /// bounded far above any oracle-reachable depth.
     fn parse_pattern_at(&mut self, context: PatternContext, precedence: u8) -> TokenSpan {
-        if !self.enter_depth() {
+        if !self.enter_type_depth() {
             return self.peek_span();
         }
         let begin = self.peek_span();
@@ -164,12 +174,12 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
             let kind = self.peek_kind();
             let Some(level) = pattern_level(kind) else {
                 self.listener.end_pattern(token);
-                self.leave_depth();
+                self.leave_type_depth();
                 return token;
             };
             if level < precedence {
                 self.listener.end_pattern(token);
-                self.leave_depth();
+                self.leave_type_depth();
                 return token;
             }
             match kind {
@@ -212,7 +222,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
                 _ => {
                     // Some other operator that doesn't belong in a pattern.
                     self.listener.end_pattern(token);
-                    self.leave_depth();
+                    self.leave_type_depth();
                     return token;
                 }
             }

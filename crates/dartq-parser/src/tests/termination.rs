@@ -9,10 +9,11 @@
 //!    per breach site, synthetic-`;`/identifier splice, skip to the enclosing
 //!    closer, then keep parsing — the post-fuse cascade rides the ordinary
 //!    recovery faces), while the
-//!    type-descent path (record types, type arguments/variables) carries NO
-//!    observable cap — the official parser counters only
-//!    statement/expression recursion, so oracle-parity depths there must
-//!    parse to completion; it is bounded only by the far-above-parity
+//!    type-descent paths (record types, type arguments/variables, the
+//!    formal-parameter descent, the pattern descent) carry NO observable
+//!    cap — the official parser counters only statement/expression
+//!    recursion, so oracle-parity depths there must parse to completion;
+//!    they are bounded only by the far-above-parity
 //!    `TYPE_DEPTH_CRASH_GUARD` (structured bail, never a panic);
 //! 3. the `<id>` fast-shape consume paths emit the official event order
 //!    without the off-by-one that used to trip `debug_assert!(peek_is_closer)`
@@ -137,6 +138,96 @@ fn deep_valid_type_arguments_produce_zero_diagnostics() {
     assert!(
         listener.errors.is_empty(),
         "the oracle is silent on this shape: {:?}",
+        listener.errors.iter().take(5).collect::<Vec<_>>()
+    );
+}
+
+/// Deep nested function-typed formal parameters (`void f(void g(void g(…`
+/// 600 levels) are VALID Dart the official parser descends with no counter:
+/// the only depth counters in `parser_impl.dart` (3.13.7 checkout) are
+/// `statementDepth` (:6686) and `expressionDepth` (:6915), and the
+/// `parseFormalParametersRest` (:1916) → `parseFormalParameter` (:2029) →
+/// `parseFormalParametersRequiredOpt` (:2307) chain between them carries
+/// none — so the oracle parses this shape silently. dartq must match: no
+/// observable cap on the formal-parameter descent (bounded only by
+/// `TYPE_DEPTH_CRASH_GUARD`), zero diagnostics, no false
+/// `stack_overflow`.
+#[test]
+fn deep_nested_function_typed_formals_parse_silently() {
+    let source: &'static str = Box::leak(
+        format!(
+            "void f({}{}) {{}}",
+            "void g(".repeat(600),
+            ")".repeat(600)
+        )
+        .into_boxed_str(),
+    );
+    // `parse_formal_parameter` carries the largest frame on any descent path,
+    // so the pin parses on a dedicated wide-stack thread: the assertion
+    // targets the guard semantics (no observable cap below
+    // `TYPE_DEPTH_CRASH_GUARD`), not the libtest thread's default stack
+    // budget — the same input parses on the ordinary engine entry in a
+    // process with a proportional stack.
+    let (bailed, errors) = std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(move || {
+            let (table, text) = scan_ok(source);
+            let mut listener = Collector::default();
+            let bailed = {
+                let mut parser = Parser::new(text, table, latest_features(), &mut listener);
+                parser.parse_unit();
+                parser.is_bailed()
+            };
+            (bailed, listener.errors)
+        })
+        .expect("spawn the wide-stack pin thread")
+        .join()
+        .expect("the pin thread must not panic");
+    assert!(
+        !bailed,
+        "the formal-parameter descent has no observable cap: the \
+         600-deep function-typed formals must parse to completion: {errors:?}"
+    );
+    assert!(
+        errors.is_empty(),
+        "the oracle is silent on this valid shape: {:?}",
+        errors.iter().take(5).collect::<Vec<_>>()
+    );
+}
+
+/// Deep parenthesized patterns (`final ((((…a…)))) = x;`, 600 levels) are
+/// VALID Dart the official parser descends with no counter: `parsePattern`
+/// (:11549) → `parsePrimaryPattern` (:11658) →
+/// `parseParenthesizedPatternOrRecordPattern` (:12143) → `parsePattern`
+/// recurses between `statementDepth`/`expressionDepth` crossings (only the
+/// innermost operand would ride `parseExpression`, and a bare identifier
+/// does not even do that) — the oracle parses this shape silently. dartq
+/// must match: no observable cap on the pattern descent (bounded only by
+/// `TYPE_DEPTH_CRASH_GUARD`), zero diagnostics, no false `stack_overflow`.
+#[test]
+fn deep_parenthesized_patterns_parse_silently() {
+    let source: &'static str = Box::leak(
+        format!(
+            "void f() {{ final {}a{} = x; }}",
+            "(".repeat(600),
+            ")".repeat(600)
+        )
+        .into_boxed_str(),
+    );
+    let (table, text) = scan_ok(source);
+    let mut listener = Collector::default();
+    {
+        let mut parser = Parser::new(text, table, latest_features(), &mut listener);
+        parser.parse_unit();
+        assert!(
+            !parser.is_bailed(),
+            "the pattern descent has no observable cap: the 600-deep \
+             parenthesized pattern must parse to completion"
+        );
+    }
+    assert!(
+        listener.errors.is_empty(),
+        "the oracle is silent on this valid shape: {:?}",
         listener.errors.iter().take(5).collect::<Vec<_>>()
     );
 }

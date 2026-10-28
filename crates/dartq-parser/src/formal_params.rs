@@ -49,14 +49,21 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         self.parse_formal_parameters_rest(kind)
     }
 
-    /// Official `parseFormalParametersRest`; the cursor sits before `(`.
+    /// Official `parseFormalParametersRest` (3.13.7 checkout:
+    /// `parser_impl.dart:1916`); the cursor sits before `(`.
     ///
-    /// Depth-guarded: inline function-typed parameters recurse back into this
-    /// function through `parseFormalParameter`, so `((((...` in a parameter
-    /// list is unbounded recursion without the guard (official
-    /// `recoverFromStackOverflow`).
+    /// Guarded by [`crate::parser::TYPE_DEPTH_CRASH_GUARD`], not
+    /// [`crate::parser::MAX_DEPTH`]: nested function-typed parameters recurse
+    /// back into this function through `parseFormalParameter` (:2029) →
+    /// `parseFormalParametersRequiredOpt` (:2307), and the official parser
+    /// carries NO counter on that chain — the only depth counters in
+    /// `parser_impl.dart` are `statementDepth` (:6686) and `expressionDepth`
+    /// (:6915). No observable cap may sit inside the oracle-defined domain
+    /// (deep-but-valid function-typed formals parse silently); the crash
+    /// guard only keeps the Rust recursion bounded far above any
+    /// oracle-reachable depth.
     pub(crate) fn parse_formal_parameters_rest(&mut self, kind: MemberKind) -> TokenSpan {
-        if !self.enter_depth() {
+        if !self.enter_type_depth() {
             return self.peek_span();
         }
         let begin = self.peek_span();
@@ -200,7 +207,7 @@ impl<L: ParserListener> Parser<'_, '_, '_, L> {
         self.last_parameter_count = parameter_count;
         self.listener
             .end_formal_parameters(parameter_count, begin, end, kind);
-        self.leave_depth();
+        self.leave_type_depth();
         end
     }
 
