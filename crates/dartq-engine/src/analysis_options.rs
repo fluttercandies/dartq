@@ -101,8 +101,11 @@
 //!   keeps no spans, so rows anchor at the token text's occurrence in the
 //!   initial file: a section's *value* tokens (include URIs, error actions,
 //!   flag and rule names) search from their section key onward
-//!   (`anchor_in_section`), keys at their first occurrence (`anchor_span`);
-//!   the `(code, file)` differential face is exact regardless.
+//!   (`anchor_in_section`), keys at their first occurrence (`anchor_span`),
+//!   and section-level rows (`invalid_section_format`) at the section's own
+//!   *value node* (`section_value_anchor` — the upstream `analyzer.span`
+//!   convention, the pinned 2026-10-29 probe's `2:3|11`); the
+//!   `(code, file)` differential face is exact regardless.
 //!   `undefined_lint` needs the lint registry, which lives in dartq-lints (an
 //!   engine dependency would cycle) — the engine records the declared rule
 //!   names per file (the initial file in
@@ -117,7 +120,18 @@
 //! - The top-level `plugins:` section reports `invalid_section_format`
 //!   (probed on the 3.13.1 oracle — the section's only CLI-observable faces
 //!   are that row plus stderr load noise) and dartq loads no plugins: any
-//!   declared section is the row, silent only when absent or null.
+//!   declared section is the row, silent only when absent or null. The
+//!   3.13.7 verifier adds `plugins_in_inner_options`
+//!   (parse_model:1538-1545): an *initial* options file outside its context
+//!   root declaring a top-level `plugins:` map — the
+//!   [`OptionsIssue::plugins_in_inner_options`] row, anchored at the
+//!   section's value node; the emitting caller is the CLI face's
+//!   loaded-options walk, which owns the initial/context-root knowledge.
+//! - [`text_direction_issues`] is the unicode-text verifier
+//!   (unicode_text_verifier.dart) over one Dart source: every bidi code
+//!   point reports `text_direction_code_point_in_literal` inside a string
+//!   literal region, `text_direction_code_point_in_comment` anywhere else.
+//!   It rides the per-file Dart diagnostic pass (its mounting face).
 //! - Unreadable files are tolerated — the official reports unresolvable
 //!   includes and still produces effective options (missing include →
 //!   skipped).
@@ -254,6 +268,39 @@ const DUPLICATE_RULE: CodeInfo = CodeInfo::new(
 const INCOMPATIBLE_LINT: CodeInfo = CodeInfo::new(
     "incompatible_lint",
     "INCOMPATIBLE_LINT",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// `The Unicode code point 'U+{0}' changes the appearance of text from how
+/// it's interpreted by the compiler.` (registry :15936-15951 — the shared
+/// template of the `in_comment`/`in_literal` pair; `{0}` is the code
+/// point's uppercase hex with no zero padding).
+const TEXT_DIRECTION_CODE_POINT_IN_COMMENT: CodeInfo = CodeInfo::new(
+    "text_direction_code_point_in_comment",
+    "TEXT_DIRECTION_CODE_POINT_IN_COMMENT",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// Same template as [`TEXT_DIRECTION_CODE_POINT_IN_COMMENT`] — the pair
+/// splits only on where the code point sits (string literal vs anywhere
+/// else; `unicode_text_verifier.dart`:23-34).
+const TEXT_DIRECTION_CODE_POINT_IN_LITERAL: CodeInfo = CodeInfo::new(
+    "text_direction_code_point_in_literal",
+    "TEXT_DIRECTION_CODE_POINT_IN_LITERAL",
+    DiagnosticType::StaticWarning,
+    true,
+);
+
+/// `Plugins can only be specified in the root of a pub workspace or the
+/// root of a package that isn't in a workspace.` (registry :13996-14007;
+/// emitted by the caller that owns the context-root knowledge — the CLI
+/// face's loaded-options walk; the row anchors at the top-level `plugins`
+/// section's value node, `parse_model`:1538-1545).
+const PLUGINS_IN_INNER_OPTIONS: CodeInfo = CodeInfo::new(
+    "plugins_in_inner_options",
+    "PLUGINS_IN_INNER_OPTIONS",
     DiagnosticType::StaticWarning,
     true,
 );
@@ -516,6 +563,28 @@ impl OptionsIssue {
                 "Ensure that all specifications of the same plugin use an identical source."
                     .to_owned(),
             ),
+            offset: span.0,
+            length: span.1,
+        }
+    }
+
+    /// The `plugins_in_inner_options` row (`_ParsedPluginsData.parse`,
+    /// parse_model:1538-1545): an *initial* options file whose directory is
+    /// not its context root declaring a top-level `plugins:` map reports at
+    /// the section's value node (`plugins.span` — the whole map block;
+    /// [`section_value_anchor`] derives it). `context_root` renders in the
+    /// correction verbatim. The non-map section reports
+    /// `invalid_section_format` instead and never reaches here.
+    #[must_use]
+    pub fn plugins_in_inner_options(context_root: &str, span: (u32, u32)) -> Self {
+        OptionsIssue {
+            code: PLUGINS_IN_INNER_OPTIONS,
+            message: "Plugins can only be specified in the root of a pub workspace or the root \
+                      of a package that isn't in a workspace."
+                .to_owned(),
+            correction: Some(format!(
+                "Try specifying plugins in an analysis options file at '{context_root}'."
+            )),
             offset: span.0,
             length: span.1,
         }
@@ -1163,6 +1232,19 @@ impl AnalysisOptions {
             return anchor_in_section(text, "plugins", name);
         }
         plugin_value_anchor(text, "plugins")
+    }
+
+    /// The top-level `plugins` section's whole value-node span — the
+    /// `plugins_in_inner_options` anchor (`plugins.span`, parse_model:1543;
+    /// [`OptionsIssue::plugins_in_inner_options`] renders the row, the CLI
+    /// face's loaded-options walk decides the initial/context-root
+    /// condition that fires it). `(0, 0)` when the section or its value
+    /// cannot be located.
+    pub fn plugins_section_anchor(&self) -> (u32, u32) {
+        let Some((text, _)) = &self.layout else {
+            return (0, 0);
+        };
+        section_value_anchor(text, "plugins").unwrap_or((0, 0))
     }
 
     /// The compiled exclude globs, in declaration order (far to near). The
@@ -3218,6 +3300,29 @@ fn plugin_value_anchor(text: &str, key: &str) -> (u32, u32) {
     (0, 0)
 }
 
+/// The UTF-16 `(offset, length)` of the *value* node of the mapping key
+/// `key`'s first occurrence — the upstream anchor of every section-level
+/// row (`analyzer.span` on a non-map `analyzer:`, `plugins.span` on the
+/// plugins face). The same span machinery as [`plugin_value_anchor`] with
+/// the whole-text first-occurrence scoping [`anchor_in_section`] uses for
+/// a token equal to its section key: successive occurrences are tried
+/// until one reads as a real `key:` entry (a homograph inside a comment or
+/// a longer key's head is no hit). `None` when no entry locates.
+fn section_value_anchor(text: &str, key: &str) -> Option<(u32, u32)> {
+    let mut scan = 0;
+    while let Some(relative) = text[scan..].find(key) {
+        let key_at = scan + relative;
+        if let Some((start, end)) = value_span(text.as_bytes(), key, key_at) {
+            return Some((
+                byte_offset_to_utf16(text, start),
+                byte_offset_to_utf16(text, end).saturating_sub(byte_offset_to_utf16(text, start)),
+            ));
+        }
+        scan = key_at + key.len();
+    }
+    None
+}
+
 /// The byte `(start, end)` of the value node of the mapping key `key` at
 /// `key_at` — `None` when `key_at` does not sit on a `key:` entry (a token
 /// inside a scalar or a longer key's head). The span machinery of
@@ -3400,10 +3505,15 @@ fn push_plugin_unsupported(
 }
 
 /// Records one `invalid_section_format` row (`Invalid format for the '{0}'
-/// section.`, registry :9708-9722), anchored at `token` (section-scoped —
-/// [`anchor_in_section`]).
+/// section.`, registry :9708-9722), anchored at the section's own value
+/// node ([`section_value_anchor`] — the upstream `analyzer.span`/`errors.span`
+/// convention: the pinned 2026-10-29 probe reports the block-list value of
+/// `analyzer:` at `2:3|11`, never the key), falling back to the
+/// section-scoped key anchor ([`anchor_in_section`]) when no `key:` entry
+/// locates (a bare key with nothing below it).
 fn push_invalid_section(issues: &mut Vec<OptionsIssue>, text: &str, section: &str, token: &str) {
-    let (offset, length) = anchor_in_section(text, section, token);
+    let (offset, length) = section_value_anchor(text, section)
+        .unwrap_or_else(|| anchor_in_section(text, section, token));
     issues.push(OptionsIssue {
         code: INVALID_SECTION_FORMAT,
         message: format!("Invalid format for the '{section}' section."),
@@ -6245,6 +6355,240 @@ impl<'a> ManifestParser<'a> {
     }
 }
 
+// --- The unicode-text face (`text_direction_*`) ---
+
+/// Whether `c` is one of the nine bidirectional code points the verifier
+/// flags — U+202A..U+202E and U+2066..U+2069 (`_isCodeUnitMatch`,
+/// unicode_text_verifier.dart:53-62).
+fn is_direction_code_point(c: char) -> bool {
+    matches!(c as u32, 0x202A..=0x202E | 0x2066..=0x2069)
+}
+
+/// One region frame of the source scan ([`text_direction_issues`]): code
+/// (top level or an interpolation body, brace-depth carried for the `}`
+/// that closes the interpolation), the two comment forms (Dart block
+/// comments nest), and a string literal — `quote`/`triple` pick the
+/// terminator, `raw` disables escapes and interpolation.
+#[derive(Debug, Clone, Copy)]
+enum TextRegion {
+    Code { braces: u32 },
+    LineComment,
+    BlockComment { depth: u32 },
+    Str { quote: u8, triple: bool, raw: bool },
+}
+
+/// The `text_direction_code_point_in_comment` / `..._in_literal` rows for
+/// one Dart source (`UnicodeTextVerifier.verify`, upstream Dart SDK source,
+/// `pkg/analyzer/lib/src/error/unicode_text_verifier.dart`:17-40): every
+/// bidi code point (U+202A..U+202E, U+2066..U+2069) reports at its own
+/// UTF-16 `(offset, 1)` — `in_literal` when the covering node is a string
+/// literal (`SimpleStringLiteral`/`InterpolationString`), `in_comment`
+/// otherwise ("if it's not in a string literal, we assume we're in a
+/// comment" — the verifier's own approximation, over-reporting kept).
+///
+/// The covering-node question reduces to a source-region scan: a nesting
+/// stack tracks comment and string-literal regions, interpolation `${...}`
+/// re-entering code (which may open strings and comments of its own), the
+/// escape and `$identifier` forms of non-raw strings, and the triple/raw
+/// terminators. A code point inside any string region reports `in_literal`,
+/// everywhere else `in_comment`, in source order. Rides the per-file Dart
+/// diagnostic pass (the engine face that attributes rows to each source
+/// file); the options module carries it as the auxiliary-verifier home
+/// until that face mounts it.
+#[must_use]
+pub fn text_direction_issues(text: &str) -> Vec<OptionsIssue> {
+    // The upstream pre-pass: the region walk only runs when a flagged code
+    // point exists at all (unicode_text_verifier.dart:20-22, 43-51).
+    if !text.chars().any(is_direction_code_point) {
+        return Vec::new();
+    }
+    let mut issues = Vec::new();
+    let mut stack = vec![TextRegion::Code { braces: 0 }];
+    let (mut at, mut utf16) = (0_usize, 0_u32);
+    while let Some(c) = text[at..].chars().next() {
+        let (size, units) = (c.len_utf8(), c.len_utf16() as u32);
+        if is_direction_code_point(c) {
+            let hex = format!("{:X}", c as u32);
+            let code_info = match stack.last() {
+                // The string-literal arm; everywhere else — the comments and
+                // plain code — is the in_comment arm (the verifier's
+                // covering-node assumption).
+                Some(TextRegion::Str { .. }) => TEXT_DIRECTION_CODE_POINT_IN_LITERAL,
+                _ => TEXT_DIRECTION_CODE_POINT_IN_COMMENT,
+            };
+            issues.push(OptionsIssue {
+                code: code_info,
+                message: format!(
+                    "The Unicode code point 'U+{hex}' changes the appearance of text from how \
+                     it's interpreted by the compiler."
+                ),
+                correction: Some(format!(
+                    "Try removing the code point or using the Unicode escape sequence '\\u{hex}'."
+                )),
+                offset: utf16,
+                length: 1,
+            });
+        }
+        match *stack.last().expect("the stack never empties") {
+            TextRegion::Str { quote, triple, raw } => {
+                if !raw && c == '\\' {
+                    // The escape consumes the next char too (a raw newline
+                    // continuation included).
+                    at += size;
+                    utf16 += units;
+                    if let Some(escaped) = text[at..].chars().next() {
+                        at += escaped.len_utf8();
+                        utf16 += escaped.len_utf16() as u32;
+                    }
+                } else if !raw && c == '$' {
+                    if text[at + size..].as_bytes().first() == Some(&b'{') {
+                        at += size + 1;
+                        utf16 += units + 1;
+                        stack.push(TextRegion::Code { braces: 0 });
+                    } else {
+                        // `$identifier`: the identifier's chars ride the
+                        // literal region (no bidi char is an identifier
+                        // char, so none of them match).
+                        at += size;
+                        utf16 += units;
+                        while let Some(next) = text[at..].chars().next() {
+                            if next.is_ascii_alphanumeric() || next == '_' || next == '$' {
+                                at += next.len_utf8();
+                                utf16 += next.len_utf16() as u32;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                } else if c as u32 == u32::from(quote) {
+                    let closing = if triple {
+                        let rest = text[at + size..].as_bytes();
+                        rest.first() == Some(&quote) && rest.get(1) == Some(&quote)
+                    } else {
+                        true
+                    };
+                    let span = if triple { 3 * size } else { size };
+                    let span_units = if triple { 3 * units } else { units };
+                    at += span;
+                    utf16 += span_units;
+                    if closing {
+                        stack.pop();
+                    }
+                } else {
+                    at += size;
+                    utf16 += units;
+                }
+            }
+            TextRegion::LineComment => {
+                if c == '\n' {
+                    stack.pop();
+                }
+                at += size;
+                utf16 += units;
+            }
+            TextRegion::BlockComment { depth } => {
+                let rest = text[at + size..].as_bytes();
+                let (opener, closer) = (c == '/' && rest.first() == Some(&b'*'),
+                    c == '*' && rest.first() == Some(&b'/'));
+                if opener || closer {
+                    at += 2 * size;
+                    utf16 += 2 * units;
+                    match (opener, depth) {
+                        (true, _) => stack.push(TextRegion::BlockComment { depth: depth + 1 }),
+                        (false, 1) => {
+                            stack.pop();
+                        }
+                        (false, _) => {
+                            stack.pop();
+                            stack.push(TextRegion::BlockComment { depth: depth - 1 });
+                        }
+                    }
+                } else {
+                    at += size;
+                    utf16 += units;
+                }
+            }
+            TextRegion::Code { braces } => {
+                let next = text[at + size..].as_bytes().first().copied();
+                match c {
+                    '/' if next == Some(b'/') => {
+                        at += 2 * size;
+                        utf16 += 2 * units;
+                        stack.push(TextRegion::LineComment);
+                    }
+                    '/' if next == Some(b'*') => {
+                        at += 2 * size;
+                        utf16 += 2 * units;
+                        stack.push(TextRegion::BlockComment { depth: 1 });
+                    }
+                    '\'' | '"' => {
+                        let quote = c as u8;
+                        let rest = text[at + size..].as_bytes();
+                        let triple =
+                            rest.first() == Some(&quote) && rest.get(1) == Some(&quote);
+                        let span = if triple { 3 * size } else { size };
+                        let span_units = if triple { 3 * units } else { units };
+                        at += span;
+                        utf16 += span_units;
+                        stack.push(TextRegion::Str {
+                            quote,
+                            triple,
+                            raw: false,
+                        });
+                    }
+                    // The raw prefix only opens a literal when a quote
+                    // follows directly (`r'...'`); a bare `r` identifier
+                    // falls through the catch-all.
+                    'r' if matches!(next, Some(b'\'' | b'"')) => {
+                        let quote = next.expect("matched above");
+                        let rest = text[at + 2 * size..].as_bytes();
+                        let triple =
+                            rest.first() == Some(&quote) && rest.get(1) == Some(&quote);
+                        let span = if triple { 3 * size } else { 2 * size };
+                        let span_units = if triple { 3 * units } else { 2 * units };
+                        at += span;
+                        utf16 += span_units;
+                        stack.push(TextRegion::Str {
+                            quote,
+                            triple,
+                            raw: true,
+                        });
+                    }
+                    '{' => {
+                        if let Some(TextRegion::Code { braces }) = stack.last_mut() {
+                            *braces += 1;
+                        }
+                        at += size;
+                        utf16 += units;
+                    }
+                    '}' => {
+                        match (braces, stack.len()) {
+                            // The `}` closing an interpolation pops back to
+                            // the owning string literal.
+                            (0, n) if n > 1 => {
+                                stack.pop();
+                            }
+                            (0, _) => {}
+                            _ => {
+                                if let Some(TextRegion::Code { braces }) = stack.last_mut() {
+                                    *braces -= 1;
+                                }
+                            }
+                        }
+                        at += size;
+                        utf16 += units;
+                    }
+                    _ => {
+                        at += size;
+                        utf16 += units;
+                    }
+                }
+            }
+        }
+    }
+    issues
+}
+
 // --- The pinned diagnostic-code name universe (`unrecognized_error_code`) ---
 
 /// The diagnostic code universe the pinned SDK's public registry knows — the
@@ -9027,5 +9371,247 @@ mod pubspec_manifest_pins {
         let map: serde_yaml::Value = serde_yaml::from_str(text).expect("yaml");
         let issues = local_issues(map.as_mapping().expect("mapping"), text);
         assert!(!codes(&issues).contains(&"multiple_plugins"));
+    }
+}
+
+#[cfg(test)]
+mod options_verifier_pins {
+    use super::*;
+
+    /// The UTF-16 offset of one 1-based line/column position (the
+    /// expected.tsv face; every pin fixture is ASCII, so bytes and code
+    /// units agree).
+    fn at(text: &str, line: usize, col: usize) -> u32 {
+        let mut offset = 0_u32;
+        for (index, line_text) in text.split('\n').enumerate() {
+            if index + 1 == line {
+                return offset + col as u32 - 1;
+            }
+            offset += line_text.len() as u32 + 1;
+        }
+        unreachable!("line {line} past the fixture");
+    }
+
+    /// One row's full pin: code, severity family, message, span.
+    fn assert_row(issue: &OptionsIssue, code: &str, message: &str, offset: u32, length: u32) {
+        assert_eq!(issue.code.name, code, "code of {message}");
+        assert_eq!(issue.code.dtype, DiagnosticType::StaticWarning);
+        assert_eq!(issue.message, message);
+        assert_eq!(issue.offset, offset, "offset of {code}");
+        assert_eq!(issue.length, length, "length of {code}");
+    }
+
+    fn codes(issues: &[OptionsIssue]) -> Vec<&str> {
+        issues.iter().map(|issue| issue.code.name).collect()
+    }
+
+    /// The initial file's local shape rows for one options text.
+    fn local(text: &str) -> Vec<OptionsIssue> {
+        let map: serde_yaml::Value = serde_yaml::from_str(text).expect("yaml");
+        local_issues(map.as_mapping().expect("mapping"), text)
+    }
+
+    #[test]
+    fn the_section_rows_anchor_the_sections_value_node() {
+        // invalid_section_format /1 — the oracle anchors the analyzer
+        // section's block-list value (`- not_a_map`, 2:3|11), never the
+        // key (the 2026-10-29 probe's position diff, fixed here).
+        let text = "analyzer:\n  - not_a_map\n";
+        let issues = local(text);
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "invalid_section_format",
+            "Invalid format for the 'analyzer' section.",
+            at(text, 2, 3),
+            11,
+        );
+        // /2 — a well-formed analyzer.errors section stays silent.
+        assert!(local("analyzer:\n  errors:\n    dead_code: ignore\n").is_empty());
+        // A same-line scalar value anchors the scalar's own node.
+        let text = "analyzer: not_a_map\n";
+        let issues = local(text);
+        assert_row(
+            &issues[0],
+            "invalid_section_format",
+            "Invalid format for the 'analyzer' section.",
+            at(text, 1, 11),
+            9,
+        );
+        // A nested whole-section arm anchors that section's value node.
+        let text = "analyzer:\n  errors:\n    - not_a_map\n";
+        let issues = local(text);
+        assert_eq!(codes(&issues), ["invalid_section_format"]);
+        assert_eq!(issues[0].offset, at(text, 3, 5));
+        assert_eq!(issues[0].length, 11);
+    }
+
+    #[test]
+    fn the_registry_rows_render_their_oracle_spans() {
+        // undefined_lint /1 — the row the CLI face renders for an
+        // unregistered name, anchored at the name's own occurrence
+        // (3:7|26). The registry gate itself rides dartq-lints at the CLI
+        // face (an engine dependency would cycle); /2's `prefer_final_locals`
+        // is registered there and stays silent.
+        let text = "linter:\n  rules:\n    - definitely_not_a_real_rule\n";
+        let map: serde_yaml::Value = serde_yaml::from_str(text).expect("yaml");
+        let declared = declared_rule_names(&map["linter"]["rules"], text);
+        let row = OptionsIssue::undefined_lint(&declared[0]);
+        assert_row(
+            &row,
+            "undefined_lint",
+            "'definitely_not_a_real_rule' isn't a recognized lint rule.",
+            at(text, 3, 7),
+            26,
+        );
+        assert_eq!(
+            row.correction.as_deref(),
+            Some("Try using the name of a recognized lint rule.")
+        );
+        // /2 — a registered name extracts with its own span; the gate at
+        // the CLI face drops it before any row renders.
+        let text = "linter:\n  rules:\n    - prefer_final_locals\n";
+        let map: serde_yaml::Value = serde_yaml::from_str(text).expect("yaml");
+        let declared = declared_rule_names(&map["linter"]["rules"], text);
+        assert_eq!(declared[0].name, "prefer_final_locals");
+        assert_eq!(declared[0].offset, at(text, 3, 7));
+        assert_eq!(declared[0].length, 19);
+
+        // duplicate_rule /1 — the second enabled occurrence reports at
+        // its own span (4:7|19); /2's single declaration has no earlier
+        // occurrence to repeat.
+        let text = "linter:\n  rules:\n    - prefer_final_locals\n    - prefer_final_locals\n";
+        let map: serde_yaml::Value = serde_yaml::from_str(text).expect("yaml");
+        let declared = declared_rule_names(&map["linter"]["rules"], text);
+        let row = OptionsIssue::duplicate_rule(&declared[1]);
+        assert_row(
+            &row,
+            "duplicate_rule",
+            "The rule 'prefer_final_locals' is already enabled and doesn't need to be \
+             enabled again.",
+            at(text, 4, 7),
+            19,
+        );
+        assert_eq!(declared.len(), 2);
+        assert!(OptionsIssue::duplicate_rule(&declared[0]).offset == at(text, 3, 7));
+
+        // incompatible_lint /1 — the later declaration conflicts with the
+        // earlier enabled one; the message nests the quoted join inside
+        // the template's own quotes (4:7|23).
+        let text = "linter:\n  rules:\n    - always_use_package_imports\n    - prefer_relative_imports\n";
+        let map: serde_yaml::Value = serde_yaml::from_str(text).expect("yaml");
+        let declared = declared_rule_names(&map["linter"]["rules"], text);
+        let row = OptionsIssue::incompatible_lint(&declared[1], &["always_use_package_imports"]);
+        assert_row(
+            &row,
+            "incompatible_lint",
+            "The rule 'prefer_relative_imports' is incompatible with \
+             ''always_use_package_imports''.",
+            at(text, 4, 7),
+            23,
+        );
+
+        // unrecognized_error_code /1 — an unknown analyzer.errors key at
+        // its own span (3:5|17); /2's `dead_code` is a known diagnostic
+        // code — the engine-side gate leg that keeps the row silent.
+        let text = "analyzer:\n  errors:\n    not_an_error_code: ignore\n";
+        let map: serde_yaml::Value = serde_yaml::from_str(text).expect("yaml");
+        let declared = declared_error_codes(map.as_mapping().expect("mapping"), text);
+        assert!(!is_known_diagnostic_code(&declared[0].code));
+        let row = OptionsIssue::unrecognized_error_code(&declared[0]);
+        assert_row(
+            &row,
+            "unrecognized_error_code",
+            "'not_an_error_code' isn't a recognized diagnostic code.",
+            at(text, 3, 5),
+            17,
+        );
+        let text = "analyzer:\n  errors:\n    dead_code: ignore\n";
+        let map: serde_yaml::Value = serde_yaml::from_str(text).expect("yaml");
+        let declared = declared_error_codes(map.as_mapping().expect("mapping"), text);
+        assert!(is_known_diagnostic_code(&declared[0].code));
+    }
+
+    #[test]
+    fn the_inner_plugins_face_pins_its_row() {
+        // plugins_in_inner_options /1 — the row anchors the top-level
+        // plugins section's whole value node (`custom_lint:` through
+        // `path: .`, 2:3|24), the same node the row fires on when the
+        // file's directory is not its context root (the emitting caller
+        // owns that condition — the CLI face's loaded-options walk).
+        let text = "plugins:\n  custom_lint:\n    path: .\n";
+        let anchor = section_value_anchor(text, "plugins").expect("plugins value node");
+        let row = OptionsIssue::plugins_in_inner_options("/", anchor);
+        assert_row(
+            &row,
+            "plugins_in_inner_options",
+            "Plugins can only be specified in the root of a pub workspace or the root of a \
+             package that isn't in a workspace.",
+            at(text, 2, 3),
+            24,
+        );
+        assert_eq!(
+            row.correction.as_deref(),
+            Some("Try specifying plugins in an analysis options file at '/'.")
+        );
+    }
+
+    #[test]
+    fn the_unicode_text_face_splits_comment_from_literal() {
+        let bidi = '\u{202E}';
+        // text_direction_code_point_in_comment /1 — the flipped comment.
+        let text = format!("// The text direction is silently flipped here {bidi}\nvoid f() {{\n}}\n");
+        let issues = text_direction_issues(&text);
+        assert_eq!(issues.len(), 1);
+        assert_row(
+            &issues[0],
+            "text_direction_code_point_in_comment",
+            "The Unicode code point 'U+202E' changes the appearance of text from how it's \
+             interpreted by the compiler.",
+            at(&text, 1, 48),
+            1,
+        );
+        assert_eq!(
+            issues[0].correction.as_deref(),
+            Some(
+                "Try removing the code point or using the Unicode escape sequence '\u{5c}u202E'."
+            )
+        );
+        // /2 — an unchanged comment stays silent.
+        assert!(text_direction_issues("// The text direction is unchanged here.\nvoid f() {}\n")
+            .is_empty());
+        // text_direction_code_point_in_literal /1 — the flipped literal.
+        let text = format!("var s = 'a{bidi}b';\n\nvoid f() {{\n  print(s);\n}}\n");
+        let issues = text_direction_issues(&text);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code.name, "text_direction_code_point_in_literal");
+        assert_eq!(issues[0].offset, at(&text, 1, 11));
+        assert_eq!(issues[0].length, 1);
+        // /2 — a bidi code point in a comment beside a clean literal
+        // reports the in_comment arm at the comment's own code point.
+        let text = format!("// The flagged code point only appears in a comment: {bidi}\nvar s = 'ab';\n\nvoid f() {{\n  print(s);\n}}\n");
+        let issues = text_direction_issues(&text);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code.name, "text_direction_code_point_in_comment");
+        assert_eq!(issues[0].offset, at(&text, 1, 54));
+        // Every other bidi code point flags too, raw strings carry theirs
+        // as literals, escapes never fire, and multiple code points report
+        // in source order.
+        let text = "\u{2066}a\u{202A}b";
+        let issues = text_direction_issues(text);
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].message, "The Unicode code point 'U+2066' changes the appearance of text from how it's interpreted by the compiler.");
+        let text = format!("var a = r'{bidi}';\nvar b = '\\u{{202E}}';\n");
+        let issues = text_direction_issues(&text);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code.name, "text_direction_code_point_in_literal");
+        // A code point inside an interpolation's expression re-enters
+        // code — the covering node is no string literal, so the in_comment
+        // arm fires (the verifier's covering-node assumption).
+        let text = format!("var s = '${{{bidi}}}';");
+        let issues = text_direction_issues(&text);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code.name, "text_direction_code_point_in_comment");
+        assert_eq!(issues[0].offset, at(&text, 1, 12));
     }
 }
