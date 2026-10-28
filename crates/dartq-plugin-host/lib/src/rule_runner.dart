@@ -157,15 +157,9 @@ Future<List<PluginDiagnostic>> _runRulesResolved(
       );
     }
   }
-  final collection = AnalysisContextCollectionImpl(
+  final collection = _buildCollection(
     resourceProvider: resourceProvider,
     includedPaths: [for (final file in files) file.absolute],
-    drainStreams: false,
-    updateAnalysisOptions4: ({required analysisOptions}) {
-      analysisOptions
-        ..warning = false
-        ..lint = false;
-    },
   );
   try {
     // Group the analyzed set into libraries: a part file resolves with its
@@ -223,8 +217,7 @@ Future<List<PluginDiagnostic>> _runRulesResolved(
         }
         continue;
       }
-      for (final MapEntry(key: path, value: diagnostics)
-          in resolved.entries) {
+      for (final MapEntry(key: path, value: diagnostics) in resolved.entries) {
         final wirePath = wireByAbsolute[path];
         if (wirePath == null) {
           continue;
@@ -237,6 +230,50 @@ Future<List<PluginDiagnostic>> _runRulesResolved(
     return findings;
   } finally {
     await collection.dispose();
+  }
+}
+
+/// Builds the resolved-path collection with warning/lint computation off
+/// (upstream `plugin_server.dart`'s options callback: warnings and lints
+/// are the main analysis isolate's job, never the plugin isolate's).
+///
+/// The callback's named parameter is analyzer-era sensitive and cannot be
+/// spelled statically for both eras this file compiles against: analyzer 14
+/// renamed it to `configureAnalysisOptionsBuilder`, receiving the mutable
+/// `AnalysisOptionsBuilder` (the built `AnalysisOptionsImpl`'s fields became
+/// final), while analyzer 13 and earlier spell it `updateAnalysisOptions4`,
+/// receiving the built `AnalysisOptionsImpl`. The constructor tearoff +
+/// `Function.apply` dispatch at runtime: the 14-era spelling is tried
+/// first, and the missing parameter falls back to the 13-era one — a
+/// sidecar compiling against the older era pays one failed dynamic
+/// invocation per process, on its first resolved-path cycle, nothing after.
+AnalysisContextCollectionImpl _buildCollection({
+  required OverlayResourceProvider resourceProvider,
+  required List<String> includedPaths,
+}) {
+  final shared = <Symbol, Object?>{
+    #resourceProvider: resourceProvider,
+    #includedPaths: includedPaths,
+    #drainStreams: false,
+  };
+  try {
+    return Function.apply(AnalysisContextCollectionImpl.new, [], {
+          ...shared,
+          #configureAnalysisOptionsBuilder:
+              ({required analysisOptionsBuilder}) => analysisOptionsBuilder
+                ..warning = false
+                ..lint = false,
+        })
+        as AnalysisContextCollectionImpl;
+  } on NoSuchMethodError {
+    return Function.apply(AnalysisContextCollectionImpl.new, [], {
+          ...shared,
+          #updateAnalysisOptions4: ({required analysisOptions}) =>
+              analysisOptions
+                ..warning = false
+                ..lint = false,
+        })
+        as AnalysisContextCollectionImpl;
   }
 }
 
@@ -344,8 +381,7 @@ Future<Map<String, List<Diagnostic>>?> _runRulesOnLibrary(
   AnalysisRuleVisitor(visitRegistry).afterLibrary();
 
   return {
-    for (final unit in allUnits)
-      unit.file.path: listeners[unit]!.diagnostics,
+    for (final unit in allUnits) unit.file.path: listeners[unit]!.diagnostics,
   };
 }
 

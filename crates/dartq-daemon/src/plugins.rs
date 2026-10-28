@@ -22,15 +22,18 @@
 //! sidecar starts there); the first spawn handshake (up to the manifest's
 //! `request_ms × (retries + 1)` per plugin, defaults 10 s × 4)
 //! lands inside [`PluginSet::cycle`]'s launch pass on the first cycle that
-//! has something to feed, and each cycle after that spends at most one
-//! [`DRAIN_BUDGET`] per plugin waiting for findings.
-//! Findings that arrive after a cycle's budget publish on the next cycle.
-//! The cycle is the *merge step* of the core-first publish: the session
-//! stages its engine diagnostics publish before consulting the plugin set
-//! at all, so the waits here can delay only the plugin rows' own addition —
-//! never the core publish ([`DRAIN_BUDGET`] is the per-plugin timeout
-//! isolation; a plugin that will not quiesce within it is degraded, its
-//! rows deferred, and the move is counted in the stats' `degraded_cycles`).
+//! has something to feed, and each cycle after that waits out at most the
+//! plugin's manifest `callback_ms` for its findings — the same bound
+//! upstream `dart analyze` applies to a plugin's response, bounded by the
+//! plugin's own declaration and no shorter. A healthy plugin ends the wait
+//! early through the drain's settle window, so the budget prices only
+//! overruns.
+//! Findings in flight past that budget publish on the next cycle (the
+//! drain reports them *degraded*: the timeout isolation, counted in the
+//! stats' `degraded_cycles`). The cycle is the *merge step* of the
+//! core-first publish: the session stages its engine diagnostics publish
+//! before consulting the plugin set at all, so the waits here can delay
+//! only the plugin rows' own addition — never the core publish.
 //!
 //! # Known-accepted postures
 //!
@@ -86,11 +89,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{Value, json};
 
 use crate::wire;
-
-/// Per-cycle wait for plugin findings (the bounded drain): long enough for a
-/// warm plugin's push, short enough to keep the main loop responsive. Rows
-/// arriving later publish on the next cycle.
-const DRAIN_BUDGET: Duration = Duration::from_millis(50);
 
 /// One analyze cycle's caller-side context: what the plugin face needs
 /// beyond the engine diagnostics themselves.
@@ -432,13 +430,15 @@ impl PluginSet {
 
     /// One analyze cycle against the plugins: pushes the engine's merged
     /// diagnostic set (the lints included by the caller), the cycle's
-    /// analyzed file set, and the resolved per-plugin execution config; waits
-    /// [`DRAIN_BUDGET`] per live plugin for findings; and returns both.
+    /// analyzed file set, and the resolved per-plugin execution config;
+    /// waits each live plugin's manifest `callback_ms` for findings; and
+    /// returns both.
     ///
     /// `anchor` is the crash anchor, resolved by the caller at cycle entry
-    /// (the file table's first published entry) — `None` when nothing has
-    /// published yet, in which case crash rows are withheld until a cycle
-    /// that has one. Crash rows come back beside the findings as engine
+    /// (the file table's first published entry, or the first analyzed file
+    /// when nothing has published yet — a sidecar that dies at startup
+    /// anchors immediately instead of waiting for a publish). Crash rows
+    /// come back beside the findings as engine
     /// `Diagnostic`s; the caller's merge step converts and publishes them
     /// (they never join the engine vec). At most one is emitted per plugin
     /// per session.
@@ -572,20 +572,22 @@ impl PluginSet {
             let started = Instant::now();
             let outcome = runtime
                 .feed(engine, files, &push)
-                .and_then(|()| pump_plugin(runtime, server, DRAIN_BUDGET));
+                .and_then(|()| pump_plugin(runtime, server));
             match outcome {
                 Ok((rows, degraded)) => {
                     // The cycle's per-plugin cost lands in the stats face:
                     // the busy wall time, and the budget-expired drains
-                    // (degraded — the plugin's remaining rows publish on a
-                    // later cycle). Errors take the crash path below and
-                    // count through the crash machinery instead.
+                    // (degraded — the plugin's analyze demand was still
+                    // open when its manifest callback budget expired; its
+                    // remaining rows publish on a later cycle or die with
+                    // the monitor's kill). Errors take the crash path
+                    // below and count through the crash machinery instead.
                     if degraded {
                         eprintln!(
-                            "dartq-daemon: plugin `{}` exceeded its {} ms drain budget; \
+                            "dartq-daemon: plugin `{}` exceeded its {} ms analyze callback budget; \
                              remaining rows publish on a later cycle",
                             slot.name,
-                            DRAIN_BUDGET.as_millis(),
+                            runtime.callback_timeout().as_millis(),
                         );
                     }
                     runtime.observe_cycle(started.elapsed(), degraded);
@@ -607,10 +609,10 @@ impl PluginSet {
     /// kill-only — the exact posture restart-budget exhaustion leaves — and
     /// its slot records the failure, so the next cycle emits the plugin's
     /// one-shot `dartq/plugin_crashed` row through the normal path
-    /// (withheld until an anchor exists, never repeated). Already-dead
-    /// slots keep their recorded state. Returns `true` when at least one
-    /// live plugin was disabled — exactly once per session; later calls
-    /// find nothing live and change nothing.
+    /// (anchored at the first published or analyzed file, never repeated).
+    /// Already-dead slots keep their recorded state. Returns `true` when at
+    /// least one live plugin was disabled — exactly once per session; later
+    /// calls find nothing live and change nothing.
     pub fn disable_for_session(&mut self, cause: &str) -> bool {
         let mut disabled = false;
         for slot in &mut self.plugins {
@@ -714,7 +716,9 @@ fn accept_rows(
 /// budget reaching the error), and the failure records as the plugin's
 /// one-shot `dartq/plugin_crashed` row, published against `anchor` in this
 /// cycle or withheld (pending) until a cycle that has one. Shared by the
-/// cycle's launch pass and its feed/drain error arm.
+/// cycle's launch pass and its feed/drain error arm. The failure is also
+/// logged once on stderr: a plugin's death is user-visible state, and the
+/// row alone can sit unpublished until a later cycle.
 fn fail_slot(
     slot: &mut PluginSlot,
     error: RuntimeError,
@@ -725,6 +729,7 @@ fn fail_slot(
     if slot.crash_emitted {
         return;
     }
+    eprintln!("dartq-daemon: plugin `{}` failed: {error}", slot.name);
     if let Some(anchor) = anchor {
         cycle
             .crashes
@@ -980,29 +985,40 @@ pub fn merge(
     merged
 }
 
-/// One plugin's bounded drain (the cycle's wait half): parks for at most
-/// [budget] total, hands back every diagnostic that arrived plus whether
-/// the drain was *degraded* — the budget expired before the plugin
-/// quiesced, so its remaining rows publish on a later cycle (the timeout
-/// isolation: the caller never waits past [budget] for a plugin) — and
-/// pumps the plugin's reverse `request/query` frames through [server] as
-/// they land — a producer that queries while its findings are computed
-/// stalls itself, so the answers go out within the same drain instead of
-/// past the plugin's own callback budget. A cycle without a server declines
-/// the queries (the immediate error reply — the producer fails fast, the
-/// session stays up).
+/// One plugin's bounded drain (the cycle's wait half): parks for the
+/// plugin's manifest-declared analyze budget ([`PluginRuntime::callback_timeout`])
+/// — the bound upstream's `dart analyze` applies to a plugin's response —
+/// and hands back every diagnostic that arrived plus whether the drain was
+/// *degraded*: the budget expired while the analyze demand was still open
+/// (the plugin's remaining rows land in `pending` and publish on a later
+/// cycle, or are lost if the monitor kills the child for the same overrun).
+/// The wait ends early on quiesce: `wait_output` returns as soon as a burst
+/// of `notification/diagnostic` frames settles (the reader's `BURST_SETTLE`
+/// quiet window), so a healthy plugin never holds the cycle for the full
+/// budget. While the wait runs, the plugin's reverse `request/query` frames
+/// pump through [server] — a producer that queries while its findings are
+/// computed stalls itself, so the answers go out within the same drain
+/// instead of past the plugin's own budget. A cycle without a server
+/// declines the queries (the immediate error reply — the producer fails
+/// fast, the session stays up).
 fn pump_plugin(
     runtime: &mut PluginRuntime,
     mut server: Option<&mut dyn FnMut(&PendingQuery) -> QueryAnswer>,
-    budget: Duration,
 ) -> Result<(Vec<PluginDiagnostic>, bool), RuntimeError> {
-    let deadline = Instant::now() + budget;
+    let deadline = Instant::now() + runtime.callback_timeout();
     let mut rows = Vec::new();
     loop {
         let drain = runtime.wait_output(deadline.saturating_duration_since(Instant::now()))?;
         rows.extend(drain.diagnostics);
         if drain.pending_queries == 0 {
-            return Ok((rows, false));
+            // The drain ended because either the burst settled (demand
+            // closed — quiesced or dead) or the deadline hit. An analyze
+            // demand still open at exit means the plugin is mid-burst
+            // past its own budget: the cycle reports degraded honestly,
+            // and rows still in flight land on a later cycle or die with
+            // the monitor's kill.
+            let degraded = runtime.analyze_demand_open();
+            return Ok((rows, degraded));
         }
         match server.as_deref_mut() {
             Some(serve) => {

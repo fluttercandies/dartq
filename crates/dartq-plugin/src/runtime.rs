@@ -894,6 +894,28 @@ impl PluginRuntime {
         })
     }
 
+    /// Whether the analyze demand is still open — `feed` wrote an
+    /// `engine_diagnostics` batch the child has yet to answer with a
+    /// diagnostic (or die trying). The caller uses this to distinguish
+    /// "the drain completed because the plugin quiesced" from "the drain's
+    /// budget expired while the plugin was still working": rows of the
+    /// second kind land in `pending` later and re-feed on the next cycle.
+    /// Read-only; the monitor's own enforcement runs off the same clock.
+    #[must_use]
+    pub fn analyze_demand_open(&self) -> bool {
+        self.analyze_clock.open_for(self.created).is_some()
+    }
+
+    /// The manifest's `callback_ms` — the plugin's declared budget for one
+    /// analyze demand (and one `request/fixes` round trip). The drain's
+    /// outer bound is this budget, matching upstream's `await` of the
+    /// plugin's response; a plugin that overruns it is killed by the
+    /// monitor through the same path the fixes face uses.
+    #[must_use]
+    pub const fn callback_timeout(&self) -> Duration {
+        self.callback_timeout
+    }
+
     /// [`Self::take_output`] with a wait: parks on the reader's push signal
     /// until diagnostics arrived (holding through one `BURST_SETTLE` quiet
     /// window so a synchronous reply — one analyze cycle answered with

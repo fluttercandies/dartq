@@ -114,6 +114,11 @@ Future<void> main(List<String> args) async {
   var exitCode = 0;
   try {
     await session.start();
+    // Lazy-boot daemon (#2591): no eager startup sweep runs on spawn — the
+    // cold discovery+analysis rides the first drain that stages engine work.
+    // One sync over the corpus stages it; the cold-wave wait below then
+    // measures that drain exactly as it did the eager sweep.
+    session.syncPaths(files);
     final coldWatch = Stopwatch()..start();
     await session.waitForColdWave(coldWatch);
     final coldMs = coldWatch.elapsedMilliseconds;
@@ -133,9 +138,18 @@ Future<void> main(List<String> args) async {
     // complete lines in the original, plus one for the separating newline.
     final baseLine = original.split('\n').length - 1;
     final roundMs = <int>[];
+    // Rounds append cumulatively: round N's statement lands on exactly
+    // baseLine + N, matching the waitForPublish line pin below, and each
+    // round genuinely grows the file's diagnostic set (a rebuild-from-
+    // original edit is set-neutral from round 3 on, so the diff-based push
+    // face would never publish and the round wait would hang).
+    final content = StringBuffer(original);
     for (var round = 1; round <= rounds; round++) {
       final watch = Stopwatch()..start();
-      session.change(target, '$original\nvar round_edit_$round = ;\n');
+      content
+        ..writeln()
+        ..write('var round_edit_$round = ;\n');
+      session.change(target, content.toString());
       await session.waitForPublish(watch, of: target, line: baseLine + round);
       roundMs.add(watch.elapsedMilliseconds);
     }
@@ -417,6 +431,14 @@ class _Session {
       await Future<void>.delayed(const Duration(milliseconds: 10));
     }
     return _publishes.removeAt(0);
+  }
+
+  /// Stages the engine without writing files: reports [paths] as unchanged
+  /// syncs, so the lazy-boot daemon's first drain runs the cold
+  /// discovery+analysis (the eager startup sweep this driver's cold-wave
+  /// wait was originally written against).
+  void syncPaths(List<String> paths) {
+    _notify('dartq/sync', {'paths': paths});
   }
 
   /// Ends the session the protocol's way: EOF on stdin is the daemon's only

@@ -168,11 +168,14 @@
 //! client waits on the answer); everything else is `Normal` — overlay
 //! writes (`dartq/sync` and watch batches alike), the publish-carrying
 //! reads they enqueue, and the startup sweep's first analysis.
-//! `Background` is the engine's slot for indexing/prewarm
-//! producers the daemon does not run yet. Tier never changes after enqueue:
-//! a request attaching to an already-queued read keeps that read's tier
-//! (drain order is unaffected while one read serves the whole turn anyway;
-//! the distinction bites across contexts).
+//! `Background` is the warm lane's tier (#2739): each context whose
+//! engine has warm work armed carries one queued warm task, stepped once
+//! per drain behind every write and read — the scheduler's own tier
+//! order is the "foreground always wins" guarantee, and an epoch bump
+//! voids a queued warm task like any other. Tier never changes after
+//! enqueue: a request attaching to an already-queued read keeps that
+//! read's tier (drain order is unaffected while one read serves the
+//! whole turn anyway; the distinction bites across contexts).
 //!
 //! # Snapshot persistence (#306)
 //!
@@ -375,6 +378,16 @@ const PLUGIN_PANIC_LIMIT: u32 = 3;
 /// retry that is contained again stops the ladder until the next applied
 /// write).
 const PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// The warm lane's idle tick (#2739): while warm work is armed or queued
+/// the main loop bounds its receive by this, so a quiet session steps the
+/// `Tier::Background` lane instead of stalling until the next intake.
+/// Longer than the publish retry — warming is a latency optimization,
+/// never a correctness path — while short enough that a restart-scale
+/// miss set (the face pass is `WARM_STEP_FILES`-bounded per step) still
+/// converges during a reading pause. Every tick is a full drain, so
+/// intake landing between ticks preempts the lane for free.
+const WARM_TICK: Duration = Duration::from_millis(25);
 
 /// The wall-clock ceiling for one fix/assists dispatch (
 /// isolation posture at session granularity). The manifests' own budgets
@@ -994,6 +1007,21 @@ pub struct Session {
     /// Queued read tasks, one per context at most (reads coalesce per
     /// context).
     reads: Vec<PendingRead>,
+    /// The `Tier::Background` warm tasks in flight: scheduler cookie →
+    /// context. A context carries at most one queued warm task; the
+    /// drain arm removes its cookie on execution, and the post-drain
+    /// sweep drops cookies a stale drop stranded (an epoch bump voids a
+    /// queued warm task exactly like any other). Warm tasks are the
+    /// engine's `parallel_prime_caches` lane (#2739): they step
+    /// [`Engine::warm_step`] once per drain at the lowest tier, behind
+    /// every write and read.
+    warm_cookies: FxHashMap<u64, ContextId>,
+    /// The warm lane's self-wake: while any context has warm work armed
+    /// or a warm task queued, the main loop bounds its idle receive by
+    /// this, so an idle daemon keeps stepping the lane — the
+    /// [`Self::publish_retry`] deadline's posture, timer-free. `None`
+    /// when nothing is warm-pending.
+    warm_next: Option<Instant>,
     /// Requests cancelled while queued, answered cancelled at the drain.
     cancelled: Vec<RequestId>,
     /// The plugin set: discovered under the
@@ -1082,6 +1110,15 @@ pub struct Session {
     /// store was rebound to it at assembly. Kept as the session's handle
     /// for the residency probes ([`Self::shared_store_mapped_bytes`]).
     mapped_pool: Option<dartq_engine::MappedContentPool>,
+    /// The quit ladder's engine-side cell (#2729): every analysis this
+    /// session runs passes this token, so a flip mid-turn stops the
+    /// in-flight recompute at its next checkpoint instead of waiting
+    /// out the turn. Per-session, never re-armed: the flip means the
+    /// session is ending — every exit path funnels into the shutdown
+    /// ladder, after which no further analysis ever runs. A session
+    /// nobody binds a flag to keeps an uncancellable token — the same
+    /// `default()` posture the token type documents.
+    quit: CancellationToken,
     snapshot: SnapshotSink,
 }
 
@@ -1407,6 +1444,8 @@ impl Session {
             staged: Vec::new(),
             write: None,
             reads: Vec::new(),
+            warm_cookies: FxHashMap::default(),
+            warm_next: None,
             cancelled: Vec::new(),
             plugins,
             plugin_path_panics: 0,
@@ -1425,12 +1464,35 @@ impl Session {
             debug_dispatch: None,
             test: crate::test::TestManager::default(),
             mapped_pool,
+            quit: CancellationToken::new(),
             snapshot: SnapshotSink {
                 store,
                 dirty: false,
                 last_apply: None,
             },
         })
+    }
+
+    /// Binds the session's quit cell (#2729): the caller's flag —
+    /// the serve loop's signal-hook `Arc<AtomicBool>` — becomes the
+    /// cell every analysis token polls, so a mid-turn signal write
+    /// lands inside the engine checkpoints' stride instead of waiting
+    /// out the turn, while the same write stays observable to the
+    /// caller's own poll. Call before the first analysis: rebinding
+    /// after a token clone escaped severs the link (the serve loop
+    /// binds at assembly; nothing else clones the token).
+    pub fn bind_quit_flag(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.quit = CancellationToken::from_flag(flag);
+    }
+
+    /// Cancels the session's analysis token — the shutdown-ladder arm
+    /// for exits that never came through the bound flag (idle reap,
+    /// unrecoverable listener): idempotent, and a no-op against an
+    /// already-flipped cell. After it, every later analysis cancels at
+    /// its first checkpoint — the session-level quit fact, which the
+    /// ladder follows to death anyway.
+    pub fn cancel_analysis(&self) {
+        self.quit.cancel();
     }
 
     /// The session-start workspace sweep: discover every surface file
@@ -2496,6 +2558,12 @@ impl Session {
             self.ensure_write();
         }
         let report = self.runtime.drain();
+        // The warm-cookie liveness snapshot: every cookie queued before
+        // this drain either reaches its arm below (removed there) or was
+        // stale-dropped by an epoch bump (still in the map — swept after
+        // the loop). Cookies enqueued during the drain are not in the
+        // snapshot and always retain.
+        let warm_queued: FxHashSet<u64> = self.warm_cookies.keys().copied().collect();
         // The lazy-boot discovery (#2591): the first drain that actually
         // stages engine work walks the workspace here — ahead of this
         // turn's write arm, so staged client overlays apply on top of the
@@ -2657,9 +2725,41 @@ impl Session {
                         .expect("the default context lives for the session");
                     self.fixes[position].cookie = cookie;
                 }
+            } else if let Some(context) = self.warm_cookies.remove(&task.cookie) {
+                // The `Tier::Background` arm (#2739): one bounded
+                // `warm_step` per drained warm task, behind every write
+                // and read the drain ordered ahead of it. The step runs
+                // inside the same panic boundary discipline as every
+                // engine turn — a warm that panicked must not kill the
+                // loop (the engine's own boundaries cover the analysis;
+                // the warm path is the same `&mut` surface).
+                let quit = self.quit.clone();
+                let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    self.engine_mut(context).warm_step(&quit)
+                }));
+                match step {
+                    Ok(dartq_engine::WarmStep::More) => {
+                        // Work remains armed: re-queue at the background
+                        // tier — the next drain (tick- or intake-woken)
+                        // continues the pass behind whatever foreground
+                        // landed meanwhile.
+                        let cookie = self.next_cookie();
+                        self.runtime
+                            .enqueue(context, false, Tier::Background, cookie)
+                            .expect("session contexts live for the session");
+                        self.warm_cookies.insert(cookie, context);
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        eprintln!(
+                            "dartq-daemon: warm step panicked; the context's warm lane \
+                             re-arms at the next settle"
+                        );
+                    }
+                }
             } else {
-                // Invariant: the popped task is a live read — the write and fix arms did not
-                // claim its cookie.
+                // Invariant: the popped task is a live read — the write, fix, and warm arms
+                // did not claim its cookie.
                 let position = self
                     .reads
                     .iter()
@@ -2684,6 +2784,38 @@ impl Session {
                 self.published.remove(&file);
             }
         }
+        // The warm-lane sweep (#2739): cookies queued before this drain
+        // that never reached the arm were stale-dropped (an epoch bump
+        // voids a queued warm task like any other) — drop them so a
+        // lingering cookie cannot block `ensure_warm`'s dedupe.
+        self.warm_cookies
+            .retain(|cookie, _| !warm_queued.contains(cookie));
+        // The settle's enqueue: every context whose engine has warm work
+        // armed carries one queued warm task (deduped per context). A
+        // task queued here drains at the next turn's drain — behind any
+        // foreground that lands first, and dropped stale if a write
+        // bumps the epoch meanwhile.
+        for index in 0..self.context_ids.len() {
+            let context = self.context_ids[index];
+            if self.engine(context).warm_pending() {
+                self.ensure_warm(context);
+            }
+        }
+        // The idle self-wake: while warm work is armed or queued the
+        // loop wakes at WARM_TICK to keep stepping — the publish-retry
+        // deadline's posture, timer-free. Foreground intake always wins:
+        // the tick's drain runs the queued warm tasks behind whatever
+        // else arrived.
+        self.warm_next = if !self.warm_cookies.is_empty()
+            || self
+                .context_ids
+                .iter()
+                .any(|&context| self.engine(context).warm_pending())
+        {
+            Some(Instant::now() + WARM_TICK)
+        } else {
+            None
+        };
         // Between turns the engine is base-resident: agent wears never
         // outlive the drain, so intake-time state reads and the next
         // drain's wear-time captures never see a stale view.
@@ -3014,20 +3146,17 @@ impl Session {
             if let Ok(()) = outcome {
                 // `Ok` covers two cases. A completed drain cleared
                 // `publishes_due` at the publish plan, so a scheduled
-                // fallback retry is superseded. But a cancelled analysis
-                // (`analyze_with_lints` → `Err(Cancelled)`) also returns
-                // `Ok` — WITHOUT running the plan — so a due diff is
-                // dropped here and nothing self-driven recovers it until
-                // the next intake, which can be indefinitely far for a
-                // quiet open file. Unreachable today: the session's
-                // analyze passes a default token nothing cancels. M4
-                // precondition: once a real cancellation token is threaded
-                // through, clear `publishes_due`/`publish_retry` only when
-                // the plan actually ran (have `run_group` report
-                // plan-executed, or check that `publishes_due` was
-                // consumed).
-                self.publishes_due = false;
-                self.publish_retry = None;
+                // fallback retry is superseded. A quit-cancelled
+                // analysis (`analyze_with_lints` → `Err(Cancelled)`)
+                // also returns `Ok` — WITHOUT running the plan — so the
+                // due flags stay set here: on quit the shutdown ladder
+                // ends the session anyway, and keeping the diff honest
+                // is what a future non-quit cancel source needs for the
+                // #1310 retry to fire.
+                if !self.quit.is_cancelled() {
+                    self.publishes_due = false;
+                    self.publish_retry = None;
+                }
             } else {
                 eprintln!(
                     "dartq-daemon: base analysis panicked; the publish diff retries on \
@@ -3197,10 +3326,12 @@ impl Session {
             return;
         };
         // The crash anchor at cycle entry: the published state the plugins
-        // answer against, resolved before any publish touches the baseline —
-        // the withhold-until-anchored posture sees exactly that state. The
-        // scan runs only when a plugin set exists; the empty set's cycle
-        // pays one emptiness check.
+        // answer against, resolved before any publish touches the baseline.
+        // The scan runs only when a plugin set exists; the empty set's
+        // cycle pays one emptiness check. A session that has published
+        // nothing yet falls back to the first analyzed file inside
+        // [`Self::weave_plugins`] — a startup-dead sidecar must still
+        // surface its crash row.
         let anchor = if self.plugins.is_empty() {
             None
         } else {
@@ -3303,9 +3434,10 @@ impl Session {
     /// files and the cycle's crash rows as engine-shaped [`Diagnostic`]s —
     /// both are plain data here; the caller layers them onto the baseline
     /// ([`Self::publish_plugin_rows`]). The engine rows the plugins fed are
-    /// [`engine_rows`]; a crash whose [anchor] does not exist yet — the
-    /// session has published nothing — is withheld by the cycle, not
-    /// dropped: it publishes on the first cycle that has one. Contained a
+    /// [`engine_rows`]; a crash reported before anything has published is
+    /// anchored by the weave at the first analyzed file (below), so a
+    /// sidecar that dies at startup still surfaces its one row on a
+    /// workspace that would otherwise never publish. Contained a
     /// level finer than the group (#690): this is the group's only
     /// plugin-row exposure, so a panic here is attributable and penalizes
     /// immediately — the group's engine rows have already converted,
@@ -3349,18 +3481,28 @@ impl Session {
         // never stale disk bytes), and the governing root options file
         // (the `plugins:` rule configs). The enumeration runs only when a
         // plugin set exists; the vec build is the per-cycle cost of
-        // hosting rules.
+        // hosting rules. The first analyzed file doubles as the fallback
+        // crash anchor: a plugin that dies before anything has published
+        // (a sidecar that fails to compile or start reports through
+        // exactly this path) must still surface its one crash row, so it
+        // anchors at a real analyzed file instead of waiting for a
+        // publish that a clean workspace may never produce.
+        let mut first_analyzed: Option<FileId> = None;
         let analyzed: Vec<String> = engine
             .libraries()
             .into_iter()
             .flat_map(|(_, files)| files)
             .filter_map(|file| {
+                if first_analyzed.is_none() {
+                    first_analyzed = Some(file);
+                }
                 engine
                     .file_table()
                     .path(file)
                     .map(|path| path.to_string_lossy().into_owned())
             })
             .collect();
+        let anchor = anchor.or(first_analyzed);
         let overlays = self.plugin_overlays();
         // The weave-feed probe: tests read back exactly the overlay set the
         // cycle was handed (the `CycleContext.overlays` face's evidence).
@@ -3760,8 +3902,8 @@ impl Session {
     /// Disables the plugin set for the session: each live plugin drops
     /// kill-only (the restart-budget-exhaustion posture) and emits its
     /// one-shot `dartq/plugin_crashed` row on the next cycle through the
-    /// crash machinery — anchored, withheld until an anchor exists, never
-    /// repeated. Logged once; later calls find nothing live.
+    /// crash machinery — anchored at the first published file or analyzed
+    /// file, never repeated. Logged once; later calls find nothing live.
     fn penalize_plugins(&mut self, cause: &str) {
         if self.plugins.disable_for_session(cause) {
             eprintln!("dartq-daemon: every plugin disabled for the session: {cause}");
@@ -3957,6 +4099,62 @@ impl Session {
         });
     }
 
+    /// Queues `context`'s warm task at `Tier::Background` when none is
+    /// queued — the warm lane's only producer (#2739). The task carries
+    /// no payload: the drain arm steps `Engine::warm_step` against the
+    /// context's engine. Enqueue stamps the context's current epoch, so
+    /// a write landing before the drain voids the task at the drain
+    /// point — the foreground-wins semantic in the scheduler's own
+    /// discipline.
+    fn ensure_warm(&mut self, context: ContextId) {
+        if self.warm_cookies.values().any(|&queued| queued == context) {
+            return;
+        }
+        let cookie = self.next_cookie();
+        // Invariant: `context` is a session-lived context, so the enqueue cannot reject it.
+        self.runtime
+            .enqueue(context, false, Tier::Background, cookie)
+            .expect("session contexts live for the session");
+        self.warm_cookies.insert(cookie, context);
+    }
+
+    /// The warm lane's deadline (the idle self-wake): while warm work is
+    /// armed or queued, `Some` of the next tick — the main loop folds it
+    /// into its idle-receive bound next to the fix budget, the snapshot
+    /// debounce, and the publish retry, so a quiet session keeps
+    /// stepping the lane one chunk per wake. `None` while nothing is
+    /// warm-pending — the receive blocks freely.
+    #[must_use]
+    pub(crate) fn warm_deadline(&self) -> Option<Instant> {
+        self.warm_next
+    }
+
+    /// Fires the warm tick once it is due (`now` past `warm_next`):
+    /// queues a warm task for every warm-pending context and drains —
+    /// the warm tasks execute behind any foreground tasks the drain
+    /// also holds. Returns `None` while nothing is due, the same
+    /// contract as [`Self::retry_deferred_publish`].
+    #[must_use]
+    pub(crate) fn service_warm_tick(&mut self, now: Instant) -> Option<Turn> {
+        let deadline = self.warm_next?;
+        if now < deadline {
+            return None;
+        }
+        self.warm_next = None;
+        for index in 0..self.context_ids.len() {
+            let context = self.context_ids[index];
+            if self.engine(context).warm_pending() {
+                self.ensure_warm(context);
+            }
+        }
+        // Nothing armed and nothing queued: the deadline was stale (the
+        // last step disarmed the lane) — skip the empty drain.
+        if self.warm_cookies.is_empty() {
+            return None;
+        }
+        Some(self.service())
+    }
+
     fn next_cookie(&mut self) -> u64 {
         self.next_cookie += 1;
         self.next_cookie
@@ -3981,13 +4179,21 @@ impl Session {
     /// applies the overlay and returns the merged diagnostic set of every
     /// live library, canonically sorted. The apply's `SourceRejected`
     /// events (the sweep's discovery sets, anything else still pending)
-    /// feed the rejection advisories (#1549).
+    /// feed the rejection advisories (#1549). The run rides the session's
+    /// quit token (#2729): a serve-loop signal flipping the bound cell
+    /// stops the recompute inside the checkpoint stride, so the turn —
+    /// and the shutdown ladder behind it — is no longer hostage to a
+    /// slow analysis.
     fn analyze(&mut self, context: ContextId) -> Result<Vec<Diagnostic>, Cancelled> {
         let mut rejections = Vec::new();
+        // A clone against the disjoint-field rule: the engine borrow is
+        // `&mut self`, so the token travels by `Arc` — one refcount bump
+        // per analysis, nothing on the checkpoint path.
+        let quit = self.quit.clone();
         let analyzed = self.engine_mut(context).analyze(
             &[],
             &mut rejection_collector(&mut rejections),
-            &CancellationToken::default(),
+            &quit,
         );
         self.note_rejections(rejections);
         analyzed
@@ -9217,18 +9423,20 @@ mod tests {
     }
 
     /// The plugin weave (#471 phase B): a dead plugin is recorded at
-    /// assembly; the crash row withholds until the session has an anchor
-    /// (a published file), then publishes once — merged after the engine
-    /// rows — and never repeats. The dead set is injected rather than
-    /// reached through a manifest on disk: a missing-entrypoint manifest is
-    /// *skipped* at discovery (never spawn-failed), and a spawnable one
-    /// needs a real child process — both pinned by plugins.rs's own tests.
-    /// This gate pins the session side of the weave.
+    /// assembly; its crash row publishes on the FIRST analysis — anchored
+    /// at the analyzed file when nothing has published yet (a sidecar that
+    /// fails to start must never be silent on a clean workspace) — merged
+    /// after the engine rows, and never repeats. The dead set is injected
+    /// rather than reached through a manifest on disk: a
+    /// missing-entrypoint manifest is *skipped* at discovery (never
+    /// spawn-failed), and a spawnable one needs a real child process —
+    /// both pinned by plugins.rs's own tests. This gate pins the session
+    /// side of the weave.
     #[test]
     fn a_failing_plugin_surfaces_its_crash_row_on_the_base_publish() {
         let (_workspace, mut session) = fixture("plugin-crash-unit");
         // The broken plugin lands before the first drain: its spawn failure
-        // is already recorded, awaiting the first anchored cycle.
+        // surfaces on the first analysis itself.
         session.inject_plugins(PluginSet::with_dead_plugin(
             "dead",
             "restart budget of 3 exhausted",
@@ -9239,34 +9447,7 @@ mod tests {
         assert_eq!(
             turn.publishes.len(),
             1,
-            "the seeded error publishes: {:?}",
-            turn.publishes
-        );
-        assert!(
-            turn.publishes[0]
-                .diagnostics
-                .iter()
-                .all(|row| row.code != dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name),
-            "no anchor existed at the first analysis — the crash withheld"
-        );
-
-        // The next base analysis has an anchor (the published file): the
-        // held crash row publishes once, merged after the engine rows.
-        session.queue_command(
-            RequestId::Num(2),
-            Request::Analyze {
-                targets: Vec::new(),
-                format: None,
-                verbosity: Verbosity::Compact,
-                agent: None,
-                context: None,
-            },
-        );
-        let turn = session.service();
-        assert_eq!(
-            turn.publishes.len(),
-            1,
-            "the crash row joined the file's push: {:?}",
+            "one push for the seeded file: {:?}",
             turn.publishes
         );
         let rows = &turn.publishes[0].diagnostics;
@@ -9284,9 +9465,10 @@ mod tests {
             "crash rows ride the engine conversion"
         );
 
-        // Once per session: the next base cycle is clean again.
+        // Once per session: the next base cycle is clean again (the crash
+        // never baselined, the engine rows already published).
         session.queue_command(
-            RequestId::Num(3),
+            RequestId::Num(2),
             Request::Analyze {
                 targets: Vec::new(),
                 format: None,
@@ -9304,14 +9486,11 @@ mod tests {
     }
 
     /// The core-first publish order, observed end to end: the turn after
-    /// the crash is withheld carries BOTH an engine delta (a disk rewrite
-    /// synced through the watch intake) and the crash row. The core plan
-    /// stages the engine rows first; the plugin merge step extends the SAME
-    /// staged push instead of emitting a second one for the file — one
-    /// publish, engine rows leading, the crash row appended — and the next
-    /// cycle is clean (the crash never baselined, the engine rows did).
-    /// The turn-1 withhold above also pins the anchor's resolution point:
-    /// it is read before any publish touches the baseline, not after.
+    /// the crash published carries an engine delta (a disk rewrite synced
+    /// through the watch intake). The core plan stages the new engine rows;
+    /// the plugin merge step adds nothing — the crash row spent itself on
+    /// the first cycle, never baselined — so the rewrite publishes exactly
+    /// the file's new engine rows, one push.
     #[test]
     fn the_plugin_merge_extends_the_core_push_instead_of_duplicating_it() {
         let (workspace, mut session) = fixture("core-first-unit");
@@ -9325,12 +9504,13 @@ mod tests {
         assert_eq!(
             turn.publishes.len(),
             1,
-            "the seeded error publishes: {:?}",
+            "the seeded error publishes with the crash appended: {:?}",
             turn.publishes
         );
 
-        // The engine view changes AND the withheld crash publishes, in one
-        // turn: the core push grows by the crash row, never duplicates.
+        // The engine view changes on the next turn: the core plan's push
+        // carries the new engine rows, and the spent crash row neither
+        // repeats nor baselines into the rewrite.
         std::fs::write(workspace.path("lib/main.dart"), SYNTAX_BROKEN).expect("rewrite");
         session
             .queue_disk_changes(&[workspace.path("lib/main.dart")])
@@ -9354,9 +9534,9 @@ mod tests {
         );
         let rows = &turn.publishes[0].diagnostics;
         // `void f() { x }` carries two oracle rows (the differential corpus
-        // pins both: `expected_token` then `undefined_identifier`) plus the
-        // one-shot crash row.
-        assert_eq!(rows.len(), 3, "the rewritten file's rows plus the crash");
+        // pins both: `expected_token` then `undefined_identifier`) and
+        // nothing else — the crash row is once-per-session.
+        assert_eq!(rows.len(), 2, "the rewritten file's engine rows only");
         assert_eq!(
             rows[0].code, "expected_token",
             "the new engine rows lead: {rows:?}"
@@ -9365,13 +9545,8 @@ mod tests {
             rows[1].code, "undefined_identifier",
             "the rewritten file's second engine row: {rows:?}"
         );
-        assert_eq!(
-            rows[2].code,
-            dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name,
-            "the crash row appends: {rows:?}"
-        );
 
-        // The next cycle is clean: engine rows baselined, crash not.
+        // The next cycle is clean: engine rows baselined, crash spent.
         session.queue_command(
             RequestId::Num(3),
             Request::Analyze {
@@ -9392,9 +9567,11 @@ mod tests {
 
     /// The weave is contained a level finer than the group (#690): a panic
     /// in the plugin cycle skips that cycle's findings but the group's
-    /// engine rows still answer and publish — and the penalty's crash row
-    /// surfaces on the next cycle through the normal one-shot path, exactly
-    /// like a transport-side death.
+    /// engine rows still answer and publish. The dead plugin's one-shot row
+    /// was already spent on the first cycle (anchored at the analyzed
+    /// file), the panic costs only its own cycle's rows, and the penalty
+    /// over an already-dead set finds nothing live to disable — the session
+    /// moves on with nothing further to report.
     #[test]
     fn a_panicking_plugin_cycle_keeps_the_group_alive_and_the_row_comes_once() {
         let (_workspace, mut session) = fixture("weave-panic-unit");
@@ -9405,14 +9582,15 @@ mod tests {
 
         session.sweep().expect("sweep");
         let turn = session.service();
-        assert!(
-            turn.publishes.len() == 1
-                && turn.publishes[0]
-                    .diagnostics
-                    .iter()
-                    .all(|row| row.code != dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name),
-            "the first cycle withheld the crash (no anchor): {:?}",
-            turn.publishes
+        assert_eq!(turn.publishes.len(), 1, "one push: {:?}", turn.publishes);
+        assert_eq!(
+            turn.publishes[0]
+                .diagnostics
+                .last()
+                .map(|row| row.code.as_str()),
+            Some(dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name),
+            "the first cycle anchored the crash at the analyzed file: {:?}",
+            turn.publishes[0].diagnostics
         );
 
         // The weave panics at the cycle's entry: no findings, no crash row
@@ -9440,33 +9618,10 @@ mod tests {
             turn.publishes
         );
 
-        // The next cycle runs: the anchor exists (turn 1 published), so the
-        // held crash row publishes once, merged after the engine rows.
+        // The next cycle runs clean: the crash row was spent on the first
+        // cycle and the panic held nothing back.
         session.queue_command(
             RequestId::Num(3),
-            Request::Analyze {
-                targets: Vec::new(),
-                format: None,
-                verbosity: Verbosity::Compact,
-                agent: None,
-                context: None,
-            },
-        );
-        let turn = session.service();
-        let rows = &turn
-            .publishes
-            .first()
-            .expect("the crash row publishes on the recovered cycle")
-            .diagnostics;
-        assert_eq!(
-            rows.last().expect("row present").code,
-            dartq_diagnostics::DARTQ_PLUGIN_CRASHED.name,
-            "the crash row rides the merge: {rows:?}"
-        );
-
-        // Once per session: the cycle after is clean again.
-        session.queue_command(
-            RequestId::Num(4),
             Request::Analyze {
                 targets: Vec::new(),
                 format: None,
@@ -9859,5 +10014,228 @@ mod tests {
             "a bogus explicit sdk answers INVALID_PARAMS: {:?}",
             turn.answers[0]
         );
+    }
+
+    // -- The quit token (#2729) ---------------------------------------------
+
+    /// A [`dartq_source::SourceStore`] that counts `get` calls and —
+    /// once armed — flips a shared `AtomicBool` on the `flip_at`-th
+    /// call: the deterministic mid-analysis quit for the token tests.
+    /// The member fold's `Checkpoint` cadence then surfaces
+    /// `Err(Cancelled)` inside the turn, exactly the way a serve-loop
+    /// SIGTERM would flip the bound flag.
+    struct FlipStore {
+        inner: Box<dyn dartq_source::SourceStore + Send + Sync>,
+        get_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        flip_at: Option<usize>,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl dartq_source::SourceStore for FlipStore {
+        fn put(&mut self, bytes: &[u8]) -> dartq_source::ContentId {
+            self.inner.put(bytes)
+        }
+        fn get(&self, id: dartq_source::ContentId) -> Option<&[u8]> {
+            let call = self
+                .get_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if self.flip_at == Some(call) {
+                self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.get(id)
+        }
+        fn remove(&mut self, id: dartq_source::ContentId) -> bool {
+            self.inner.remove(id)
+        }
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+        fn len_bytes(&self) -> u64 {
+            self.inner.len_bytes()
+        }
+    }
+
+    /// One part-library workspace (`lib/main.dart` plus `parts` part
+    /// files): the multi-member fold a mid-analysis flip lands inside
+    /// of. The unarmed session construction — the caller overrides
+    /// `config.store` — returns the workspace and the engine config
+    /// for that arming.
+    fn part_library(parts: usize) -> (Workspace, dartq_engine::EngineConfig) {
+        let mut main = String::from("library t;\n");
+        for i in 0..parts {
+            main.push_str(&format!("part 'p{i}.dart';\n"));
+        }
+        let workspace = Workspace::new(&main);
+        for i in 0..parts {
+            std::fs::write(
+                workspace.path(&format!("lib/p{i}.dart")),
+                format!("part of 'main.dart';\nint p{i}() => {i};\n"),
+            )
+            .expect("part file");
+        }
+        let config = workspace.engine_config();
+        (workspace, config)
+    }
+
+    /// [`part_library`] assembled into a session: the counting store
+    /// wraps `memory_store` so the test reads how many content reads
+    /// the turn performed; `pooled_mapped_store` stays off so the
+    /// armed store reaches the engine instead of being rebound.
+    fn flip_session(
+        name: &str,
+        config: dartq_engine::EngineConfig,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        flip_at: Option<usize>,
+    ) -> (Session, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let get_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut config = config;
+        config.store = Box::new(FlipStore {
+            inner: dartq_engine::memory_store(),
+            get_calls: std::sync::Arc::clone(&get_calls),
+            flip_at,
+            flag: std::sync::Arc::clone(&flag),
+        });
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root(name)),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session = Session::with_runtime(
+            config,
+            Vec::new(),
+            Some(store),
+            None,
+            SessionRuntime {
+                pooled_mapped_store: false,
+                ..SessionRuntime::default()
+            },
+        )
+        .expect("session");
+        session.bind_quit_flag(flag);
+        (session, get_calls)
+    }
+
+    /// #2729's core contract: a flip landing mid-analysis (the
+    /// serve-loop's bound flag — signal hook or `cancel_analysis`)
+    /// stops the turn's engine run at the next checkpoint — the
+    /// requests answer `Cancelled` instead of waiting out the
+    /// recompute — and the session still ends orderly: a no-request
+    /// service drain and the shutdown tail (`flush_snapshot` /
+    /// `shutdown_plugins`) run clean on the cancelled session. The
+    /// unflipped baseline doubles as the output-neutral arm: a token
+    /// nobody flips leaves the turn byte-identical.
+    #[test]
+    fn the_quit_flag_stops_a_mid_analysis_turn_and_the_session_ends_cleanly() {
+        const PARTS: usize = 64;
+
+        // The baseline: count the re-analyzing turn's content reads
+        // and capture the honest answer set — the output-neutral arm.
+        // The counter resets after the sweep drain so `flip_at`
+        // calibrates against the dirty recompute alone (a quiet
+        // re-analyze would answer fully cached and read nothing).
+        let (workspace, config) = part_library(PARTS);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut session, gets) = flip_session("quit-cancel-baseline", config, flag.clone(), None);
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        gets.store(0, std::sync::atomic::Ordering::Relaxed);
+        // The dirty mark: a synced edit forces the read's recompute —
+        // the member fold the flip lands inside.
+        let main = workspace.path("lib/main.dart");
+        let mut body = String::from("library t;\n");
+        for i in 0..PARTS {
+            body.push_str(&format!("part 'p{i}.dart';\n"));
+        }
+        body.push_str("int marker() => 0;\n");
+        std::fs::write(&main, &body).expect("rewrite main");
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("sync admits");
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                targets: Vec::new(),
+                format: None,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        let baseline_gets = gets.load(std::sync::atomic::Ordering::Relaxed);
+        let baseline_answer = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("the unflipped turn answers the analysis")
+            .clone();
+        assert!(
+            baseline_gets > PARTS,
+            "the baseline read enough contents for a mid-fold flip: {baseline_gets}"
+        );
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        drop(session);
+
+        // The flipped run: `flip_at` 4 sets the quit cell inside the
+        // turn's early engine work — the drain's fourth content read —
+        // so the member fold's first `Checkpoint` stride already polls
+        // the flipped flag and the analysis exits `Err(Cancelled)`
+        // long before its baseline end. (A late flip can land in the
+        // lint stage's reads, which poll no checkpoint.)
+        let (workspace, config) = part_library(PARTS);
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (mut session, gets) = flip_session(
+            "quit-cancel-flipped",
+            config,
+            flag.clone(),
+            Some(4),
+        );
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        gets.store(0, std::sync::atomic::Ordering::Relaxed);
+        let main = workspace.path("lib/main.dart");
+        std::fs::write(&main, &body).expect("rewrite main");
+        session
+            .queue_disk_changes(std::slice::from_ref(&main))
+            .expect("sync admits");
+        session.queue_command(
+            RequestId::Num(2),
+            Request::Analyze {
+                targets: Vec::new(),
+                format: None,
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Relaxed),
+            "the armed store flipped the quit cell"
+        );
+        assert!(
+            matches!(turn.answers[0].1, Err(SessionError::Cancelled)),
+            "the in-flight turn answers cancelled: {:?}",
+            turn.answers[0]
+        );
+        assert!(
+            gets.load(std::sync::atomic::Ordering::Relaxed) < baseline_gets,
+            "the cancelled run stopped early: {} reads vs {} baseline",
+            gets.load(std::sync::atomic::Ordering::Relaxed),
+            baseline_gets
+        );
+        // The baseline answer being a real document is the
+        // output-neutral arm: the token adds its decrement-and-branch
+        // per member and nothing else.
+        assert!(baseline_answer["diags"].is_array());
+
+        // The ladder-equivalent tail on the cancelled session: a quiet
+        // drain returns at once (every later analysis cancels at its
+        // first checkpoint) and the shutdown tail runs clean.
+        let _ = session.service();
+        session.flush_snapshot();
+        session.shutdown_plugins();
+        session.cancel_analysis();
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 }

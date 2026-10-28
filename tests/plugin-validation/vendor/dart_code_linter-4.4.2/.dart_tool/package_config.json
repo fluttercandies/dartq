@@ -8,10 +8,16 @@
       "languageVersion": "3.13"
     },
     {
-      "name": "analysis_server_plugin",
-      "rootUri": "file:///Users/iota9star/.pub-cache/hosted/pub.dev/analysis_server_plugin-0.3.25",
+      "name": "dartq_plugin_host",
+      "rootUri": "../../../../../crates/dartq-plugin-host",
       "packageUri": "lib/",
-      "languageVersion": "3.13"
+      "languageVersion": "3.10"
+    },
+    {
+      "name": "analysis_server_plugin",
+      "rootUri": "../../../../../crates/dartq-plugin-host/lib/src/analysis_server_plugin_shim",
+      "packageUri": "lib/",
+      "languageVersion": "3.10"
     },
     {
       "name": "analyzer",

@@ -53,7 +53,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use dartq_diagnostics::{CodeInfo, Diagnostic, DiagnosticType, FileId, Severity};
 use dartq_engine::Engine;
@@ -71,11 +71,6 @@ use serde_json::{Value, json};
 
 use crate::fix::{DeclaredPlugin, declared_plugin_sources, plugin_package_config};
 use crate::query as commands_query;
-
-/// Per-cycle wait for plugin findings (the bounded drain): long enough for
-/// a warm plugin's push, short enough to keep the analyze run responsive.
-/// Rows arriving later are dropped at process end (the CLI runs one cycle).
-const DRAIN_BUDGET: Duration = Duration::from_millis(50);
 
 /// One analyze cycle's caller-side context: what the plugin face needs
 /// beyond the engine diagnostics themselves.
@@ -458,14 +453,15 @@ impl PluginSet {
             let started = Instant::now();
             let outcome = runtime
                 .feed(engine, files, &push)
-                .and_then(|()| pump_plugin(runtime, server, DRAIN_BUDGET));
+                .and_then(|()| pump_plugin(runtime, server));
             match outcome {
                 Ok((rows, degraded)) => {
                     if degraded {
                         eprintln!(
-                            "dartq: plugin `{}` exceeded its {} ms drain budget; remaining rows are dropped",
+                            "dartq: plugin `{}` exceeded its {} ms analyze callback budget; \
+                             remaining rows are dropped",
                             slot.name,
-                            DRAIN_BUDGET.as_millis(),
+                            runtime.callback_timeout().as_millis(),
                         );
                     }
                     runtime.observe_cycle(started.elapsed(), degraded);
@@ -523,7 +519,10 @@ fn accept_rows(
 /// Ends a slot's run at its first surfaced runtime error: the runtime is
 /// dropped (the isolation contract), and the failure records as the
 /// plugin's one-shot `dartq/plugin_crashed` row, published against `anchor`
-/// in this cycle or withheld (pending) until a cycle that has one.
+/// in this cycle or withheld (pending) until a cycle that has one. The
+/// failure is also logged once on stderr: a plugin's death is
+/// user-visible state, and the row alone can sit unpublished until a
+/// later cycle.
 fn fail_slot(
     slot: &mut PluginSlot,
     error: RuntimeError,
@@ -534,6 +533,7 @@ fn fail_slot(
     if slot.crash_emitted {
         return;
     }
+    eprintln!("dartq: plugin `{}` failed: {error}", slot.name);
     if let Some(anchor) = anchor {
         cycle
             .crashes
@@ -782,23 +782,34 @@ pub fn merge(engine_rows: Vec<Diagnostic>, findings: Vec<Diagnostic>) -> Vec<Dia
     merged
 }
 
-/// One plugin's bounded drain (the cycle's wait half): parks for at most
-/// [budget] total, hands back every diagnostic that arrived plus whether
-/// the drain was *degraded* — the budget expired before the plugin
-/// quiesced — and pumps the plugin's reverse `request/query` frames through
-/// [server] as they land. A cycle without a server declines the queries.
+/// One plugin's bounded drain (the cycle's wait half): parks for the
+/// plugin's manifest-declared analyze budget ([`PluginRuntime::callback_timeout`])
+/// — the bound upstream `dart analyze` applies to a plugin's response — and
+/// hands back every diagnostic that arrived plus whether the drain was
+/// *degraded*: the budget expired while the analyze demand was still open
+/// (the CLI runs one cycle, so those rows are lost; the monitor's overrun
+/// kill bounds the wait anyway). The wait ends early on quiesce through the
+/// drain's settle window, so a healthy plugin never holds the cycle for the
+/// full budget. While the wait runs, the plugin's reverse `request/query`
+/// frames pump through [server] as they land — a producer that queries
+/// while its findings are computed stalls itself, so the answers go out
+/// within the same drain. A cycle without a server declines the queries.
 fn pump_plugin(
     runtime: &mut PluginRuntime,
     mut server: Option<&mut dyn FnMut(&PendingQuery) -> QueryAnswer>,
-    budget: Duration,
 ) -> Result<(Vec<PluginDiagnostic>, bool), RuntimeError> {
-    let deadline = Instant::now() + budget;
+    let deadline = Instant::now() + runtime.callback_timeout();
     let mut rows = Vec::new();
     loop {
         let drain = runtime.wait_output(deadline.saturating_duration_since(Instant::now()))?;
         rows.extend(drain.diagnostics);
         if drain.pending_queries == 0 {
-            return Ok((rows, false));
+            // An analyze demand still open at exit means the plugin is
+            // mid-burst past its own budget: the cycle reports degraded
+            // honestly (this is the CLI's last chance to see those rows;
+            // the monitor's overrun kill bounds the wait anyway).
+            let degraded = runtime.analyze_demand_open();
+            return Ok((rows, degraded));
         }
         match server.as_deref_mut() {
             Some(serve) => {
