@@ -16854,3 +16854,53 @@ fn long_cascade_resolves_linearly() {
         code_names(&r)
     );
 }
+
+/// The `RECV_WALK_DEPTH_CAP` firing pin. The canonical promoted-receiver
+/// send (`if (b is Box) b.next…next.takeCb((e) => …)`) leaves the closure
+/// formal unsolved at pass 1 — the merge classifies every link `Unknown`
+/// off the `dynamic` head — and the pass-2 formal re-derivation walks the
+/// receiver chain recursively to re-derive the schema. Just under the cap
+/// the walk resolves `Box` at hop 1 (the promoted flow face) and the
+/// formal solves to the callee's parameter type, so the body's miss
+/// reports against `Idx`. Past the 1024-hop cap the walk cannot name a
+/// face — every classified receiver in the chain is `Unknown`, so the
+/// documented degrade answers `None` — the formal stays `dynamic`, and
+/// the body's miss under-reports.
+#[test]
+fn recv_walk_depth_cap_degrades_the_formal_schema() {
+    let fixture = |hops: usize| {
+        let mut src = String::from(
+            "class Box {\n\
+             \x20 Box get next => this;\n\
+             \x20 void takeCb(void f(Idx x)) {}\n\
+             }\n\
+             class Idx {}\n\
+             void main() {\n\
+             \x20 dynamic b = Box();\n\
+             \x20 if (b is Box) {\n\
+             \x20   b",
+        );
+        for _ in 0..hops {
+            src.push_str(".next");
+        }
+        src.push_str(".takeCb((e) => e.miss);\n  }\n}\n");
+        src
+    };
+    // 900 hops: the walk resolves the promoted face and the formal solves.
+    let r = report(&fixture(900));
+    assert_eq!(
+        code_names(&r),
+        ["undefined_getter"],
+        "{:?}",
+        code_names(&r)
+    );
+    assert_eq!(
+        r.diagnostics[0].message,
+        "The getter 'miss' isn't defined for the type 'Idx'."
+    );
+    // 1100 hops: hop 1025 finds `recv_walk_depth` at the cap and degrades
+    // to the classified receiver — `Unknown` here, so the walk answers
+    // `None`, the formal stays unsolved, and the body's miss under-reports.
+    let r = report(&fixture(1100));
+    assert!(code_names(&r).is_empty(), "{:?}", code_names(&r));
+}

@@ -4540,6 +4540,66 @@ mod tests {
         let long = vec!["1"; 2000];
         assert_eq!(eval_written(&long), WrittenValue::NotEvaluable);
     }
+
+    /// The [`MAX_EVAL_DEPTH`] firing pin (the fold's depth guard). A
+    /// `-(-(-…nc…))` spine one level short of the fuse still evaluates
+    /// exactly — the `nc` leaf folds and the verdict anchors at its span —
+    /// while one more level folds the leaf past the fuse and the value
+    /// defers to [`Verdict::Constant`] (the documented degrade). The
+    /// not-potentially-constant scan shares the same fuse and degrades the
+    /// same way: the leaf is collected one level short, and past the fuse
+    /// the scan returns without collecting it.
+    #[test]
+    fn eval_depth_cap_defers_at_256_levels() {
+        let world = w();
+        let spine = |depth: u32| {
+            let mut node = World::node(Expr::Ident(world.id("nc")), 9);
+            for i in 0..depth {
+                node = World::node(
+                    Expr::Unary {
+                        op: UnOp::Neg,
+                        operand: Box::new(node),
+                    },
+                    i,
+                );
+            }
+            node
+        };
+        // The fold face: 256 negations fold the leaf at depth 256 (not
+        // past the fuse) and the non-constant verdict stands; 257 push the
+        // leaf to depth 257 and the answer defers to Constant.
+        assert_eq!(world.eval(&spine(256)), Verdict::NotConstant(span(9)));
+        assert_eq!(world.eval(&spine(257)), Verdict::Constant);
+        // The potentially-constant scan face: the same boundary decides
+        // whether the `nc` leaf is collected.
+        let mut collected = Vec::new();
+        collect_not_potentially_constant(&spine(256), &world, &mut collected);
+        assert_eq!(collected, vec![span(9)]);
+        let mut collected = Vec::new();
+        collect_not_potentially_constant(&spine(257), &world, &mut collected);
+        assert_eq!(collected, []);
+    }
+
+    /// The [`MAX_WRITE_DEPTH`] firing pin: the written-slice descent's
+    /// paren nesting. 128 parens parse and evaluate to the value; one more
+    /// paren pushes the descent past the fuse and the slice answers
+    /// [`WrittenValue::NotEvaluable`] — with the token budget far from
+    /// exhausted (259 lexemes), so the depth cap, not
+    /// [`MAX_WRITE_TOKENS`], is what fired.
+    #[test]
+    fn write_depth_cap_defers_at_128_parens() {
+        let nested = |depth: usize| {
+            let mut lexemes = vec!["("; depth];
+            lexemes.push("1");
+            lexemes.extend(std::iter::repeat(")").take(depth));
+            lexemes
+        };
+        assert_eq!(
+            eval_written(&nested(128)),
+            WrittenValue::Value(ConstantValue::Int(1))
+        );
+        assert_eq!(eval_written(&nested(129)), WrittenValue::NotEvaluable);
+    }
 }
 
 /// Source-level pins for the non-const duplicate face's capture window
