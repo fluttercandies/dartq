@@ -487,6 +487,38 @@ impl<'a> Engine<'a> {
                             .insert(index, (member_offset, recv_span));
                     }
                 }
+                // The keyword-receiver link (#2769): an explicit `this`
+                // receiver's member read latches exactly like the
+                // implicit-`this` bare read above — the official promotion
+                // lookup keys the property slot on the same `this` identity
+                // either way (`_handleProperty` reads the target SSA node,
+                // and `ThisPropertyTarget._getSsaNode` answers the same node
+                // an `ExpressionPropertyTarget` naming `this` does, upstream
+                // Dart SDK source,
+                // pkg/_fe_analyzer_shared/lib/src/flow_analysis/
+                // flow_analysis.dart), so the guarded chain links through
+                // the #2283 latch below (`this._p.isEven` under
+                // `if (this._p != null)` — the flow marker stands at `_p`'s
+                // token for both spellings). The cascade-section and
+                // invoked-callee exclusions mirror the bare-read latch
+                // (`this..a`'s selector re-classifies to the latched
+                // cascade target; recovery rows carrying an invoke intent
+                // keep the callee-value face). `super` takes no link: a
+                // `super.x` read has no promotion identity — the flow
+                // stages no marker for it.
+                if matches!(popped_shape, RowShape::Receiver(Receiver::This { .. }))
+                    && !(self.in_cascade && is_section)
+                    && popped.intent != Intent::Invoke
+                {
+                    let member_offset = member.range.offset;
+                    if let Err(index) = self
+                        .promoted_recv_reads
+                        .binary_search_by(|(member, _)| member.cmp(&member_offset))
+                    {
+                        self.promoted_recv_reads
+                            .insert(index, (member_offset, recv_span));
+                    }
+                }
                 // The FIRST cascade section's selector re-reads the cascade
                 // target (`builder..a = x`'s `..a` reads `builder` exactly
                 // as a plain access does): it latches on the target's own

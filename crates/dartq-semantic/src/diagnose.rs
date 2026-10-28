@@ -5011,6 +5011,15 @@ mod ticket_2521_tests;
 #[cfg(test)]
 mod ticket_2536_tests;
 
+/// The #2769 pins: the keyword-receiver head latch — an explicit `this`
+/// receiver's member read arms the same promotion latch the implicit
+/// bare read does (the official promotion lookup keys the property on
+/// the same `this` identity either way), so the guarded chained read
+/// `this._p.isEven` stays silent while the flow-scoped and unguarded
+/// shapes keep their rows.
+#[cfg(test)]
+mod ticket_2769_tests;
+
 /// The shared single-file rig with the resolved-type snapshot mounted
 /// (`report_ops`), the shape the per-ticket modules each carried.
 #[cfg(test)]
