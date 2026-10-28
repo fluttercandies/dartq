@@ -2480,10 +2480,16 @@ impl<'a> Engine<'a> {
 
     /// The face-bearing site of `member` on `container`'s chain (the
     /// resolution's same-file walk; a hop into another file's index
-    /// chain-breaks, under-reporting).
+    /// chain-breaks, under-reporting, and so does a revisited container —
+    /// a cyclic chain, mutual `extends` or a self-shadowed edge, ends the
+    /// climb the same way instead of spinning).
     pub(crate) fn ur_member_site(&self, container: StringId, member: StringId) -> Option<usize> {
         let mut current = Some(container);
+        let mut seen: FxHashSet<StringId> = FxHashSet::default();
         while let Some(c) = current {
+            if !seen.insert(c) {
+                return None;
+            }
             if let Some(&site) = self.ur_sites.get(&(Some(c), member)) {
                 return Some(site);
             }
@@ -3417,5 +3423,38 @@ mod pins {
             super::normalize_deprecation("  may be removed  "),
             Some("may be removed.".to_string())
         );
+    }
+
+    /// #2745: a cyclic same-file superclass chain (mutual `extends`)
+    /// must not spin the `ur_member_site` climb — the member row
+    /// resolves on the chain with no UseResult face anywhere, so the
+    /// walk terminates (revisit = chain-broken terminus) and reports
+    /// nothing.
+    #[test]
+    fn mutual_extends_cycle_terminates_the_ur_member_climb() {
+        let source = "class A extends B {\n\
+                      \x20 void m() {}\n\
+                      }\n\
+                      class B extends A {}\n\
+                      void t(A a) {\n\
+                      \x20 a.m();\n\
+                      }\n";
+        let r = report(source);
+        assert_eq!(r.diagnostics, vec![], "{source:?}");
+    }
+
+    /// #2745: the self-shadowed edge (`class S extends S`) is the same
+    /// climb meeting its own name one hop out — terminates, reports
+    /// nothing.
+    #[test]
+    fn self_extends_shadow_edge_terminates_the_ur_member_climb() {
+        let source = "class S extends S {\n\
+                      \x20 void m() {}\n\
+                      }\n\
+                      void t(S s) {\n\
+                      \x20 s.m();\n\
+                      }\n";
+        let r = report(source);
+        assert_eq!(r.diagnostics, vec![], "{source:?}");
     }
 }
