@@ -36,6 +36,12 @@
 //! |                 | es); the read task has just analyzed, so the     |
 //! |                 | tallies read the maintained state with no scan,  |
 //! |                 | no parse, no second capture                      |
+//! | `dartq/memory`  | requested view — the memory posture over the     |
+//! |                 | context's armed budget ladder (limit, descended  |
+//! |                 | tiers, deepest tier key, the ladder's last RSS   |
+//! |                 | sample) plus the warm lane's counters; the read  |
+//! |                 | task has just analyzed, so the sample is that    |
+//! |                 | pass's final boundary reading                    |
 //! | `dartq/analyze` | requested view (base, or the agent's overlay)    |
 //! | `dartq/check`   | base: the M0 disk pipeline (scan+parse over the  |
 //! |                 | discovered file set). `agent_id`: the requested   |
@@ -166,8 +172,9 @@ pub(crate) const SCHEMA_VERSION: u32 = dartq_commands::SCHEMA_VERSION;
 /// `pub` so the drift gate (tests/rpc_schema.rs) can pin the served request
 /// set itself, not a parallel copy: the schema test asserts this table IS
 /// the dispatchable request family, in both directions.
-pub const METHODS: [&str; 16] = [
+pub const METHODS: [&str; 17] = [
     "dartq/index",
+    "dartq/memory",
     "dartq/analyze",
     "dartq/check",
     "dartq/query",
@@ -194,6 +201,18 @@ pub(crate) enum Request {
     /// `agent_id`/`context` select the view; `since` is rejected — the
     /// aggregate has no rows for a delta cursor to filter.
     Index {
+        verbosity: Verbosity,
+        agent: Option<String>,
+        context: Option<String>,
+    },
+    /// The memory-posture face: the answering view's budget ladder state
+    /// (armed limit, descended tiers, deepest tier key), the ladder's last
+    /// phase-boundary RSS sample, and the warm lane's counters. An
+    /// engine-view face — every context arms its own budget — so
+    /// `agent_id`/`context` select the view; `since` is rejected — the
+    /// posture has no rows for a delta cursor to filter (the
+    /// `dartq/index` rule).
+    Memory {
         verbosity: Verbosity,
         agent: Option<String>,
         context: Option<String>,
@@ -228,10 +247,12 @@ pub(crate) enum Request {
     },
     /// The symbol-index face; `kind` picks the answered rows (symbol
     /// by default, references, the callers subset, the implementations
-    /// walk, or the declaring library's dependencies).
+    /// walk, or the declaring library's dependencies). `fuzzy` switches
+    /// the symbol kind to the ranked discovery answer.
     Query {
         name: String,
         kind: QueryKind,
+        fuzzy: bool,
         format: Option<RenderFormat>,
         verbosity: Verbosity,
         agent: Option<String>,
@@ -334,6 +355,7 @@ impl Request {
     pub(crate) fn agent(&self) -> Option<&str> {
         match self {
             Self::Index { agent, .. }
+            | Self::Memory { agent, .. }
             | Self::Analyze { agent, .. }
             | Self::Check { agent, .. }
             | Self::Query { agent, .. }
@@ -352,6 +374,7 @@ impl Request {
     pub(crate) fn context(&self) -> Option<&str> {
         match self {
             Self::Index { context, .. }
+            | Self::Memory { context, .. }
             | Self::Analyze { context, .. }
             | Self::Check { context, .. }
             | Self::Query { context, .. }
@@ -371,6 +394,7 @@ impl Request {
     pub(crate) fn verbosity(&self) -> Verbosity {
         match self {
             Self::Index { verbosity, .. }
+            | Self::Memory { verbosity, .. }
             | Self::Analyze { verbosity, .. }
             | Self::Check { verbosity, .. }
             | Self::Query { verbosity, .. }
@@ -453,7 +477,12 @@ pub(crate) enum Position {
 impl Position {
     /// Decodes the cursor fields: exactly one spelling may come — `offset`
     /// alone, or `line` and `col` together.
-    fn decode(method: &str, offset: Option<u32>, line: Option<u32>, col: Option<u32>) -> Result<Self, String> {
+    fn decode(
+        method: &str,
+        offset: Option<u32>,
+        line: Option<u32>,
+        col: Option<u32>,
+    ) -> Result<Self, String> {
         match (offset, line, col) {
             (Some(offset), None, None) => Ok(Self::Offset(offset)),
             (None, Some(line), Some(col)) => Ok(Self::LineCol { line, col }),
@@ -507,6 +536,13 @@ struct QueryParams {
     /// the accepted set, surfaced as `INVALID_PARAMS`.
     #[serde(default)]
     kind: QueryKind,
+    /// Fuzzy discovery on the symbol kind: the ranked candidate rows
+    /// replace the exact lookup's (the ranking spec lives on the
+    /// dartq-index `fuzzy` module). Absent means false, so every existing
+    /// request decodes unchanged; combined with any other kind the
+    /// request is `INVALID_PARAMS`.
+    #[serde(default)]
+    fuzzy: bool,
     /// The routed one-shot face's output switch (#2629) — see
     /// [`RenderFormat`].
     #[serde(default)]
@@ -661,6 +697,26 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
                 context,
             })
         }
+        "dartq/memory" => {
+            // The posture has no rows to filter here: the answer is one
+            // object over the view's engine (the dartq/index rule).
+            let (agent, since) = session_fields(params)?;
+            if since.is_some() {
+                return Err(
+                    "dartq/memory reports the whole view's memory posture; since applies to \
+                     the row-shaped faces (check/query/impact/explain)"
+                        .into(),
+                );
+            }
+            let context = context_field(params)?;
+            let decoded =
+                serde_json::from_value::<VerbosityParams>(params.clone()).map_err(invalid)?;
+            Ok(Request::Memory {
+                verbosity: decoded.verbosity,
+                agent,
+                context,
+            })
+        }
         "dartq/analyze" => {
             let (agent, _) = session_fields(params)?;
             let context = context_field(params)?;
@@ -706,10 +762,24 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
             let (agent, since) = session_fields(params)?;
             let context = context_field(params)?;
             let decoded = serde_json::from_value::<QueryParams>(params.clone()).map_err(invalid)?;
-            reject_rendered_view("dartq/query", decoded.format, agent.clone(), context.clone(), since)?;
+            if decoded.fuzzy && decoded.kind != QueryKind::Symbol {
+                return Err(
+                    "the `fuzzy` flag answers the symbol kind only; drop it or set kind to \
+                     `symbol`"
+                        .into(),
+                );
+            }
+            reject_rendered_view(
+                "dartq/query",
+                decoded.format,
+                agent.clone(),
+                context.clone(),
+                since,
+            )?;
             Ok(Request::Query {
                 name: decoded.name,
                 kind: decoded.kind,
+                fuzzy: decoded.fuzzy,
                 format: decoded.format,
                 verbosity: decoded.verbosity,
                 agent,
@@ -732,13 +802,15 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
             let context = context_field(params)?;
             let decoded =
                 serde_json::from_value::<ResolveAtParams>(params.clone()).map_err(invalid)?;
-            reject_rendered_view("dartq/resolveAt", decoded.format, agent.clone(), context.clone(), None)?;
-            let position = Position::decode(
+            reject_rendered_view(
                 "dartq/resolveAt",
-                decoded.offset,
-                decoded.line,
-                decoded.col,
+                decoded.format,
+                agent.clone(),
+                context.clone(),
+                None,
             )?;
+            let position =
+                Position::decode("dartq/resolveAt", decoded.offset, decoded.line, decoded.col)?;
             Ok(Request::ResolveAt {
                 file: resolve(root, decoded.file),
                 position,
@@ -790,7 +862,13 @@ pub(crate) fn parse(method: &str, params: &Value, root: &Path) -> Result<Request
             let context = context_field(params)?;
             let decoded =
                 serde_json::from_value::<TargetParams>(params.clone()).map_err(invalid)?;
-            reject_rendered_view("dartq/impact", decoded.format, agent.clone(), context.clone(), since)?;
+            reject_rendered_view(
+                "dartq/impact",
+                decoded.format,
+                agent.clone(),
+                context.clone(),
+                since,
+            )?;
             Ok(Request::Impact {
                 target: resolve(root, decoded.path),
                 symbols: decoded.symbols,
@@ -1499,6 +1577,7 @@ impl PackageStamp {
 pub(crate) fn answer(drain: &Drain<'_>, request: &Request) -> Result<Value, SessionError> {
     match request {
         Request::Index { verbosity, .. } => Ok(index_answer(drain, *verbosity)),
+        Request::Memory { .. } => Ok(memory_answer(drain)),
         Request::Analyze {
             targets,
             format,
@@ -1519,23 +1598,34 @@ pub(crate) fn answer(drain: &Drain<'_>, request: &Request) -> Result<Value, Sess
         Request::Query {
             name,
             kind,
+            fuzzy,
             format,
             verbosity,
             since,
             ..
-        } => Ok(query_answer(drain, name, *kind, *format, *verbosity, *since)),
+        } => Ok(query_answer(
+            drain, name, *kind, *fuzzy, *format, *verbosity, *since,
+        )),
         Request::QueryBatch {
             queries,
             format,
             verbosity,
             since,
             ..
-        } => Ok(query_batch_answer(drain, queries, *format, *verbosity, *since)),
+        } => Ok(query_batch_answer(
+            drain, queries, *format, *verbosity, *since,
+        )),
         Request::ResolveAt {
-            file, position, format, ..
+            file,
+            position,
+            format,
+            ..
         } => resolve_at_answer(drain, file, *position, *format),
         Request::Completion {
-            file, position, format, ..
+            file,
+            position,
+            format,
+            ..
         } => completion_answer(drain, file, *position, *format),
         Request::Impact {
             target,
@@ -1664,6 +1754,33 @@ fn index_answer(drain: &Drain<'_>, _verbosity: Verbosity) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// dartq/memory — the memory-posture face
+// ---------------------------------------------------------------------------
+
+/// The answering view's memory posture over its armed budget ladder — the
+/// limit, how far it descended, the deepest fired tier's machine key (the
+/// `dartq/memory_degraded` row's and the trace face's `MemoryDegrade.tier`
+/// vocabulary), the ladder's last phase-boundary RSS sample — plus the warm
+/// lane's cumulative counters (`Engine::warm_stats`). Read-only over the
+/// engine's own data: nothing here samples, so an idle session answers its
+/// last turn's final boundary reading. A view with no budget armed answers
+/// nulls — the sampler never runs unbudgeted, so there is nothing to
+/// report.
+fn memory_answer(drain: &Drain<'_>) -> Value {
+    let status = drain.engine.memory_status();
+    let warm = drain.engine.warm_stats();
+    json!({
+        "v": dartq_commands::SCHEMA_VERSION,
+        "rss": status.rss_bytes,
+        "limit_mib": status.limit_mib,
+        "degraded_tiers": status.degraded_tiers,
+        "tier": status.degraded_tier,
+        "warm_done": warm.completed,
+        "warm_skipped": warm.skipped,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // dartq/analyze — the diagnostics pull face
 // ---------------------------------------------------------------------------
 
@@ -1749,11 +1866,9 @@ fn rendered_answer(
             &dartq_commands::analyze::diags_document(output),
         ),
         RenderFormat::Json => dartq_diagnostics::write_json(&mut stdout, output),
-        RenderFormat::Text => dartq_commands::render::write_human(
-            &mut stdout,
-            output.diagnostics,
-            output.files,
-        ),
+        RenderFormat::Text => {
+            dartq_commands::render::write_human(&mut stdout, output.diagnostics, output.files)
+        }
     };
     rendered.expect("an in-memory writer never fails");
     let (errors, warnings, infos) =
@@ -1788,7 +1903,11 @@ fn rendered_answer(
 /// 0 on a answered document, its usage errors being the caller's own cold
 /// path's. No session economics ride the rendered arm — the bytes are the
 /// cold face's, short ids and delta cursors included out.
-fn rendered_value(format: RenderFormat, value: &Value, package_stamp: Option<&PackageStamp>) -> Value {
+fn rendered_value(
+    format: RenderFormat,
+    value: &Value,
+    package_stamp: Option<&PackageStamp>,
+) -> Value {
     let mut stdout = Vec::new();
     let rendered = match format {
         RenderFormat::Lon => dartq_commands::render::write_lon(&mut stdout, value),
@@ -1957,18 +2076,25 @@ fn check_engine_view(
 
 /// The `dartq/query` answer: `kind` routes to the matching engine query
 /// face, then the shared shaper shapes the run — the one shaper the batch
-/// face reuses, so the two answers cannot drift. With `format` (#2629) the
-/// answer is the routed one-shot face instead: the same tier-shaped value
-/// the cold CLI face prints, rendered through the format's one writer.
+/// face reuses, so the two answers cannot drift. `fuzzy` (validated to
+/// the symbol kind at parse) routes to the ranked discovery face over the
+/// same envelope. With `format` (#2629) the answer is the routed one-shot
+/// face instead: the same tier-shaped value the cold CLI face prints,
+/// rendered through the format's one writer.
 fn query_answer(
     drain: &Drain<'_>,
     name: &str,
     kind: QueryKind,
+    fuzzy: bool,
     format: Option<RenderFormat>,
     verbosity: Verbosity,
     since: Option<u64>,
 ) -> Value {
-    let run = query::kind_after_analysis(drain.engine, name, kind);
+    let run = if fuzzy {
+        query::symbol_fuzzy_after_analysis(drain.engine, name)
+    } else {
+        query::kind_after_analysis(drain.engine, name, kind)
+    };
     if let Some(format) = format {
         let value = query::to_json_at_tier(&run, name, verbosity);
         return rendered_value(format, &value, drain.package_stamp);
@@ -2094,11 +2220,15 @@ fn resolve_at_answer(
     position: Position,
     format: Option<RenderFormat>,
 ) -> Result<Value, SessionError> {
-    let answer = resolve_core::resolve_at_after_analysis(drain.engine, file, offset_of(drain, file, position)?)
-        .map_err(|error| match error {
-            ResolveError::NotResident(_) => SessionError::InvalidParams(error.to_string()),
-            ResolveError::Analyze(_) => SessionError::Internal(error.to_string()),
-        })?;
+    let answer = resolve_core::resolve_at_after_analysis(
+        drain.engine,
+        file,
+        offset_of(drain, file, position)?,
+    )
+    .map_err(|error| match error {
+        ResolveError::NotResident(_) => SessionError::InvalidParams(error.to_string()),
+        ResolveError::Analyze(_) => SessionError::Internal(error.to_string()),
+    })?;
     Ok(render_position_answer(drain, format, answer))
 }
 
@@ -2112,11 +2242,15 @@ fn completion_answer(
     position: Position,
     format: Option<RenderFormat>,
 ) -> Result<Value, SessionError> {
-    let answer = resolve_core::completion_after_analysis(drain.engine, file, offset_of(drain, file, position)?)
-        .map_err(|error| match error {
-            ResolveError::NotResident(_) => SessionError::InvalidParams(error.to_string()),
-            ResolveError::Analyze(_) => SessionError::Internal(error.to_string()),
-        })?;
+    let answer = resolve_core::completion_after_analysis(
+        drain.engine,
+        file,
+        offset_of(drain, file, position)?,
+    )
+    .map_err(|error| match error {
+        ResolveError::NotResident(_) => SessionError::InvalidParams(error.to_string()),
+        ResolveError::Analyze(_) => SessionError::Internal(error.to_string()),
+    })?;
     Ok(render_position_answer(drain, format, answer))
 }
 
@@ -2127,23 +2261,19 @@ fn offset_of(drain: &Drain<'_>, file: &Path, position: Position) -> Result<u32, 
     match position {
         Position::Offset(offset) => Ok(offset),
         Position::LineCol { line, col } => {
-            resolve_core::position_offset(drain.engine, file, line, col).map_err(|error| {
-                match error {
+            resolve_core::position_offset(drain.engine, file, line, col).map_err(
+                |error| match error {
                     ResolveError::NotResident(_) => SessionError::InvalidParams(error.to_string()),
                     ResolveError::Analyze(_) => SessionError::Internal(error.to_string()),
-                }
-            })
+                },
+            )
         }
     }
 }
 
 /// The position face's answer under its two arms: the routed one-shot
 /// face's rendered bytes (#2629), or the envelope verbatim.
-fn render_position_answer(
-    drain: &Drain<'_>,
-    format: Option<RenderFormat>,
-    answer: Value,
-) -> Value {
+fn render_position_answer(drain: &Drain<'_>, format: Option<RenderFormat>, answer: Value) -> Value {
     match format {
         Some(format) => rendered_value(format, &answer, drain.package_stamp),
         None => answer,
@@ -2356,21 +2486,22 @@ fn rename_answer(
     new_name: &str,
     format: Option<RenderFormat>,
 ) -> Result<Value, SessionError> {
-    let plan = dartq_commands::rename::plan(drain.engine, target, anchor).map_err(
-        |error| match error {
-            dartq_commands::rename::RenameError::NotResident(_)
-            | dartq_commands::rename::RenameError::OutOfRange { .. }
-            | dartq_commands::rename::RenameError::IllegalName(_) => {
-                SessionError::InvalidParams(error.to_string())
-            }
-            // The read task has just run the analysis pass; the plan path
-            // runs no prelude, so the analyze arm cannot arise here.
-            dartq_commands::rename::RenameError::Stale(_)
-            | dartq_commands::rename::RenameError::Analyze(_) => {
-                SessionError::Internal(error.to_string())
-            }
-        },
-    )?;
+    let plan =
+        dartq_commands::rename::plan(drain.engine, target, anchor).map_err(
+            |error| match error {
+                dartq_commands::rename::RenameError::NotResident(_)
+                | dartq_commands::rename::RenameError::OutOfRange { .. }
+                | dartq_commands::rename::RenameError::IllegalName(_) => {
+                    SessionError::InvalidParams(error.to_string())
+                }
+                // The read task has just run the analysis pass; the plan path
+                // runs no prelude, so the analyze arm cannot arise here.
+                dartq_commands::rename::RenameError::Stale(_)
+                | dartq_commands::rename::RenameError::Analyze(_) => {
+                    SessionError::Internal(error.to_string())
+                }
+            },
+        )?;
     let document = dartq_commands::rename::to_json(&plan, new_name);
     Ok(match format {
         Some(format) => rendered_value(format, &document, drain.package_stamp),
@@ -2637,5 +2768,56 @@ mod tests {
         }
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// The `dartq/memory` intake: the view selectors decode (`agent_id`,
+    /// `context`), `since` is rejected (the dartq/index rule — the posture
+    /// has no rows for a delta cursor), and the method is a published face
+    /// (`METHODS`).
+    #[test]
+    fn the_memory_face_decodes_selectors_and_rejects_since() {
+        let root = std::env::temp_dir().join(format!("dqs-memory-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("root dir");
+
+        assert!(is_command("dartq/memory"), "a published METHODS face");
+        match parse("dartq/memory", &json!({}), &root).expect("the empty params decode") {
+            Request::Memory {
+                verbosity,
+                agent,
+                context,
+            } => {
+                assert_eq!(verbosity, Verbosity::Compact, "the compact default");
+                assert_eq!(agent, None);
+                assert_eq!(context, None);
+            }
+            other => panic!("a memory request, got {other:?}"),
+        }
+        // The selectors decode.
+        match parse(
+            "dartq/memory",
+            &json!({"agent_id": "reviewer", "context": "perf", "verbosity": "full"}),
+            &root,
+        )
+        .expect("the selectors decode")
+        {
+            Request::Memory {
+                verbosity,
+                agent,
+                context,
+            } => {
+                assert_eq!(verbosity, Verbosity::Full);
+                assert_eq!(agent.as_deref(), Some("reviewer"));
+                assert_eq!(context.as_deref(), Some("perf"));
+            }
+            other => panic!("a memory request, got {other:?}"),
+        }
+        // A delta cursor has nothing to filter.
+        let error = parse("dartq/memory", &json!({"since": 7}), &root).expect_err("since rejected");
+        assert!(
+            error.contains("since"),
+            "the rejection names the rule: {error}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

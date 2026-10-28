@@ -27,7 +27,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::budget;
-use crate::cancel::{CancellationToken, Cancelled};
+use crate::cancel::{CancellationToken, Cancelled, Checkpoint};
 use crate::cycle::Condensation;
 use crate::event::{EngineEvent, duration_us};
 use crate::l1;
@@ -341,7 +341,9 @@ pub(crate) fn analyze(
     // open direction — and each unit parses once here instead of once per
     // fold that lists it.
     let clauses = folding.then(|| {
-        let generic = generic_containers.as_ref().expect("built above when folding");
+        let generic = generic_containers
+            .as_ref()
+            .expect("built above when folding");
         let gated: Vec<FileId> = state
             .residency
             .iter()
@@ -372,8 +374,7 @@ pub(crate) fn analyze(
                         let content = state.residency[&file].content;
                         let bytes = state.store.get(content)?;
                         let text = std::str::from_utf8(bytes).ok()?;
-                        let version =
-                            l1::language_version_for(&state.packages, &state.files, file);
+                        let version = l1::language_version_for(&state.packages, &state.files, file);
                         let (feature_set, settled, scanned, _) =
                             l1::scan_unit(text, version, file, &state.grants());
                         (
@@ -459,7 +460,7 @@ pub(crate) fn analyze(
                 return None;
             };
             let mut member_refs = Vec::new();
-            let mut diagnostics = diagnose_library(
+            let Ok(mut diagnostics) = diagnose_library(
                 state,
                 resolved,
                 semdiag,
@@ -469,12 +470,25 @@ pub(crate) fn analyze(
                 clauses.as_ref(),
                 *library,
                 &mut member_refs,
-            );
+                cancel,
+            ) else {
+                // The intra-library checkpoint fired mid-recompute: the
+                // same early-exit shape as the per-library checkpoint
+                // above — no partial run reaches the store, the library
+                // stays dirty for the next analyze.
+                cancelled.store(true, AtomicOrdering::Relaxed);
+                return None;
+            };
             // The run's canonical sort rides the job too (a pure read of the
             // file table).
             diagnostics.sort_by(|a, b| compare_canonical(&state.files, a, b));
             let info = state.libraries.info(*library).expect("live library");
-            let surface = library_surface(state, resolved, *library, info, &member_refs);
+            let Ok(surface) =
+                library_surface(state, resolved, *library, info, &member_refs, cancel)
+            else {
+                cancelled.store(true, AtomicOrdering::Relaxed);
+                return None;
+            };
             // The surface's use view is a pure function of its rows: it
             // rides the job too, so the serial store loop only installs it.
             let view = crate::state::use_view_of(&surface);
@@ -873,6 +887,13 @@ fn captures_a_header(facts: &UnitFacts, generic: &FxHashSet<StringId>) -> bool {
 /// The run holds refcount handles (#1501): the members' facts rows and the
 /// memoized fold rows enter by bump, only this library's own fresh rows
 /// take a new allocation.
+///
+/// `Err(Cancelled)` when `cancel` flips mid-library: the member loops poll
+/// it on a [`Checkpoint`] cadence (one relaxed atomic load per stride of
+/// member files — the bounded-window contract), and the partially filled
+/// `out` drops here; the caller records nothing, so the library stays
+/// dirty for the next analyze exactly as the per-library checkpoint's
+/// early-exit shape.
 #[expect(clippy::too_many_lines)] // long diagnostic-table dispatch
 fn diagnose_library(
     state: &EngineState,
@@ -884,11 +905,14 @@ fn diagnose_library(
     clauses: Option<&dartq_semantic::ClauseTrees>,
     library: LibraryId,
     member_refs: &mut Vec<(FileId, std::sync::Arc<[dartq_semantic::MemberRef]>)>,
-) -> Vec<Arc<Diagnostic>> {
+    cancel: &CancellationToken,
+) -> Result<Vec<Arc<Diagnostic>>, Cancelled> {
     let info = state.libraries.info(library).expect("live library");
     let members = member_files(info);
     let mut out = Vec::new();
+    let mut checkpoint = Checkpoint::new(cancel);
     for file in &members {
+        checkpoint.tick()?;
         let facts = &state.residency[file];
         // A part's missing-target row spells the RESOLVED absolute form:
         // the oracle's part-include state lands the URI on a `FileState`
@@ -967,9 +991,7 @@ fn diagnose_library(
                         .files
                         .path(target)
                         .map(|path| format!("file://{}", path.display()))
-                        .unwrap_or_else(|| {
-                            directive.uri.clone().unwrap_or_default().to_string()
-                        }),
+                        .unwrap_or_else(|| directive.uri.clone().unwrap_or_default().to_string()),
                     _ => directive.uri.clone().unwrap_or_default().to_string(),
                 };
                 out.push(Arc::new(l1::uri_diagnostic(
@@ -1104,8 +1126,17 @@ fn diagnose_library(
             // The residency-pairing degrade log (stability lane #1459): the
             // fold records the members it skips on a store/UTF-8 miss.
             degrades: &state.residency_degrades,
+            // The fold's member loop polls this on a cadence; a flip stops
+            // the fold early, and the check right after the call keeps the
+            // partial `out` from ever reaching the store.
+            cancel,
         };
         diagnoser.diagnose_library(&view, &mut out);
+        // The fold's intra-library cadence may have stopped it early: the
+        // rows accumulated so far are a partial run, so they drop with the
+        // `Err` — the library stays dirty exactly as if the per-library
+        // checkpoint had fired ahead of its job.
+        cancel.check()?;
         // The resolved member-access rows (#2618): read back through the
         // same view (the default diagnoser serves them from the fold memo
         // the call above just populated) — the surface build folds them in
@@ -1122,6 +1153,7 @@ fn diagnose_library(
     // duplicate-import noise on top of the root causes.
     if !suppresses_import_verification(&out) {
         for file in &members {
+            checkpoint.tick()?;
             let facts = &state.residency[file];
             // In-clause repeats of a target-defined name report
             // `duplicate_hidden_name`/`duplicate_shown_name` at the repeat
@@ -1169,7 +1201,7 @@ fn diagnose_library(
         }
     }
     cap_per_file(&mut out);
-    out
+    Ok(out)
 }
 
 /// Per-file diagnostics cap at the engine's aggregation sink
@@ -1425,13 +1457,20 @@ fn library_surface(
     library: LibraryId,
     info: &LibraryInfo,
     member_refs: &[(FileId, std::sync::Arc<[dartq_semantic::MemberRef]>)],
-) -> dartq_index::LibraryIndex {
+    cancel: &CancellationToken,
+) -> Result<dartq_index::LibraryIndex, Cancelled> {
     let mut builder = dartq_index::LibraryBuilder::new(
         resolved.graph_ids[&library],
         &resolved.graph,
         resolved.namespaces(),
     );
+    let mut checkpoint = Checkpoint::new(cancel);
     for file in member_files(info) {
+        // The intra-library cadence (see `diagnose_library`): a capture
+        // re-derivation past the site cache's cap is a scan + parse per
+        // member, so the loop polls the token per stride rather than per
+        // member.
+        checkpoint.tick()?;
         // Members are resident and captured after an analyze — the same
         // live-member contract the reachability build's unit walk runs on.
         // A capture whose sites the site cache shed re-derives them here
@@ -1464,7 +1503,7 @@ fn library_surface(
             qualifier: StringId::NONE,
         }));
     }
-    builder.finish()
+    Ok(builder.finish())
 }
 
 /// Recaptures every file whose facts moved since the last analyze (the
@@ -1639,24 +1678,25 @@ fn build_library_graph(state: &mut EngineState) -> ResolvedGraph {
         .iter()
         .flat_map(|(_, files)| files.iter().copied())
         .collect();
-    let register_sdk_units =
-        |builder: &mut LibraryGraphBuilder<'_>, node: dartq_resolution::LibraryId, files: &[FileId]| {
-            for &file in files {
-                let Some(unit) = state.deps.units.get(&file) else {
+    let register_sdk_units = |builder: &mut LibraryGraphBuilder<'_>,
+                              node: dartq_resolution::LibraryId,
+                              files: &[FileId]| {
+        for &file in files {
+            let Some(unit) = state.deps.units.get(&file) else {
+                continue;
+            };
+            builder.unit(node, file);
+            for (name, declaration) in unit.facts.elements.declarations() {
+                if declaration.kind == MicroKind::TypeParam {
                     continue;
-                };
-                builder.unit(node, file);
-                for (name, declaration) in unit.facts.elements.declarations() {
-                    if declaration.kind == MicroKind::TypeParam {
-                        continue;
-                    }
-                    match class_modifier_facts(&unit.facts.elements, name) {
-                        Some(modifiers) => builder.declare_class(node, name, file, modifiers),
-                        None => builder.declare(node, name, file),
-                    }
+                }
+                match class_modifier_facts(&unit.facts.elements, name) {
+                    Some(modifiers) => builder.declare_class(node, name, file, modifiers),
+                    None => builder.declare(node, name, file),
                 }
             }
-        };
+        }
+    };
     for (uri, names) in SDK_LIBRARY_FACES {
         let node = builder.intern(&format!("dart:{uri}"));
         match sdk_loaded.iter().find(|(name, _)| name == uri) {
@@ -2249,9 +2289,12 @@ fn directive_graph_target(
     directive: &DirectiveFacts,
 ) -> Option<dartq_resolution::LibraryId> {
     match directive.target {
-        ResolvedTarget::Resolved(_) => {
-            graph_target(state, &resolved.graph_ids, &resolved.dep_nodes, directive.target)
-        }
+        ResolvedTarget::Resolved(_) => graph_target(
+            state,
+            &resolved.graph_ids,
+            &resolved.dep_nodes,
+            directive.target,
+        ),
         ResolvedTarget::External => directive
             .uri
             .as_deref()?
@@ -2296,7 +2339,12 @@ fn duplicate_target<'a>(
 ) -> Option<DuplicateTarget<'a>> {
     match directive.target {
         ResolvedTarget::Resolved(file) => {
-            match graph_target(state, &resolved.graph_ids, &resolved.dep_nodes, directive.target) {
+            match graph_target(
+                state,
+                &resolved.graph_ids,
+                &resolved.dep_nodes,
+                directive.target,
+            ) {
                 Some(node) => Some(DuplicateTarget::Library(node)),
                 // Outside the analyzed world (absent on disk, or removed
                 // since parse — the oracle re-resolves to a library flagged
@@ -2640,7 +2688,7 @@ mod tests {
     use dartq_pub::{LockFile, PackageConfig, Pubspec, build_graph};
     use dartq_resolution::CombinatorClause;
     use dartq_sdk::SdkSnapshot;
-    use dartq_source::{FileTable, SourceRange, StringId};
+    use dartq_source::{ContentId, FileTable, SourceRange, SourceStore, StringId};
 
     use super::*;
     use crate::semdiag::diagnoser;
@@ -2753,8 +2801,7 @@ mod tests {
         let rows = engine
             .analyze(&[a, b], &mut |_| {}, &CancellationToken::default())
             .expect("analyze");
-        rows.iter()
-            .any(|row| row.code.name == "undefined_getter")
+        rows.iter().any(|row| row.code.name == "undefined_getter")
     }
 
     /// The clause-tree wiring's engine-level pin (#2229): the cross-unit
@@ -3231,10 +3278,7 @@ mod tests {
                 CodeInfo::new(code.0, code.1, DiagnosticType::CompileTimeError, false),
                 message,
                 file,
-                SourceRange {
-                    offset,
-                    length: 16,
-                },
+                SourceRange { offset, length: 16 },
                 None,
             ))
         }
@@ -3293,11 +3337,26 @@ mod tests {
         assert_eq!(out.len(), 5, "no key dedup: every same-key row survives");
         // Canonical order groups by (path, offset, code) with the message
         // tiebreaker inside each same-key group.
-        assert_eq!(out[0].message, "The named parameter '_error' is required, but there's no corresponding argument.");
-        assert_eq!(out[1].message, "The named parameter '_loading' is required, but there's no corresponding argument.");
-        assert_eq!(out[2].message, "'ElementImpl.reference' isn't a valid concrete implementation of 'PropertyInducingElementImpl.reference'.");
-        assert_eq!(out[3].message, "'FieldElementImpl.baseElement' isn't a valid concrete implementation of 'InternalFieldElement.baseElement'.");
-        assert_eq!(out[4].message, "'PropertyInducingElementImpl.fragments' isn't a valid concrete implementation of 'InternalFieldElement.fragments'.");
+        assert_eq!(
+            out[0].message,
+            "The named parameter '_error' is required, but there's no corresponding argument."
+        );
+        assert_eq!(
+            out[1].message,
+            "The named parameter '_loading' is required, but there's no corresponding argument."
+        );
+        assert_eq!(
+            out[2].message,
+            "'ElementImpl.reference' isn't a valid concrete implementation of 'PropertyInducingElementImpl.reference'."
+        );
+        assert_eq!(
+            out[3].message,
+            "'FieldElementImpl.baseElement' isn't a valid concrete implementation of 'InternalFieldElement.baseElement'."
+        );
+        assert_eq!(
+            out[4].message,
+            "'PropertyInducingElementImpl.fragments' isn't a valid concrete implementation of 'InternalFieldElement.fragments'."
+        );
         // Determinism: a second merge over the same runs is byte-identical.
         assert_eq!(merged(&files, &[library.as_slice()]), out);
     }
@@ -3424,9 +3483,7 @@ mod tests {
             .extend(batch_a.changed.iter().copied());
         // Batch B removes b — the same refresh window, the removal side.
         state.pending_order.push(b);
-        state
-            .pending
-            .insert(b, crate::state::PendingChange::Remove);
+        state.pending.insert(b, crate::state::PendingChange::Remove);
         let batch_b = crate::l1::apply(&mut state, &mut sink);
         state
             .structure_removed
@@ -3484,11 +3541,7 @@ mod tests {
         // exists — the row drops, the code clears, the holder reports as
         // relinked, and its owner library re-enters the dirty set (its
         // output face moved even though no folded identity input did).
-        crate::l1::tests::set(
-            &mut state,
-            &lib.join("target.dart"),
-            "int target() => 0;\n",
-        );
+        crate::l1::tests::set(&mut state, &lib.join("target.dart"), "int target() => 0;\n");
         let batch = crate::l1::apply(&mut state, &mut |_| {});
         assert_eq!(
             batch.relinked,
@@ -3525,11 +3578,8 @@ mod tests {
             &lib.join("holder.dart"),
             "import 'target.dart';\n",
         );
-        let target = crate::l1::tests::set(
-            &mut state,
-            &lib.join("target.dart"),
-            "int target() => 0;\n",
-        );
+        let target =
+            crate::l1::tests::set(&mut state, &lib.join("target.dart"), "int target() => 0;\n");
         let batch = crate::l1::apply(&mut state, &mut |_| {});
         assert!(batch.relinked.is_empty());
         assert!(state.residency[&holder].diagnostics.is_empty());
@@ -3578,15 +3628,11 @@ mod tests {
             &lib.join("bystander.dart"),
             "import 'other.dart';\n",
         );
-        crate::l1::tests::set(
-            &mut state,
-            &lib.join("other.dart"),
-            "int other() => 0;\n",
-        );
+        crate::l1::tests::set(&mut state, &lib.join("other.dart"), "int other() => 0;\n");
         let mut graph: Option<ResolvedGraph> = None;
         let cancel = CancellationToken::new();
-        let merged = analyze(&mut state, &mut graph, None, &[], &mut |_| {}, &cancel)
-            .expect("cold analyze");
+        let merged =
+            analyze(&mut state, &mut graph, None, &[], &mut |_| {}, &cancel).expect("cold analyze");
         assert!(
             merged
                 .iter()
@@ -4231,7 +4277,12 @@ mod tests {
                                 graph_id,
                                 ImportEdge {
                                     target: sdk_target.or_else(|| {
-                                        graph_target(state, &graph_ids, &dep_nodes, directive.target)
+                                        graph_target(
+                                            state,
+                                            &graph_ids,
+                                            &dep_nodes,
+                                            directive.target,
+                                        )
                                     }),
                                     prefix: directive.prefix,
                                     deferred: directive.deferred,
@@ -4253,7 +4304,12 @@ mod tests {
                                 graph_id,
                                 ExportEdge {
                                     target: sdk_target.or_else(|| {
-                                        graph_target(state, &graph_ids, &dep_nodes, directive.target)
+                                        graph_target(
+                                            state,
+                                            &graph_ids,
+                                            &dep_nodes,
+                                            directive.target,
+                                        )
                                     }),
                                     combinators: directive.combinators.clone(),
                                 },
@@ -4397,7 +4453,8 @@ mod tests {
         let fixture = crate::l1::tests::Fixture::new();
         let mut state = fixture.state();
         let lib = fixture.root.join("lib");
-        let meta_file = crate::l1::tests::set(&mut state, &lib.join("meta.dart"), "library meta;\n");
+        let meta_file =
+            crate::l1::tests::set(&mut state, &lib.join("meta.dart"), "library meta;\n");
         let plain_file =
             crate::l1::tests::set(&mut state, &lib.join("plain.dart"), "int f() => 1;\n");
         crate::l1::apply(&mut state, &mut |_| {});
@@ -4573,5 +4630,215 @@ mod tests {
             .max()
             .expect("kept rows");
         assert_eq!(last_kept, (MAX_DIAGNOSTICS_PER_FILE - 1) as u32);
+    }
+
+    /// A [`SourceStore`] that flips a [`CancellationToken`] on the
+    /// `flip_at`-th `get` — the deterministic mid-run cancel for the
+    /// intra-library checkpoint tests: the member-fold loop polls the
+    /// token on its [`Checkpoint`] cadence, so a flip landing mid-fold
+    /// surfaces as `Err(Cancelled)` with the members past the next stride
+    /// never read. `get_calls` doubles as the processed-count probe the
+    /// tests assert on (every content read — capture, fold, surface —
+    /// walks through it).
+    struct FlipStore {
+        inner: Box<dyn SourceStore + Send + Sync>,
+        get_calls: Arc<std::sync::atomic::AtomicUsize>,
+        flip_at: usize,
+        token: CancellationToken,
+    }
+
+    impl SourceStore for FlipStore {
+        fn put(&mut self, bytes: &[u8]) -> ContentId {
+            self.inner.put(bytes)
+        }
+        fn get(&self, id: ContentId) -> Option<&[u8]> {
+            if self.get_calls.fetch_add(1, Ordering::Relaxed) + 1 == self.flip_at {
+                self.token.cancel();
+            }
+            self.inner.get(id)
+        }
+        fn remove(&mut self, id: ContentId) -> bool {
+            self.inner.remove(id)
+        }
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+        fn len_bytes(&self) -> u64 {
+            self.inner.len_bytes()
+        }
+    }
+
+    /// A [`SourceStore`] that only counts `get` calls — the baseline run
+    /// calibrating [`FlipStore`]'s flip point.
+    struct CountingStore {
+        inner: Box<dyn SourceStore + Send + Sync>,
+        get_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl SourceStore for CountingStore {
+        fn put(&mut self, bytes: &[u8]) -> ContentId {
+            self.inner.put(bytes)
+        }
+        fn get(&self, id: ContentId) -> Option<&[u8]> {
+            self.get_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.get(id)
+        }
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+        fn len_bytes(&self) -> u64 {
+            self.inner.len_bytes()
+        }
+    }
+
+    /// A default-diagnoser engine over [`clause_workspace`]'s faces whose
+    /// content store is `store` (the [`FlipStore`] face the cancellation
+    /// tests arm).
+    fn store_engine(root: &Path, store: Box<dyn SourceStore + Send + Sync>) -> Engine {
+        let config_dir = root.join(".dart_tool");
+        let config = Arc::new(
+            PackageConfig::parse(
+                &std::fs::read_to_string(config_dir.join("package_config.json")).expect("config"),
+            )
+            .expect("valid config"),
+        );
+        let lock = LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
+            .expect("valid lock");
+        let root_pubspec = Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
+            .expect("valid pubspec");
+        let graph = build_graph(
+            &config,
+            &lock,
+            &root_pubspec,
+            &BTreeMap::new(),
+            None,
+            &config_dir,
+        )
+        .expect("graph");
+        Engine::new(EngineConfig {
+            store,
+            sdk: SdkSnapshot::load(&root.join("sdk"), None).expect("synthetic SDK loads"),
+            packages: PackageTable::build(&config, &graph, &config_dir).expect("table"),
+            pub_config: Arc::clone(&config),
+            config_dir,
+            semdiag: Some(diagnoser()),
+            target: crate::DEFAULT_TARGET.to_owned(),
+            declared_variables: FxHashMap::default(),
+            experiments: Vec::new(),
+        })
+        .expect("engine")
+    }
+
+    /// One library of `1 + PARTS` members: a defining file plus `PARTS`
+    /// part files, all `part of`-bound — the single-library recompute the
+    /// intra-library checkpoint tests run a flip through.
+    fn seed_part_library(engine: &mut Engine, root: &Path, parts: usize) {
+        let mut main = String::from("library t;\n");
+        for i in 0..parts {
+            main.push_str(&format!("part 'p{i}.dart';\n"));
+        }
+        engine.set_content(&root.join("lib/main.dart"), main.as_bytes());
+        for i in 0..parts {
+            engine.set_content(
+                &root.join(format!("lib/p{i}.dart")),
+                format!("part of 'main.dart';\nint p{i}() => {i};\n").as_bytes(),
+            );
+        }
+        engine.apply_pending(&mut |_| {});
+    }
+
+    /// The intra-library checkpoint contract: a token flipped mid-fold of
+    /// ONE library stops its recompute — `Err(Cancelled)` with the members
+    /// past the next cadence stride never read — instead of waiting out
+    /// the whole library the way the per-library boundary check alone
+    /// would (`Ok` under that posture, the gap this lane closes). The
+    /// `get`-call counter is the processed-count probe: a cancelled run
+    /// reads strictly fewer contents than the full run's baseline, so the
+    /// recompute demonstrably stopped near the flip point rather than
+    /// after it.
+    #[test]
+    fn intra_library_cancel_stops_the_member_fold() {
+        const PARTS: usize = 64;
+        let root = clause_workspace("intra-cancel");
+        // The uncancellable baseline: the same workspace's diagnostic run
+        // plus its full `get` count — the cancelled run's early-exit and
+        // output-equality assertions both read from it.
+        let (baseline_rows, baseline_gets) = {
+            let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let store = CountingStore {
+                inner: memory_store(),
+                get_calls: Arc::clone(&gets),
+            };
+            let mut engine = store_engine(&root, Box::new(store));
+            seed_part_library(&mut engine, &root, PARTS);
+            let rows = engine
+                .analyze(&[], &mut |_| {}, &CancellationToken::default())
+                .expect("baseline analyze");
+            (rows, gets.load(Ordering::Relaxed))
+        };
+        assert!(baseline_gets > 0);
+
+        // The flipped run: the token fires `PARTS` reads before the
+        // baseline's end — inside the single library's recompute by
+        // construction (the member fold reads once per member and the
+        // surface build's reads trail it, so the last `PARTS` reads all
+        // sit past the per-library job-head check). `Err` here can only
+        // come from the intra-library cadence — the head-check alone
+        // would have let the library run to `Ok`.
+        let token = CancellationToken::new();
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = FlipStore {
+            inner: memory_store(),
+            get_calls: Arc::clone(&gets),
+            flip_at: baseline_gets - PARTS,
+            token: token.clone(),
+        };
+        let mut engine = store_engine(&root, Box::new(store));
+        seed_part_library(&mut engine, &root, PARTS);
+        let cancelled = engine.analyze(&[], &mut |_| {}, &token);
+        assert_eq!(
+            cancelled.unwrap_err(),
+            Cancelled,
+            "a mid-library flip must stop the run, not wait the library out"
+        );
+        assert!(
+            gets.load(Ordering::Relaxed) < baseline_gets,
+            "the cancelled run stopped early: {} reads vs {} baseline",
+            gets.load(Ordering::Relaxed),
+            baseline_gets
+        );
+
+        // The dirty-library contract: the cancelled library stayed dirty,
+        // so a fresh token's analyze recomputes it and returns the exact
+        // baseline output — the early exit published no partial run.
+        let retried = engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("retry analyze");
+        assert_eq!(
+            retried.as_slice(),
+            baseline_rows.as_slice(),
+            "retry matches the full run"
+        );
+    }
+
+    /// The output-neutral arm of the contract: a token that never flips
+    /// leaves the run byte-identical — the cadence counter adds its
+    /// decrement-and-branch per member and nothing else.
+    #[test]
+    fn intra_library_cancel_token_at_rest_leaves_output_unchanged() {
+        const PARTS: usize = 64;
+        let root = clause_workspace("intra-cancel-quiet");
+        let mut quiet = store_engine(&root, memory_store());
+        seed_part_library(&mut quiet, &root, PARTS);
+        let quiet_rows = quiet
+            .analyze(&[], &mut |_| {}, &CancellationToken::new())
+            .expect("quiet analyze");
+
+        let mut baseline = store_engine(&root, memory_store());
+        seed_part_library(&mut baseline, &root, PARTS);
+        let baseline_rows = baseline
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("baseline analyze");
+        assert_eq!(quiet_rows, baseline_rows);
     }
 }

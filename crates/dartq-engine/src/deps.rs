@@ -163,7 +163,10 @@ pub(crate) fn load_dep_closure(state: &mut EngineState) {
                 continue;
             };
             for directive in &facts.directives {
-                if !matches!(directive.kind, DirectiveKind::Import | DirectiveKind::Export) {
+                if !matches!(
+                    directive.kind,
+                    DirectiveKind::Import | DirectiveKind::Export
+                ) {
                     continue;
                 }
                 let ResolvedTarget::Resolved(target) = directive.target else {
@@ -180,8 +183,7 @@ pub(crate) fn load_dep_closure(state: &mut EngineState) {
                 {
                     continue;
                 }
-                if state.residency.contains_key(&target) || state.deps.units.contains_key(&target)
-                {
+                if state.residency.contains_key(&target) || state.deps.units.contains_key(&target) {
                     continue;
                 }
                 if dep_candidate(state, target) {
@@ -267,12 +269,18 @@ fn load_dep_unit(state: &mut EngineState, file: FileId) -> Vec<FileId> {
     );
     let mut targets = Vec::with_capacity(facts.directives.len());
     for directive in &facts.directives {
-        if !matches!(directive.kind, DirectiveKind::Import | DirectiveKind::Export) {
+        if !matches!(
+            directive.kind,
+            DirectiveKind::Import | DirectiveKind::Export
+        ) {
             targets.push(ResolvedTarget::Missing);
             continue;
         }
-        let resolution =
-            resolver.resolve(file, directive.uri.as_deref(), UriDirectiveKind::ImportExport);
+        let resolution = resolver.resolve(
+            file,
+            directive.uri.as_deref(),
+            UriDirectiveKind::ImportExport,
+        );
         targets.push(resolution.target);
     }
     drop(resolver);
@@ -284,8 +292,7 @@ fn load_dep_unit(state: &mut EngineState, file: FileId) -> Vec<FileId> {
         ResolvedTarget::Resolved(file) => Some(*file),
         _ => None,
     }) {
-        if state.residency.contains_key(&dependency) || state.deps.units.contains_key(&dependency)
-        {
+        if state.residency.contains_key(&dependency) || state.deps.units.contains_key(&dependency) {
             continue;
         }
         if !dep_candidate(state, dependency) {

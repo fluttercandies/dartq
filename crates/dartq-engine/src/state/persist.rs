@@ -820,9 +820,9 @@ mod tests {
     use crate::{CancellationToken, Engine, EngineConfig, EngineEvent, memory_store};
     use dartq_pub::{LockFile, PackageConfig, Pubspec, build_graph};
     use dartq_semantic::persisted::{
-        PersistedAnnotation, PersistedContainer, PersistedContainerKind,
-        PersistedExtensionFace, PersistedFormal, PersistedFormals, PersistedMemberEntry,
-        PersistedMemberKind, PersistedMicroKind, PersistedTopDecl, PersistedTy,
+        PersistedAnnotation, PersistedContainer, PersistedContainerKind, PersistedExtensionFace,
+        PersistedFormal, PersistedFormals, PersistedMemberEntry, PersistedMemberKind,
+        PersistedMicroKind, PersistedTopDecl, PersistedTy,
     };
     use dartq_snapshot::{SnapshotConfig, SnapshotStore};
     use dartq_source::SourceRange;
@@ -2872,8 +2872,7 @@ mod tests {
         // (`import 'other.dart' ` is 20 columns, so the spans start at
         // offsets 20/63 with lengths 21/20 — verified against
         // `dart analyze --format machine` on this exact file shape).
-        let row =
-            |d: &Diagnostic| (d.code.name, d.range.offset, d.range.length, d.severity);
+        let row = |d: &Diagnostic| (d.code.name, d.range.offset, d.range.length, d.severity);
         assert_eq!(
             cold.file_facts(main_cold)
                 .expect("resident")
@@ -2917,8 +2916,16 @@ mod tests {
         let cold_facts = cold.file_facts(main_cold).expect("resident");
         let warm_facts = warm.file_facts(main_warm).expect("resident");
         assert_eq!(
-            warm_facts.diagnostics.iter().map(|d| row(d)).collect::<Vec<_>>(),
-            cold_facts.diagnostics.iter().map(|d| row(d)).collect::<Vec<_>>(),
+            warm_facts
+                .diagnostics
+                .iter()
+                .map(|d| row(d))
+                .collect::<Vec<_>>(),
+            cold_facts
+                .diagnostics
+                .iter()
+                .map(|d| row(d))
+                .collect::<Vec<_>>(),
             "the warm start must reproduce the cold rows exactly — no \
              duplicate-combinator or duplicate-import row beyond them, got \
              {:?} vs cold {:?}",

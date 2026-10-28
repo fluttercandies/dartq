@@ -529,8 +529,7 @@ fn element_heap_bytes(elements: &FileElements) -> usize {
             + std::mem::size_of_val(&*container.enum_constants)
             + std::mem::size_of_val(&*container.constructors)
             + std::mem::size_of_val(&*container.annotations)
-            + container.ctor_formals.len()
-                * (size_of::<StringId>() + size_of::<usize>())
+            + container.ctor_formals.len() * (size_of::<StringId>() + size_of::<usize>())
             + container
                 .ctor_formals
                 .values()
@@ -1748,6 +1747,11 @@ pub(crate) struct EngineState {
     /// [`crate::Engine::open_content_store`]; every apply batch persists
     /// its changed contents and flushes (pipeline's `flush_l3`).
     pub(crate) l3: Option<crate::store::ContentStore>,
+    /// The `Tier::Background` warm lane's plan ([`crate::warm::WarmPlan`]):
+    /// armed at each analyze settle, stepped in bounded chunks by the
+    /// caller's background-tier drain. `armed=false` (the default) is the
+    /// zero-cost shape — `warm_pending` is one flag test.
+    pub(crate) warm: crate::warm::WarmPlan,
 }
 
 /// The context roots the analysis surfaces derive from: every package root
@@ -1879,6 +1883,7 @@ impl EngineState {
             budget: None,
             trace: None,
             l3: None,
+            warm: crate::warm::WarmPlan::default(),
         })
     }
 
@@ -1960,6 +1965,16 @@ impl EngineState {
     /// Scanned-face lookup.
     pub(crate) fn cached_scanned(&self, key: FactsKey) -> Option<Arc<ScannedFace>> {
         self.scanned.get(&key).cloned()
+    }
+
+    /// Test seam: drops every cached scanned face — the post-shed miss
+    /// shape the tier-2 budget descent and the warm-start ingest both
+    /// produce, without paying their setup. The warm-lane pins stage
+    /// their miss set through here.
+    #[cfg(test)]
+    pub(crate) fn shed_scanned_for_test(&mut self) {
+        self.scanned.clear();
+        self.scanned_order.clear();
     }
 
     /// The persisted scan face of a resident file, addressed under the exact
@@ -2226,7 +2241,10 @@ impl EngineState {
                 .flatten()
                 .map(|view| {
                     view.len() * size_of::<(FileId, Box<[u32]>)>()
-                        + view.iter().map(|(_, rows)| rows.len() * size_of::<u32>()).sum::<usize>()
+                        + view
+                            .iter()
+                            .map(|(_, rows)| rows.len() * size_of::<u32>())
+                            .sum::<usize>()
                 })
                 .sum::<usize>();
         (captures, surfaces)
@@ -2274,8 +2292,7 @@ impl EngineState {
             .values()
             .map(|result| result.diagnostics.capacity() * size_of::<Arc<Diagnostic>>())
             .sum::<usize>();
-        let results_map = self.results.capacity()
-            * (size_of::<(LibraryId, LibraryResult)>() + 1);
+        let results_map = self.results.capacity() * (size_of::<(LibraryId, LibraryResult)>() + 1);
         let (merged, merged_contributors) = self.merged.as_ref().map_or((0, 0), |merged| {
             (
                 merged.output.capacity() * size_of::<Diagnostic>(),
@@ -2287,8 +2304,8 @@ impl EngineState {
             .values()
             .map(|face| face.tokens.len() * (size_of::<dartq_scanner::Token>() + 4))
             .sum::<usize>();
-        let scanned_slots = self.scanned.capacity()
-            * (size_of::<(FactsKey, Arc<ScannedFace>)>() + 1);
+        let scanned_slots =
+            self.scanned.capacity() * (size_of::<(FactsKey, Arc<ScannedFace>)>() + 1);
         let element_models = self
             .residency
             .values()
@@ -2310,12 +2327,12 @@ impl EngineState {
                     + element_heap_bytes(&unit.elements)
             })
             .sum::<usize>();
-        let facts_cache_slots = self.facts_cache.capacity()
-            * (size_of::<(FactsKey, Arc<UnitFacts>)>() + 1);
+        let facts_cache_slots =
+            self.facts_cache.capacity() * (size_of::<(FactsKey, Arc<UnitFacts>)>() + 1);
         let (warm_start, warm_start_slots) = self.warm_start_bytes();
         let session_scratch = self.session_scratch_bytes();
-        let residency_slots = self.residency.capacity()
-            * (size_of::<(FileId, Arc<UnitFacts>)>() + 1);
+        let residency_slots =
+            self.residency.capacity() * (size_of::<(FileId, Arc<UnitFacts>)>() + 1);
         let as_u64 = |bytes: usize| bytes as u64;
         vec![
             ("store_bytes", self.store.len_bytes(), "exact"),
@@ -2339,7 +2356,11 @@ impl EngineState {
             ("library_results_handles", as_u64(results), "exact"),
             ("library_results_map", as_u64(results_map), "exact"),
             ("merged_output_rows", as_u64(merged), "exact"),
-            ("merged_contributor_rows", as_u64(merged_contributors), "exact"),
+            (
+                "merged_contributor_rows",
+                as_u64(merged_contributors),
+                "exact",
+            ),
             ("scanned_cache_tokens", as_u64(scanned), "exact"),
             ("scanned_map_slots", as_u64(scanned_slots), "exact"),
             ("facts_cache_facts", as_u64(cached_facts), "est"),
@@ -2348,7 +2369,11 @@ impl EngineState {
             ("warm_start_map_slots", as_u64(warm_start_slots), "exact"),
             ("session_scratch", as_u64(session_scratch), "exact"),
             ("scanned_cache_entries", self.scanned.len() as u64, "count"),
-            ("facts_cache_entries", self.facts_cache.len() as u64, "count"),
+            (
+                "facts_cache_entries",
+                self.facts_cache.len() as u64,
+                "count",
+            ),
             ("warm_start_entries", self.warm_start.len() as u64, "count"),
             ("residency_files", self.residency.len() as u64, "count"),
             ("string_table_entries", self.strings.len() as u64, "count"),
@@ -2367,8 +2392,7 @@ impl EngineState {
             .values()
             .map(|facts| {
                 size_of::<persist::PersistedFacts>()
-                    + facts.directives.capacity()
-                        * size_of::<persist::PersistedDirective>()
+                    + facts.directives.capacity() * size_of::<persist::PersistedDirective>()
                     + facts
                         .directives
                         .iter()
@@ -2430,10 +2454,7 @@ impl EngineState {
                 .sum::<usize>()
             + self.library_generations.capacity() * (size_of::<(LibraryId, u32)>() + 1)
             + self.structure_digests.capacity() * (size_of::<(FileId, u64)>() + 1)
-            + self
-                .reported
-                .capacity()
-                * (size_of::<(FileId, (Arc<str>, LineIndex))>() + 1)
+            + self.reported.capacity() * (size_of::<(FileId, (Arc<str>, LineIndex))>() + 1)
             + self
                 .reported
                 .values()
@@ -2601,12 +2622,7 @@ impl EngineState {
         // The dependency-interface units' sources stay live too: a swept dep
         // content would break the clause-tree capture's store read (the
         // under-report direction, but an avoidable one).
-        live.extend(
-            self.deps
-                .units
-                .values()
-                .map(|unit| unit.facts.content()),
-        );
+        live.extend(self.deps.units.values().map(|unit| unit.facts.content()));
         self.store
             .collect_garbage(&|id: ContentId| live.contains(&id));
     }
@@ -2640,6 +2656,23 @@ impl EngineState {
             }
         }
         Some((tier, limit_mib, self.structural_bytes()))
+    }
+
+    /// The memory posture ([`crate::budget::MemoryStatus`]): the ladder's
+    /// own data read back — limit, descended tiers, deepest tier key, and
+    /// the last boundary sample. An unarmed budget answers the default
+    /// (nothing armed, nothing sampled, nothing degraded): the sampler
+    /// never ran, so there is nothing to report.
+    pub(crate) fn memory_status(&self) -> crate::budget::MemoryStatus {
+        match self.budget {
+            Some(budget) => crate::budget::MemoryStatus {
+                rss_bytes: budget.sample_bytes(),
+                limit_mib: Some(budget.limit_mib()),
+                degraded_tiers: budget.tiers_fired(),
+                degraded_tier: budget.deepest_tier().map(crate::budget::Tier::key),
+            },
+            None => crate::budget::MemoryStatus::default(),
+        }
     }
 
     /// A URI resolver over the engine's package table, SDK snapshot, and file
@@ -2858,22 +2891,45 @@ mod tests {
         };
 
         assert_eq!(
-            owner(tree.root.join("sky_engine").join("lib").join("ui").join("ui.dart")),
+            owner(
+                tree.root
+                    .join("sky_engine")
+                    .join("lib")
+                    .join("ui")
+                    .join("ui.dart")
+            ),
             Some(GrantOwner::SdkLibrary("ui".into())),
             "a mapped library file attributes to its dart: name"
         );
         assert_eq!(
-            owner(tree.root.join("sky_engine").join("lib").join("ui").join("painting.dart")),
+            owner(
+                tree.root
+                    .join("sky_engine")
+                    .join("lib")
+                    .join("ui")
+                    .join("painting.dart")
+            ),
             Some(GrantOwner::SdkLibrary("ui".into())),
             "a part under the library's directory attributes the same"
         );
         assert_eq!(
-            owner(tree.root.join("sky_engine").join("lib").join("embedder_core.dart")),
+            owner(
+                tree.root
+                    .join("sky_engine")
+                    .join("lib")
+                    .join("embedder_core.dart")
+            ),
             Some(GrantOwner::SdkLibrary("core".into())),
             "a mapped library directly in the yaml's directory attributes"
         );
         assert_eq!(
-            owner(tree.root.join("dart-sdk").join("lib").join("core").join("core.dart")),
+            owner(
+                tree.root
+                    .join("dart-sdk")
+                    .join("lib")
+                    .join("core")
+                    .join("core.dart")
+            ),
             None,
             "the replaced dart-sdk tree attributes nothing while the embedder backs the table"
         );
@@ -2894,12 +2950,24 @@ mod tests {
         };
 
         assert_eq!(
-            owner(tree.root.join("dart-sdk").join("lib").join("core").join("bool.dart")),
+            owner(
+                tree.root
+                    .join("dart-sdk")
+                    .join("lib")
+                    .join("core")
+                    .join("bool.dart")
+            ),
             Some(GrantOwner::SdkLibrary("core".into())),
             "the flat table's core directory still attributes its parts"
         );
         assert_eq!(
-            owner(tree.root.join("sky_engine").join("lib").join("ui").join("ui.dart")),
+            owner(
+                tree.root
+                    .join("sky_engine")
+                    .join("lib")
+                    .join("ui")
+                    .join("ui.dart")
+            ),
             None,
             "an embedder directory outside the dart-sdk tree is no SDK library"
         );
@@ -2915,7 +2983,10 @@ mod tests {
     fn degenerate_embedder_uri_is_rejected_at_load() {
         let tree = GrantTree::new("degenerate");
         std::fs::write(
-            tree.root.join("sky_engine").join("lib").join("_embedder.yaml"),
+            tree.root
+                .join("sky_engine")
+                .join("lib")
+                .join("_embedder.yaml"),
             "embedded_libs:\n  \"dart:bad\": \"/\"\n",
         )
         .expect("yaml");

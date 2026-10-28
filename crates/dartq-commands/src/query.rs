@@ -44,6 +44,13 @@
 //! buys one graph build for N answers. There is no aggregate envelope (the
 //! schema crate's frozen batch convention): each answer is the single
 //! query's own JSON line, so batch and single output cannot drift.
+//!
+//! The fuzzy discovery face ([`symbol_fuzzy`]) is the opt-in sibling: the
+//! declarations whose names fuzzy-match the query, best-first, capped —
+//! the ranking spec lives on the dartq-index `fuzzy` module. It reuses the
+//! query envelope verbatim (`sym` carries the query, `decls` the ranked
+//! candidates, `refs` empty); the exact faces' request path and cost are
+//! untouched.
 
 // The dependencies row type (the frozen `DependencyRow` shape), re-exported
 // so the faces name it in their signatures without a dartq-ai dependency.
@@ -96,6 +103,46 @@ pub struct SymbolRun<'a> {
 pub fn symbol<'a>(engine: &'a mut Engine, name: &str) -> Result<SymbolRun<'a>, AnalyzeError> {
     let _ = prelude(engine)?;
     Ok(symbol_after_analysis(engine, name))
+}
+
+/// The fuzzy discovery face: the analyzed workspace's declarations whose
+/// names fuzzy-match `query`, best-first (the dartq-index `fuzzy` module's
+/// ranking spec — exact prefix, then word-boundary camelCase, then
+/// contiguous substring, then sparse subsequence; ties by name length,
+/// then name bytes), capped at that module's result cap. The exact faces'
+/// request path is untouched: this is a separate entry, reached only when
+/// the request opts in (the CLI's `--fuzzy`, the daemon's `fuzzy` param).
+///
+/// # Errors
+///
+/// [`AnalyzeError`] on discovery failure or cancellation.
+pub fn symbol_fuzzy<'a>(
+    engine: &'a mut Engine,
+    query: &str,
+) -> Result<SymbolRun<'a>, AnalyzeError> {
+    let _ = prelude(engine)?;
+    Ok(symbol_fuzzy_after_analysis(engine, query))
+}
+
+/// The discovery answer over an already-analyzed engine — the daemon path
+/// (see [`symbol_after_analysis`]). The `decls` array is the rank order
+/// (NOT the exact faces' path-then-offset contract; within one matched
+/// name rows keep file-then-offset order) and `refs` stays empty —
+/// discovery names symbols, the exact faces resolve their uses. The JSON
+/// envelope is the query contract's own shape (`sym` carries the query,
+/// `decls` the ranked candidates), so the discovery face shares the exact
+/// face's shapers verbatim.
+#[must_use]
+pub fn symbol_fuzzy_after_analysis<'a>(engine: &'a Engine, query: &str) -> SymbolRun<'a> {
+    let answer = engine.query_symbols_fuzzy(query);
+    let layout = EngineLayout::over(engine, answer.decls.iter().map(|decl| decl.file));
+    SymbolRun {
+        decls: answer.decls,
+        refs: Vec::new(),
+        implementations: Vec::new(),
+        dependencies: Vec::new(),
+        layout,
+    }
 }
 
 /// The `Container.member` spelling's split (#2655): the last `.` separates
@@ -2090,6 +2137,49 @@ mod tests {
             minimal,
             "minimal golden drift"
         );
+
+        fs_remove(&root);
+    }
+
+    /// The fuzzy discovery face end to end: the ranked candidates answer
+    /// best-first (exact prefix, then the camelCase word-boundary match,
+    /// then the contiguous substring, then the sparse subsequence), the
+    /// case-insensitive query answers the identical order, references stay
+    /// empty, and the envelope is the query contract's own shape.
+    #[test]
+    fn discovery_ranks_candidates_best_first() {
+        let source = "class FooBar {}\nvoid fb() {}\nvoid xfbx() {}\nvoid foob() {}\n";
+        let root = workspace("discovery", &[("lib/disc.dart", source)]);
+        let (mut engine, _) = open_engine(&root, Some(&root.join("sdk"))).expect("engine");
+
+        for query in ["fb", "FB"] {
+            let run = symbol_fuzzy(&mut engine, query).expect("discovery");
+            let names: Vec<&str> = run.decls.iter().map(|decl| decl.name).collect();
+            assert_eq!(
+                names,
+                ["fb", "FooBar", "xfbx", "foob"],
+                "{query}: the four classes, best first, case-insensitively"
+            );
+            assert!(run.refs.is_empty(), "discovery joins no references");
+
+            let json = to_json(&run, query);
+            assert_eq!(json["sym"], query);
+            assert_eq!(
+                json["decls"].as_array().expect("decls").len(),
+                4,
+                "the ranked candidates ride the shared envelope: {json}"
+            );
+            dartq_schema::validate(&json.to_string(), dartq_schema::Domain::Query)
+                .expect("schema-valid");
+        }
+
+        // The exact name spells a full declaration: it ranks first, and
+        // the exact face's own answer is unchanged beside it.
+        let exact = symbol(&mut engine, "FooBar").expect("exact");
+        assert_eq!(exact.decls.len(), 1);
+        assert_eq!(exact.decls[0].name, "FooBar");
+        let discovery = symbol_fuzzy_after_analysis(&engine, "FooBar");
+        assert_eq!(discovery.decls[0].name, "FooBar", "the exact name ranks first");
 
         fs_remove(&root);
     }

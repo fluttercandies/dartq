@@ -172,8 +172,12 @@ fn extension_member_key(
     index: &dartq_semantic::ElementIndex,
     range: SourceRange,
 ) -> Option<(FileId, u32, StringId)> {
-    index.get(file)?.extension_faces().iter().enumerate().find_map(
-        |(face_index, face)| {
+    index
+        .get(file)?
+        .extension_faces()
+        .iter()
+        .enumerate()
+        .find_map(|(face_index, face)| {
             face.members
                 .iter()
                 .find(|(_, entry)| entry.name_range == range)
@@ -182,8 +186,7 @@ fn extension_member_key(
                         .ok()
                         .map(|face_index| (file, face_index, *spelling))
                 })
-        },
-    )
+        })
 }
 
 /// Releases the staged `unused_import` rows whose import the library's
@@ -300,8 +303,7 @@ fn release_unused_imports(
             .chain(doc_refs.iter().copied())
             .filter(|name| !own.contains(name))
             .any(|name| {
-                edge.combinators.allows(name)
-                    && library.graph.exported(target, name).is_some()
+                edge.combinators.allows(name) && library.graph.exported(target, name).is_some()
             })
             || extension_member_credit(library, edge, target, consumed);
         if credited {
@@ -735,8 +737,7 @@ impl MemberFold {
         size_of::<Self>()
             + self.diagnostics.len() * size_of::<Arc<Diagnostic>>()
             + self.unused.len() * size_of::<(Arc<Diagnostic>, StringId)>()
-            + self.unused_extension.len()
-                * size_of::<(Arc<Diagnostic>, (FileId, u32, StringId))>()
+            + self.unused_extension.len() * size_of::<(Arc<Diagnostic>, (FileId, u32, StringId))>()
             + self.unused_fields.len() * size_of::<(Arc<Diagnostic>, StringId)>()
             + self.unused_imports.len() * size_of::<Arc<Diagnostic>>()
             + self.doc_refs.len() * size_of::<StringId>()
@@ -931,7 +932,17 @@ impl SemanticDiagnoser for Diagnoser {
         let mut staged_imports: Vec<Arc<Diagnostic>> = Vec::new();
         let mut doc_refs: Vec<StringId> = Vec::new();
         let unused_import = unused_import_name();
+        // The intra-library cancellation cadence: one relaxed atomic load
+        // per stride of member folds — the bounded-window contract a flip
+        // rides (see `cancel::Checkpoint`). An early return drops the
+        // staging vecs with the partial run; the pipeline-side check right
+        // after this call keeps the partial rows from ever reaching the
+        // result store.
+        let mut checkpoint = crate::cancel::Checkpoint::new(library.cancel);
         for &file in library.files {
+            if checkpoint.tick().is_err() {
+                return;
+            }
             let facts = &library.facts[&file];
             // The member-level memo (#1384): a member whose identity inputs
             // stood is served byte-identical — the text decode, the
@@ -1027,9 +1038,7 @@ impl SemanticDiagnoser for Diagnoser {
                 feature_set.is_enabled(Feature::InferenceUpdate2),
                 ops.as_ref(),
             );
-            let dartq_semantic::UnitFold {
-                report, face, ..
-            } = fold;
+            let dartq_semantic::UnitFold { report, face, .. } = fold;
             let member_refs = report.member_refs.into();
             // The bake in `l1::duplicate_diagnostics` is the single source,
             // so the fold drops the re-issued rows; the filtered set is
@@ -1050,20 +1059,12 @@ impl SemanticDiagnoser for Diagnoser {
                 }
                 let row = Arc::new(diagnostic);
                 if row.code.name == unused {
-                    let name = staged_decl_name(
-                        text,
-                        &facts.line_index,
-                        row.range,
-                        library.strings,
-                    );
+                    let name =
+                        staged_decl_name(text, &facts.line_index, row.range, library.strings);
                     candidates.push((row, name));
                 } else if unused_fields.contains(&row.code.name) {
-                    let name = staged_decl_name(
-                        text,
-                        &facts.line_index,
-                        row.range,
-                        library.strings,
-                    );
+                    let name =
+                        staged_decl_name(text, &facts.line_index, row.range, library.strings);
                     field_rows.push((row, name));
                 } else if row.code.name == unused_import {
                     import_rows.push(row);
@@ -1251,7 +1252,10 @@ mod compact_face_tests {
         assert!(back.imports[1].shown.is_empty());
         assert_eq!(back.exports.len(), 1);
         assert_eq!(back.exports[0].shown, vec![id("z")]);
-        assert!(compact.used.windows(2).all(|w| w[0] < w[1]), "sorted, deduped");
+        assert!(
+            compact.used.windows(2).all(|w| w[0] < w[1]),
+            "sorted, deduped"
+        );
         let ids = size_of::<StringId>();
         assert_eq!(
             compact.heap_bytes(),
@@ -1938,7 +1942,8 @@ mod tests {
     fn part_file_unused_element_closes_library_wide() {
         let root = memo_workspace();
         let mut engine = memo_engine(&root);
-        let main_base = "part 'p.dart';\n\nclass _Host {}\n\nvoid main() {\n  _Tile();\n  _tileFn();\n}\n";
+        let main_base =
+            "part 'p.dart';\n\nclass _Host {}\n\nvoid main() {\n  _Tile();\n  _tileFn();\n}\n";
         let p_base = "part of 'main.dart';\n\nclass _Tile {\n  const _Tile();\n}\n\nvoid _tileFn() {}\n\nclass _Orphan {}\n\nvoid _makeHost() {\n  _Host();\n}\n\nvoid _useSelf() {\n  _SelfUsed();\n}\n\nclass _SelfUsed {}\n\nclass _Shadow {}\n";
         let other_base =
             "class _Shadow {\n  void m() {}\n}\n\nvoid useOwn() {\n  _Shadow().m();\n}\n";
@@ -2000,14 +2005,9 @@ mod tests {
 
     /// The `unused_field` rows of one analyze output: (path, message) pairs
     /// in emission order.
-    fn unused_field_rows(
-        engine: &Engine,
-        rows: &[Diagnostic],
-    ) -> Vec<(String, String)> {
+    fn unused_field_rows(engine: &Engine, rows: &[Diagnostic]) -> Vec<(String, String)> {
         rows.iter()
-            .filter(|row| {
-                unused_field_names().contains(&row.code.name)
-            })
+            .filter(|row| unused_field_names().contains(&row.code.name))
             .map(|row| {
                 (
                     engine
@@ -2037,7 +2037,8 @@ mod tests {
         let main_base = "part 'p.dart';\npart 'q.dart';\n\nvoid main() {\n  final t = _makeT();\n  t._read;\n  t._written = 1;\n  _useQ();\n}\n";
         let p_base = "part of 'main.dart';\n\nclass _T {\n  int _read = 0;\n  int _written = 0;\n  int _orphan = 0;\n  void use() {}\n}\n\n_T _makeT() => _T();\n\nenum _Op {\n  and,\n  or,\n}\n";
         let q_base = "part of 'main.dart';\n\nvoid _useQ() {\n  _Op.or;\n}\n";
-        let other_base = "class _Shadow {\n  int _f = 0;\n}\n\nvoid useOwn() {\n  _Shadow()._f;\n}\n";
+        let other_base =
+            "class _Shadow {\n  int _f = 0;\n}\n\nvoid useOwn() {\n  _Shadow()._f;\n}\n";
         let mut current: Vec<(String, String)> = vec![
             ("lib/main.dart".into(), main_base.into()),
             ("lib/p.dart".into(), p_base.into()),
@@ -2092,10 +2093,7 @@ mod tests {
 
     /// The unused-import rows of one analyze output: (path, message) pairs
     /// in emission order.
-    fn unused_import_rows(
-        engine: &Engine,
-        rows: &[Diagnostic],
-    ) -> Vec<(String, String)> {
+    fn unused_import_rows(engine: &Engine, rows: &[Diagnostic]) -> Vec<(String, String)> {
         rows.iter()
             .filter(|row| row.code.name == unused_import_name())
             .map(|row| {
@@ -2113,10 +2111,7 @@ mod tests {
 
     /// Sets a fresh multi-file workspace, analyzes it whole, and returns
     /// the engine (for path resolution) with the merged diagnostics.
-    fn analyze_files(
-        root: &Path,
-        files: &[(&str, &str)],
-    ) -> (Engine, Vec<Diagnostic>) {
+    fn analyze_files(root: &Path, files: &[(&str, &str)]) -> (Engine, Vec<Diagnostic>) {
         let mut engine = memo_engine(root);
         for (relative, content) in files {
             engine.set_content(&root.join(relative), content.as_bytes());
@@ -2229,7 +2224,10 @@ mod tests {
                     "lib/main.dart",
                     "import 'other.dart';\n\n/// See [Widget.make] for the factory.\nclass Local {}\n",
                 ),
-                ("lib/other.dart", "class Widget {\n  Widget make() => this;\n}\n"),
+                (
+                    "lib/other.dart",
+                    "class Widget {\n  Widget make() => this;\n}\n",
+                ),
             ],
         );
         assert!(
@@ -2375,9 +2373,17 @@ mod tests {
             ],
         );
         let elements = unused_rows(&engine, &out);
-        assert_eq!(elements.len(), 2, "host and orphan both report: {elements:?}");
+        assert_eq!(
+            elements.len(),
+            2,
+            "host and orphan both report: {elements:?}"
+        );
         let imports = unused_import_rows(&engine, &out);
-        assert_eq!(imports.len(), 1, "the import stays: no exported name is spelled");
+        assert_eq!(
+            imports.len(),
+            1,
+            "the import stays: no exported name is spelled"
+        );
     }
 
     /// The extension-member close gate (#2318): the staged member rows
@@ -2394,10 +2400,7 @@ mod tests {
         let (engine, out) = analyze_files(
             &root,
             &[
-                (
-                    "lib/main.dart",
-                    "part 'p.dart';\n\nvoid main() {}\n",
-                ),
+                ("lib/main.dart", "part 'p.dart';\n\nvoid main() {}\n"),
                 (
                     "lib/p.dart",
                     "part of 'main.dart';\n\nclass A {}\n\nclass B {}\n\n\

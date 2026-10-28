@@ -49,7 +49,10 @@ pub(crate) fn load_sdk_units(state: &mut EngineState) {
     let mut queue: Vec<String> = vec!["core".to_string()];
     for facts in state.residency.values() {
         for directive in &facts.directives {
-            if !matches!(directive.kind, DirectiveKind::Import | DirectiveKind::Export) {
+            if !matches!(
+                directive.kind,
+                DirectiveKind::Import | DirectiveKind::Export
+            ) {
                 continue;
             }
             if let Some(name) = directive.uri.as_deref().and_then(sdk_library_of) {
@@ -124,9 +127,15 @@ fn load_sdk_file(state: &mut EngineState, file: FileId) -> Option<Arc<UnitFacts>
         .directives
         .iter()
         .map(|directive| {
-            let external = matches!(directive.kind, DirectiveKind::Import | DirectiveKind::Export)
-                && directive.uri.as_deref().and_then(sdk_library_of).is_some();
-            if external { ResolvedTarget::External } else { ResolvedTarget::Missing }
+            let external = matches!(
+                directive.kind,
+                DirectiveKind::Import | DirectiveKind::Export
+            ) && directive.uri.as_deref().and_then(sdk_library_of).is_some();
+            if external {
+                ResolvedTarget::External
+            } else {
+                ResolvedTarget::Missing
+            }
         })
         .collect();
     let facts = Arc::new(facts);

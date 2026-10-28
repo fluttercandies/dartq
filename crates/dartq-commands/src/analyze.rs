@@ -149,6 +149,11 @@ pub struct AnalyzeRun<'a> {
     /// diagnostic row: it joins no severity tier, no machine/JSON face,
     /// and no metrics count.
     pub degrade_notices: Vec<String>,
+    /// The engine's memory posture at the run's end (the residency peak):
+    /// the budget ladder's state and last boundary sample, plus the warm
+    /// lane's counters — the `--memory-report` face's data, captured
+    /// where the run's own telemetry prints.
+    pub memory: (dartq_engine::MemoryStatus, dartq_engine::WarmStats),
     /// Position/path resolution over the analyzed engine.
     pub layout: EngineLayout<'a>,
 }
@@ -251,6 +256,9 @@ pub fn run_overlaid<'a>(
     }
     let lints = lints_at.elapsed();
     report_memory(engine);
+    // The run's memory posture: the same moment the decomposition probe
+    // prints, the run's end (the residency peak).
+    let memory = (engine.memory_status(), engine.warm_stats());
     // The layout snapshot covers every location the writers resolve — a
     // context message may anchor in a file that carries no row of its own
     // (#2164: its id joins the output set or the merged lookups panic).
@@ -274,6 +282,7 @@ pub fn run_overlaid<'a>(
         libraries_analyzed,
         libraries_from_cache,
         degrade_notices: notices,
+        memory,
         layout,
     })
 }
@@ -494,6 +503,9 @@ pub fn run_targets<'a>(
         diagnostics = plugin_rows;
     }
     report_memory(engine);
+    // The run's memory posture: the same moment the decomposition probe
+    // prints, the run's end (the residency peak).
+    let memory = (engine.memory_status(), engine.warm_stats());
     // The layout snapshot covers every location the writers resolve — a
     // context message may anchor in a file that carries no row of its own
     // (#2164: its id joins the output set or the merged lookups panic).
@@ -517,6 +529,7 @@ pub fn run_targets<'a>(
         libraries_analyzed,
         libraries_from_cache,
         degrade_notices: notices,
+        memory,
         layout,
     })
 }
@@ -544,6 +557,9 @@ pub struct MergedRun<'a> {
     pub libraries_from_cache: usize,
     /// Every run's warning-tier notices, concatenated in run order.
     pub degrade_notices: Vec<String>,
+    /// Each run's engine memory posture ([`AnalyzeRun::memory`]), in run
+    /// order — the `--memory-report` face's per-engine lines.
+    pub memory: Vec<(dartq_engine::MemoryStatus, dartq_engine::WarmStats)>,
     /// The remapped file ids' owning run and original id — `owners[i]` is
     /// the provenance of merged `FileId` `i`, the delegation table
     /// [`FileLayoutProvider::line_col`] resolves through.
@@ -661,6 +677,7 @@ pub fn merge_runs<'a>(runs: Vec<AnalyzeRun<'a>>) -> MergedRun<'a> {
         .into_iter()
         .map(|owner| owner.expect("every interned id has an owner"))
         .collect();
+    let memory = runs.iter().map(|run| run.memory).collect();
 
     let mut merged = MergedRun {
         diagnostics,
@@ -672,6 +689,7 @@ pub fn merge_runs<'a>(runs: Vec<AnalyzeRun<'a>>) -> MergedRun<'a> {
         libraries_analyzed: 0,
         libraries_from_cache: 0,
         degrade_notices: Vec::new(),
+        memory,
         owners,
         files,
         runs,

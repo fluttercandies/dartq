@@ -738,7 +738,9 @@ fn recompute_facts(
                 // no relink — a later edit recomputes it) and the miss
                 // lands in the bounded ledger instead of panicking the
                 // apply.
-                state.residency_degrades.record(&[(*file, FACTS_PAIRING_FACE)]);
+                state
+                    .residency_degrades
+                    .record(&[(*file, FACTS_PAIRING_FACE)]);
                 None
             }
         })
@@ -1038,7 +1040,10 @@ pub(crate) fn scan_unit(
             // to the (0,0) anchor rather than crash the scan face.
             let span = scanned
                 .language_version_override_span
-                .unwrap_or(SourceRange { offset: 0, length: 0 });
+                .unwrap_or(SourceRange {
+                    offset: 0,
+                    length: 0,
+                });
             warnings.push(Diagnostic::new(
                 code.dtype.severity(),
                 code,
@@ -1063,7 +1068,10 @@ pub(crate) fn scan_unit(
                 // to the (0,0) anchor rather than crash the scan face.
                 let span = scanned
                     .language_version_override_span
-                    .unwrap_or(SourceRange { offset: 0, length: 0 });
+                    .unwrap_or(SourceRange {
+                        offset: 0,
+                        length: 0,
+                    });
                 warnings.push(Diagnostic::new(
                     code.dtype.severity(),
                     code,
@@ -2449,8 +2457,7 @@ fn relink_directives(
         return Vec::new();
     }
 
-    let changed_set: FxHashSet<FileId> =
-        recomputed.iter().map(|(file, _, _, _)| *file).collect();
+    let changed_set: FxHashSet<FileId> = recomputed.iter().map(|(file, _, _, _)| *file).collect();
     let mut holders: FxHashSet<FileId> = FxHashSet::default();
     let mut gather = |state: &EngineState, target: FileId| {
         for &source in state
@@ -2599,8 +2606,7 @@ fn maintain_and_close(
     // files whose membership moves may seed the importer closure (the
     // doctrine `close` documents: an unchanged file's claim flip never
     // seeds, and a relinked file is content-unchanged by construction).
-    let content_changed: FxHashSet<FileId> =
-        changed.iter().map(|(file, _, _)| *file).collect();
+    let content_changed: FxHashSet<FileId> = changed.iter().map(|(file, _, _)| *file).collect();
     let changed_set: FxHashSet<FileId> = content_changed
         .iter()
         .copied()
@@ -2634,7 +2640,11 @@ fn maintain_and_close(
         })
         .collect();
     changed_faces.extend(relinked.iter().map(|(file, old)| {
-        (*file, Some(UnitFace::of(old)), UnitFace::of(&state.residency[file]))
+        (
+            *file,
+            Some(UnitFace::of(old)),
+            UnitFace::of(&state.residency[file]),
+        )
     }));
     let removed_faces: Vec<(FileId, UnitFace)> = removed
         .iter()
@@ -2647,7 +2657,9 @@ fn maintain_and_close(
             // the same tolerant posture the edge-retarget pass below reads
             // this map with.
             let Some(facts) = old_facts.get(file) else {
-                state.residency_degrades.record(&[(*file, REMOVED_FACTS_FACE)]);
+                state
+                    .residency_degrades
+                    .record(&[(*file, REMOVED_FACTS_FACE)]);
                 return None;
             };
             Some((*file, UnitFace::of(facts)))
@@ -2742,7 +2754,12 @@ fn maintain_and_close(
             .iter()
             .map(|(file, _, _)| *file)
             .filter(|file| !state.canonical_uris.contains_key(file))
-            .filter_map(|file| state.files.path(file).map(|path| (file, path.to_path_buf())))
+            .filter_map(|file| {
+                state
+                    .files
+                    .path(file)
+                    .map(|path| (file, path.to_path_buf()))
+            })
             .collect();
         let packages = &state.uri_packages;
         let composed: Vec<(FileId, Arc<str>)> = pending
@@ -5403,10 +5420,7 @@ pub(crate) mod tests {
              export 'dart:convert' "
             .len();
         assert_eq!(rows[1].range.offset, export_head as u32);
-        assert_eq!(
-            rows[1].range.length,
-            "show utf8 hide json".len() as u32
-        );
+        assert_eq!(rows[1].range.length, "show utf8 hide json".len() as u32);
     }
 
     /// A `part`'s missing target spells the resolved absolute form — the
@@ -5445,15 +5459,11 @@ pub(crate) mod tests {
         assert_eq!(spelled, expected, "part spells the absolute form");
         let import = rows
             .iter()
-            .find(|d| {
-                d.range.offset
-                    == ("part 'sub/gone.dart';\n".len() + "import ".len()) as u32
-            })
+            .find(|d| d.range.offset == ("part 'sub/gone.dart';\n".len() + "import ".len()) as u32)
             .expect("the import row reports");
         let import_spelled: String = import.message.to_string();
         assert_eq!(
-            import_spelled,
-            "Target of URI doesn't exist: 'nope.dart'.",
+            import_spelled, "Target of URI doesn't exist: 'nope.dart'.",
             "import keeps the written literal"
         );
     }

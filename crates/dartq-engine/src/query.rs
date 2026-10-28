@@ -358,6 +358,115 @@ pub(crate) fn symbols<'a>(state: &'a EngineState, name: &str) -> SymbolAnswer<'a
     SymbolAnswer { decls, refs }
 }
 
+/// The fuzzy discovery answer: the workspace's declarations whose names
+/// fuzzy-match `query`, best-first (the dartq-index `fuzzy` module's
+/// ranking spec — exact prefix, then word-boundary humps, then contiguous
+/// substring, then sparse subsequence; ties by name length, then name
+/// bytes), capped at that module's result cap. Both declaration tiers
+/// scan (the resident workspace captures and the dependency interface
+/// units, the exact face's answer domain), a name both hold ranking once.
+///
+/// References are not part of the answer: discovery names symbols, the
+/// exact faces resolve their uses — `refs` stays empty. Row order inside
+/// one matched name is file-then-offset; across names it is the rank, NOT
+/// the exact face's file-ascending contract.
+///
+/// # Freshness contract
+///
+/// [`symbols`]'s, verbatim — except the scan interns nothing: the query
+/// folds to a scratch buffer, the names resolve off the existing table,
+/// and the state is a pure read.
+///
+/// # Cost shape
+///
+/// One linear subsequence pass per distinct indexed name across the two
+/// decl directories (the dartq-index `fuzzy` module's posture —
+/// sub-millisecond at corpus scale), then the winners' rows off their
+/// files' equal-name runs: the scan plus the answer's size. No parse, no
+/// namespace rebuild, no workspace scan.
+pub(crate) fn symbols_fuzzy<'a>(state: &'a EngineState, query: &str) -> SymbolAnswer<'a> {
+    let folded = dartq_index::fold_query(query);
+    let mut seen: FxHashSet<StringId> = FxHashSet::default();
+    let mut candidates: Vec<dartq_index::Candidate> = state
+        .decl_postings
+        .names()
+        .chain(state.deps.decl_postings.names())
+        .filter_map(|(name, _)| {
+            let class = dartq_index::classify(&folded, state.strings.resolve(name))?;
+            seen.insert(name)
+                .then_some(dartq_index::Candidate { class, name })
+        })
+        .collect();
+    dartq_index::rank(&mut candidates, &state.strings);
+
+    let decls: Vec<DeclHit<'a>> = candidates
+        .into_iter()
+        .flat_map(move |candidate| {
+            let name = candidate.name;
+            let mut rows: Vec<DeclHit<'a>> = state
+                .decl_postings
+                .units(name)
+                .iter()
+                .copied()
+                .filter_map(|file| {
+                    let capture = state.capture(file)?;
+                    Some(
+                        capture
+                            .index
+                            .by_name(name)?
+                            .iter()
+                            .map(move |decl| decl_hit(state, file, &capture.index, decl)),
+                    )
+                })
+                .flatten()
+                .collect();
+            rows.extend(
+                state
+                    .deps
+                    .decl_postings
+                    .units(name)
+                    .iter()
+                    .copied()
+                    .filter_map(|file| {
+                        let capture = &state.deps.units.get(&file)?.capture;
+                        Some(
+                            capture
+                                .index
+                                .by_name(name)?
+                                .iter()
+                                .map(move |decl| decl_hit(state, file, &capture.index, decl)),
+                        )
+                    })
+                    .flatten(),
+            );
+            rows.sort_by_key(|hit| (hit.file, hit.range.offset));
+            rows
+        })
+        .collect();
+    SymbolAnswer {
+        decls,
+        refs: Vec::new(),
+    }
+}
+
+/// The declaration row's answer projection — the row shape every by-name
+/// face serves (file, kind, resolved name and container, span).
+fn decl_hit<'a>(
+    state: &'a EngineState,
+    file: FileId,
+    index: &dartq_index::FileIndex,
+    row: &DeclRow,
+) -> DeclHit<'a> {
+    DeclHit {
+        file,
+        kind: row.kind,
+        name: state.strings.resolve(row.name),
+        container: (row.container != DeclRow::NONE)
+            .then(|| state.strings.resolve(index.row(row.container).name)),
+        range: row.range,
+    }
+}
+
 /// The reverse supertype adjacency over the whole analyzed workspace: one
 /// resolved edge per (subtype container, clause) target, grouped by
 /// supertype — the subtype walk's substrate (the surfaces index edges
@@ -431,11 +540,7 @@ fn is_member_kind(kind: DeclKind) -> bool {
 /// [`is_member_kind`] row of the name whose container anchor names
 /// `container` — the family membership predicate. A container whose file
 /// the resident captures do not hold answers false.
-fn declares_member(
-    state: &EngineState,
-    container: (FileId, StringId),
-    name: StringId,
-) -> bool {
+fn declares_member(state: &EngineState, container: (FileId, StringId), name: StringId) -> bool {
     let Some(capture) = state.capture(container.0) else {
         return false;
     };
@@ -1061,9 +1166,13 @@ pub(crate) fn resolve_at(
     // cross-package rename face's substrate). A phase disagreement (the
     // resolution outran the target's capture or its declaring rows)
     // answers `None` — not found, never a panic.
-    let target = state
-        .capture(row.target_file)
-        .or_else(|| state.deps.units.get(&row.target_file).map(|unit| &unit.capture))?;
+    let target = state.capture(row.target_file).or_else(|| {
+        state
+            .deps
+            .units
+            .get(&row.target_file)
+            .map(|unit| &unit.capture)
+    })?;
     let decl = target.index.by_name(row.target_name).and_then(|run| {
         if row.target_container == StringId::NONE {
             run.iter().find(|decl| decl.is_library_face())

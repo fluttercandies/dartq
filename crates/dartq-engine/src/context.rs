@@ -905,8 +905,13 @@ mod tests {
         );
 
         let (root, config, packages) = fixture("drain-epoch");
-        let engine = Engine::new(engine_config(&root, &config, &packages, crate::memory_store()))
-            .expect("engine");
+        let engine = Engine::new(engine_config(
+            &root,
+            &config,
+            &packages,
+            crate::memory_store(),
+        ))
+        .expect("engine");
         let live = vec![Some(Context {
             engine,
             key: ContextKey([0; 16]),
@@ -937,7 +942,10 @@ mod tests {
         runtime.close_context(id).expect("close");
 
         let report = runtime.drain();
-        assert!(report.tasks.is_empty(), "the closed context's queue is gone");
+        assert!(
+            report.tasks.is_empty(),
+            "the closed context's queue is gone"
+        );
         assert_eq!(
             report.stale_dropped, 0,
             "the purge is a clear, not a stale drop"

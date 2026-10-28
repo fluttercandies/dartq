@@ -86,6 +86,10 @@ pub(crate) struct MemoryBudget {
     limit_mib: u64,
     /// Descended-tier count — the index of the next tier to fire.
     fired: u8,
+    /// The last RSS reading a boundary poll held — the observability
+    /// face's sample ([`MemoryStatus::rss_bytes`]). A missing reading
+    /// never clobbers it: the ladder keeps the last data it had.
+    last_sample: Option<u64>,
 }
 
 impl MemoryBudget {
@@ -95,8 +99,67 @@ impl MemoryBudget {
             limit_bytes: limit_mib.saturating_mul(1024 * 1024),
             limit_mib,
             fired: 0,
+            last_sample: None,
         }
     }
+
+    /// Whether the ladder already descended a tier — the warm lane's
+    /// read-only pressure probe. A descended budget is shedding exactly
+    /// the recomputable caches warm work would fill, so the lane pauses
+    /// while this holds. Read-only: probing fires nothing and samples
+    /// nothing (unlike [`poll`], which descends a tier as its effect).
+    pub(crate) fn descended(&self) -> bool {
+        self.fired > 0
+    }
+
+    /// The armed limit, in MiB (the diagnostic rows' unit).
+    pub(crate) fn limit_mib(&self) -> u64 {
+        self.limit_mib
+    }
+
+    /// How many tiers the ladder has descended (sticky, capped at the
+    /// ladder's length).
+    pub(crate) fn tiers_fired(&self) -> u8 {
+        self.fired
+    }
+
+    /// The deepest tier that fired — `None` while the ladder stands at
+    /// tier 0. The machine key the status face carries is [`Tier::key`].
+    pub(crate) fn deepest_tier(&self) -> Option<Tier> {
+        self.fired
+            .checked_sub(1)
+            .map(|index| TIERS[usize::from(index)])
+    }
+
+    /// The last boundary-poll RSS sample — `None` before the first
+    /// boundary ran with a reading.
+    pub(crate) fn sample_bytes(&self) -> Option<u64> {
+        self.last_sample
+    }
+}
+
+/// One engine's memory posture — the product surface over the budget
+/// ladder's state ([`Engine::memory_status`](crate::Engine::memory_status),
+/// served by the daemon's `dartq/memory` face and the CLI's
+/// `--memory-report`). All fields are the ladder's own data: nothing
+/// here samples on read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryStatus {
+    /// The process's peak RSS at the last budget boundary poll
+    /// (`getrusage` `ru_maxrss` — the monotone peak the ladder acts on).
+    /// `None` when no budget is armed (the sampler never runs unbudgeted:
+    /// the zero-cost posture) or no boundary has been polled yet; between
+    /// turns it holds the last turn's final boundary reading.
+    pub rss_bytes: Option<u64>,
+    /// The armed budget limit in MiB — `None` when unarmed.
+    pub limit_mib: Option<u64>,
+    /// How many ladder tiers have descended (sticky; 0 is the no-pressure
+    /// posture).
+    pub degraded_tiers: u8,
+    /// The deepest descended tier's machine key — the
+    /// `dartq/memory_degraded` row's and the trace face's
+    /// `MemoryDegrade.tier` vocabulary — `None` at tier 0.
+    pub degraded_tier: Option<&'static str>,
 }
 
 /// The phase-boundary poll: descends at most one tier while over budget.
@@ -112,6 +175,10 @@ pub(crate) fn poll(budget: &mut Option<MemoryBudget>) -> Option<(Tier, u64)> {
 fn poll_with(budget: &mut Option<MemoryBudget>, rss: Option<u64>) -> Option<(Tier, u64)> {
     let budget = budget.as_mut()?;
     let rss = rss?;
+    // The sample is the status face's data before it is the ladder's
+    // trigger: every real reading lands, under the limit or not (a
+    // missing reading never clobbers the last one held).
+    budget.last_sample = Some(rss);
     if rss <= budget.limit_bytes || budget.fired >= TIERS.len() as u8 {
         return None;
     }
@@ -242,6 +309,61 @@ mod tests {
     fn no_budget_short_circuits_before_accounting() {
         let mut budget = None;
         assert!(poll_with(&mut budget, Some(u64::MAX)).is_none());
+    }
+
+    /// The status face's sample: every real boundary reading lands (under
+    /// the limit or not), and a missing reading never clobbers the last
+    /// one held — the ladder keeps the last data it had.
+    #[test]
+    fn poll_stores_the_last_boundary_sample() {
+        let mut budget = Some(armed(100));
+        assert!(poll_with(&mut budget, Some(64 * MIB)).is_none());
+        assert_eq!(
+            budget.as_ref().expect("armed").sample_bytes(),
+            Some(64 * MIB)
+        );
+        // An over-limit reading lands too (it both fires and records).
+        let mut budget = Some(armed(1));
+        assert_eq!(
+            poll_with(&mut budget, Some(2 * MIB)).map(|(tier, _)| tier),
+            Some(Tier::LazyParse)
+        );
+        assert_eq!(
+            budget.as_ref().expect("armed").sample_bytes(),
+            Some(2 * MIB)
+        );
+        // A missing reading sheds nothing and keeps the previous sample.
+        assert!(poll_with(&mut budget, None).is_none());
+        assert_eq!(
+            budget.as_ref().expect("armed").sample_bytes(),
+            Some(2 * MIB)
+        );
+    }
+
+    /// The posture getters over a descended ladder: the fired count, the
+    /// deepest fired tier, the limit, and the last sample read back
+    /// exactly as the polls laid them down.
+    #[test]
+    fn budget_getters_surface_the_posture() {
+        let mut budget = Some(armed(1));
+        let (first, second) = (
+            poll_with(&mut budget, Some(2 * MIB)),
+            poll_with(&mut budget, Some(3 * MIB)),
+        );
+        assert_eq!(first.map(|(tier, _)| tier), Some(Tier::LazyParse));
+        assert_eq!(second.map(|(tier, _)| tier), Some(Tier::SemanticSlices));
+        let budget = budget.as_ref().expect("armed");
+        assert_eq!(budget.limit_mib(), 1);
+        assert_eq!(budget.tiers_fired(), 2);
+        assert_eq!(budget.deepest_tier(), Some(Tier::SemanticSlices));
+        assert_eq!(budget.sample_bytes(), Some(3 * MIB));
+
+        // Tier 0: no tier key yet.
+        let mut fresh = Some(armed(8));
+        assert!(poll_with(&mut fresh, Some(MIB)).is_none());
+        let fresh = fresh.as_ref().expect("armed");
+        assert_eq!(fresh.tiers_fired(), 0);
+        assert_eq!(fresh.deepest_tier(), None);
     }
 
     /// The emitted row carries the registered `dartq/memory_degraded` code,

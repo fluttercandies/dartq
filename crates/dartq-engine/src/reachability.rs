@@ -244,8 +244,23 @@ impl fmt::Debug for UnitProduct {
 /// row scan. The one exception is the standing-bits fast path below: when
 /// every unit's product stood (by identity key or by re-derived bytes) the
 /// previous graph IS this graph and the previous map returns untouched.
+///
+/// `cancel` rides the engine's bounded-window discipline: phase A polls
+/// at member cadence, phase B at job (library) cadence — the analyze
+/// fan-out's own granularity — and phase C's worklist on a
+/// [`Checkpoint`] stride. `Err(Cancelled)` publishes nothing: the memo
+/// keeps its standing map (or absence) and the next build retries the
+/// same product, exactly the pipeline's cancelled-library posture. The
+/// lazy read face passes a never-fired token; the warm lane's token is
+/// the live one.
 #[expect(clippy::too_many_lines)] // the three build phases: salvage decision, parallel derive, global propagation
-pub(crate) fn build(state: &EngineState, salvage: Option<Arc<Reachability>>) -> Arc<Reachability> {
+pub(crate) fn build(
+    state: &EngineState,
+    salvage: Option<Arc<Reachability>>,
+    cancel: &crate::cancel::CancellationToken,
+) -> Result<Arc<Reachability>, crate::Cancelled> {
+    use crate::cancel::Checkpoint;
+
     let strings = &state.strings;
     let main = strings.intern("main");
     let pragma = strings.intern("pragma");
@@ -260,8 +275,10 @@ pub(crate) fn build(state: &EngineState, salvage: Option<Arc<Reachability>>) -> 
     let mut products: FxHashMap<FileId, UnitProduct> = FxHashMap::default();
     let mut dirty_by_owner: FxHashMap<LibraryId, Vec<FileId>> = FxHashMap::default();
     let mut misses: Vec<(FileId, &'static str)> = Vec::new();
+    let mut checkpoint = Checkpoint::new(cancel);
     for (library, info) in state.libraries.iter_infos() {
         for file in member_files(info) {
+            checkpoint.tick()?;
             // Members are resident and captured after an analyze — the same
             // contract `library_surface` builds on. The probe is also the
             // coherence precondition: the memo only builds post-drain. A
@@ -311,10 +328,17 @@ pub(crate) fn build(state: &EngineState, salvage: Option<Arc<Reachability>>) -> 
     // library: a use file's reference rows live only in its owner's surface
     // (a surface is built from its own members' captures), so the job scans
     // exactly the standing surfaces the moved units belong to and touches
-    // no other.
+    // no other. The cancel check rides at job head — the analyze fan-out's
+    // own per-library granularity: a flip mid-phase voids the remaining
+    // jobs, in-flight ones finish, and the phase's whole product drops.
+    let phase_b_cancelled = std::sync::atomic::AtomicBool::new(false);
     let derived: Vec<Vec<(FileId, Result<UnitProduct, &'static str>)>> = dirty_by_owner
         .into_par_iter()
         .map(|(library, files)| {
+            if cancel.check().is_err() {
+                phase_b_cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Vec::new();
+            }
             let surface_rows: &[RefRow] = state.surface(library).map_or(&[], LibraryIndex::refs);
             let mut buckets: FxHashMap<FileId, Vec<&RefRow>> =
                 files.iter().map(|&file| (file, Vec::new())).collect();
@@ -369,6 +393,9 @@ pub(crate) fn build(state: &EngineState, salvage: Option<Arc<Reachability>>) -> 
                 .collect()
         })
         .collect();
+    if phase_b_cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crate::Cancelled);
+    }
     // Whether every re-derived payload came out byte-equal (a capture moved
     // under it — comment churn — without moving a seed or an edge). A unit
     // whose derive skipped on a pairing miss drops from the unit set here —
@@ -405,7 +432,7 @@ pub(crate) fn build(state: &EngineState, salvage: Option<Arc<Reachability>>) -> 
         let same_units = prev.units.len() == order.len()
             && order.iter().all(|file| prev.units.contains_key(file));
         if same_units && (all_stood || payload_stood) {
-            return salvage.expect("checked fresh above");
+            return Ok(salvage.expect("checked fresh above"));
         }
     }
 
@@ -464,6 +491,7 @@ pub(crate) fn build(state: &EngineState, salvage: Option<Arc<Reachability>>) -> 
         cursor[from as usize] += 1;
     }
     while let Some(node) = stack.pop() {
+        checkpoint.tick()?;
         for &to in &adjacency[offsets[node as usize] as usize..offsets[node as usize + 1] as usize]
         {
             let (unit_index, row) = locate(&bases, to);
@@ -475,10 +503,10 @@ pub(crate) fn build(state: &EngineState, salvage: Option<Arc<Reachability>>) -> 
         }
     }
 
-    Arc::new(Reachability {
+    Ok(Arc::new(Reachability {
         reachable: order.into_iter().zip(bits).collect(),
         units: products,
-    })
+    }))
 }
 
 /// Derives one unit's product: the entry seeds and the propagation edges of
@@ -616,11 +644,7 @@ fn derive_unit(
         }
         for source in sources.into_iter().flatten() {
             for target_row in first..first + run {
-                edges.push((
-                    source,
-                    row.target_file,
-                    saturate_slot_u32(target_row),
-                ));
+                edges.push((source, row.target_file, saturate_slot_u32(target_row)));
             }
         }
         // A member-targeted reference also marks the enclosing
@@ -1122,7 +1146,8 @@ mod tests {
     /// state (the pre-salvage eager build, [`build`] without salvage).
     fn assert_matches_wholesale(engine: &Engine) {
         let map = engine.reachability().expect("the map builds at read");
-        let whole = crate::reachability::build(&engine.state, None);
+        let whole = crate::reachability::build(&engine.state, None, &CancellationToken::new())
+            .expect("the wholesale build is not cancelled");
         for (_library, members) in engine.libraries() {
             for file in members {
                 let capture = engine.file_capture(file).expect("analyzed member");
@@ -1155,7 +1180,8 @@ mod tests {
         // The pairing break: the capture vanishes post-analyze.
         let mut engine = engine;
         engine.state.clear_capture(a);
-        let map = crate::reachability::build(&engine.state, None);
+        let map = crate::reachability::build(&engine.state, None, &CancellationToken::new())
+            .expect("the build is not cancelled");
         assert_eq!(
             map.is_reachable(a, 0),
             None,
@@ -1167,7 +1193,7 @@ mod tests {
             "one degrade row for the (file, face) pair"
         );
         // The dedup bounds the bookkeeping: the same miss derives no row.
-        let _ = crate::reachability::build(&engine.state, None);
+        let _ = crate::reachability::build(&engine.state, None, &CancellationToken::new());
         assert!(
             engine.state.residency_degrades.take().is_empty(),
             "already-reported pairs no-op"

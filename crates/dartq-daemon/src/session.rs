@@ -1401,9 +1401,7 @@ impl Session {
         let config_stamps = config_input_stamps(&workspace_root);
         // The universe's own stamp (#2675): the package config the
         // assembled resolution was read from, as it sits right now.
-        let package_stamp = commands::PackageStamp::read(
-            config_dir.join("package_config.json"),
-        );
+        let package_stamp = commands::PackageStamp::read(config_dir.join("package_config.json"));
         // #2619: the debug registry's live counter, shared with the
         // manager wherever it lives (here or on the debug worker).
         let debug_live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1662,18 +1660,17 @@ impl Session {
     /// A failure at any step keeps the assembled universe (logged) —
     /// never a failed turn.
     fn rebuild_universe(&mut self, mut config: EngineConfig) {
-        let stamp = commands::PackageStamp::read(
-            config.config_dir.join("package_config.json"),
-        );
+        let stamp = commands::PackageStamp::read(config.config_dir.join("package_config.json"));
         let pub_config = Arc::clone(&config.pub_config);
         let config_dir = config.config_dir.clone();
         if let Some(pool) = &self.mapped_pool {
             config.store = dartq_engine::pooled_mmap_store(pool);
         }
         let old = self.default_context;
-        let opened = self
-            .runtime
-            .open_context(dartq_engine::ContextConfig { engine: config, flags: 0 });
+        let opened = self.runtime.open_context(dartq_engine::ContextConfig {
+            engine: config,
+            flags: 0,
+        });
         let fresh = match opened {
             Ok(fresh) => fresh,
             Err(error) => {
@@ -1691,7 +1688,10 @@ impl Session {
             if let Some(limit) = self.context_content_store_limit
                 && let Some(root) = dartq_engine::store::default_root()
             {
-                let store_config = dartq_engine::store::StoreConfig { root, size_limit: limit };
+                let store_config = dartq_engine::store::StoreConfig {
+                    root,
+                    size_limit: limit,
+                };
                 if let Err(error) = engine.open_content_store(&store_config) {
                     eprintln!("dartq-daemon: content store disabled: {error}");
                 }
@@ -1703,9 +1703,7 @@ impl Session {
                 }
             }
             if self.context_traced {
-                eprintln!(
-                    "dartq-daemon: the trace sink does not carry across a universe rebuild"
-                );
+                eprintln!("dartq-daemon: the trace sink does not carry across a universe rebuild");
             }
             // The fresh context discovers its workspace here — ahead of
             // this turn's write apply and read analysis, the same order
@@ -4190,11 +4188,9 @@ impl Session {
         // `&mut self`, so the token travels by `Arc` — one refcount bump
         // per analysis, nothing on the checkpoint path.
         let quit = self.quit.clone();
-        let analyzed = self.engine_mut(context).analyze(
-            &[],
-            &mut rejection_collector(&mut rejections),
-            &quit,
-        );
+        let analyzed =
+            self.engine_mut(context)
+                .analyze(&[], &mut rejection_collector(&mut rejections), &quit);
         self.note_rejections(rejections);
         analyzed
     }
@@ -4718,12 +4714,17 @@ mod tests {
         // After: the same session's next answer reflects the new universe —
         // clean, with the stamp naming the config bytes on disk now.
         let after = pull(&mut session, 2);
-        let stdout = after["stdout"].as_str().expect("the routed face renders stdout");
+        let stdout = after["stdout"]
+            .as_str()
+            .expect("the routed face renders stdout");
         assert!(
             !stdout.contains("uri_does_not_exist") && !stdout.contains("undefined_function"),
             "the once-dangling import now resolves (no stale universe): {after}"
         );
-        assert!(stdout.contains("diags:[]"), "the tree answers clean: {after}");
+        assert!(
+            stdout.contains("diags:[]"),
+            "the tree answers clean: {after}"
+        );
         let packages = after.get("packages").expect("the stamp rides the answer");
         assert_eq!(
             packages["path"].as_str().expect("the config path"),
@@ -4870,9 +4871,8 @@ mod tests {
         assert!(!rows.is_empty(), "the pull is not empty");
         assert_eq!(rows[0]["file"], "lib/main.dart", "the located spelling");
         assert!(
-            rows.iter()
-                .all(|row| row["file"] != config_uri.as_str()
-                    && row["code"] != "dartq/package_config_out_of_date"),
+            rows.iter().all(|row| row["file"] != config_uri.as_str()
+                && row["code"] != "dartq/package_config_out_of_date"),
             "the advisory never rides the machine pull: {answer}"
         );
         assert!(
@@ -4904,8 +4904,7 @@ mod tests {
             .expect("the post-edit pull answers");
         let rows = answer["diags"].as_array().expect("diagnostics rows");
         assert!(
-            rows.iter()
-                .all(|row| row["file"] != config_uri.as_str()),
+            rows.iter().all(|row| row["file"] != config_uri.as_str()),
             "the advisory stays off the pull after a source-only edit: {answer}"
         );
         assert!(
@@ -9955,14 +9954,12 @@ mod tests {
             .expect("diagnostics array");
         assert_eq!(entries.len(), 2, "the warning plus the error: {entries:?}");
         assert_eq!(
-            entries[0]["file"],
-            "lib/b.dart",
+            entries[0]["file"], "lib/b.dart",
             "the error sorts first despite b.dart sorting second (the CLI's severity-first order, the located spelling): {entries:?}"
         );
         assert_eq!(entries[0]["sev"], "error", "error first");
         assert_eq!(
-            entries[1]["file"],
-            "lib/a.dart",
+            entries[1]["file"], "lib/a.dart",
             "the warning follows: {entries:?}"
         );
         assert_eq!(entries[1]["sev"], "warning", "warning second");
@@ -10184,12 +10181,8 @@ mod tests {
         // lint stage's reads, which poll no checkpoint.)
         let (workspace, config) = part_library(PARTS);
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (mut session, gets) = flip_session(
-            "quit-cancel-flipped",
-            config,
-            flag.clone(),
-            Some(4),
-        );
+        let (mut session, gets) =
+            flip_session("quit-cancel-flipped", config, flag.clone(), Some(4));
         session.sweep().expect("sweep");
         let _ = session.service();
         gets.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -10237,5 +10230,60 @@ mod tests {
         session.shutdown_plugins();
         session.cancel_analysis();
         assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    /// The `dartq/memory` posture face end to end: the session's context
+    /// arms the standing budget, the read pass polls the ladder at its
+    /// boundaries, and the answer carries the posture — the armed limit,
+    /// the no-pressure tier state, a real boundary sample (unix), and the
+    /// warm counters — over the short-vocabulary object.
+    #[test]
+    fn the_memory_face_answers_the_armed_budget_posture() {
+        let (_workspace, mut session) =
+            fixture_with("memory-posture", "void main() => print('hi');\n");
+        session.sweep().expect("sweep");
+        let _ = session.service();
+        session.queue_command(
+            RequestId::Num(1),
+            Request::Memory {
+                verbosity: Verbosity::Compact,
+                agent: None,
+                context: None,
+            },
+        );
+        let turn = session.service();
+        let answer = turn.answers[0]
+            .1
+            .as_ref()
+            .expect("the posture face answers")
+            .clone();
+        assert_eq!(
+            answer["limit_mib"].as_u64(),
+            Some(DEFAULT_MEMORY_LIMIT_MIB),
+            "the context's standing budget: {answer}"
+        );
+        assert_eq!(
+            answer["degraded_tiers"].as_u64(),
+            Some(0),
+            "no pressure under the 2 GiB standing budget: {answer}"
+        );
+        assert!(
+            answer["tier"].is_null(),
+            "tier 0 carries no tier key: {answer}"
+        );
+        #[cfg(unix)]
+        assert!(
+            answer["rss"].as_u64().is_some(),
+            "the read pass's boundary polls left a sample: {answer}"
+        );
+        assert!(
+            answer["warm_done"].as_u64().is_some() && answer["warm_skipped"].as_u64().is_some(),
+            "the warm counters ride beside the ladder state: {answer}"
+        );
+        assert_eq!(
+            answer["v"].as_u64(),
+            Some(u64::from(dartq_commands::SCHEMA_VERSION)),
+            "the short-vocabulary stamp: {answer}"
+        );
     }
 }

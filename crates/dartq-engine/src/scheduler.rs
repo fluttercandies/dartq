@@ -25,7 +25,9 @@ use crate::context::ContextId;
 pub enum Tier {
     /// Indexing, prewarming, snapshot triggers — must not delay waiting
     /// clients. Starvation protection is the caller's quota policy (the
-    /// daemon currently has no background producers).
+    /// daemon's warm lane runs bounded chunks at this tier, so a queued
+    /// warm task never outranks a waiting read and re-queues rather than
+    /// monopolizing a drain).
     Background,
     /// Overlay application and file-watch re-analyses: work that must happen
     /// soon but has no request blocked on it.

@@ -46,7 +46,6 @@ pub mod cancel;
 pub mod context;
 mod cycle;
 mod deps;
-mod sdk_units;
 pub mod event;
 pub mod l1;
 pub mod pipeline;
@@ -55,9 +54,11 @@ pub mod reachability;
 pub mod scheduler;
 pub mod sdk_extension_faces;
 pub mod sdk_faces_gen;
+mod sdk_units;
 pub mod semdiag;
 pub mod state;
 pub mod store;
+mod warm;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError};
@@ -93,6 +94,9 @@ pub use reachability::Reachability;
 pub use scheduler::{DrainReport, Task, Tier};
 pub use state::persist::PersistedFacts;
 pub use state::{DirectiveFacts, DirectiveKind, FeatureGrants, LibraryId, ScannedFace, UnitFacts};
+pub use warm::{WarmStats, WarmStep};
+
+pub use budget::MemoryStatus;
 
 /// The default SDK target segment (`libraries.json` panel) `dart:` URI
 /// resolution dispatches against — the `dart analyze` posture. Every
@@ -204,6 +208,15 @@ pub struct Engine {
     /// [`Engine::capture_pubspecs`]: a pubspec is re-read only when its
     /// mtime moved since the last capture.
     pubspec_mtimes: FxHashMap<PathBuf, SystemTime>,
+    /// The captured Android manifests' mtimes at capture time — the read
+    /// guard for the `<pkg>/android/AndroidManifest.xml` mount
+    /// [`Engine::capture_pubspec_at`] runs beside each pubspec (the
+    /// oracle's driver walks every `AndroidManifest.xml` under the
+    /// analysis roots the same way it walks pubspecs —
+    /// `analyzer_cli/lib/src/driver.dart` :346, `_collectFiles`
+    /// :427-448). The pass emits only when the governing options enable
+    /// `analyzer.optional-checks.chrome-os-manifest-checks`.
+    manifest_mtimes: FxHashMap<PathBuf, SystemTime>,
     /// The discovery loads' disk stamps (mtime, size) by normalized path —
     /// the read guard for [`Engine::refresh_workspace`] (#2596): a source
     /// is re-read only when its stamp moved since the last load. Seeded by
@@ -266,6 +279,7 @@ impl Engine {
             semdiag,
             context_root: config.config_dir,
             pubspec_mtimes: FxHashMap::default(),
+            manifest_mtimes: FxHashMap::default(),
             source_stamps: FxHashMap::default(),
             pubspec_dirs_scanned: FxHashMap::default(),
             nested_scan_epoch: 0,
@@ -511,6 +525,11 @@ impl Engine {
         .as_ref()
         .clone();
         self.capture_nested_pubspecs();
+        // The settle's arming point (#2739): a completed analyze arms the
+        // `Tier::Background` warm lane — O(1), the plan's items
+        // materialize at the first `warm_step`. A cancelled run skipped
+        // the `?` above, so a partial settle arms nothing.
+        self.state.arm_warm();
         let rows = self.option_issue_rows();
         if !rows.is_empty() {
             // The engine rows leave the pipeline canonically sorted; the
@@ -553,6 +572,8 @@ impl Engine {
             cancel,
         )?;
         self.capture_nested_pubspecs();
+        // The settle's arming point (#2739), as in [`Self::analyze`].
+        self.state.arm_warm();
         let rows = self.option_issue_rows();
         if rows.is_empty() && !self.severity_overrides_present() {
             return Ok(shared);
@@ -671,12 +692,23 @@ impl Engine {
         for start in to_scan {
             // The containing package root cuts the walk: everything below
             // it is the boundary search's reach, everything above is the
-            // workspace's (the root's own pubspec is already mounted).
+            // workspace's (the root's own pubspec is already mounted). A
+            // bare-floor workspace (`PackageTable::basic` with no self
+            // package — the oracle's `BasicWorkspace` over an analyzed
+            // directory) attributes no directory to a package, so the walk
+            // bound is the analyzed directory itself: the oracle still
+            // lints every `pubspec.yaml` under it (the CLI driver walks
+            // the whole context root, `analyzer_cli/lib/src/driver.dart`
+            // `_collectFiles` :427-448).
             let Some(bound) = self
                 .state
                 .packages
                 .containing(&start)
                 .map(|identity| identity.root.clone())
+                .or_else(|| {
+                    let root = self.state.packages.workspace_root();
+                    start.starts_with(root).then(|| root.to_path_buf())
+                })
             else {
                 continue;
             };
@@ -711,24 +743,36 @@ impl Engine {
 
     /// The mtime-guarded mount of one directory's `pubspec.yaml` into the
     /// reported set — the body both captures share (the doc on
-    /// [`Self::capture_pubspecs`] carries the contract).
+    /// [`Self::capture_pubspecs`] carries the contract). The sibling
+    /// `android/AndroidManifest.xml` mounts through the same guard (the
+    /// oracle analyzes it wherever it sits under an analysis root —
+    /// `analyzer_cli/lib/src/driver.dart` :346-370); the lint face reads
+    /// it back through [`Self::captured_manifests`].
     fn capture_pubspec_at(&mut self, dir: &Path) {
         let path = dir.join("pubspec.yaml");
-        let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified()) else {
-            return;
-        };
-        if self.pubspec_mtimes.get(&path) == Some(&modified) {
-            return;
+        if let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified())
+            && self.pubspec_mtimes.get(&path) != Some(&modified)
+            && let Ok(text) = std::fs::read_to_string(&path)
+        {
+            self.pubspec_mtimes.insert(path.clone(), modified);
+            let file = self.state.files.intern(&path);
+            let index = dartq_source::LineIndex::new(&text);
+            self.state
+                .reported
+                .insert(file, (Arc::from(text.as_str()), index));
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        self.pubspec_mtimes.insert(path.clone(), modified);
-        let file = self.state.files.intern(&path);
-        let index = dartq_source::LineIndex::new(&text);
-        self.state
-            .reported
-            .insert(file, (Arc::from(text.as_str()), index));
+        let manifest = dir.join("android").join("AndroidManifest.xml");
+        if let Ok(modified) = std::fs::metadata(&manifest).and_then(|meta| meta.modified())
+            && self.manifest_mtimes.get(&manifest) != Some(&modified)
+            && let Ok(text) = std::fs::read_to_string(&manifest)
+        {
+            self.manifest_mtimes.insert(manifest.clone(), modified);
+            let file = self.state.files.intern(&manifest);
+            let index = dartq_source::LineIndex::new(&text);
+            self.state
+                .reported
+                .insert(file, (Arc::from(text.as_str()), index));
+        }
     }
 
     /// Every `pubspec.yaml` the captures mounted — the root package's,
@@ -740,6 +784,18 @@ impl Engine {
     #[must_use]
     pub fn captured_pubspecs(&self) -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = self.pubspec_mtimes.keys().cloned().collect();
+        paths.sort();
+        paths
+    }
+
+    /// Every `AndroidManifest.xml` the captures mounted — the package
+    /// roots', members', and nested boundaries' `android/` siblings — in
+    /// sorted order. The manifest lint face's enumeration; emission stays
+    /// gated on the governing options' `chrome-os-manifest-checks` (the
+    /// face's judgment, not this one's).
+    #[must_use]
+    pub fn captured_manifests(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self.manifest_mtimes.keys().cloned().collect();
         paths.sort();
         paths
     }
@@ -879,6 +935,24 @@ impl Engine {
     #[must_use]
     pub fn query_symbols(&self, name: &str) -> SymbolAnswer<'_> {
         query::symbols(&self.state, name)
+    }
+
+    /// The fuzzy discovery face: the workspace's declarations whose names
+    /// fuzzy-match `query`, best-first (the dartq-index `fuzzy` module's
+    /// ranking spec — exact prefix, then word-boundary camelCase, then
+    /// contiguous substring, then sparse subsequence; ties by name length,
+    /// then name bytes), capped at that module's result cap. References
+    /// are not joined: discovery names symbols, the exact faces resolve
+    /// their uses.
+    ///
+    /// Read-after-write contract: [`Self::query_symbols`]'s, verbatim — a
+    /// pure read of the latest analyze's state that interns nothing (the
+    /// exact lookup's one side effect does not exist here; the query folds
+    /// to a scratch buffer). Querying before the first analyze answers an
+    /// empty set.
+    #[must_use]
+    pub fn query_symbols_fuzzy(&self, query: &str) -> SymbolAnswer<'_> {
+        query::symbols_fuzzy(&self.state, query)
     }
 
     /// The `query callers` face: every declaration whose body invokes
@@ -1483,10 +1557,69 @@ impl Engine {
         }
         if memo.stale || memo.map.is_none() {
             let prev = memo.map.take();
-            memo.map = Some(crate::reachability::build(&self.state, prev));
-            memo.stale = false;
+            // The lazy read's token never fires — the read's contract is
+            // to answer, not to yield; the warm lane's token is the live
+            // one the caller's cancel source flips.
+            let token = CancellationToken::new();
+            match crate::reachability::build(&self.state, prev, &token) {
+                Ok(map) => {
+                    memo.map = Some(map);
+                    memo.stale = false;
+                }
+                // Unreachable under a fresh token; the memo keeps its
+                // stale flag and standing map — the read serves what it
+                // had rather than failing.
+                Err(Cancelled) => {}
+            }
         }
         memo.map.clone()
+    }
+
+    /// Whether the `Tier::Background` warm lane is armed — the O(1)
+    /// readiness probe the scheduler-side caller checks before queueing a
+    /// warm task. An analyze's settle arms the lane (see
+    /// [`Engine::warm_step`]); the flag is optimistic in that a settle
+    /// with nothing to warm still arms, and the first step disarms it.
+    #[must_use]
+    pub fn warm_pending(&self) -> bool {
+        self.state.warm_pending()
+    }
+
+    /// One bounded warm chunk — the `Tier::Background` producer
+    /// (rust-analyzer's `parallel_prime_caches` posture, [`warm`] module
+    /// docs for the targets and mechanics). Runs the plan's next slice:
+    /// the reachability build if the memo needs one, else up to
+    /// `WARM_STEP_FILES` scanned-face fills. `cancel` is the same
+    /// cooperative token the analyze checkpoints ride — a flip stops the
+    /// step mid-plan with the remainder still armed.
+    ///
+    /// Output-neutral by construction: every item the lane fills is a
+    /// pure function of the settled state — the same `Arc` a lazy read or
+    /// a cache-miss fallback would produce — so warming can only move
+    /// work off the critical path, never change an answer.
+    pub fn warm_step(&mut self, cancel: &CancellationToken) -> WarmStep {
+        self.state.warm_step(cancel)
+    }
+
+    /// The cumulative warm counters: items produced (a cached scanned
+    /// face, the reachability map) and items visited without work (left
+    /// residency, already warm, budget-paused) — the observability face
+    /// beside [`Engine::sites_occupancy`] and the memory-report counters.
+    #[must_use]
+    pub fn warm_stats(&self) -> WarmStats {
+        self.state.warm_stats()
+    }
+
+    /// The memory posture over the armed budget ladder: the limit, how far
+    /// it descended, the deepest tier's machine key, and the ladder's last
+    /// phase-boundary RSS sample — the data `dartq/memory` (daemon) and
+    /// `--memory-report` (CLI) surface. Read-only: nothing here samples;
+    /// the readings are the boundary polls'. An unbudgeted engine answers
+    /// the default — the sampler never runs, so the face reports nothing
+    /// armed, nothing sampled, nothing degraded.
+    #[must_use]
+    pub fn memory_status(&self) -> MemoryStatus {
+        self.state.memory_status()
     }
 
     /// The engine's intern table — the one table every resident fact's
@@ -1876,6 +2009,14 @@ pub struct LibraryView<'a> {
     /// bounded, deduped row per (file, face) pair). Crate-internal, same
     /// discipline as [`LibraryView::memo`].
     pub(crate) degrades: &'a crate::state::ResidencyDegrades,
+    /// The analyze's cancellation token: the fold's member loop polls it
+    /// on a [`crate::cancel::Checkpoint`] cadence so a flip mid-library
+    /// stops the fold instead of waiting out the whole recompute. The
+    /// caller treats a fired token as the run's early exit, so a
+    /// diagnoser that returns early on it never publishes a partial
+    /// product. Crate-internal, same discipline as
+    /// [`LibraryView::memo`].
+    pub(crate) cancel: &'a CancellationToken,
 }
 
 /// The semantic diagnostics plug point (#120/#121).
@@ -2050,7 +2191,8 @@ mod tests {
         std::fs::create_dir_all(root.join("lib")).expect("lib dir");
         std::fs::write(root.join("lib/main.dart"), "int main() => 1;\n").expect("seed");
         engine.discover_workspace().expect("discover");
-        let report = engine.analyze(&[], &mut |_| {}, &CancellationToken::default())
+        let report = engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
             .expect("analyze");
         assert!(report.is_empty(), "the seeded tree is clean");
 
@@ -2064,7 +2206,8 @@ mod tests {
         let moved = engine.refresh_workspace(usize::MAX).expect("refresh");
         assert_eq!(moved.reloaded, 1, "only the edited file re-read");
         assert_eq!(moved.removed, 0);
-        let report = engine.analyze(&[], &mut |_| {}, &CancellationToken::default())
+        let report = engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
             .expect("analyze");
         assert!(
             report.iter().any(|row| row.code.name == "expected_token"),
@@ -2081,7 +2224,8 @@ mod tests {
         let reverted = engine.refresh_workspace(usize::MAX).expect("refresh");
         assert_eq!(reverted.removed, 1, "the vanished file removes");
         assert_eq!(reverted.reloaded, 1, "the reverted file re-reads");
-        let report = engine.analyze(&[], &mut |_| {}, &CancellationToken::default())
+        let report = engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
             .expect("analyze");
         assert!(
             report.is_empty(),
@@ -2200,10 +2344,7 @@ mod tests {
         assert_eq!(stats.file_count, 2, "a.dart and sub/b.dart accepted");
         for name in ["a.dart", "sub/b.dart"] {
             assert!(
-                engine
-                    .file_table()
-                    .try_file_id(&root.join(name))
-                    .is_some(),
+                engine.file_table().try_file_id(&root.join(name)).is_some(),
                 "{name} discovered"
             );
         }
@@ -2217,10 +2358,7 @@ mod tests {
         engine.discover_workspace().expect("walk");
         for name in [".dot.dart", ".hidden/c.dart"] {
             assert!(
-                engine
-                    .file_table()
-                    .try_file_id(&root.join(name))
-                    .is_none(),
+                engine.file_table().try_file_id(&root.join(name)).is_none(),
                 "{name} excluded"
             );
         }
@@ -2343,8 +2481,11 @@ mod tests {
     fn memory_report_counts_the_admitted_workspace() {
         let (root, mut engine) = facade_engine();
         std::fs::create_dir_all(root.join("lib")).expect("lib dir");
-        std::fs::write(root.join("lib/a.dart"), "import 'b.dart';\nvoid a() { b(); }\n")
-            .expect("a");
+        std::fs::write(
+            root.join("lib/a.dart"),
+            "import 'b.dart';\nvoid a() { b(); }\n",
+        )
+        .expect("a");
         std::fs::write(root.join("lib/b.dart"), "void b() {}\n").expect("b");
         let stats = engine.discover_workspace().expect("discover");
         assert!(stats.file_count >= 2);
@@ -2353,7 +2494,10 @@ mod tests {
             .expect("analyze");
         let report = engine.memory_report();
         let row = |family: &str| {
-            let rows: Vec<_> = report.iter().filter(|(name, _, _)| *name == family).collect();
+            let rows: Vec<_> = report
+                .iter()
+                .filter(|(name, _, _)| *name == family)
+                .collect();
             assert_eq!(rows.len(), 1, "{family} reported once");
             rows[0].1
         };
@@ -2361,8 +2505,14 @@ mod tests {
         assert!(row("residency_files") >= 2);
         assert_eq!(row("store_bytes"), engine.stored_bytes());
         assert!(row("residency_line_index") > 0);
-        assert!(row("index_captures") > 0, "every resident file carries a capture");
-        assert!(row("index_library_surfaces") > 0, "the analyze built surfaces");
+        assert!(
+            row("index_captures") > 0,
+            "every resident file carries a capture"
+        );
+        assert!(
+            row("index_library_surfaces") > 0,
+            "the analyze built surfaces"
+        );
         assert_eq!(
             row("index_postings"),
             engine.postings_bytes(),
@@ -2375,13 +2525,56 @@ mod tests {
         );
     }
 
+    /// The memory-status face over an armed budget: the limit reads back,
+    /// a real run's boundary polls leave a sample (unix), and a
+    /// no-pressure run stays at tier 0 with no tier key. The unbudgeted
+    /// engine answers the default — nothing armed, nothing sampled,
+    /// nothing degraded.
+    #[test]
+    fn memory_status_reports_the_armed_budget() {
+        let (root, mut engine) = facade_engine();
+        std::fs::create_dir_all(root.join("lib")).expect("lib dir");
+        std::fs::write(root.join("lib/a.dart"), "void a() {}\n").expect("a");
+        // 1 TiB: armed, but no realistic test RSS crosses it — the
+        // posture stays at tier 0 deterministically.
+        engine.set_memory_limit(Some(1024 * 1024));
+        engine.discover_workspace().expect("discover");
+        engine
+            .analyze(&[], &mut |_| {}, &CancellationToken::default())
+            .expect("analyze");
+        let status = engine.memory_status();
+        assert_eq!(status.limit_mib, Some(1024 * 1024));
+        assert_eq!(
+            status.degraded_tiers, 0,
+            "no pressure under the 1 TiB limit"
+        );
+        assert_eq!(status.degraded_tier, None);
+        #[cfg(unix)]
+        assert!(
+            status.rss_bytes.is_some(),
+            "a polled boundary left a sample"
+        );
+
+        let (_, engine) = facade_engine();
+        assert_eq!(
+            engine.memory_status(),
+            MemoryStatus::default(),
+            "unbudgeted: the sampler never ran"
+        );
+    }
+
     /// Discovery over several package roots enqueues exactly the per-root
     /// sorted order concatenated in sorted root order — the order the
     /// serial per-root loop produced before the roots fanned out.
     #[test]
     fn discovery_enqueues_roots_in_sorted_order() {
         let (root, mut engine) = facade_engine();
-        for relative in ["lib/z.dart", "lib/a.dart", "test/m_test.dart", "tool/t.dart"] {
+        for relative in [
+            "lib/z.dart",
+            "lib/a.dart",
+            "test/m_test.dart",
+            "tool/t.dart",
+        ] {
             let path = root.join(relative);
             std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
             std::fs::write(&path, "void f() {}\n").expect("file");
@@ -2396,7 +2589,10 @@ mod tests {
             .collect();
         let mut sorted = order.clone();
         sorted.sort();
-        assert_eq!(order, sorted, "one root: the enqueue order is the sorted walk");
+        assert_eq!(
+            order, sorted,
+            "one root: the enqueue order is the sorted walk"
+        );
         assert_eq!(order.len(), 4);
     }
 
@@ -2864,7 +3060,11 @@ mod tests {
             "pubspec.yaml",
             "name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n",
         );
-        write(&root, "pubspec.lock", "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n");
+        write(
+            &root,
+            "pubspec.lock",
+            "packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n",
+        );
         write(
             &root,
             ".dart_tool/package_config.json",
@@ -2901,15 +3101,16 @@ mod tests {
         let root = root.canonicalize().expect("workspace root resolves");
         let external = external.canonicalize().expect("external root resolves");
         let config_dir = root.join(".dart_tool");
-        let config = Arc::new(PackageConfig::parse(
-            &std::fs::read_to_string(config_dir.join("package_config.json")).expect("config"),
-        )
-        .expect("valid config"));
+        let config = Arc::new(
+            PackageConfig::parse(
+                &std::fs::read_to_string(config_dir.join("package_config.json")).expect("config"),
+            )
+            .expect("valid config"),
+        );
         let lock = LockFile::parse("packages: {}\nsdks:\n  dart: \">=3.5.0 <4.0.0\"\n")
             .expect("valid lock");
-        let root_pubspec =
-            Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
-                .expect("valid pubspec");
+        let root_pubspec = Pubspec::parse("name: t\nversion: 0.1.0\nenvironment:\n  sdk: ^3.5.0\n")
+            .expect("valid pubspec");
         let graph = build_graph(
             &config,
             &lock,
@@ -2950,7 +3151,10 @@ mod tests {
             "a.dart and pkg/nested/lib/n.dart — nothing under the external tree"
         );
         assert!(
-            engine.file_table().try_file_id(&root.join("lib/a.dart")).is_some()
+            engine
+                .file_table()
+                .try_file_id(&root.join("lib/a.dart"))
+                .is_some()
                 && engine
                     .file_table()
                     .try_file_id(&root.join("pkg/nested/lib/n.dart"))
@@ -2959,7 +3163,10 @@ mod tests {
         );
         for path in ["lib/e.dart", "test/never_analyzed.dart"] {
             assert!(
-                engine.file_table().try_file_id(&external.join(path)).is_none(),
+                engine
+                    .file_table()
+                    .try_file_id(&external.join(path))
+                    .is_none(),
                 "the out-of-tree dependency's {path} must not be discovered"
             );
         }
@@ -2979,7 +3186,11 @@ mod tests {
         let entry = external.join("lib/e.dart");
         assert!(
             engine.state.deps.units.contains_key(
-                &engine.state.files.try_file_id(&entry).expect("interned by the dep load")
+                &engine
+                    .state
+                    .files
+                    .try_file_id(&entry)
+                    .expect("interned by the dep load")
             ),
             "the imported dep file loads through the lazy interface index"
         );
@@ -2993,16 +3204,14 @@ mod tests {
             }),
             "dependency files stay row-silent: {diagnostics:?}"
         );
-        let importer = diagnostics
-            .iter()
-            .any(|row| {
-                engine
-                    .state
-                    .files
-                    .path(row.file)
-                    .is_some_and(|path| path == root.join("lib/a.dart"))
-                    && row.code.name.contains("uri_")
-            });
+        let importer = diagnostics.iter().any(|row| {
+            engine
+                .state
+                .files
+                .path(row.file)
+                .is_some_and(|path| path == root.join("lib/a.dart"))
+                && row.code.name.contains("uri_")
+        });
         assert!(
             !importer,
             "the workspace importer reports no URI-layer staleness: {diagnostics:?}"

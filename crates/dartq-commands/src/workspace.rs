@@ -789,7 +789,22 @@ fn no_root_posture(dir: &Path, packages_overridden: bool) -> Result<AssemblyBody
             dir.display()
         )))
     } else {
-        bare_assembly(dir).map(AssemblyBody::Floor)
+        // The bare floor still splits context roots for nested self-resolved
+        // packages: the locator gives every folder with a local package
+        // config its own workspace even when the analyzed tree has no
+        // pubspec on the ancestor chain (the chunked-conformance shape: a
+        // directory of independent case roots, each analyzed against its own
+        // resolution). The single-context stand-in merges those resolutions
+        // into the floor's config.
+        bare_assembly(dir).map(|(packages, config, config_dir, analyzed, advisory)| {
+            AssemblyBody::Floor((
+                packages,
+                extend_config_with_nested_roots(config, &config_dir, dir),
+                config_dir,
+                analyzed,
+                advisory,
+            ))
+        })
     }
 }
 
@@ -1168,23 +1183,31 @@ fn seed_non_member_path_deps(
 /// startup cost without bound.
 const NESTED_ROOT_WALK_BUDGET: usize = 10_000;
 
-/// Extends the context config with one entry per nested self-resolved
-/// package: a directory under `dir` (the canonicalized analyzed tree)
-/// carrying its own `pubspec.yaml` together with its own
+/// Extends the context config with the resolutions of nested self-resolved
+/// packages: directories under `dir` (the canonicalized analyzed tree)
+/// carrying their own `pubspec.yaml` together with their own
 /// `.dart_tool/package_config.json` — the oracle's separate-context-root
 /// trigger (`context_locator.dart` `_createContextRoots`,
-/// `packageConfigFileToUse != containingRoot.packagesFile`). The entry's
-/// language version is the nested pubspec's sdk lower bound — what pub
-/// materializes into a written config's `languageVersion`, the same
-/// inference the degraded floor applies.
+/// `packageConfigFileToUse != containingRoot.packagesFile`). The locator
+/// gives each such folder its own workspace parsed from that local config
+/// (`_createWorkspace`), so every entry the nested config declares — the
+/// self package and anything it references, mock or dependency — resolves
+/// inside the nested root. The single-context stand-in merges those entries
+/// into the one config: each entry's `rootUri` is resolved against the
+/// nested root's `.dart_tool/` and re-spelled against the merged config's
+/// directory, with `packageUri` and `languageVersion` carried verbatim (the
+/// dartq-pub reader contract, unchanged). The nested pubspec's sdk lower
+/// bound backs the identity entry only when the local config cannot be
+/// read or parsed — the same inference the degraded floor applies.
 ///
 /// Skips: directories already covered by a config entry root (the root,
 /// workspace members, path deps), names already present or added (one
-/// identity per name is a table invariant), and pubspecs that fail to load
-/// — a stray malformed pubspec degrades to today's attribution instead of
-/// failing the assembly. Hidden directories hold no package source
-/// (`.dart_tool`, `.git`) and are not descended; discovered roots are,
-/// mirroring the locator's recursion; the walk stops at
+/// identity per name is a table invariant; the outer config wins, matching
+/// the containing root's precedence), roots already claimed, and pubspecs
+/// that fail to load — a stray malformed pubspec degrades to today's
+/// attribution instead of failing the assembly. Hidden directories hold no
+/// package source (`.dart_tool`, `.git`) and are not descended; discovered
+/// roots are, mirroring the locator's recursion; the walk stops at
 /// [`NESTED_ROOT_WALK_BUDGET`] directories.
 ///
 /// The common case — no nested roots — returns `config` unchanged.
@@ -1225,7 +1248,10 @@ fn extend_config_with_nested_roots(
             })
             .unwrap_or_default();
         children.sort();
-        for child in children {
+        // DFS pre-order in alphabetical order — the locator's recursion
+        // (`_createContextRootsIn` iterates sorted children) — so the
+        // first-wins owner of a duplicated name is the discovered first.
+        for child in children.into_iter().rev() {
             if child
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -1250,25 +1276,77 @@ fn extend_config_with_nested_roots(
         if taken_roots.contains(&target) || !added_roots.insert(target.clone()) {
             continue;
         }
-        let Ok(spec) = load_pubspec(&target) else {
-            continue;
-        };
-        if taken_names.contains(spec.name.as_str()) || !added_names.insert(spec.name.clone()) {
-            continue;
-        }
         let base = config_dir.parent().unwrap_or(config_dir);
-        let Ok(relative) = target.strip_prefix(base) else {
-            continue;
-        };
-        entries.push(PackageConfigEntry {
-            name: spec.name.clone(),
-            root_uri: relative_root_uri(relative),
-            package_uri: Some("lib/".to_owned()),
-            language_version: Some(LanguageVersion::from_sdk_constraint(
-                spec.environment.sdk.as_ref(),
-            )),
-            additional_properties: BTreeMap::new(),
-        });
+        let nested_config_dir = target.join(".dart_tool");
+        let nested_config = fs::read_to_string(nested_config_dir.join("package_config.json"))
+            .ok()
+            .and_then(|text| PackageConfig::parse(&text).ok());
+        match nested_config {
+            // The local resolution merges in full — the oracle analyzes the
+            // nested root against its own parsed config
+            // (`parsePackageConfigJsonFile` under `_createWorkspace`).
+            Some(nested) => {
+                for entry in nested.packages {
+                    if taken_names.contains(entry.name.as_str())
+                        || !added_names.insert(entry.name.clone())
+                    {
+                        continue;
+                    }
+                    // A name outside the reader grammar or an unresolvable
+                    // `rootUri` is one broken entry in one nested root, not
+                    // an assembly defect: skip the entry, keep the rest.
+                    let Ok(root) = entry.resolve_root(&nested_config_dir) else {
+                        continue;
+                    };
+                    let root = normalize(&root);
+                    // The root dedup exempts the discovered root itself: the
+                    // self entry lives exactly there, and the claim above
+                    // already cleared it against outer and sibling roots.
+                    if root != target
+                        && (taken_roots.contains(&root) || !added_roots.insert(root.clone()))
+                    {
+                        continue;
+                    }
+                    let merged = PackageConfigEntry {
+                        root_uri: nested_root_uri(base, &root),
+                        package_uri: entry.package_uri,
+                        language_version: entry.language_version,
+                        ..entry
+                    };
+                    // The resolution faces reject the whole config on one
+                    // invalid entry; the merge must never turn a nested
+                    // root's broken entry into an assembly refusal.
+                    if entry_resolves(&merged, base) {
+                        entries.push(merged);
+                    }
+                }
+            }
+            // The local config is unreadable or floors at parse: fall back
+            // to the pubspec-derived identity entry (the name, the root, the
+            // sdk bound) so the nested package itself still attributes.
+            None => {
+                let Ok(spec) = load_pubspec(&target) else {
+                    continue;
+                };
+                if taken_names.contains(spec.name.as_str())
+                    || !added_names.insert(spec.name.clone())
+                {
+                    continue;
+                }
+                let Ok(relative) = target.strip_prefix(base) else {
+                    continue;
+                };
+                entries.push(PackageConfigEntry {
+                    name: spec.name.clone(),
+                    root_uri: relative_root_uri(relative),
+                    package_uri: Some("lib/".to_owned()),
+                    language_version: Some(LanguageVersion::from_sdk_constraint(
+                        spec.environment.sdk.as_ref(),
+                    )),
+                    additional_properties: BTreeMap::new(),
+                });
+            }
+        }
     }
     if entries.is_empty() {
         return config;
@@ -1278,10 +1356,38 @@ fn extend_config_with_nested_roots(
     Arc::new(extended)
 }
 
-/// The `rootUri` for a nested root: a relative URI path from the config's
-/// directory (`"../example"`). The raw spelling rides `resolve_root`'s
+/// The `rootUri` for a merged nested-config entry: a relative URI path from
+/// the merged config's directory (`"../example"`) when the resolved root
+/// sits under it, an absolute `file:` URI when it lives outside (mock and
+/// cache-style roots). The raw spelling rides `resolve_root`'s
 /// percent-decode, so a directory name carrying an encoded `%` would
 /// mis-decode — a spelling real package directories never carry.
+fn nested_root_uri(base: &Path, root: &Path) -> String {
+    match root.strip_prefix(base) {
+        Ok(relative) => relative_root_uri(relative),
+        Err(_) => absolute_file_root_uri(root),
+    }
+}
+
+/// Whether a candidate merged entry survives [`PackageConfig::resolve`]'s
+/// entry policies — the reader name grammar and the `packageUri` subtree
+/// validation — checked on a throwaway one-entry config so a broken nested
+/// entry is skipped instead of flooring the whole assembly.
+fn entry_resolves(entry: &PackageConfigEntry, config_dir: &Path) -> bool {
+    PackageConfig {
+        packages: vec![entry.clone()],
+        generator: None,
+        generator_version: None,
+        additional_properties: BTreeMap::new(),
+    }
+    .resolve(config_dir)
+    .is_ok()
+}
+
+/// The `rootUri` for a merged nested-config entry: a relative URI path from
+/// the config's directory (`"../example"`). The raw spelling rides
+/// `resolve_root`'s percent-decode, so a directory name carrying an encoded
+/// `%` would mis-decode — a spelling real package directories never carry.
 fn relative_root_uri(relative: &Path) -> String {
     let mut uri = String::from("../");
     for (index, component) in relative.components().enumerate() {
@@ -1289,6 +1395,28 @@ fn relative_root_uri(relative: &Path) -> String {
             uri.push('/');
         }
         uri.push_str(&component.as_os_str().to_string_lossy());
+    }
+    uri
+}
+
+/// The absolute `file:` spelling of a package root outside the merged
+/// config's directory tree, percent-encoded over the spec's unreserved set
+/// (`PackageConfigFileBuilder.toContent` shape; `resolve_root` decodes the
+/// escapes back into the same path).
+fn absolute_file_root_uri(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let mut uri = String::from("file://");
+    for (index, segment) in text.split('/').enumerate() {
+        if index > 0 {
+            uri.push('/');
+        }
+        for byte in segment.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                uri.push(byte as char);
+            } else {
+                uri.push_str(&format!("%{byte:02X}"));
+            }
+        }
     }
     uri
 }
@@ -1858,6 +1986,97 @@ mod tests {
         );
 
         fs::remove_dir_all(&bare).ok();
+    }
+
+    /// The chunked-conformance shape backing the mock-package faces: a bare
+    /// analyzed tree (no pubspec on the ancestor chain) holding independent
+    /// package roots, each with its own `package_config.json` whose mock
+    /// entries live OUTSIDE the tree at absolute `file:` rootUris. The
+    /// locator analyzes each root against its own parsed config
+    /// (`context_locator.dart` `_createContextRoots` splitting on the local
+    /// packages file, `_createWorkspace` parsing it), so `package:ffi`-style
+    /// imports resolve there; the bare floor's empty map must not floor them
+    /// into `uri_does_not_exist`. Pins the merged resolution: both roots'
+    /// entries join the URI face with the absolute roots decoded back to the
+    /// mock directories, the alphabetically first root claims the duplicated
+    /// self name against its own root (the rebase), and the MissingConfig
+    /// advisory stays (the analyzed root itself has no config).
+    #[test]
+    fn bare_floor_merges_nested_case_root_resolutions() {
+        let chunk = workspace("ws_chunk_roots", &[]);
+        fs::remove_file(chunk.join("pubspec.yaml")).expect("drop pubspec");
+        fs::remove_file(chunk.join("pubspec.lock")).expect("drop lock");
+        fs::remove_file(chunk.join(".dart_tool/package_config.json")).expect("drop config");
+        let chunk = chunk.canonicalize().expect("chunk");
+        // The mocks tree sits outside the analyzed tree, like the harness's
+        // shared mock packages.
+        let mocks = chunk
+            .parent()
+            .expect("temp parent")
+            .join(format!("ws_chunk_mocks_{}", std::process::id()));
+        for name in ["ffi", "meta"] {
+            fs::create_dir_all(mocks.join(name).join("lib")).expect("mock layout");
+            fs::write(
+                mocks.join(name).join("lib").join(format!("{name}.dart")),
+                "var x = 1;\n",
+            )
+            .expect("mock source");
+        }
+        let case_config = |mock: &str| {
+            format!(
+                r#"[{{"name": "test", "rootUri": "../", "packageUri": "lib/", "languageVersion": "3.13"}}, {{"name": "{mock}", "rootUri": "file://{}/{}", "packageUri": "lib/", "languageVersion": "3.13"}}]"#,
+                mocks.display(),
+                mock
+            )
+        };        for (index, mock) in [("0", "ffi"), ("1", "meta")] {
+            let root = chunk.join(index);
+            fs::create_dir_all(root.join("lib")).expect("case lib");
+            fs::create_dir_all(root.join(".dart_tool")).expect("case dart_tool");
+            fs::write(root.join("pubspec.yaml"), "name: test\n").expect("case pubspec");
+            fs::write(root.join("lib/test.dart"), "var x = 1;\n").expect("case source");
+            fs::write(
+                root.join(".dart_tool/package_config.json"),
+                format!(
+                    r#"{{"configVersion": 2, "packages": {}, "generator": "pub"}}"#,
+                    case_config(mock)
+                ),
+            )
+            .expect("case config");
+        }
+
+        let (config, dir, advisory) =
+            engine_config_with_advisory(&chunk, Some(&chunk.join("sdk")))
+                .expect("the bare floor still assembles");
+        assert_eq!(dir, chunk);
+        assert!(
+            matches!(advisory, Some(WorkspaceAdvisory::MissingConfig(_))),
+            "the analyzed root itself carries no config: {advisory:?}"
+        );
+
+        let resolved = config
+            .pub_config
+            .resolve(&chunk.join(".dart_tool"))
+            .expect("the merged config resolves");
+        let by_name: BTreeMap<&str, _> = resolved
+            .iter()
+            .map(|package| (package.name.as_str(), package))
+            .collect();
+        assert_eq!(by_name["ffi"].lib_dir, normalize(&mocks.join("ffi/lib")));
+        assert_eq!(by_name["meta"].lib_dir, normalize(&mocks.join("meta/lib")));
+        // The duplicated self name goes to the alphabetically first root —
+        // rebased against that root's own `.dart_tool/`, not the chunk root.
+        assert_eq!(by_name["test"].root, normalize(&chunk.join("0")));
+        // The floor's attribution face is unchanged: the identity table
+        // stays bare; only the URI face joins the nested resolutions.
+        assert!(
+            config
+                .packages
+                .containing(&chunk.join("0/lib/test.dart"))
+                .is_none()
+        );
+
+        fs::remove_dir_all(&chunk).ok();
+        fs::remove_dir_all(&mocks).ok();
     }
 
     /// The lock is optional (#759): config present, lock absent — the

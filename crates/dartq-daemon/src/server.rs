@@ -245,6 +245,14 @@ where
         if let Some(turn) = session.retry_deferred_publish(Instant::now()) {
             write_turn(&mut output, turn)?;
         }
+        // The `Tier::Background` warm tick (#2739): while the engine has
+        // warm work armed or queued, the loop wakes each WARM_TICK to run
+        // one drain — the queued warm task executes behind whatever
+        // foreground landed since, so a quiet session warms its caches
+        // and an intake never waits behind a warm chunk.
+        if let Some(turn) = session.service_warm_tick(Instant::now()) {
+            write_turn(&mut output, turn)?;
+        }
 
         // The wait: a select over intake, the fix workers' mailbox, and
         // the debug worker's completions, so any of them wakes the loop
@@ -266,6 +274,7 @@ where
             .into_iter()
             .chain(session.flush_deadline())
             .chain(session.publish_retry_deadline())
+            .chain(session.warm_deadline())
             // #2632: the signal tick bounds the quiet wait while a flag
             // is armed — the loop-top check above is what observes it.
             .chain(signal.map(|_| Instant::now() + SIGNAL_POLL))
@@ -1786,5 +1795,249 @@ mod tests {
             json!([]),
             "the deferred push is the post-write base view: {pushes:?}"
         );
+    }
+
+    // -- The quit token (#2729) ---------------------------------------------
+
+    /// A [`dartq_source::SourceStore`] that counts `get` calls and —
+    /// once armed — flips a shared `AtomicBool` on the `flip_at`-th
+    /// call: the deterministic mid-analysis quit for the token tests.
+    /// The bound flag is the same cell [`run_with_signal`] polls, so
+    /// the flip is exactly a signal landing mid-turn.
+    struct FlipStore {
+        inner: Box<dyn dartq_source::SourceStore + Send + Sync>,
+        get_calls: Arc<std::sync::atomic::AtomicUsize>,
+        flip_at: Option<usize>,
+        flag: Arc<AtomicBool>,
+    }
+
+    impl dartq_source::SourceStore for FlipStore {
+        fn put(&mut self, bytes: &[u8]) -> dartq_source::ContentId {
+            self.inner.put(bytes)
+        }
+        fn get(&self, id: dartq_source::ContentId) -> Option<&[u8]> {
+            let call = self.get_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.flip_at == Some(call) {
+                self.flag.store(true, Ordering::Relaxed);
+            }
+            self.inner.get(id)
+        }
+        fn remove(&mut self, id: dartq_source::ContentId) -> bool {
+            self.inner.remove(id)
+        }
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+        fn len_bytes(&self) -> u64 {
+            self.inner.len_bytes()
+        }
+    }
+
+    /// One part-library workspace (`lib/main.dart` plus `parts` part
+    /// files): the multi-member fold a mid-analysis flip lands inside.
+    fn part_workspace(parts: usize) -> test_fixtures::Workspace {
+        let mut main = String::from("library t;\n");
+        for i in 0..parts {
+            main.push_str(&format!("part 'p{i}.dart';\n"));
+        }
+        let workspace = test_fixtures::Workspace::new(&main);
+        for i in 0..parts {
+            fs::write(
+                workspace.path(&format!("lib/p{i}.dart")),
+                format!("part of 'main.dart';\nint p{i}() => {i};\n"),
+            )
+            .expect("part file");
+        }
+        workspace
+    }
+
+    /// A session over `workspace` whose engine reads through a
+    /// [`FlipStore`] on `flag`/`get_calls`; the session's quit token is
+    /// bound to the same cell, so one atomic is the signal flag and
+    /// the engine checkpoints' token alike — the serve-loop topology.
+    /// `pooled_mapped_store` stays off so the armed store reaches the
+    /// engine instead of being rebound.
+    fn flip_session(
+        name: &str,
+        workspace: &test_fixtures::Workspace,
+        flag: Arc<AtomicBool>,
+        flip_at: Option<usize>,
+    ) -> (Session, Arc<std::sync::atomic::AtomicUsize>) {
+        let get_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut config = workspace.engine_config();
+        config.store = Box::new(FlipStore {
+            inner: dartq_engine::memory_store(),
+            get_calls: Arc::clone(&get_calls),
+            flip_at,
+            flag: Arc::clone(&flag),
+        });
+        let store = SnapshotStore::open(SnapshotConfig {
+            root: Some(store_root(name)),
+            capacity_bytes: DEFAULT_CAPACITY_BYTES,
+        })
+        .expect("store opens on a temp root");
+        let mut session = Session::with_runtime(
+            config,
+            Vec::new(),
+            Some(store),
+            None,
+            crate::session::SessionRuntime {
+                pooled_mapped_store: false,
+                ..crate::session::SessionRuntime::default()
+            },
+        )
+        .expect("session");
+        session.bind_quit_flag(flag);
+        (session, get_calls)
+    }
+
+    /// One `dartq/sync` + `dartq/analyze` turn over the wire: the sync
+    /// rewrites `lib/main.dart` on disk first so the read recomputes
+    /// the fold (a quiet re-analyze would answer fully cached and read
+    /// nothing). Returns the analyze answer frame; `client`/`output`
+    /// come from the caller's server harness.
+    fn dirty_analyze(
+        workspace: &test_fixtures::Workspace,
+        parts: usize,
+        client: &mpsc::Sender<Vec<u8>>,
+        output: &TestOutput,
+    ) -> Value {
+        let main = workspace.path("lib/main.dart");
+        let mut body = String::from("library t;\n");
+        for i in 0..parts {
+            body.push_str(&format!("part 'p{i}.dart';\n"));
+        }
+        body.push_str("int marker() => 0;\n");
+        fs::write(&main, &body).expect("rewrite main");
+        let mut batch = Vec::new();
+        batch.extend_from_slice(&framed(&notification(
+            "dartq/sync",
+            json!({"paths": ["lib/main.dart"]}),
+        )));
+        batch.extend_from_slice(&framed(&request(1, "dartq/analyze", json!({}))));
+        client.send(batch).expect("batch send");
+        wait_for(
+            || {
+                transcript_of(output)
+                    .iter()
+                    .find(|frame| frame.get("id") == Some(&json!(1)))
+                    .cloned()
+            },
+            "the analyze request never answered",
+        )
+    }
+
+    /// #2729 end to end: the signal cell bound to the session's quit
+    /// token flips mid-analysis (the armed store's `flip_at`-th read —
+    /// inside the member fold by the baseline's calibration), the
+    /// in-flight turn answers the request `RequestCancelled` instead
+    /// of waiting out the recompute, and the loop's own close-out runs
+    /// — the same `EXIT_CLEAN` end any signal-polled turn takes, with
+    /// the shutdown tail (`flush_snapshot`/`shutdown_plugins`) behind
+    /// it. The unflipped run doubles as the output-neutral arm: a
+    /// token nobody flips leaves the turn's answer byte-identical.
+    #[test]
+    fn the_quit_flag_interrupts_the_in_flight_analysis_and_the_loop_closes_out() {
+        const PARTS: usize = 64;
+
+        // The baseline run: the same workspace and turn, unflipped —
+        // `baseline_gets` calibrates the flip point inside the fold
+        // and the answer is the output-neutral arm.
+        let workspace = part_workspace(PARTS);
+        let flag = Arc::new(AtomicBool::new(false));
+        let (session, gets) = flip_session("quit-wire-baseline", &workspace, flag.clone(), None);
+        let (client, receiver) = mpsc::channel::<Vec<u8>>();
+        let output = TestOutput::default();
+        let server_output = output.clone();
+        let run_flag = flag.clone();
+        let server = thread::spawn(move || {
+            run_with_signal(
+                BufReader::new(FeedClient {
+                    receiver,
+                    pending: Vec::new(),
+                }),
+                server_output,
+                &mut { session },
+                None,
+                Some(&*run_flag),
+            )
+        });
+        let baseline = dirty_analyze(&workspace, PARTS, &client, &output);
+        let baseline_gets = gets.load(Ordering::Relaxed);
+        assert!(
+            baseline_gets > PARTS,
+            "the baseline read enough contents for a mid-fold flip: {baseline_gets}"
+        );
+        assert!(baseline["result"]["diags"].is_array(), "answered: {baseline}");
+        assert!(!flag.load(Ordering::Relaxed), "nobody flipped the baseline's cell");
+        drop(client);
+        let baseline_code = server
+            .join()
+            .expect("baseline server thread does not panic")
+            .expect("baseline transport does not fail on memory pipes");
+        assert_eq!(baseline_code, EXIT_CLEAN);
+
+        // The flipped run: `flip_at` 4 sets the quit cell inside the
+        // turn's early engine work — the drain's fourth content read —
+        // so the member fold's first `Checkpoint` stride already polls
+        // the flipped flag and the analysis exits `Err(Cancelled)`
+        // long before its baseline end. (A late flip can land in the
+        // lint stage's reads, which poll no checkpoint.) The flip is
+        // the serve loop's SIGTERM landing mid-turn.
+        let workspace = part_workspace(PARTS);
+        let flag = Arc::new(AtomicBool::new(false));
+        let (session, gets) = flip_session(
+            "quit-wire-flipped",
+            &workspace,
+            flag.clone(),
+            Some(4),
+        );
+        let (client, receiver) = mpsc::channel::<Vec<u8>>();
+        let output = TestOutput::default();
+        let server_output = output.clone();
+        let run_flag = flag.clone();
+        let server = thread::spawn(move || {
+            run_with_signal(
+                BufReader::new(FeedClient {
+                    receiver,
+                    pending: Vec::new(),
+                }),
+                server_output,
+                &mut { session },
+                None,
+                Some(&*run_flag),
+            )
+        });
+        let answer = dirty_analyze(&workspace, PARTS, &client, &output);
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "the armed store flipped the quit cell mid-analysis"
+        );
+        assert_eq!(
+            answer["error"]["code"],
+            json!(codes::REQUEST_CANCELLED),
+            "the in-flight turn answers the request cancelled: {answer}"
+        );
+        assert!(
+            gets.load(Ordering::Relaxed) < baseline_gets,
+            "the cancelled run stopped early: {} reads vs {} baseline",
+            gets.load(Ordering::Relaxed),
+            baseline_gets
+        );
+
+        // The loop's own close-out: the flag it polls IS the cell the
+        // store flipped, so the next loop top ends the session — the
+        // shutdown tail behind a clean code, no reaper needed.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !server.is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(server.is_finished(), "the quit close-out ended the session");
+        drop(client);
+        let code = server
+            .join()
+            .expect("server thread does not panic")
+            .expect("transport does not fail on memory pipes");
+        assert_eq!(code, EXIT_CLEAN, "the ladder-equivalent close is clean");
     }
 }

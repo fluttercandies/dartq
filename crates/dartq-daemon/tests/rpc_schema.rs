@@ -305,8 +305,7 @@ fn dartq_compat_answers_validate_at_every_tier() {
     }
     let compact = answer_result(&h, 3);
     assert_eq!(
-        compact["matrix"][0]["first_failure"]["code"],
-        "experiment_not_enabled_off_by_default",
+        compact["matrix"][0]["first_failure"]["code"], "experiment_not_enabled_off_by_default",
         "the compact tier carries the evidence"
     );
 
@@ -517,7 +516,10 @@ fn dartq_fix_documents_validate_with_their_provenance() {
     );
     assert_eq!(
         files[0]["file"],
-        workspace.path("analysis_options.yaml").display().to_string()
+        workspace
+            .path("analysis_options.yaml")
+            .display()
+            .to_string()
     );
     let edits = files[0]["edits"].as_array().expect("edits array");
     assert_eq!(edits.len(), 2, "one suppression row per code");
@@ -560,10 +562,7 @@ fn every_stamped_face_validates_against_its_published_domain() {
         );
         let result = answer_result(&h, id);
         assert!(
-            !result["diags"]
-                .as_array()
-                .expect("check rows")
-                .is_empty(),
+            !result["diags"].as_array().expect("check rows").is_empty(),
             "the broken fixture keeps the row shape honest: {result}"
         );
         let payload = assert_valid_at_tier(&result, Domain::Check, tier);
@@ -609,11 +608,7 @@ fn every_stamped_face_validates_against_its_published_domain() {
     h.step(&request(8, "dartq/index", json!({})), 1);
     let result = answer_result(&h, 8);
     let payload = assert_valid_at_tier(&result, Domain::Index, Verbosity::Compact);
-    assert_eq!(
-        payload.matches("\"v\"").count(),
-        1,
-        "index: {payload}"
-    );
+    assert_eq!(payload.matches("\"v\"").count(), 1, "index: {payload}");
 
     for (id, tier) in [
         (9, Verbosity::Minimal),
@@ -630,11 +625,7 @@ fn every_stamped_face_validates_against_its_published_domain() {
         );
         let result = answer_result(&h, id);
         let payload = assert_valid_at_tier(&result, Domain::Assists, tier);
-        assert_eq!(
-            payload.matches("\"v\"").count(),
-            1,
-            "assists: {payload}"
-        );
+        assert_eq!(payload.matches("\"v\"").count(), 1, "assists: {payload}");
     }
 
     let (code, _) = h.join_ended();
@@ -696,13 +687,14 @@ fn corrupted_live_answers_are_named_at_their_path() {
     fs::remove_dir_all(&workspace.root).ok();
 }
 
-/// The frozen `dartq/*` method family: the daemon's 16-method request
+/// The frozen `dartq/*` method family: the daemon's 17-method request
 /// table, pinned here as the independent copy the live face must serve.
 /// dartq-schema validates answer shapes per domain and has no method-name
 /// registry, so the frozen wire shape is the pin — an added, renamed, or
 /// removed method drifts the table and fails the gate below.
-const FROZEN_METHODS: [&str; 16] = [
+const FROZEN_METHODS: [&str; 17] = [
     "dartq/index",
+    "dartq/memory",
     "dartq/analyze",
     "dartq/check",
     "dartq/query",
@@ -734,8 +726,9 @@ fn every_frozen_method_is_a_live_face() {
     // Params chosen to reach each face's own intake (a valid selector where
     // the face validates one) — the pin is "answered, never METHOD_NOT_FOUND".
     let paths = json!({ "paths": [a.display().to_string()] });
-    let cases: [(i64, &str, Value); 16] = [
+    let cases: [(i64, &str, Value); 17] = [
         (1, "dartq/index", json!({})),
+        (18, "dartq/memory", json!({})),
         (2, "dartq/analyze", json!({})),
         (3, "dartq/check", paths.clone()),
         (4, "dartq/query", json!({ "name": "Foo" })),
@@ -961,7 +954,10 @@ fn the_debug_family_matches_the_frozen_table() {
     // empty is still a printed document, never blank output).
     h.step(&request(99, "dartq/debug/nope", json!({})), 1);
     let frame = h.wait_answer(99);
-    assert_eq!(frame["error"]["code"], -32601, "the debug face set is closed");
+    assert_eq!(
+        frame["error"]["code"], -32601,
+        "the debug face set is closed"
+    );
     h.step(&request(100, "dartq/debug/status", json!({})), 1);
     assert_eq!(
         h.wait_answer(100)["result"],
@@ -1036,7 +1032,10 @@ fn the_test_family_matches_the_frozen_table() {
     // METHOD_NOT_FOUND.
     h.step(&request(99, "dartq/test/nope", json!({})), 1);
     let frame = h.wait_answer(99);
-    assert_eq!(frame["error"]["code"], -32601, "the test face set is closed");
+    assert_eq!(
+        frame["error"]["code"], -32601,
+        "the test face set is closed"
+    );
 
     let (code, _) = h.join_ended();
     assert_eq!(code, dartq_daemon::EXIT_CLEAN);
