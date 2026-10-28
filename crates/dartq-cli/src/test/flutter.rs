@@ -132,8 +132,19 @@ pub(super) fn run(args: &[String], inv: Invocation) -> u8 {
         }
     }
     let workers = inv.concurrency.unwrap_or_else(|| {
-        // The tool's default: half the cores, at least one.
-        std::thread::available_parallelism().map_or(1, |cores| (cores.get() / 2).max(1))
+        // This runner's default: three quarters of the cores, at least
+        // one. The tool defaults to half the cores because each of its
+        // concurrent suites costs a whole `flutter_tester` plus a fresh
+        // whole-program compile; the grouped pass shares one compiler and
+        // reuses testers (~0.3–0.65 GB each), and every run's real
+        // concurrency is re-bounded by the host memory lease — so a higher
+        // target is cheap. Past ~three quarters of the cores the resident
+        // compiler, the runner VM and dartq's own replay parsing start
+        // contending with the testers: measured on a 92-suite package
+        // (10-core, 32 GB host, 79 grouped), per-suite aggregate work
+        // inflates from ~60 s at 5 workers to ~120 s at 10 while wall
+        // stops improving.
+        std::thread::available_parallelism().map_or(1, |cores| (cores.get() * 3 / 4).max(1))
     });
     let plan = Plan { root, flutter, inv, suites, selected, workers };
     match execute(&plan) {

@@ -484,7 +484,17 @@ pub fn execute(plan: &Plan<'_>, cfg: &crate::ExecConfig) -> Result<Outcome, crat
         }
     }
     let mut args: Vec<String> = plan.runner_args.to_vec();
-    args.extend(["--reporter".to_owned(), "json".to_owned(), "--".to_owned()]);
+    // The engine's run pool must match the tester pool: `runner_args` never
+    // carries `--concurrency` (the tool's `-j` drives its own scheduler,
+    // not `testArgs`), and test_core's default is half the cores — which
+    // would cap suites in flight below `plan.concurrency` testers.
+    args.extend([
+        "--concurrency".to_owned(),
+        plan.concurrency.max(1).to_string(),
+        "--reporter".to_owned(),
+        "json".to_owned(),
+        "--".to_owned(),
+    ]);
     args.extend(plan.suites.iter().map(|suite| suite.path.display().to_string()));
     let config = serde_json::json!({
         "tester": plan.recipe.tester,
